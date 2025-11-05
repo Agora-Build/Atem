@@ -1,0 +1,25 @@
+# Build artifacts
+/target
+
+# Local environment configuration
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Tooling state
+.claude/
+
+# Editor settings
+.vscode/
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+codex_logs/
+
