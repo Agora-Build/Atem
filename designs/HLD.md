@@ -27,6 +27,7 @@ Video based collabrating with anyone
 Ctrl + Shift + V(Managed by Astation) to launch real-time collabrating
 Astation
 Powerful AI based work-suite behind the curtain 
+
 2. Interactive AI-powered Shell
 When invoked without arguments (atem), launches an AI-enhanced REPL environment.
 
@@ -76,6 +77,5 @@ Future Considerations
 Add plugin architecture for community extensions.
 
 Enhance AI contextual memory for long-running sessions.
-
 
 
