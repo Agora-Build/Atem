@@ -1,6 +1,7 @@
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
 use clap::{Parser, Subcommand};
+use serde_json::{json, Value};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -19,11 +20,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use std::{
+    collections::VecDeque,
     fs,
     io::{self, Stdout, Write},
     path::PathBuf,
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError},
@@ -33,8 +35,10 @@ use uuid::Uuid;
 use vt100::{Cell as VtCell, Color as VtColor, Parser as VtParser};
 
 mod codex_client;
+mod rtm_client;
 mod websocket_client;
 use codex_client::{CodexClient, CodexResizeHandle};
+use rtm_client::{RtmClient, RtmConfig, RtmEvent};
 use websocket_client::{AstationClient, AstationMessage};
 
 #[derive(Parser)]
@@ -109,10 +113,27 @@ struct App {
     codex_view_rows: u16,
     codex_view_cols: u16,
     force_terminal_redraw: bool,
+    rtm_client: Option<RtmClient>,
+    rtm_app_id: String,
+    rtm_token: String,
+    rtm_channel: String,
+    rtm_client_id: String,
+    last_activity_ping: Option<Instant>,
+    activity_ping_interval: Duration,
+    pending_transcriptions: VecDeque<String>,
 }
 
 impl App {
     fn new() -> Self {
+        let rtm_app_id =
+            std::env::var("ASTATION_APP_ID").unwrap_or_else(|_| "demo-app-id".to_string());
+        let rtm_token =
+            std::env::var("ASTATION_RTM_TOKEN").unwrap_or_else(|_| "demo-token".to_string());
+        let rtm_channel =
+            std::env::var("ASTATION_RTM_CHANNEL").unwrap_or_else(|_| "agora-demo-channel".to_string());
+        let rtm_client_id = std::env::var("ASTATION_CLIENT_ID")
+            .unwrap_or_else(|_| format!("atem-{}", Uuid::new_v4()));
+
         Self {
             mode: AppMode::MainMenu,
             selected_index: 0,
@@ -146,6 +167,14 @@ impl App {
             codex_view_rows: 0,
             codex_view_cols: 0,
             force_terminal_redraw: false,
+            rtm_client: None,
+            rtm_app_id,
+            rtm_token,
+            rtm_channel,
+            rtm_client_id,
+            last_activity_ping: None,
+            activity_ping_interval: Duration::from_secs(2),
+            pending_transcriptions: VecDeque::new(),
         }
     }
 
@@ -722,6 +751,157 @@ impl App {
         if disconnected || exit_detected {
             self.finalize_codex_session();
         }
+    }
+
+    async fn ensure_rtm_client(&mut self) -> Result<()> {
+        if self.rtm_client.is_some() {
+            return Ok(());
+        }
+
+        let config = RtmConfig {
+            app_id: self.rtm_app_id.clone(),
+            token: self.rtm_token.clone(),
+            channel: self.rtm_channel.clone(),
+            client_id: self.rtm_client_id.clone(),
+        };
+
+        match RtmClient::new(config) {
+            Ok(client) => {
+                self.rtm_client = Some(client);
+                self.status_message = Some("Connected to Astation signaling.".to_string());
+                Ok(())
+            }
+            Err(err) => {
+                self.status_message =
+                    Some(format!("Failed to connect to Astation signaling: {}", err));
+                Err(err)
+            }
+        }
+    }
+
+    async fn send_activity_ping(&mut self, focused: bool) -> Result<()> {
+        self.ensure_rtm_client().await?;
+        let client = match &self.rtm_client {
+            Some(client) => client,
+            None => return Ok(()),
+        };
+
+        let payload = json!({
+            "type": "activity",
+            "client_id": self.rtm_client_id,
+            "focused": focused,
+            "timestamp": current_timestamp_ms(),
+        })
+        .to_string();
+
+        client.publish_channel(&payload).await?;
+        Ok(())
+    }
+
+    async fn maybe_send_activity_ping(&mut self, focused: bool) {
+        let should_send = match self.last_activity_ping {
+            Some(last) => last.elapsed() >= self.activity_ping_interval,
+            None => true,
+        };
+
+        if should_send {
+            match self.send_activity_ping(focused).await {
+                Ok(()) => {
+                    self.last_activity_ping = Some(Instant::now());
+                }
+                Err(err) => {
+                    self.status_message =
+                        Some(format!("Failed to send activity ping: {}", err));
+                }
+            }
+        }
+    }
+
+    async fn process_rtm_messages(&mut self) -> Result<()> {
+        if let Some(client) = &self.rtm_client {
+            let events = client.drain_events().await;
+            for event in events {
+                self.handle_rtm_event(event);
+            }
+        }
+
+        self.flush_pending_transcriptions().await?;
+        Ok(())
+    }
+
+    fn handle_rtm_event(&mut self, event: RtmEvent) {
+        if event.payload.trim().is_empty() {
+            return;
+        }
+
+        match serde_json::from_str::<Value>(&event.payload) {
+            Ok(value) => {
+                if let Some(kind) = value.get("type").and_then(|v| v.as_str()) {
+                    match kind {
+                        "transcription" => {
+                            let target = value
+                                .get("target")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if target == self.rtm_client_id {
+                                if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+                                    self.pending_transcriptions.push_back(text.to_string());
+                                }
+                            }
+                        }
+                        "active_update" => {
+                            if let Some(active) =
+                                value.get("active_atem_id").and_then(|v| v.as_str())
+                            {
+                                if active == self.rtm_client_id {
+                                    self.status_message =
+                                        Some("Astation marked this Atem as active.".to_string());
+                                } else {
+                                    self.status_message =
+                                        Some(format!("Astation active Atem: {}", active));
+                                }
+                            }
+                        }
+                        "dictation_state" => {
+                            if let Some(state) = value.get("enabled").and_then(|v| v.as_bool()) {
+                                self.status_message = Some(if state {
+                                    "Astation dictation enabled.".to_string()
+                                } else {
+                                    "Astation dictation paused.".to_string()
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(err) => {
+                self.status_message =
+                    Some(format!("Failed to parse RTM message '{}' ({})", event.payload, err));
+            }
+        }
+    }
+
+    async fn flush_pending_transcriptions(&mut self) -> Result<()> {
+        while let Some(text) = self.pending_transcriptions.pop_front() {
+            if matches!(self.mode, AppMode::CodexChat) {
+                if let Err(err) = self.send_codex_prompt(&text).await {
+                    self.status_message =
+                        Some(format!("Failed to send transcription to Codex: {}", err));
+                    return Err(err);
+                }
+            } else {
+                self.status_message =
+                    Some(format!("Transcription received (switch to Codex): {}", text));
+                self.pending_transcriptions.push_front(text);
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn register_local_activity(&mut self, focused: bool) {
+        self.maybe_send_activity_ping(focused).await;
     }
 
     fn finalize_codex_session(&mut self) {
@@ -1425,6 +1605,13 @@ fn centered_rect(
         .split(popup_layout[1])[1]
 }
 
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_millis() as u64
+}
+
 async fn run_app() -> Result<()> {
     // Handle command line arguments first
     let cli = Cli::parse();
@@ -1474,11 +1661,15 @@ async fn run_app() -> Result<()> {
 async fn run_tui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     // Try to connect to Astation at startup
     let _ = app.try_connect_astation().await;
+    let _ = app.ensure_rtm_client().await;
 
     loop {
         // Process any pending Astation messages
         app.process_astation_messages().await;
         app.process_codex_output();
+        if let Err(err) = app.process_rtm_messages().await {
+            app.status_message = Some(format!("RTM processing error: {}", err));
+        }
 
         if app.force_terminal_redraw {
             terminal.clear()?;
@@ -1490,6 +1681,7 @@ async fn run_tui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    app.register_local_activity(true).await;
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
                     if ctrl && matches!(app.mode, AppMode::CodexChat) {

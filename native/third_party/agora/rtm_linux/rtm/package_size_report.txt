@@ -1,0 +1,2 @@
+linux arch shared_library size(b)
+linux x86_64 libagora_rtm_sdk.so 10110416
