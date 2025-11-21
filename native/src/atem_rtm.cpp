@@ -11,6 +11,11 @@ struct AtemRtmClient {
     AtemRtmMessageCallback callback{nullptr};
     void* user_data{nullptr};
     bool connected{false};
+    bool logged_in{false};
+    bool channel_joined{false};
+    std::string user_id;
+    std::string channel_id;
+    std::string token;
 };
 
 namespace {
@@ -50,6 +55,8 @@ int atem_rtm_connect(AtemRtmClient* client) {
         return -1;
     }
     client->connected = true;
+    client->logged_in = false;
+    client->channel_joined = false;
     return 0;
 }
 
@@ -58,13 +65,39 @@ int atem_rtm_disconnect(AtemRtmClient* client) {
         return -1;
     }
     client->connected = false;
+    client->logged_in = false;
+    client->channel_joined = false;
+    return 0;
+}
+
+int atem_rtm_login(
+    AtemRtmClient* client,
+    const char* token,
+    const char* user_id) {
+    if (!client || !client->connected || !user_id) {
+        return -1;
+    }
+    client->token = token ? token : "";
+    client->user_id = user_id;
+    client->logged_in = true;
+    return 0;
+}
+
+int atem_rtm_join_channel(
+    AtemRtmClient* client,
+    const char* channel_id) {
+    if (!client || !client->logged_in || !channel_id) {
+        return -1;
+    }
+    client->channel_id = channel_id;
+    client->channel_joined = true;
     return 0;
 }
 
 int atem_rtm_publish_channel(
     AtemRtmClient* client,
     const char* payload) {
-    if (!client || !client->connected || !payload) {
+    if (!client || !client->connected || !client->channel_joined || !payload) {
         return -1;
     }
     if (client->callback) {
@@ -88,4 +121,3 @@ int atem_rtm_send_peer(
 }
 
 } // extern "C"
-

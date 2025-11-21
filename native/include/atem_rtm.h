@@ -30,6 +30,15 @@ void atem_rtm_destroy(AtemRtmClient* client);
 int atem_rtm_connect(AtemRtmClient* client);
 int atem_rtm_disconnect(AtemRtmClient* client);
 
+int atem_rtm_login(
+    AtemRtmClient* client,
+    const char* token,
+    const char* user_id);
+
+int atem_rtm_join_channel(
+    AtemRtmClient* client,
+    const char* channel_id);
+
 int atem_rtm_publish_channel(
     AtemRtmClient* client,
     const char* payload);
@@ -42,4 +51,3 @@ int atem_rtm_send_peer(
 #ifdef __cplusplus
 }
 #endif
-

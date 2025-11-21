@@ -1,12 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use libc::{c_char, c_void};
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::Arc;
-use tokio::sync::mpsc::{
-    error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender,
-};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
+};
 
 #[repr(C)]
 struct AtemRtmClient {
@@ -37,6 +37,12 @@ unsafe extern "C" {
     fn atem_rtm_destroy(client: *mut AtemRtmClient);
     fn atem_rtm_connect(client: *mut AtemRtmClient) -> i32;
     fn atem_rtm_disconnect(client: *mut AtemRtmClient) -> i32;
+    fn atem_rtm_login(
+        client: *mut AtemRtmClient,
+        token: *const c_char,
+        user_id: *const c_char,
+    ) -> i32;
+    fn atem_rtm_join_channel(client: *mut AtemRtmClient, channel_id: *const c_char) -> i32;
     fn atem_rtm_publish_channel(client: *mut AtemRtmClient, payload: *const c_char) -> i32;
     fn atem_rtm_send_peer(
         client: *mut AtemRtmClient,
@@ -200,10 +206,34 @@ impl RtmClient {
     pub async fn publish_channel(&self, payload: &str) -> Result<()> {
         let payload_c = CString::new(payload)?;
         let guard = self.inner.lock().await;
-        let rc =
-            unsafe { atem_rtm_publish_channel(guard.handle, payload_c.as_ptr()) };
+        let rc = unsafe { atem_rtm_publish_channel(guard.handle, payload_c.as_ptr()) };
         if rc != 0 {
             return Err(anyhow!("failed to publish channel message (code {rc})"));
+        }
+        Ok(())
+    }
+
+    pub async fn login_and_join(&self, token: &str, account: &str, channel: &str) -> Result<()> {
+        let token_c = CString::new(token)?;
+        let account_c = CString::new(account)?;
+        let channel_c = CString::new(channel)?;
+
+        let handle = {
+            let guard = self.inner.lock().await;
+            guard.handle
+        };
+
+        let rc = unsafe { atem_rtm_login(handle, token_c.as_ptr(), account_c.as_ptr()) };
+        if rc != 0 {
+            return Err(anyhow!("failed to login to signaling (code {rc})"));
+        }
+
+        let rc_join = unsafe { atem_rtm_join_channel(handle, channel_c.as_ptr()) };
+        if rc_join != 0 {
+            return Err(anyhow!(
+                "failed to join signaling channel {} (code {rc_join})",
+                channel
+            ));
         }
         Ok(())
     }
@@ -212,9 +242,7 @@ impl RtmClient {
         let target_c = CString::new(target)?;
         let payload_c = CString::new(payload)?;
         let guard = self.inner.lock().await;
-        let rc = unsafe {
-            atem_rtm_send_peer(guard.handle, target_c.as_ptr(), payload_c.as_ptr())
-        };
+        let rc = unsafe { atem_rtm_send_peer(guard.handle, target_c.as_ptr(), payload_c.as_ptr()) };
         if rc != 0 {
             return Err(anyhow!("failed to send peer message (code {rc})"));
         }

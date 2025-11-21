@@ -1,7 +1,6 @@
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
 use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -19,6 +18,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     fs,
@@ -36,9 +36,17 @@ use vt100::{Cell as VtCell, Color as VtColor, Parser as VtParser};
 
 mod codex_client;
 mod rtm_client;
+mod token;
 mod websocket_client;
 use codex_client::{CodexClient, CodexResizeHandle};
 use rtm_client::{RtmClient, RtmConfig, RtmEvent};
+use token::generate_rtm_token;
+
+const AGORA_APP_ID: &str = "YOUR_AGORA_APP_ID";
+const AGORA_APP_CERTIFICATE: &str = "YOUR_AGORA_APP_CERTIFICATE";
+const AGORA_RTM_CHANNEL: &str = "atem_channel";
+const AGORA_RTM_ACCOUNT: &str = "atem01";
+const AGORA_RTM_TOKEN_TTL_SECS: u32 = 3600;
 use websocket_client::{AstationClient, AstationMessage};
 
 #[derive(Parser)]
@@ -114,26 +122,16 @@ struct App {
     codex_view_cols: u16,
     force_terminal_redraw: bool,
     rtm_client: Option<RtmClient>,
-    rtm_app_id: String,
-    rtm_token: String,
-    rtm_channel: String,
     rtm_client_id: String,
+    rtm_certificate: String,
     last_activity_ping: Option<Instant>,
     activity_ping_interval: Duration,
     pending_transcriptions: VecDeque<String>,
+    rtm_token_expires_at: Option<Instant>,
 }
 
 impl App {
     fn new() -> Self {
-        let rtm_app_id =
-            std::env::var("ASTATION_APP_ID").unwrap_or_else(|_| "demo-app-id".to_string());
-        let rtm_token =
-            std::env::var("ASTATION_RTM_TOKEN").unwrap_or_else(|_| "demo-token".to_string());
-        let rtm_channel =
-            std::env::var("ASTATION_RTM_CHANNEL").unwrap_or_else(|_| "agora-demo-channel".to_string());
-        let rtm_client_id = std::env::var("ASTATION_CLIENT_ID")
-            .unwrap_or_else(|_| format!("atem-{}", Uuid::new_v4()));
-
         Self {
             mode: AppMode::MainMenu,
             selected_index: 0,
@@ -168,13 +166,12 @@ impl App {
             codex_view_cols: 0,
             force_terminal_redraw: false,
             rtm_client: None,
-            rtm_app_id,
-            rtm_token,
-            rtm_channel,
-            rtm_client_id,
+            rtm_client_id: AGORA_RTM_ACCOUNT.to_string(),
+            rtm_certificate: AGORA_APP_CERTIFICATE.to_string(),
             last_activity_ping: None,
             activity_ping_interval: Duration::from_secs(2),
             pending_transcriptions: VecDeque::new(),
+            rtm_token_expires_at: None,
         }
     }
 
@@ -754,29 +751,52 @@ impl App {
     }
 
     async fn ensure_rtm_client(&mut self) -> Result<()> {
-        if self.rtm_client.is_some() {
+        let needs_new_client = self.rtm_client.is_none()
+            || self
+                .rtm_token_expires_at
+                .map(|expiry| expiry <= Instant::now())
+                .unwrap_or(true);
+
+        if !needs_new_client {
             return Ok(());
         }
 
+        let token = generate_rtm_token(
+            AGORA_APP_ID,
+            &self.rtm_certificate,
+            AGORA_RTM_ACCOUNT,
+            AGORA_RTM_TOKEN_TTL_SECS,
+        );
+
         let config = RtmConfig {
-            app_id: self.rtm_app_id.clone(),
-            token: self.rtm_token.clone(),
-            channel: self.rtm_channel.clone(),
+            app_id: AGORA_APP_ID.to_string(),
+            token: token.clone(),
+            channel: AGORA_RTM_CHANNEL.to_string(),
             client_id: self.rtm_client_id.clone(),
         };
 
-        match RtmClient::new(config) {
-            Ok(client) => {
-                self.rtm_client = Some(client);
-                self.status_message = Some("Connected to Astation signaling.".to_string());
-                Ok(())
-            }
-            Err(err) => {
-                self.status_message =
-                    Some(format!("Failed to connect to Astation signaling: {}", err));
-                Err(err)
-            }
+        let client = RtmClient::new(config).map_err(|err| {
+            self.status_message = Some(format!("Failed to connect to Astation signaling: {}", err));
+            err
+        })?;
+
+        if let Err(err) = client
+            .login_and_join(&token, AGORA_RTM_ACCOUNT, AGORA_RTM_CHANNEL)
+            .await
+        {
+            self.status_message = Some(format!("Failed to login/join signaling: {}", err));
+            return Err(err);
         }
+
+        let refresh_margin = if AGORA_RTM_TOKEN_TTL_SECS > 120 {
+            AGORA_RTM_TOKEN_TTL_SECS as u64 - 60
+        } else {
+            (AGORA_RTM_TOKEN_TTL_SECS as u64).saturating_sub(10)
+        };
+        self.rtm_token_expires_at = Some(Instant::now() + Duration::from_secs(refresh_margin));
+        self.rtm_client = Some(client);
+        self.status_message = Some("Connected to Astation signaling.".to_string());
+        Ok(())
     }
 
     async fn send_activity_ping(&mut self, focused: bool) -> Result<()> {
@@ -810,8 +830,7 @@ impl App {
                     self.last_activity_ping = Some(Instant::now());
                 }
                 Err(err) => {
-                    self.status_message =
-                        Some(format!("Failed to send activity ping: {}", err));
+                    self.status_message = Some(format!("Failed to send activity ping: {}", err));
                 }
             }
         }
@@ -876,8 +895,10 @@ impl App {
                 }
             }
             Err(err) => {
-                self.status_message =
-                    Some(format!("Failed to parse RTM message '{}' ({})", event.payload, err));
+                self.status_message = Some(format!(
+                    "Failed to parse RTM message '{}' ({})",
+                    event.payload, err
+                ));
             }
         }
     }
@@ -891,8 +912,10 @@ impl App {
                     return Err(err);
                 }
             } else {
-                self.status_message =
-                    Some(format!("Transcription received (switch to Codex): {}", text));
+                self.status_message = Some(format!(
+                    "Transcription received (switch to Codex): {}",
+                    text
+                ));
                 self.pending_transcriptions.push_front(text);
                 break;
             }
@@ -1313,9 +1336,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     let base_footer = match app.mode {
         AppMode::MainMenu => "↑↓/jk: Navigate | Enter: Select | c: Copy Mode | q: Quit",
         AppMode::CommandExecution => "Type command + Enter | b: Back | q: Quit",
-        AppMode::CodexChat => {
-            "Enter: Send | Ctrl+C: Exit Codex | u: Summary | b: Back | q: Quit"
-        }
+        AppMode::CodexChat => "Enter: Send | Ctrl+C: Exit Codex | u: Summary | b: Back | q: Quit",
         _ => "b: Back | q: Quit",
     };
 
