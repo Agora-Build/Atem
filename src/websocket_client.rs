@@ -274,3 +274,268 @@ impl AstationClient {
         self.send_message(message).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Serialization round-trip tests ---
+
+    #[test]
+    fn project_list_request_serializes() {
+        let msg = AstationMessage::ProjectListRequest;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"projectListRequest\""));
+    }
+
+    #[test]
+    fn project_list_request_roundtrip() {
+        let msg = AstationMessage::ProjectListRequest;
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, AstationMessage::ProjectListRequest));
+    }
+
+    #[test]
+    fn project_list_response_roundtrip() {
+        let msg = AstationMessage::ProjectListResponse {
+            projects: vec![AgoraProject {
+                id: "p1".into(),
+                name: "Test".into(),
+                description: "A test project".into(),
+                created_at: "2025-01-01".into(),
+                status: "active".into(),
+            }],
+            timestamp: "12345".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::ProjectListResponse {
+            projects,
+            timestamp,
+        } = parsed
+        {
+            assert_eq!(projects.len(), 1);
+            assert_eq!(projects[0].id, "p1");
+            assert_eq!(projects[0].name, "Test");
+            assert_eq!(timestamp, "12345");
+        } else {
+            panic!("expected ProjectListResponse");
+        }
+    }
+
+    #[test]
+    fn token_request_serializes_without_project_id() {
+        let msg = AstationMessage::TokenRequest {
+            channel: "ch1".into(),
+            uid: "u1".into(),
+            project_id: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("project_id"));
+    }
+
+    #[test]
+    fn token_request_serializes_with_project_id() {
+        let msg = AstationMessage::TokenRequest {
+            channel: "ch1".into(),
+            uid: "u1".into(),
+            project_id: Some("proj_1".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("proj_1"));
+    }
+
+    #[test]
+    fn token_response_roundtrip() {
+        let msg = AstationMessage::TokenResponse {
+            token: "abc123".into(),
+            channel: "ch1".into(),
+            uid: "u1".into(),
+            expires_in: "3600".into(),
+            timestamp: "99999".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::TokenResponse { token, channel, .. } = parsed {
+            assert_eq!(token, "abc123");
+            assert_eq!(channel, "ch1");
+        } else {
+            panic!("expected TokenResponse");
+        }
+    }
+
+    #[test]
+    fn claude_launch_request_roundtrip() {
+        let msg = AstationMessage::ClaudeLaunchRequest {
+            context: Some("fix the bug".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::ClaudeLaunchRequest { context } = parsed {
+            assert_eq!(context, Some("fix the bug".into()));
+        } else {
+            panic!("expected ClaudeLaunchRequest");
+        }
+    }
+
+    #[test]
+    fn claude_launch_request_none_context() {
+        let msg = AstationMessage::ClaudeLaunchRequest { context: None };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::ClaudeLaunchRequest { context } = parsed {
+            assert!(context.is_none());
+        } else {
+            panic!("expected ClaudeLaunchRequest");
+        }
+    }
+
+    #[test]
+    fn command_response_roundtrip() {
+        let msg = AstationMessage::CommandResponse {
+            output: "hello world".into(),
+            success: true,
+            timestamp: "1000".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::CommandResponse {
+            output, success, ..
+        } = parsed
+        {
+            assert_eq!(output, "hello world");
+            assert!(success);
+        } else {
+            panic!("expected CommandResponse");
+        }
+    }
+
+    #[test]
+    fn heartbeat_roundtrip() {
+        let msg = AstationMessage::Heartbeat {
+            timestamp: "555".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::Heartbeat { timestamp } = parsed {
+            assert_eq!(timestamp, "555");
+        } else {
+            panic!("expected Heartbeat");
+        }
+    }
+
+    #[test]
+    fn pong_roundtrip() {
+        let msg = AstationMessage::Pong {
+            timestamp: "666".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, AstationMessage::Pong { .. }));
+    }
+
+    #[test]
+    fn system_status_response_roundtrip() {
+        let msg = AstationMessage::SystemStatusResponse {
+            status: SystemStatus {
+                connected_clients: 2,
+                claude_running: true,
+                uptime_seconds: 3600,
+                projects: 5,
+            },
+            timestamp: "7777".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::SystemStatusResponse { status, .. } = parsed {
+            assert_eq!(status.connected_clients, 2);
+            assert!(status.claude_running);
+            assert_eq!(status.uptime_seconds, 3600);
+            assert_eq!(status.projects, 5);
+        } else {
+            panic!("expected SystemStatusResponse");
+        }
+    }
+
+    #[test]
+    fn codex_task_request_without_context() {
+        let msg = AstationMessage::CodexTaskRequest {
+            prompt: "write a test".into(),
+            context: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("context"));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::CodexTaskRequest { prompt, context } = parsed {
+            assert_eq!(prompt, "write a test");
+            assert!(context.is_none());
+        } else {
+            panic!("expected CodexTaskRequest");
+        }
+    }
+
+    #[test]
+    fn status_update_roundtrip() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("client_type".to_string(), "Atem".to_string());
+        let msg = AstationMessage::StatusUpdate {
+            status: "connected".into(),
+            data,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::StatusUpdate { status, data } = parsed {
+            assert_eq!(status, "connected");
+            assert_eq!(data.get("client_type").unwrap(), "Atem");
+        } else {
+            panic!("expected StatusUpdate");
+        }
+    }
+
+    // --- AstationClient unit tests ---
+
+    #[test]
+    fn new_client_is_not_connected() {
+        let client = AstationClient::new();
+        assert!(client.sender.is_none());
+        assert!(client.receiver.is_none());
+    }
+
+    // --- Deserialization from raw JSON ---
+
+    #[test]
+    fn deserialize_project_list_request_from_json() {
+        let json = r#"{"type":"projectListRequest"}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, AstationMessage::ProjectListRequest));
+    }
+
+    #[test]
+    fn deserialize_token_response_from_json() {
+        let json = r#"{
+            "type": "tokenResponse",
+            "data": {
+                "token": "tok_abc",
+                "channel": "ch",
+                "uid": "42",
+                "expires_in": "7200",
+                "timestamp": "100"
+            }
+        }"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::TokenResponse { token, uid, .. } = msg {
+            assert_eq!(token, "tok_abc");
+            assert_eq!(uid, "42");
+        } else {
+            panic!("expected TokenResponse");
+        }
+    }
+
+    #[test]
+    fn invalid_type_fails_deserialization() {
+        let json = r#"{"type":"unknownMessageType","data":{}}"#;
+        let result = serde_json::from_str::<AstationMessage>(json);
+        assert!(result.is_err());
+    }
+}

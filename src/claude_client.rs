@@ -7,22 +7,22 @@ use std::{
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 #[derive(Clone)]
-pub struct CodexResizeHandle {
+pub struct ClaudeResizeHandle {
     inner: Arc<Mutex<Box<dyn MasterPty + Send>>>,
 }
 
-impl std::fmt::Debug for CodexResizeHandle {
+impl std::fmt::Debug for ClaudeResizeHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CodexResizeHandle { .. }")
+        f.write_str("ClaudeResizeHandle { .. }")
     }
 }
 
-impl CodexResizeHandle {
+impl ClaudeResizeHandle {
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         let guard = self
             .inner
             .lock()
-            .map_err(|_| anyhow!("Codex PTY is unavailable (resize lock poisoned)"))?;
+            .map_err(|_| anyhow!("Claude PTY is unavailable (resize lock poisoned)"))?;
         guard
             .resize(PtySize {
                 rows,
@@ -30,34 +30,34 @@ impl CodexResizeHandle {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|err| anyhow!("Failed to resize Codex PTY: {}", err))
+            .map_err(|err| anyhow!("Failed to resize Claude PTY: {}", err))
     }
 }
 
 #[derive(Debug)]
-pub struct CodexSession {
+pub struct ClaudeSession {
     pub sender: UnboundedSender<String>,
     pub receiver: UnboundedReceiver<String>,
-    pub resize_handle: CodexResizeHandle,
+    pub resize_handle: ClaudeResizeHandle,
 }
 
 #[derive(Clone, Debug)]
-pub struct CodexClient {
+pub struct ClaudeClient {
     binary: String,
     extra_args: Vec<String>,
 }
 
-impl CodexClient {
+impl ClaudeClient {
     pub fn new() -> Self {
-        let binary = std::env::var("CODEX_CLI_BIN").unwrap_or_else(|_| "codex".to_string());
-        let extra_args = std::env::var("CODEX_CLI_ARGS")
+        let binary = std::env::var("CLAUDE_CLI_BIN").unwrap_or_else(|_| "claude".to_string());
+        let extra_args = std::env::var("CLAUDE_CLI_ARGS")
             .map(|raw| raw.split_whitespace().map(|s| s.to_string()).collect())
             .unwrap_or_default();
 
         Self { binary, extra_args }
     }
 
-    pub async fn start_session(&self) -> Result<CodexSession> {
+    pub async fn start_session(&self) -> Result<ClaudeSession> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -75,7 +75,7 @@ impl CodexClient {
                 .map_err(|err| anyhow!("Failed to read current dir: {}", err))?,
         );
 
-        // Preserve current environment so Codex inherits auth/config.
+        // Preserve current environment so Claude inherits auth/config.
         cmd.env_clear();
         for (key, value) in std::env::vars() {
             cmd.env(&key, &value);
@@ -88,14 +88,14 @@ impl CodexClient {
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|err| anyhow!("Failed to spawn Codex CLI: {}", err))?;
+            .map_err(|err| anyhow!("Failed to spawn Claude CLI: {}", err))?;
 
         let master = Arc::new(Mutex::new(pair.master));
 
         let mut reader = {
             let guard = master
                 .lock()
-                .map_err(|_| anyhow!("Codex PTY is unavailable (reader lock poisoned)"))?;
+                .map_err(|_| anyhow!("Claude PTY is unavailable (reader lock poisoned)"))?;
             guard
                 .try_clone_reader()
                 .map_err(|err| anyhow!("Failed to clone PTY reader: {}", err))?
@@ -104,7 +104,7 @@ impl CodexClient {
         let writer = {
             let guard = master
                 .lock()
-                .map_err(|_| anyhow!("Codex PTY is unavailable (writer lock poisoned)"))?;
+                .map_err(|_| anyhow!("Claude PTY is unavailable (writer lock poisoned)"))?;
             guard
                 .take_writer()
                 .map_err(|err| anyhow!("Failed to acquire PTY writer: {}", err))?
@@ -126,10 +126,7 @@ impl CodexClient {
                     writer_for_task
                         .lock()
                         .map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "Codex writer lock poisoned",
-                            )
+                            std::io::Error::other("Claude writer lock poisoned")
                         })
                         .and_then(|mut guard| {
                             guard.write_all(message_to_write.as_bytes())?;
@@ -141,12 +138,12 @@ impl CodexClient {
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
-                        let msg = format!("⚠️ Failed to send input to Codex CLI: {}", err);
+                        let msg = format!("⚠️ Failed to send input to Claude CLI: {}", err);
                         let _ = output_tx_for_writer.send(msg);
                         break;
                     }
                     Err(join_err) => {
-                        let msg = format!("⚠️ Failed to schedule Codex write task: {}", join_err);
+                        let msg = format!("⚠️ Failed to schedule Claude write task: {}", join_err);
                         let _ = output_tx_for_writer.send(msg);
                         break;
                     }
@@ -169,7 +166,7 @@ impl CodexClient {
                         }
                         Err(err) => {
                             let _ = output_tx_clone
-                                .send(format!("⚠️ Failed to read from Codex CLI: {}", err));
+                                .send(format!("⚠️ Failed to read from Claude CLI: {}", err));
                             break;
                         }
                     }
@@ -182,18 +179,18 @@ impl CodexClient {
             move || match child.wait() {
                 Ok(status) => {
                     let _ =
-                        output_tx_clone.send(format!("Codex CLI exited with status {}", status));
+                        output_tx_clone.send(format!("Claude CLI exited with status {}", status));
                 }
                 Err(err) => {
-                    let _ = output_tx_clone.send(format!("Codex CLI wait error: {}", err));
+                    let _ = output_tx_clone.send(format!("Claude CLI wait error: {}", err));
                 }
             }
         });
 
-        Ok(CodexSession {
+        Ok(ClaudeSession {
             sender: input_tx,
             receiver: output_rx,
-            resize_handle: CodexResizeHandle {
+            resize_handle: ClaudeResizeHandle {
                 inner: Arc::clone(&master),
             },
         })
@@ -206,35 +203,40 @@ mod tests {
 
     #[test]
     fn client_struct_holds_binary_and_args() {
-        let client = CodexClient {
-            binary: "my-codex".to_string(),
-            extra_args: vec!["-n".to_string(), "hello".to_string()],
+        let client = ClaudeClient {
+            binary: "my-claude".to_string(),
+            extra_args: vec!["--flag1".to_string(), "--flag2".to_string()],
         };
-        assert_eq!(client.binary, "my-codex");
-        assert_eq!(client.extra_args, vec!["-n", "hello"]);
+        assert_eq!(client.binary, "my-claude");
+        assert_eq!(client.extra_args, vec!["--flag1", "--flag2"]);
     }
 
     #[test]
-    fn client_default_binary_is_codex() {
-        let client = CodexClient::new();
+    fn client_default_binary_is_claude() {
+        // Verify the fallback value when the env var is absent.
+        // We can't safely clear env in parallel tests, so just check
+        // that ClaudeClient::new() returns a non-empty binary field.
+        let client = ClaudeClient::new();
         assert!(!client.binary.is_empty());
     }
 
     #[tokio::test]
     async fn session_with_echo_produces_output() {
-        let client = CodexClient {
+        // Use 'echo' as a stand-in binary — it prints and exits immediately.
+        let client = ClaudeClient {
             binary: "echo".to_string(),
-            extra_args: vec!["hello from codex pty".to_string()],
+            extra_args: vec!["hello from pty".to_string()],
         };
         let mut session = client.start_session().await.unwrap();
 
+        // Collect output until the exit message appears.
         let mut combined = String::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
             match tokio::time::timeout_at(deadline, session.receiver.recv()).await {
                 Ok(Some(chunk)) => {
                     combined.push_str(&chunk);
-                    if combined.contains("Codex CLI exited") {
+                    if combined.contains("Claude CLI exited") {
                         break;
                     }
                 }
@@ -242,7 +244,7 @@ mod tests {
             }
         }
         assert!(
-            combined.contains("hello from codex pty"),
+            combined.contains("hello from pty"),
             "expected echo output in: {}",
             combined
         );
@@ -250,21 +252,24 @@ mod tests {
 
     #[tokio::test]
     async fn session_with_cat_receives_sent_input() {
-        let client = CodexClient {
+        // 'cat' echoes stdin back to stdout, so we can verify round-trip IO.
+        let client = ClaudeClient {
             binary: "cat".to_string(),
             extra_args: vec![],
         };
         let mut session = client.start_session().await.unwrap();
 
-        session.sender.send("codex_ping\n".to_string()).unwrap();
+        // Send a line to cat's stdin
+        session.sender.send("ping\n".to_string()).unwrap();
 
+        // Read output — should see "ping" echoed back
         let mut combined = String::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
             match tokio::time::timeout_at(deadline, session.receiver.recv()).await {
                 Ok(Some(chunk)) => {
                     combined.push_str(&chunk);
-                    if combined.contains("codex_ping") {
+                    if combined.contains("ping") {
                         break;
                     }
                 }
@@ -272,16 +277,16 @@ mod tests {
             }
         }
         assert!(
-            combined.contains("codex_ping"),
-            "expected 'codex_ping' in output: {}",
+            combined.contains("ping"),
+            "expected 'ping' in output: {}",
             combined
         );
     }
 
     #[tokio::test]
     async fn session_reports_exit_on_process_end() {
-        let client = CodexClient {
-            binary: "true".to_string(),
+        let client = ClaudeClient {
+            binary: "true".to_string(), // exits immediately with status 0
             extra_args: vec![],
         };
         let mut session = client.start_session().await.unwrap();
@@ -292,7 +297,7 @@ mod tests {
             match tokio::time::timeout_at(deadline, session.receiver.recv()).await {
                 Ok(Some(chunk)) => {
                     combined.push_str(&chunk);
-                    if combined.contains("Codex CLI exited") {
+                    if combined.contains("Claude CLI exited") {
                         break;
                     }
                 }
@@ -300,7 +305,7 @@ mod tests {
             }
         }
         assert!(
-            combined.contains("Codex CLI exited"),
+            combined.contains("Claude CLI exited"),
             "expected exit message in: {}",
             combined
         );
@@ -308,18 +313,19 @@ mod tests {
 
     #[tokio::test]
     async fn resize_handle_works() {
-        let client = CodexClient {
+        let client = ClaudeClient {
             binary: "cat".to_string(),
             extra_args: vec![],
         };
         let session = client.start_session().await.unwrap();
+        // Should not panic or error
         let result = session.resize_handle.resize(50, 100);
         assert!(result.is_ok(), "resize failed: {:?}", result.err());
     }
 
     #[tokio::test]
     async fn nonexistent_binary_fails() {
-        let client = CodexClient {
+        let client = ClaudeClient {
             binary: "/nonexistent/binary/xyz_12345".to_string(),
             extra_args: vec![],
         };
