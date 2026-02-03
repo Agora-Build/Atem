@@ -120,4 +120,25 @@ int atem_rtm_send_peer(
     return 0;
 }
 
+int atem_rtm_set_token(
+    AtemRtmClient* client,
+    const char* token) {
+    if (!client || !token) {
+        return -1;
+    }
+    client->token = token;
+    return 0;
+}
+
+int atem_rtm_subscribe_topic(
+    AtemRtmClient* client,
+    const char* channel,
+    const char* topic) {
+    if (!client || !client->logged_in || !channel || !topic) {
+        return -1;
+    }
+    // Stub: no-op for topic subscription
+    return 0;
+}
+
 } // extern "C"

@@ -49,6 +49,12 @@ unsafe extern "C" {
         target_client_id: *const c_char,
         payload: *const c_char,
     ) -> i32;
+    fn atem_rtm_set_token(client: *mut AtemRtmClient, token: *const c_char) -> i32;
+    fn atem_rtm_subscribe_topic(
+        client: *mut AtemRtmClient,
+        channel: *const c_char,
+        topic: *const c_char,
+    ) -> i32;
 }
 
 pub struct RtmEvent {
@@ -265,6 +271,32 @@ impl RtmClient {
             }
         }
         events
+    }
+
+    pub async fn set_token(&self, token: &str) -> Result<()> {
+        let token_c = CString::new(token)?;
+        let guard = self.inner.lock().await;
+        let rc = unsafe { atem_rtm_set_token(guard.handle, token_c.as_ptr()) };
+        if rc != 0 {
+            return Err(anyhow!("failed to set token (code {rc})"));
+        }
+        Ok(())
+    }
+
+    pub async fn subscribe_topic(&self, channel: &str, topic: &str) -> Result<()> {
+        let channel_c = CString::new(channel)?;
+        let topic_c = CString::new(topic)?;
+        let guard = self.inner.lock().await;
+        let rc =
+            unsafe { atem_rtm_subscribe_topic(guard.handle, channel_c.as_ptr(), topic_c.as_ptr()) };
+        if rc != 0 {
+            return Err(anyhow!(
+                "failed to subscribe topic {} on channel {} (code {rc})",
+                topic,
+                channel
+            ));
+        }
+        Ok(())
     }
 
     pub async fn disconnect(&self) {

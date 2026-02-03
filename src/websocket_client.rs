@@ -89,11 +89,23 @@ pub enum AstationMessage {
         timestamp: String,
     },
 
+    #[serde(rename = "volume_update")]
+    VolumeUpdate { level: f32 },
+
     #[serde(rename = "heartbeat")]
     Heartbeat { timestamp: String },
 
     #[serde(rename = "pong")]
     Pong { timestamp: String },
+
+    #[serde(rename = "voice_toggle")]
+    VoiceToggle { active: bool },
+
+    #[serde(rename = "video_toggle")]
+    VideoToggle { active: bool },
+
+    #[serde(rename = "atem_instance_list")]
+    AtemInstanceList { instances: Vec<AtemInstance> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +123,14 @@ pub struct SystemStatus {
     pub claude_running: bool,
     pub uptime_seconds: u64,
     pub projects: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtemInstance {
+    pub id: String,
+    pub hostname: String,
+    pub tag: String,
+    pub is_focused: bool,
 }
 
 pub struct AstationClient {
@@ -537,5 +557,156 @@ mod tests {
         let json = r#"{"type":"unknownMessageType","data":{}}"#;
         let result = serde_json::from_str::<AstationMessage>(json);
         assert!(result.is_err());
+    }
+
+    // --- VoiceToggle tests ---
+
+    #[test]
+    fn voice_toggle_roundtrip() {
+        let msg = AstationMessage::VoiceToggle { active: true };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"voice_toggle""#));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceToggle { active } = parsed {
+            assert!(active);
+        } else {
+            panic!("expected VoiceToggle");
+        }
+    }
+
+    #[test]
+    fn voice_toggle_false_roundtrip() {
+        let msg = AstationMessage::VoiceToggle { active: false };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceToggle { active } = parsed {
+            assert!(!active);
+        } else {
+            panic!("expected VoiceToggle");
+        }
+    }
+
+    #[test]
+    fn deserialize_voice_toggle_from_json() {
+        let json = r#"{"type":"voice_toggle","data":{"active":true}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VoiceToggle { active } = msg {
+            assert!(active);
+        } else {
+            panic!("expected VoiceToggle");
+        }
+    }
+
+    // --- VideoToggle tests ---
+
+    #[test]
+    fn video_toggle_roundtrip() {
+        let msg = AstationMessage::VideoToggle { active: true };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"video_toggle""#));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VideoToggle { active } = parsed {
+            assert!(active);
+        } else {
+            panic!("expected VideoToggle");
+        }
+    }
+
+    #[test]
+    fn video_toggle_false_roundtrip() {
+        let msg = AstationMessage::VideoToggle { active: false };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VideoToggle { active } = parsed {
+            assert!(!active);
+        } else {
+            panic!("expected VideoToggle");
+        }
+    }
+
+    #[test]
+    fn deserialize_video_toggle_from_json() {
+        let json = r#"{"type":"video_toggle","data":{"active":false}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VideoToggle { active } = msg {
+            assert!(!active);
+        } else {
+            panic!("expected VideoToggle");
+        }
+    }
+
+    // --- AtemInstanceList tests ---
+
+    #[test]
+    fn atem_instance_list_roundtrip() {
+        let msg = AstationMessage::AtemInstanceList {
+            instances: vec![
+                AtemInstance {
+                    id: "inst-1".into(),
+                    hostname: "dev-laptop".into(),
+                    tag: "primary".into(),
+                    is_focused: true,
+                },
+                AtemInstance {
+                    id: "inst-2".into(),
+                    hostname: "build-server".into(),
+                    tag: "ci".into(),
+                    is_focused: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AtemInstanceList { instances } = parsed {
+            assert_eq!(instances.len(), 2);
+            assert_eq!(instances[0].id, "inst-1");
+            assert_eq!(instances[0].hostname, "dev-laptop");
+            assert_eq!(instances[0].tag, "primary");
+            assert!(instances[0].is_focused);
+            assert_eq!(instances[1].id, "inst-2");
+            assert!(!instances[1].is_focused);
+        } else {
+            panic!("expected AtemInstanceList");
+        }
+    }
+
+    #[test]
+    fn atem_instance_list_empty_roundtrip() {
+        let msg = AstationMessage::AtemInstanceList {
+            instances: vec![],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AtemInstanceList { instances } = parsed {
+            assert!(instances.is_empty());
+        } else {
+            panic!("expected AtemInstanceList");
+        }
+    }
+
+    #[test]
+    fn deserialize_atem_instance_list_from_json() {
+        let json = "{\"type\": \"atem_instance_list\", \"data\": {\"instances\": [{\"id\": \"a1\", \"hostname\": \"host1\", \"tag\": \"dev\", \"is_focused\": true}]}}";
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::AtemInstanceList { instances } = msg {
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].id, "a1");
+        } else {
+            panic!("expected AtemInstanceList");
+        }
+    }
+
+    #[test]
+    fn atem_instance_struct_serializes() {
+        let inst = AtemInstance {
+            id: "test-id".into(),
+            hostname: "my-host".into(),
+            tag: "main".into(),
+            is_focused: false,
+        };
+        let json = serde_json::to_string(&inst).unwrap();
+        assert!(json.contains("test-id"));
+        assert!(json.contains("my-host"));
+        assert!(json.contains("false"));
     }
 }

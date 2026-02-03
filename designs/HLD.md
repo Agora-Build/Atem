@@ -31,6 +31,9 @@ Powerful AI based work-suite behind the curtain
 2. Interactive AI-powered Shell
 When invoked without arguments (atem), launches an AI-enhanced REPL environment.
 
+with Astation better, more powerful AI based work-suite behind the curtain
+generate an 8 digits code(this is from https://astation.agora.build), When I type this code in Astation, this Atem will connect to Astation.
+
 Accepts natural language input to interpret user intent.
 
 Automatically detects recognizable commands and prompts for confirmation before execution.
@@ -63,15 +66,75 @@ Innovation: Combines AI conversational interfaces with traditional CLI tools for
 Flexibility: Works both as a straightforward CLI and an interactive AI assistant shell.
 
 High-Level Architecture
-CLI Core: Built with Node.js using frameworks like commander or oclif for command parsing.
 
-AI Module: Integrates with large language models (e.g., OpenAI GPT APIs) for natural language understanding and response generation.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ATEM (Rust CLI/TUI)                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐│
+│  │   CLI Mode  │  │  TUI Mode   │  │  REPL Mode  │  │   Voice Pipeline    ││
+│  │   (clap)    │  │  (ratatui)  │  │ (rustyline) │  │   (RTM + Codex)     ││
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘│
+│         │                │                │                     │          │
+│         └────────────────┴────────────────┴─────────────────────┘          │
+│                                    │                                        │
+│  ┌─────────────────────────────────▼────────────────────────────────────┐  │
+│  │                        Command Dispatcher                             │  │
+│  │   • Token commands (RTC/RTM create, decode)                          │  │
+│  │   • Project management (list, use, show)                             │  │
+│  │   • Auth commands (login, logout)                                    │  │
+│  │   • Config display                                                   │  │
+│  └─────────────────────────────────┬────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌────────────┬────────────┬───────┴───────┬────────────┬────────────────┐ │
+│  │            │            │               │            │                │ │
+│  ▼            ▼            ▼               ▼            ▼                │ │
+│ ┌──────┐  ┌──────┐  ┌───────────┐  ┌────────────┐  ┌─────────────┐      │ │
+│ │Token │  │Config│  │ Agora API │  │ WebSocket  │  │ RTM Client  │      │ │
+│ │ Gen  │  │Mgmt  │  │  Client   │  │  Client    │  │   (FFI)     │      │ │
+│ └──────┘  └──────┘  └───────────┘  └────────────┘  └─────────────┘      │ │
+│                                          │               │               │ │
+│                                          │               │               │ │
+│  ┌───────────────────────────────────────┼───────────────┼─────────────┐ │ │
+│  │                            Native FFI │Layer          │             │ │ │
+│  │                                       ▼               ▼             │ │ │
+│  │                               ┌─────────────────────────────┐       │ │ │
+│  │                               │   Agora RTM SDK (C++17)     │       │ │ │
+│  │                               └─────────────────────────────┘       │ │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │ │
+│                                                                           │ │
+│  ┌───────────────────────────────────────────────────────────────────────┘ │
+│  │                                                                         │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                     │
+│  │  │   Codex    │  │   Claude    │  │  AI Client  │                      │
+│  │  │  (PTY)     │  │   (PTY)     │  │ (HTTP API)  │                      │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘                     │
+│  │                                                                         │
+└──┴─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ WebSocket / RTM
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         ASTATION (macOS Menu Bar App)                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐│
+│  │ Mic Capture │  │  WebRTC VAD │  │  ConvoAI    │  │  RTM/RTC Engine     ││
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-REPL Shell: Custom Node.js REPL environment enhanced with AI prompt handling and command confirmation workflows.
+**Technology Stack (Implemented)**:
 
-Command Parser: Hybrid parser using known commands and fuzzy matching to detect intents.
-
-Execution Engine: Safely executes confirmed commands, supports output explanations and iterative improvements.
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| CLI/TUI | Rust + clap + ratatui + crossterm | Command parsing, terminal UI |
+| Async Runtime | Tokio | Async I/O, channels, task spawning |
+| Networking | reqwest + tokio-tungstenite | HTTP API calls, WebSocket |
+| Terminal Emulation | portable-pty + vt100 + vte | Codex/Claude subprocess management |
+| Cryptography | hmac + sha2 + base64 | AccessToken2 generation |
+| Native FFI | libc + C++17 | Agora RTM SDK integration |
+| Configuration | toml + dirs | Config file management |
+| Line Editing | rustyline | REPL with history |
 
 Future Considerations
 Add plugin architecture for community extensions.

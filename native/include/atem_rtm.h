@@ -48,6 +48,15 @@ int atem_rtm_send_peer(
     const char* target_client_id,
     const char* payload);
 
+int atem_rtm_set_token(
+    AtemRtmClient* client,
+    const char* token);
+
+int atem_rtm_subscribe_topic(
+    AtemRtmClient* client,
+    const char* channel,
+    const char* topic);
+
 #ifdef __cplusplus
 }
 #endif
