@@ -8,7 +8,7 @@ use crossterm::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io,
     path::PathBuf,
@@ -24,6 +24,8 @@ use vt100::Parser as VtParser;
 use crate::agora_api::{AgoraApiProject, fetch_agora_projects, format_projects};
 use crate::claude_client::{ClaudeClient, ClaudeResizeHandle};
 use crate::codex_client::{CodexClient, CodexResizeHandle};
+use crate::command::StreamBuffer;
+use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
 use crate::rtm_client::{RtmClient, RtmConfig, RtmEvent};
 use crate::token::generate_rtm_token;
@@ -101,10 +103,9 @@ pub struct App {
     pub peer_atems: Vec<crate::websocket_client::AtemInstance>,
     pub voice_fx_tick: u64,
     pub config: AtemConfig,
-    pub mark_task_queue: VecDeque<String>,
-    pub mark_task_active: Option<String>,
-    pub mark_task_needs_finalize: bool,
-    pub voice_command_buffer: String,
+    pub dispatcher: TaskDispatcher,
+    pub work_items: HashMap<String, WorkItem>,
+    pub voice_commands: StreamBuffer,
 }
 
 impl App {
@@ -171,10 +172,9 @@ impl App {
             peer_atems: Vec::new(),
             voice_fx_tick: 0,
             config,
-            mark_task_queue: VecDeque::new(),
-            mark_task_active: None,
-            mark_task_needs_finalize: false,
-            voice_command_buffer: String::new(),
+            dispatcher: TaskDispatcher::new(),
+            work_items: HashMap::new(),
+            voice_commands: StreamBuffer::new(&["execute", "run it", "do it", "go ahead", "send it"]),
         }
     }
 
@@ -1278,9 +1278,7 @@ impl App {
         }
 
         // If there's an active mark task, flag it for async finalization
-        if self.mark_task_active.is_some() {
-            self.mark_task_needs_finalize = true;
-        }
+        self.dispatcher.set_main_needs_finalize();
 
         let had_activity_before_finalize = !self.claude_raw_log.trim().is_empty();
 
@@ -1521,10 +1519,23 @@ impl App {
             AstationMessage::VoiceCommand { text, is_final } => {
                 self.handle_voice_command(&text, is_final).await;
             }
-            AstationMessage::MarkTaskAssignment { task_id } => {
+            AstationMessage::MarkTaskAssignment { task_id, received_at_ms } => {
                 println!("\u{1f4cc} Mark task assignment received: {}", task_id);
-                self.mark_task_queue.push_back(task_id);
-                self.process_next_mark_task().await;
+                match self.load_and_build_work_item(&task_id, received_at_ms) {
+                    Ok(item) => {
+                        let main_busy = self.dispatcher.main_is_active();
+                        self.work_items.insert(task_id.clone(), item.clone());
+                        self.dispatcher.submit(item, main_busy);
+                        self.try_dispatch_main().await;
+                    }
+                    Err(err) => {
+                        eprintln!("\u{274c} Failed to load mark task {}: {}", task_id, err);
+                        let _ = self
+                            .astation_client
+                            .send_mark_result(&task_id, false, &format!("Failed to load task: {}", err))
+                            .await;
+                    }
+                }
             }
             _ => {
                 println!("\u{1f4e8} Received message from Astation: {:?}", message);
@@ -1534,92 +1545,86 @@ impl App {
 
     // MARK: - Mark Task Processing
 
-    pub async fn process_next_mark_task(&mut self) {
-        // If a task is already running, wait for it to finish
-        if self.mark_task_active.is_some() {
+    /// Load task JSON from disk and build a WorkItem with the assembled prompt.
+    pub fn load_and_build_work_item(&self, task_id: &str, received_at_ms: u64) -> Result<WorkItem> {
+        let task_path = PathBuf::from(".chisel/tasks").join(format!("{}.json", task_id));
+        let task_json = fs::read_to_string(&task_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read task file: {}", e))?;
+        let task: Value = serde_json::from_str(&task_json)
+            .map_err(|e| anyhow::anyhow!("Failed to parse task JSON: {}", e))?;
+        let prompt = self.build_mark_task_prompt(&task);
+        Ok(WorkItem {
+            task_id: task_id.to_string(),
+            received_at_ms,
+            kind: WorkKind::MarkTask,
+            prompt,
+        })
+    }
+
+    /// Pop the next task from the dispatcher's main queue and send it to the Claude PTY.
+    pub async fn try_dispatch_main(&mut self) {
+        if self.dispatcher.main_is_active() {
             return;
         }
 
-        // Loop to skip tasks that fail to load, without recursion
-        loop {
-            let task_id = match self.mark_task_queue.pop_front() {
-                Some(id) => id,
-                None => return,
-            };
+        let task_id = match self.dispatcher.next_for_main() {
+            Some(id) => id,
+            None => return,
+        };
 
-            // Read task JSON from local filesystem
-            let task_path = PathBuf::from(".chisel/tasks").join(format!("{}.json", task_id));
-            let task_json = match fs::read_to_string(&task_path) {
-                Ok(content) => content,
-                Err(err) => {
-                    eprintln!("\u{274c} Failed to read mark task {}: {}", task_id, err);
-                    let _ = self
-                        .astation_client
-                        .send_mark_result(&task_id, false, &format!("Failed to read task file: {}", err))
-                        .await;
-                    continue; // Try next task
-                }
-            };
-
-            let task: Value = match serde_json::from_str(&task_json) {
-                Ok(v) => v,
-                Err(err) => {
-                    eprintln!("\u{274c} Failed to parse mark task {}: {}", task_id, err);
-                    let _ = self
-                        .astation_client
-                        .send_mark_result(&task_id, false, &format!("Failed to parse task JSON: {}", err))
-                        .await;
-                    continue; // Try next task
-                }
-            };
-
-            // Build prompt from task data
-            let prompt = self.build_mark_task_prompt(&task);
-
-            // Ensure Claude session and send the prompt
-            self.mode = AppMode::ClaudeChat;
-            self.input_text.clear();
-            self.claude_waiting_exit = false;
-            if self.claude_output_log.is_empty() {
-                self.claude_output_log = "\u{1f916} Claude Code CLI Session (Mark Task)\n\n".to_string();
+        let item = match self.work_items.get(&task_id) {
+            Some(item) => item.clone(),
+            None => {
+                eprintln!("\u{274c} Work item not found for task {}", task_id);
+                self.dispatcher.complete_main();
+                return;
             }
+        };
 
-            match self.ensure_claude_session().await {
-                Ok(new_session_started) => {
-                    if new_session_started {
-                        self.record_claude_output("\u{1f50c} Claude Code CLI session started for mark task.\n");
-                    }
-                }
-                Err(err) => {
-                    eprintln!("\u{274c} Failed to start Claude session for task {}: {}", task_id, err);
-                    let _ = self
-                        .astation_client
-                        .send_mark_result(&task_id, false, &format!("Failed to start Claude: {}", err))
-                        .await;
-                    continue; // Try next task
-                }
-            }
-
-            self.mark_task_active = Some(task_id.clone());
-
-            // Send prompt to Claude via PTY
-            self.record_claude_output(format!("> [Mark Task {}]\n", task_id));
-            self.claude_user_actions.push(format!("[Mark Task {}]", task_id));
-
-            if self.claude_sender.is_some() {
-                self.send_claude_data(&prompt);
-                if self.claude_sender.is_some() {
-                    self.send_claude_data("\n");
-                }
-                if self.claude_sender.is_some() {
-                    self.send_claude_data("\r");
-                }
-            }
-
-            self.refresh_claude_view();
-            println!("\u{1f4cc} Mark task {} sent to Claude", task_id);
-            break; // Task dispatched, exit loop
+        // Ensure Claude session and send the prompt
+        self.mode = AppMode::ClaudeChat;
+        self.input_text.clear();
+        self.claude_waiting_exit = false;
+        if self.claude_output_log.is_empty() {
+            self.claude_output_log = "\u{1f916} Claude Code CLI Session (Mark Task)\n\n".to_string();
         }
+
+        match self.ensure_claude_session().await {
+            Ok(new_session_started) => {
+                if new_session_started {
+                    self.record_claude_output("\u{1f50c} Claude Code CLI session started for mark task.\n");
+                }
+            }
+            Err(err) => {
+                eprintln!("\u{274c} Failed to start Claude session for task {}: {}", task_id, err);
+                let _ = self
+                    .astation_client
+                    .send_mark_result(&task_id, false, &format!("Failed to start Claude: {}", err))
+                    .await;
+                self.dispatcher.complete_main();
+                self.work_items.remove(&task_id);
+                // Try next task
+                Box::pin(self.try_dispatch_main()).await;
+                return;
+            }
+        }
+
+        // Send prompt to Claude via PTY
+        self.record_claude_output(format!("> [Mark Task {}]\n", task_id));
+        self.claude_user_actions.push(format!("[Mark Task {}]", task_id));
+
+        if self.claude_sender.is_some() {
+            self.send_claude_data(&item.prompt);
+            if self.claude_sender.is_some() {
+                self.send_claude_data("\n");
+            }
+            if self.claude_sender.is_some() {
+                self.send_claude_data("\r");
+            }
+        }
+
+        self.refresh_claude_view();
+        println!("\u{1f4cc} Mark task {} sent to Claude", task_id);
     }
 
     fn build_mark_task_prompt(&self, task: &Value) -> String {
@@ -1682,17 +1687,9 @@ impl App {
         prompt
     }
 
-    /// Check if a mark task needs async finalization (called from main loop).
-    pub async fn check_mark_task_finalize(&mut self) {
-        if self.mark_task_needs_finalize {
-            self.mark_task_needs_finalize = false;
-            self.finalize_mark_task(true).await;
-        }
-    }
-
-    /// Called when a Claude session ends to report mark task result and process next queued task.
+    /// Called when a Claude session ends to report mark task result and dispatch next queued task.
     pub async fn finalize_mark_task(&mut self, success: bool) {
-        if let Some(task_id) = self.mark_task_active.take() {
+        if let Some(task_id) = self.dispatcher.complete_main() {
             let message = if success {
                 "Task completed by Claude"
             } else {
@@ -1702,38 +1699,26 @@ impl App {
                 .astation_client
                 .send_mark_result(&task_id, success, message)
                 .await;
+            self.work_items.remove(&task_id);
             println!("\u{1f4cc} Mark task {} result sent: success={}", task_id, success);
 
-            // Process next queued task
-            self.process_next_mark_task().await;
+            // Dispatch next queued task
+            self.try_dispatch_main().await;
         }
     }
 
     // MARK: - Voice Command Processing
 
-    /// Trigger phrases that signal end of a voice command.
-    const VOICE_TRIGGERS: &'static [&'static str] = &[
-        "execute",
-        "run it",
-        "do it",
-        "go ahead",
-        "send it",
-    ];
-
     /// Handle an incoming voice command chunk from Astation.
     /// Buffers text until a trigger word is detected (or is_final is set),
     /// then sends the accumulated text to Claude Code via PTY.
     pub async fn handle_voice_command(&mut self, text: &str, is_final: bool) {
-        if !self.voice_command_buffer.is_empty() {
-            self.voice_command_buffer.push(' ');
-        }
-        self.voice_command_buffer.push_str(text);
+        self.voice_commands.push(text);
 
-        let should_send = is_final || self.detect_voice_trigger();
+        let should_send = is_final || self.voice_commands.detect_trigger();
 
-        if should_send && !self.voice_command_buffer.trim().is_empty() {
-            let command = self.voice_command_buffer.trim().to_string();
-            self.voice_command_buffer.clear();
+        if should_send && self.voice_commands.has_content() {
+            let command = self.voice_commands.take();
 
             println!("\u{1f3a4} Voice command: {}", command);
             self.status_message = Some(format!("Voice: {}", command));
@@ -1744,26 +1729,6 @@ impl App {
                     Some(format!("Failed to send voice command to Claude: {}", err));
             }
         }
-    }
-
-    /// Check if the buffer ends with a trigger phrase. If found, strip it and return true.
-    fn detect_voice_trigger(&mut self) -> bool {
-        let lower = self.voice_command_buffer.to_lowercase();
-        for trigger in Self::VOICE_TRIGGERS {
-            if lower.trim().ends_with(trigger) {
-                // Strip the trigger phrase from the buffer
-                let buf_len = self.voice_command_buffer.trim_end().len();
-                let trigger_len = trigger.len();
-                if buf_len >= trigger_len {
-                    self.voice_command_buffer.truncate(buf_len - trigger_len);
-                    // Also trim trailing whitespace left behind
-                    let trimmed = self.voice_command_buffer.trim_end().to_string();
-                    self.voice_command_buffer = trimmed;
-                }
-                return true;
-            }
-        }
-        false
     }
 
     pub async fn process_astation_messages(&mut self) {

@@ -1,6 +1,8 @@
 mod agora_api;
 mod ai_client;
 mod app;
+mod command;
+mod dispatch;
 mod auth;
 mod claude_client;
 mod cli;

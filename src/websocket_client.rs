@@ -119,6 +119,8 @@ pub enum AstationMessage {
     MarkTaskAssignment {
         #[serde(rename = "taskId")]
         task_id: String,
+        #[serde(default, rename = "receivedAtMs")]
+        received_at_ms: u64,
     },
 
     #[serde(rename = "markTaskResult")]
@@ -810,10 +812,24 @@ mod tests {
 
     #[test]
     fn test_mark_task_assignment_deserialize() {
-        let json = r#"{"type":"markTaskAssignment","data":{"taskId":"mark_123_abc"}}"#;
+        let json = r#"{"type":"markTaskAssignment","data":{"taskId":"mark_123_abc","receivedAtMs":1700000000000}}"#;
         let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::MarkTaskAssignment { task_id } = msg {
+        if let AstationMessage::MarkTaskAssignment { task_id, received_at_ms } = msg {
             assert_eq!(task_id, "mark_123_abc");
+            assert_eq!(received_at_ms, 1700000000000);
+        } else {
+            panic!("expected MarkTaskAssignment");
+        }
+    }
+
+    #[test]
+    fn test_mark_task_assignment_backward_compat() {
+        // Old Astation without receivedAtMs — should default to 0
+        let json = r#"{"type":"markTaskAssignment","data":{"taskId":"mark_old"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::MarkTaskAssignment { task_id, received_at_ms } = msg {
+            assert_eq!(task_id, "mark_old");
+            assert_eq!(received_at_ms, 0);
         } else {
             panic!("expected MarkTaskAssignment");
         }

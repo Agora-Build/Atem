@@ -55,7 +55,22 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
         app.process_astation_messages().await;
         app.process_codex_output();
         app.process_claude_output();
-        app.check_mark_task_finalize().await;
+
+        // Dispatcher: drain triage verdicts and try to send next task to main
+        app.dispatcher.poll_triage_results();
+        app.try_dispatch_main().await;
+
+        // Dispatcher: collect completed background task results
+        for result in app.dispatcher.poll_background_results() {
+            let _ = app.astation_client
+                .send_mark_result(&result.task_id, result.success, &result.output).await;
+            app.work_items.remove(&result.task_id);
+        }
+
+        // Dispatcher: deferred finalize flag (set when Claude session ends mid-task)
+        if app.dispatcher.take_main_needs_finalize() {
+            app.finalize_mark_task(true).await;
+        }
         if let Err(err) = app.process_rtm_messages().await {
             app.status_message = Some(format!("RTM processing error: {}", err));
         }
