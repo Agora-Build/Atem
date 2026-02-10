@@ -28,7 +28,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: atem-darwin-aarch64
-          - os: macos-13
+          - os: macos-14
             target: x86_64-apple-darwin
             artifact: atem-darwin-x86_64
 
@@ -44,14 +44,22 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu perl make
 
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+          OPENSSL_STATIC: "1"
+          OPENSSL_NO_VENDOR: ""
+        run: |
+          # Use vendored OpenSSL for cross-compilation
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            cargo build --release --target ${{ matrix.target }} --features openssl-vendored
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Run tests
         if: matrix.target != 'aarch64-unknown-linux-gnu'
@@ -63,8 +71,12 @@ jobs:
           BINARY="target/${{ matrix.target }}/release/atem"
           ARCHIVE="atem-${VERSION}-${{ matrix.artifact }}.tar.gz"
 
-          # Strip binary (reduce size)
-          strip "$BINARY" 2>/dev/null || true
+          # Strip binary (reduce size) — use cross-strip for arm64 linux
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || true
+          else
+            strip "$BINARY" 2>/dev/null || true
+          fi
 
           # Create tarball with just the binary named "atem"
           tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" atem

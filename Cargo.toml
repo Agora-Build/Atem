@@ -27,9 +27,11 @@ sha2 = "0.10"
 rand = "0.8"
 rustyline = "14.0"
 hostname = "0.4"
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [features]
 real_rtm = []
+openssl-vendored = ["openssl"]
 
 [build-dependencies]
 cc = "1.0"
