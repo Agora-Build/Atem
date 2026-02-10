@@ -22,4 +22,8 @@
 .DS_Store
 
 codex_logs/
+claude_logs/
+.downloads/
 
+# Test scratch files
+test.*.py

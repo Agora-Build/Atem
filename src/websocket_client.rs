@@ -106,6 +106,20 @@ pub enum AstationMessage {
 
     #[serde(rename = "atem_instance_list")]
     AtemInstanceList { instances: Vec<AtemInstance> },
+
+    #[serde(rename = "markTaskAssignment")]
+    MarkTaskAssignment {
+        #[serde(rename = "taskId")]
+        task_id: String,
+    },
+
+    #[serde(rename = "markTaskResult")]
+    MarkTaskResult {
+        #[serde(rename = "taskId")]
+        task_id: String,
+        success: bool,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +294,20 @@ impl AstationClient {
 
     pub fn is_connected(&self) -> bool {
         self.sender.is_some() && self.receiver.is_some()
+    }
+
+    pub async fn send_mark_result(
+        &self,
+        task_id: &str,
+        success: bool,
+        message: &str,
+    ) -> Result<()> {
+        let msg = AstationMessage::MarkTaskResult {
+            task_id: task_id.to_string(),
+            success,
+            message: message.to_string(),
+        };
+        self.send_message(msg).await
     }
 
     pub async fn send_codex_task(
@@ -708,5 +736,55 @@ mod tests {
         assert!(json.contains("test-id"));
         assert!(json.contains("my-host"));
         assert!(json.contains("false"));
+    }
+
+    // --- MarkTaskAssignment / MarkTaskResult tests ---
+
+    #[test]
+    fn test_mark_task_assignment_deserialize() {
+        let json = r#"{"type":"markTaskAssignment","data":{"taskId":"mark_123_abc"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::MarkTaskAssignment { task_id } = msg {
+            assert_eq!(task_id, "mark_123_abc");
+        } else {
+            panic!("expected MarkTaskAssignment");
+        }
+    }
+
+    #[test]
+    fn test_mark_task_result_serialize() {
+        let msg = AstationMessage::MarkTaskResult {
+            task_id: "mark_456_def".into(),
+            success: true,
+            message: "All annotations addressed".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"markTaskResult""#));
+        assert!(json.contains(r#""taskId":"mark_456_def""#));
+        assert!(json.contains(r#""success":true"#));
+        assert!(json.contains("All annotations addressed"));
+    }
+
+    #[test]
+    fn test_mark_task_round_trip() {
+        let msg = AstationMessage::MarkTaskResult {
+            task_id: "mark_789_ghi".into(),
+            success: false,
+            message: "Failed to parse task".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::MarkTaskResult {
+            task_id,
+            success,
+            message,
+        } = parsed
+        {
+            assert_eq!(task_id, "mark_789_ghi");
+            assert!(!success);
+            assert_eq!(message, "Failed to parse task");
+        } else {
+            panic!("expected MarkTaskResult");
+        }
     }
 }

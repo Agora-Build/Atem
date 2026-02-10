@@ -101,6 +101,9 @@ pub struct App {
     pub peer_atems: Vec<crate::websocket_client::AtemInstance>,
     pub voice_fx_tick: u64,
     pub config: AtemConfig,
+    pub mark_task_queue: VecDeque<String>,
+    pub mark_task_active: Option<String>,
+    pub mark_task_needs_finalize: bool,
 }
 
 impl App {
@@ -167,6 +170,9 @@ impl App {
             peer_atems: Vec::new(),
             voice_fx_tick: 0,
             config,
+            mark_task_queue: VecDeque::new(),
+            mark_task_active: None,
+            mark_task_needs_finalize: false,
         }
     }
 
@@ -1269,6 +1275,11 @@ impl App {
             return;
         }
 
+        // If there's an active mark task, flag it for async finalization
+        if self.mark_task_active.is_some() {
+            self.mark_task_needs_finalize = true;
+        }
+
         let had_activity_before_finalize = !self.claude_raw_log.trim().is_empty();
 
         self.record_claude_output("\u{2699}\u{fe0f} Claude Code CLI session ended.\n");
@@ -1505,9 +1516,191 @@ impl App {
             AstationMessage::AtemInstanceList { instances } => {
                 self.peer_atems = instances;
             }
+            AstationMessage::MarkTaskAssignment { task_id } => {
+                println!("\u{1f4cc} Mark task assignment received: {}", task_id);
+                self.mark_task_queue.push_back(task_id);
+                self.process_next_mark_task().await;
+            }
             _ => {
                 println!("\u{1f4e8} Received message from Astation: {:?}", message);
             }
+        }
+    }
+
+    // MARK: - Mark Task Processing
+
+    pub async fn process_next_mark_task(&mut self) {
+        // If a task is already running, wait for it to finish
+        if self.mark_task_active.is_some() {
+            return;
+        }
+
+        // Loop to skip tasks that fail to load, without recursion
+        loop {
+            let task_id = match self.mark_task_queue.pop_front() {
+                Some(id) => id,
+                None => return,
+            };
+
+            // Read task JSON from local filesystem
+            let task_path = PathBuf::from(".chisel/tasks").join(format!("{}.json", task_id));
+            let task_json = match fs::read_to_string(&task_path) {
+                Ok(content) => content,
+                Err(err) => {
+                    eprintln!("\u{274c} Failed to read mark task {}: {}", task_id, err);
+                    let _ = self
+                        .astation_client
+                        .send_mark_result(&task_id, false, &format!("Failed to read task file: {}", err))
+                        .await;
+                    continue; // Try next task
+                }
+            };
+
+            let task: Value = match serde_json::from_str(&task_json) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("\u{274c} Failed to parse mark task {}: {}", task_id, err);
+                    let _ = self
+                        .astation_client
+                        .send_mark_result(&task_id, false, &format!("Failed to parse task JSON: {}", err))
+                        .await;
+                    continue; // Try next task
+                }
+            };
+
+            // Build prompt from task data
+            let prompt = self.build_mark_task_prompt(&task);
+
+            // Ensure Claude session and send the prompt
+            self.mode = AppMode::ClaudeChat;
+            self.input_text.clear();
+            self.claude_waiting_exit = false;
+            if self.claude_output_log.is_empty() {
+                self.claude_output_log = "\u{1f916} Claude Code CLI Session (Mark Task)\n\n".to_string();
+            }
+
+            match self.ensure_claude_session().await {
+                Ok(new_session_started) => {
+                    if new_session_started {
+                        self.record_claude_output("\u{1f50c} Claude Code CLI session started for mark task.\n");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("\u{274c} Failed to start Claude session for task {}: {}", task_id, err);
+                    let _ = self
+                        .astation_client
+                        .send_mark_result(&task_id, false, &format!("Failed to start Claude: {}", err))
+                        .await;
+                    continue; // Try next task
+                }
+            }
+
+            self.mark_task_active = Some(task_id.clone());
+
+            // Send prompt to Claude via PTY
+            self.record_claude_output(format!("> [Mark Task {}]\n", task_id));
+            self.claude_user_actions.push(format!("[Mark Task {}]", task_id));
+
+            if self.claude_sender.is_some() {
+                self.send_claude_data(&prompt);
+                if self.claude_sender.is_some() {
+                    self.send_claude_data("\n");
+                }
+                if self.claude_sender.is_some() {
+                    self.send_claude_data("\r");
+                }
+            }
+
+            self.refresh_claude_view();
+            println!("\u{1f4cc} Mark task {} sent to Claude", task_id);
+            break; // Task dispatched, exit loop
+        }
+    }
+
+    fn build_mark_task_prompt(&self, task: &Value) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str("You have a UI annotation task from Chisel Dev. ");
+        prompt.push_str("A user drew annotations on a screenshot of their web app and wants you to implement the changes.\n\n");
+
+        if let Some(url) = task.get("url").and_then(|v| v.as_str()) {
+            prompt.push_str(&format!("Page URL: {}\n", url));
+        }
+        if let Some(title) = task.get("title").and_then(|v| v.as_str()) {
+            prompt.push_str(&format!("Page title: {}\n", title));
+        }
+
+        // Screenshot path for vision
+        if let Some(screenshot) = task.get("screenshot").and_then(|v| v.as_str()) {
+            prompt.push_str(&format!("\nScreenshot (annotated): {}\n", screenshot));
+            prompt.push_str("Please look at this screenshot to understand the visual context.\n");
+        }
+
+        // Annotations
+        if let Some(annotations) = task.get("annotations").and_then(|v| v.as_array()) {
+            prompt.push_str(&format!("\nAnnotations ({}):\n", annotations.len()));
+            for (i, ann) in annotations.iter().enumerate() {
+                let tool = ann.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let text = ann.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let x = ann.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = ann.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                prompt.push_str(&format!(
+                    "  {}. [{}] at ({:.0}, {:.0})",
+                    i + 1,
+                    tool,
+                    x,
+                    y
+                ));
+                if !text.is_empty() {
+                    prompt.push_str(&format!(" — \"{}\"", text));
+                }
+                prompt.push('\n');
+            }
+        }
+
+        // Source files
+        if let Some(files) = task.get("sourceFiles").and_then(|v| v.as_array()) {
+            prompt.push_str(&format!("\nProject source files ({} files available):\n", files.len()));
+            for f in files.iter().take(20) {
+                if let Some(path) = f.as_str() {
+                    prompt.push_str(&format!("  - {}\n", path));
+                }
+            }
+            if files.len() > 20 {
+                prompt.push_str(&format!("  ... and {} more\n", files.len() - 20));
+            }
+        }
+
+        prompt.push_str("\nPlease implement the changes indicated by the annotations. ");
+        prompt.push_str("Focus on the visual changes the user has marked up.");
+
+        prompt
+    }
+
+    /// Check if a mark task needs async finalization (called from main loop).
+    pub async fn check_mark_task_finalize(&mut self) {
+        if self.mark_task_needs_finalize {
+            self.mark_task_needs_finalize = false;
+            self.finalize_mark_task(true).await;
+        }
+    }
+
+    /// Called when a Claude session ends to report mark task result and process next queued task.
+    pub async fn finalize_mark_task(&mut self, success: bool) {
+        if let Some(task_id) = self.mark_task_active.take() {
+            let message = if success {
+                "Task completed by Claude"
+            } else {
+                "Claude session ended before completing task"
+            };
+            let _ = self
+                .astation_client
+                .send_mark_result(&task_id, success, message)
+                .await;
+            println!("\u{1f4cc} Mark task {} result sent: success={}", task_id, success);
+
+            // Process next queued task
+            self.process_next_mark_task().await;
         }
     }
 

@@ -55,6 +55,7 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
         app.process_astation_messages().await;
         app.process_codex_output();
         app.process_claude_output();
+        app.check_mark_task_finalize().await;
         if let Err(err) = app.process_rtm_messages().await {
             app.status_message = Some(format!("RTM processing error: {}", err));
         }
