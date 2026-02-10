@@ -104,6 +104,7 @@ pub struct App {
     pub mark_task_queue: VecDeque<String>,
     pub mark_task_active: Option<String>,
     pub mark_task_needs_finalize: bool,
+    pub voice_command_buffer: String,
 }
 
 impl App {
@@ -173,6 +174,7 @@ impl App {
             mark_task_queue: VecDeque::new(),
             mark_task_active: None,
             mark_task_needs_finalize: false,
+            voice_command_buffer: String::new(),
         }
     }
 
@@ -1516,6 +1518,9 @@ impl App {
             AstationMessage::AtemInstanceList { instances } => {
                 self.peer_atems = instances;
             }
+            AstationMessage::VoiceCommand { text, is_final } => {
+                self.handle_voice_command(&text, is_final).await;
+            }
             AstationMessage::MarkTaskAssignment { task_id } => {
                 println!("\u{1f4cc} Mark task assignment received: {}", task_id);
                 self.mark_task_queue.push_back(task_id);
@@ -1702,6 +1707,63 @@ impl App {
             // Process next queued task
             self.process_next_mark_task().await;
         }
+    }
+
+    // MARK: - Voice Command Processing
+
+    /// Trigger phrases that signal end of a voice command.
+    const VOICE_TRIGGERS: &'static [&'static str] = &[
+        "execute",
+        "run it",
+        "do it",
+        "go ahead",
+        "send it",
+    ];
+
+    /// Handle an incoming voice command chunk from Astation.
+    /// Buffers text until a trigger word is detected (or is_final is set),
+    /// then sends the accumulated text to Claude Code via PTY.
+    pub async fn handle_voice_command(&mut self, text: &str, is_final: bool) {
+        if !self.voice_command_buffer.is_empty() {
+            self.voice_command_buffer.push(' ');
+        }
+        self.voice_command_buffer.push_str(text);
+
+        let should_send = is_final || self.detect_voice_trigger();
+
+        if should_send && !self.voice_command_buffer.trim().is_empty() {
+            let command = self.voice_command_buffer.trim().to_string();
+            self.voice_command_buffer.clear();
+
+            println!("\u{1f3a4} Voice command: {}", command);
+            self.status_message = Some(format!("Voice: {}", command));
+
+            // Send to Claude Code
+            if let Err(err) = self.send_claude_prompt(&command).await {
+                self.status_message =
+                    Some(format!("Failed to send voice command to Claude: {}", err));
+            }
+        }
+    }
+
+    /// Check if the buffer ends with a trigger phrase. If found, strip it and return true.
+    fn detect_voice_trigger(&mut self) -> bool {
+        let lower = self.voice_command_buffer.to_lowercase();
+        for trigger in Self::VOICE_TRIGGERS {
+            if lower.trim().ends_with(trigger) {
+                // Strip the trigger phrase from the buffer
+                let buf_len = self.voice_command_buffer.trim_end().len();
+                let trigger_len = trigger.len();
+                if buf_len >= trigger_len {
+                    self.voice_command_buffer.truncate(buf_len - trigger_len);
+                    // Also trim trailing whitespace left behind
+                    let trimmed = self.voice_command_buffer.trim_end().to_string();
+                    self.voice_command_buffer = trimmed;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn process_astation_messages(&mut self) {

@@ -107,6 +107,14 @@ pub enum AstationMessage {
     #[serde(rename = "atem_instance_list")]
     AtemInstanceList { instances: Vec<AtemInstance> },
 
+    #[serde(rename = "voiceCommand")]
+    VoiceCommand {
+        text: String,
+        /// true = final chunk (trigger word detected by sender), false = partial
+        #[serde(default)]
+        is_final: bool,
+    },
+
     #[serde(rename = "markTaskAssignment")]
     MarkTaskAssignment {
         #[serde(rename = "taskId")]
@@ -736,6 +744,66 @@ mod tests {
         assert!(json.contains("test-id"));
         assert!(json.contains("my-host"));
         assert!(json.contains("false"));
+    }
+
+    // --- VoiceCommand tests ---
+
+    #[test]
+    fn voice_command_roundtrip() {
+        let msg = AstationMessage::VoiceCommand {
+            text: "fix the login page".into(),
+            is_final: false,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"voiceCommand""#));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceCommand { text, is_final } = parsed {
+            assert_eq!(text, "fix the login page");
+            assert!(!is_final);
+        } else {
+            panic!("expected VoiceCommand");
+        }
+    }
+
+    #[test]
+    fn voice_command_final_roundtrip() {
+        let msg = AstationMessage::VoiceCommand {
+            text: "execute".into(),
+            is_final: true,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceCommand { text, is_final } = parsed {
+            assert_eq!(text, "execute");
+            assert!(is_final);
+        } else {
+            panic!("expected VoiceCommand");
+        }
+    }
+
+    #[test]
+    fn deserialize_voice_command_from_json() {
+        let json = r#"{"type":"voiceCommand","data":{"text":"add a button","is_final":false}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VoiceCommand { text, is_final } = msg {
+            assert_eq!(text, "add a button");
+            assert!(!is_final);
+        } else {
+            panic!("expected VoiceCommand");
+        }
+    }
+
+    #[test]
+    fn deserialize_voice_command_without_is_final() {
+        // is_final should default to false when missing
+        let json = r#"{"type":"voiceCommand","data":{"text":"hello world"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VoiceCommand { text, is_final } = msg {
+            assert_eq!(text, "hello world");
+            assert!(!is_final);
+        } else {
+            panic!("expected VoiceCommand");
+        }
     }
 
     // --- MarkTaskAssignment / MarkTaskResult tests ---
