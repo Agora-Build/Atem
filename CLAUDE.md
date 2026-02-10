@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Atem is an intelligent CLI tool for developers working with Agora.io real-time communication platforms. It provides a TUI (terminal user interface) with multiple modes: token generation, Claude chat, Codex terminal integration, and RTM signaling for voice-driven coding workflows.
+Atem is an AI development terminal for Agora.io platforms. It provides a TUI (terminal user interface) with multiple modes: Claude Code integration, token generation, mark task execution, and RTM signaling for voice-driven coding workflows.
+
+Distributed via npm: `npm install -g @agora-build/atem`
 
 ## Development Commands
 
@@ -13,7 +15,7 @@ cargo build                              # Debug build
 cargo build --release                    # Release build
 cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
-cargo test                               # Run tests
+cargo test                               # Run tests (124 tests)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
@@ -25,42 +27,86 @@ cargo clippy --all-targets --all-features  # Lint
 
 ```
 src/
-├── main.rs              # Entry point, CLI parsing (clap), TUI state machine, event loop
-├── token.rs             # RTM token generation
+├── main.rs              # Entry point, CLI parsing (clap)
+├── app.rs               # TUI state machine, mark task queue, Claude session management
+├── cli.rs               # CLI command definitions
+├── repl.rs              # Interactive REPL mode
+├── websocket_client.rs  # Astation WebSocket protocol (message types + client)
+├── claude_client.rs     # PTY-based Claude Code CLI integration
+├── codex_client.rs      # PTY-based Codex terminal integration
+├── token.rs             # Agora RTC/RTM token generation
 ├── rtm_client.rs        # Agora RTM FFI wrapper with async Tokio channels
-├── websocket_client.rs  # Astation WebSocket integration, message protocol
-└── codex_client.rs      # PTY-based Codex terminal integration
+├── ai_client.rs         # Anthropic API client for intent parsing
+├── agora_api.rs         # Agora REST API client (projects, credentials)
+├── auth.rs              # Auth session management, deep link flow
+├── config.rs            # TOML config + env var loading (AtemConfig)
+├── time_sync.rs         # HTTP Date-based time synchronization
+└── tui/
+    ├── mod.rs           # Main event loop, rendering dispatch
+    └── voice_fx.rs      # Voice activity visual effects
+native/
+├── include/atem_rtm.h   # C header for RTM client interface
+├── src/atem_rtm.cpp     # Stub RTM implementation (default)
+├── src/atem_rtm_real.cpp # Real RTM using Agora SDK (feature: real_rtm)
+npm/
+├── package.json         # @agora-build/atem npm wrapper
+├── install.js           # Postinstall binary downloader from GitHub releases
+└── bin/atem             # Placeholder (replaced by real binary on install)
+designs/
+├── HLD.md               # High-level design
+├── LLD.md               # Low-level design
+├── roadmap.md           # Project roadmap
+└── data-flow-between-atem-and-astation.md  # Voice coding architecture
 ```
 
 ### Core Components
 
-**TUI State Machine** (`main.rs`): Enum-based mode switching via `AppMode`:
+**TUI State Machine** (`app.rs`): Enum-based mode switching via `AppMode`:
 - `MainMenu` - Navigation between features
 - `TokenGeneration` - Token creation UI
-- `ClaudeChat` - Claude LLM integration
-- `CodexChat` - Codex terminal emulator
+- `ClaudeChat` - Claude Code CLI integration (PTY)
+- `CodexChat` - Codex terminal emulator (PTY)
 - `CommandExecution` - Shell command runner
 
-**RTM Signaling** (`rtm_client.rs`): FFI wrapper for native C RTM client with:
-- Connection lifecycle management (connect, login, join_channel)
-- Message publishing (channel and peer-to-peer)
-- Async event distribution via mpsc channels
-- Automatic token refresh tracking
+**Mark Task Queue** (`app.rs`): Receives task assignments from Astation, reads task JSON from local `.chisel/tasks/` directory, builds prompts from annotations + screenshots, sends to Claude Code, reports results back.
 
-**Astation Integration** (`websocket_client.rs`): WebSocket protocol for real-time communication with Astation (the voice collaboration backend). Handles project lists, token requests, Codex tasks, Claude interactions.
+Key fields:
+- `mark_task_queue: VecDeque<String>` - pending task IDs
+- `mark_task_active: Option<String>` - currently running task
+- `mark_task_needs_finalize: bool` - sync→async bridge flag
 
-**Codex Integration** (`codex_client.rs`): Manages Codex as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
+Key methods:
+- `process_next_mark_task()` - loop-based (no recursion), pops queue, reads JSON, spawns Claude
+- `build_mark_task_prompt()` - constructs prompt from task data
+- `finalize_mark_task()` - reports result to Astation, processes next
+- `check_mark_task_finalize()` - called from main loop for async finalization
+
+**Astation Integration** (`websocket_client.rs`): WebSocket protocol with `AstationMessage` enum:
+- `MarkTaskAssignment { task_id }` - received from Astation
+- `MarkTaskResult { task_id, success, message }` - sent back to Astation
+- Also: project lists, token requests, voice/video toggle, heartbeat, auth flow
+
+**Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
+
+**RTM Signaling** (`rtm_client.rs`): FFI wrapper for native C RTM client with async Tokio channels. Default build uses a stub; enable `real_rtm` feature for Agora SDK.
 
 ### Native FFI Layer
 
 ```
 native/
 ├── include/atem_rtm.h       # C header for RTM client interface
-├── src/atem_rtm.cpp         # Stub RTM implementation
-└── third_party/agora/rtm_linux/rtm/sdk/  # Agora RTM SDK binaries
+├── src/atem_rtm.cpp         # Stub RTM implementation (default)
+└── src/atem_rtm_real.cpp    # Real RTM (requires Agora SDK in native/third_party/)
 ```
 
-Build script (`build.rs`) compiles C++17 code via the `cc` crate and links against Agora RTM SDK.
+Build script (`build.rs`) compiles C++17 code via the `cc` crate. With `real_rtm` feature, links against Agora RTM SDK.
+
+### Feature Flags
+
+| Flag | Description |
+|------|-------------|
+| `real_rtm` | Link against Agora RTM SDK (default: stub implementation) |
+| `openssl-vendored` | Build OpenSSL from source (used in CI for cross-compilation) |
 
 ## Key Dependencies
 
@@ -71,18 +117,48 @@ Build script (`build.rs`) compiles C++17 code via the `cc` crate and links again
 | TUI | ratatui, crossterm | Terminal UI rendering |
 | Network | reqwest, tokio-tungstenite | HTTP, WebSocket |
 | PTY | portable-pty, vt100, vte | Terminal emulation |
-| FFI | libc | C interop for RTM |
+| FFI | libc, cc | C interop for RTM |
+| Config | toml, dirs | Configuration loading |
+| Crypto | hmac, sha2 | Token generation |
 
-## Voice-Driven Coding Flow
+## Mark Task Flow
 
-1. **Astation** captures mic audio, runs WebRTC VAD, streams via Agora RTC
-2. **ConvoAI** transcribes speech, pushes text over Agora RTM
-3. **Atem** receives transcription via RTM, routes to Codex for execution
+```
+Chisel (browser) ──POST──→ Express/Chisel middleware
+                            ↓ saves .chisel/tasks/{taskId}.json + .png
+                            ↓ WS markTaskNotify → Astation
+Astation hub ←── markTaskNotify {taskId, status, description}
+  ↓ picks best Atem instance
+  ↓ markTaskAssignment {taskId}
+Atem receives assignment (websocket_client.rs)
+  ↓ handle_astation_message() in app.rs
+  ↓ process_next_mark_task()
+  ↓ reads .chisel/tasks/{taskId}.json from LOCAL disk
+  ↓ build_mark_task_prompt() → annotations + screenshot + source files
+  ↓ ensure_claude_session() + send prompt via PTY
+  ↓ markTaskResult {taskId, success, message} → Astation
+```
 
-See `designs/data-flow-between-atem-and-astation.md` for full architecture.
+## Release Process
+
+Releases are triggered by pushing a git tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+GitHub Actions (`.github/workflows/release.yml`):
+1. Builds binaries for linux-x64, linux-arm64, darwin-x64, darwin-arm64
+2. Creates GitHub release with tarballed binaries
+3. Publishes `@agora-build/atem` to npm (version synced from tag)
+
+Requires `NPM_TOKEN` secret in GitHub repo settings.
 
 ## Integration Points
 
-- **Astation**: External voice/video collaboration backend (WebSocket + RTM)
-- **Codex CLI**: Spawned as PTY subprocess for AI-powered code execution
-- **Agora RTM SDK**: Native library for real-time messaging
+- **Astation**: macOS menubar hub for task routing (WebSocket)
+- **Chisel**: Dev panel that creates annotation tasks (`.chisel/tasks/`)
+- **Claude Code CLI**: Spawned as PTY subprocess for AI-powered code implementation
+- **Agora RTM SDK**: Native library for real-time messaging (voice coding)
+- **Agora REST API**: Project management, credential fetching
