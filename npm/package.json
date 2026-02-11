@@ -10,7 +10,8 @@
   },
   "files": [
     "bin/",
-    "install.js"
+    "install.js",
+    "README.md"
   ],
   "repository": {
     "type": "git",
