@@ -1423,7 +1423,7 @@ impl App {
                 Err(e) => {
                     println!("\u{26a0}\u{fe0f} Failed to connect via pairing: {}", e);
                     // Fall back to direct URL connection
-                    let url = self.config.astation_url().to_string();
+                    let url = self.config.astation_ws().to_string();
                     match self.astation_client.connect(&url).await {
                         Ok(_) => {
                             self.astation_connected = true;

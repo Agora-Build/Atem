@@ -10,8 +10,8 @@ pub struct AtemConfig {
     pub customer_secret: Option<String>,
     pub rtm_channel: Option<String>,
     pub rtm_account: Option<String>,
-    pub astation_url: Option<String>,
-    pub station_url: Option<String>,
+    pub astation_ws: Option<String>,
+    pub station_relay_url: Option<String>,
 }
 
 /// Active project state persisted to ~/.config/atem/active_project.json
@@ -49,11 +49,11 @@ impl AtemConfig {
         if let Ok(val) = std::env::var("ATEM_RTM_ACCOUNT") {
             config.rtm_account = Some(val);
         }
-        if let Ok(val) = std::env::var("ASTATION_URL") {
-            config.astation_url = Some(val);
+        if let Ok(val) = std::env::var("ASTATION_WS") {
+            config.astation_ws = Some(val);
         }
-        if let Ok(val) = std::env::var("AGORA_STATION_URL") {
-            config.station_url = Some(val);
+        if let Ok(val) = std::env::var("AGORA_STATION_RELAY_URL") {
+            config.station_relay_url = Some(val);
         }
 
         Ok(config)
@@ -94,12 +94,12 @@ impl AtemConfig {
             self.rtm_account.as_deref().unwrap_or("(not set)")
         ));
         lines.push(format!(
-            "astation_url: {}",
-            self.astation_url.as_deref().unwrap_or("(not set)")
+            "astation_ws: {}",
+            self.astation_ws.as_deref().unwrap_or("(not set)")
         ));
         lines.push(format!(
-            "station_url: {}",
-            self.station_url.as_deref().unwrap_or("(not set)")
+            "station_relay_url: {}",
+            self.station_relay_url.as_deref().unwrap_or("(not set)")
         ));
 
         // Show active project info
@@ -135,15 +135,15 @@ impl AtemConfig {
     }
 
     /// Get Astation URL with fallback default
-    pub fn astation_url(&self) -> &str {
-        self.astation_url
+    pub fn astation_ws(&self) -> &str {
+        self.astation_ws
             .as_deref()
             .unwrap_or("ws://127.0.0.1:8080/ws")
     }
 
     /// Get Station relay URL with fallback default
-    pub fn station_url(&self) -> &str {
-        self.station_url
+    pub fn station_relay_url(&self) -> &str {
+        self.station_relay_url
             .as_deref()
             .unwrap_or("https://station.agora.build")
     }
@@ -255,8 +255,8 @@ mod tests {
         assert!(config.customer_secret.is_none());
         assert!(config.rtm_channel.is_none());
         assert!(config.rtm_account.is_none());
-        assert!(config.astation_url.is_none());
-        assert!(config.station_url.is_none());
+        assert!(config.astation_ws.is_none());
+        assert!(config.station_relay_url.is_none());
     }
 
     #[test]
@@ -264,8 +264,8 @@ mod tests {
         let config = AtemConfig::default();
         assert_eq!(config.rtm_channel(), "atem_channel");
         assert_eq!(config.rtm_account(), "atem01");
-        assert_eq!(config.astation_url(), "ws://127.0.0.1:8080/ws");
-        assert_eq!(config.station_url(), "https://station.agora.build");
+        assert_eq!(config.astation_ws(), "ws://127.0.0.1:8080/ws");
+        assert_eq!(config.station_relay_url(), "https://station.agora.build");
     }
 
     #[test]
@@ -352,24 +352,24 @@ mod tests {
     }
 
     #[test]
-    fn test_station_url_default() {
+    fn test_station_relay_url_default() {
         let config = AtemConfig::default();
-        assert_eq!(config.station_url(), "https://station.agora.build");
+        assert_eq!(config.station_relay_url(), "https://station.agora.build");
     }
 
     #[test]
-    fn test_station_url_custom() {
+    fn test_station_relay_url_custom() {
         let config = AtemConfig {
-            station_url: Some("https://custom.station.example.com".to_string()),
+            station_relay_url: Some("https://custom.station.example.com".to_string()),
             ..Default::default()
         };
-        assert_eq!(config.station_url(), "https://custom.station.example.com");
+        assert_eq!(config.station_relay_url(), "https://custom.station.example.com");
     }
 
     #[test]
-    fn test_display_masked_includes_station_url() {
+    fn test_display_masked_includes_station_relay_url() {
         let config = AtemConfig::default();
         let display = config.display_masked();
-        assert!(display.contains("station_url"));
+        assert!(display.contains("station_relay_url"));
     }
 }

@@ -343,7 +343,7 @@ impl AstationClient {
     ///
     /// Returns the pairing code on success.
     pub async fn connect_with_pairing(&mut self, config: &AtemConfig) -> Result<String> {
-        let station_url = config.station_url().to_string();
+        let station_url = config.station_relay_url().to_string();
 
         // 1. Register with relay → get pairing code
         let code = self.register_pair(&station_url).await?;

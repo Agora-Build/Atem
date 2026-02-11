@@ -44,7 +44,7 @@ Enter the code in Astation's Dev Console to pair. If a local Astation is running
 Override the relay URL:
 
 ```bash
-AGORA_STATION_URL=https://my-relay.example.com atem
+AGORA_STATION_RELAY_URL=https://my-relay.example.com atem
 ```
 
 ## Configuration
@@ -52,8 +52,8 @@ AGORA_STATION_URL=https://my-relay.example.com atem
 Create `~/.config/atem/atem.toml`:
 
 ```toml
-astation_url = "ws://127.0.0.1:8080/ws"
-station_url = "https://station.agora.build"
+astation_ws = "ws://127.0.0.1:8080/ws"
+station_relay_url = "https://station.agora.build"
 
 [agora]
 app_id = "your_app_id"
@@ -65,8 +65,7 @@ Or use environment variables:
 ```bash
 AGORA_CUSTOMER_ID=...
 AGORA_CUSTOMER_SECRET=...
-AGORA_STATION_URL=...
-ANTHROPIC_API_KEY=...
+AGORA_STATION_RELAY_URL=...
 ```
 
 ## Supported Platforms

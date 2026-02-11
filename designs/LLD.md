@@ -194,8 +194,8 @@ server_url = "wss://astation.agora.build"
 | `AGORA_CUSTOMER_SECRET` | API authentication |
 | `AGORA_APP_ID` | Active project override |
 | `AGORA_APP_CERTIFICATE` | Token signing |
-| `ASTATION_URL` | Server endpoint override |
-| `ANTHROPIC_API_KEY` | Claude API access |
+| `ASTATION_WS` | Astation WebSocket endpoint override |
+| `AGORA_STATION_RELAY_URL` | Station relay URL override |
 
 ---
 
@@ -536,8 +536,8 @@ cargo test
 | `AGORA_CUSTOMER_SECRET` | — | Agora Console API authentication |
 | `AGORA_APP_ID` | — | Override active project app ID |
 | `AGORA_APP_CERTIFICATE` | — | Token signing certificate |
-| `ASTATION_URL` | `wss://astation.agora.build` | Astation server endpoint |
-| `ANTHROPIC_API_KEY` | — | Claude API key for AI features |
+| `ASTATION_WS` | `ws://127.0.0.1:8080/ws` | Astation WebSocket endpoint |
+| `AGORA_STATION_RELAY_URL` | `https://station.agora.build` | Station relay URL |
 | `ATEM_AI_API_URL` | `https://api.anthropic.com` | AI endpoint override |
 | `ATEM_AI_MODEL` | `claude-3-haiku-20240307` | AI model selection |
 | `CODEX_CLI_BIN` | `codex` | Codex executable path |

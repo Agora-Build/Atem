@@ -69,7 +69,7 @@ Astation captures mic audio, runs WebRTC VAD, and streams through Agora RTC. Con
 Create `~/.config/atem/atem.toml`:
 
 ```toml
-astation_url = "ws://127.0.0.1:8080/ws"
+astation_ws = "ws://127.0.0.1:8080/ws"
 
 [agora]
 app_id = "your_app_id"
@@ -81,7 +81,6 @@ Or use environment variables:
 ```bash
 AGORA_CUSTOMER_ID=...
 AGORA_CUSTOMER_SECRET=...
-ANTHROPIC_API_KEY=...
 ```
 
 ## Architecture
