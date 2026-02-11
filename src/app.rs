@@ -42,6 +42,13 @@ pub enum AppMode {
     CommandExecution,
 }
 
+/// Which CLI backend is currently active for routing commands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveCli {
+    Claude,
+    Codex,
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenInfo {
     pub token: String,
@@ -106,6 +113,9 @@ pub struct App {
     pub dispatcher: TaskDispatcher,
     pub work_items: HashMap<String, WorkItem>,
     pub voice_commands: StreamBuffer,
+    pub active_cli: ActiveCli,
+    pub pinned_cli: Option<ActiveCli>,
+    pub pairing_code: Option<String>,
 }
 
 impl App {
@@ -175,6 +185,9 @@ impl App {
             dispatcher: TaskDispatcher::new(),
             work_items: HashMap::new(),
             voice_commands: StreamBuffer::new(&["execute", "run it", "do it", "go ahead", "send it"]),
+            active_cli: ActiveCli::Claude,
+            pinned_cli: None,
+            pairing_code: None,
         }
     }
 
@@ -248,6 +261,7 @@ impl App {
             1 => {
                 // Launch Claude Code
                 self.mode = AppMode::ClaudeChat;
+                self.active_cli = ActiveCli::Claude;
 
                 if self.astation_connected {
                     // Request Claude launch through Astation
@@ -292,6 +306,7 @@ impl App {
             2 => {
                 // Launch Codex
                 self.mode = AppMode::CodexChat;
+                self.active_cli = ActiveCli::Codex;
                 self.input_text.clear();
                 self.codex_waiting_exit = false;
                 if self.codex_output_log.is_empty() {
@@ -1399,15 +1414,26 @@ impl App {
 
     pub async fn try_connect_astation(&mut self) -> Result<()> {
         if !self.astation_connected {
-            let url = self.config.astation_url().to_string();
-            match self.astation_client.connect(&url).await {
-                Ok(_) => {
+            match self.astation_client.connect_with_pairing(&self.config).await {
+                Ok(code) => {
                     self.astation_connected = true;
+                    self.pairing_code = Some(code);
                     println!("\u{1f50c} Connected to Astation successfully");
                 }
                 Err(e) => {
-                    println!("\u{26a0}\u{fe0f} Failed to connect to Astation: {}", e);
-                    // Continue in local mode
+                    println!("\u{26a0}\u{fe0f} Failed to connect via pairing: {}", e);
+                    // Fall back to direct URL connection
+                    let url = self.config.astation_url().to_string();
+                    match self.astation_client.connect(&url).await {
+                        Ok(_) => {
+                            self.astation_connected = true;
+                            println!("\u{1f50c} Connected to Astation (direct) successfully");
+                        }
+                        Err(e2) => {
+                            println!("\u{26a0}\u{fe0f} Failed to connect to Astation: {}", e2);
+                            // Continue in local mode
+                        }
+                    }
                 }
             }
         }
@@ -1536,6 +1562,26 @@ impl App {
                             .await;
                     }
                 }
+            }
+            AstationMessage::UserCommand { command, context } => {
+                let action = context.get("action").map(|s| s.as_str()).unwrap_or("cli_input");
+                match action {
+                    "cli_input" => {
+                        let target = self.pinned_cli.clone().unwrap_or(self.active_cli.clone());
+                        match target {
+                            ActiveCli::Claude => { self.send_claude_prompt(&command).await.ok(); }
+                            ActiveCli::Codex => { self.send_codex_prompt(&command).await.ok(); }
+                        }
+                    }
+                    "claude_input" => { self.send_claude_prompt(&command).await.ok(); }
+                    "codex_input" => { self.send_codex_prompt(&command).await.ok(); }
+                    "shell" => { self.execute_command(&command).await.ok(); }
+                    _ => { self.send_claude_prompt(&command).await.ok(); }
+                }
+                self.status_message = Some(format!(
+                    "Received command: {}",
+                    &command[..command.len().min(50)]
+                ));
             }
             _ => {
                 println!("\u{1f4e8} Received message from Astation: {:?}", message);
@@ -1743,4 +1789,35 @@ pub fn current_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_active_cli_default_is_claude() {
+        let app = App::new();
+        assert_eq!(app.active_cli, ActiveCli::Claude);
+    }
+
+    #[test]
+    fn test_active_cli_equality() {
+        assert_eq!(ActiveCli::Claude, ActiveCli::Claude);
+        assert_eq!(ActiveCli::Codex, ActiveCli::Codex);
+        assert_ne!(ActiveCli::Claude, ActiveCli::Codex);
+        assert_ne!(ActiveCli::Codex, ActiveCli::Claude);
+    }
+
+    #[test]
+    fn test_pinned_cli_default_is_none() {
+        let app = App::new();
+        assert!(app.pinned_cli.is_none());
+    }
+
+    #[test]
+    fn test_pairing_code_default_is_none() {
+        let app = App::new();
+        assert!(app.pairing_code.is_none());
+    }
 }

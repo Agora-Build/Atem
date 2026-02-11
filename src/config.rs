@@ -11,6 +11,7 @@ pub struct AtemConfig {
     pub rtm_channel: Option<String>,
     pub rtm_account: Option<String>,
     pub astation_url: Option<String>,
+    pub station_url: Option<String>,
 }
 
 /// Active project state persisted to ~/.config/atem/active_project.json
@@ -50,6 +51,9 @@ impl AtemConfig {
         }
         if let Ok(val) = std::env::var("ASTATION_URL") {
             config.astation_url = Some(val);
+        }
+        if let Ok(val) = std::env::var("AGORA_STATION_URL") {
+            config.station_url = Some(val);
         }
 
         Ok(config)
@@ -93,6 +97,10 @@ impl AtemConfig {
             "astation_url: {}",
             self.astation_url.as_deref().unwrap_or("(not set)")
         ));
+        lines.push(format!(
+            "station_url: {}",
+            self.station_url.as_deref().unwrap_or("(not set)")
+        ));
 
         // Show active project info
         match ActiveProject::load() {
@@ -131,6 +139,13 @@ impl AtemConfig {
         self.astation_url
             .as_deref()
             .unwrap_or("ws://127.0.0.1:8080/ws")
+    }
+
+    /// Get Station relay URL with fallback default
+    pub fn station_url(&self) -> &str {
+        self.station_url
+            .as_deref()
+            .unwrap_or("https://station.agora.build")
     }
 }
 
@@ -241,6 +256,7 @@ mod tests {
         assert!(config.rtm_channel.is_none());
         assert!(config.rtm_account.is_none());
         assert!(config.astation_url.is_none());
+        assert!(config.station_url.is_none());
     }
 
     #[test]
@@ -249,6 +265,7 @@ mod tests {
         assert_eq!(config.rtm_channel(), "atem_channel");
         assert_eq!(config.rtm_account(), "atem01");
         assert_eq!(config.astation_url(), "ws://127.0.0.1:8080/ws");
+        assert_eq!(config.station_url(), "https://station.agora.build");
     }
 
     #[test]
@@ -332,5 +349,27 @@ mod tests {
         if had_file {
             let _ = fs::rename(&backup, &path);
         }
+    }
+
+    #[test]
+    fn test_station_url_default() {
+        let config = AtemConfig::default();
+        assert_eq!(config.station_url(), "https://station.agora.build");
+    }
+
+    #[test]
+    fn test_station_url_custom() {
+        let config = AtemConfig {
+            station_url: Some("https://custom.station.example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.station_url(), "https://custom.station.example.com");
+    }
+
+    #[test]
+    fn test_display_masked_includes_station_url() {
+        let config = AtemConfig::default();
+        let display = config.display_masked();
+        assert!(display.contains("station_url"));
     }
 }

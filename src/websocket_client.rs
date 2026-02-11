@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::config::AtemConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AstationMessage {
@@ -330,6 +332,77 @@ impl AstationClient {
             context,
         };
         self.send_message(message).await
+    }
+
+    /// Register with the relay service to get a pairing code, then connect.
+    ///
+    /// Flow:
+    /// 1. POST to relay /api/pair → get pairing code
+    /// 2. Try local Astation (ws://127.0.0.1:8080/ws)
+    /// 3. If local fails → fall back to relay WebSocket
+    ///
+    /// Returns the pairing code on success.
+    pub async fn connect_with_pairing(&mut self, config: &AtemConfig) -> Result<String> {
+        let station_url = config.station_url().to_string();
+
+        // 1. Register with relay → get pairing code
+        let code = self.register_pair(&station_url).await?;
+        println!("Pairing code: {}", code);
+        println!("Open: {}/pair?code={}", station_url, code);
+
+        // 2. Try local Astation first
+        if self.try_connect_local().await.is_ok() {
+            println!("Connected to local Astation");
+            return Ok(code);
+        }
+
+        // 3. Fall back to relay
+        let ws_scheme = if station_url.starts_with("https://") {
+            station_url.replace("https://", "wss://")
+        } else {
+            station_url.replace("http://", "ws://")
+        };
+        let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
+        self.connect(&ws_url).await?;
+        println!("Connected via relay");
+        Ok(code)
+    }
+
+    /// Register with the relay service and get a pairing code.
+    async fn register_pair(&self, station_url: &str) -> Result<String> {
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/pair", station_url))
+            .json(&serde_json::json!({"hostname": hostname}))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to register with relay: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "Relay returned status {}",
+                resp.status()
+            ));
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse relay response: {}", e))?;
+
+        body.get("code")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
+    }
+
+    /// Try connecting to a local Astation instance on 127.0.0.1:8080.
+    async fn try_connect_local(&mut self) -> Result<()> {
+        self.connect("ws://127.0.0.1:8080/ws").await
     }
 }
 
@@ -869,6 +942,117 @@ mod tests {
             assert_eq!(message, "Failed to parse task");
         } else {
             panic!("expected MarkTaskResult");
+        }
+    }
+
+    // --- UserCommand tests ---
+
+    #[test]
+    fn test_user_command_roundtrip() {
+        let mut context = std::collections::HashMap::new();
+        context.insert("action".to_string(), "cli_input".to_string());
+        context.insert("source".to_string(), "voice".to_string());
+        let msg = AstationMessage::UserCommand {
+            command: "fix the bug".into(),
+            context,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::UserCommand { command, context } = parsed {
+            assert_eq!(command, "fix the bug");
+            assert_eq!(context.get("action").unwrap(), "cli_input");
+            assert_eq!(context.get("source").unwrap(), "voice");
+        } else {
+            panic!("expected UserCommand");
+        }
+    }
+
+    #[test]
+    fn test_user_command_with_cli_input_action() {
+        let mut context = std::collections::HashMap::new();
+        context.insert("action".to_string(), "cli_input".to_string());
+        let msg = AstationMessage::UserCommand {
+            command: "refactor the module".into(),
+            context,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::UserCommand { command, context } = parsed {
+            assert_eq!(command, "refactor the module");
+            assert_eq!(context.get("action").unwrap(), "cli_input");
+        } else {
+            panic!("expected UserCommand");
+        }
+    }
+
+    #[test]
+    fn test_user_command_with_shell_action() {
+        let mut context = std::collections::HashMap::new();
+        context.insert("action".to_string(), "shell".to_string());
+        let msg = AstationMessage::UserCommand {
+            command: "ls -la".into(),
+            context,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::UserCommand { command, context } = parsed {
+            assert_eq!(command, "ls -la");
+            assert_eq!(context.get("action").unwrap(), "shell");
+        } else {
+            panic!("expected UserCommand");
+        }
+    }
+
+    #[test]
+    fn test_user_command_with_claude_input_action() {
+        let mut context = std::collections::HashMap::new();
+        context.insert("action".to_string(), "claude_input".to_string());
+        let msg = AstationMessage::UserCommand {
+            command: "explain this code".into(),
+            context,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::UserCommand { command, context } = parsed {
+            assert_eq!(command, "explain this code");
+            assert_eq!(context.get("action").unwrap(), "claude_input");
+        } else {
+            panic!("expected UserCommand");
+        }
+    }
+
+    #[test]
+    fn test_user_command_with_codex_input_action() {
+        let mut context = std::collections::HashMap::new();
+        context.insert("action".to_string(), "codex_input".to_string());
+        let msg = AstationMessage::UserCommand {
+            command: "write a test".into(),
+            context,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::UserCommand { command, context } = parsed {
+            assert_eq!(command, "write a test");
+            assert_eq!(context.get("action").unwrap(), "codex_input");
+        } else {
+            panic!("expected UserCommand");
+        }
+    }
+
+    #[test]
+    fn test_user_command_empty_context() {
+        let context = std::collections::HashMap::new();
+        let msg = AstationMessage::UserCommand {
+            command: "hello".into(),
+            context,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::UserCommand { command, context } = parsed {
+            assert_eq!(command, "hello");
+            assert!(context.is_empty());
+        } else {
+            panic!("expected UserCommand");
         }
     }
 }
