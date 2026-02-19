@@ -41,6 +41,11 @@ pub enum Commands {
     },
     /// Clear saved authentication session
     Logout,
+    /// Sync credentials and state from the paired Astation app
+    Sync {
+        #[command(subcommand)]
+        sync_command: SyncCommands,
+    },
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {
         #[command(subcommand)]
@@ -136,6 +141,12 @@ pub enum ListCommands {
         #[arg(long)]
         show_certificates: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum SyncCommands {
+    /// Pull Agora credentials from the paired Astation app and save to config
+    Credentials,
 }
 
 #[derive(Subcommand)]
@@ -401,6 +412,60 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                             2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars\n\
                             3. Add to ~/.config/atem/config.toml",
                             ws_url, e
+                        );
+                    }
+                }
+                Ok(())
+            }
+        },
+        Commands::Sync { sync_command } => match sync_command {
+            SyncCommands::Credentials => {
+                let config = crate::config::AtemConfig::load()?;
+                let ws_url = config.astation_ws();
+                println!("Connecting to Astation at {}...", ws_url);
+
+                let mut client = crate::websocket_client::AstationClient::new();
+                client.connect(ws_url).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Could not connect to Astation ({}): {}\n\
+                        Make sure Astation is running and configured in ~/.config/atem/config.toml",
+                        ws_url, e
+                    )
+                })?;
+
+                // Astation sends credentialSync in response to our statusUpdate on connect.
+                let timeout = tokio::time::Duration::from_secs(5);
+                let result = tokio::time::timeout(timeout, async {
+                    loop {
+                        match client.recv_message().await {
+                            Some(crate::websocket_client::AstationMessage::CredentialSync {
+                                customer_id,
+                                customer_secret,
+                            }) => return Some((customer_id, customer_secret)),
+                            Some(_) => continue,
+                            None => return None,
+                        }
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(Some((cid, csecret))) => {
+                        let id_preview = cid[..4.min(cid.len())].to_string();
+                        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                        cfg.customer_id = Some(cid);
+                        cfg.customer_secret = Some(csecret);
+                        cfg.save_to_disk()?;
+                        println!(
+                            "Credentials synced from Astation (customer_id: {}...) and saved to {}",
+                            id_preview,
+                            crate::config::AtemConfig::config_path().display()
+                        );
+                    }
+                    Ok(None) | Err(_) => {
+                        anyhow::bail!(
+                            "Timed out waiting for credentials from Astation.\n\
+                            Make sure Astation has credentials configured (Settings → Agora Credentials)."
                         );
                     }
                 }
