@@ -55,6 +55,8 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
         app.process_astation_messages().await;
         app.process_codex_output();
         app.process_claude_output();
+        // Forward ACP agent events to Astation
+        app.poll_acp_events().await;
 
         // Dispatcher: drain triage verdicts and try to send next task to main
         app.dispatcher.poll_triage_results();

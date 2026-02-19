@@ -30,8 +30,9 @@ use crate::config::AtemConfig;
 use crate::rtm_client::{RtmClient, RtmConfig, RtmEvent};
 use crate::token::generate_rtm_token;
 use crate::websocket_client::{AstationClient, AstationMessage};
-use crate::agent_client::{AgentInfo, AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
+use crate::agent_client::{AgentEvent, AgentInfo, AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
 use crate::agent_registry::AgentRegistry;
+use crate::acp_client::AcpClient;
 
 pub const AGORA_RTM_TOKEN_TTL_SECS: u32 = 3600;
 
@@ -120,6 +121,8 @@ pub struct App {
     pub pairing_code: Option<String>,
     /// Registry of all known agents (PTY + ACP, launched or discovered).
     pub agent_registry: AgentRegistry,
+    /// Live ACP WebSocket connections keyed by agent_id.
+    pub acp_clients: HashMap<String, AcpClient>,
 }
 
 impl App {
@@ -193,6 +196,7 @@ impl App {
             pinned_cli: None,
             pairing_code: None,
             agent_registry: AgentRegistry::new(),
+            acp_clients: HashMap::new(),
         }
     }
 
@@ -1189,6 +1193,88 @@ impl App {
         }
     }
 
+    /// Connect to an ACP agent by ID, run the handshake, and store the live
+    /// client.  The agent must already be in the registry with an `acp_url`.
+    pub async fn connect_acp_agent(&mut self, agent_id: &str) -> anyhow::Result<()> {
+        let info = self
+            .agent_registry
+            .get(agent_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown agent: {}", agent_id))?;
+
+        let url = info
+            .acp_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Agent {} has no ACP URL", agent_id))?
+            .to_string();
+
+        let mut client = AcpClient::connect(&url).await?;
+        let server_info = client.initialize().await?;
+        let _session_id = client.new_session().await?;
+
+        // Update kind from the server's own name
+        println!(
+            "\u{1f517} ACP connected: {} ({} v{})",
+            agent_id, server_info.kind, server_info.version
+        );
+
+        self.agent_registry.update_status(agent_id, AgentStatus::Idle);
+        self.acp_clients.insert(agent_id.to_string(), client);
+        Ok(())
+    }
+
+    /// Poll all live ACP clients for pending events and forward them to
+    /// Astation as `agentEvent` messages.  Called every TUI tick.
+    pub async fn poll_acp_events(&mut self) {
+        // Collect events per agent first (to avoid borrow issues)
+        let agent_ids: Vec<String> = self.acp_clients.keys().cloned().collect();
+
+        for agent_id in agent_ids {
+            let events = {
+                let client = self.acp_clients.get_mut(&agent_id).unwrap();
+                client.drain_events()
+            };
+            if events.is_empty() {
+                continue;
+            }
+
+            let session_id = self
+                .acp_clients
+                .get(&agent_id)
+                .and_then(|c| c.session_id().map(|s| s.to_string()))
+                .unwrap_or_default();
+
+            let mut disconnected = false;
+            for event in &events {
+                // Update registry status
+                match event {
+                    AgentEvent::TextDelta(_) | AgentEvent::ToolCall { .. } => {
+                        self.agent_registry
+                            .update_status(&agent_id, AgentStatus::Thinking);
+                    }
+                    AgentEvent::Done => {
+                        self.agent_registry
+                            .update_status(&agent_id, AgentStatus::Idle);
+                    }
+                    AgentEvent::Disconnected => {
+                        self.agent_registry
+                            .update_status(&agent_id, AgentStatus::Disconnected);
+                        disconnected = true;
+                    }
+                    _ => {}
+                }
+                // Forward to Astation
+                let _ = self
+                    .astation_client
+                    .send_agent_event(&agent_id, &session_id, event)
+                    .await;
+            }
+
+            if disconnected {
+                self.acp_clients.remove(&agent_id);
+            }
+        }
+    }
+
     pub fn record_claude_output(&mut self, data: impl AsRef<str>) {
         let text = data.as_ref();
         self.claude_raw_log.push_str(text);
@@ -1677,8 +1763,20 @@ impl App {
                             }
                         }
                         AgentProtocol::Acp => {
-                            // ACP routing will be wired in Stage 3.
-                            eprintln!("\u{1f6a7} ACP prompt routing not yet implemented for {}", agent_id);
+                            // Try the live client first; connect on demand if needed.
+                            if !self.acp_clients.contains_key(&agent_id) {
+                                if let Err(e) = self.connect_acp_agent(&agent_id).await {
+                                    eprintln!("\u{274c} ACP connect failed for {}: {}", agent_id, e);
+                                }
+                            }
+                            if let Some(acp) = self.acp_clients.get_mut(&agent_id) {
+                                if let Err(e) = acp.send_prompt(&text) {
+                                    eprintln!("\u{274c} ACP send_prompt failed: {}", e);
+                                } else {
+                                    self.agent_registry
+                                        .update_status(&agent_id, AgentStatus::Thinking);
+                                }
+                            }
                         }
                     },
                 }
