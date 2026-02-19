@@ -131,6 +131,10 @@ pub struct App {
     /// Credentials synced from Astation via WebSocket. Highest priority over env/config.
     pub synced_customer_id: Option<String>,
     pub synced_customer_secret: Option<String>,
+    /// Background Astation connection result channel (set up at startup).
+    pub astation_connect_rx: Option<tokio::sync::oneshot::Receiver<
+        Result<(crate::websocket_client::AstationClient, Option<String>)>
+    >>,
 }
 
 impl App {
@@ -210,6 +214,7 @@ impl App {
             agent_panel_selected: 0,
             synced_customer_id: None,
             synced_customer_secret: None,
+            astation_connect_rx: None,
         }
     }
 
@@ -790,12 +795,9 @@ impl App {
             err
         })?;
 
-        if let Err(err) = tokio::time::timeout(
-            Duration::from_secs(10),
-            client.login_and_join(&token, &rtm_account, &rtm_channel),
-        )
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("RTM login timed out")))
+        if let Err(err) = client
+            .login_and_join(&token, &rtm_account, &rtm_channel)
+            .await
         {
             self.status_message = Some(format!("Failed to login/join signaling: {}", err));
             return Err(err);
@@ -1593,6 +1595,59 @@ impl App {
         fs::write(&path, summary)?;
         self.claude_summary_file = Some(path.clone());
         Ok(path)
+    }
+
+    /// Spawn a background task that connects to Astation without blocking.
+    /// Poll the result each loop tick with `poll_astation_connect()`.
+    pub fn spawn_astation_connect(&mut self) {
+        if self.astation_connected || self.astation_connect_rx.is_some() {
+            return;
+        }
+        let config = self.config.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.astation_connect_rx = Some(rx);
+        tokio::spawn(async move {
+            let mut client = crate::websocket_client::AstationClient::new();
+            let result = match client.connect_with_pairing(&config).await {
+                Ok(code) => Ok((client, Some(code))),
+                Err(_) => {
+                    // Fall back to direct URL
+                    let url = config.astation_ws().to_string();
+                    let mut client2 = crate::websocket_client::AstationClient::new();
+                    match client2.connect(&url).await {
+                        Ok(()) => Ok((client2, None)),
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Check if the background Astation connection has completed, and if so apply it.
+    pub fn poll_astation_connect(&mut self) {
+        if let Some(rx) = &mut self.astation_connect_rx {
+            match rx.try_recv() {
+                Ok(Ok((client, code))) => {
+                    self.astation_connect_rx = None;
+                    self.astation_client = client;
+                    self.astation_connected = true;
+                    self.pairing_code = code;
+                    self.status_message = Some("Connected to Astation".to_string());
+                }
+                Ok(Err(_)) => {
+                    // Connection failed — stay in local mode
+                    self.astation_connect_rx = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    // Still pending
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    // Task dropped without sending — treat as failure
+                    self.astation_connect_rx = None;
+                }
+            }
+        }
     }
 
     pub async fn try_connect_astation(&mut self) -> Result<()> {

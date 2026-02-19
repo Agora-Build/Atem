@@ -46,13 +46,16 @@ pub async fn run_tui() -> Result<()> {
 }
 
 async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
-    // Try to connect to Astation at startup
-    let _ = app.try_connect_astation().await;
-    let _ = app.ensure_rtm_client().await;
-    // Scan lockfiles and register any externally running agents
+    // Fast startup: scan lockfiles (no network), then render immediately.
     app.startup_scan_agents().await;
 
+    // Kick off Astation connection in the background — won't block the UI.
+    app.spawn_astation_connect();
+
     loop {
+        // Check if background Astation connection has completed
+        app.poll_astation_connect();
+
         // Process any pending Astation messages
         app.process_astation_messages().await;
         app.process_codex_output();
