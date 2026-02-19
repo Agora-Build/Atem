@@ -32,7 +32,7 @@ Powerful AI based work-suite behind the curtain
 When invoked without arguments (atem), launches an AI-enhanced REPL environment.
 
 with Astation better, more powerful AI based work-suite behind the curtain
-generate an 8 digits code(this is from https://astation.agora.build), When I type this code in Astation, this Atem will connect to Astation.
+generate an 8 digits code(this is from https://station.agora.build), When I type this code in Astation, this Atem will connect to Astation.
 
 Accepts natural language input to interpret user intent.
 

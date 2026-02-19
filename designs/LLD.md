@@ -154,7 +154,7 @@ pub enum AstationMessage {
 
 **Connection Lifecycle**:
 ```
-1. Connect to wss://astation.agora.build/ws
+1. Connect to wss://station.agora.build/ws
 2. Send Heartbeat every 30 seconds
 3. Handle messages via mpsc channels
 4. Auto-reconnect on disconnect
@@ -184,7 +184,7 @@ app_certificate = "..."
 name = "My Project"
 
 [astation]
-server_url = "wss://astation.agora.build"
+server_url = "wss://station.agora.build"
 ```
 
 **Environment Variable Overrides**:
@@ -218,7 +218,7 @@ astation://auth?otp=12345678&hostname=my-machine
 
 **Web Fallback**:
 ```
-https://astation.agora.build/auth?otp=12345678&hostname=my-machine
+https://station.agora.build/auth?otp=12345678&hostname=my-machine
 ```
 
 ---

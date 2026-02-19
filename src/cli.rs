@@ -35,7 +35,7 @@ pub enum Commands {
     Repl,
     /// Authenticate with Astation (OTP + deep link pairing)
     Login {
-        /// Astation server URL (defaults to https://astation.agora.build)
+        /// Astation server URL (defaults to https://station.agora.build)
         #[arg(long)]
         server: Option<String>,
     },

@@ -3,7 +3,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const DEFAULT_SERVER_URL: &str = "https://astation.agora.build";
+const DEFAULT_SERVER_URL: &str = "https://station.agora.build";
 
 /// Stored session after successful authentication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,17 +230,17 @@ mod tests {
 
     #[test]
     fn web_fallback_url_format() {
-        let url = build_web_fallback_url("https://astation.agora.build", "sess123", "my-host");
+        let url = build_web_fallback_url("https://station.agora.build", "sess123", "my-host");
         assert_eq!(
             url,
-            "https://astation.agora.build/auth?id=sess123&tag=my-host"
+            "https://station.agora.build/auth?id=sess123&tag=my-host"
         );
     }
 
     #[test]
     fn web_fallback_url_strips_trailing_slash() {
-        let url = build_web_fallback_url("https://astation.agora.build/", "s1", "h1");
-        assert_eq!(url, "https://astation.agora.build/auth?id=s1&tag=h1");
+        let url = build_web_fallback_url("https://station.agora.build/", "s1", "h1");
+        assert_eq!(url, "https://station.agora.build/auth?id=s1&tag=h1");
     }
 
     #[test]

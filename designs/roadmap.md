@@ -29,7 +29,7 @@
 |------|------|-------|------|
 | **Atem** | `/home/guohai/Dev/Agora.Build/Atem/` | Rust, TUI/CLI | Execution Hub |
 | **Astation** | `/home/guohai/Dev/Agora.Build/Astation/` | Swift 5.9 macOS menu bar + C++17 core | Sensory Hub |
-| **Astation Server** | `Astation/server/` (new) | Rust | Cloud backend at `astation.agora.build` |
+| **Astation Server** | `Astation/server/` (new) | Rust | Cloud backend at `station.agora.build` |
 
 ---
 
@@ -182,7 +182,7 @@ struct MachineIdentity {
 ### Stage A5: Astation Cloud Server
 
 **Status**: `pending`
-**Goal**: Standalone Rust server at `astation.agora.build`.
+**Goal**: Standalone Rust server at `station.agora.build`.
 
 **Complexity**: L
 
