@@ -14,6 +14,11 @@ mod time_sync;
 mod token;
 mod tui;
 mod websocket_client;
+// Agent hub — ACP/PTY protocol abstraction
+mod acp_client;
+mod agent_client;
+mod agent_detector;
+mod agent_registry;
 
 use anyhow::Result;
 use clap::Parser;
