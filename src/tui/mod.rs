@@ -49,6 +49,8 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
     // Try to connect to Astation at startup
     let _ = app.try_connect_astation().await;
     let _ = app.ensure_rtm_client().await;
+    // Scan lockfiles and register any externally running agents
+    app.startup_scan_agents().await;
 
     loop {
         // Process any pending Astation messages
