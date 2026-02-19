@@ -40,6 +40,20 @@ pub enum Commands {
     },
     /// Clear saved authentication session
     Logout,
+    /// Generate a beautiful visual explanation as a self-contained HTML page
+    Explain {
+        /// The topic or concept to explain
+        topic: String,
+        /// Path to a file whose contents will be added as context (optional)
+        #[arg(long, short)]
+        context: Option<String>,
+        /// Save the HTML to this path instead of a temp file
+        #[arg(long, short)]
+        output: Option<String>,
+        /// Don't open the result in the browser
+        #[arg(long)]
+        no_browser: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -317,6 +331,46 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             println!("Logged out. Session cleared.");
             Ok(())
         }
+        Commands::Explain {
+            topic,
+            context,
+            output,
+            no_browser,
+        } => {
+            let explainer = crate::visual_explainer::VisualExplainer::new()?;
+
+            // Load optional context file
+            let context_str = if let Some(path) = &context {
+                Some(std::fs::read_to_string(path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read context file '{}': {}", path, e)
+                })?)
+            } else {
+                None
+            };
+
+            println!("Generating visual explanation for: {}", topic);
+            let html = explainer
+                .generate(&topic, context_str.as_deref())
+                .await?;
+
+            // Determine output path
+            let path = if let Some(out) = &output {
+                let p = std::path::PathBuf::from(out);
+                std::fs::write(&p, &html)?;
+                p
+            } else {
+                crate::visual_explainer::VisualExplainer::save_to_temp(&html)?
+            };
+
+            println!("Saved to: {}", path.display());
+
+            if !no_browser {
+                crate::visual_explainer::VisualExplainer::open_in_browser(&path)?;
+                println!("Opened in browser.");
+            }
+
+            Ok(())
+        }
     }
 }
 
@@ -485,5 +539,74 @@ mod tests {
     fn cli_logout_parses() {
         let cli = Cli::try_parse_from(["atem", "logout"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Logout)));
+    }
+
+    // ── explain command ───────────────────────────────────────────────────
+
+    #[test]
+    fn cli_explain_topic_only() {
+        let cli = Cli::try_parse_from(["atem", "explain", "ACP Protocol"]).unwrap();
+        match cli.command {
+            Some(Commands::Explain {
+                topic,
+                context,
+                output,
+                no_browser,
+            }) => {
+                assert_eq!(topic, "ACP Protocol");
+                assert!(context.is_none());
+                assert!(output.is_none());
+                assert!(!no_browser);
+            }
+            _ => panic!("expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_explain_with_no_browser() {
+        let cli =
+            Cli::try_parse_from(["atem", "explain", "Rust async", "--no-browser"]).unwrap();
+        match cli.command {
+            Some(Commands::Explain { no_browser, .. }) => {
+                assert!(no_browser);
+            }
+            _ => panic!("expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_explain_with_output() {
+        let cli = Cli::try_parse_from([
+            "atem",
+            "explain",
+            "WebSockets",
+            "--output",
+            "/tmp/out.html",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Explain { output, .. }) => {
+                assert_eq!(output.as_deref(), Some("/tmp/out.html"));
+            }
+            _ => panic!("expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_explain_with_context_file() {
+        let cli = Cli::try_parse_from([
+            "atem",
+            "explain",
+            "my module",
+            "--context",
+            "src/main.rs",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Explain { context, .. }) => {
+                assert_eq!(context.as_deref(), Some("src/main.rs"));
+            }
+            _ => panic!("expected Explain command"),
+        }
     }
 }

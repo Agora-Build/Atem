@@ -1730,6 +1730,39 @@ impl App {
                     &command[..command.len().min(50)]
                 ));
             }
+            AstationMessage::GenerateExplainer {
+                topic,
+                context,
+                request_id,
+            } => {
+                println!("\u{1f5bc} Generate explainer requested: {}", topic);
+                match crate::visual_explainer::VisualExplainer::new() {
+                    Ok(explainer) => {
+                        match explainer.generate(&topic, context.as_deref()).await {
+                            Ok(html) => {
+                                let _ = self
+                                    .astation_client
+                                    .send_explainer_result(request_id, &topic, &html)
+                                    .await;
+                            }
+                            Err(e) => {
+                                eprintln!("\u{274c} Explainer generation failed: {}", e);
+                                let _ = self
+                                    .astation_client
+                                    .send_explainer_error(request_id, &topic, &e.to_string())
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\u{274c} VisualExplainer init failed: {}", e);
+                        let _ = self
+                            .astation_client
+                            .send_explainer_error(request_id, &topic, &e.to_string())
+                            .await;
+                    }
+                }
+            }
             AstationMessage::AgentListRequest => {
                 let agents = self.agent_registry.all();
                 println!("\u{1f916} Agent list requested — {} agent(s) known", agents.len());

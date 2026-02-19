@@ -174,6 +174,36 @@ pub enum AstationMessage {
         agent_id: String,
         status: crate::agent_client::AgentStatus,
     },
+
+    // ── Visual Explainer messages ─────────────────────────────────────────
+
+    /// Astation → Atem: generate a visual HTML explanation.
+    #[serde(rename = "generateExplainer")]
+    GenerateExplainer {
+        /// The topic or concept to explain.
+        topic: String,
+        /// Optional context (agent output, code snippet, etc.).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+        /// Optional request ID so the response can be correlated.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+
+    /// Atem → Astation: the generated HTML page.
+    #[serde(rename = "explainerResult")]
+    ExplainerResult {
+        /// Matches the request_id from GenerateExplainer (if provided).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// The complete self-contained HTML string.
+        html: String,
+        /// The topic that was explained.
+        topic: String,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +460,40 @@ impl AstationClient {
         self.send_message(AstationMessage::AgentStatusUpdate {
             agent_id: agent_id.to_string(),
             status,
+        })
+        .await
+    }
+
+    /// Send a generated explainer page back to Astation.
+    pub async fn send_explainer_result(
+        &self,
+        request_id: Option<String>,
+        topic: &str,
+        html: &str,
+    ) -> Result<()> {
+        self.send_message(AstationMessage::ExplainerResult {
+            request_id,
+            html: html.to_string(),
+            topic: topic.to_string(),
+            success: true,
+            error: None,
+        })
+        .await
+    }
+
+    /// Send an explainer error back to Astation.
+    pub async fn send_explainer_error(
+        &self,
+        request_id: Option<String>,
+        topic: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.send_message(AstationMessage::ExplainerResult {
+            request_id,
+            html: String::new(),
+            topic: topic.to_string(),
+            success: false,
+            error: Some(error.to_string()),
         })
         .await
     }
@@ -1312,6 +1376,91 @@ mod tests {
             assert_eq!(a.acp_url.as_deref(), Some("ws://localhost:8765"));
         } else {
             panic!("expected AgentListResponse");
+        }
+    }
+
+    // ── Visual Explainer message tests ────────────────────────────────────
+
+    #[test]
+    fn generate_explainer_roundtrip() {
+        let msg = AstationMessage::GenerateExplainer {
+            topic: "ACP Protocol".into(),
+            context: Some("some context".into()),
+            request_id: Some("req-1".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"generateExplainer\""));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::GenerateExplainer {
+            topic,
+            context,
+            request_id,
+        } = parsed
+        {
+            assert_eq!(topic, "ACP Protocol");
+            assert_eq!(context.as_deref(), Some("some context"));
+            assert_eq!(request_id.as_deref(), Some("req-1"));
+        } else {
+            panic!("expected GenerateExplainer");
+        }
+    }
+
+    #[test]
+    fn generate_explainer_optional_fields_omitted() {
+        let msg = AstationMessage::GenerateExplainer {
+            topic: "hello".into(),
+            context: None,
+            request_id: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("\"context\""));
+        assert!(!json.contains("\"request_id\""));
+    }
+
+    #[test]
+    fn explainer_result_success_roundtrip() {
+        let msg = AstationMessage::ExplainerResult {
+            request_id: Some("req-1".into()),
+            html: "<html><body>hi</body></html>".into(),
+            topic: "Test".into(),
+            success: true,
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::ExplainerResult {
+            success,
+            html,
+            topic,
+            error,
+            ..
+        } = parsed
+        {
+            assert!(success);
+            assert_eq!(html, "<html><body>hi</body></html>");
+            assert_eq!(topic, "Test");
+            assert!(error.is_none());
+        } else {
+            panic!("expected ExplainerResult");
+        }
+    }
+
+    #[test]
+    fn explainer_result_error_roundtrip() {
+        let msg = AstationMessage::ExplainerResult {
+            request_id: None,
+            html: String::new(),
+            topic: "Test".into(),
+            success: false,
+            error: Some("API key missing".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::ExplainerResult { success, error, .. } = parsed {
+            assert!(!success);
+            assert_eq!(error.as_deref(), Some("API key missing"));
+        } else {
+            panic!("expected ExplainerResult");
         }
     }
 }

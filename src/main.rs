@@ -19,6 +19,8 @@ mod acp_client;
 mod agent_client;
 mod agent_detector;
 mod agent_registry;
+// Visual Explainer
+mod visual_explainer;
 
 use anyhow::Result;
 use clap::Parser;
