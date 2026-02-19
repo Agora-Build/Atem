@@ -2117,7 +2117,8 @@ impl App {
     }
 
     pub async fn process_astation_messages(&mut self) {
-        if let Some(message) = self.astation_client.recv_message().await {
+        // Drain all pending messages (non-blocking try_recv loop)
+        while let Some(message) = self.astation_client.recv_message() {
             self.handle_astation_message(message).await;
         }
     }

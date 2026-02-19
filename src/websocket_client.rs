@@ -318,7 +318,17 @@ impl AstationClient {
         Ok(())
     }
 
-    pub async fn recv_message(&mut self) -> Option<AstationMessage> {
+    /// Non-blocking: returns a message if one is already queued, None otherwise.
+    pub fn recv_message(&mut self) -> Option<AstationMessage> {
+        if let Some(receiver) = &mut self.receiver {
+            receiver.try_recv().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Blocking: waits until a message arrives (for CLI use only, not the TUI loop).
+    pub async fn recv_message_async(&mut self) -> Option<AstationMessage> {
         if let Some(receiver) = &mut self.receiver {
             receiver.recv().await
         } else {

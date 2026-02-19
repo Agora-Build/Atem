@@ -36,7 +36,7 @@ async fn resolve_credentials(
     let timeout = tokio::time::Duration::from_secs(5);
     let result = tokio::time::timeout(timeout, async {
         loop {
-            match client.recv_message().await {
+            match client.recv_message_async().await {
                 Some(crate::websocket_client::AstationMessage::CredentialSync {
                     customer_id,
                     customer_secret,
