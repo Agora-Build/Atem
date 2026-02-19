@@ -128,6 +128,9 @@ pub struct App {
     pub active_agent_id: Option<String>,
     /// Cursor position in the AgentPanel list.
     pub agent_panel_selected: usize,
+    /// Credentials synced from Astation via WebSocket. Highest priority over env/config.
+    pub synced_customer_id: Option<String>,
+    pub synced_customer_secret: Option<String>,
 }
 
 impl App {
@@ -205,6 +208,8 @@ impl App {
             acp_clients: HashMap::new(),
             active_agent_id: None,
             agent_panel_selected: 0,
+            synced_customer_id: None,
+            synced_customer_secret: None,
         }
     }
 
@@ -251,7 +256,16 @@ impl App {
                         self.output_text = "\u{1f4cb} Requesting projects from Astation...\n\nPress 'b' to go back to main menu".to_string();
                     }
                 } else {
-                    match fetch_agora_projects().await {
+                    // Priority: synced from Astation > env vars > config file
+                    let fetch_result = if let (Some(cid), Some(csecret)) = (
+                        self.synced_customer_id.as_deref(),
+                        self.synced_customer_secret.as_deref(),
+                    ) {
+                        crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret).await
+                    } else {
+                        fetch_agora_projects().await
+                    };
+                    match fetch_result {
                         Ok(projects) => {
                             self.show_certificates = false;
                             let info = format_projects(&projects, self.show_certificates);
@@ -1832,6 +1846,14 @@ impl App {
                         }
                     },
                 }
+            }
+            AstationMessage::CredentialSync {
+                customer_id,
+                customer_secret,
+            } => {
+                println!("\u{1f511} Credentials synced from Astation (customer_id: {}...)", &customer_id[..4.min(customer_id.len())]);
+                self.synced_customer_id = Some(customer_id);
+                self.synced_customer_secret = Some(customer_secret);
             }
             _ => {
                 println!("\u{1f4e8} Received message from Astation: {:?}", message);

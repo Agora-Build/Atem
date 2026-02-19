@@ -190,6 +190,16 @@ pub enum AstationMessage {
         request_id: Option<String>,
     },
 
+    /// Astation → Atem: Agora REST API credentials for use without env vars.
+    /// Priority: synced (this) > env vars > config file.
+    #[serde(rename = "credentialSync")]
+    CredentialSync {
+        #[serde(rename = "customer_id")]
+        customer_id: String,
+        #[serde(rename = "customer_secret")]
+        customer_secret: String,
+    },
+
     /// Atem → Astation: the generated HTML page.
     #[serde(rename = "explainerResult")]
     ExplainerResult {
@@ -1442,6 +1452,45 @@ mod tests {
             assert!(error.is_none());
         } else {
             panic!("expected ExplainerResult");
+        }
+    }
+
+    #[test]
+    fn credential_sync_roundtrip() {
+        let msg = AstationMessage::CredentialSync {
+            customer_id: "cid_abc123".into(),
+            customer_secret: "csec_xyz789".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"credentialSync""#));
+        assert!(json.contains("customer_id"));
+        assert!(json.contains("customer_secret"));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::CredentialSync {
+            customer_id,
+            customer_secret,
+        } = parsed
+        {
+            assert_eq!(customer_id, "cid_abc123");
+            assert_eq!(customer_secret, "csec_xyz789");
+        } else {
+            panic!("expected CredentialSync");
+        }
+    }
+
+    #[test]
+    fn credential_sync_deserialize_from_json() {
+        let json = r#"{"type":"credentialSync","data":{"customer_id":"my_id","customer_secret":"my_secret"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::CredentialSync {
+            customer_id,
+            customer_secret,
+        } = msg
+        {
+            assert_eq!(customer_id, "my_id");
+            assert_eq!(customer_secret, "my_secret");
+        } else {
+            panic!("expected CredentialSync");
         }
     }
 
