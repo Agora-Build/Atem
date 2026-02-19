@@ -1204,6 +1204,12 @@ impl App {
                 pty_pid: agent.pid,
             });
         }
+
+        // Push current agent list to Astation so the UI is immediately up-to-date.
+        let agents = self.agent_registry.all();
+        if !agents.is_empty() {
+            let _ = self.astation_client.send_agent_list(agents).await;
+        }
     }
 
     /// Connect to an ACP agent by ID, run the handshake, and store the live
