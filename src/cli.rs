@@ -445,9 +445,20 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             session.save()?;
             println!("Session saved. You are now authenticated.");
 
-            if save_credentials {
+            // Determine whether to sync credentials: --save-credentials flag, or ask interactively.
+            let should_sync = if save_credentials {
+                true
+            } else {
+                print!("Sync Agora credentials from Astation? [Y/n] ");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).unwrap_or(0);
+                !matches!(input.trim().to_lowercase().as_str(), "n" | "no")
+            };
+
+            if should_sync {
                 println!("Syncing Agora credentials from Astation...");
-                // Use a config with no credentials to force the Astation WS path.
                 let mut cfg_no_creds = crate::config::AtemConfig::load().unwrap_or_default();
                 cfg_no_creds.customer_id = None;
                 cfg_no_creds.customer_secret = None;
