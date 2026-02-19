@@ -272,11 +272,44 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                             }
 
                             match app.mode {
+                                AppMode::AgentPanel => match key.code {
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        let count = app.agent_registry.all().len();
+                                        if count > 0 {
+                                            app.agent_panel_selected =
+                                                (app.agent_panel_selected + 1) % count;
+                                        }
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        let count = app.agent_registry.all().len();
+                                        if count > 0 {
+                                            app.agent_panel_selected = if app.agent_panel_selected == 0 {
+                                                count - 1
+                                            } else {
+                                                app.agent_panel_selected - 1
+                                            };
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        let agents = app.agent_registry.all();
+                                        if let Some(info) = agents.get(app.agent_panel_selected) {
+                                            let id = info.id.clone();
+                                            app.active_agent_id = Some(id.clone());
+                                            app.status_message = Some(format!("Active agent: {}", id));
+                                        }
+                                    }
+                                    KeyCode::Char('r') | KeyCode::Char('R') if !ctrl => {
+                                        // Refresh: rescan lockfiles
+                                        app.startup_scan_agents().await;
+                                        app.status_message = Some("Agent list refreshed".to_string());
+                                    }
+                                    _ => {}
+                                },
                                 AppMode::MainMenu => match key.code {
                                     KeyCode::Down | KeyCode::Char('j') => app.next_item(),
                                     KeyCode::Up | KeyCode::Char('k') => app.previous_item(),
                                     KeyCode::Enter => {
-                                        if app.selected_index == 5 {
+                                        if app.selected_index == 6 {
                                             // Exit
                                             return Ok(());
                                         }

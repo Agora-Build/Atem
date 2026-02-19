@@ -43,6 +43,7 @@ pub enum AppMode {
     ClaudeChat,
     CodexChat,
     CommandExecution,
+    AgentPanel,
 }
 
 /// Which CLI backend is currently active for routing commands.
@@ -123,6 +124,10 @@ pub struct App {
     pub agent_registry: AgentRegistry,
     /// Live ACP WebSocket connections keyed by agent_id.
     pub acp_clients: HashMap<String, AcpClient>,
+    /// ID of the agent currently selected as the active routing target.
+    pub active_agent_id: Option<String>,
+    /// Cursor position in the AgentPanel list.
+    pub agent_panel_selected: usize,
 }
 
 impl App {
@@ -137,6 +142,7 @@ impl App {
                 "\u{1f916} Launch Claude Code".to_string(),
                 "\u{1f9e0} Launch Codex".to_string(),
                 "\u{1f4bb} Execute Shell Command".to_string(),
+                "\u{1f916} Agent Panel".to_string(),
                 "\u{2753} Help".to_string(),
                 "\u{1f6aa} Exit".to_string(),
             ],
@@ -197,6 +203,8 @@ impl App {
             pairing_code: None,
             agent_registry: AgentRegistry::new(),
             acp_clients: HashMap::new(),
+            active_agent_id: None,
+            agent_panel_selected: 0,
         }
     }
 
@@ -359,10 +367,15 @@ impl App {
                 self.input_text.clear();
             }
             4 => {
+                // Agent Panel
+                self.mode = AppMode::AgentPanel;
+                self.agent_panel_selected = 0;
+            }
+            5 => {
                 // Help
                 self.show_help_popup();
             }
-            5 => {
+            6 => {
                 // Exit - handled by caller
             }
             _ => {}
