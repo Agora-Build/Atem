@@ -358,8 +358,13 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         },
         Commands::Repl => crate::repl::run_repl().await,
         Commands::Login { server } => {
-            let session =
-                crate::auth::run_login_flow(server.as_deref()).await?;
+            let relay = if let Some(s) = server.as_deref() {
+                s.to_string()
+            } else {
+                let cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                cfg.astation_relay_url().to_string()
+            };
+            let session = crate::auth::run_login_flow(Some(&relay)).await?;
             session.save()?;
             println!("Session saved. You are now authenticated.");
             Ok(())
