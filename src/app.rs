@@ -790,9 +790,12 @@ impl App {
             err
         })?;
 
-        if let Err(err) = client
-            .login_and_join(&token, &rtm_account, &rtm_channel)
-            .await
+        if let Err(err) = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.login_and_join(&token, &rtm_account, &rtm_channel),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("RTM login timed out")))
         {
             self.status_message = Some(format!("Failed to login/join signaling: {}", err));
             return Err(err);
@@ -1852,6 +1855,9 @@ impl App {
                 // Store in memory for this session.
                 self.synced_customer_id = Some(customer_id.clone());
                 self.synced_customer_secret = Some(customer_secret.clone());
+                // Also update the in-memory config so the main menu status reflects it
+                self.config.customer_id = Some(customer_id.clone());
+                self.config.customer_secret = Some(customer_secret.clone());
 
                 // Persist to config file so CLI commands (e.g. `atem list project`) can use them.
                 let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();

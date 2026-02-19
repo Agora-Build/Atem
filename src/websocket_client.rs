@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::config::AtemConfig;
@@ -255,8 +256,9 @@ impl AstationClient {
     }
 
     pub async fn connect(&mut self, url: &str) -> Result<()> {
-        let (ws_stream, _) = connect_async(url)
+        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
             .await
+            .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
             .map_err(|e| anyhow!("Failed to connect to WebSocket: {}", e))?;
 
         let (mut write, mut read) = ws_stream.split();
@@ -267,8 +269,7 @@ impl AstationClient {
         tokio::spawn(async move {
             while let Some(message) = msg_rx.recv().await {
                 if let Ok(json) = serde_json::to_string(&message) {
-                    if let Err(e) = write.send(Message::Text(json)).await {
-                        eprintln!("❌ Failed to send WebSocket message: {}", e);
+                    if let Err(_) = write.send(Message::Text(json)).await {
                         break;
                     }
                 }
@@ -287,11 +288,9 @@ impl AstationClient {
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        println!("🔌 WebSocket connection closed by server");
                         break;
                     }
-                    Err(e) => {
-                        eprintln!("❌ WebSocket error: {}", e);
+                    Err(_) => {
                         break;
                     }
                     _ => {}
@@ -305,7 +304,6 @@ impl AstationClient {
         // Send initial status update to let Astation know we're connected
         self.send_status_update("connected").await?;
 
-        println!("🔌 Connected to Astation at {}", url);
         Ok(())
     }
 
@@ -519,14 +517,16 @@ impl AstationClient {
     pub async fn connect_with_pairing(&mut self, config: &AtemConfig) -> Result<String> {
         let station_url = config.astation_relay_url().to_string();
 
-        // 1. Register with relay → get pairing code
-        let code = self.register_pair(&station_url).await?;
-        println!("Pairing code: {}", code);
-        println!("Open: {}/pair?code={}", station_url, code);
+        // 1. Register with relay → get pairing code (5s timeout)
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.register_pair(&station_url),
+        )
+        .await
+        .map_err(|_| anyhow!("Relay registration timed out"))??;
 
         // 2. Try local Astation first
         if self.try_connect_local().await.is_ok() {
-            println!("Connected to local Astation");
             return Ok(code);
         }
 
@@ -538,7 +538,6 @@ impl AstationClient {
         };
         let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
         self.connect(&ws_url).await?;
-        println!("Connected via relay");
         Ok(code)
     }
 
@@ -548,7 +547,10 @@ impl AstationClient {
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client
             .post(format!("{}/api/pair", station_url))
             .json(&serde_json::json!({"hostname": hostname}))
