@@ -89,7 +89,7 @@ pub async fn create_server_session(
 
     #[derive(Deserialize)]
     struct CreateResp {
-        session_id: String,
+        id: String,
         otp: String,
     }
 
@@ -98,7 +98,7 @@ pub async fn create_server_session(
         .await
         .map_err(|e| anyhow!("Failed to parse server response: {}", e))?;
 
-    Ok((data.session_id, data.otp, server_url.to_string()))
+    Ok((data.id, data.otp, server_url.to_string()))
 }
 
 /// Poll the server for session status until granted, denied, or timeout.
@@ -129,7 +129,7 @@ pub async fn poll_session_status(
         if resp.status().is_success() {
             #[derive(Deserialize)]
             struct StatusResp {
-                session_id: String,
+                id: String,
                 status: String,
                 token: Option<String>,
             }
@@ -146,7 +146,7 @@ pub async fn poll_session_status(
                         .unwrap()
                         .as_secs();
                     return Ok(AuthSession {
-                        session_id: data.session_id,
+                        session_id: data.id,
                         token,
                         hostname: get_hostname(),
                         authenticated_at: now,
