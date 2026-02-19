@@ -229,17 +229,12 @@ mod tests {
         };
         let mut session = client.start_session().await.unwrap();
 
-        // Collect output until the exit message appears.
+        // Drain all output until channel closes.
         let mut combined = String::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
             match tokio::time::timeout_at(deadline, session.receiver.recv()).await {
-                Ok(Some(chunk)) => {
-                    combined.push_str(&chunk);
-                    if combined.contains("Claude CLI exited") {
-                        break;
-                    }
-                }
+                Ok(Some(chunk)) => combined.push_str(&chunk),
                 _ => break,
             }
         }
