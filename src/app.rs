@@ -1245,10 +1245,10 @@ impl App {
         let _session_id = client.new_session().await?;
 
         // Update kind from the server's own name
-        println!(
-            "\u{1f517} ACP connected: {} ({} v{})",
+        self.status_message = Some(format!(
+            "\u{1f517} Agent connected: {} ({} v{})",
             agent_id, server_info.kind, server_info.version
-        );
+        ));
 
         self.agent_registry.update_status(agent_id, AgentStatus::Idle);
         self.acp_clients.insert(agent_id.to_string(), client);
@@ -1598,20 +1598,18 @@ impl App {
                 Ok(code) => {
                     self.astation_connected = true;
                     self.pairing_code = Some(code);
-                    println!("\u{1f50c} Connected to Astation successfully");
+                    self.status_message = Some("Connected to Astation".to_string());
                 }
-                Err(e) => {
-                    println!("\u{26a0}\u{fe0f} Failed to connect via pairing: {}", e);
+                Err(_) => {
                     // Fall back to direct URL connection
                     let url = self.config.astation_ws().to_string();
                     match self.astation_client.connect(&url).await {
                         Ok(_) => {
                             self.astation_connected = true;
-                            println!("\u{1f50c} Connected to Astation (direct) successfully");
+                            self.status_message = Some("Connected to Astation".to_string());
                         }
-                        Err(e2) => {
-                            println!("\u{26a0}\u{fe0f} Failed to connect to Astation: {}", e2);
-                            // Continue in local mode
+                        Err(_) => {
+                            // Continue in local mode (no Astation)
                         }
                     }
                 }
@@ -1688,8 +1686,8 @@ impl App {
                     );
                 }
             }
-            AstationMessage::StatusUpdate { status, data } => {
-                println!("\u{1f4ca} Status update from Astation: {} - {:?}", status, data);
+            AstationMessage::StatusUpdate { status: _, data: _ } => {
+                // Status updates are informational; ignore in TUI
             }
             AstationMessage::CodexTaskResponse {
                 output,
@@ -1726,7 +1724,7 @@ impl App {
                 self.handle_voice_command(&text, is_final).await;
             }
             AstationMessage::MarkTaskAssignment { task_id, received_at_ms } => {
-                println!("\u{1f4cc} Mark task assignment received: {}", task_id);
+                self.status_message = Some(format!("\u{1f4cc} Task received: {}", task_id));
                 match self.load_and_build_work_item(&task_id, received_at_ms) {
                     Ok(item) => {
                         let main_busy = self.dispatcher.main_is_active();
@@ -1735,7 +1733,7 @@ impl App {
                         self.try_dispatch_main().await;
                     }
                     Err(err) => {
-                        eprintln!("\u{274c} Failed to load mark task {}: {}", task_id, err);
+                        self.status_message = Some(format!("\u{274c} Failed to load task {}: {}", task_id, err));
                         let _ = self
                             .astation_client
                             .send_mark_result(&task_id, false, &format!("Failed to load task: {}", err))
@@ -1768,7 +1766,7 @@ impl App {
                 context,
                 request_id,
             } => {
-                println!("\u{1f5bc} Generate explainer requested: {}", topic);
+                self.status_message = Some(format!("\u{1f5bc} Generating explainer: {}", topic));
                 match crate::visual_explainer::VisualExplainer::new() {
                     Ok(explainer) => {
                         match explainer.generate(&topic, context.as_deref()).await {
@@ -1779,7 +1777,7 @@ impl App {
                                     .await;
                             }
                             Err(e) => {
-                                eprintln!("\u{274c} Explainer generation failed: {}", e);
+                                self.status_message = Some(format!("\u{274c} Explainer failed: {}", e));
                                 let _ = self
                                     .astation_client
                                     .send_explainer_error(request_id, &topic, &e.to_string())
@@ -1788,7 +1786,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        eprintln!("\u{274c} VisualExplainer init failed: {}", e);
+                        self.status_message = Some(format!("\u{274c} VisualExplainer init failed: {}", e));
                         let _ = self
                             .astation_client
                             .send_explainer_error(request_id, &topic, &e.to_string())
@@ -1798,7 +1796,6 @@ impl App {
             }
             AstationMessage::AgentListRequest => {
                 let agents = self.agent_registry.all();
-                println!("\u{1f916} Agent list requested — {} agent(s) known", agents.len());
                 let _ = self.astation_client.send_agent_list(agents).await;
             }
             AstationMessage::AgentPrompt {
@@ -1806,12 +1803,11 @@ impl App {
                 session_id,
                 text,
             } => {
-                println!("\u{1f4ac} Agent prompt → {} (session {}): {:?}", agent_id, session_id, &text[..text.len().min(60)]);
                 // Route to the appropriate backend.
                 let agent = self.agent_registry.get(&agent_id);
                 match agent {
                     None => {
-                        eprintln!("\u{274c} Unknown agent: {}", agent_id);
+                        self.status_message = Some(format!("\u{274c} Unknown agent: {}", agent_id));
                     }
                     Some(info) => match info.protocol {
                         AgentProtocol::Pty => {
@@ -1824,7 +1820,7 @@ impl App {
                                     let _ = self.send_codex_prompt(&text).await;
                                 }
                                 AgentKind::Unknown(_) => {
-                                    eprintln!("\u{274c} No PTY route for unknown agent kind");
+                                    self.status_message = Some("\u{274c} No PTY route for unknown agent kind".to_string());
                                 }
                             }
                         }
@@ -1832,12 +1828,12 @@ impl App {
                             // Try the live client first; connect on demand if needed.
                             if !self.acp_clients.contains_key(&agent_id) {
                                 if let Err(e) = self.connect_acp_agent(&agent_id).await {
-                                    eprintln!("\u{274c} ACP connect failed for {}: {}", agent_id, e);
+                                    self.status_message = Some(format!("\u{274c} ACP connect failed for {}: {}", agent_id, e));
                                 }
                             }
                             if let Some(acp) = self.acp_clients.get_mut(&agent_id) {
                                 if let Err(e) = acp.send_prompt(&text) {
-                                    eprintln!("\u{274c} ACP send_prompt failed: {}", e);
+                                    self.status_message = Some(format!("\u{274c} ACP send failed: {}", e));
                                 } else {
                                     self.agent_registry
                                         .update_status(&agent_id, AgentStatus::Thinking);
@@ -1851,8 +1847,7 @@ impl App {
                 customer_id,
                 customer_secret,
             } => {
-                let id_preview = &customer_id[..4.min(customer_id.len())];
-                println!("\u{1f511} Credentials synced from Astation (customer_id: {}...)", id_preview);
+                let id_preview = customer_id[..4.min(customer_id.len())].to_string();
 
                 // Store in memory for this session.
                 self.synced_customer_id = Some(customer_id.clone());
@@ -1863,13 +1858,13 @@ impl App {
                 cfg.customer_id = Some(customer_id);
                 cfg.customer_secret = Some(customer_secret);
                 if let Err(e) = cfg.save_to_disk() {
-                    eprintln!("\u{26a0}\u{fe0f}  Failed to persist synced credentials: {}", e);
+                    self.status_message = Some(format!("\u{26a0}\u{fe0f} Could not save credentials: {}", e));
                 } else {
-                    println!("   Saved to ~/.config/atem/config.toml");
+                    self.status_message = Some(format!("\u{1f511} Credentials synced ({}...)", id_preview));
                 }
             }
             _ => {
-                println!("\u{1f4e8} Received message from Astation: {:?}", message);
+                // Unknown/unhandled message type — ignore silently
             }
         }
     }
@@ -1906,7 +1901,7 @@ impl App {
         let item = match self.work_items.get(&task_id) {
             Some(item) => item.clone(),
             None => {
-                eprintln!("\u{274c} Work item not found for task {}", task_id);
+                self.status_message = Some(format!("\u{274c} Task item not found: {}", task_id));
                 self.dispatcher.complete_main();
                 return;
             }
@@ -1955,7 +1950,7 @@ impl App {
         }
 
         self.refresh_claude_view();
-        println!("\u{1f4cc} Mark task {} sent to Claude", task_id);
+        self.status_message = Some(format!("\u{1f4cc} Task {} → Claude", task_id));
     }
 
     fn build_mark_task_prompt(&self, task: &Value) -> String {
@@ -2031,7 +2026,6 @@ impl App {
                 .send_mark_result(&task_id, success, message)
                 .await;
             self.work_items.remove(&task_id);
-            println!("\u{1f4cc} Mark task {} result sent: success={}", task_id, success);
 
             // Dispatch next queued task
             self.try_dispatch_main().await;
@@ -2051,8 +2045,7 @@ impl App {
         if should_send && self.voice_commands.has_content() {
             let command = self.voice_commands.take();
 
-            println!("\u{1f3a4} Voice command: {}", command);
-            self.status_message = Some(format!("Voice: {}", command));
+            self.status_message = Some(format!("\u{1f3a4} Voice: {}", command));
 
             // Send to Claude Code
             if let Err(err) = self.send_claude_prompt(&command).await {

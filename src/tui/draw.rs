@@ -99,6 +99,39 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
 }
 
 pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    // Build credential status line
+    let cred_line = if app.synced_customer_id.is_some() {
+        format!(
+            "\u{1f511} Credentials: synced from Astation{}",
+            if app.astation_connected { " | \u{1f7e2} Astation connected" } else { "" }
+        )
+    } else if app.config.customer_id.is_some() {
+        "\u{1f511} Credentials: from config file".to_string()
+    } else {
+        "\u{26a0}\u{fe0f}  No credentials — run `atem login` or set AGORA_CUSTOMER_ID".to_string()
+    };
+
+    let cred_style = if app.synced_customer_id.is_some() || app.config.customer_id.is_some() {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+
+    let cred_paragraph = Paragraph::new(cred_line)
+        .style(cred_style)
+        .block(Block::default().borders(Borders::NONE));
+
+    // Split area: credential status bar (1 line) + menu list
+    let chunks = ratatui::layout::Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    frame.render_widget(cred_paragraph, chunks[0]);
+
     let items: Vec<ListItem> = app
         .main_menu_items
         .iter()
@@ -125,7 +158,7 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
-    frame.render_widget(list, area);
+    frame.render_widget(list, chunks[1]);
 }
 
 pub(crate) fn draw_output_view(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
