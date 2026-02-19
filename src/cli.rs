@@ -105,6 +105,9 @@ pub enum Commands {
         /// Astation server URL (defaults to https://station.agora.build)
         #[arg(long)]
         server: Option<String>,
+        /// After pairing, connect to Astation and save Agora credentials to config
+        #[arg(long)]
+        save_credentials: bool,
     },
     /// Clear saved authentication session
     Logout,
@@ -431,7 +434,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
         },
         Commands::Repl => crate::repl::run_repl().await,
-        Commands::Login { server } => {
+        Commands::Login { server, save_credentials } => {
             let relay = if let Some(s) = server.as_deref() {
                 s.to_string()
             } else {
@@ -441,6 +444,21 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             let session = crate::auth::run_login_flow(Some(&relay)).await?;
             session.save()?;
             println!("Session saved. You are now authenticated.");
+
+            if save_credentials {
+                println!("Syncing Agora credentials from Astation...");
+                // Use a config with no credentials to force the Astation WS path.
+                let mut cfg_no_creds = crate::config::AtemConfig::load().unwrap_or_default();
+                cfg_no_creds.customer_id = None;
+                cfg_no_creds.customer_secret = None;
+                match resolve_credentials(&cfg_no_creds).await {
+                    Ok((cid, _)) => println!(
+                        "Credentials saved (customer_id: {}...)",
+                        &cid[..4.min(cid.len())]
+                    ),
+                    Err(e) => eprintln!("Warning: could not sync credentials: {e}"),
+                }
+            }
             Ok(())
         }
         Commands::Logout => {
@@ -761,8 +779,9 @@ mod tests {
     fn cli_login_parses() {
         let cli = Cli::try_parse_from(["atem", "login"]).unwrap();
         match cli.command {
-            Some(Commands::Login { server }) => {
+            Some(Commands::Login { server, save_credentials }) => {
                 assert!(server.is_none());
+                assert!(!save_credentials);
             }
             _ => panic!("Expected Login command"),
         }
@@ -773,7 +792,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["atem", "login", "--server", "http://localhost:3000"]).unwrap();
         match cli.command {
-            Some(Commands::Login { server }) => {
+            Some(Commands::Login { server, .. }) => {
                 assert_eq!(server.as_deref(), Some("http://localhost:3000"));
             }
             _ => panic!("Expected Login command with server"),
@@ -781,6 +800,18 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn cli_login_save_credentials_flag() {
+        let cli =
+            Cli::try_parse_from(["atem", "login", "--save-credentials"]).unwrap();
+        match cli.command {
+            Some(Commands::Login { save_credentials, .. }) => {
+                assert!(save_credentials);
+            }
+            _ => panic!("Expected Login command with save_credentials"),
+        }
+    }
+
     fn cli_logout_parses() {
         let cli = Cli::try_parse_from(["atem", "logout"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Logout)));
