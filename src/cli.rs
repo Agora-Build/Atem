@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "atem")]
+#[command(version)]
 #[command(about = "Agora.io CLI tool with AI integration")]
 pub struct Cli {
     #[command(subcommand)]
