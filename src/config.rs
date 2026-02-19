@@ -11,7 +11,7 @@ pub struct AtemConfig {
     pub rtm_channel: Option<String>,
     pub rtm_account: Option<String>,
     pub astation_ws: Option<String>,
-    pub station_relay_url: Option<String>,
+    pub astation_relay_url: Option<String>,
 }
 
 /// Active project state persisted to ~/.config/atem/active_project.json
@@ -52,8 +52,8 @@ impl AtemConfig {
         if let Ok(val) = std::env::var("ASTATION_WS") {
             config.astation_ws = Some(val);
         }
-        if let Ok(val) = std::env::var("AGORA_STATION_RELAY_URL") {
-            config.station_relay_url = Some(val);
+        if let Ok(val) = std::env::var("ASTATION_RELAY_URL") {
+            config.astation_relay_url = Some(val);
         }
 
         Ok(config)
@@ -98,8 +98,8 @@ impl AtemConfig {
             self.astation_ws.as_deref().unwrap_or("(not set)")
         ));
         lines.push(format!(
-            "station_relay_url: {}",
-            self.station_relay_url.as_deref().unwrap_or("(not set)")
+            "astation_relay_url: {}",
+            self.astation_relay_url.as_deref().unwrap_or("(not set)")
         ));
 
         // Show active project info
@@ -142,8 +142,8 @@ impl AtemConfig {
     }
 
     /// Get Station relay URL with fallback default
-    pub fn station_relay_url(&self) -> &str {
-        self.station_relay_url
+    pub fn astation_relay_url(&self) -> &str {
+        self.astation_relay_url
             .as_deref()
             .unwrap_or("https://station.agora.build")
     }
@@ -256,7 +256,7 @@ mod tests {
         assert!(config.rtm_channel.is_none());
         assert!(config.rtm_account.is_none());
         assert!(config.astation_ws.is_none());
-        assert!(config.station_relay_url.is_none());
+        assert!(config.astation_relay_url.is_none());
     }
 
     #[test]
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(config.rtm_channel(), "atem_channel");
         assert_eq!(config.rtm_account(), "atem01");
         assert_eq!(config.astation_ws(), "ws://127.0.0.1:8080/ws");
-        assert_eq!(config.station_relay_url(), "https://station.agora.build");
+        assert_eq!(config.astation_relay_url(), "https://station.agora.build");
     }
 
     #[test]
@@ -352,24 +352,24 @@ mod tests {
     }
 
     #[test]
-    fn test_station_relay_url_default() {
+    fn test_astation_relay_url_default() {
         let config = AtemConfig::default();
-        assert_eq!(config.station_relay_url(), "https://station.agora.build");
+        assert_eq!(config.astation_relay_url(), "https://station.agora.build");
     }
 
     #[test]
-    fn test_station_relay_url_custom() {
+    fn test_astation_relay_url_custom() {
         let config = AtemConfig {
-            station_relay_url: Some("https://custom.station.example.com".to_string()),
+            astation_relay_url: Some("https://custom.station.example.com".to_string()),
             ..Default::default()
         };
-        assert_eq!(config.station_relay_url(), "https://custom.station.example.com");
+        assert_eq!(config.astation_relay_url(), "https://custom.station.example.com");
     }
 
     #[test]
-    fn test_display_masked_includes_station_relay_url() {
+    fn test_display_masked_includes_astation_relay_url() {
         let config = AtemConfig::default();
         let display = config.display_masked();
-        assert!(display.contains("station_relay_url"));
+        assert!(display.contains("astation_relay_url"));
     }
 }
