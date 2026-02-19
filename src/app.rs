@@ -30,6 +30,8 @@ use crate::config::AtemConfig;
 use crate::rtm_client::{RtmClient, RtmConfig, RtmEvent};
 use crate::token::generate_rtm_token;
 use crate::websocket_client::{AstationClient, AstationMessage};
+use crate::agent_client::{AgentInfo, AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
+use crate::agent_registry::AgentRegistry;
 
 pub const AGORA_RTM_TOKEN_TTL_SECS: u32 = 3600;
 
@@ -116,6 +118,8 @@ pub struct App {
     pub active_cli: ActiveCli,
     pub pinned_cli: Option<ActiveCli>,
     pub pairing_code: Option<String>,
+    /// Registry of all known agents (PTY + ACP, launched or discovered).
+    pub agent_registry: AgentRegistry,
 }
 
 impl App {
@@ -188,6 +192,7 @@ impl App {
             active_cli: ActiveCli::Claude,
             pinned_cli: None,
             pairing_code: None,
+            agent_registry: AgentRegistry::new(),
         }
     }
 
@@ -1125,7 +1130,63 @@ impl App {
                 Some(format!("Failed to sync Claude terminal size: {}", err));
         }
         self.claude_waiting_exit = false;
+
+        // Register (or re-register) the Claude PTY session in the agent registry.
+        // We generate a stable ID by checking if one already exists for a Launched
+        // Claude PTY; if not, mint a new one.
+        let existing_id = self
+            .agent_registry
+            .by_protocol(AgentProtocol::Pty)
+            .into_iter()
+            .find(|a| a.kind == AgentKind::ClaudeCode && a.origin == AgentOrigin::Launched)
+            .map(|a| a.id);
+        let agent_id = existing_id.unwrap_or_else(|| {
+            format!("claude-pty-{}", uuid::Uuid::new_v4())
+        });
+        self.agent_registry.register(AgentInfo {
+            id: agent_id.clone(),
+            name: "claude-code".to_string(),
+            kind: AgentKind::ClaudeCode,
+            protocol: AgentProtocol::Pty,
+            origin: AgentOrigin::Launched,
+            status: AgentStatus::Idle,
+            session_ids: vec![],
+            acp_url: None,
+            pty_pid: None,
+        });
+
         Ok(true)
+    }
+
+    /// Scan lockfiles for externally started agents and register them.
+    ///
+    /// Called once at startup (or on demand).  Agents that are already in
+    /// the registry (same ACP URL) are skipped.
+    pub async fn startup_scan_agents(&mut self) {
+        use crate::agent_detector::scan_lockfiles;
+
+        let detected = scan_lockfiles();
+        for agent in detected {
+            if self.agent_registry.has_acp_url(&agent.acp_url) {
+                continue; // already registered
+            }
+            let id = format!(
+                "{}-ext-{}",
+                agent.kind,
+                agent.pid.map(|p| p.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            );
+            self.agent_registry.register(AgentInfo {
+                id,
+                name: agent.kind.to_string(),
+                kind: agent.kind,
+                protocol: AgentProtocol::Acp,
+                origin: AgentOrigin::External,
+                status: AgentStatus::Idle,
+                session_ids: vec![],
+                acp_url: Some(agent.acp_url),
+                pty_pid: agent.pid,
+            });
+        }
     }
 
     pub fn record_claude_output(&mut self, data: impl AsRef<str>) {
@@ -1582,6 +1643,45 @@ impl App {
                     "Received command: {}",
                     &command[..command.len().min(50)]
                 ));
+            }
+            AstationMessage::AgentListRequest => {
+                let agents = self.agent_registry.all();
+                println!("\u{1f916} Agent list requested — {} agent(s) known", agents.len());
+                let _ = self.astation_client.send_agent_list(agents).await;
+            }
+            AstationMessage::AgentPrompt {
+                agent_id,
+                session_id,
+                text,
+            } => {
+                println!("\u{1f4ac} Agent prompt → {} (session {}): {:?}", agent_id, session_id, &text[..text.len().min(60)]);
+                // Route to the appropriate backend.
+                let agent = self.agent_registry.get(&agent_id);
+                match agent {
+                    None => {
+                        eprintln!("\u{274c} Unknown agent: {}", agent_id);
+                    }
+                    Some(info) => match info.protocol {
+                        AgentProtocol::Pty => {
+                            // Route to the active PTY based on agent kind.
+                            match info.kind {
+                                AgentKind::ClaudeCode => {
+                                    let _ = self.send_claude_prompt(&text).await;
+                                }
+                                AgentKind::Codex => {
+                                    let _ = self.send_codex_prompt(&text).await;
+                                }
+                                AgentKind::Unknown(_) => {
+                                    eprintln!("\u{274c} No PTY route for unknown agent kind");
+                                }
+                            }
+                        }
+                        AgentProtocol::Acp => {
+                            // ACP routing will be wired in Stage 3.
+                            eprintln!("\u{1f6a7} ACP prompt routing not yet implemented for {}", agent_id);
+                        }
+                    },
+                }
             }
             _ => {
                 println!("\u{1f4e8} Received message from Astation: {:?}", message);

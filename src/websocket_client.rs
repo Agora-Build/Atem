@@ -132,6 +132,48 @@ pub enum AstationMessage {
         success: bool,
         message: String,
     },
+
+    // ── Agent hub messages ────────────────────────────────────────────────
+
+    /// Astation → Atem: request the list of connected agents.
+    #[serde(rename = "agentListRequest")]
+    AgentListRequest,
+
+    /// Atem → Astation: snapshot of all registered agents.
+    #[serde(rename = "agentListResponse")]
+    AgentListResponse {
+        agents: Vec<crate::agent_client::AgentInfo>,
+    },
+
+    /// Astation → Atem: send a text prompt to a specific agent.
+    #[serde(rename = "agentPrompt")]
+    AgentPrompt {
+        agent_id: String,
+        session_id: String,
+        text: String,
+    },
+
+    /// Atem → Astation: a streaming event from an agent.
+    ///
+    /// `event_type` is one of: `"text_delta"`, `"tool_call"`,
+    /// `"tool_result"`, `"done"`, `"error"`, `"disconnected"`.
+    #[serde(rename = "agentEvent")]
+    AgentEventMsg {
+        agent_id: String,
+        session_id: String,
+        event_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
+
+    /// Atem → Astation: an agent's status changed.
+    #[serde(rename = "agentStatusUpdate")]
+    AgentStatusUpdate {
+        agent_id: String,
+        status: crate::agent_client::AgentStatus,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +374,64 @@ impl AstationClient {
             context,
         };
         self.send_message(message).await
+    }
+
+    /// Reply to an `agentListRequest` with all currently registered agents.
+    pub async fn send_agent_list(
+        &self,
+        agents: Vec<crate::agent_client::AgentInfo>,
+    ) -> Result<()> {
+        self.send_message(AstationMessage::AgentListResponse { agents }).await
+    }
+
+    /// Stream an agent event to Astation.
+    pub async fn send_agent_event(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        event: &crate::agent_client::AgentEvent,
+    ) -> Result<()> {
+        use crate::agent_client::AgentEvent;
+        let (event_type, text, data) = match event {
+            AgentEvent::TextDelta(t) => {
+                ("text_delta".to_string(), Some(t.clone()), None)
+            }
+            AgentEvent::ToolCall { id, name, input } => (
+                "tool_call".to_string(),
+                None,
+                Some(serde_json::json!({ "id": id, "name": name, "input": input })),
+            ),
+            AgentEvent::ToolResult { id, output } => (
+                "tool_result".to_string(),
+                None,
+                Some(serde_json::json!({ "id": id, "output": output })),
+            ),
+            AgentEvent::Done => ("done".to_string(), None, None),
+            AgentEvent::Error(msg) => ("error".to_string(), Some(msg.clone()), None),
+            AgentEvent::Disconnected => ("disconnected".to_string(), None, None),
+        };
+
+        self.send_message(AstationMessage::AgentEventMsg {
+            agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            event_type,
+            text,
+            data,
+        })
+        .await
+    }
+
+    /// Notify Astation that an agent's status has changed.
+    pub async fn send_agent_status(
+        &self,
+        agent_id: &str,
+        status: crate::agent_client::AgentStatus,
+    ) -> Result<()> {
+        self.send_message(AstationMessage::AgentStatusUpdate {
+            agent_id: agent_id.to_string(),
+            status,
+        })
+        .await
     }
 
     /// Register with the relay service to get a pairing code, then connect.
@@ -1053,6 +1153,165 @@ mod tests {
             assert!(context.is_empty());
         } else {
             panic!("expected UserCommand");
+        }
+    }
+
+    // ── Agent hub message tests ───────────────────────────────────────────
+
+    fn make_agent_info(id: &str) -> crate::agent_client::AgentInfo {
+        use crate::agent_client::{AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
+        crate::agent_client::AgentInfo {
+            id: id.to_string(),
+            name: format!("agent-{id}"),
+            kind: AgentKind::ClaudeCode,
+            protocol: AgentProtocol::Acp,
+            origin: AgentOrigin::Launched,
+            status: AgentStatus::Idle,
+            session_ids: vec![],
+            acp_url: Some("ws://localhost:8765".to_string()),
+            pty_pid: None,
+        }
+    }
+
+    #[test]
+    fn agent_list_request_roundtrip() {
+        let msg = AstationMessage::AgentListRequest;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"agentListRequest\""));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, AstationMessage::AgentListRequest));
+    }
+
+    #[test]
+    fn agent_list_response_roundtrip() {
+        let msg = AstationMessage::AgentListResponse {
+            agents: vec![make_agent_info("abc"), make_agent_info("def")],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AgentListResponse { agents } = parsed {
+            assert_eq!(agents.len(), 2);
+            assert_eq!(agents[0].id, "abc");
+            assert_eq!(agents[1].id, "def");
+        } else {
+            panic!("expected AgentListResponse");
+        }
+    }
+
+    #[test]
+    fn agent_list_response_empty() {
+        let msg = AstationMessage::AgentListResponse { agents: vec![] };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AgentListResponse { agents } = parsed {
+            assert!(agents.is_empty());
+        } else {
+            panic!("expected AgentListResponse");
+        }
+    }
+
+    #[test]
+    fn agent_prompt_roundtrip() {
+        let msg = AstationMessage::AgentPrompt {
+            agent_id: "agent-1".into(),
+            session_id: "sess-1".into(),
+            text: "write a unit test".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AgentPrompt {
+            agent_id,
+            session_id,
+            text,
+        } = parsed
+        {
+            assert_eq!(agent_id, "agent-1");
+            assert_eq!(session_id, "sess-1");
+            assert_eq!(text, "write a unit test");
+        } else {
+            panic!("expected AgentPrompt");
+        }
+    }
+
+    #[test]
+    fn agent_event_text_delta_roundtrip() {
+        let msg = AstationMessage::AgentEventMsg {
+            agent_id: "agent-1".into(),
+            session_id: "sess-1".into(),
+            event_type: "text_delta".into(),
+            text: Some("hello world".into()),
+            data: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        // The outer "data" content key is always present (serde tagged enum).
+        // The inner optional "text" field should be present; inner "data" skipped.
+        assert!(json.contains("\"text\""));
+        assert!(json.contains("hello world"));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AgentEventMsg {
+            event_type, text, data, ..
+        } = parsed
+        {
+            assert_eq!(event_type, "text_delta");
+            assert_eq!(text.as_deref(), Some("hello world"));
+            assert!(data.is_none());
+        } else {
+            panic!("expected AgentEventMsg");
+        }
+    }
+
+    #[test]
+    fn agent_event_done_roundtrip() {
+        let msg = AstationMessage::AgentEventMsg {
+            agent_id: "agent-1".into(),
+            session_id: "sess-1".into(),
+            event_type: "done".into(),
+            text: None,
+            data: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        // Inner optional "text" and "data" fields should both be omitted.
+        assert!(!json.contains("\"text\""));
+        // Outer "data" content key is present but inner field should not add another "data"
+        let parsed_val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let inner = &parsed_val["data"];
+        assert!(inner["text"].is_null());
+        assert!(inner["data"].is_null());
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, AstationMessage::AgentEventMsg { .. }));
+    }
+
+    #[test]
+    fn agent_status_update_roundtrip() {
+        use crate::agent_client::AgentStatus;
+        let msg = AstationMessage::AgentStatusUpdate {
+            agent_id: "agent-1".into(),
+            status: AgentStatus::Thinking,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AgentStatusUpdate { agent_id, status } = parsed {
+            assert_eq!(agent_id, "agent-1");
+            assert_eq!(status, AgentStatus::Thinking);
+        } else {
+            panic!("expected AgentStatusUpdate");
+        }
+    }
+
+    #[test]
+    fn agent_list_response_preserves_all_info_fields() {
+        let info = make_agent_info("test-id");
+        let msg = AstationMessage::AgentListResponse {
+            agents: vec![info],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::AgentListResponse { agents } = parsed {
+            let a = &agents[0];
+            assert_eq!(a.id, "test-id");
+            assert_eq!(a.acp_url.as_deref(), Some("ws://localhost:8765"));
+        } else {
+            panic!("expected AgentListResponse");
         }
     }
 }
