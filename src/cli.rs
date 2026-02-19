@@ -1,6 +1,73 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+/// Resolve Agora REST credentials following the canonical priority:
+///   runtime-synced (via WS) > env vars > config file
+///
+/// For CLI commands there is no in-memory synced state, so the effective
+/// priority here is: env vars > config file > Astation WS fallback.
+///
+/// Callers inside the TUI that already have synced credentials should use
+/// them directly and not call this function.
+async fn resolve_credentials(
+    config: &crate::config::AtemConfig,
+) -> Result<(String, String)> {
+    // 1. env vars override config — AtemConfig::load() already applied env vars,
+    //    so customer_id / customer_secret already reflect env > config file.
+    if let (Some(cid), Some(csecret)) =
+        (config.customer_id.clone(), config.customer_secret.clone())
+    {
+        return Ok((cid, csecret));
+    }
+
+    // 2. No local credentials — try Astation WS (receives credentialSync on connect).
+    let ws_url = config.astation_ws().to_string();
+    let mut client = crate::websocket_client::AstationClient::new();
+    client.connect(&ws_url).await.map_err(|e| {
+        anyhow::anyhow!(
+            "No credentials found locally and could not connect to Astation ({ws_url}): {e}\n\
+            Fix options:\n\
+            1. Run `atem sync credentials` (needs Astation running with credentials set)\n\
+            2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars\n\
+            3. Add customer_id / customer_secret to ~/.config/atem/config.toml"
+        )
+    })?;
+
+    let timeout = tokio::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            match client.recv_message().await {
+                Some(crate::websocket_client::AstationMessage::CredentialSync {
+                    customer_id,
+                    customer_secret,
+                }) => return Some((customer_id, customer_secret)),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await;
+
+    let (cid, csecret) = result
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for credentials from Astation"))?
+        .ok_or_else(|| anyhow::anyhow!("Astation disconnected before sending credentials"))?;
+
+    // Persist so subsequent CLI calls don't need to connect again.
+    let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+    cfg.customer_id = Some(cid.clone());
+    cfg.customer_secret = Some(csecret.clone());
+    if let Err(e) = cfg.save_to_disk() {
+        eprintln!("Warning: could not persist credentials to config: {e}");
+    } else {
+        println!(
+            "Credentials synced and saved to {}",
+            crate::config::AtemConfig::config_path().display()
+        );
+    }
+
+    Ok((cid, csecret))
+}
+
 #[derive(Parser)]
 #[command(name = "atem")]
 #[command(version)]
@@ -293,19 +360,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Project { project_command } => match project_command {
             ProjectCommands::Use { app_id } => {
                 let config = crate::config::AtemConfig::load()?;
-                let cid = config.customer_id.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "AGORA_CUSTOMER_ID not configured. Set it in ~/.config/atem/config.toml or as env var."
-                    )
-                })?;
-                let csecret = config.customer_secret.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "AGORA_CUSTOMER_SECRET not configured. Set it in ~/.config/atem/config.toml or as env var."
-                    )
-                })?;
-
+                let (cid, csecret) = resolve_credentials(&config).await?;
                 let projects =
-                    crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret).await?;
+                    crate::agora_api::fetch_agora_projects_with_credentials(&cid, &csecret).await?;
                 let project = projects
                     .iter()
                     .find(|p| p.vendor_key == app_id)
@@ -350,125 +407,26 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::List { list_command } => match list_command {
             ListCommands::Project { show_certificates } => {
                 let config = crate::config::AtemConfig::load()?;
-
-                // Priority 1: local credentials (env > config file)
-                if let (Some(cid), Some(csecret)) =
-                    (config.customer_id.as_deref(), config.customer_secret.as_deref())
-                {
-                    let projects =
-                        crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret)
-                            .await?;
-                    print!("{}", crate::agora_api::format_projects(&projects, show_certificates));
-                    return Ok(());
-                }
-
-                // Priority 2: request projects from local Astation over WebSocket
-                println!("No local credentials — connecting to Astation...");
-                let ws_url = config.astation_ws();
-                let mut client = crate::websocket_client::AstationClient::new();
-                match client.connect(ws_url).await {
-                    Ok(()) => {
-                        client.request_projects().await?;
-                        // Wait up to 5 seconds for response
-                        let timeout = tokio::time::Duration::from_secs(5);
-                        let result = tokio::time::timeout(timeout, async {
-                            loop {
-                                match client.recv_message().await {
-                                    Some(crate::websocket_client::AstationMessage::ProjectListResponse {
-                                        projects,
-                                        ..
-                                    }) => return Some(projects),
-                                    Some(_) => continue,
-                                    None => return None,
-                                }
-                            }
-                        })
-                        .await;
-
-                        match result {
-                            Ok(Some(projects)) => {
-                                if projects.is_empty() {
-                                    println!("No projects found in your Agora account.");
-                                } else {
-                                    for (i, p) in projects.iter().enumerate() {
-                                        println!("{}. {} (ID: {})", i + 1, p.name, p.id);
-                                    }
-                                }
-                            }
-                            Ok(None) | Err(_) => {
-                                anyhow::bail!(
-                                    "Timed out waiting for projects from Astation.\n\
-                                    Configure credentials in ~/.config/atem/config.toml or run `atem` \
-                                    to sync them automatically after pairing."
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        anyhow::bail!(
-                            "No credentials found and could not connect to Astation ({}): {}\n\
-                            Options:\n\
-                            1. Run `atem` (TUI) — credentials auto-sync from Astation on connect\n\
-                            2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars\n\
-                            3. Add to ~/.config/atem/config.toml",
-                            ws_url, e
-                        );
-                    }
-                }
+                let (cid, csecret) = resolve_credentials(&config).await?;
+                let projects =
+                    crate::agora_api::fetch_agora_projects_with_credentials(&cid, &csecret)
+                        .await?;
+                print!("{}", crate::agora_api::format_projects(&projects, show_certificates));
                 Ok(())
             }
         },
         Commands::Sync { sync_command } => match sync_command {
             SyncCommands::Credentials => {
-                let config = crate::config::AtemConfig::load()?;
-                let ws_url = config.astation_ws();
-                println!("Connecting to Astation at {}...", ws_url);
-
-                let mut client = crate::websocket_client::AstationClient::new();
-                client.connect(ws_url).await.map_err(|e| {
-                    anyhow::anyhow!(
-                        "Could not connect to Astation ({}): {}\n\
-                        Make sure Astation is running and configured in ~/.config/atem/config.toml",
-                        ws_url, e
-                    )
-                })?;
-
-                // Astation sends credentialSync in response to our statusUpdate on connect.
-                let timeout = tokio::time::Duration::from_secs(5);
-                let result = tokio::time::timeout(timeout, async {
-                    loop {
-                        match client.recv_message().await {
-                            Some(crate::websocket_client::AstationMessage::CredentialSync {
-                                customer_id,
-                                customer_secret,
-                            }) => return Some((customer_id, customer_secret)),
-                            Some(_) => continue,
-                            None => return None,
-                        }
-                    }
-                })
-                .await;
-
-                match result {
-                    Ok(Some((cid, csecret))) => {
-                        let id_preview = cid[..4.min(cid.len())].to_string();
-                        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                        cfg.customer_id = Some(cid);
-                        cfg.customer_secret = Some(csecret);
-                        cfg.save_to_disk()?;
-                        println!(
-                            "Credentials synced from Astation (customer_id: {}...) and saved to {}",
-                            id_preview,
-                            crate::config::AtemConfig::config_path().display()
-                        );
-                    }
-                    Ok(None) | Err(_) => {
-                        anyhow::bail!(
-                            "Timed out waiting for credentials from Astation.\n\
-                            Make sure Astation has credentials configured (Settings → Agora Credentials)."
-                        );
-                    }
-                }
+                // Force Astation WS path by using a config with no credentials set,
+                // so resolve_credentials always connects to Astation.
+                let mut cfg_no_creds = crate::config::AtemConfig::load().unwrap_or_default();
+                cfg_no_creds.customer_id = None;
+                cfg_no_creds.customer_secret = None;
+                let (cid, _) = resolve_credentials(&cfg_no_creds).await?;
+                println!(
+                    "Credentials synced (customer_id: {}...) — run `atem list project` to verify",
+                    &cid[..4.min(cid.len())]
+                );
                 Ok(())
             }
         },
