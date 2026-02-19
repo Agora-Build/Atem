@@ -339,20 +339,71 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::List { list_command } => match list_command {
             ListCommands::Project { show_certificates } => {
                 let config = crate::config::AtemConfig::load()?;
-                let cid = config.customer_id.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "AGORA_CUSTOMER_ID not configured. Set it in ~/.config/atem/config.toml or as env var."
-                    )
-                })?;
-                let csecret = config.customer_secret.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "AGORA_CUSTOMER_SECRET not configured. Set it in ~/.config/atem/config.toml or as env var."
-                    )
-                })?;
 
-                let projects =
-                    crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret).await?;
-                print!("{}", crate::agora_api::format_projects(&projects, show_certificates));
+                // Priority 1: local credentials (env > config file)
+                if let (Some(cid), Some(csecret)) =
+                    (config.customer_id.as_deref(), config.customer_secret.as_deref())
+                {
+                    let projects =
+                        crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret)
+                            .await?;
+                    print!("{}", crate::agora_api::format_projects(&projects, show_certificates));
+                    return Ok(());
+                }
+
+                // Priority 2: request projects from local Astation over WebSocket
+                println!("No local credentials — connecting to Astation...");
+                let ws_url = config.astation_ws();
+                let mut client = crate::websocket_client::AstationClient::new();
+                match client.connect(ws_url).await {
+                    Ok(()) => {
+                        client.request_projects().await?;
+                        // Wait up to 5 seconds for response
+                        let timeout = tokio::time::Duration::from_secs(5);
+                        let result = tokio::time::timeout(timeout, async {
+                            loop {
+                                match client.recv_message().await {
+                                    Some(crate::websocket_client::AstationMessage::ProjectListResponse {
+                                        projects,
+                                        ..
+                                    }) => return Some(projects),
+                                    Some(_) => continue,
+                                    None => return None,
+                                }
+                            }
+                        })
+                        .await;
+
+                        match result {
+                            Ok(Some(projects)) => {
+                                if projects.is_empty() {
+                                    println!("No projects found in your Agora account.");
+                                } else {
+                                    for (i, p) in projects.iter().enumerate() {
+                                        println!("{}. {} (ID: {})", i + 1, p.name, p.id);
+                                    }
+                                }
+                            }
+                            Ok(None) | Err(_) => {
+                                anyhow::bail!(
+                                    "Timed out waiting for projects from Astation.\n\
+                                    Configure credentials in ~/.config/atem/config.toml or run `atem` \
+                                    to sync them automatically after pairing."
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "No credentials found and could not connect to Astation ({}): {}\n\
+                            Options:\n\
+                            1. Run `atem` (TUI) — credentials auto-sync from Astation on connect\n\
+                            2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars\n\
+                            3. Add to ~/.config/atem/config.toml",
+                            ws_url, e
+                        );
+                    }
+                }
                 Ok(())
             }
         },

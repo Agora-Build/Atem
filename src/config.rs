@@ -59,6 +59,50 @@ impl AtemConfig {
         Ok(config)
     }
 
+    /// Persist the config to disk (~/.config/atem/config.toml).
+    /// Only serializes non-None fields (env-var overrides are not written).
+    pub fn save_to_disk(&self) -> Result<()> {
+        let path = Self::config_path();
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
+
+        // Load existing file so we don't clobber non-credential keys.
+        let mut existing = if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            toml::from_str::<toml::Value>(&content).unwrap_or(toml::Value::Table(Default::default()))
+        } else {
+            toml::Value::Table(Default::default())
+        };
+
+        let table = existing.as_table_mut().expect("config is a TOML table");
+
+        if let Some(cid) = &self.customer_id {
+            table.insert("customer_id".into(), toml::Value::String(cid.clone()));
+        }
+        if let Some(cs) = &self.customer_secret {
+            table.insert("customer_secret".into(), toml::Value::String(cs.clone()));
+        }
+        if let Some(ch) = &self.rtm_channel {
+            table.insert("rtm_channel".into(), toml::Value::String(ch.clone()));
+        }
+        if let Some(acc) = &self.rtm_account {
+            table.insert("rtm_account".into(), toml::Value::String(acc.clone()));
+        }
+        if let Some(ws) = &self.astation_ws {
+            table.insert("astation_ws".into(), toml::Value::String(ws.clone()));
+        }
+        if let Some(relay) = &self.astation_relay_url {
+            table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
+        }
+
+        let content = toml::to_string_pretty(&existing)
+            .with_context(|| "Failed to serialize config")?;
+        fs::write(&path, content)
+            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+        Ok(())
+    }
+
     /// Get the config directory path: ~/.config/atem/
     pub fn config_dir() -> PathBuf {
         dirs::config_dir()

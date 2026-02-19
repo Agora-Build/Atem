@@ -1851,9 +1851,22 @@ impl App {
                 customer_id,
                 customer_secret,
             } => {
-                println!("\u{1f511} Credentials synced from Astation (customer_id: {}...)", &customer_id[..4.min(customer_id.len())]);
-                self.synced_customer_id = Some(customer_id);
-                self.synced_customer_secret = Some(customer_secret);
+                let id_preview = &customer_id[..4.min(customer_id.len())];
+                println!("\u{1f511} Credentials synced from Astation (customer_id: {}...)", id_preview);
+
+                // Store in memory for this session.
+                self.synced_customer_id = Some(customer_id.clone());
+                self.synced_customer_secret = Some(customer_secret.clone());
+
+                // Persist to config file so CLI commands (e.g. `atem list project`) can use them.
+                let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                cfg.customer_id = Some(customer_id);
+                cfg.customer_secret = Some(customer_secret);
+                if let Err(e) = cfg.save_to_disk() {
+                    eprintln!("\u{26a0}\u{fe0f}  Failed to persist synced credentials: {}", e);
+                } else {
+                    println!("   Saved to ~/.config/atem/config.toml");
+                }
             }
             _ => {
                 println!("\u{1f4e8} Received message from Astation: {:?}", message);
