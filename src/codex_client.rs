@@ -232,12 +232,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
             match tokio::time::timeout_at(deadline, session.receiver.recv()).await {
-                Ok(Some(chunk)) => {
-                    combined.push_str(&chunk);
-                    if combined.contains("Codex CLI exited") {
-                        break;
-                    }
-                }
+                Ok(Some(chunk)) => combined.push_str(&chunk),
                 _ => break,
             }
         }
