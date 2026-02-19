@@ -50,7 +50,7 @@ jobs:
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
-          sed -i'' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          perl -pi -e "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
 
       - name: Build
         env:
