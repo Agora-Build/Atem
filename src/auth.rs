@@ -264,4 +264,83 @@ mod tests {
         let h = get_hostname();
         assert!(!h.is_empty());
     }
+
+    // --- Mock server helpers ---
+
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spin up a one-shot HTTP server that returns the given body for any request.
+    async fn mock_http_server(response_body: &'static str, status: u16) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = match status {
+            200 => "200 OK",
+            404 => "404 Not Found",
+            _ => "500 Internal Server Error",
+        };
+        tokio::spawn(async move {
+            // Accept multiple connections (poll loops retry)
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let body = response_body;
+                    let resp = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_line,
+                        body.len(),
+                        body
+                    );
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn create_server_session_parses_id_field() {
+        let body = r#"{"id":"abc-123","otp":"12345678","hostname":"host","status":"pending","created_at":"2024-01-01T00:00:00Z","expires_at":"2024-01-01T04:00:00Z"}"#;
+        let addr = mock_http_server(body, 200).await;
+        let url = format!("http://{}", addr);
+        let (session_id, otp, _) = create_server_session(&url, "test-host").await.unwrap();
+        assert_eq!(session_id, "abc-123");
+        assert_eq!(otp, "12345678");
+    }
+
+    #[tokio::test]
+    async fn poll_session_status_parses_granted() {
+        let body = r#"{"id":"abc-123","status":"granted","token":"tok-xyz"}"#;
+        let addr = mock_http_server(body, 200).await;
+        let url = format!("http://{}", addr);
+        let session = poll_session_status(&url, "abc-123", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(session.session_id, "abc-123");
+        assert_eq!(session.token, "tok-xyz");
+    }
+
+    #[tokio::test]
+    async fn poll_session_status_returns_error_on_denied() {
+        let body = r#"{"id":"abc-123","status":"denied"}"#;
+        let addr = mock_http_server(body, 200).await;
+        let url = format!("http://{}", addr);
+        let err = poll_session_status(&url, "abc-123", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn poll_session_status_returns_error_on_404() {
+        let body = r#"{"error":"not found"}"#;
+        let addr = mock_http_server(body, 404).await;
+        let url = format!("http://{}", addr);
+        let err = poll_session_status(&url, "no-such-id", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found") || err.to_string().contains("expired"));
+    }
 }
