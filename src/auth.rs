@@ -14,6 +14,19 @@ pub struct AuthSession {
     pub authenticated_at: u64,
 }
 
+impl AuthSession {
+    /// Check if this session is still valid (not expired).
+    /// Sessions expire after 30 days.
+    pub fn is_valid(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        let age = now.saturating_sub(self.authenticated_at);
+        age < 30 * 24 * 60 * 60 // 30 days in seconds
+    }
+}
+
 /// Generate a random 8-digit OTP code.
 pub fn generate_otp() -> String {
     let mut rng = rand::thread_rng();

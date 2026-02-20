@@ -1608,15 +1608,52 @@ impl App {
         self.astation_connect_rx = Some(rx);
         tokio::spawn(async move {
             let mut client = crate::websocket_client::AstationClient::new();
-            let result = match client.connect_with_pairing(&config).await {
-                Ok(code) => Ok((client, Some(code))),
-                Err(_) => {
-                    // Fall back to direct URL
-                    let url = config.astation_ws().to_string();
-                    let mut client2 = crate::websocket_client::AstationClient::new();
-                    match client2.connect(&url).await {
-                        Ok(()) => Ok((client2, None)),
-                        Err(e) => Err(e),
+            let url = config.astation_ws().to_string();
+
+            // Try session-based auth first if we have a valid saved session
+            let result = if let Some(session) = crate::auth::AuthSession::load_saved() {
+                if session.is_valid() {
+                    match client.connect_with_session(&url, &session.session_id).await {
+                        Ok(()) => Ok((client, None)),
+                        Err(_) => {
+                            // Session auth failed, try pairing
+                            let mut client2 = crate::websocket_client::AstationClient::new();
+                            match client2.connect_with_pairing(&config).await {
+                                Ok(code) => Ok((client2, Some(code))),
+                                Err(_) => {
+                                    // Fall back to direct URL
+                                    let mut client3 = crate::websocket_client::AstationClient::new();
+                                    match client3.connect(&url).await {
+                                        Ok(()) => Ok((client3, None)),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Expired session, try pairing
+                    match client.connect_with_pairing(&config).await {
+                        Ok(code) => Ok((client, Some(code))),
+                        Err(_) => {
+                            let mut client2 = crate::websocket_client::AstationClient::new();
+                            match client2.connect(&url).await {
+                                Ok(()) => Ok((client2, None)),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No session, try pairing
+                match client.connect_with_pairing(&config).await {
+                    Ok(code) => Ok((client, Some(code))),
+                    Err(_) => {
+                        let mut client2 = crate::websocket_client::AstationClient::new();
+                        match client2.connect(&url).await {
+                            Ok(()) => Ok((client2, None)),
+                            Err(e) => Err(e),
+                        }
                     }
                 }
             };
@@ -1858,7 +1895,7 @@ impl App {
             }
             AstationMessage::AgentPrompt {
                 agent_id,
-                session_id,
+                session_id: _,
                 text,
             } => {
                 // Route to the appropriate backend.

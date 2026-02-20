@@ -255,6 +255,16 @@ impl AstationClient {
         }
     }
 
+    /// Connect to Astation using a saved auth session.
+    pub async fn connect_with_session(&mut self, base_url: &str, session_id: &str) -> Result<()> {
+        let url = if base_url.contains('?') {
+            format!("{}&session={}", base_url, session_id)
+        } else {
+            format!("{}?session={}", base_url, session_id)
+        };
+        self.connect(&url).await
+    }
+
     pub async fn connect(&mut self, url: &str) -> Result<()> {
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
             .await

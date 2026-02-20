@@ -23,15 +23,30 @@ async fn resolve_credentials(
     // 2. No local credentials — try Astation WS (receives credentialSync on connect).
     let ws_url = config.astation_ws().to_string();
     let mut client = crate::websocket_client::AstationClient::new();
-    client.connect(&ws_url).await.map_err(|e| {
-        anyhow::anyhow!(
-            "No credentials found locally and could not connect to Astation ({ws_url}): {e}\n\
-            Fix options:\n\
-            1. Run `atem sync credentials` (needs Astation running with credentials set)\n\
-            2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars\n\
-            3. Add customer_id / customer_secret to ~/.config/atem/config.toml"
-        )
-    })?;
+
+    // Try session-based connection first if we have a valid saved session
+    let connected = if let Some(session) = crate::auth::AuthSession::load_saved() {
+        if session.is_valid() {
+            client.connect_with_session(&ws_url, &session.session_id).await.is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Fall back to direct connection if session auth failed
+    if !connected {
+        client.connect(&ws_url).await.map_err(|e| {
+            anyhow::anyhow!(
+                "No credentials found locally and could not connect to Astation ({ws_url}): {e}\n\
+                Fix options:\n\
+                1. Run `atem login` to authenticate, then `atem sync credentials`\n\
+                2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars\n\
+                3. Add customer_id / customer_secret to ~/.config/atem/config.toml"
+            )
+        })?;
+    }
 
     let timeout = tokio::time::Duration::from_secs(5);
     let result = tokio::time::timeout(timeout, async {
