@@ -723,9 +723,18 @@ impl AstationClient {
     ///
     /// Returns the pairing code on success.
     pub async fn connect_with_pairing(&mut self, config: &AtemConfig) -> Result<String> {
+        // 1. Try local Astation first (fast, no relay needed)
+        let local_url = config.astation_ws().to_string();
+        if self.connect(&local_url).await.is_ok() {
+            // Connected locally! Wait for pairing code from auth flow
+            // The code will be shown in the pairing dialog on Astation side
+            return Ok("local".to_string()); // Return dummy code - actual pairing happens via WebSocket
+        }
+
+        // 2. Local failed - fall back to relay
         let station_url = config.astation_relay_url().to_string();
 
-        // 1. Register with relay → get pairing code (5s timeout)
+        // Register with relay → get pairing code (5s timeout)
         let code = tokio::time::timeout(
             Duration::from_secs(5),
             self.register_pair(&station_url),
@@ -733,12 +742,7 @@ impl AstationClient {
         .await
         .map_err(|_| anyhow!("Relay registration timed out"))??;
 
-        // 2. Try local Astation first
-        if self.try_connect_local().await.is_ok() {
-            return Ok(code);
-        }
-
-        // 3. Fall back to relay
+        // Connect to relay with the pairing code
         let ws_scheme = if station_url.starts_with("https://") {
             station_url.replace("https://", "wss://")
         } else {
@@ -784,10 +788,6 @@ impl AstationClient {
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
     }
 
-    /// Try connecting to a local Astation instance on 127.0.0.1:8080.
-    async fn try_connect_local(&mut self) -> Result<()> {
-        self.connect("ws://127.0.0.1:8080/ws").await
-    }
 }
 
 #[cfg(test)]

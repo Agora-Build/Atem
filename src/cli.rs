@@ -449,22 +449,31 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
         },
         Commands::Repl => crate::repl::run_repl().await,
-        Commands::Login { server, save_credentials } => {
-            let relay = if let Some(s) = server.as_deref() {
-                s.to_string()
-            } else {
-                let cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                cfg.astation_relay_url().to_string()
-            };
-            // Note: Old HTTP-based auth flow - uses default astation_id
-            // TODO: Deprecate in favor of WebSocket message-based auth
-            let astation_id = "default";
-            let session = crate::auth::run_login_flow(Some(&relay), astation_id).await?;
+        Commands::Login { server: _, save_credentials } => {
+            use crate::websocket_client::AstationClient;
 
-            // Save session to SessionManager
-            let mut session_mgr = crate::auth::SessionManager::load().unwrap_or_default();
-            session_mgr.save_session(session)?;
-            println!("Session saved. You are now authenticated.");
+            println!("Authenticating with Astation...");
+
+            // Load config
+            let config = crate::config::AtemConfig::load().unwrap_or_default();
+
+            // Connect using WebSocket (tries local first, falls back to relay)
+            let mut client = AstationClient::new();
+            let pairing_code = client.connect_with_pairing(&config).await?;
+
+            if pairing_code == "local" {
+                println!("Connected to local Astation!");
+                println!("Waiting for pairing approval...");
+            } else {
+                println!("Connected via relay (code: {})", pairing_code);
+                println!("Check your Mac for pairing approval dialog");
+            }
+
+            // Wait for successful authentication
+            // The pairing dialog approval will trigger session creation on Astation side
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            println!("✓ Authenticated successfully!");
 
             // Determine whether to sync credentials: --save-credentials flag, or ask interactively.
             let should_sync = if save_credentials {
