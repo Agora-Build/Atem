@@ -8,6 +8,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::config::AtemConfig;
 
+/// Authentication response from Astation
+enum AuthResponse {
+    Authenticated,
+    SessionExpired,
+    Denied(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AstationMessage {
@@ -256,13 +263,12 @@ impl AstationClient {
     }
 
     /// Connect to Astation using a saved auth session.
-    pub async fn connect_with_session(&mut self, base_url: &str, session_id: &str) -> Result<()> {
-        let url = if base_url.contains('?') {
-            format!("{}&session={}", base_url, session_id)
-        } else {
-            format!("{}?session={}", base_url, session_id)
-        };
-        self.connect(&url).await
+    /// Connect with session (now handled via message-based auth)
+    /// This is now just an alias for connect() since auth happens after connection.
+    pub async fn connect_with_session(&mut self, base_url: &str, _session_id: &str) -> Result<()> {
+        // Session auth now happens inside connect() via authenticate()
+        // The session_id parameter is ignored - session is loaded from disk
+        self.connect(base_url).await
     }
 
     pub async fn connect(&mut self, url: &str) -> Result<()> {
@@ -311,10 +317,175 @@ impl AstationClient {
         self.sender = Some(msg_tx);
         self.receiver = Some(rx);
 
-        // Send initial status update to let Astation know we're connected
-        self.send_status_update("connected").await?;
+        // Perform authentication handshake
+        self.authenticate().await?;
 
         Ok(())
+    }
+
+    /// Authenticate with Astation after WebSocket connection.
+    /// Waits for auth_required, then sends session ID or pairing code.
+    async fn authenticate(&mut self) -> Result<()> {
+        // Wait for auth_required message (with timeout)
+        let _auth_required = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.wait_for_message(|msg| {
+                matches!(msg, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
+            })
+        )
+        .await
+        .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
+        .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
+
+        // Try session-based auth first if we have a saved session
+        if let Some(session) = crate::auth::AuthSession::load_saved() {
+            if session.is_valid() {
+                // Send session auth
+                let mut auth_data = std::collections::HashMap::new();
+                auth_data.insert("session_id".to_string(), session.session_id.clone());
+
+                let auth_msg = AstationMessage::StatusUpdate {
+                    status: "auth".to_string(),
+                    data: auth_data,
+                };
+                self.send_message(auth_msg).await?;
+
+                // Wait for response
+                if let Some(response) = self.wait_for_auth_response().await? {
+                    match response {
+                        AuthResponse::Authenticated => {
+                            // Session auth successful - refresh and save
+                            let mut session = session;
+                            session.refresh();
+                            let _ = session.save();
+                            return Ok(());
+                        }
+                        AuthResponse::SessionExpired => {
+                            // Fall through to pairing
+                        }
+                        AuthResponse::Denied(msg) => {
+                            return Err(anyhow!("Authentication denied: {}", msg));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Session auth failed or no session - use pairing
+        self.authenticate_with_pairing().await
+    }
+
+    /// Authenticate using pairing code (fallback when session invalid/missing)
+    async fn authenticate_with_pairing(&mut self) -> Result<()> {
+        // Generate pairing code
+        let pairing_code = crate::auth::generate_otp();
+        let hostname = crate::auth::get_hostname();
+
+        println!("🔐 Pairing with Astation...");
+        println!("   Code: {}", pairing_code);
+        println!("   Waiting for approval...");
+
+        // Send pairing auth
+        let mut auth_data = std::collections::HashMap::new();
+        auth_data.insert("pairing_code".to_string(), pairing_code.clone());
+        auth_data.insert("hostname".to_string(), hostname.clone());
+
+        let auth_msg = AstationMessage::StatusUpdate {
+            status: "auth".to_string(),
+            data: auth_data,
+        };
+        self.send_message(auth_msg).await?;
+
+        // Wait for pairing response (longer timeout for user to approve)
+        let response = tokio::time::timeout(
+            Duration::from_secs(300), // 5 minutes for user to approve
+            self.wait_for_auth_response()
+        )
+        .await
+        .map_err(|_| anyhow!("Pairing timed out after 5 minutes"))??;
+
+        match response {
+            Some(AuthResponse::Authenticated) => {
+                println!("✅ Pairing approved!");
+                Ok(())
+            }
+            Some(AuthResponse::Denied(msg)) => {
+                println!("❌ Pairing denied: {}", msg);
+                Err(anyhow!("Pairing denied: {}", msg))
+            }
+            Some(AuthResponse::SessionExpired) => {
+                Err(anyhow!("Unexpected session_expired during pairing"))
+            }
+            None => {
+                Err(anyhow!("Connection closed during pairing"))
+            }
+        }
+    }
+
+    /// Wait for auth response message and extract session if granted
+    async fn wait_for_auth_response(&mut self) -> Result<Option<AuthResponse>> {
+        while let Some(msg) = self.recv_message_async().await {
+            match msg {
+                AstationMessage::StatusUpdate { status, data } if status == "auth" => {
+                    // Check auth response
+                    if let Some(auth_status) = data.get("status") {
+                        match auth_status.as_str() {
+                            "granted" => {
+                                // Save new session if provided
+                                if let (Some(session_id), Some(token)) =
+                                    (data.get("session_id"), data.get("token"))
+                                {
+                                    let hostname = crate::auth::get_hostname();
+                                    let session = crate::auth::AuthSession::new(
+                                        session_id.clone(),
+                                        token.clone(),
+                                        hostname,
+                                    );
+                                    let _ = session.save();
+                                }
+                                return Ok(Some(AuthResponse::Authenticated));
+                            }
+                            "denied" => {
+                                let msg = data.get("message")
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("Unknown reason");
+                                return Ok(Some(AuthResponse::Denied(msg.to_string())));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                AstationMessage::StatusUpdate { status, data: _ } if status == "authenticated" => {
+                    // Alternative authenticated message format
+                    return Ok(Some(AuthResponse::Authenticated));
+                }
+                AstationMessage::StatusUpdate { status, data } if status == "error" => {
+                    if let Some(msg) = data.get("message") {
+                        if msg.contains("expired") || msg.contains("Session expired") {
+                            return Ok(Some(AuthResponse::SessionExpired));
+                        }
+                        return Ok(Some(AuthResponse::Denied(msg.clone())));
+                    }
+                }
+                _ => {
+                    // Ignore other messages during auth
+                }
+            }
+        }
+        Ok(None) // Connection closed
+    }
+
+    /// Wait for a message matching the predicate
+    async fn wait_for_message<F>(&mut self, predicate: F) -> Option<AstationMessage>
+    where
+        F: Fn(&AstationMessage) -> bool,
+    {
+        while let Some(msg) = self.recv_message_async().await {
+            if predicate(&msg) {
+                return Some(msg);
+            }
+        }
+        None
     }
 
     pub async fn send_message(&self, message: AstationMessage) -> Result<()> {

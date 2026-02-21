@@ -1607,57 +1607,62 @@ impl App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.astation_connect_rx = Some(rx);
         tokio::spawn(async move {
-            let mut client = crate::websocket_client::AstationClient::new();
-            let url = config.astation_ws().to_string();
+            // Connection priority:
+            // 1. Local URL (from config or default ws://127.0.0.1:8080/ws)
+            //    - Works for: same machine, LAN IP, VPN IP (Netbird, Tailscale, etc.)
+            // 2. Relay (wss://station.agora.build) - remote connection
 
-            // Try session-based auth first if we have a valid saved session
-            let result = if let Some(session) = crate::auth::AuthSession::load_saved() {
-                if session.is_valid() {
-                    match client.connect_with_session(&url, &session.session_id).await {
-                        Ok(()) => Ok((client, None)),
-                        Err(_) => {
-                            // Session auth failed, try pairing
-                            let mut client2 = crate::websocket_client::AstationClient::new();
-                            match client2.connect_with_pairing(&config).await {
-                                Ok(code) => Ok((client2, Some(code))),
-                                Err(_) => {
-                                    // Fall back to direct URL
-                                    let mut client3 = crate::websocket_client::AstationClient::new();
-                                    match client3.connect(&url).await {
-                                        Ok(()) => Ok((client3, None)),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Expired session, try pairing
-                    match client.connect_with_pairing(&config).await {
-                        Ok(code) => Ok((client, Some(code))),
-                        Err(_) => {
-                            let mut client2 = crate::websocket_client::AstationClient::new();
-                            match client2.connect(&url).await {
-                                Ok(()) => Ok((client2, None)),
-                                Err(e) => Err(e),
-                            }
-                        }
+            let local_url = config.astation_ws();
+            let session = crate::auth::AuthSession::load_saved();
+
+            // Try local connection first
+            let mut client = crate::websocket_client::AstationClient::new();
+
+            // If we have a valid session, try local with session auth
+            if let Some(ref sess) = session {
+                if sess.is_valid() {
+                    if let Ok(()) = client.connect_with_session(local_url, &sess.session_id).await {
+                        let _ = tx.send(Ok((client, None)));
+                        return;
                     }
                 }
-            } else {
-                // No session, try pairing
-                match client.connect_with_pairing(&config).await {
-                    Ok(code) => Ok((client, Some(code))),
-                    Err(_) => {
-                        let mut client2 = crate::websocket_client::AstationClient::new();
-                        match client2.connect(&url).await {
-                            Ok(()) => Ok((client2, None)),
-                            Err(e) => Err(e),
-                        }
+            }
+
+            // Try local without auth (direct connection)
+            let mut client = crate::websocket_client::AstationClient::new();
+            if let Ok(()) = client.connect(local_url).await {
+                let _ = tx.send(Ok((client, None)));
+                return;
+            }
+
+            // Local failed, try relay with session if available
+            if let Some(ref sess) = session {
+                if sess.is_valid() {
+                    // Convert HTTP/HTTPS relay URL to WebSocket URL
+                    let relay_base = config.astation_relay_url();
+                    let relay_ws_url = relay_base
+                        .replace("https://", "wss://")
+                        .replace("http://", "ws://");
+                    let relay_url = format!("{}/ws", relay_ws_url);
+
+                    let mut client = crate::websocket_client::AstationClient::new();
+                    if let Ok(()) = client.connect_with_session(&relay_url, &sess.session_id).await {
+                        let _ = tx.send(Ok((client, None)));
+                        return;
                     }
                 }
-            };
-            let _ = tx.send(result);
+            }
+
+            // Try relay with pairing code
+            let mut client = crate::websocket_client::AstationClient::new();
+            match client.connect_with_pairing(&config).await {
+                Ok(code) => {
+                    let _ = tx.send(Ok((client, Some(code))));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
         });
     }
 
@@ -1671,6 +1676,13 @@ impl App {
                     self.astation_connected = true;
                     self.pairing_code = code;
                     self.status_message = Some("Connected to Astation".to_string());
+
+                    // Refresh session on successful connection
+                    if let Some(session) = crate::auth::AuthSession::load_saved() {
+                        let mut session = session;
+                        session.refresh();
+                        let _ = session.save();
+                    }
                 }
                 Ok(Err(_)) => {
                     // Connection failed — stay in local mode
@@ -2155,8 +2167,19 @@ impl App {
 
     pub async fn process_astation_messages(&mut self) {
         // Drain all pending messages (non-blocking try_recv loop)
+        let mut message_count = 0;
         while let Some(message) = self.astation_client.recv_message() {
             self.handle_astation_message(message).await;
+            message_count += 1;
+        }
+
+        // Refresh session activity if we received any messages
+        if message_count > 0 {
+            if let Some(session) = crate::auth::AuthSession::load_saved() {
+                let mut session = session;
+                session.refresh();
+                let _ = session.save();
+            }
         }
     }
 }

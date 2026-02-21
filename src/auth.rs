@@ -5,26 +5,53 @@ use std::time::Duration;
 
 const DEFAULT_SERVER_URL: &str = "https://station.agora.build";
 
-/// Stored session after successful authentication.
+/// Stored session after successful pairing.
+/// Sessions expire after 7 days of inactivity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthSession {
     pub session_id: String,
     pub token: String,
     pub hostname: String,
-    pub authenticated_at: u64,
+    pub last_activity: u64,  // Unix timestamp of last connection/message
 }
 
 impl AuthSession {
     /// Check if this session is still valid (not expired).
-    /// Sessions expire after 30 days.
+    /// Sessions expire after 7 days of inactivity.
     pub fn is_valid(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs();
-        let age = now.saturating_sub(self.authenticated_at);
-        age < 30 * 24 * 60 * 60 // 30 days in seconds
+        let now = now_timestamp();
+        let age = now.saturating_sub(self.last_activity);
+        age < 7 * 24 * 60 * 60 // 7 days in seconds
     }
+
+    /// Refresh the session activity timestamp to current time.
+    /// Call this on every connection or message to keep session alive.
+    pub fn refresh(&mut self) {
+        self.last_activity = now_timestamp();
+    }
+
+    /// Create a new session with current timestamp.
+    pub fn new(session_id: String, token: String, hostname: String) -> Self {
+        Self {
+            session_id,
+            token,
+            hostname,
+            last_activity: now_timestamp(),
+        }
+    }
+
+    /// Get age in seconds since last activity.
+    pub fn age_seconds(&self) -> u64 {
+        now_timestamp().saturating_sub(self.last_activity)
+    }
+}
+
+/// Get current Unix timestamp in seconds.
+fn now_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs()
 }
 
 /// Generate a random 8-digit OTP code.
@@ -154,16 +181,11 @@ pub async fn poll_session_status(
                     let token = data
                         .token
                         .ok_or_else(|| anyhow!("Granted but no token received"))?;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    return Ok(AuthSession {
-                        session_id: data.id,
+                    return Ok(AuthSession::new(
+                        data.id,
                         token,
-                        hostname: get_hostname(),
-                        authenticated_at: now,
-                    });
+                        get_hostname(),
+                    ));
                 }
                 "denied" => {
                     return Err(anyhow!("Authentication was denied"));
@@ -258,18 +280,17 @@ mod tests {
 
     #[test]
     fn auth_session_serialization_roundtrip() {
-        let session = AuthSession {
-            session_id: "test-id".to_string(),
-            token: "test-token".to_string(),
-            hostname: "test-host".to_string(),
-            authenticated_at: 1700000000,
-        };
+        let session = AuthSession::new(
+            "test-id".to_string(),
+            "test-token".to_string(),
+            "test-host".to_string(),
+        );
         let json = serde_json::to_string(&session).unwrap();
         let parsed: AuthSession = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.session_id, "test-id");
         assert_eq!(parsed.token, "test-token");
         assert_eq!(parsed.hostname, "test-host");
-        assert_eq!(parsed.authenticated_at, 1700000000);
+        assert!(parsed.last_activity > 0);
     }
 
     #[test]
@@ -355,5 +376,189 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found") || err.to_string().contains("expired"));
+    }
+
+    // ===== Session Expiry & Refresh Tests =====
+
+    #[test]
+    fn session_is_valid_when_fresh() {
+        let session = AuthSession::new(
+            "sess-123".to_string(),
+            "token-abc".to_string(),
+            "test-host".to_string(),
+        );
+        assert!(session.is_valid(), "Fresh session should be valid");
+        assert_eq!(session.age_seconds(), 0, "Fresh session age should be 0");
+    }
+
+    #[test]
+    fn session_expires_after_7_days() {
+        let mut session = AuthSession::new(
+            "sess-123".to_string(),
+            "token-abc".to_string(),
+            "test-host".to_string(),
+        );
+
+        // Simulate 7 days + 1 second of inactivity
+        let seven_days_ago = now_timestamp() - (7 * 24 * 60 * 60 + 1);
+        session.last_activity = seven_days_ago;
+
+        assert!(!session.is_valid(), "Session should expire after 7 days");
+        assert!(session.age_seconds() > 7 * 24 * 60 * 60, "Age should be over 7 days");
+    }
+
+    #[test]
+    fn session_valid_just_before_expiry() {
+        let mut session = AuthSession::new(
+            "sess-123".to_string(),
+            "token-abc".to_string(),
+            "test-host".to_string(),
+        );
+
+        // Simulate 7 days - 1 second of inactivity (just before expiry)
+        let almost_seven_days_ago = now_timestamp() - (7 * 24 * 60 * 60 - 1);
+        session.last_activity = almost_seven_days_ago;
+
+        assert!(session.is_valid(), "Session should be valid just before 7 days");
+    }
+
+    #[test]
+    fn session_refresh_extends_validity() {
+        let mut session = AuthSession::new(
+            "sess-123".to_string(),
+            "token-abc".to_string(),
+            "test-host".to_string(),
+        );
+
+        // Simulate 6 days of inactivity
+        let six_days_ago = now_timestamp() - (6 * 24 * 60 * 60);
+        session.last_activity = six_days_ago;
+
+        assert!(session.is_valid(), "6-day-old session should still be valid");
+
+        // Refresh the session (simulates new connection/message)
+        session.refresh();
+
+        // Now it should be fresh again
+        assert!(session.is_valid(), "Refreshed session should be valid");
+        assert!(session.age_seconds() < 5, "Refreshed session should have age near 0");
+    }
+
+    #[test]
+    fn session_refresh_prevents_expiry() {
+        let mut session = AuthSession::new(
+            "sess-123".to_string(),
+            "token-abc".to_string(),
+            "test-host".to_string(),
+        );
+
+        // Simulate expired session (8 days old)
+        let eight_days_ago = now_timestamp() - (8 * 24 * 60 * 60);
+        session.last_activity = eight_days_ago;
+
+        assert!(!session.is_valid(), "8-day-old session should be expired");
+
+        // Refresh won't help - expired is expired (need new pairing)
+        session.refresh();
+
+        // But now it's fresh again (this simulates creating a new session after re-pairing)
+        assert!(session.is_valid(), "After refresh, session is valid");
+    }
+
+    #[test]
+    fn session_age_calculation() {
+        let mut session = AuthSession::new(
+            "sess-123".to_string(),
+            "token-abc".to_string(),
+            "test-host".to_string(),
+        );
+
+        // Test various ages
+        let test_cases = vec![
+            (1 * 60 * 60, "1 hour"),              // 1 hour
+            (24 * 60 * 60, "1 day"),              // 1 day
+            (3 * 24 * 60 * 60, "3 days"),         // 3 days
+            (6 * 24 * 60 * 60, "6 days"),         // 6 days
+        ];
+
+        for (age_seconds, label) in test_cases {
+            session.last_activity = now_timestamp() - age_seconds;
+            let actual_age = session.age_seconds();
+
+            // Allow 1 second tolerance for test execution time
+            assert!(
+                (actual_age as i64 - age_seconds as i64).abs() <= 1,
+                "{}: expected age {}, got {}",
+                label,
+                age_seconds,
+                actual_age
+            );
+        }
+    }
+
+    #[test]
+    fn session_save_and_load_preserves_activity() {
+        use std::path::PathBuf;
+
+        // Create a temp session file
+        let temp_dir = std::env::temp_dir();
+        let session_path = temp_dir.join("test_session_activity.json");
+
+        // Clean up any existing file
+        let _ = std::fs::remove_file(&session_path);
+
+        let original = AuthSession::new(
+            "sess-456".to_string(),
+            "token-xyz".to_string(),
+            "test-machine".to_string(),
+        );
+
+        // Save to file
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        std::fs::write(&session_path, &json).unwrap();
+
+        // Load from file
+        let content = std::fs::read_to_string(&session_path).unwrap();
+        let loaded: AuthSession = serde_json::from_str(&content).unwrap();
+
+        // Verify all fields match
+        assert_eq!(loaded.session_id, original.session_id);
+        assert_eq!(loaded.token, original.token);
+        assert_eq!(loaded.hostname, original.hostname);
+        assert_eq!(loaded.last_activity, original.last_activity);
+        assert!(loaded.is_valid());
+
+        // Clean up
+        let _ = std::fs::remove_file(&session_path);
+    }
+
+    #[test]
+    fn multiple_sessions_independent() {
+        // Simulate multiple devices with different sessions
+        let session_b = AuthSession::new(
+            "sess-machine-b".to_string(),
+            "token-b".to_string(),
+            "machine-b".to_string(),
+        );
+
+        let mut session_c = AuthSession::new(
+            "sess-machine-c".to_string(),
+            "token-c".to_string(),
+            "machine-c".to_string(),
+        );
+
+        // Machine C is old (5 days)
+        session_c.last_activity = now_timestamp() - (5 * 24 * 60 * 60);
+
+        // Both should be valid
+        assert!(session_b.is_valid(), "Machine B session should be valid");
+        assert!(session_c.is_valid(), "Machine C session (5 days) should be valid");
+
+        // Refresh machine C
+        session_c.refresh();
+
+        // Machine B should be unaffected
+        assert!(session_b.age_seconds() < 5, "Machine B should still be fresh");
+        assert!(session_c.age_seconds() < 5, "Machine C should now be fresh");
     }
 }
