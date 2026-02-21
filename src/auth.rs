@@ -11,6 +11,7 @@ const DEFAULT_SERVER_URL: &str = "https://station.agora.build";
 pub struct AuthSession {
     pub session_id: String,
     pub token: String,
+    pub astation_id: String,  // Unique ID of the Astation instance
     pub hostname: String,
     pub last_activity: u64,  // Unix timestamp of last connection/message
 }
@@ -31,10 +32,11 @@ impl AuthSession {
     }
 
     /// Create a new session with current timestamp.
-    pub fn new(session_id: String, token: String, hostname: String) -> Self {
+    pub fn new(session_id: String, token: String, astation_id: String, hostname: String) -> Self {
         Self {
             session_id,
             token,
+            astation_id,
             hostname,
             last_activity: now_timestamp(),
         }
@@ -52,6 +54,93 @@ fn now_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs()
+}
+
+/// Manages multiple sessions, one per Astation instance.
+/// Sessions are keyed by astation_id, allowing seamless endpoint switching.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionManager {
+    sessions: std::collections::HashMap<String, AuthSession>,
+}
+
+impl SessionManager {
+    /// Load sessions from disk (~/.config/atem/sessions.json).
+    /// Returns empty SessionManager if file doesn't exist.
+    pub fn load() -> Result<Self> {
+        let path = Self::sessions_path()?;
+
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow!("Failed to read sessions file: {}", e))?;
+
+        let manager: SessionManager = serde_json::from_str(&content)
+            .map_err(|e| anyhow!("Failed to parse sessions file: {}", e))?;
+
+        Ok(manager)
+    }
+
+    /// Save all sessions to disk.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::sessions_path()?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("Failed to create config directory: {}", e))?;
+        }
+
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow!("Failed to serialize sessions: {}", e))?;
+
+        std::fs::write(&path, json)
+            .map_err(|e| anyhow!("Failed to write sessions file: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get session for a specific Astation (if valid).
+    pub fn get(&self, astation_id: &str) -> Option<&AuthSession> {
+        self.sessions.get(astation_id).filter(|s| s.is_valid())
+    }
+
+    /// Get mutable session for a specific Astation (if valid).
+    pub fn get_mut(&mut self, astation_id: &str) -> Option<&mut AuthSession> {
+        self.sessions.get_mut(astation_id).filter(|s| s.is_valid())
+    }
+
+    /// Save or update a session for a specific Astation.
+    pub fn save_session(&mut self, session: AuthSession) -> Result<()> {
+        let astation_id = session.astation_id.clone();
+        self.sessions.insert(astation_id, session);
+        self.save()
+    }
+
+    /// Remove a session for a specific Astation.
+    pub fn remove(&mut self, astation_id: &str) -> Result<()> {
+        self.sessions.remove(astation_id);
+        self.save()
+    }
+
+    /// Get all active (valid) sessions.
+    pub fn active_sessions(&self) -> Vec<&AuthSession> {
+        self.sessions.values().filter(|s| s.is_valid()).collect()
+    }
+
+    /// Clean up expired sessions and save.
+    pub fn cleanup_expired(&mut self) -> Result<()> {
+        self.sessions.retain(|_, session| session.is_valid());
+        self.save()
+    }
+
+    /// Get the path to the sessions file.
+    fn sessions_path() -> Result<std::path::PathBuf> {
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| anyhow!("Could not determine config directory"))?;
+        Ok(config_dir.join("atem").join("sessions.json"))
+    }
 }
 
 /// Generate a random 8-digit OTP code.
@@ -145,6 +234,7 @@ pub async fn create_server_session(
 pub async fn poll_session_status(
     server_url: &str,
     session_id: &str,
+    astation_id: &str,
     timeout: Duration,
 ) -> Result<AuthSession> {
     let url = format!(
@@ -184,6 +274,7 @@ pub async fn poll_session_status(
                     return Ok(AuthSession::new(
                         data.id,
                         token,
+                        astation_id.to_string(),
                         get_hostname(),
                     ));
                 }
@@ -207,7 +298,9 @@ pub async fn poll_session_status(
 }
 
 /// Run the full login flow.
-pub async fn run_login_flow(server_url: Option<&str>) -> Result<AuthSession> {
+/// Note: This is for the old HTTP-based auth flow. For WebSocket-based auth,
+/// the astation_id is received in the auth_required message.
+pub async fn run_login_flow(server_url: Option<&str>, astation_id: &str) -> Result<AuthSession> {
     let server = server_url.unwrap_or(DEFAULT_SERVER_URL);
     let hostname = get_hostname();
 
@@ -233,7 +326,7 @@ pub async fn run_login_flow(server_url: Option<&str>) -> Result<AuthSession> {
 
     // Step 3: Poll for grant
     let timeout = Duration::from_secs(300); // 5 minutes
-    let session = poll_session_status(server, &session_id, timeout).await?;
+    let session = poll_session_status(server, &session_id, astation_id, timeout).await?;
 
     println!("Authenticated successfully!");
     Ok(session)
@@ -283,12 +376,14 @@ mod tests {
         let session = AuthSession::new(
             "test-id".to_string(),
             "test-token".to_string(),
+            "astation-123".to_string(),
             "test-host".to_string(),
         );
         let json = serde_json::to_string(&session).unwrap();
         let parsed: AuthSession = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.session_id, "test-id");
         assert_eq!(parsed.token, "test-token");
+        assert_eq!(parsed.astation_id, "astation-123");
         assert_eq!(parsed.hostname, "test-host");
         assert!(parsed.last_activity > 0);
     }
@@ -349,11 +444,12 @@ mod tests {
         let body = r#"{"id":"abc-123","status":"granted","token":"tok-xyz"}"#;
         let addr = mock_http_server(body, 200).await;
         let url = format!("http://{}", addr);
-        let session = poll_session_status(&url, "abc-123", Duration::from_secs(5))
+        let session = poll_session_status(&url, "abc-123", "astation-test", Duration::from_secs(5))
             .await
             .unwrap();
         assert_eq!(session.session_id, "abc-123");
         assert_eq!(session.token, "tok-xyz");
+        assert_eq!(session.astation_id, "astation-test");
     }
 
     #[tokio::test]
@@ -361,7 +457,7 @@ mod tests {
         let body = r#"{"id":"abc-123","status":"denied"}"#;
         let addr = mock_http_server(body, 200).await;
         let url = format!("http://{}", addr);
-        let err = poll_session_status(&url, "abc-123", Duration::from_secs(5))
+        let err = poll_session_status(&url, "abc-123", "astation-test", Duration::from_secs(5))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("denied"));
@@ -372,7 +468,7 @@ mod tests {
         let body = r#"{"error":"not found"}"#;
         let addr = mock_http_server(body, 404).await;
         let url = format!("http://{}", addr);
-        let err = poll_session_status(&url, "no-such-id", Duration::from_secs(5))
+        let err = poll_session_status(&url, "no-such-id", "astation-test", Duration::from_secs(5))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found") || err.to_string().contains("expired"));
@@ -385,6 +481,7 @@ mod tests {
         let session = AuthSession::new(
             "sess-123".to_string(),
             "token-abc".to_string(),
+            "astation-home".to_string(),
             "test-host".to_string(),
         );
         assert!(session.is_valid(), "Fresh session should be valid");
@@ -396,6 +493,7 @@ mod tests {
         let mut session = AuthSession::new(
             "sess-123".to_string(),
             "token-abc".to_string(),
+            "astation-home".to_string(),
             "test-host".to_string(),
         );
 
@@ -412,6 +510,7 @@ mod tests {
         let mut session = AuthSession::new(
             "sess-123".to_string(),
             "token-abc".to_string(),
+            "astation-home".to_string(),
             "test-host".to_string(),
         );
 
@@ -427,6 +526,7 @@ mod tests {
         let mut session = AuthSession::new(
             "sess-123".to_string(),
             "token-abc".to_string(),
+            "astation-home".to_string(),
             "test-host".to_string(),
         );
 
@@ -449,6 +549,7 @@ mod tests {
         let mut session = AuthSession::new(
             "sess-123".to_string(),
             "token-abc".to_string(),
+            "astation-home".to_string(),
             "test-host".to_string(),
         );
 
@@ -470,6 +571,7 @@ mod tests {
         let mut session = AuthSession::new(
             "sess-123".to_string(),
             "token-abc".to_string(),
+            "astation-home".to_string(),
             "test-host".to_string(),
         );
 
@@ -498,8 +600,6 @@ mod tests {
 
     #[test]
     fn session_save_and_load_preserves_activity() {
-        use std::path::PathBuf;
-
         // Create a temp session file
         let temp_dir = std::env::temp_dir();
         let session_path = temp_dir.join("test_session_activity.json");
@@ -510,6 +610,7 @@ mod tests {
         let original = AuthSession::new(
             "sess-456".to_string(),
             "token-xyz".to_string(),
+            "astation-office".to_string(),
             "test-machine".to_string(),
         );
 
@@ -524,6 +625,7 @@ mod tests {
         // Verify all fields match
         assert_eq!(loaded.session_id, original.session_id);
         assert_eq!(loaded.token, original.token);
+        assert_eq!(loaded.astation_id, original.astation_id);
         assert_eq!(loaded.hostname, original.hostname);
         assert_eq!(loaded.last_activity, original.last_activity);
         assert!(loaded.is_valid());
@@ -534,16 +636,18 @@ mod tests {
 
     #[test]
     fn multiple_sessions_independent() {
-        // Simulate multiple devices with different sessions
+        // Simulate multiple Astation instances with different sessions
         let session_b = AuthSession::new(
             "sess-machine-b".to_string(),
             "token-b".to_string(),
+            "astation-home".to_string(),
             "machine-b".to_string(),
         );
 
         let mut session_c = AuthSession::new(
             "sess-machine-c".to_string(),
             "token-c".to_string(),
+            "astation-office".to_string(),
             "machine-c".to_string(),
         );
 
@@ -560,5 +664,237 @@ mod tests {
         // Machine B should be unaffected
         assert!(session_b.age_seconds() < 5, "Machine B should still be fresh");
         assert!(session_c.age_seconds() < 5, "Machine C should now be fresh");
+    }
+
+    // ===== SessionManager Tests =====
+
+    #[test]
+    fn session_manager_starts_empty() {
+        let manager = SessionManager::default();
+        assert_eq!(manager.active_sessions().len(), 0);
+    }
+
+    #[test]
+    fn session_manager_save_and_load() {
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join("test_session_manager.json");
+        let _ = std::fs::remove_file(&temp_path);
+
+        // Create manager with sessions
+        let mut manager = SessionManager::default();
+        let session1 = AuthSession::new(
+            "sess-1".to_string(),
+            "token-1".to_string(),
+            "astation-home".to_string(),
+            "laptop".to_string(),
+        );
+        let session2 = AuthSession::new(
+            "sess-2".to_string(),
+            "token-2".to_string(),
+            "astation-office".to_string(),
+            "desktop".to_string(),
+        );
+
+        manager.sessions.insert("astation-home".to_string(), session1.clone());
+        manager.sessions.insert("astation-office".to_string(), session2.clone());
+
+        // Serialize and save
+        let json = serde_json::to_string_pretty(&manager).unwrap();
+        std::fs::write(&temp_path, json).unwrap();
+
+        // Load from file
+        let content = std::fs::read_to_string(&temp_path).unwrap();
+        let loaded: SessionManager = serde_json::from_str(&content).unwrap();
+
+        // Verify sessions loaded correctly
+        assert_eq!(loaded.sessions.len(), 2);
+        assert!(loaded.get("astation-home").is_some());
+        assert!(loaded.get("astation-office").is_some());
+        assert_eq!(loaded.get("astation-home").unwrap().session_id, "sess-1");
+        assert_eq!(loaded.get("astation-office").unwrap().session_id, "sess-2");
+
+        // Clean up
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn session_manager_get_valid_session() {
+        let mut manager = SessionManager::default();
+        let session = AuthSession::new(
+            "sess-abc".to_string(),
+            "token-abc".to_string(),
+            "astation-home".to_string(),
+            "my-laptop".to_string(),
+        );
+
+        manager.sessions.insert("astation-home".to_string(), session);
+
+        // Should return the session
+        let retrieved = manager.get("astation-home");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().session_id, "sess-abc");
+    }
+
+    #[test]
+    fn session_manager_get_expired_session_returns_none() {
+        let mut manager = SessionManager::default();
+        let mut session = AuthSession::new(
+            "sess-old".to_string(),
+            "token-old".to_string(),
+            "astation-home".to_string(),
+            "my-laptop".to_string(),
+        );
+
+        // Make session expired (8 days old)
+        session.last_activity = now_timestamp() - (8 * 24 * 60 * 60);
+        manager.sessions.insert("astation-home".to_string(), session);
+
+        // Should return None for expired session
+        assert!(manager.get("astation-home").is_none());
+    }
+
+    #[test]
+    fn session_manager_get_nonexistent() {
+        let manager = SessionManager::default();
+        assert!(manager.get("nonexistent-astation").is_none());
+    }
+
+    #[test]
+    fn session_manager_multiple_astations() {
+        let mut manager = SessionManager::default();
+
+        // Add sessions for 3 different Astation instances
+        let session_home = AuthSession::new(
+            "sess-home".to_string(),
+            "token-home".to_string(),
+            "astation-home".to_string(),
+            "laptop".to_string(),
+        );
+        let session_office = AuthSession::new(
+            "sess-office".to_string(),
+            "token-office".to_string(),
+            "astation-office".to_string(),
+            "desktop".to_string(),
+        );
+        let session_lab = AuthSession::new(
+            "sess-lab".to_string(),
+            "token-lab".to_string(),
+            "astation-lab".to_string(),
+            "workstation".to_string(),
+        );
+
+        manager.sessions.insert("astation-home".to_string(), session_home);
+        manager.sessions.insert("astation-office".to_string(), session_office);
+        manager.sessions.insert("astation-lab".to_string(), session_lab);
+
+        // All sessions should be accessible
+        assert_eq!(manager.sessions.len(), 3);
+        assert!(manager.get("astation-home").is_some());
+        assert!(manager.get("astation-office").is_some());
+        assert!(manager.get("astation-lab").is_some());
+        assert_eq!(manager.active_sessions().len(), 3);
+    }
+
+    #[test]
+    fn session_manager_cleanup_expired() {
+        let mut manager = SessionManager::default();
+
+        // Add 2 valid sessions and 2 expired sessions
+        let valid1 = AuthSession::new(
+            "sess-valid1".to_string(),
+            "token-valid1".to_string(),
+            "astation-home".to_string(),
+            "laptop".to_string(),
+        );
+        let valid2 = AuthSession::new(
+            "sess-valid2".to_string(),
+            "token-valid2".to_string(),
+            "astation-office".to_string(),
+            "desktop".to_string(),
+        );
+
+        let mut expired1 = AuthSession::new(
+            "sess-expired1".to_string(),
+            "token-expired1".to_string(),
+            "astation-old1".to_string(),
+            "old-laptop".to_string(),
+        );
+        expired1.last_activity = now_timestamp() - (8 * 24 * 60 * 60);
+
+        let mut expired2 = AuthSession::new(
+            "sess-expired2".to_string(),
+            "token-expired2".to_string(),
+            "astation-old2".to_string(),
+            "old-desktop".to_string(),
+        );
+        expired2.last_activity = now_timestamp() - (10 * 24 * 60 * 60);
+
+        manager.sessions.insert("astation-home".to_string(), valid1);
+        manager.sessions.insert("astation-office".to_string(), valid2);
+        manager.sessions.insert("astation-old1".to_string(), expired1);
+        manager.sessions.insert("astation-old2".to_string(), expired2);
+
+        assert_eq!(manager.sessions.len(), 4);
+        assert_eq!(manager.active_sessions().len(), 2); // Only valid ones
+
+        // Cleanup should remove expired sessions
+        manager.sessions.retain(|_, session| session.is_valid());
+
+        assert_eq!(manager.sessions.len(), 2);
+        assert!(manager.get("astation-home").is_some());
+        assert!(manager.get("astation-office").is_some());
+        assert!(manager.get("astation-old1").is_none());
+        assert!(manager.get("astation-old2").is_none());
+    }
+
+    #[test]
+    fn session_manager_same_atem_different_endpoints() {
+        // This tests the core feature: one session works for both local and relay
+        let mut manager = SessionManager::default();
+
+        let session = AuthSession::new(
+            "sess-universal".to_string(),
+            "token-universal".to_string(),
+            "astation-home-abc123".to_string(), // Unique Astation ID
+            "my-laptop".to_string(),
+        );
+
+        manager.sessions.insert("astation-home-abc123".to_string(), session.clone());
+
+        // Connection 1: Local WebSocket (ws://127.0.0.1:8080/ws)
+        // Uses astation_id from auth_required → finds session
+        assert!(manager.get("astation-home-abc123").is_some());
+
+        // Connection 2: Relay server (https://station.agora.build)
+        // Uses same astation_id from auth_required → finds SAME session
+        assert!(manager.get("astation-home-abc123").is_some());
+
+        // Both connections share one session!
+        assert_eq!(manager.sessions.len(), 1);
+    }
+
+    #[test]
+    fn session_manager_get_mut_allows_refresh() {
+        let mut manager = SessionManager::default();
+
+        let mut session = AuthSession::new(
+            "sess-abc".to_string(),
+            "token-abc".to_string(),
+            "astation-home".to_string(),
+            "laptop".to_string(),
+        );
+
+        // Make session 5 days old
+        session.last_activity = now_timestamp() - (5 * 24 * 60 * 60);
+        manager.sessions.insert("astation-home".to_string(), session);
+
+        // Get mutable reference and refresh
+        if let Some(session) = manager.get_mut("astation-home") {
+            session.refresh();
+        }
+
+        // Session should now be fresh
+        let refreshed = manager.get("astation-home").unwrap();
+        assert!(refreshed.age_seconds() < 5);
     }
 }

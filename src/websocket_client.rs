@@ -327,7 +327,7 @@ impl AstationClient {
     /// Waits for auth_required, then sends session ID or pairing code.
     async fn authenticate(&mut self) -> Result<()> {
         // Wait for auth_required message (with timeout)
-        let _auth_required = tokio::time::timeout(
+        let auth_required = tokio::time::timeout(
             Duration::from_secs(5),
             self.wait_for_message(|msg| {
                 matches!(msg, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
@@ -337,46 +337,58 @@ impl AstationClient {
         .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
         .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
 
-        // Try session-based auth first if we have a saved session
-        if let Some(session) = crate::auth::AuthSession::load_saved() {
-            if session.is_valid() {
-                // Send session auth
-                let mut auth_data = std::collections::HashMap::new();
-                auth_data.insert("session_id".to_string(), session.session_id.clone());
+        // Extract astation_id from auth_required message
+        let astation_id = if let AstationMessage::StatusUpdate { data, .. } = &auth_required {
+            data.get("astation_id")
+                .ok_or_else(|| anyhow!("auth_required missing astation_id"))?
+                .clone()
+        } else {
+            return Err(anyhow!("Invalid auth_required message"));
+        };
 
-                let auth_msg = AstationMessage::StatusUpdate {
-                    status: "auth".to_string(),
-                    data: auth_data,
-                };
-                self.send_message(auth_msg).await?;
+        // Load session manager
+        let mut session_mgr = crate::auth::SessionManager::load()
+            .unwrap_or_default();
 
-                // Wait for response
-                if let Some(response) = self.wait_for_auth_response().await? {
-                    match response {
-                        AuthResponse::Authenticated => {
-                            // Session auth successful - refresh and save
-                            let mut session = session;
+        // Try session-based auth first if we have a saved session for this Astation
+        if let Some(session) = session_mgr.get(&astation_id) {
+            // Send session auth
+            let mut auth_data = std::collections::HashMap::new();
+            auth_data.insert("session_id".to_string(), session.session_id.clone());
+
+            let auth_msg = AstationMessage::StatusUpdate {
+                status: "auth".to_string(),
+                data: auth_data,
+            };
+            self.send_message(auth_msg).await?;
+
+            // Wait for response
+            if let Some(response) = self.wait_for_auth_response(&astation_id).await? {
+                match response {
+                    AuthResponse::Authenticated => {
+                        // Session auth successful - refresh and save
+                        if let Some(session) = session_mgr.get_mut(&astation_id) {
                             session.refresh();
-                            let _ = session.save();
-                            return Ok(());
+                            let _ = session_mgr.save();
                         }
-                        AuthResponse::SessionExpired => {
-                            // Fall through to pairing
-                        }
-                        AuthResponse::Denied(msg) => {
-                            return Err(anyhow!("Authentication denied: {}", msg));
-                        }
+                        return Ok(());
+                    }
+                    AuthResponse::SessionExpired => {
+                        // Fall through to pairing
+                    }
+                    AuthResponse::Denied(msg) => {
+                        return Err(anyhow!("Authentication denied: {}", msg));
                     }
                 }
             }
         }
 
         // Session auth failed or no session - use pairing
-        self.authenticate_with_pairing().await
+        self.authenticate_with_pairing(&astation_id).await
     }
 
     /// Authenticate using pairing code (fallback when session invalid/missing)
-    async fn authenticate_with_pairing(&mut self) -> Result<()> {
+    async fn authenticate_with_pairing(&mut self, astation_id: &str) -> Result<()> {
         // Generate pairing code
         let pairing_code = crate::auth::generate_otp();
         let hostname = crate::auth::get_hostname();
@@ -399,7 +411,7 @@ impl AstationClient {
         // Wait for pairing response (longer timeout for user to approve)
         let response = tokio::time::timeout(
             Duration::from_secs(300), // 5 minutes for user to approve
-            self.wait_for_auth_response()
+            self.wait_for_auth_response(astation_id)
         )
         .await
         .map_err(|_| anyhow!("Pairing timed out after 5 minutes"))??;
@@ -423,7 +435,7 @@ impl AstationClient {
     }
 
     /// Wait for auth response message and extract session if granted
-    async fn wait_for_auth_response(&mut self) -> Result<Option<AuthResponse>> {
+    async fn wait_for_auth_response(&mut self, astation_id: &str) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
             match msg {
                 AstationMessage::StatusUpdate { status, data } if status == "auth" => {
@@ -439,9 +451,14 @@ impl AstationClient {
                                     let session = crate::auth::AuthSession::new(
                                         session_id.clone(),
                                         token.clone(),
+                                        astation_id.to_string(),
                                         hostname,
                                     );
-                                    let _ = session.save();
+
+                                    // Save to session manager
+                                    let mut session_mgr = crate::auth::SessionManager::load()
+                                        .unwrap_or_default();
+                                    let _ = session_mgr.save_session(session);
                                 }
                                 return Ok(Some(AuthResponse::Authenticated));
                             }

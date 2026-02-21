@@ -456,8 +456,14 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 let cfg = crate::config::AtemConfig::load().unwrap_or_default();
                 cfg.astation_relay_url().to_string()
             };
-            let session = crate::auth::run_login_flow(Some(&relay)).await?;
-            session.save()?;
+            // Note: Old HTTP-based auth flow - uses default astation_id
+            // TODO: Deprecate in favor of WebSocket message-based auth
+            let astation_id = "default";
+            let session = crate::auth::run_login_flow(Some(&relay), astation_id).await?;
+
+            // Save session to SessionManager
+            let mut session_mgr = crate::auth::SessionManager::load().unwrap_or_default();
+            session_mgr.save_session(session)?;
             println!("Session saved. You are now authenticated.");
 
             // Determine whether to sync credentials: --save-credentials flag, or ask interactively.
