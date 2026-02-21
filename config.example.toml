@@ -34,8 +34,16 @@ rtm_account = "atem01"
 # astation_relay_url = "https://station.agora.build"    # Default
 # astation_relay_url = "http://100.117.91.44:8080"      # Custom relay server
 
+# Astation ID for relay routing (required for relay connections)
+# This is the unique identifier of your Astation instance.
+# Get it from: ~/Library/Application Support/Astation/identity.txt (on macOS)
+# With this configured, relay connections use sessions (no pairing needed after first time)
+#
+# Example:
+# astation_relay_code = "astation-abc123-def456-..."
+
 # === Connection Priority ===
 # 1. Try astation_ws (local/LAN/VPN) with session auth → seamless
 # 2. Try astation_ws direct → no auth needed for localhost
-# 3. Try relay with session auth → seamless remote
-# 4. Try relay with pairing code → explicit approval required
+# 3. Try relay with session auth → seamless remote (requires astation_relay_code)
+# 4. Try relay with pairing code → explicit approval required (legacy fallback)

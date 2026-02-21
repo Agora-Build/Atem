@@ -1635,25 +1635,26 @@ impl App {
                 return;
             }
 
-            // Local failed, try relay with session if available
-            if let Some(ref sess) = session {
-                if sess.is_valid() {
-                    // Convert HTTP/HTTPS relay URL to WebSocket URL
-                    let relay_base = config.astation_relay_url();
-                    let relay_ws_url = relay_base
-                        .replace("https://", "wss://")
-                        .replace("http://", "ws://");
-                    let relay_url = format!("{}/ws", relay_ws_url);
+            // Local failed, try relay
+            // Convert HTTP/HTTPS relay URL to WebSocket URL
+            let relay_base = config.astation_relay_url();
+            let relay_ws_url = relay_base
+                .replace("https://", "wss://")
+                .replace("http://", "ws://");
 
-                    let mut client = crate::websocket_client::AstationClient::new();
-                    if let Ok(()) = client.connect_with_session(&relay_url, &sess.session_id).await {
-                        let _ = tx.send(Ok((client, None)));
-                        return;
-                    }
+            // If astation_relay_code is configured, use it as the room code
+            // This enables universal sessions through the relay
+            if let Some(astation_id) = config.astation_relay_code.as_ref() {
+                let relay_url = format!("{}/ws?role=atem&code={}", relay_ws_url, astation_id);
+                let mut client = crate::websocket_client::AstationClient::new();
+                if let Ok(()) = client.connect(&relay_url).await {
+                    // Session auth happens via WebSocket messages (authenticate() called in connect())
+                    let _ = tx.send(Ok((client, None)));
+                    return;
                 }
             }
 
-            // Try relay with pairing code
+            // Legacy fallback: Try relay with pairing code
             let mut client = crate::websocket_client::AstationClient::new();
             match client.connect_with_pairing(&config).await {
                 Ok(code) => {

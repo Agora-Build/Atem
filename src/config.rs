@@ -12,6 +12,7 @@ pub struct AtemConfig {
     pub rtm_account: Option<String>,
     pub astation_ws: Option<String>,
     pub astation_relay_url: Option<String>,
+    pub astation_relay_code: Option<String>,
 }
 
 /// Active project state persisted to ~/.config/atem/active_project.json
@@ -54,6 +55,9 @@ impl AtemConfig {
         }
         if let Ok(val) = std::env::var("ASTATION_RELAY_URL") {
             config.astation_relay_url = Some(val);
+        }
+        if let Ok(val) = std::env::var("ASTATION_RELAY_CODE") {
+            config.astation_relay_code = Some(val);
         }
 
         Ok(config)
