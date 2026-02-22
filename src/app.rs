@@ -1956,9 +1956,6 @@ impl App {
             } => {
                 let id_preview = customer_id[..4.min(customer_id.len())].to_string();
 
-                // DEBUG: Log that we received CredentialSync
-                eprintln!("[DEBUG] CredentialSync received: {}...", id_preview);
-
                 // Store in memory for this session (available immediately)
                 self.synced_customer_id = Some(customer_id.clone());
                 self.synced_customer_secret = Some(customer_secret.clone());
@@ -1974,15 +1971,13 @@ impl App {
                         "\u{1f511} Credentials synced from Astation ({}...)",
                         id_preview
                     ));
-                    eprintln!("[DEBUG] Credentials already saved in config - skipping prompt");
                 } else {
                     // Not saved yet - prompt user
                     self.pending_credential_save = Some((customer_id, customer_secret));
                     self.status_message = Some(format!(
-                        "\u{1f511} Credentials received ({}...) | Press 'y' to save, 'n' to use for this session only",
+                        "\u{1f511} Credentials received ({}...) Press 'y' to save, 'n' for session only",
                         id_preview
                     ));
-                    eprintln!("[DEBUG] Showing credential save prompt");
                 }
             }
             _ => {
