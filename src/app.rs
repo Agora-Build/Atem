@@ -848,8 +848,9 @@ impl App {
                 Ok(()) => {
                     self.last_activity_ping = Some(Instant::now());
                 }
-                Err(err) => {
-                    self.status_message = Some(format!("Failed to send activity ping: {}", err));
+                Err(_err) => {
+                    // Silently ignore activity ping errors (RTM not configured/no active project)
+                    // This is expected in normal TUI usage without voice coding features
                 }
             }
         }
