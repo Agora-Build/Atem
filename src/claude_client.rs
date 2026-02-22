@@ -145,7 +145,7 @@ impl ClaudeClient {
         #[cfg(target_os = "macos")]
         {
             cmd.env("TERM_PROGRAM", "Atem");
-            cmd.env("TERM_PROGRAM_VERSION", "0.4.41");
+            cmd.env("TERM_PROGRAM_VERSION", "0.4.43");
         }
 
         let mut child = pair

@@ -155,9 +155,9 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                         continue;
                     }
 
-                    // In local Claude mode, forward ALL keystrokes directly to
+                    // In Claude mode, forward ALL keystrokes directly to
                     // Claude Code's PTY.  Only Ctrl+B escapes back to the menu.
-                    if matches!(app.mode, AppMode::ClaudeChat) && !app.astation_connected {
+                    if matches!(app.mode, AppMode::ClaudeChat) {
                         if ctrl && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
                         {
                             app.finalize_claude_session();

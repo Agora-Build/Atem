@@ -1435,7 +1435,7 @@ impl App {
     }
 
     pub fn finalize_claude_session(&mut self) {
-        if !matches!(self.mode, AppMode::ClaudeChat) || self.astation_connected {
+        if !matches!(self.mode, AppMode::ClaudeChat) {
             return;
         }
 
