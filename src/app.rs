@@ -1956,6 +1956,9 @@ impl App {
             } => {
                 let id_preview = customer_id[..4.min(customer_id.len())].to_string();
 
+                // DEBUG: Log that we received CredentialSync
+                eprintln!("[DEBUG] CredentialSync received: {}...", id_preview);
+
                 // Store in memory for this session (available immediately)
                 self.synced_customer_id = Some(customer_id.clone());
                 self.synced_customer_secret = Some(customer_secret.clone());
@@ -1963,12 +1966,24 @@ impl App {
                 self.config.customer_id = Some(customer_id.clone());
                 self.config.customer_secret = Some(customer_secret.clone());
 
-                // Prompt user to save to disk (don't auto-save)
-                self.pending_credential_save = Some((customer_id, customer_secret));
-                self.status_message = Some(format!(
-                    "\u{1f511} Credentials received ({}...) | Press 'y' to save, 'n' to use for this session only",
-                    id_preview
-                ));
+                // Check if credentials already saved in config file
+                let cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                if cfg.customer_id.is_some() {
+                    // Already saved - don't prompt again
+                    self.status_message = Some(format!(
+                        "\u{1f511} Credentials synced from Astation ({}...)",
+                        id_preview
+                    ));
+                    eprintln!("[DEBUG] Credentials already saved in config - skipping prompt");
+                } else {
+                    // Not saved yet - prompt user
+                    self.pending_credential_save = Some((customer_id, customer_secret));
+                    self.status_message = Some(format!(
+                        "\u{1f511} Credentials received ({}...) | Press 'y' to save, 'n' to use for this session only",
+                        id_preview
+                    ));
+                    eprintln!("[DEBUG] Showing credential save prompt");
+                }
             }
             _ => {
                 // Unknown/unhandled message type — ignore silently
