@@ -299,47 +299,33 @@ impl App {
                 }
             }
             1 => {
-                // Launch Claude Code
+                // Launch Claude Code - always launch locally from Atem (like Codex)
                 self.mode = AppMode::ClaudeChat;
                 self.active_cli = ActiveCli::Claude;
+                self.input_text.clear();
+                self.claude_waiting_exit = false;
+                if self.claude_output_log.is_empty() {
+                    self.claude_output_log = "\u{1f916} Claude Code CLI Session\n\n\
+                        Atem routes your input to the Claude Code CLI and streams its replies back here.\n\
+                        Type commands in the input box and press Enter to send them to Claude.\n\
+                        Press Ctrl+C to end the Claude session and return to the main menu.\n\
+                        After a session, press 'u' to save a summary report.\n"
+                        .to_string();
+                }
 
-                if self.astation_connected {
-                    // Request Claude launch through Astation
-                    if let Err(e) = self.astation_client.launch_claude(None).await {
-                        self.output_text = format!(
-                            "\u{274c} Failed to request Claude launch from Astation: {}\n\nPress 'b' to go back to main menu",
-                            e
-                        );
-                    } else {
-                        self.output_text = "\u{1f916} Requesting Claude Code launch from Astation...\n\nPress 'b' to go back to main menu".to_string();
-                    }
-                } else {
-                    // Launch Claude locally via PTY
-                    self.input_text.clear();
-                    self.claude_waiting_exit = false;
-                    if self.claude_output_log.is_empty() {
-                        self.claude_output_log = "\u{1f916} Claude Code CLI Session\n\n\
-                            Atem routes your input to the Claude Code CLI and streams its replies back here.\n\
-                            Type commands in the input box and press Enter to send them to Claude.\n\
-                            Press Ctrl+C to end the Claude session and return to the main menu.\n\
-                            After a session, press 'u' to save a summary report.\n"
-                            .to_string();
-                    }
-
-                    match self.ensure_claude_session().await {
-                        Ok(new_session_started) => {
-                            if new_session_started {
-                                self.record_claude_output("\u{1f50c} Claude Code CLI session started.\n");
-                            }
-                            self.refresh_claude_view();
+                match self.ensure_claude_session().await {
+                    Ok(new_session_started) => {
+                        if new_session_started {
+                            self.record_claude_output("\u{1f50c} Claude Code CLI session started.\n");
                         }
-                        Err(err) => {
-                            self.record_claude_output(format!(
-                                "\u{274c} Unable to start Claude Code CLI: {}\n",
-                                err
-                            ));
-                            self.refresh_claude_view();
-                        }
+                        self.refresh_claude_view();
+                    }
+                    Err(err) => {
+                        self.record_claude_output(format!(
+                            "\u{274c} Unable to start Claude Code CLI: {}\n",
+                            err
+                        ));
+                        self.refresh_claude_view();
                     }
                 }
             }
