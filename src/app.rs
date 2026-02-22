@@ -751,89 +751,14 @@ impl App {
     }
 
     pub async fn ensure_rtm_client(&mut self) -> Result<()> {
-        let needs_new_client = self.rtm_client.is_none()
-            || self
-                .rtm_token_expires_at
-                .map(|expiry| expiry <= Instant::now())
-                .unwrap_or(true);
-
-        if !needs_new_client {
-            return Ok(());
-        }
-
-        // Resolve app_id and certificate from active project
-        let app_id = match crate::config::ActiveProject::resolve_app_id(None) {
-            Ok(id) => id,
-            Err(err) => {
-                self.status_message = Some(format!("RTM: {}", err));
-                return Err(err);
-            }
-        };
-        let app_certificate = match crate::config::ActiveProject::resolve_app_certificate(None) {
-            Ok(cert) => cert,
-            Err(err) => {
-                self.status_message = Some(format!("RTM: {}", err));
-                return Err(err);
-            }
-        };
-
-        let rtm_account = self.config.rtm_account().to_string();
-        let rtm_channel = self.config.rtm_channel().to_string();
-
-        let token = generate_rtm_token(
-            &app_id,
-            &app_certificate,
-            &rtm_account,
-            AGORA_RTM_TOKEN_TTL_SECS,
-        );
-
-        let config = RtmConfig {
-            app_id,
-            token: token.clone(),
-            channel: rtm_channel.clone(),
-            client_id: self.rtm_client_id.clone(),
-        };
-
-        let client = RtmClient::new(config).map_err(|err| {
-            self.status_message = Some(format!("Failed to connect to Astation signaling: {}", err));
-            err
-        })?;
-
-        if let Err(err) = client
-            .login_and_join(&token, &rtm_account, &rtm_channel)
-            .await
-        {
-            self.status_message = Some(format!("Failed to login/join signaling: {}", err));
-            return Err(err);
-        }
-
-        let refresh_margin = if AGORA_RTM_TOKEN_TTL_SECS > 120 {
-            AGORA_RTM_TOKEN_TTL_SECS as u64 - 60
-        } else {
-            (AGORA_RTM_TOKEN_TTL_SECS as u64).saturating_sub(10)
-        };
-        self.rtm_token_expires_at = Some(Instant::now() + Duration::from_secs(refresh_margin));
-        self.rtm_client = Some(client);
-        self.status_message = Some("Connected to Astation signaling.".to_string());
+        // RTM DISABLED: Use WebSocket for all communication
+        // TODO: Re-enable RTM for voice coding features in the future
         Ok(())
     }
 
-    pub async fn send_activity_ping(&mut self, focused: bool) -> Result<()> {
-        self.ensure_rtm_client().await?;
-        let client = match &self.rtm_client {
-            Some(client) => client,
-            None => return Ok(()),
-        };
-
-        let payload = json!({
-            "type": "activity",
-            "client_id": self.rtm_client_id,
-            "focused": focused,
-            "timestamp": current_timestamp_ms(),
-        })
-        .to_string();
-
-        client.publish_channel(&payload).await?;
+    pub async fn send_activity_ping(&mut self, _focused: bool) -> Result<()> {
+        // RTM DISABLED: Activity pings not needed without voice coding
+        // TODO: Send activity via WebSocket when implementing voice coding
         Ok(())
     }
 
@@ -857,13 +782,8 @@ impl App {
     }
 
     pub async fn process_rtm_messages(&mut self) -> Result<()> {
-        if let Some(client) = &self.rtm_client {
-            let events = client.drain_events().await;
-            for event in events {
-                self.handle_rtm_event(event);
-            }
-        }
-
+        // RTM DISABLED: No RTM events to process
+        // Still flush transcriptions if needed
         self.flush_pending_transcriptions().await?;
         Ok(())
     }
