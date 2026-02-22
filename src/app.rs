@@ -250,51 +250,40 @@ impl App {
         self.status_message = None;
         match self.selected_index {
             0 => {
-                // List Agora Projects
+                // List Agora Projects - Always fetch directly from Agora REST API
                 self.mode = AppMode::TokenGeneration; // Reusing this mode for project listing
                 self.output_text = "\u{1f4cb} Fetching Agora Projects...\n\n".to_string();
 
-                if self.astation_connected {
-                    // Request projects from Astation
-                    if let Err(e) = self.astation_client.request_projects().await {
+                // Priority: synced from Astation > env vars > config file
+                let fetch_result = if let (Some(cid), Some(csecret)) = (
+                    self.synced_customer_id.as_deref(),
+                    self.synced_customer_secret.as_deref(),
+                ) {
+                    crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret).await
+                } else {
+                    fetch_agora_projects().await
+                };
+
+                match fetch_result {
+                    Ok(projects) => {
+                        self.show_certificates = false;
+                        let info = format_projects(&projects, self.show_certificates);
+                        self.cached_projects = projects;
                         self.output_text = format!(
-                            "\u{274c} Failed to request projects from Astation: {}\n\nPress 'b' to go back to main menu",
+                            "Agora Projects\n\n{}",
+                            info
+                        );
+                    }
+                    Err(e) => {
+                        self.cached_projects.clear();
+                        self.output_text = format!(
+                            "Failed to fetch Agora projects: {}\n\n\
+                            Configure credentials in ~/.config/atem/config.toml or set\n\
+                            AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET environment variables.\n\
+                            Get these from https://console.agora.io -> RESTful API\n\n\
+                            Press 'b' to go back to main menu",
                             e
                         );
-                    } else {
-                        self.output_text = "\u{1f4cb} Requesting projects from Astation...\n\nPress 'b' to go back to main menu".to_string();
-                    }
-                } else {
-                    // Priority: synced from Astation > env vars > config file
-                    let fetch_result = if let (Some(cid), Some(csecret)) = (
-                        self.synced_customer_id.as_deref(),
-                        self.synced_customer_secret.as_deref(),
-                    ) {
-                        crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret).await
-                    } else {
-                        fetch_agora_projects().await
-                    };
-                    match fetch_result {
-                        Ok(projects) => {
-                            self.show_certificates = false;
-                            let info = format_projects(&projects, self.show_certificates);
-                            self.cached_projects = projects;
-                            self.output_text = format!(
-                                "Agora Projects\n\n{}",
-                                info
-                            );
-                        }
-                        Err(e) => {
-                            self.cached_projects.clear();
-                            self.output_text = format!(
-                                "Failed to fetch Agora projects: {}\n\n\
-                                Configure credentials in ~/.config/atem/config.toml or set\n\
-                                AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET environment variables.\n\
-                                Get these from https://console.agora.io -> RESTful API\n\n\
-                                Press 'b' to go back to main menu",
-                                e
-                            );
-                        }
                     }
                 }
             }
