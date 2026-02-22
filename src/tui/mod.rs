@@ -219,6 +219,27 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
 
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') if !ctrl => return Ok(()),
+                        // Handle credential save prompt (y/n)
+                        KeyCode::Char('y') | KeyCode::Char('Y') if !ctrl && app.pending_credential_save.is_some() => {
+                            if let Some((customer_id, customer_secret)) = app.pending_credential_save.take() {
+                                let id_preview = customer_id[..4.min(customer_id.len())].to_string();
+                                // Save to config file
+                                let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                                cfg.customer_id = Some(customer_id);
+                                cfg.customer_secret = Some(customer_secret);
+                                if let Err(e) = cfg.save_to_disk() {
+                                    app.status_message = Some(format!("\u{26a0}\u{fe0f} Could not save credentials: {}", e));
+                                } else {
+                                    app.status_message = Some(format!("\u{2705} Credentials saved to config ({}...)", id_preview));
+                                }
+                            }
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') if !ctrl && app.pending_credential_save.is_some() => {
+                            if let Some((customer_id, _)) = app.pending_credential_save.take() {
+                                let id_preview = customer_id[..4.min(customer_id.len())].to_string();
+                                app.status_message = Some(format!("\u{1f511} Using credentials for this session only ({}...)", id_preview));
+                            }
+                        }
                         KeyCode::Char('c') | KeyCode::Char('C')
                             if !ctrl
                                 && !matches!(

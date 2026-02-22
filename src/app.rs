@@ -131,6 +131,9 @@ pub struct App {
     /// Credentials synced from Astation via WebSocket. Highest priority over env/config.
     pub synced_customer_id: Option<String>,
     pub synced_customer_secret: Option<String>,
+    /// Pending credentials waiting for user to decide whether to save to disk.
+    /// (customer_id, customer_secret)
+    pub pending_credential_save: Option<(String, String)>,
     /// Background Astation connection result channel (set up at startup).
     pub astation_connect_rx: Option<tokio::sync::oneshot::Receiver<
         Result<(crate::websocket_client::AstationClient, Option<String>)>
@@ -214,6 +217,7 @@ impl App {
             agent_panel_selected: 0,
             synced_customer_id: None,
             synced_customer_secret: None,
+            pending_credential_save: None,
             astation_connect_rx: None,
         }
     }
@@ -1952,22 +1956,19 @@ impl App {
             } => {
                 let id_preview = customer_id[..4.min(customer_id.len())].to_string();
 
-                // Store in memory for this session.
+                // Store in memory for this session (available immediately)
                 self.synced_customer_id = Some(customer_id.clone());
                 self.synced_customer_secret = Some(customer_secret.clone());
-                // Also update the in-memory config so the main menu status reflects it
+                // Also update the in-memory config so features work immediately
                 self.config.customer_id = Some(customer_id.clone());
                 self.config.customer_secret = Some(customer_secret.clone());
 
-                // Persist to config file so CLI commands (e.g. `atem list project`) can use them.
-                let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                cfg.customer_id = Some(customer_id);
-                cfg.customer_secret = Some(customer_secret);
-                if let Err(e) = cfg.save_to_disk() {
-                    self.status_message = Some(format!("\u{26a0}\u{fe0f} Could not save credentials: {}", e));
-                } else {
-                    self.status_message = Some(format!("\u{1f511} Credentials synced ({}...)", id_preview));
-                }
+                // Prompt user to save to disk (don't auto-save)
+                self.pending_credential_save = Some((customer_id, customer_secret));
+                self.status_message = Some(format!(
+                    "\u{1f511} Credentials received ({}...) | Press 'y' to save, 'n' to use for this session only",
+                    id_preview
+                ));
             }
             _ => {
                 // Unknown/unhandled message type — ignore silently
