@@ -58,9 +58,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
         AppMode::MainMenu => "\u{2191}\u{2193}/jk: Navigate | Enter: Select | c: Copy Mode | q: Quit",
         AppMode::CommandExecution => "Type command + Enter | b: Back | q: Quit",
         AppMode::CodexChat => "All input goes to Codex | Ctrl+B: Back to menu",
-        AppMode::ClaudeChat if !app.astation_connected => {
-            "All input goes to Claude | Ctrl+B: Back to menu"
-        }
+        AppMode::ClaudeChat => "All input goes to Claude | Ctrl+B: Back to menu",
         AppMode::AgentPanel => "\u{2191}\u{2193}/jk: Navigate | Enter: Set Active | r: Refresh | b: Back",
         AppMode::TokenGeneration if !app.cached_projects.is_empty() => {
             if app.show_certificates {
