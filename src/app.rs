@@ -1269,6 +1269,16 @@ impl App {
         let text = data.as_ref();
         self.claude_raw_log.push_str(text);
 
+        // Debug: show bytes received
+        if !text.is_empty() {
+            self.status_message = Some(format!(
+                "Claude output: {} bytes (raw_log: {}, output_log: {})",
+                text.len(),
+                self.claude_raw_log.len(),
+                self.claude_output_log.len()
+            ));
+        }
+
         self.claude_terminal.process(text.as_bytes());
         self.update_claude_output_from_terminal();
     }
