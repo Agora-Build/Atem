@@ -489,15 +489,40 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
 
             if should_sync {
                 println!("Syncing Agora credentials from Astation...");
-                let mut cfg_no_creds = crate::config::AtemConfig::load().unwrap_or_default();
-                cfg_no_creds.customer_id = None;
-                cfg_no_creds.customer_secret = None;
-                match resolve_credentials(&cfg_no_creds).await {
-                    Ok((cid, _)) => println!(
-                        "Credentials saved (customer_id: {}...)",
-                        &cid[..4.min(cid.len())]
-                    ),
-                    Err(e) => eprintln!("Warning: could not sync credentials: {e}"),
+
+                // Wait for CredentialSync message from Astation (on the existing authenticated client)
+                let timeout = tokio::time::Duration::from_secs(5);
+                let result = tokio::time::timeout(timeout, async {
+                    loop {
+                        match client.recv_message_async().await {
+                            Some(crate::websocket_client::AstationMessage::CredentialSync {
+                                customer_id,
+                                customer_secret,
+                            }) => return Some((customer_id, customer_secret)),
+                            Some(_) => continue,
+                            None => return None,
+                        }
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(Some((cid, csecret))) => {
+                        // Save credentials to config
+                        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                        cfg.customer_id = Some(cid.clone());
+                        cfg.customer_secret = Some(csecret.clone());
+                        if let Err(e) = cfg.save_to_disk() {
+                            eprintln!("Warning: could not persist credentials to config: {e}");
+                        } else {
+                            println!(
+                                "✓ Credentials saved (customer_id: {}...)",
+                                &cid[..4.min(cid.len())]
+                            );
+                        }
+                    }
+                    Ok(None) => eprintln!("Warning: Astation disconnected before sending credentials"),
+                    Err(_) => eprintln!("Warning: Timed out waiting for credentials from Astation"),
                 }
             }
             Ok(())
