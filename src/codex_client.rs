@@ -57,34 +57,51 @@ impl CodexClient {
         Self { binary, extra_args }
     }
 
-    /// Resolve binary path using `which` command if needed
+    /// Resolve binary path by searching through PATH directories
     fn resolve_binary_path(&self) -> Result<String> {
+        use std::path::PathBuf;
+
         // If binary is already an absolute path, use it directly
         if std::path::Path::new(&self.binary).is_absolute() {
             return Ok(self.binary.clone());
         }
 
-        // Try to find the binary in PATH using `which`
-        let output = std::process::Command::new("which")
-            .arg(&self.binary)
-            .output()
-            .map_err(|e| anyhow!("Failed to run 'which' command: {}", e))?;
+        // Get PATH environment variable
+        let path_env = std::env::var("PATH").unwrap_or_else(|_| {
+            // Fallback to common PATH if not set
+            "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin".to_string()
+        });
 
-        if output.status.success() {
-            let path = String::from_utf8(output.stdout)
-                .map_err(|e| anyhow!("Invalid UTF-8 in 'which' output: {}", e))?
-                .trim()
-                .to_string();
+        // Search through each directory in PATH
+        for dir in path_env.split(':') {
+            let mut candidate = PathBuf::from(dir);
+            candidate.push(&self.binary);
 
-            if !path.is_empty() {
-                return Ok(path);
+            if candidate.exists() && candidate.is_file() {
+                // Check if it's executable (on Unix)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&candidate) {
+                        let permissions = metadata.permissions();
+                        if permissions.mode() & 0o111 != 0 {
+                            return Ok(candidate.to_string_lossy().to_string());
+                        }
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    return Ok(candidate.to_string_lossy().to_string());
+                }
             }
         }
 
-        // Fallback: return original binary name
+        // Not found in PATH
         Err(anyhow!(
-            "Unable to spawn {} because it doesn't exist on the filesystem and was not found in PATH",
-            self.binary
+            "Unable to find '{}' in PATH. Searched directories: {}",
+            self.binary,
+            path_env
         ))
     }
 
