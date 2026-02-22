@@ -1287,7 +1287,7 @@ impl App {
         }
 
         self.claude_output_log = lines.join("\n");
-        if matches!(self.mode, AppMode::ClaudeChat) && !self.astation_connected {
+        if matches!(self.mode, AppMode::ClaudeChat) {
             self.output_text = self.claude_output_log.clone();
         }
     }
@@ -1334,7 +1334,7 @@ impl App {
     }
 
     pub fn refresh_claude_view(&mut self) {
-        if matches!(self.mode, AppMode::ClaudeChat) && !self.astation_connected {
+        if matches!(self.mode, AppMode::ClaudeChat) {
             self.output_text = self.claude_output_log.clone();
         }
     }
