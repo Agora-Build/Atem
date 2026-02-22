@@ -137,6 +137,17 @@ impl ClaudeClient {
             cmd.env("TERM", "xterm-256color");
         }
 
+        // Force interactive mode - Claude might check these
+        cmd.env("FORCE_COLOR", "1");
+        cmd.env("COLORTERM", "truecolor");
+
+        // Explicitly mark as TTY for macOS
+        #[cfg(target_os = "macos")]
+        {
+            cmd.env("TERM_PROGRAM", "Atem");
+            cmd.env("TERM_PROGRAM_VERSION", "0.4.41");
+        }
+
         let mut child = pair
             .slave
             .spawn_command(cmd)
