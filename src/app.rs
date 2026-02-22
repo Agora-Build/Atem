@@ -1113,9 +1113,15 @@ impl App {
     /// Called once at startup (or on demand).  Agents that are already in
     /// the registry (same ACP URL) are skipped.
     pub async fn startup_scan_agents(&mut self) {
-        use crate::agent_detector::scan_lockfiles;
+        use crate::agent_detector::{scan_lockfiles, scan_default_ports};
 
-        let detected = scan_lockfiles();
+        // First, scan for lockfiles (traditional detection)
+        let mut detected = scan_lockfiles();
+
+        // Then, scan common ACP ports (for agents without lockfiles)
+        let port_detected = scan_default_ports().await;
+        detected.extend(port_detected);
+
         for agent in detected {
             if self.agent_registry.has_acp_url(&agent.acp_url) {
                 continue; // already registered

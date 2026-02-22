@@ -118,6 +118,39 @@ pub fn scan_lockfiles() -> Vec<DetectedAgent> {
     agents
 }
 
+/// Scan common ACP ports for running agents.
+///
+/// This probes localhost ports commonly used by ACP agents (8765-8770)
+/// to detect agents that don't create lockfiles.
+///
+/// This is an async function that makes real network connections.
+pub async fn scan_default_ports() -> Vec<DetectedAgent> {
+    // Common ACP ports (8765 is the default from stdio-to-ws examples)
+    let ports = vec![8765, 8766, 8767, 8768, 8769, 8770];
+    let mut agents = Vec::new();
+
+    for port in ports {
+        let url = format!("ws://127.0.0.1:{}", port);
+        // Use a short timeout (500ms) to avoid blocking startup
+        match probe_acp(&url, 500).await {
+            ProbeResult::AcpAvailable { kind, version: _ } => {
+                agents.push(DetectedAgent {
+                    kind,
+                    protocol: AgentProtocol::Acp,
+                    acp_url: url,
+                    pid: None, // No PID available from port scan
+                    lockfile: std::path::PathBuf::from(format!("<port-scan:{}>", port)),
+                });
+            }
+            _ => {
+                // Port not available or not ACP - continue
+            }
+        }
+    }
+
+    agents
+}
+
 // ── ACP probe ─────────────────────────────────────────────────────────────
 
 /// Result of a WebSocket ACP probe.
