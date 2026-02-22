@@ -238,6 +238,12 @@ pub enum SyncCommands {
 pub enum AgentCommands {
     /// Scan lockfiles and list all detected agents
     List,
+    /// Launch Claude Code as a PTY agent
+    Launch {
+        /// Agent type to launch (claude-code or codex)
+        #[arg(default_value = "claude-code")]
+        agent_type: String,
+    },
     /// Connect to an ACP agent at a WebSocket URL and show its server info
     Connect {
         /// WebSocket URL of the ACP server (e.g. ws://localhost:8765)
@@ -533,6 +539,13 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Agent { agent_command } => match agent_command {
+            AgentCommands::Launch { agent_type } => {
+                println!("Launching {} as PTY agent...", agent_type);
+                println!("Note: This will be implemented in the TUI mode");
+                println!("For now, use: atem (enter TUI)");
+                // TODO: Implement CLI agent launch with interactive session
+                Ok(())
+            }
             AgentCommands::List => {
                 use crate::agent_detector::{scan_lockfiles, scan_default_ports};
                 use crate::agent_client::AgentProtocol;

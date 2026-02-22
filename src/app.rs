@@ -138,6 +138,16 @@ pub struct App {
     pub astation_connect_rx: Option<tokio::sync::oneshot::Receiver<
         Result<(crate::websocket_client::AstationClient, Option<String>)>
     >>,
+    /// Pending command from Astation waiting for output relay.
+    pub pending_astation_command: Option<PendingAstationCommand>,
+}
+
+/// Tracks a command sent from Astation that needs output relayed back.
+#[derive(Debug, Clone)]
+pub struct PendingAstationCommand {
+    pub target: ActiveCli,
+    pub output_start_pos: usize, // Position in output_log where command output starts
+    pub sent_at: Instant,
 }
 
 impl App {
@@ -219,6 +229,7 @@ impl App {
             synced_customer_secret: None,
             pending_credential_save: None,
             astation_connect_rx: None,
+            pending_astation_command: None,
         }
     }
 
@@ -1108,6 +1119,41 @@ impl App {
         Ok(true)
     }
 
+    /// Launch Claude Code as a PTY agent and register it.
+    ///
+    /// Returns the agent ID on success.
+    pub async fn launch_claude_pty_agent(&mut self) -> anyhow::Result<String> {
+        use crate::agent_client::{AgentInfo, AgentKind, AgentProtocol, AgentOrigin, AgentStatus, PtyAgentClient};
+
+        // Start Claude Code PTY session
+        let session = self.claude_client.start_session().await?;
+
+        // Generate agent ID
+        let agent_id = format!("claude-pty-{}", uuid::Uuid::new_v4());
+
+        // ClaudeSession already has sender/receiver channels, use them directly
+        let pty_client = PtyAgentClient::new(&agent_id, session.sender, session.receiver);
+
+        // Register agent
+        let agent_info = AgentInfo {
+            id: agent_id.clone(),
+            name: "Claude Code (PTY)".to_string(),
+            kind: AgentKind::ClaudeCode,
+            protocol: AgentProtocol::Pty,
+            origin: AgentOrigin::Launched,
+            status: AgentStatus::Idle,
+            session_ids: vec![],
+            acp_url: None,
+            pty_pid: None, // PTY doesn't expose PID easily
+        };
+
+        self.agent_registry.register(agent_info);
+
+        // TODO: Store pty_client somewhere so we can send prompts to it
+        // For now, we've registered the agent
+        Ok(agent_id)
+    }
+
     /// Scan lockfiles for externally started agents and register them.
     ///
     /// Called once at startup (or on demand).  Agents that are already in
@@ -1766,9 +1812,31 @@ impl App {
             }
             AstationMessage::UserCommand { command, context } => {
                 let action = context.get("action").map(|s| s.as_str()).unwrap_or("cli_input");
+
+                // Determine target CLI
+                let target = match action {
+                    "cli_input" => self.pinned_cli.clone().unwrap_or(self.active_cli.clone()),
+                    "claude_input" => ActiveCli::Claude,
+                    "codex_input" => ActiveCli::Codex,
+                    _ => ActiveCli::Claude,
+                };
+
+                // Track output start position before sending command
+                let output_start_pos = match target {
+                    ActiveCli::Claude => self.claude_output_log.len(),
+                    ActiveCli::Codex => self.codex_output_log.len(),
+                };
+
+                // Store pending command for output relay
+                self.pending_astation_command = Some(PendingAstationCommand {
+                    target: target.clone(),
+                    output_start_pos,
+                    sent_at: Instant::now(),
+                });
+
+                // Send command to appropriate CLI
                 match action {
                     "cli_input" => {
-                        let target = self.pinned_cli.clone().unwrap_or(self.active_cli.clone());
                         match target {
                             ActiveCli::Claude => { self.send_claude_prompt(&command).await.ok(); }
                             ActiveCli::Codex => { self.send_codex_prompt(&command).await.ok(); }
@@ -1776,9 +1844,14 @@ impl App {
                     }
                     "claude_input" => { self.send_claude_prompt(&command).await.ok(); }
                     "codex_input" => { self.send_codex_prompt(&command).await.ok(); }
-                    "shell" => { self.execute_command(&command).await.ok(); }
+                    "shell" => {
+                        self.execute_command(&command).await.ok();
+                        // For shell commands, clear pending since we don't track shell output relay yet
+                        self.pending_astation_command = None;
+                    }
                     _ => { self.send_claude_prompt(&command).await.ok(); }
                 }
+
                 self.status_message = Some(format!(
                     "Received command: {}",
                     &command[..command.len().min(50)]
@@ -2088,6 +2161,49 @@ impl App {
         }
     }
 
+    /// Check if pending Astation command has output ready and relay it back.
+    /// Sends output after 2 seconds of inactivity.
+    pub async fn check_relay_output(&mut self) {
+        if let Some(ref pending) = self.pending_astation_command.clone() {
+            let elapsed = pending.sent_at.elapsed();
+
+            // Wait at least 2 seconds for output to accumulate
+            if elapsed < Duration::from_secs(2) {
+                return;
+            }
+
+            // Extract output since command was sent
+            let (output, success) = match pending.target {
+                ActiveCli::Claude => {
+                    let full_log = &self.claude_output_log;
+                    if full_log.len() > pending.output_start_pos {
+                        (full_log[pending.output_start_pos..].to_string(), true)
+                    } else {
+                        ("No output received".to_string(), false)
+                    }
+                }
+                ActiveCli::Codex => {
+                    let full_log = &self.codex_output_log;
+                    if full_log.len() > pending.output_start_pos {
+                        (full_log[pending.output_start_pos..].to_string(), true)
+                    } else {
+                        ("No output received".to_string(), false)
+                    }
+                }
+            };
+
+            // Send response back to Astation
+            if let Err(e) = self.astation_client.send_command_response(&output, success).await {
+                self.status_message = Some(format!("Failed to relay output to Astation: {}", e));
+            } else {
+                self.status_message = Some("Output relayed to Astation".to_string());
+            }
+
+            // Clear pending command
+            self.pending_astation_command = None;
+        }
+    }
+
     pub async fn process_astation_messages(&mut self) {
         // Drain all pending messages (non-blocking try_recv loop)
         let mut message_count = 0;
@@ -2104,6 +2220,9 @@ impl App {
                 let _ = session.save();
             }
         }
+
+        // Check if we should relay output back to Astation
+        self.check_relay_output().await;
     }
 }
 

@@ -622,6 +622,24 @@ impl AstationClient {
         self.send_message(message).await
     }
 
+    pub async fn send_command_response(
+        &self,
+        output: &str,
+        success: bool,
+    ) -> Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let message = AstationMessage::CommandResponse {
+            output: output.to_string(),
+            success,
+            timestamp,
+        };
+        self.send_message(message).await
+    }
+
     /// Reply to an `agentListRequest` with all currently registered agents.
     pub async fn send_agent_list(
         &self,
