@@ -1628,11 +1628,17 @@ impl App {
                 }
             }
 
-            // Try local without auth (direct connection)
+            // No valid session - try local with pairing flow (will authenticate)
             let mut client = crate::websocket_client::AstationClient::new();
-            if let Ok(()) = client.connect(local_url).await {
-                let _ = tx.send(Ok((client, None)));
-                return;
+            match client.connect_with_pairing(&config).await {
+                Ok(code) => {
+                    // Successfully authenticated via pairing
+                    let _ = tx.send(Ok((client, Some(code))));
+                    return;
+                }
+                Err(_) => {
+                    // Local pairing failed, will try relay below
+                }
             }
 
             // Local failed, try relay
@@ -1642,19 +1648,8 @@ impl App {
                 .replace("https://", "wss://")
                 .replace("http://", "ws://");
 
-            // If astation_relay_code is configured, use it as the room code
-            // This enables universal sessions through the relay
-            if let Some(astation_id) = config.astation_relay_code.as_ref() {
-                let relay_url = format!("{}/ws?role=atem&code={}", relay_ws_url, astation_id);
-                let mut client = crate::websocket_client::AstationClient::new();
-                if let Ok(()) = client.connect(&relay_url).await {
-                    // Session auth happens via WebSocket messages (authenticate() called in connect())
-                    let _ = tx.send(Ok((client, None)));
-                    return;
-                }
-            }
-
-            // Legacy fallback: Try relay with pairing code
+            // Local failed - try relay with pairing
+            // (connect_with_pairing tries relay automatically)
             let mut client = crate::websocket_client::AstationClient::new();
             match client.connect_with_pairing(&config).await {
                 Ok(code) => {
