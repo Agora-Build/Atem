@@ -1821,10 +1821,10 @@ impl App {
                     _ => ActiveCli::Claude,
                 };
 
-                // Track output start position before sending command
+                // Track output start position before sending command (use raw_log which accumulates)
                 let output_start_pos = match target {
-                    ActiveCli::Claude => self.claude_output_log.len(),
-                    ActiveCli::Codex => self.codex_output_log.len(),
+                    ActiveCli::Claude => self.claude_raw_log.len(),
+                    ActiveCli::Codex => self.codex_raw_log.len(),
                 };
 
                 // Store pending command for output relay
@@ -2172,10 +2172,10 @@ impl App {
                 return;
             }
 
-            // Extract output since command was sent
+            // Extract output since command was sent (use raw_log which accumulates all output)
             let (output, success) = match pending.target {
                 ActiveCli::Claude => {
-                    let full_log = &self.claude_output_log;
+                    let full_log = &self.claude_raw_log;
                     if full_log.len() > pending.output_start_pos {
                         (full_log[pending.output_start_pos..].to_string(), true)
                     } else {
@@ -2183,7 +2183,7 @@ impl App {
                     }
                 }
                 ActiveCli::Codex => {
-                    let full_log = &self.codex_output_log;
+                    let full_log = &self.codex_raw_log;
                     if full_log.len() > pending.output_start_pos {
                         (full_log[pending.output_start_pos..].to_string(), true)
                     } else {
