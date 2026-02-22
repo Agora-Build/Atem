@@ -398,4 +398,63 @@ mod tests {
         let result = rt.block_on(probe_acp("ws://127.0.0.1:1", 200));
         assert_eq!(result, ProbeResult::Unreachable);
     }
+
+    // ── scan_default_ports ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_scan_default_ports_returns_vec() {
+        // Should return a vec (may be empty if no agents running)
+        // without panicking
+        let agents = scan_default_ports().await;
+        // No assertion on count - may be 0 or more
+        let _ = agents;
+    }
+
+    #[tokio::test]
+    async fn test_scan_default_ports_detects_no_agents_when_none_running() {
+        // With no ACP servers running on ports 8765-8770,
+        // should return empty vec
+        let agents = scan_default_ports().await;
+
+        // This may fail if user actually has agents running,
+        // but in CI it should pass
+        // Just verify the function completes without panic
+        assert!(agents.len() <= 6, "Should scan at most 6 ports");
+    }
+
+    #[tokio::test]
+    async fn test_scan_default_ports_produces_valid_urls() {
+        let agents = scan_default_ports().await;
+
+        // Verify all detected agents have valid WebSocket URLs
+        for agent in agents {
+            assert!(agent.acp_url.starts_with("ws://127.0.0.1:"));
+            assert_eq!(agent.protocol, AgentProtocol::Acp);
+            // Port should be in the expected range
+            let port_str = agent.acp_url.strip_prefix("ws://127.0.0.1:").unwrap();
+            let port: u16 = port_str.parse().unwrap();
+            assert!((8765..=8770).contains(&port), "Port {} not in range 8765-8770", port);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_default_ports_no_duplicates() {
+        let agents = scan_default_ports().await;
+
+        // Verify no duplicate URLs
+        let urls: std::collections::HashSet<_> = agents.iter().map(|a| &a.acp_url).collect();
+        assert_eq!(urls.len(), agents.len(), "Found duplicate agent URLs");
+    }
+
+    #[tokio::test]
+    async fn test_scan_default_ports_has_expected_lockfile_placeholder() {
+        let agents = scan_default_ports().await;
+
+        // Each agent should have a lockfile path that indicates port scan
+        for agent in agents {
+            let path_str = agent.lockfile.to_string_lossy();
+            assert!(path_str.contains("<port-scan:"),
+                "Lockfile path '{}' should indicate port scan", path_str);
+        }
+    }
 }

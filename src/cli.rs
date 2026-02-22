@@ -534,13 +534,19 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         Commands::Agent { agent_command } => match agent_command {
             AgentCommands::List => {
-                use crate::agent_detector::scan_lockfiles;
+                use crate::agent_detector::{scan_lockfiles, scan_default_ports};
                 use crate::agent_client::AgentProtocol;
 
-                let agents = scan_lockfiles();
+                // Scan both lockfiles and default ports
+                let mut agents = scan_lockfiles();
+                let port_agents = scan_default_ports().await;
+                agents.extend(port_agents);
+
                 if agents.is_empty() {
-                    println!("No agents detected (no lockfiles found).");
-                    println!("Tip: start Claude Code or Codex and re-run.");
+                    println!("No agents detected.");
+                    println!("Tip: start Claude Code in ACP mode or Codex and re-run.");
+                    println!("Example: npx -y @rebornix/stdio-to-ws --persist --grace-period 604800 \\");
+                    println!("         \"npx @zed-industries/claude-code-acp\" --port 8765");
                 } else {
                     println!("Detected agents ({})\n", agents.len());
                     for (i, agent) in agents.iter().enumerate() {
