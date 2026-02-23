@@ -140,6 +140,8 @@ pub struct App {
     >>,
     /// Pending command from Astation waiting for output relay.
     pub pending_astation_command: Option<PendingAstationCommand>,
+    /// Pending voice coding request waiting for Claude to finish.
+    pub pending_voice_request: Option<PendingVoiceRequest>,
 }
 
 /// Tracks a command sent from Astation that needs output relayed back.
@@ -148,6 +150,16 @@ pub struct PendingAstationCommand {
     pub target: ActiveCli,
     pub output_start_pos: usize, // Position in output_log where command output starts
     pub sent_at: Instant,
+}
+
+/// Tracks a voice coding request waiting for Claude to finish.
+#[derive(Debug, Clone)]
+pub struct PendingVoiceRequest {
+    pub session_id: String,
+    pub relay_url: String,
+    pub sent_at: Instant,
+    pub output_snapshot_len: usize,
+    pub last_output_at: Instant,
 }
 
 impl App {
@@ -230,6 +242,7 @@ impl App {
             pending_credential_save: None,
             astation_connect_rx: None,
             pending_astation_command: None,
+            pending_voice_request: None,
         }
     }
 
@@ -1920,6 +1933,13 @@ impl App {
                     },
                 }
             }
+            AstationMessage::VoiceRequest {
+                session_id,
+                accumulated_text,
+                relay_url,
+            } => {
+                self.handle_voice_request(session_id, accumulated_text, relay_url).await;
+            }
             AstationMessage::CredentialSync {
                 customer_id,
                 customer_secret,
@@ -2142,6 +2162,120 @@ impl App {
         }
     }
 
+    /// Handle a voice coding request from Astation: send to Claude and track for completion.
+    pub async fn handle_voice_request(
+        &mut self,
+        session_id: String,
+        accumulated_text: String,
+        relay_url: String,
+    ) {
+        self.status_message = Some(format!("\u{1f3a4} Voice request: {}", &accumulated_text[..accumulated_text.len().min(50)]));
+
+        // Send the transcribed text to Claude Code
+        if let Err(err) = self.send_claude_prompt(&accumulated_text).await {
+            self.status_message =
+                Some(format!("Failed to send voice request to Claude: {}", err));
+            // POST failure to relay so it unblocks
+            let client = reqwest::Client::new();
+            let _ = client
+                .post(format!("{}/api/voice-sessions/response", relay_url))
+                .json(&serde_json::json!({
+                    "session_id": session_id,
+                    "response": format!("Error: {}", err),
+                }))
+                .send()
+                .await;
+            let _ = self
+                .astation_client
+                .send_voice_response(&session_id, false, &format!("Failed to send to Claude: {}", err))
+                .await;
+            return;
+        }
+
+        // Track pending request — watch for Claude output completion
+        let now = Instant::now();
+        self.pending_voice_request = Some(PendingVoiceRequest {
+            session_id,
+            relay_url,
+            sent_at: now,
+            output_snapshot_len: self.claude_raw_log.len(),
+            last_output_at: now,
+        });
+    }
+
+    /// Check if a pending voice request's Claude output is complete (2s inactivity).
+    /// When done, POST the response to the relay and notify Astation.
+    pub async fn check_voice_request_completion(&mut self) {
+        let pending = match self.pending_voice_request.clone() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let current_len = self.claude_raw_log.len();
+
+        // Output is still growing — update snapshot
+        if current_len > pending.output_snapshot_len {
+            if let Some(ref mut p) = self.pending_voice_request {
+                p.output_snapshot_len = current_len;
+                p.last_output_at = Instant::now();
+            }
+            return;
+        }
+
+        // No new output yet — wait at least 2 seconds of inactivity
+        if pending.last_output_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+
+        // Also require at least 2s since the prompt was sent (avoid racing)
+        if pending.sent_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+
+        // Claude is done — extract the response text
+        let response_text = if current_len > pending.output_snapshot_len {
+            self.claude_raw_log[pending.output_snapshot_len..].to_string()
+        } else if current_len > 0 && pending.output_snapshot_len < current_len {
+            self.claude_raw_log[pending.output_snapshot_len..].to_string()
+        } else {
+            // Snapshot may have been set before any output was produced.
+            // Use everything accumulated since the initial snapshot position.
+            let start = pending.output_snapshot_len.min(self.claude_raw_log.len());
+            if start < self.claude_raw_log.len() {
+                self.claude_raw_log[start..].to_string()
+            } else {
+                "No output received from Claude.".to_string()
+            }
+        };
+
+        // POST response to relay server
+        let client = reqwest::Client::new();
+        let post_result = client
+            .post(format!("{}/api/voice-sessions/response", pending.relay_url))
+            .json(&serde_json::json!({
+                "session_id": pending.session_id,
+                "response": response_text,
+            }))
+            .send()
+            .await;
+
+        let success = post_result.is_ok();
+        let msg = if success {
+            "Response delivered to relay".to_string()
+        } else {
+            format!("Failed to POST to relay: {}", post_result.unwrap_err())
+        };
+
+        // Notify Astation
+        let _ = self
+            .astation_client
+            .send_voice_response(&pending.session_id, success, &msg)
+            .await;
+
+        self.status_message = Some(format!("\u{1f3a4} Voice response: {}", msg));
+        self.pending_voice_request = None;
+    }
+
     /// Check if pending Astation command has output ready and relay it back.
     /// Sends output after 2 seconds of inactivity.
     pub async fn check_relay_output(&mut self) {
@@ -2204,6 +2338,9 @@ impl App {
 
         // Check if we should relay output back to Astation
         self.check_relay_output().await;
+
+        // Check if pending voice request has completed
+        self.check_voice_request_completion().await;
     }
 }
 

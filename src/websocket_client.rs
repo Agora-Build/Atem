@@ -198,6 +198,22 @@ pub enum AstationMessage {
         request_id: Option<String>,
     },
 
+    /// Astation → Atem: voice coding request with accumulated transcription.
+    #[serde(rename = "voiceRequest")]
+    VoiceRequest {
+        session_id: String,
+        accumulated_text: String,
+        relay_url: String,
+    },
+
+    /// Atem → Astation: voice coding response confirmation.
+    #[serde(rename = "voiceResponse")]
+    VoiceResponse {
+        session_id: String,
+        success: bool,
+        message: String,
+    },
+
     /// Astation → Atem: Agora REST API credentials for use without env vars.
     /// Priority: synced (this) > env vars > config file.
     #[serde(rename = "credentialSync")]
@@ -604,6 +620,20 @@ impl AstationClient {
     ) -> Result<()> {
         let msg = AstationMessage::MarkTaskResult {
             task_id: task_id.to_string(),
+            success,
+            message: message.to_string(),
+        };
+        self.send_message(msg).await
+    }
+
+    pub async fn send_voice_response(
+        &self,
+        session_id: &str,
+        success: bool,
+        message: &str,
+    ) -> Result<()> {
+        let msg = AstationMessage::VoiceResponse {
+            session_id: session_id.to_string(),
             success,
             message: message.to_string(),
         };
@@ -1719,6 +1749,87 @@ mod tests {
             assert_eq!(customer_secret, "my_secret");
         } else {
             panic!("expected CredentialSync");
+        }
+    }
+
+    // ── VoiceRequest / VoiceResponse tests ─────────────────────────────
+
+    #[test]
+    fn voice_request_deserialize() {
+        let json = r#"{"type":"voiceRequest","data":{"session_id":"sess-abc","accumulated_text":"fix the login bug","relay_url":"https://station.agora.build"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VoiceRequest {
+            session_id,
+            accumulated_text,
+            relay_url,
+        } = msg
+        {
+            assert_eq!(session_id, "sess-abc");
+            assert_eq!(accumulated_text, "fix the login bug");
+            assert_eq!(relay_url, "https://station.agora.build");
+        } else {
+            panic!("expected VoiceRequest");
+        }
+    }
+
+    #[test]
+    fn voice_request_roundtrip() {
+        let msg = AstationMessage::VoiceRequest {
+            session_id: "sess-1".into(),
+            accumulated_text: "add a button".into(),
+            relay_url: "https://relay.example.com".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"voiceRequest""#));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceRequest {
+            session_id,
+            accumulated_text,
+            relay_url,
+        } = parsed
+        {
+            assert_eq!(session_id, "sess-1");
+            assert_eq!(accumulated_text, "add a button");
+            assert_eq!(relay_url, "https://relay.example.com");
+        } else {
+            panic!("expected VoiceRequest");
+        }
+    }
+
+    #[test]
+    fn voice_response_serialize() {
+        let msg = AstationMessage::VoiceResponse {
+            session_id: "sess-1".into(),
+            success: true,
+            message: "Response delivered".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"voiceResponse""#));
+        assert!(json.contains(r#""session_id":"sess-1""#));
+        assert!(json.contains(r#""success":true"#));
+        assert!(json.contains("Response delivered"));
+    }
+
+    #[test]
+    fn voice_response_roundtrip() {
+        let msg = AstationMessage::VoiceResponse {
+            session_id: "sess-2".into(),
+            success: false,
+            message: "Claude timeout".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceResponse {
+            session_id,
+            success,
+            message,
+        } = parsed
+        {
+            assert_eq!(session_id, "sess-2");
+            assert!(!success);
+            assert_eq!(message, "Claude timeout");
+        } else {
+            panic!("expected VoiceResponse");
         }
     }
 
