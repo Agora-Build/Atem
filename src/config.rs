@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
@@ -169,6 +172,20 @@ impl AtemConfig {
             }
         }
 
+        // Show env var overrides if set
+        let env_app_id = std::env::var("AGORA_APP_ID").ok().filter(|s| !s.is_empty());
+        let env_cert = std::env::var("AGORA_APP_CERTIFICATE").ok().filter(|s| !s.is_empty());
+        if env_app_id.is_some() || env_cert.is_some() {
+            lines.push(String::new());
+            lines.push("Env var overrides:".to_string());
+            if let Some(id) = &env_app_id {
+                lines.push(format!("  AGORA_APP_ID={}", id));
+            }
+            if env_cert.is_some() {
+                lines.push(format!("  AGORA_APP_CERTIFICATE={}", mask(&env_cert)));
+            }
+        }
+
         lines.join("\n")
     }
 
@@ -232,26 +249,215 @@ impl ActiveProject {
         Ok(())
     }
 
-    /// Resolve app_id: CLI flag > active project > error
+    /// Resolve app_id: CLI flag > env var > active project > error
     pub fn resolve_app_id(cli_app_id: Option<&str>) -> Result<String> {
         if let Some(id) = cli_app_id {
             return Ok(id.to_string());
         }
+        if let Ok(id) = std::env::var("AGORA_APP_ID") {
+            if !id.is_empty() {
+                return Ok(id);
+            }
+        }
         if let Some(proj) = Self::load() {
             return Ok(proj.app_id);
         }
-        anyhow::bail!("No active project. Run `atem project use <APP_ID>` or pass `--app-id`")
+        anyhow::bail!(
+            "No active project. Run `atem config set --app-id <ID> --app-certificate <CERT>`, \
+             `atem project use <APP_ID>`, set AGORA_APP_ID env var, or pass `--app-id`"
+        )
     }
 
-    /// Resolve app_certificate: CLI flag > active project > error
+    /// Resolve app_certificate: CLI flag > env var > active project > error
     pub fn resolve_app_certificate(cli_cert: Option<&str>) -> Result<String> {
         if let Some(cert) = cli_cert {
             return Ok(cert.to_string());
         }
+        if let Ok(cert) = std::env::var("AGORA_APP_CERTIFICATE") {
+            if !cert.is_empty() {
+                return Ok(cert);
+            }
+        }
         if let Some(proj) = Self::load() {
             return Ok(proj.app_certificate);
         }
-        anyhow::bail!("No active project. Run `atem project use <APP_ID>` or pass `--app-id`")
+        anyhow::bail!(
+            "No active project. Run `atem config set --app-id <ID> --app-certificate <CERT>`, \
+             `atem project use <APP_ID>`, set AGORA_APP_CERTIFICATE env var, or pass `--app-id`"
+        )
+    }
+}
+
+// ── Encrypted project cache ─────────────────────────────────────────
+
+/// Get machine ID for cache encryption key derivation.
+fn get_machine_id() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(id) = fs::read_to_string("/etc/machine-id") {
+            let trimmed = id.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("IOPlatformUUID") {
+                    if let Some(uuid) = line.split('"').nth(3) {
+                        return uuid.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: hostname
+    hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "atem-fallback-id".to_string())
+}
+
+/// Derive a 32-byte encryption key from the machine ID.
+fn derive_cache_key() -> [u8; 32] {
+    type HmacSha256 = Hmac<Sha256>;
+    let machine_id = get_machine_id();
+    let mut mac =
+        HmacSha256::new_from_slice(b"atem-project-cache-v1").expect("HMAC accepts any key size");
+    mac.update(machine_id.as_bytes());
+    let result = mac.finalize();
+    result.into_bytes().into()
+}
+
+/// XOR-encrypt `plaintext` with a SHA256-based keystream derived from `key`.
+pub fn encrypt_field(plaintext: &str, key: &[u8; 32]) -> String {
+    let pt = plaintext.as_bytes();
+    let keystream = generate_keystream(key, pt.len());
+    let encrypted: Vec<u8> = pt.iter().zip(keystream.iter()).map(|(a, b)| a ^ b).collect();
+    general_purpose::STANDARD.encode(&encrypted)
+}
+
+/// Decrypt a base64-encoded ciphertext using the same XOR keystream.
+pub fn decrypt_field(ciphertext_b64: &str, key: &[u8; 32]) -> Result<String> {
+    let encrypted = general_purpose::STANDARD
+        .decode(ciphertext_b64)
+        .map_err(|e| anyhow::anyhow!("Failed to decode base64: {}", e))?;
+    let keystream = generate_keystream(key, encrypted.len());
+    let decrypted: Vec<u8> = encrypted
+        .iter()
+        .zip(keystream.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    String::from_utf8(decrypted).map_err(|e| anyhow::anyhow!("Invalid UTF-8 after decrypt: {}", e))
+}
+
+/// Generate a keystream of `len` bytes: SHA256(key || 0) || SHA256(key || 1) || ...
+fn generate_keystream(key: &[u8; 32], len: usize) -> Vec<u8> {
+    let mut stream = Vec::with_capacity(len);
+    let mut counter: u32 = 0;
+    while stream.len() < len {
+        let mut hasher = Sha256::new();
+        hasher.update(key);
+        hasher.update(counter.to_le_bytes());
+        let block = hasher.finalize();
+        stream.extend_from_slice(&block);
+        counter += 1;
+    }
+    stream.truncate(len);
+    stream
+}
+
+/// A single cached project with encrypted sign_key.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedProject {
+    name: String,
+    vendor_key: String,
+    sign_key_encrypted: String,
+    id: String,
+    status: i32,
+    created: u64,
+}
+
+/// Encrypted project cache stored at ~/.config/atem/project_cache.json
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectCache {
+    projects: Vec<CachedProject>,
+}
+
+impl ProjectCache {
+    /// Cache file path: ~/.config/atem/project_cache.json
+    pub fn path() -> PathBuf {
+        AtemConfig::config_dir().join("project_cache.json")
+    }
+
+    /// Save projects to the encrypted cache.
+    pub fn save(projects: &[crate::agora_api::AgoraApiProject]) -> Result<()> {
+        let key = derive_cache_key();
+        let cached: Vec<CachedProject> = projects
+            .iter()
+            .map(|p| CachedProject {
+                name: p.name.clone(),
+                vendor_key: p.vendor_key.clone(),
+                sign_key_encrypted: encrypt_field(&p.sign_key, &key),
+                id: p.id.clone(),
+                status: p.status,
+                created: p.created,
+            })
+            .collect();
+
+        let cache = ProjectCache { projects: cached };
+        let path = Self::path();
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir)?;
+        let json = serde_json::to_string_pretty(&cache)?;
+        fs::write(&path, json)?;
+        Ok(())
+    }
+
+    /// Load projects from the encrypted cache.
+    pub fn load() -> Option<Vec<crate::agora_api::AgoraApiProject>> {
+        let path = Self::path();
+        if !path.exists() {
+            return None;
+        }
+        let content = fs::read_to_string(&path).ok()?;
+        let cache: ProjectCache = serde_json::from_str(&content).ok()?;
+        let key = derive_cache_key();
+
+        let projects: Vec<crate::agora_api::AgoraApiProject> = cache
+            .projects
+            .iter()
+            .filter_map(|cp| {
+                let sign_key = decrypt_field(&cp.sign_key_encrypted, &key).ok()?;
+                Some(crate::agora_api::AgoraApiProject {
+                    id: cp.id.clone(),
+                    name: cp.name.clone(),
+                    vendor_key: cp.vendor_key.clone(),
+                    sign_key,
+                    recording_server: None,
+                    status: cp.status,
+                    created: cp.created,
+                })
+            })
+            .collect();
+
+        Some(projects)
+    }
+
+    /// Get a project by 1-based index from the cache.
+    pub fn get(index: usize) -> Option<crate::agora_api::AgoraApiProject> {
+        let projects = Self::load()?;
+        if index == 0 || index > projects.len() {
+            return None;
+        }
+        Some(projects[index - 1].clone())
     }
 }
 
@@ -400,6 +606,77 @@ mod tests {
     }
 
     #[test]
+    fn resolve_app_id_env_var_overrides() {
+        // Temporarily back up active project + env
+        let path = ActiveProject::path();
+        let backup = path.with_extension("json.bak2");
+        let had_file = path.exists();
+        if had_file {
+            let _ = fs::rename(&path, &backup);
+        }
+        let old_env = std::env::var("AGORA_APP_ID").ok();
+
+        unsafe { std::env::set_var("AGORA_APP_ID", "env_app_id") };
+        let result = ActiveProject::resolve_app_id(None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "env_app_id");
+
+        // Restore
+        unsafe {
+            match old_env {
+                Some(v) => std::env::set_var("AGORA_APP_ID", v),
+                None => std::env::remove_var("AGORA_APP_ID"),
+            }
+        }
+        if had_file {
+            let _ = fs::rename(&backup, &path);
+        }
+    }
+
+    #[test]
+    fn resolve_app_id_cli_beats_env() {
+        let old_env = std::env::var("AGORA_APP_ID").ok();
+        unsafe { std::env::set_var("AGORA_APP_ID", "env_app_id") };
+
+        let result = ActiveProject::resolve_app_id(Some("cli_app_id"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "cli_app_id");
+
+        unsafe {
+            match old_env {
+                Some(v) => std::env::set_var("AGORA_APP_ID", v),
+                None => std::env::remove_var("AGORA_APP_ID"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_app_certificate_env_var() {
+        let path = ActiveProject::path();
+        let backup = path.with_extension("json.bak3");
+        let had_file = path.exists();
+        if had_file {
+            let _ = fs::rename(&path, &backup);
+        }
+        let old_env = std::env::var("AGORA_APP_CERTIFICATE").ok();
+
+        unsafe { std::env::set_var("AGORA_APP_CERTIFICATE", "env_cert") };
+        let result = ActiveProject::resolve_app_certificate(None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "env_cert");
+
+        unsafe {
+            match old_env {
+                Some(v) => std::env::set_var("AGORA_APP_CERTIFICATE", v),
+                None => std::env::remove_var("AGORA_APP_CERTIFICATE"),
+            }
+        }
+        if had_file {
+            let _ = fs::rename(&backup, &path);
+        }
+    }
+
+    #[test]
     fn test_astation_relay_url_default() {
         let config = AtemConfig::default();
         assert_eq!(config.astation_relay_url(), "https://station.agora.build");
@@ -419,5 +696,78 @@ mod tests {
         let config = AtemConfig::default();
         let display = config.display_masked();
         assert!(display.contains("astation_relay_url"));
+    }
+
+    // ── project cache + crypto tests ────────────────────────────────────
+
+    #[test]
+    fn encrypt_decrypt_round_trip() {
+        let key = derive_cache_key();
+        let plaintext = "my-secret-certificate-abc123";
+        let encrypted = encrypt_field(plaintext, &key);
+        assert_ne!(encrypted, plaintext);
+        let decrypted = decrypt_field(&encrypted, &key).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encrypt_decrypt_empty_string() {
+        let key = derive_cache_key();
+        let encrypted = encrypt_field("", &key);
+        let decrypted = decrypt_field(&encrypted, &key).unwrap();
+        assert_eq!(decrypted, "");
+    }
+
+    #[test]
+    fn project_cache_round_trip() {
+        use crate::agora_api::AgoraApiProject;
+
+        let projects = vec![
+            AgoraApiProject {
+                id: "id1".to_string(),
+                name: "Project One".to_string(),
+                vendor_key: "appid1".to_string(),
+                sign_key: "secret-cert-1".to_string(),
+                recording_server: None,
+                status: 1,
+                created: 1700000000,
+            },
+            AgoraApiProject {
+                id: "id2".to_string(),
+                name: "Project Two".to_string(),
+                vendor_key: "appid2".to_string(),
+                sign_key: "".to_string(),
+                recording_server: None,
+                status: 0,
+                created: 1700000001,
+            },
+        ];
+
+        // Save
+        ProjectCache::save(&projects).unwrap();
+
+        // Verify the file exists and sign_key is NOT in plaintext
+        let raw = fs::read_to_string(ProjectCache::path()).unwrap();
+        assert!(!raw.contains("secret-cert-1"), "sign_key should be encrypted on disk");
+        assert!(raw.contains("appid1"), "vendor_key (non-sensitive) should be readable");
+
+        // Load and verify
+        let loaded = ProjectCache::load().expect("cache should load");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Project One");
+        assert_eq!(loaded[0].sign_key, "secret-cert-1");
+        assert_eq!(loaded[1].sign_key, "");
+
+        // Also test get-by-index (1-based) on the same data to avoid file races
+        let p1 = ProjectCache::get(1).expect("index 1 should exist");
+        assert_eq!(p1.name, "Project One");
+        assert_eq!(p1.sign_key, "secret-cert-1");
+
+        let p2 = ProjectCache::get(2).expect("index 2 should exist");
+        assert_eq!(p2.name, "Project Two");
+
+        // Out of range
+        assert!(ProjectCache::get(0).is_none());
+        assert!(ProjectCache::get(3).is_none());
     }
 }

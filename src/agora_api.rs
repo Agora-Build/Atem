@@ -1,13 +1,13 @@
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 pub struct AgoraApiResponse {
     pub projects: Vec<AgoraApiProject>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgoraApiProject {
     #[allow(dead_code)]
     pub id: String,
