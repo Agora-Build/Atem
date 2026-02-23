@@ -136,6 +136,11 @@ pub enum Commands {
         #[command(subcommand)]
         agent_command: AgentCommands,
     },
+    /// Manage Agora dev servers
+    Serv {
+        #[command(subcommand)]
+        serv_command: ServCommands,
+    },
     /// Generate a beautiful visual explanation as a self-contained HTML page
     Explain {
         /// The topic or concept to explain
@@ -270,6 +275,40 @@ pub enum AgentCommands {
         #[arg(long, default_value = "2000")]
         timeout: u64,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ServCommands {
+    /// Launch a browser-based RTC audio/video test page (HTTPS)
+    Rtc {
+        /// Channel name
+        #[arg(long, default_value = "test")]
+        channel: String,
+        /// HTTPS port (0 = auto-assign)
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Token expiry in seconds
+        #[arg(long, default_value = "3600")]
+        expire: u32,
+        /// Don't auto-open the browser
+        #[arg(long)]
+        no_browser: bool,
+        /// Run as a background daemon
+        #[arg(long)]
+        background: bool,
+        /// Internal: marks this process as the detached daemon (hidden)
+        #[arg(long, hide = true)]
+        _serv_daemon: bool,
+    },
+    /// List running background servers
+    List,
+    /// Kill a background server by ID
+    Kill {
+        /// Server ID (e.g. rtc-demo-8443)
+        id: String,
+    },
+    /// Kill all background servers
+    Killall,
 }
 
 pub async fn handle_cli_command(command: Commands) -> Result<()> {
@@ -679,6 +718,29 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Serv { serv_command } => match serv_command {
+            ServCommands::Rtc {
+                channel,
+                port,
+                expire,
+                no_browser,
+                background,
+                _serv_daemon,
+            } => {
+                let config = crate::rtc_test_server::RtcTestConfig {
+                    channel,
+                    port,
+                    expire_secs: expire,
+                    no_browser,
+                    background,
+                    _daemon: _serv_daemon,
+                };
+                crate::rtc_test_server::run_server(config).await
+            }
+            ServCommands::List => crate::rtc_test_server::cmd_list_servers(),
+            ServCommands::Kill { id } => crate::rtc_test_server::cmd_kill_server(&id),
+            ServCommands::Killall => crate::rtc_test_server::cmd_kill_all_servers(),
+        },
         Commands::Explain {
             topic,
             context,
@@ -1071,5 +1133,116 @@ mod tests {
             }
             _ => panic!("expected Explain command"),
         }
+    }
+
+    // ── serv command ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cli_serv_rtc_defaults() {
+        let cli = Cli::try_parse_from(["atem", "serv", "rtc"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command:
+                    ServCommands::Rtc {
+                        channel,
+                        port,
+                        expire,
+                        no_browser,
+                        background,
+                        ..
+                    },
+            }) => {
+                assert_eq!(channel, "test");
+                assert_eq!(port, 0);
+                assert_eq!(expire, 3600);
+                assert!(!no_browser);
+                assert!(!background);
+            }
+            _ => panic!("expected Serv Rtc command"),
+        }
+    }
+
+    #[test]
+    fn cli_serv_rtc_with_options() {
+        let cli = Cli::try_parse_from([
+            "atem",
+            "serv",
+            "rtc",
+            "--channel",
+            "demo",
+            "--port",
+            "8443",
+            "--expire",
+            "7200",
+            "--no-browser",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command:
+                    ServCommands::Rtc {
+                        channel,
+                        port,
+                        expire,
+                        no_browser,
+                        ..
+                    },
+            }) => {
+                assert_eq!(channel, "demo");
+                assert_eq!(port, 8443);
+                assert_eq!(expire, 7200);
+                assert!(no_browser);
+            }
+            _ => panic!("expected Serv Rtc command"),
+        }
+    }
+
+    #[test]
+    fn cli_serv_rtc_background_flag() {
+        let cli =
+            Cli::try_parse_from(["atem", "serv", "rtc", "--background"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Rtc { background, .. },
+            }) => {
+                assert!(background);
+            }
+            _ => panic!("expected Serv Rtc command"),
+        }
+    }
+
+    #[test]
+    fn cli_serv_list_parses() {
+        let cli = Cli::try_parse_from(["atem", "serv", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serv {
+                serv_command: ServCommands::List
+            })
+        ));
+    }
+
+    #[test]
+    fn cli_serv_kill_parses() {
+        let cli = Cli::try_parse_from(["atem", "serv", "kill", "rtc-demo-8443"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Kill { id },
+            }) => {
+                assert_eq!(id, "rtc-demo-8443");
+            }
+            _ => panic!("expected Serv Kill command"),
+        }
+    }
+
+    #[test]
+    fn cli_serv_killall_parses() {
+        let cli = Cli::try_parse_from(["atem", "serv", "killall"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serv {
+                serv_command: ServCommands::Killall
+            })
+        ));
     }
 }

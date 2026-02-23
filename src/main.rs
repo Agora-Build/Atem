@@ -21,6 +21,8 @@ mod agent_detector;
 mod agent_registry;
 // Visual Explainer
 mod visual_explainer;
+// RTC test server
+mod rtc_test_server;
 
 use anyhow::Result;
 use clap::Parser;
