@@ -1268,21 +1268,6 @@ impl App {
     pub fn record_claude_output(&mut self, data: impl AsRef<str>) {
         let text = data.as_ref();
         self.claude_raw_log.push_str(text);
-
-        // Debug: show bytes received and check for exit/error messages
-        if !text.is_empty() {
-            let is_exit = text.contains("Claude CLI exited") || text.contains("wait error");
-            let is_error = text.contains("⚠️") || text.contains("Failed");
-            self.status_message = Some(format!(
-                "Claude: {} bytes | raw:{} parsed:{} | exit:{} err:{}",
-                text.len(),
-                self.claude_raw_log.len(),
-                self.claude_output_log.len(),
-                is_exit,
-                is_error
-            ));
-        }
-
         self.claude_terminal.process(text.as_bytes());
         self.update_claude_output_from_terminal();
     }
