@@ -1834,6 +1834,86 @@ mod tests {
     }
 
     #[test]
+    fn voice_request_empty_text() {
+        let msg = AstationMessage::VoiceRequest {
+            session_id: "sess-empty".into(),
+            accumulated_text: "".into(),
+            relay_url: "https://relay.example.com".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceRequest { accumulated_text, .. } = parsed {
+            assert_eq!(accumulated_text, "");
+        } else {
+            panic!("expected VoiceRequest");
+        }
+    }
+
+    #[test]
+    fn voice_request_special_characters() {
+        let msg = AstationMessage::VoiceRequest {
+            session_id: "sess-special".into(),
+            accumulated_text: "create a fn that returns \"hello\" with 100% accuracy & <b>tags</b>".into(),
+            relay_url: "https://relay.example.com/path?key=val&other=1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceRequest { accumulated_text, relay_url, .. } = parsed {
+            assert!(accumulated_text.contains("\"hello\""));
+            assert!(accumulated_text.contains("100%"));
+            assert!(accumulated_text.contains("<b>tags</b>"));
+            assert!(relay_url.contains("key=val&other=1"));
+        } else {
+            panic!("expected VoiceRequest");
+        }
+    }
+
+    #[test]
+    fn voice_response_success_true() {
+        let msg = AstationMessage::VoiceResponse {
+            session_id: "sess-ok".into(),
+            success: true,
+            message: "Response delivered to relay".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VoiceResponse { success, message, .. } = parsed {
+            assert!(success);
+            assert_eq!(message, "Response delivered to relay");
+        } else {
+            panic!("expected VoiceResponse");
+        }
+    }
+
+    #[test]
+    fn voice_request_wire_format_field_names() {
+        // Verify the exact wire format field names match what Astation Swift sends
+        let json = r#"{"type":"voiceRequest","data":{"session_id":"s1","accumulated_text":"hello","relay_url":"https://r.test"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VoiceRequest { session_id, accumulated_text, relay_url } = msg {
+            assert_eq!(session_id, "s1");
+            assert_eq!(accumulated_text, "hello");
+            assert_eq!(relay_url, "https://r.test");
+        } else {
+            panic!("expected VoiceRequest");
+        }
+    }
+
+    #[test]
+    fn voice_response_wire_format_field_names() {
+        // Verify the exact wire format field names match what Atem Rust sends
+        let json = r#"{"type":"voiceResponse","data":{"session_id":"s1","success":true,"message":"ok"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VoiceResponse { session_id, success, message } = msg {
+            assert_eq!(session_id, "s1");
+            assert!(success);
+            assert_eq!(message, "ok");
+        } else {
+            panic!("expected VoiceResponse");
+        }
+    }
+
+    #[test]
     fn explainer_result_error_roundtrip() {
         let msg = AstationMessage::ExplainerResult {
             request_id: None,

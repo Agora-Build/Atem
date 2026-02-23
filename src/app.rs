@@ -2232,20 +2232,13 @@ impl App {
             return;
         }
 
-        // Claude is done — extract the response text
-        let response_text = if current_len > pending.output_snapshot_len {
-            self.claude_raw_log[pending.output_snapshot_len..].to_string()
-        } else if current_len > 0 && pending.output_snapshot_len < current_len {
-            self.claude_raw_log[pending.output_snapshot_len..].to_string()
+        // Claude is done — extract the response text.
+        // At this point current_len <= pending.output_snapshot_len (output stopped growing).
+        let start = pending.output_snapshot_len.min(self.claude_raw_log.len());
+        let response_text = if start < self.claude_raw_log.len() {
+            self.claude_raw_log[start..].to_string()
         } else {
-            // Snapshot may have been set before any output was produced.
-            // Use everything accumulated since the initial snapshot position.
-            let start = pending.output_snapshot_len.min(self.claude_raw_log.len());
-            if start < self.claude_raw_log.len() {
-                self.claude_raw_log[start..].to_string()
-            } else {
-                "No output received from Claude.".to_string()
-            }
+            "No output received from Claude.".to_string()
         };
 
         // POST response to relay server
@@ -2379,5 +2372,41 @@ mod tests {
     fn test_pairing_code_default_is_none() {
         let app = App::new();
         assert!(app.pairing_code.is_none());
+    }
+
+    #[test]
+    fn test_pending_voice_request_default_is_none() {
+        let app = App::new();
+        assert!(app.pending_voice_request.is_none());
+    }
+
+    #[test]
+    fn test_pending_voice_request_tracks_fields() {
+        let now = Instant::now();
+        let req = PendingVoiceRequest {
+            session_id: "sess-123".to_string(),
+            relay_url: "https://relay.example.com".to_string(),
+            sent_at: now,
+            output_snapshot_len: 42,
+            last_output_at: now,
+        };
+        assert_eq!(req.session_id, "sess-123");
+        assert_eq!(req.relay_url, "https://relay.example.com");
+        assert_eq!(req.output_snapshot_len, 42);
+    }
+
+    #[test]
+    fn test_pending_voice_request_clone() {
+        let now = Instant::now();
+        let req = PendingVoiceRequest {
+            session_id: "sess-clone".to_string(),
+            relay_url: "https://relay.test".to_string(),
+            sent_at: now,
+            output_snapshot_len: 100,
+            last_output_at: now,
+        };
+        let cloned = req.clone();
+        assert_eq!(cloned.session_id, "sess-clone");
+        assert_eq!(cloned.output_snapshot_len, 100);
     }
 }
