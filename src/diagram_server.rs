@@ -1071,9 +1071,9 @@ mod tests {
         stream.write_all(request.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
 
-        let mut buf = vec![0u8; 1024 * 1024];
-        let n = stream.read(&mut buf).await.unwrap();
-        String::from_utf8_lossy(&buf[..n]).to_string()
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).to_string()
     }
 
     #[tokio::test]
