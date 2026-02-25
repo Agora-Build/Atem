@@ -220,20 +220,12 @@ pub enum RtmCommands {
 pub enum ConfigCommands {
     /// Show resolved configuration with secrets masked
     Show,
-    /// Set active project credentials directly or pick from cached project list
+    /// Set a configuration value
     Set {
-        /// Project index from `atem list project` (1-based)
-        #[arg(value_name = "INDEX")]
-        index: Option<usize>,
-        /// Agora App ID
-        #[arg(long)]
-        app_id: Option<String>,
-        /// Agora App Certificate
-        #[arg(long)]
-        app_certificate: Option<String>,
-        /// Project name (optional label)
-        #[arg(long, default_value = "manual")]
-        name: String,
+        /// Config key (astation_ws, astation_relay_url)
+        key: String,
+        /// Config value
+        value: String,
     },
     /// Clear the active project
     Clear,
@@ -241,10 +233,10 @@ pub enum ConfigCommands {
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
-    /// Set active project by App ID
+    /// Set active project by App ID or index from `atem list project`
     Use {
-        /// The Agora App ID to set as active
-        app_id: String,
+        /// App ID or 1-based index from `atem list project`
+        app_id_or_index: String,
     },
     /// Show current active project
     Show,
@@ -446,14 +438,38 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 println!("{}", config.display_masked());
                 Ok(())
             }
-            ConfigCommands::Set {
-                index,
-                app_id,
-                app_certificate,
-                name,
-            } => {
-                if let Some(idx) = index {
-                    // Pick from cached project list
+            ConfigCommands::Set { key, value } => {
+                let mut config = crate::config::AtemConfig::load()?;
+                match key.as_str() {
+                    "astation_ws" => {
+                        config.astation_ws = Some(value.clone());
+                        config.save_to_disk()?;
+                        println!("astation_ws = {}", value);
+                    }
+                    "astation_relay_url" => {
+                        config.astation_relay_url = Some(value.clone());
+                        config.save_to_disk()?;
+                        println!("astation_relay_url = {}", value);
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "Unknown config key '{}'. Available keys: astation_ws, astation_relay_url",
+                            key
+                        );
+                    }
+                }
+                Ok(())
+            }
+            ConfigCommands::Clear => {
+                crate::config::ActiveProject::clear()?;
+                println!("Active project cleared.");
+                Ok(())
+            }
+        },
+        Commands::Project { project_command } => match project_command {
+            ProjectCommands::Use { app_id_or_index } => {
+                // If it parses as a number, treat as index into cached project list
+                if let Ok(idx) = app_id_or_index.parse::<usize>() {
                     let project = crate::config::ProjectCache::get(idx).ok_or_else(|| {
                         let hint = match crate::config::ProjectCache::load() {
                             Some(projects) => format!(
@@ -470,78 +486,30 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         name: project.name.clone(),
                     };
                     active.save()?;
-                    let cert_display = if project.sign_key.len() > 4 {
-                        format!(
-                            "{}...{}",
-                            &project.sign_key[..2],
-                            &project.sign_key[project.sign_key.len() - 2..]
-                        )
-                    } else if project.sign_key.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        "****".to_string()
-                    };
-                    println!(
-                        "Active project set: {} ({})",
-                        project.name, project.vendor_key
-                    );
-                    println!("Certificate: {}", cert_display);
-                } else if let (Some(aid), Some(acert)) = (app_id, app_certificate) {
-                    // Direct set via flags
+                    println!("Active project set: {} ({})", project.name, project.vendor_key);
+                } else {
+                    // Treat as App ID — fetch from API to resolve name + certificate
+                    let config = crate::config::AtemConfig::load()?;
+                    let (cid, csecret) = resolve_credentials(&config).await?;
+                    let projects =
+                        crate::agora_api::fetch_agora_projects_with_credentials(&cid, &csecret).await?;
+                    if let Err(e) = crate::config::ProjectCache::save(&projects) {
+                        eprintln!("Warning: could not cache projects: {}", e);
+                    }
+                    let project = projects
+                        .iter()
+                        .find(|p| p.vendor_key == app_id_or_index)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Project with App ID '{}' not found", app_id_or_index)
+                        })?;
                     let active = crate::config::ActiveProject {
-                        app_id: aid.clone(),
-                        app_certificate: acert.clone(),
-                        name: name.clone(),
+                        app_id: project.vendor_key.clone(),
+                        app_certificate: project.sign_key.clone(),
+                        name: project.name.clone(),
                     };
                     active.save()?;
-                    let cert_display = if acert.len() > 4 {
-                        format!(
-                            "{}...{}",
-                            &acert[..2],
-                            &acert[acert.len() - 2..]
-                        )
-                    } else {
-                        "****".to_string()
-                    };
-                    println!("Active project set: {} ({})", name, aid);
-                    println!("Certificate: {}", cert_display);
-                } else {
-                    anyhow::bail!(
-                        "Usage: atem config set <INDEX>  or  atem config set --app-id <ID> --app-certificate <CERT>"
-                    );
+                    println!("Active project set: {} ({})", active.name, active.app_id);
                 }
-                Ok(())
-            }
-            ConfigCommands::Clear => {
-                crate::config::ActiveProject::clear()?;
-                println!("Active project cleared.");
-                Ok(())
-            }
-        },
-        Commands::Project { project_command } => match project_command {
-            ProjectCommands::Use { app_id } => {
-                let config = crate::config::AtemConfig::load()?;
-                let (cid, csecret) = resolve_credentials(&config).await?;
-                let projects =
-                    crate::agora_api::fetch_agora_projects_with_credentials(&cid, &csecret).await?;
-                // Cache for offline use (atem config set <N>)
-                if let Err(e) = crate::config::ProjectCache::save(&projects) {
-                    eprintln!("Warning: could not cache projects: {}", e);
-                }
-                let project = projects
-                    .iter()
-                    .find(|p| p.vendor_key == app_id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Project with App ID '{}' not found", app_id)
-                    })?;
-
-                let active = crate::config::ActiveProject {
-                    app_id: project.vendor_key.clone(),
-                    app_certificate: project.sign_key.clone(),
-                    name: project.name.clone(),
-                };
-                active.save()?;
-                println!("Active project set: {} ({})", active.name, active.app_id);
                 Ok(())
             }
             ProjectCommands::Show => {
@@ -576,7 +544,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 let projects =
                     crate::agora_api::fetch_agora_projects_with_credentials(&cid, &csecret)
                         .await?;
-                // Cache for offline use (atem config set <N>)
+                // Cache for offline use (atem project use <N>)
                 if let Err(e) = crate::config::ProjectCache::save(&projects) {
                     eprintln!("Warning: could not cache projects: {}", e);
                 }
@@ -950,9 +918,9 @@ mod tests {
         let cli = Cli::try_parse_from(["atem", "project", "use", "my_app_id"]).unwrap();
         match cli.command {
             Some(Commands::Project {
-                project_command: ProjectCommands::Use { app_id },
+                project_command: ProjectCommands::Use { app_id_or_index },
             }) => {
-                assert_eq!(app_id, "my_app_id");
+                assert_eq!(app_id_or_index, "my_app_id");
             }
             _ => panic!("Expected Project Use command"),
         }
@@ -1249,84 +1217,63 @@ mod tests {
     // ── config set / clear ────────────────────────────────────────────────
 
     #[test]
-    fn cli_config_set_parses() {
+    fn cli_project_use_with_app_id() {
+        let cli = Cli::try_parse_from(["atem", "project", "use", "abc123def456"]).unwrap();
+        match cli.command {
+            Some(Commands::Project {
+                project_command: ProjectCommands::Use { app_id_or_index },
+            }) => {
+                assert_eq!(app_id_or_index, "abc123def456");
+            }
+            _ => panic!("Expected Project Use command"),
+        }
+    }
+
+    #[test]
+    fn cli_project_use_with_index() {
+        let cli = Cli::try_parse_from(["atem", "project", "use", "3"]).unwrap();
+        match cli.command {
+            Some(Commands::Project {
+                project_command: ProjectCommands::Use { app_id_or_index },
+            }) => {
+                assert_eq!(app_id_or_index, "3");
+                assert!(app_id_or_index.parse::<usize>().is_ok());
+            }
+            _ => panic!("Expected Project Use with index"),
+        }
+    }
+
+    #[test]
+    fn cli_config_set_astation_ws() {
         let cli = Cli::try_parse_from([
-            "atem", "config", "set", "--app-id", "abc123", "--app-certificate", "cert456",
+            "atem", "config", "set", "astation_ws", "ws://10.0.0.5:8080/ws",
         ])
         .unwrap();
         match cli.command {
             Some(Commands::Config {
-                config_command:
-                    ConfigCommands::Set {
-                        index,
-                        app_id,
-                        app_certificate,
-                        name,
-                    },
+                config_command: ConfigCommands::Set { key, value },
             }) => {
-                assert!(index.is_none());
-                assert_eq!(app_id.as_deref(), Some("abc123"));
-                assert_eq!(app_certificate.as_deref(), Some("cert456"));
-                assert_eq!(name, "manual"); // default
+                assert_eq!(key, "astation_ws");
+                assert_eq!(value, "ws://10.0.0.5:8080/ws");
             }
             _ => panic!("Expected Config Set command"),
         }
     }
 
     #[test]
-    fn cli_config_set_with_name() {
+    fn cli_config_set_astation_relay_url() {
         let cli = Cli::try_parse_from([
-            "atem",
-            "config",
-            "set",
-            "--app-id",
-            "abc123",
-            "--app-certificate",
-            "cert456",
-            "--name",
-            "My Project",
+            "atem", "config", "set", "astation_relay_url", "https://custom.relay.example.com",
         ])
         .unwrap();
         match cli.command {
             Some(Commands::Config {
-                config_command: ConfigCommands::Set { name, .. },
+                config_command: ConfigCommands::Set { key, value },
             }) => {
-                assert_eq!(name, "My Project");
+                assert_eq!(key, "astation_relay_url");
+                assert_eq!(value, "https://custom.relay.example.com");
             }
-            _ => panic!("Expected Config Set command with name"),
-        }
-    }
-
-    #[test]
-    fn cli_config_set_index_parses() {
-        let cli = Cli::try_parse_from(["atem", "config", "set", "3"]).unwrap();
-        match cli.command {
-            Some(Commands::Config {
-                config_command: ConfigCommands::Set { index, app_id, app_certificate, .. },
-            }) => {
-                assert_eq!(index, Some(3));
-                assert!(app_id.is_none());
-                assert!(app_certificate.is_none());
-            }
-            _ => panic!("Expected Config Set with index"),
-        }
-    }
-
-    #[test]
-    fn cli_config_set_flags_still_work() {
-        let cli = Cli::try_parse_from([
-            "atem", "config", "set", "--app-id", "X", "--app-certificate", "Y",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Config {
-                config_command: ConfigCommands::Set { index, app_id, app_certificate, .. },
-            }) => {
-                assert!(index.is_none());
-                assert_eq!(app_id.as_deref(), Some("X"));
-                assert_eq!(app_certificate.as_deref(), Some("Y"));
-            }
-            _ => panic!("Expected Config Set with flags"),
+            _ => panic!("Expected Config Set command"),
         }
     }
 

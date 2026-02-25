@@ -41,6 +41,7 @@ atem token rtm create --user-id bob --expire 3600
 atem list project                       # List Agora projects
 atem list project --show-certificates   # List with app certificates visible
 atem project use <APP_ID>               # Set active project by App ID
+atem project use <N>                    # Set active project by index (1-based)
 atem project show                       # Show current active project
 ```
 
@@ -48,8 +49,8 @@ atem project show                       # Show current active project
 
 ```bash
 atem config show                        # Show resolved config (secrets masked)
-atem config set <N>                     # Set active project from cached list (1-based index)
-atem config set --app-id <ID> --app-certificate <CERT>
+atem config set astation_ws <URL>       # Set Astation WebSocket URL
+atem config set astation_relay_url <URL> # Set Astation relay URL
 atem config clear                       # Clear active project
 ```
 
