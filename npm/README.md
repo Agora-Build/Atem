@@ -143,8 +143,8 @@ cargo build --release
 
 ## Related Projects
 
-- [Astation](https://github.com/Agora-Build/Astation) -- macOS menubar hub for task routing + relay service
-- [Chisel](https://github.com/Agora-Build/chisel) -- Dev panel for visual annotation and CSS editing
+- [Astation](https://github.com/Agora-Build/Astation) -- macOS menubar hub that coordinates Chisel, Atem, and AI agents — talk to your coding agent from anywhere
+- [Chisel](https://github.com/Agora-Build/chisel) -- Dev panel for visual annotation and UI editing by anyone, including AI agents
 - [Vox](https://github.com/Agora-Build/Vox) -- AI latency evaluation platform
 
 ## License

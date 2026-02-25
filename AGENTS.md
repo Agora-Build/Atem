@@ -221,8 +221,8 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
 
 ## Integration Points
 
-- **Astation**: macOS menubar hub for task routing (WebSocket)
-- **Chisel**: Dev panel that creates annotation tasks (`.chisel/tasks/`)
+- **Astation**: macOS menubar hub that coordinates Chisel, Atem, and AI agents — talk to your coding agent from anywhere (WebSocket)
+- **Chisel**: Dev panel for visual annotation and UI editing by anyone, including AI agents (`.chisel/tasks/`)
 - **Claude Code CLI**: Spawned as PTY subprocess for AI-powered code implementation
 - **Agora RTM SDK**: Native library for real-time messaging (voice coding)
 - **Agora REST API**: Project management, credential fetching

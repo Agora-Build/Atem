@@ -104,9 +104,9 @@ atem config clear                       # Clear active project
 
 ### Astation Integration
 
-[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that pairs with Atem over WebSocket. Once paired, Atem can:
+[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates between [Chisel](https://github.com/Agora-Build/chisel), Atem, and AI agents. It receives annotation tasks from the browser, routes them to the right Atem instance, and tracks task status — so you can talk to your coding agent from anywhere. Once paired, Atem can:
 
-- Receive task assignments from [Chisel](https://github.com/Agora-Build/chisel) annotations and route them to AI agents
+- Receive task assignments from Chisel annotations and route them to AI agents
 - Sync Agora credentials automatically
 - Relay voice-coding sessions (speech-to-code and code-to-speech)
 - Request diagram generation from AI agents
@@ -166,8 +166,8 @@ cargo clippy             # Lint
 
 ## Related Projects
 
-- [Astation](https://github.com/Agora-Build/Astation) -- macOS menubar hub for task routing
-- [Chisel](https://github.com/Agora-Build/chisel) -- Dev panel for visual annotation and CSS editing
+- [Astation](https://github.com/Agora-Build/Astation) -- macOS menubar hub that coordinates Chisel, Atem, and AI agents — talk to your coding agent from anywhere
+- [Chisel](https://github.com/Agora-Build/chisel) -- Dev panel for visual annotation and UI editing by anyone, including AI agents
 - [Vox](https://github.com/Agora-Build/Vox) -- AI latency evaluation platform
 
 ## License
