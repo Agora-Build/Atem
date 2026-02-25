@@ -202,6 +202,10 @@ pub fn resolve_diagram_server_url(config: &crate::config::AtemConfig) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Tests that touch ~/.agent/diagrams/ must hold this lock.
+    static DIAGRAMS_DIR_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_diagrams_dir_ends_with_expected_path() {
@@ -224,6 +228,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_is_idempotent() {
+        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
         let snap1 = snapshot_diagrams_dir();
         let snap2 = snapshot_diagrams_dir();
         assert_eq!(snap1.len(), snap2.len());
@@ -234,6 +239,7 @@ mod tests {
 
     #[test]
     fn test_detect_new_files_empty_when_unchanged() {
+        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
         let snap = snapshot_diagrams_dir();
         let new_files = detect_new_html_files(&snap);
         assert!(new_files.is_empty());
@@ -241,6 +247,7 @@ mod tests {
 
     #[test]
     fn test_detect_new_files_finds_new_file() {
+        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
         let dir = diagrams_dir();
         let _ = std::fs::create_dir_all(&dir);
 
@@ -267,6 +274,7 @@ mod tests {
 
     #[test]
     fn test_detect_new_files_sorted_newest_first() {
+        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
         let dir = diagrams_dir();
         let _ = std::fs::create_dir_all(&dir);
 

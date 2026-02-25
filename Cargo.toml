@@ -1,6 +1,6 @@
 [package]
 name = "atem"
-version = "0.4.64"
+version = "0.4.65"
 edition = "2024"
 
 [dependencies]
@@ -38,6 +38,7 @@ rustls = "0.23"
 rustls-pemfile = "2"
 ctrlc = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+agora_token = { git = "https://github.com/AgoraIO/Tools.git", subdirectory = "DynamicKey/AgoraDynamicKey/rust" }
 
 [features]
 real_rtm = []

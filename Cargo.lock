@@ -53,6 +53,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agora_token"
+version = "0.1.0"
+source = "git+https://github.com/AgoraIO/Tools.git#374cd21f5220d2c921ec903c1eae2ee1464be651"
+dependencies = [
+ "base64 0.22.1",
+ "byteorder",
+ "flate2",
+ "hmac",
+ "md5",
+ "rand",
+ "sha2",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -134,9 +148,10 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "atem"
-version = "0.4.63"
+version = "0.4.64"
 dependencies = [
  "aes-gcm",
+ "agora_token",
  "anyhow",
  "base64 0.21.7",
  "cc",
@@ -1320,6 +1335,12 @@ checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown 0.15.5",
 ]
+
+[[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "memchr"

@@ -573,6 +573,11 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .btn-stats {{ background: #21262d; color: #e6edf3; }}
 .btn-stats:hover {{ background: #30363d; }}
 .btn-stats.active {{ background: #1f6feb; border-color: #1f6feb; }}
+.token-row {{ background: #161b22; border-bottom: 1px solid #30363d; padding: 8px 20px; display: flex; align-items: center; gap: 10px; }}
+.token-row label {{ font-size: 12px; color: #7d8590; white-space: nowrap; }}
+.token-row textarea {{ background: #0d1117; border: 1px solid #30363d; color: #e6edf3; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-family: monospace; flex: 1; resize: vertical; min-height: 32px; max-height: 120px; line-height: 1.4; }}
+.token-row textarea:focus {{ border-color: #58a6ff; outline: none; }}
+.token-row .btn {{ flex-shrink: 0; }}
 .video-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 16px; flex: 1; }}
 .video-cell {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; position: relative; aspect-ratio: 16/9; }}
 .video-cell video {{ width: 100%; height: 100%; object-fit: cover; }}
@@ -607,6 +612,12 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
   <button id="muteAudioBtn" class="btn btn-mute" onclick="toggleMuteAudio()">Mute Mic</button>
   <button id="muteVideoBtn" class="btn btn-mute" onclick="toggleMuteVideo()">Mute Cam</button>
   <button id="statsBtn" class="btn btn-stats" onclick="toggleStats()">Stats</button>
+</div>
+
+<div class="token-row">
+  <label>Token</label>
+  <textarea id="tokenInput" rows="1" placeholder="Auto-generated on Join — or paste your own token here"></textarea>
+  <button class="btn btn-mute" onclick="fetchToken()">Fetch</button>
 </div>
 
 <div id="statsPanel" class="stats-panel"></div>
@@ -651,6 +662,26 @@ function setStatus(state, text) {{
   txt.textContent = text;
 }}
 
+async function fetchToken() {{
+  const channel = document.getElementById('channelInput').value.trim() || 'test';
+  const uidInput = document.getElementById('uidInput').value.trim();
+  const uid = uidInput ? parseInt(uidInput) || 0 : 0;
+
+  try {{
+    const resp = await fetch('/api/token', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ channel: channel, uid: String(uid) }})
+    }});
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    document.getElementById('tokenInput').value = data.token;
+    log('Token fetched', 'success');
+  }} catch (err) {{
+    log('Fetch token error: ' + err.message, 'error');
+  }}
+}}
+
 async function doJoin() {{
   const channel = document.getElementById('channelInput').value.trim() || 'test';
   const uidInput = document.getElementById('uidInput').value.trim();
@@ -660,15 +691,23 @@ async function doJoin() {{
   log('Joining channel: ' + channel + ' uid: ' + (uid || 'auto'));
 
   try {{
-    // Get token from local server
-    const resp = await fetch('/api/token', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ channel: channel, uid: String(uid) }})
-    }});
-    const data = await resp.json();
-    if (data.error) throw new Error(data.error);
+    // Use token from textarea, or fetch one if empty
+    let token = document.getElementById('tokenInput').value.trim();
+    if (!token) {{
+      const resp = await fetch('/api/token', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ channel: channel, uid: String(uid) }})
+      }});
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+      token = data.token;
+      document.getElementById('tokenInput').value = token;
+    }}
     log('Token received', 'success');
+    console.log('App ID:', APP_ID);
+    console.log('Channel:', channel);
+    console.log('Token:', token);
 
     // Create client
     client = AgoraRTC.createClient({{ mode: 'rtc', codec: 'vp8' }});
@@ -704,7 +743,7 @@ async function doJoin() {{
     }});
 
     // Join
-    const joinedUid = await client.join(APP_ID, channel, data.token, uid || null);
+    const joinedUid = await client.join(APP_ID, channel, token, uid || null);
     log('Joined as uid: ' + joinedUid, 'success');
 
     // Create local tracks
@@ -823,6 +862,9 @@ async function updateStats() {{
     document.getElementById('statsPanel').textContent = 'Error: ' + e.message;
   }}
 }}
+
+// Pre-fill token on page load
+fetchToken();
 </script>
 </body>
 </html>"##,
