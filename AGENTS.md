@@ -15,7 +15,7 @@ cargo build                              # Debug build
 cargo build --release                    # Release build
 cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
-cargo test                               # Run tests (450+ tests)
+cargo test                               # Run tests (460+ tests)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
@@ -39,7 +39,7 @@ src/
 ├── ai_client.rs         # Anthropic API client for intent parsing
 ├── agora_api.rs         # Agora REST API client (projects, credentials)
 ├── auth.rs              # Auth session management, deep link flow
-├── config.rs            # TOML config + env var loading (AtemConfig)
+├── config.rs            # Config, encrypted credentials, active project, project cache
 ├── time_sync.rs         # HTTP Date-based time synchronization
 ├── acp_client.rs        # ACP (Agent Communication Protocol) JSON-RPC 2.0 over WebSocket
 ├── agent_client.rs      # Agent event types (TextDelta, ToolCall, Done, etc.) and PTY client
@@ -121,6 +121,37 @@ Key methods:
 **Agent Visualize** (`agent_visualize.rs`): Generates visual HTML diagrams via ACP agents. Snapshots `~/.agent/diagrams/` before sending a prompt, detects new HTML files via ToolCall events or filesystem diff, uploads to diagram server, and opens results in the browser.
 
 **Diagram Server** (`diagram_server.rs`): SQLite-backed HTTP server for hosting diagrams. Stores HTML as blobs, serves at `/d/{id}`. Auto-starts as background daemon when needed. Integrates with server registry (`atem serv list/kill`).
+
+### Configuration & Credential Storage (`config.rs`)
+
+All sensitive data is encrypted at rest using machine-bound keys (HMAC-SHA256 from `/etc/machine-id` or macOS `IOPlatformUUID`).
+
+**Files in `~/.config/atem/`:**
+
+| File | Contents | Encryption |
+|------|----------|------------|
+| `config.toml` | Non-sensitive settings (astation_ws, relay URL, diagram server URL) | None |
+| `credentials.enc` | `customer_id` + `customer_secret` (Agora REST API credentials) | AES-256-GCM |
+| `active_project.json` | Selected project's `app_id`, `name`, encrypted `app_certificate` | XOR keystream |
+| `project_cache.json` | All projects from `atem list project` with encrypted certificates | XOR keystream |
+| `session.json` | Astation auth session ID + expiry | None |
+
+**Credential resolution order** (in `AtemConfig::load()`):
+1. Encrypted store (`credentials.enc`) — set by `atem login`
+2. Env vars (`AGORA_CUSTOMER_ID`, `AGORA_CUSTOMER_SECRET`) — override encrypted store
+3. Source tracked via `CredentialSource` enum: `None`, `ConfigFile`, `EnvVar`, `Astation`
+
+**`atem config show`** displays credential source and actionable hints:
+- `Credentials: from ENV` / `from encrypted store` / `from Astation`
+- `Credentials: (none) — run 'atem login' or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET`
+
+**Active project resolution** (`ActiveProject::resolve_app_id/resolve_app_certificate`):
+1. CLI flag (`--app-id`)
+2. Env var (`AGORA_APP_ID`, `AGORA_APP_CERTIFICATE`)
+3. Active project file
+4. Error with guidance message
+
+Note: RTC/RTM token generation needs only `app_id` + `app_certificate` (from active project). It does NOT need `customer_id`/`customer_secret`. Customer credentials are only for the Agora REST API (`atem list project`).
 
 ### Native FFI Layer
 
