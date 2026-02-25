@@ -28,6 +28,7 @@ pub struct AtemConfig {
     pub astation_ws: Option<String>,
     pub astation_relay_url: Option<String>,
     pub astation_relay_code: Option<String>,
+    pub diagram_server_url: Option<String>,
 
     /// Tracks where credentials were loaded from (not serialized).
     #[serde(skip)]
@@ -97,6 +98,9 @@ impl AtemConfig {
         if let Ok(val) = std::env::var("ASTATION_RELAY_CODE") {
             config.astation_relay_code = Some(val);
         }
+        if let Ok(val) = std::env::var("DIAGRAM_SERVER_URL") {
+            config.diagram_server_url = Some(val);
+        }
 
         Ok(config)
     }
@@ -143,6 +147,9 @@ impl AtemConfig {
         if let Some(relay) = &self.astation_relay_url {
             table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
         }
+        if let Some(ds) = &self.diagram_server_url {
+            table.insert("diagram_server_url".into(), toml::Value::String(ds.clone()));
+        }
 
         let content = toml::to_string_pretty(&existing)
             .with_context(|| "Failed to serialize config")?;
@@ -151,10 +158,11 @@ impl AtemConfig {
         Ok(())
     }
 
-    /// Get the config directory path: ~/.config/atem/
+    /// Get the config directory path: ~/.config/atem/ (same on all platforms)
     pub fn config_dir() -> PathBuf {
-        dirs::config_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config")
             .join("atem")
     }
 
@@ -192,6 +200,10 @@ impl AtemConfig {
         lines.push(format!(
             "astation_relay_url: {}",
             self.astation_relay_url.as_deref().unwrap_or("(not set)")
+        ));
+        lines.push(format!(
+            "diagram_server_url: {}",
+            self.diagram_server_url.as_deref().unwrap_or("(not set)")
         ));
 
         // Show active project info
@@ -649,6 +661,7 @@ mod tests {
         assert!(config.rtm_account.is_none());
         assert!(config.astation_ws.is_none());
         assert!(config.astation_relay_url.is_none());
+        assert!(config.diagram_server_url.is_none());
     }
 
     #[test]

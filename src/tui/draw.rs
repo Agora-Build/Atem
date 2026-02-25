@@ -105,8 +105,8 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
             format!("\u{1f511} Credentials: from Astation{}", suffix)
         }
         CredentialSource::EnvVar => {
-            let has_id = app.config.customer_id.is_some();
-            let has_secret = app.config.customer_secret.is_some();
+            let has_id = std::env::var("AGORA_CUSTOMER_ID").ok().filter(|s| !s.is_empty()).is_some();
+            let has_secret = std::env::var("AGORA_CUSTOMER_SECRET").ok().filter(|s| !s.is_empty()).is_some();
             match (has_id, has_secret) {
                 (true, true) => "\u{1f511} Credentials: from ENV".to_string(),
                 (true, false) => "\u{26a0}\u{fe0f}  Credentials: from ENV, but AGORA_CUSTOMER_SECRET not set".to_string(),
@@ -124,7 +124,8 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
 
     let cred_style = match &app.config.credential_source {
         CredentialSource::None => Style::default().fg(Color::Yellow),
-        CredentialSource::EnvVar if app.config.customer_id.is_none() || app.config.customer_secret.is_none() => {
+        CredentialSource::EnvVar if std::env::var("AGORA_CUSTOMER_ID").ok().filter(|s| !s.is_empty()).is_none()
+            || std::env::var("AGORA_CUSTOMER_SECRET").ok().filter(|s| !s.is_empty()).is_none() => {
             Style::default().fg(Color::Yellow)
         }
         _ => Style::default().fg(Color::Green),

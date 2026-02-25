@@ -137,6 +137,66 @@ pub fn open_html_in_browser(path: &str) {
     }
 }
 
+// ── Diagram upload ─────────────────────────────────────────────────────────
+
+/// Upload an HTML diagram to the diagram server.
+///
+/// Reads the HTML file at `file_path`, POSTs it to `{server_url}/api/diagrams`,
+/// and returns the shareable URL from the response.
+pub async fn upload_diagram(file_path: &str, topic: &str, server_url: &str) -> Result<String> {
+    let html = std::fs::read_to_string(file_path)
+        .map_err(|e| anyhow!("Failed to read diagram file: {}", e))?;
+
+    let body = serde_json::json!({
+        "topic": topic,
+        "html": html,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/diagrams", server_url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to upload diagram: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Diagram upload failed ({}): {}", status, text);
+    }
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("Invalid response from diagram server: {}", e))?;
+
+    data["url"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Diagram server response missing 'url' field"))
+}
+
+/// Resolve the diagram server URL using a three-tier strategy:
+///
+/// 1. `config.diagram_server_url` — explicitly configured
+/// 2. `config.astation_relay_url` — relay URL doubles as diagram host
+/// 3. Auto-start a local `atem serv diagrams` instance
+pub fn resolve_diagram_server_url(config: &crate::config::AtemConfig) -> Result<String> {
+    // 1. Explicit config
+    if let Some(ref url) = config.diagram_server_url {
+        return Ok(url.clone());
+    }
+
+    // 2. Relay URL (only if explicitly set, not the default)
+    if config.astation_relay_url.is_some() {
+        return Ok(config.astation_relay_url().to_string());
+    }
+
+    // 3. Auto-start local server
+    crate::diagram_server::ensure_running()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -385,5 +445,38 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&test_file);
+    }
+
+    // ── resolve_diagram_server_url tests ─────────────────────────────
+
+    #[test]
+    fn test_resolve_diagram_server_url_explicit_config() {
+        let config = crate::config::AtemConfig {
+            diagram_server_url: Some("https://diagrams.example.com".to_string()),
+            ..Default::default()
+        };
+        let url = resolve_diagram_server_url(&config).unwrap();
+        assert_eq!(url, "https://diagrams.example.com");
+    }
+
+    #[test]
+    fn test_resolve_diagram_server_url_relay() {
+        let config = crate::config::AtemConfig {
+            astation_relay_url: Some("https://custom-relay.agora.build".to_string()),
+            ..Default::default()
+        };
+        let url = resolve_diagram_server_url(&config).unwrap();
+        assert_eq!(url, "https://custom-relay.agora.build");
+    }
+
+    #[test]
+    fn test_resolve_diagram_server_url_explicit_beats_relay() {
+        let config = crate::config::AtemConfig {
+            diagram_server_url: Some("https://diagrams.example.com".to_string()),
+            astation_relay_url: Some("https://relay.example.com".to_string()),
+            ..Default::default()
+        };
+        let url = resolve_diagram_server_url(&config).unwrap();
+        assert_eq!(url, "https://diagrams.example.com");
     }
 }

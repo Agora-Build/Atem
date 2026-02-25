@@ -308,6 +308,18 @@ pub enum ServCommands {
         #[arg(long, hide = true)]
         _serv_daemon: bool,
     },
+    /// Host diagrams from SQLite — serves HTML at /d/{id}
+    Diagrams {
+        /// HTTP port (default: 8787)
+        #[arg(long, default_value = "8787")]
+        port: u16,
+        /// Run as a background daemon
+        #[arg(long)]
+        background: bool,
+        /// Internal: marks this process as the detached daemon (hidden)
+        #[arg(long, hide = true)]
+        _serv_daemon: bool,
+    },
     /// List running background servers
     List,
     /// Kill a background server by ID
@@ -825,9 +837,34 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                                 match file_path {
                                     Some(path) => {
                                         println!("\nDiagram saved: {}", path);
-                                        if !no_browser {
-                                            open_html_in_browser(&path);
-                                            println!("Opened in browser.");
+
+                                        // Upload to diagram server
+                                        let config = crate::config::AtemConfig::load().unwrap_or_default();
+                                        match crate::agent_visualize::resolve_diagram_server_url(&config) {
+                                            Ok(server_url) => {
+                                                match crate::agent_visualize::upload_diagram(&path, &topic, &server_url).await {
+                                                    Ok(url) => {
+                                                        println!("View at: {}", url);
+                                                        if !no_browser {
+                                                            open_html_in_browser(&url);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("Upload failed: {}", e);
+                                                        if !no_browser {
+                                                            open_html_in_browser(&path);
+                                                            println!("Opened local file in browser.");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Could not resolve diagram server: {}", e);
+                                                if !no_browser {
+                                                    open_html_in_browser(&path);
+                                                    println!("Opened local file in browser.");
+                                                }
+                                            }
                                         }
                                     }
                                     None => {
@@ -866,6 +903,18 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     _daemon: _serv_daemon,
                 };
                 crate::rtc_test_server::run_server(config).await
+            }
+            ServCommands::Diagrams {
+                port,
+                background,
+                _serv_daemon,
+            } => {
+                let config = crate::diagram_server::DiagramServerConfig {
+                    port,
+                    background,
+                    _daemon: _serv_daemon,
+                };
+                crate::diagram_server::run_server(config).await
             }
             ServCommands::List => crate::rtc_test_server::cmd_list_servers(),
             ServCommands::Kill { id } => crate::rtc_test_server::cmd_kill_server(&id),
@@ -1453,5 +1502,48 @@ mod tests {
                 serv_command: ServCommands::Killall
             })
         ));
+    }
+
+    // ── serv diagrams command ───────────────────────────────────────────
+
+    #[test]
+    fn cli_serv_diagrams_defaults() {
+        let cli = Cli::try_parse_from(["atem", "serv", "diagrams"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Diagrams { port, background, _serv_daemon },
+            }) => {
+                assert_eq!(port, 8787);
+                assert!(!background);
+                assert!(!_serv_daemon);
+            }
+            _ => panic!("expected Serv Diagrams command"),
+        }
+    }
+
+    #[test]
+    fn cli_serv_diagrams_with_port() {
+        let cli = Cli::try_parse_from(["atem", "serv", "diagrams", "--port", "9000"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Diagrams { port, .. },
+            }) => {
+                assert_eq!(port, 9000);
+            }
+            _ => panic!("expected Serv Diagrams command"),
+        }
+    }
+
+    #[test]
+    fn cli_serv_diagrams_background_flag() {
+        let cli = Cli::try_parse_from(["atem", "serv", "diagrams", "--background"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Diagrams { background, .. },
+            }) => {
+                assert!(background);
+            }
+            _ => panic!("expected Serv Diagrams command"),
+        }
     }
 }

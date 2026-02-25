@@ -2344,7 +2344,19 @@ impl App {
             .or_else(|| detect_new_html_files(&pending.pre_snapshot).into_iter().next());
 
         let (success, message) = match &file_path {
-            Some(path) => (true, format!("Diagram generated: {}", path)),
+            Some(path) => {
+                // Try to upload to diagram server
+                let config = AtemConfig::load().unwrap_or_default();
+                match crate::agent_visualize::resolve_diagram_server_url(&config) {
+                    Ok(server_url) => {
+                        match crate::agent_visualize::upload_diagram(path, "visualize", &server_url).await {
+                            Ok(url) => (true, format!("Diagram: {} — View at: {}", path, url)),
+                            Err(_) => (true, format!("Diagram generated: {}", path)),
+                        }
+                    }
+                    Err(_) => (true, format!("Diagram generated: {}", path)),
+                }
+            }
             None => (false, "No HTML diagram file was detected".to_string()),
         };
 

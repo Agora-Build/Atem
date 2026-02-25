@@ -22,6 +22,8 @@ mod agent_registry;
 mod agent_visualize;
 // RTC test server
 mod rtc_test_server;
+// Diagram hosting server
+mod diagram_server;
 
 use anyhow::Result;
 use clap::Parser;

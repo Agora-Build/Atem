@@ -240,10 +240,15 @@ mod tests {
         assert!(output.contains("No projects found"));
     }
 
-    /// Run with: AGORA_CUSTOMER_ID=... AGORA_CUSTOMER_SECRET=... cargo test -- --ignored
     #[tokio::test]
-    #[ignore]
     async fn fetch_agora_projects_with_real_credentials() {
+        // Skip when credentials are not available in env
+        let has_creds = std::env::var("AGORA_CUSTOMER_ID").ok().filter(|s| !s.is_empty()).is_some()
+            && std::env::var("AGORA_CUSTOMER_SECRET").ok().filter(|s| !s.is_empty()).is_some();
+        if !has_creds {
+            eprintln!("Skipping: AGORA_CUSTOMER_ID / AGORA_CUSTOMER_SECRET not set");
+            return;
+        }
         let result = fetch_agora_projects().await;
         assert!(result.is_ok(), "API call failed: {:?}", result.err());
 
