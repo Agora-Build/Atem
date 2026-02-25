@@ -1,10 +1,7 @@
 # Atem Configuration
 # Copy to ~/.config/atem/config.toml
-
-# Agora credentials (console.agora.io > RESTful API)
-# Or use: atem login / env vars AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET
-# customer_id = ""
-# customer_secret = ""
+#
+# Credentials: use `atem login` or env vars AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET
 
 # Astation WebSocket (local or VPN)
 # astation_ws = "ws://127.0.0.1:8080/ws"
