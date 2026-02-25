@@ -35,12 +35,20 @@ pub struct AtemConfig {
     pub credential_source: CredentialSource,
 }
 
-/// Active project state persisted to ~/.config/atem/active_project.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Active project state (in-memory, plaintext).
+#[derive(Debug, Clone)]
 pub struct ActiveProject {
     pub app_id: String,
     pub app_certificate: String,
     pub name: String,
+}
+
+/// On-disk format with encrypted certificate.
+#[derive(Serialize, Deserialize)]
+struct EncryptedActiveProject {
+    app_id: String,
+    app_certificate_encrypted: String,
+    name: String,
 }
 
 impl AtemConfig {
@@ -71,9 +79,9 @@ impl AtemConfig {
             config.credential_source = CredentialSource::ConfigFile;
         }
 
-        // Env var overrides
-        let env_id = std::env::var("AGORA_CUSTOMER_ID").ok();
-        let env_secret = std::env::var("AGORA_CUSTOMER_SECRET").ok();
+        // Env var overrides (ignore empty strings)
+        let env_id = std::env::var("AGORA_CUSTOMER_ID").ok().filter(|s| !s.is_empty());
+        let env_secret = std::env::var("AGORA_CUSTOMER_SECRET").ok().filter(|s| !s.is_empty());
         if env_id.is_some() || env_secret.is_some() {
             if let Some(val) = env_id {
                 config.customer_id = Some(val);
@@ -206,6 +214,28 @@ impl AtemConfig {
             self.diagram_server_url.as_deref().unwrap_or("(not set)")
         ));
 
+        // Show credential source
+        let has_credentials = self.customer_id.is_some() && self.customer_secret.is_some();
+        if has_credentials {
+            let source = match self.credential_source {
+                CredentialSource::EnvVar => "from ENV",
+                CredentialSource::ConfigFile => "from encrypted store",
+                CredentialSource::Astation => "from Astation",
+                CredentialSource::None => "loaded",
+            };
+            lines.push(format!("Credentials: {}", source));
+        } else if self.customer_id.is_some() || self.customer_secret.is_some() {
+            // Partial credentials
+            let missing = if self.customer_id.is_none() {
+                "AGORA_CUSTOMER_ID"
+            } else {
+                "AGORA_CUSTOMER_SECRET"
+            };
+            lines.push(format!("Credentials: incomplete ({} not set)", missing));
+        } else {
+            lines.push("Credentials: (none) — run `atem login` or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET".to_string());
+        }
+
         // Show active project info
         match ActiveProject::load() {
             Some(proj) => {
@@ -221,7 +251,11 @@ impl AtemConfig {
             }
             None => {
                 lines.push(String::new());
-                lines.push("Active project: (none)".to_string());
+                if has_credentials {
+                    lines.push("Active project: (none) — run `atem list project`, then `atem project use <APP_ID>`".to_string());
+                } else {
+                    lines.push("Active project: (none) — get credentials first, then `atem list project`".to_string());
+                }
             }
         }
 
@@ -280,15 +314,48 @@ impl ActiveProject {
             return None;
         }
         let content = fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
+
+        // Try encrypted format first
+        if let Ok(encrypted) = serde_json::from_str::<EncryptedActiveProject>(&content) {
+            let key = derive_cache_key();
+            let cert = decrypt_field(&encrypted.app_certificate_encrypted, &key).ok()?;
+            return Some(ActiveProject {
+                app_id: encrypted.app_id,
+                app_certificate: cert,
+                name: encrypted.name,
+            });
+        }
+
+        // Fall back to legacy plaintext format (auto-migrate on next save)
+        #[derive(Deserialize)]
+        struct LegacyActiveProject {
+            app_id: String,
+            app_certificate: String,
+            name: String,
+        }
+        let legacy: LegacyActiveProject = serde_json::from_str(&content).ok()?;
+        let proj = ActiveProject {
+            app_id: legacy.app_id,
+            app_certificate: legacy.app_certificate,
+            name: legacy.name,
+        };
+        // Auto-migrate: re-save in encrypted format
+        let _ = proj.save();
+        Some(proj)
     }
 
-    /// Save active project to disk.
+    /// Save active project to disk (certificate encrypted).
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir)?;
-        let json = serde_json::to_string_pretty(self)?;
+        let key = derive_cache_key();
+        let encrypted = EncryptedActiveProject {
+            app_id: self.app_id.clone(),
+            app_certificate_encrypted: encrypt_field(&self.app_certificate, &key),
+            name: self.name.clone(),
+        };
+        let json = serde_json::to_string_pretty(&encrypted)?;
         fs::write(&path, json)?;
         Ok(())
     }
@@ -651,6 +718,10 @@ impl crate::auth::AuthSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Tests that touch ~/.config/atem/active_project.json must hold this lock.
+    static ACTIVE_PROJECT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_config_has_none_fields() {
@@ -705,27 +776,75 @@ mod tests {
 
     #[test]
     fn active_project_round_trip() {
-        // Use a temp directory to avoid polluting real config
-        let tmp = std::env::temp_dir().join("atem_test_active_project");
-        let _ = fs::remove_file(&tmp);
-
+        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         let proj = ActiveProject {
             app_id: "test_app_id".to_string(),
-            app_certificate: "test_cert".to_string(),
+            app_certificate: "test_cert_value".to_string(),
             name: "Test Project".to_string(),
         };
 
-        let json = serde_json::to_string_pretty(&proj).unwrap();
-        fs::write(&tmp, &json).unwrap();
+        // Save and reload through the real path
+        let path = ActiveProject::path();
+        let backup = path.with_extension("json.bak");
+        let had_file = path.exists();
+        if had_file {
+            let _ = fs::rename(&path, &backup);
+        }
 
-        let content = fs::read_to_string(&tmp).unwrap();
-        let loaded: ActiveProject = serde_json::from_str(&content).unwrap();
+        proj.save().unwrap();
 
+        // Verify on-disk format has encrypted certificate (not plaintext)
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("test_cert_value"), "certificate should be encrypted on disk");
+        assert!(raw.contains("app_certificate_encrypted"));
+
+        let loaded = ActiveProject::load().unwrap();
         assert_eq!(loaded.app_id, "test_app_id");
-        assert_eq!(loaded.app_certificate, "test_cert");
+        assert_eq!(loaded.app_certificate, "test_cert_value");
         assert_eq!(loaded.name, "Test Project");
 
-        let _ = fs::remove_file(&tmp);
+        // Restore
+        if had_file {
+            let _ = fs::rename(&backup, &path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn active_project_migrates_legacy_plaintext() {
+        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
+        let path = ActiveProject::path();
+        let backup = path.with_extension("json.bak");
+        let had_file = path.exists();
+        if had_file {
+            let _ = fs::rename(&path, &backup);
+        }
+
+        // Write legacy plaintext format
+        let legacy = serde_json::json!({
+            "app_id": "legacy_id",
+            "app_certificate": "legacy_cert",
+            "name": "Legacy Project"
+        });
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        // Load should succeed and auto-migrate
+        let loaded = ActiveProject::load().unwrap();
+        assert_eq!(loaded.app_id, "legacy_id");
+        assert_eq!(loaded.app_certificate, "legacy_cert");
+
+        // File should now be encrypted
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("app_certificate_encrypted"));
+        assert!(!raw.contains("\"app_certificate\""));
+
+        if had_file {
+            let _ = fs::rename(&backup, &path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
     }
 
     #[test]
@@ -737,6 +856,7 @@ mod tests {
 
     #[test]
     fn resolve_app_id_errors_when_nothing_set() {
+        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         // Clear active project (if any) -- save original and restore
         let path = ActiveProject::path();
         let backup = path.with_extension("json.bak");
@@ -758,6 +878,7 @@ mod tests {
 
     #[test]
     fn resolve_app_id_env_var_overrides() {
+        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         // Temporarily back up active project + env
         let path = ActiveProject::path();
         let backup = path.with_extension("json.bak2");
@@ -803,6 +924,7 @@ mod tests {
 
     #[test]
     fn resolve_app_certificate_env_var() {
+        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         let path = ActiveProject::path();
         let backup = path.with_extension("json.bak3");
         let had_file = path.exists();
