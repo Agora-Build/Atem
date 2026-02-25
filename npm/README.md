@@ -10,17 +10,81 @@ npm install -g @agora-build/atem
 
 This downloads a prebuilt binary for your platform (linux-x64, linux-arm64, darwin-x64, darwin-arm64).
 
-## Usage
+## Commands
 
 ```bash
-atem                              # Launch TUI
-atem token rtc create             # Generate RTC token
-atem token rtc decode <token>     # Decode existing token
-atem list project                 # List Agora projects
-atem config show                  # Show current config
+atem                                    # Launch TUI
 ```
 
-## Modes
+### Authentication
+
+```bash
+atem login                              # Authenticate with Astation (OTP + deep link)
+atem login --save-credentials           # Login and auto-save Agora credentials
+atem logout                             # Clear saved session
+atem sync credentials                   # Pull Agora credentials from Astation
+```
+
+### Tokens
+
+```bash
+atem token rtc create                   # Generate RTC token (interactive)
+atem token rtc create --channel test --uid 0 --expire 3600
+atem token rtc decode <token>           # Decode existing RTC token
+atem token rtm create                   # Generate RTM token
+atem token rtm create --user-id bob --expire 3600
+```
+
+### Projects
+
+```bash
+atem list project                       # List Agora projects
+atem list project --show-certificates   # List with app certificates visible
+atem project use <APP_ID>               # Set active project by App ID
+atem project show                       # Show current active project
+```
+
+### Configuration
+
+```bash
+atem config show                        # Show resolved config (secrets masked)
+atem config set <N>                     # Set active project from cached list (1-based index)
+atem config set --app-id <ID> --app-certificate <CERT>
+atem config clear                       # Clear active project
+```
+
+### AI Agents
+
+```bash
+atem agent list                         # Scan and list detected AI agents
+atem agent launch                       # Launch Claude Code as PTY agent
+atem agent launch codex                 # Launch Codex as PTY agent
+atem agent connect <WS_URL>             # Connect to ACP agent and show info
+atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent
+atem agent probe <WS_URL>               # Probe URL for ACP support
+```
+
+### Dev Servers
+
+```bash
+atem serv rtc                           # Launch browser-based RTC test page (HTTPS)
+atem serv rtc --channel test --port 8443
+atem serv rtc --background              # Run as background daemon
+atem serv list                          # List running background servers
+atem serv kill <ID>                     # Kill a background server
+atem serv killall                       # Kill all background servers
+```
+
+### Other
+
+```bash
+atem repl                               # Interactive REPL with AI command interpretation
+atem explain "topic"                    # Generate visual HTML explanation
+atem explain "topic" -c file.rs         # Explain with file context
+atem explain "topic" -o out.html        # Save to specific file
+```
+
+## TUI Modes
 
 | Mode | Description |
 |------|-------------|
@@ -29,6 +93,29 @@ atem config show                  # Show current config
 | **Codex Chat** | Codex terminal integration via PTY |
 | **Token Gen** | Generate Agora RTC/RTM tokens locally |
 | **Projects** | Browse Agora projects via API |
+
+## Credential Management
+
+Credentials are encrypted at rest using AES-256-GCM with a machine-bound key.
+
+```
+Priority: Astation sync (live) > env vars > encrypted store
+Storage:  ~/.config/atem/credentials.enc (Linux)
+          ~/Library/Application Support/atem/credentials.enc (macOS)
+```
+
+### Via Astation (recommended)
+
+```bash
+atem login          # Pair with Astation, credentials sync automatically
+```
+
+### Via environment variables
+
+```bash
+export AGORA_CUSTOMER_ID="..."
+export AGORA_CUSTOMER_SECRET="..."
+```
 
 ## Astation Pairing
 
@@ -40,33 +127,6 @@ Open: https://station.agora.build/pair?code=ABCD-EFGH
 ```
 
 Enter the code in Astation's Dev Console to pair. If a local Astation is running on `ws://127.0.0.1:8080/ws`, Atem connects directly instead.
-
-Override the relay URL:
-
-```bash
-AGORA_STATION_RELAY_URL=https://my-relay.example.com atem
-```
-
-## Configuration
-
-Create `~/.config/atem/atem.toml`:
-
-```toml
-astation_ws = "ws://127.0.0.1:8080/ws"
-station_relay_url = "https://station.agora.build"
-
-[agora]
-app_id = "your_app_id"
-app_certificate = "your_app_certificate"
-```
-
-Or use environment variables:
-
-```bash
-AGORA_CUSTOMER_ID=...
-AGORA_CUSTOMER_SECRET=...
-AGORA_STATION_RELAY_URL=...
-```
 
 ## Supported Platforms
 

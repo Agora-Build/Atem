@@ -45,7 +45,8 @@ pub struct ActiveProject {
 impl AtemConfig {
     /// Load config from file + encrypted credentials + env var overrides.
     ///
-    /// Priority: env vars > encrypted credentials.enc > config.toml
+    /// Credentials come from credentials.enc (encrypted) or env vars only.
+    /// config.toml holds non-sensitive settings; any legacy plaintext credentials are ignored.
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
 
@@ -58,12 +59,11 @@ impl AtemConfig {
             AtemConfig::default()
         };
 
-        // Track credential source: config.toml is the base (legacy plaintext)
-        if config.customer_id.is_some() {
-            config.credential_source = CredentialSource::ConfigFile;
-        }
+        // Never read credentials from config.toml — they belong in credentials.enc
+        config.customer_id = None;
+        config.customer_secret = None;
 
-        // Encrypted credentials override config.toml plaintext
+        // Load credentials from encrypted store
         if let Some((cid, csecret)) = CredentialStore::load() {
             config.customer_id = Some(cid);
             config.customer_secret = Some(csecret);

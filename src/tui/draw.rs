@@ -108,7 +108,7 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
             "\u{1f511} Credentials: from ENV".to_string()
         }
         CredentialSource::ConfigFile => {
-            "\u{1f511} Credentials: from config file".to_string()
+            format!("\u{1f511} Credentials: from {}", crate::config::CredentialStore::path().display())
         }
         CredentialSource::None => {
             "\u{26a0}\u{fe0f}  No credentials — run `atem login` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string()
