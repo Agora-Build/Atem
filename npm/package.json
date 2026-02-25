@@ -1,6 +1,6 @@
 {
   "name": "@agora-build/atem",
-  "version": "0.4.60",
+  "version": "0.4.61",
   "description": "A terminal that connects people, Agora platform, and AI agents.",
   "bin": {
     "atem": "bin/atem"

@@ -14,6 +14,7 @@ This downloads a prebuilt binary for your platform (linux-x64, linux-arm64, darw
 
 ```bash
 atem                                    # Launch TUI
+atem repl                               # Interactive REPL with AI command interpretation
 ```
 
 ### Authentication
@@ -79,12 +80,6 @@ atem serv diagrams --background         # Run as background daemon
 atem serv list                          # List running background servers
 atem serv kill <ID>                     # Kill a background server
 atem serv killall                       # Kill all background servers
-```
-
-### Other
-
-```bash
-atem repl                               # Interactive REPL with AI command interpretation
 ```
 
 ## TUI Modes
