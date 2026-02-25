@@ -67,17 +67,27 @@ async fn resolve_credentials(
         .map_err(|_| anyhow::anyhow!("Timed out waiting for credentials from Astation"))?
         .ok_or_else(|| anyhow::anyhow!("Astation disconnected before sending credentials"))?;
 
-    // Persist so subsequent CLI calls don't need to connect again.
-    let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
-    cfg.customer_id = Some(cid.clone());
-    cfg.customer_secret = Some(csecret.clone());
-    if let Err(e) = cfg.save_to_disk() {
-        eprintln!("Warning: could not persist credentials to config: {e}");
+    // Ask whether to persist to config.toml
+    let id_preview = &cid[..4.min(cid.len())];
+    print!("Save credentials ({}...) to config? [Y/n] ", id_preview);
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap_or(0);
+    if !matches!(input.trim().to_lowercase().as_str(), "n" | "no") {
+        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+        cfg.customer_id = Some(cid.clone());
+        cfg.customer_secret = Some(csecret.clone());
+        if let Err(e) = cfg.save_to_disk() {
+            eprintln!("Warning: could not persist credentials to config: {e}");
+        } else {
+            println!(
+                "Credentials saved to {}",
+                crate::config::AtemConfig::config_path().display()
+            );
+        }
     } else {
-        println!(
-            "Credentials synced and saved to {}",
-            crate::config::AtemConfig::config_path().display()
-        );
+        println!("Credentials available for this session only.");
     }
 
     Ok((cid, csecret))
@@ -649,17 +659,23 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
 
                 match result {
                     Ok(Some((cid, csecret))) => {
-                        // Save credentials to config
-                        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                        cfg.customer_id = Some(cid.clone());
-                        cfg.customer_secret = Some(csecret.clone());
-                        if let Err(e) = cfg.save_to_disk() {
-                            eprintln!("Warning: could not persist credentials to config: {e}");
+                        use std::io::Write;
+                        let id_preview = &cid[..4.min(cid.len())];
+                        print!("Save credentials ({}...) to config? [Y/n] ", id_preview);
+                        std::io::stdout().flush().ok();
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).unwrap_or(0);
+                        if !matches!(input.trim().to_lowercase().as_str(), "n" | "no") {
+                            let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                            cfg.customer_id = Some(cid.clone());
+                            cfg.customer_secret = Some(csecret.clone());
+                            if let Err(e) = cfg.save_to_disk() {
+                                eprintln!("Warning: could not persist credentials to config: {e}");
+                            } else {
+                                println!("✓ Credentials saved (customer_id: {}...)", id_preview);
+                            }
                         } else {
-                            println!(
-                                "✓ Credentials saved (customer_id: {}...)",
-                                &cid[..4.min(cid.len())]
-                            );
+                            println!("Credentials available for this session only.");
                         }
                     }
                     Ok(None) => eprintln!("Warning: Astation disconnected before sending credentials"),

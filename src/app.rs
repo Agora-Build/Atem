@@ -302,8 +302,8 @@ impl App {
                         self.cached_projects.clear();
                         self.output_text = format!(
                             "Failed to fetch Agora projects: {}\n\n\
-                            Configure credentials in ~/.config/atem/config.toml or set\n\
-                            AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET environment variables.\n\
+                            Run `atem login` or set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET\n\
+                            environment variables.\n\
                             Get these from https://console.agora.io -> RESTful API\n\n\
                             Press 'b' to go back to main menu",
                             e
@@ -1949,9 +1949,10 @@ impl App {
                 // Store in memory for this session (available immediately)
                 self.synced_customer_id = Some(customer_id.clone());
                 self.synced_customer_secret = Some(customer_secret.clone());
-                // Also update the in-memory config so features work immediately
+                // Astation sync overrides everything — it's the live source of truth
                 self.config.customer_id = Some(customer_id.clone());
                 self.config.customer_secret = Some(customer_secret.clone());
+                self.config.credential_source = crate::config::CredentialSource::Astation;
 
                 // Check if credentials already saved in config file
                 let cfg = crate::config::AtemConfig::load().unwrap_or_default();

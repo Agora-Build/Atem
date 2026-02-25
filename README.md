@@ -19,14 +19,78 @@ cargo build --release
 # Binary at target/release/atem
 ```
 
-## Usage
+## Commands
 
 ```bash
-atem                              # Launch TUI
-atem token rtc create             # Generate RTC token
-atem token rtc decode <token>     # Decode existing token
-atem list project                 # List Agora projects
-atem config show                  # Show current config
+atem                                    # Launch TUI
+```
+
+### Authentication
+
+```bash
+atem login                              # Authenticate with Astation (OTP + deep link)
+atem login --save-credentials           # Login and auto-save Agora credentials
+atem logout                             # Clear saved session
+atem sync credentials                   # Pull Agora credentials from Astation
+```
+
+### Tokens
+
+```bash
+atem token rtc create                   # Generate RTC token (interactive)
+atem token rtc create --channel test --uid 0 --expire 3600
+atem token rtc decode <token>           # Decode existing RTC token
+atem token rtm create                   # Generate RTM token
+atem token rtm create --user-id bob --expire 3600
+```
+
+### Projects
+
+```bash
+atem list project                       # List Agora projects
+atem list project --show-certificates   # List with app certificates visible
+atem project use <APP_ID>               # Set active project by App ID
+atem project show                       # Show current active project
+```
+
+### Configuration
+
+```bash
+atem config show                        # Show resolved config (secrets masked)
+atem config set <N>                     # Set active project from cached list (1-based index)
+atem config set --app-id <ID> --app-certificate <CERT>   # Set project directly
+atem config clear                       # Clear active project
+```
+
+### AI Agents
+
+```bash
+atem agent list                         # Scan and list detected AI agents
+atem agent launch                       # Launch Claude Code as PTY agent
+atem agent launch codex                 # Launch Codex as PTY agent
+atem agent connect <WS_URL>             # Connect to ACP agent and show info
+atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent
+atem agent probe <WS_URL>               # Probe URL for ACP support
+```
+
+### Dev Servers
+
+```bash
+atem serv rtc                           # Launch browser-based RTC test page (HTTPS)
+atem serv rtc --channel test --port 8443
+atem serv rtc --background              # Run as background daemon
+atem serv list                          # List running background servers
+atem serv kill <ID>                     # Kill a background server
+atem serv killall                       # Kill all background servers
+```
+
+### Other
+
+```bash
+atem repl                               # Interactive REPL with AI command interpretation
+atem explain "topic"                    # Generate visual HTML explanation
+atem explain "topic" -c file.rs         # Explain with file context
+atem explain "topic" -o out.html        # Save to specific file
 ```
 
 ## How It Works
@@ -49,52 +113,65 @@ When connected to an [Astation](https://github.com/Agora-Build/Astation) hub via
 - Builds a prompt and sends it to Claude Code for implementation
 - Reports task results back to Astation
 
-### Mark Task Flow
-
-```
-Chisel (browser) ──POST──> Express middleware (saves .chisel/tasks/)
-                            ──WS notify──> Astation hub
-                                           ──WS assign──> Atem
-                                                          reads task from disk
-                                                          spawns Claude Code
-                                                          ──WS result──> Astation
-```
-
 ### Voice-Driven Coding
 
-Astation captures mic audio, runs WebRTC VAD, and streams through Agora RTC. ConvoAI transcribes speech and pushes text over Agora RTM to Atem, which routes it to Claude Code. See `designs/data-flow-between-atem-and-astation.md`.
+Astation captures mic audio via Agora RTC. A ConvoAI agent transcribes speech (ASR) and pushes text through the relay server to Atem, which routes it to Claude Code. Claude's response flows back through the relay to ConvoAI for TTS playback. See `designs/data-flow-between-atem-and-astation.md`.
+
+### Credential Management
+
+Credentials are encrypted at rest using AES-256-GCM with a machine-bound key. See `designs/credential-flow.md`.
+
+```
+Priority: Astation sync (live) > env vars > config file
+Storage:  ~/.config/atem/credentials.enc (encrypted)
+```
 
 ## Configuration
 
-Create `~/.config/atem/atem.toml`:
+### Via Astation (recommended)
+
+```bash
+atem login          # Pair with Astation, credentials sync automatically
+```
+
+### Via environment variables
+
+```bash
+export AGORA_CUSTOMER_ID="..."
+export AGORA_CUSTOMER_SECRET="..."
+```
+
+### Config file
+
+Non-sensitive settings in `~/.config/atem/config.toml`:
 
 ```toml
 astation_ws = "ws://127.0.0.1:8080/ws"
-
-[agora]
-app_id = "your_app_id"
-app_certificate = "your_app_certificate"
+astation_relay_url = "https://station.agora.build"
+rtm_channel = "atem_channel"
 ```
 
-Or use environment variables:
-
-```bash
-AGORA_CUSTOMER_ID=...
-AGORA_CUSTOMER_SECRET=...
-```
+Credentials are stored separately in `~/.config/atem/credentials.enc` (AES-256-GCM encrypted, machine-bound).
 
 ## Architecture
 
 ```
 src/
-  main.rs              # Entry point, CLI parsing
+  main.rs              # Entry point, CLI parsing (clap)
   app.rs               # TUI state machine, mark task queue, Claude session mgmt
-  websocket_client.rs  # Astation WebSocket protocol (markTaskAssignment, etc.)
+  cli.rs               # CLI command definitions and handlers
+  websocket_client.rs  # Astation WebSocket protocol
   claude_client.rs     # PTY-based Claude Code integration
+  codex_client.rs      # PTY-based Codex terminal integration
   token.rs             # Agora RTC/RTM token generation
   rtm_client.rs        # Agora RTM FFI wrapper
-  config.rs            # TOML config + env var loading
-  tui/                 # Terminal UI rendering (ratatui)
+  ai_client.rs         # Anthropic API client for intent parsing
+  agora_api.rs         # Agora REST API client (projects, credentials)
+  auth.rs              # Auth session management, deep link flow
+  config.rs            # Config loading, encrypted credential store
+  tui/
+    mod.rs             # Main event loop, rendering dispatch
+    voice_fx.rs        # Voice activity visual effects
 native/
   include/atem_rtm.h   # C header for RTM interface
   src/atem_rtm.cpp     # Stub RTM (default, no SDK needed)
@@ -104,6 +181,7 @@ npm/
 designs/
   HLD.md               # High-level design
   LLD.md               # Low-level design
+  credential-flow.md   # Credential architecture
   roadmap.md           # Project roadmap
 ```
 
@@ -111,7 +189,8 @@ designs/
 
 ```bash
 cargo build              # Debug build
-cargo test               # Run tests (124 tests)
+cargo build --release    # Release build
+cargo test               # Run tests (394 tests)
 cargo check              # Type-check
 cargo fmt                # Format
 cargo clippy             # Lint

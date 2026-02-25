@@ -59,12 +59,12 @@ pub async fn fetch_agora_projects() -> Result<Vec<AgoraApiProject>> {
     // Fall back to env vars (existing behavior)
     let customer_id = std::env::var("AGORA_CUSTOMER_ID").map_err(|_| {
         anyhow::anyhow!(
-            "AGORA_CUSTOMER_ID not set. Configure in ~/.config/atem/config.toml or set as env var."
+            "AGORA_CUSTOMER_ID not set. Run `atem login` or set as env var."
         )
     })?;
     let customer_secret = std::env::var("AGORA_CUSTOMER_SECRET").map_err(|_| {
         anyhow::anyhow!(
-            "AGORA_CUSTOMER_SECRET not set. Configure in ~/.config/atem/config.toml or set as env var."
+            "AGORA_CUSTOMER_SECRET not set. Run `atem login` or set as env var."
         )
     })?;
 

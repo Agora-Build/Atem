@@ -1,3 +1,5 @@
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, Nonce};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, Mac};
@@ -5,6 +7,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
+
+/// Where the active credentials were loaded from.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum CredentialSource {
+    #[default]
+    None,
+    ConfigFile,
+    EnvVar,
+    Astation,
+}
 
 /// Main Atem configuration loaded from ~/.config/atem/config.toml + env vars
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -16,6 +28,10 @@ pub struct AtemConfig {
     pub astation_ws: Option<String>,
     pub astation_relay_url: Option<String>,
     pub astation_relay_code: Option<String>,
+
+    /// Tracks where credentials were loaded from (not serialized).
+    #[serde(skip)]
+    pub credential_source: CredentialSource,
 }
 
 /// Active project state persisted to ~/.config/atem/active_project.json
@@ -27,7 +43,9 @@ pub struct ActiveProject {
 }
 
 impl AtemConfig {
-    /// Load config from file + env var overrides. Env vars take precedence.
+    /// Load config from file + encrypted credentials + env var overrides.
+    ///
+    /// Priority: env vars > encrypted credentials.enc > config.toml
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
 
@@ -40,9 +58,22 @@ impl AtemConfig {
             AtemConfig::default()
         };
 
+        // Track credential source: config.toml is the base (legacy plaintext)
+        if config.customer_id.is_some() {
+            config.credential_source = CredentialSource::ConfigFile;
+        }
+
+        // Encrypted credentials override config.toml plaintext
+        if let Some((cid, csecret)) = CredentialStore::load() {
+            config.customer_id = Some(cid);
+            config.customer_secret = Some(csecret);
+            config.credential_source = CredentialSource::ConfigFile;
+        }
+
         // Env var overrides
         if let Ok(val) = std::env::var("AGORA_CUSTOMER_ID") {
             config.customer_id = Some(val);
+            config.credential_source = CredentialSource::EnvVar;
         }
         if let Ok(val) = std::env::var("AGORA_CUSTOMER_SECRET") {
             config.customer_secret = Some(val);
@@ -66,15 +97,22 @@ impl AtemConfig {
         Ok(config)
     }
 
-    /// Persist the config to disk (~/.config/atem/config.toml).
-    /// Only serializes non-None fields (env-var overrides are not written).
+    /// Persist the config to disk.
+    ///
+    /// - Credentials → encrypted `~/.config/atem/credentials.enc` (AES-256-GCM)
+    /// - Non-sensitive settings → `~/.config/atem/config.toml` (plaintext)
     pub fn save_to_disk(&self) -> Result<()> {
         let path = Self::config_path();
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
 
-        // Load existing file so we don't clobber non-credential keys.
+        // Save credentials to encrypted store
+        if let (Some(cid), Some(cs)) = (&self.customer_id, &self.customer_secret) {
+            CredentialStore::save(cid, cs)?;
+        }
+
+        // Load existing config.toml so we don't clobber other keys
         let mut existing = if path.exists() {
             let content = fs::read_to_string(&path)?;
             toml::from_str::<toml::Value>(&content).unwrap_or(toml::Value::Table(Default::default()))
@@ -84,12 +122,11 @@ impl AtemConfig {
 
         let table = existing.as_table_mut().expect("config is a TOML table");
 
-        if let Some(cid) = &self.customer_id {
-            table.insert("customer_id".into(), toml::Value::String(cid.clone()));
-        }
-        if let Some(cs) = &self.customer_secret {
-            table.insert("customer_secret".into(), toml::Value::String(cs.clone()));
-        }
+        // Remove plaintext credentials from config.toml (migrated to credentials.enc)
+        table.remove("customer_id");
+        table.remove("customer_secret");
+
+        // Write non-sensitive settings
         if let Some(ch) = &self.rtm_channel {
             table.insert("rtm_channel".into(), toml::Value::String(ch.clone()));
         }
@@ -330,10 +367,107 @@ fn derive_cache_key() -> [u8; 32] {
     type HmacSha256 = Hmac<Sha256>;
     let machine_id = get_machine_id();
     let mut mac =
-        HmacSha256::new_from_slice(b"atem-project-cache-v1").expect("HMAC accepts any key size");
+        <HmacSha256 as Mac>::new_from_slice(b"atem-project-cache-v1").expect("HMAC accepts any key size");
     mac.update(machine_id.as_bytes());
     let result = mac.finalize();
     result.into_bytes().into()
+}
+
+// ── Encrypted credential store (AES-256-GCM, machine-bound) ─────────
+
+/// Encrypted credentials stored at ~/.config/atem/credentials.enc
+///
+/// File format: nonce (12 bytes) || ciphertext || auth tag (16 bytes)
+/// Key: HMAC-SHA256(salt="atem-credentials-v1", machine_id)
+/// Matches Astation's CredentialManager pattern (AES-GCM + hardware-bound key).
+pub struct CredentialStore;
+
+#[derive(Serialize, Deserialize)]
+struct StoredCredentials {
+    customer_id: String,
+    customer_secret: String,
+}
+
+impl CredentialStore {
+    /// Encrypted credentials file path: ~/.config/atem/credentials.enc
+    pub fn path() -> PathBuf {
+        AtemConfig::config_dir().join("credentials.enc")
+    }
+
+    /// Derive a 32-byte AES-256 key from the machine ID.
+    fn derive_key() -> [u8; 32] {
+        type HmacSha256 = Hmac<Sha256>;
+        let machine_id = get_machine_id();
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(b"atem-credentials-v1")
+            .expect("HMAC accepts any key size");
+        mac.update(machine_id.as_bytes());
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Save credentials to encrypted file.
+    pub fn save(customer_id: &str, customer_secret: &str) -> Result<()> {
+        let path = Self::path();
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir)?;
+
+        let creds = StoredCredentials {
+            customer_id: customer_id.to_string(),
+            customer_secret: customer_secret.to_string(),
+        };
+        let plaintext = serde_json::to_vec(&creds)?;
+
+        let key = Self::derive_key();
+        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
+
+        // Generate random 96-bit nonce
+        let mut nonce_bytes = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext.as_ref())
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+
+        // Write: nonce (12) || ciphertext+tag
+        let mut combined = Vec::with_capacity(12 + ciphertext.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        fs::write(&path, &combined)?;
+
+        Ok(())
+    }
+
+    /// Load and decrypt credentials. Returns None on any failure.
+    pub fn load() -> Option<(String, String)> {
+        let path = Self::path();
+        let combined = fs::read(&path).ok()?;
+
+        if combined.len() < 12 + 16 {
+            // Too short: need at least nonce (12) + tag (16)
+            return None;
+        }
+
+        let (nonce_bytes, ciphertext) = combined.split_at(12);
+        let nonce = Nonce::<Aes256Gcm>::from_slice(nonce_bytes);
+
+        let key = Self::derive_key();
+        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
+
+        let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
+        let creds: StoredCredentials = serde_json::from_slice(&plaintext).ok()?;
+
+        Some((creds.customer_id, creds.customer_secret))
+    }
+
+    /// Delete the encrypted credential file.
+    pub fn delete() -> Result<()> {
+        let path = Self::path();
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
 }
 
 /// XOR-encrypt `plaintext` with a SHA256-based keystream derived from `key`.
@@ -696,6 +830,108 @@ mod tests {
         let config = AtemConfig::default();
         let display = config.display_masked();
         assert!(display.contains("astation_relay_url"));
+    }
+
+    // ── credential store tests ──────────────────────────────────────────
+
+    /// Helper to test AES-GCM encryption directly (avoids shared file conflicts).
+    fn test_encrypt_decrypt_credentials(cid: &str, csecret: &str) {
+        let key = CredentialStore::derive_key();
+        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
+
+        let creds = super::StoredCredentials {
+            customer_id: cid.to_string(),
+            customer_secret: csecret.to_string(),
+        };
+        let plaintext = serde_json::to_vec(&creds).unwrap();
+
+        let mut nonce_bytes = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+
+        // Verify ciphertext doesn't contain plaintext
+        let ct_str = String::from_utf8_lossy(&ciphertext);
+        assert!(!ct_str.contains(cid));
+        assert!(!ct_str.contains(csecret));
+
+        // Decrypt
+        let decrypted = cipher.decrypt(nonce, ciphertext.as_ref()).unwrap();
+        let loaded: super::StoredCredentials = serde_json::from_slice(&decrypted).unwrap();
+        assert_eq!(loaded.customer_id, cid);
+        assert_eq!(loaded.customer_secret, csecret);
+    }
+
+    #[test]
+    fn credential_store_encrypt_decrypt() {
+        test_encrypt_decrypt_credentials("test-cid-abc123", "test-secret-xyz");
+    }
+
+    #[test]
+    fn credential_store_file_round_trip() {
+        // Use a temp file to avoid races with other tests
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let key = CredentialStore::derive_key();
+        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
+
+        let creds = super::StoredCredentials {
+            customer_id: "file-test-id".to_string(),
+            customer_secret: "file-test-secret".to_string(),
+        };
+        let plaintext = serde_json::to_vec(&creds).unwrap();
+
+        let mut nonce_bytes = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+
+        // Write combined: nonce || ciphertext+tag
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        fs::write(&path, &combined).unwrap();
+
+        // Verify file is not readable as plaintext
+        let raw_bytes = fs::read(&path).unwrap();
+        let raw = String::from_utf8_lossy(&raw_bytes);
+        assert!(!raw.contains("file-test-id"));
+
+        // Read back and decrypt
+        let data = fs::read(&path).unwrap();
+        let (n, ct) = data.split_at(12);
+        let decrypted = cipher.decrypt(
+            aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(n),
+            ct,
+        ).unwrap();
+        let loaded: super::StoredCredentials = serde_json::from_slice(&decrypted).unwrap();
+        assert_eq!(loaded.customer_id, "file-test-id");
+        assert_eq!(loaded.customer_secret, "file-test-secret");
+    }
+
+    #[test]
+    fn credential_store_tampered_data_fails() {
+        let key = CredentialStore::derive_key();
+        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
+
+        let plaintext = b"test data";
+        let mut nonce_bytes = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
+        let mut ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+
+        // Tamper: flip a byte
+        if !ciphertext.is_empty() {
+            ciphertext[0] ^= 0xFF;
+        }
+
+        // Decryption must fail (AES-GCM auth tag mismatch)
+        assert!(cipher.decrypt(nonce, ciphertext.as_ref()).is_err());
     }
 
     // ── project cache + crypto tests ────────────────────────────────────

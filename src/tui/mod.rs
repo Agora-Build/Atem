@@ -233,7 +233,7 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                                     // Update in-memory config to reflect saved state
                                     app.config.customer_id = Some(customer_id);
                                     app.config.customer_secret = Some(customer_secret);
-                                    // Clear synced credentials so banner shows "from config file"
+                                    app.config.credential_source = crate::config::CredentialSource::ConfigFile;
                                     app.synced_customer_id = None;
                                     app.synced_customer_secret = None;
                                     app.status_message = Some(format!("\u{2705} Credentials saved ({}...)", id_preview));

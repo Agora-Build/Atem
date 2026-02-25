@@ -97,19 +97,25 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
 }
 
 pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Build credential status line
-    let cred_line = if app.synced_customer_id.is_some() {
-        format!(
-            "\u{1f511} Credentials: synced from Astation{}",
-            if app.astation_connected { " | \u{1f7e2} Astation connected" } else { "" }
-        )
-    } else if app.config.customer_id.is_some() {
-        "\u{1f511} Credentials: from config file".to_string()
-    } else {
-        "\u{26a0}\u{fe0f}  No credentials — run `atem login` or set AGORA_CUSTOMER_ID".to_string()
+    // Build credential status line showing the source
+    use crate::config::CredentialSource;
+    let cred_line = match &app.config.credential_source {
+        CredentialSource::Astation => {
+            let suffix = if app.astation_connected { " | \u{1f7e2} Astation connected" } else { "" };
+            format!("\u{1f511} Credentials: from Astation{}", suffix)
+        }
+        CredentialSource::EnvVar => {
+            "\u{1f511} Credentials: from ENV".to_string()
+        }
+        CredentialSource::ConfigFile => {
+            "\u{1f511} Credentials: from config file".to_string()
+        }
+        CredentialSource::None => {
+            "\u{26a0}\u{fe0f}  No credentials — run `atem login` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string()
+        }
     };
 
-    let cred_style = if app.synced_customer_id.is_some() || app.config.customer_id.is_some() {
+    let cred_style = if app.config.credential_source != CredentialSource::None {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::Yellow)
