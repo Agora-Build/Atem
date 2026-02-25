@@ -521,7 +521,7 @@ fn unregister_server(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Spawn `atem serv diagrams --_serv-daemon` as a detached background process.
+/// Spawn `atem serv diagrams --serv-daemon` as a detached background process.
 fn spawn_background_daemon(port: u16, local_url: &str, network_url: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_dir = servers_dir();
@@ -536,7 +536,7 @@ fn spawn_background_daemon(port: u16, local_url: &str, network_url: &str) -> Res
             "diagrams",
             "--port",
             &port.to_string(),
-            "--_serv-daemon",
+            "--serv-daemon",
         ])
         .stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone()?)

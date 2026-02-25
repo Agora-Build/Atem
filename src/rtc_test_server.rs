@@ -247,7 +247,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
                 "--expire",
                 &config.expire_secs.to_string(),
                 "--no-browser",
-                "--_serv-daemon",
+                "--serv-daemon",
             ])
             .stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
