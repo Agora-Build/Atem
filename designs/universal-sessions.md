@@ -265,16 +265,15 @@ Sessions don't interfere - completely independent.
 - ✅ `src/auth.rs` - Added SessionManager, updated AuthSession
 - ✅ `src/websocket_client.rs` - Extract astation_id, use SessionManager
 - ✅ `src/cli.rs` - Updated login command
-- ✅ `UNIVERSAL_SESSIONS.md` - This file
+- ✅ `designs/universal-sessions.md` - This file
 
 ### Astation (Swift)
 - ✅ `Sources/Menubar/AstationIdentity.swift` - NEW FILE
 - ✅ `Sources/Menubar/AstationWebSocketServer.swift` - Send astation_id
 
 ### Documentation
-- ✅ `SESSION_AUTH_IMPLEMENTATION.md` - Original session design
-- ✅ `CLIENT_AUTH_COMPLETE.md` - Client auth implementation
-- ✅ `UNIVERSAL_SESSIONS.md` - Universal session architecture
+- ✅ `designs/session-auth.md` - Original session design
+- ✅ `designs/universal-sessions.md` - Universal session architecture
 
 ## Migration from Old Sessions
 

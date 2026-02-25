@@ -19,6 +19,7 @@ mod acp_client;
 mod agent_client;
 mod agent_detector;
 mod agent_registry;
+mod agent_visualize;
 // RTC test server
 mod rtc_test_server;
 

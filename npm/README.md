@@ -1,6 +1,6 @@
 # @agora-build/atem
 
-Agora AI development terminal. A TUI that connects to [Astation](https://github.com/Agora-Build/Astation) for task routing, runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions, and generates Agora RTC/RTM tokens.
+A development terminal that connects human developers, Agora platform, and AI agents. Manage Agora projects and tokens, route tasks between [Astation](https://github.com/Agora-Build/Astation) and AI coding agents, generate diagrams, drive voice-powered coding workflows, and more -- all from a single CLI/TUI.
 
 ## Install
 
@@ -62,6 +62,9 @@ atem agent launch codex                 # Launch Codex as PTY agent
 atem agent connect <WS_URL>             # Connect to ACP agent and show info
 atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent
 atem agent probe <WS_URL>               # Probe URL for ACP support
+atem agent visualize "topic"            # Generate visual HTML diagram via ACP agent
+atem agent visualize "topic" --url ws://localhost:8765  # Explicit agent URL
+atem agent visualize "topic" --no-browser               # Skip opening browser
 ```
 
 ### Dev Servers

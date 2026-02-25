@@ -142,6 +142,8 @@ pub struct App {
     pub pending_astation_command: Option<PendingAstationCommand>,
     /// Pending voice coding request waiting for Claude to finish.
     pub pending_voice_request: Option<PendingVoiceRequest>,
+    /// Pending visualize request waiting for agent to write HTML diagram.
+    pub pending_visualize: Option<PendingVisualize>,
 }
 
 /// Tracks a command sent from Astation that needs output relayed back.
@@ -150,6 +152,18 @@ pub struct PendingAstationCommand {
     pub target: ActiveCli,
     pub output_start_pos: usize, // Position in output_log where command output starts
     pub sent_at: Instant,
+}
+
+/// Tracks a visualize request waiting for the agent to write an HTML diagram.
+#[derive(Debug, Clone)]
+pub struct PendingVisualize {
+    pub session_id: String,
+    pub relay_url: Option<String>,
+    pub sent_at: Instant,
+    pub pre_snapshot: HashMap<PathBuf, SystemTime>,
+    pub detected_file: Option<String>,
+    pub output_snapshot_len: usize,
+    pub last_output_at: Instant,
 }
 
 /// Tracks a voice coding request waiting for Claude to finish.
@@ -243,6 +257,7 @@ impl App {
             astation_connect_rx: None,
             pending_astation_command: None,
             pending_voice_request: None,
+            pending_visualize: None,
         }
     }
 
@@ -1906,6 +1921,13 @@ impl App {
             } => {
                 self.handle_voice_request(session_id, accumulated_text, relay_url).await;
             }
+            AstationMessage::VisualizeRequest {
+                session_id,
+                topic,
+                relay_url,
+            } => {
+                self.handle_visualize_request(session_id, topic, relay_url).await;
+            }
             AstationMessage::CredentialSync {
                 customer_id,
                 customer_secret,
@@ -2236,6 +2258,111 @@ impl App {
         self.pending_voice_request = None;
     }
 
+    // MARK: - Visualize Request Processing
+
+    /// Handle a visualize request from Astation: send prompt to Claude and track for completion.
+    pub async fn handle_visualize_request(
+        &mut self,
+        session_id: String,
+        topic: String,
+        relay_url: Option<String>,
+    ) {
+        use crate::agent_visualize::{build_visualize_prompt, snapshot_diagrams_dir};
+
+        self.status_message = Some(format!(
+            "\u{1f4ca} Visualize request: {}",
+            &topic[..topic.len().min(50)]
+        ));
+
+        let prompt = build_visualize_prompt(&topic);
+        let pre_snapshot = snapshot_diagrams_dir();
+
+        // Send the prompt to Claude Code
+        if let Err(err) = self.send_claude_prompt(&prompt).await {
+            self.status_message =
+                Some(format!("Failed to send visualize request to Claude: {}", err));
+            let _ = self
+                .astation_client
+                .send_visualize_result(
+                    &session_id,
+                    false,
+                    &format!("Failed to send to Claude: {}", err),
+                    None,
+                )
+                .await;
+            return;
+        }
+
+        // Track pending request — watch for Claude output completion
+        let now = Instant::now();
+        self.pending_visualize = Some(PendingVisualize {
+            session_id,
+            relay_url,
+            sent_at: now,
+            pre_snapshot,
+            detected_file: None,
+            output_snapshot_len: self.claude_raw_log.len(),
+            last_output_at: now,
+        });
+    }
+
+    /// Check if a pending visualize request's Claude output is complete (3s inactivity).
+    /// When done, detect new HTML files and notify Astation.
+    pub async fn check_visualize_completion(&mut self) {
+        use crate::agent_visualize::detect_new_html_files;
+
+        let pending = match self.pending_visualize.clone() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let current_len = self.claude_raw_log.len();
+
+        // Output is still growing — update snapshot
+        if current_len > pending.output_snapshot_len {
+            if let Some(ref mut p) = self.pending_visualize {
+                p.output_snapshot_len = current_len;
+                p.last_output_at = Instant::now();
+            }
+            return;
+        }
+
+        // No new output yet — wait at least 3 seconds of inactivity
+        if pending.last_output_at.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+
+        // Also require at least 3s since the prompt was sent (avoid racing)
+        if pending.sent_at.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+
+        // Agent is done — detect new HTML files
+        let file_path = pending
+            .detected_file
+            .clone()
+            .or_else(|| detect_new_html_files(&pending.pre_snapshot).into_iter().next());
+
+        let (success, message) = match &file_path {
+            Some(path) => (true, format!("Diagram generated: {}", path)),
+            None => (false, "No HTML diagram file was detected".to_string()),
+        };
+
+        // Notify Astation
+        let _ = self
+            .astation_client
+            .send_visualize_result(
+                &pending.session_id,
+                success,
+                &message,
+                file_path,
+            )
+            .await;
+
+        self.status_message = Some(format!("\u{1f4ca} {}", message));
+        self.pending_visualize = None;
+    }
+
     /// Check if pending Astation command has output ready and relay it back.
     /// Sends output after 2 seconds of inactivity.
     pub async fn check_relay_output(&mut self) {
@@ -2301,6 +2428,9 @@ impl App {
 
         // Check if pending voice request has completed
         self.check_voice_request_completion().await;
+
+        // Check if pending visualize request has completed
+        self.check_visualize_completion().await;
     }
 }
 
@@ -2375,5 +2505,122 @@ mod tests {
         let cloned = req.clone();
         assert_eq!(cloned.session_id, "sess-clone");
         assert_eq!(cloned.output_snapshot_len, 100);
+    }
+
+    #[test]
+    fn test_pending_visualize_default_is_none() {
+        let app = App::new();
+        assert!(app.pending_visualize.is_none());
+    }
+
+    #[test]
+    fn test_pending_visualize_tracks_fields() {
+        let now = Instant::now();
+        let pv = PendingVisualize {
+            session_id: "vis-1".to_string(),
+            relay_url: Some("https://relay.test".to_string()),
+            sent_at: now,
+            pre_snapshot: HashMap::new(),
+            detected_file: None,
+            output_snapshot_len: 0,
+            last_output_at: now,
+        };
+        assert_eq!(pv.session_id, "vis-1");
+        assert_eq!(pv.relay_url.as_deref(), Some("https://relay.test"));
+        assert!(pv.detected_file.is_none());
+        assert!(pv.pre_snapshot.is_empty());
+    }
+
+    #[test]
+    fn test_pending_visualize_clone() {
+        let now = Instant::now();
+        let pv = PendingVisualize {
+            session_id: "vis-clone".to_string(),
+            relay_url: None,
+            sent_at: now,
+            pre_snapshot: HashMap::new(),
+            detected_file: Some("/tmp/test.html".to_string()),
+            output_snapshot_len: 42,
+            last_output_at: now,
+        };
+        let cloned = pv.clone();
+        assert_eq!(cloned.session_id, "vis-clone");
+        assert_eq!(cloned.detected_file.as_deref(), Some("/tmp/test.html"));
+        assert_eq!(cloned.output_snapshot_len, 42);
+    }
+
+    #[test]
+    fn test_pending_visualize_with_relay_url() {
+        let now = Instant::now();
+        let pv = PendingVisualize {
+            session_id: "vis-relay".to_string(),
+            relay_url: Some("https://relay.agora.build".to_string()),
+            sent_at: now,
+            pre_snapshot: HashMap::new(),
+            detected_file: None,
+            output_snapshot_len: 0,
+            last_output_at: now,
+        };
+        assert_eq!(pv.relay_url.as_deref(), Some("https://relay.agora.build"));
+    }
+
+    #[test]
+    fn test_pending_visualize_with_pre_snapshot() {
+        let now = Instant::now();
+        let mut snap = HashMap::new();
+        snap.insert(
+            PathBuf::from("/home/user/.agent/diagrams/existing.html"),
+            SystemTime::now(),
+        );
+        let pv = PendingVisualize {
+            session_id: "vis-snap".to_string(),
+            relay_url: None,
+            sent_at: now,
+            pre_snapshot: snap,
+            detected_file: None,
+            output_snapshot_len: 0,
+            last_output_at: now,
+        };
+        assert_eq!(pv.pre_snapshot.len(), 1);
+        assert!(pv.pre_snapshot.contains_key(&PathBuf::from("/home/user/.agent/diagrams/existing.html")));
+    }
+
+    #[test]
+    fn test_pending_visualize_detected_file_overrides_snapshot() {
+        // When detected_file is Some, it should be used instead of snapshot diff
+        let now = Instant::now();
+        let pv = PendingVisualize {
+            session_id: "vis-detect".to_string(),
+            relay_url: None,
+            sent_at: now,
+            pre_snapshot: HashMap::new(),
+            detected_file: Some("/home/user/.agent/diagrams/detected.html".to_string()),
+            output_snapshot_len: 100,
+            last_output_at: now,
+        };
+        // The detected_file should be preferred
+        let file_path = pv.detected_file.clone().or_else(|| None);
+        assert_eq!(file_path.as_deref(), Some("/home/user/.agent/diagrams/detected.html"));
+    }
+
+    #[test]
+    fn test_pending_visualize_clone_preserves_snapshot() {
+        let now = Instant::now();
+        let mut snap = HashMap::new();
+        snap.insert(PathBuf::from("/tmp/a.html"), SystemTime::now());
+        snap.insert(PathBuf::from("/tmp/b.html"), SystemTime::now());
+        let pv = PendingVisualize {
+            session_id: "vis-snap-clone".to_string(),
+            relay_url: None,
+            sent_at: now,
+            pre_snapshot: snap,
+            detected_file: None,
+            output_snapshot_len: 0,
+            last_output_at: now,
+        };
+        let cloned = pv.clone();
+        assert_eq!(cloned.pre_snapshot.len(), 2);
+        assert!(cloned.pre_snapshot.contains_key(&PathBuf::from("/tmp/a.html")));
+        assert!(cloned.pre_snapshot.contains_key(&PathBuf::from("/tmp/b.html")));
     }
 }

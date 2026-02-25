@@ -13,6 +13,8 @@
 | **T6** | Atem | AI REPL | L | `pending` | T3 |
 | **T7** | Atem | Voice Kickback | M | `pending` | T4 |
 | **T8** | Atem | Voice/Video State Display | S | `pending` | T7 |
+| **T9** | Atem | ACP Agent Hub | M | `done` | T3 |
+| **T10** | Atem | Agent Visualize | S | `done` | T9 |
 | **A0** | Astation | Encrypted Credential Storage | M | `done` | — |
 | **A1** | Astation | Settings UI | S | `done` | A0 |
 | **A2** | Astation | Real Project Fetching | S | `done` | A1 |
@@ -58,6 +60,11 @@ A5 (Cloud Server) ────────────────→    T7 (Voi
   │                                      │
   v                                      v
 A6 (Hotkeys + Instances) ────────→    T8 (Voice/Video State Display) ←── A6
+
+                                     T9 (ACP Agent Hub) ←── T3
+                                       │
+                                       v
+                                     T10 (Agent Visualize) ←── T9
 ```
 
 **Parallelism**:
@@ -359,6 +366,41 @@ struct MachineIdentity {
 | Modify | `src/websocket_client.rs` | Add VoiceToggle/VideoToggle/AtemInstanceList |
 | Modify | `src/app.rs` | Add voice_active, video_active, peer_atems fields |
 | Modify | `src/tui/draw.rs` | Show mic/video indicators, instance sidebar |
+
+---
+
+### Stage T9: ACP Agent Hub
+
+**Status**: `done`
+**Goal**: Discover, connect to, and communicate with ACP agents (Claude Code, Codex) via JSON-RPC 2.0 over WebSocket. Adds agent detection (lockfile scan + port probe), ACP client protocol, agent registry, and CLI commands (`agent list`, `agent connect`, `agent prompt`, `agent probe`).
+
+**Complexity**: M
+
+| Action | File | Purpose |
+|--------|------|---------|
+| Create | `src/acp_client.rs` | JSON-RPC 2.0 client: initialize, session, prompt, events |
+| Create | `src/agent_client.rs` | AgentEvent enum, AgentKind, PTY client abstraction |
+| Create | `src/agent_detector.rs` | Lockfile scanning, port probing |
+| Create | `src/agent_registry.rs` | Registry of all known agents |
+| Modify | `src/cli.rs` | Add `agent list/connect/prompt/probe` commands |
+| Modify | `src/app.rs` | Add agent panel, ACP client map, active agent routing |
+
+---
+
+### Stage T10: Agent Visualize
+
+**Status**: `done`
+**Goal**: Generate visual HTML diagrams by delegating to a running ACP agent. Supports CLI mode (auto-detect agent, stream events, open browser) and TUI mode (Astation-triggered via `visualizeRequest`/`visualizeResult` messages).
+
+**Complexity**: S
+
+| Action | File | Purpose |
+|--------|------|---------|
+| Create | `src/agent_visualize.rs` | Prompt builder, fs snapshot/diff, agent URL resolver, browser opener |
+| Create | `designs/agent-visualize.md` | Design document |
+| Modify | `src/cli.rs` | Add `AgentCommands::Visualize` + handler |
+| Modify | `src/websocket_client.rs` | Add `VisualizeRequest` / `VisualizeResult` messages |
+| Modify | `src/app.rs` | Add `PendingVisualize`, handler, completion checker |
 
 ---
 

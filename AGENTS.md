@@ -1,6 +1,6 @@
 ## Project Overview
 
-Atem is an intelligent CLI tool for developers working with Agora.io real-time communication platforms. It combines traditional CLI functionality with AI-powered interactive shell capabilities, supporting both precise command execution and natural language assistance.
+Atem is a development terminal that connects human developers, Agora platform, and AI agents. It provides a CLI and TUI for managing Agora projects and tokens, routing tasks between Astation and AI coding agents (Claude Code, Codex), generating visual diagrams, voice-driven coding, and more.
 
 ## Architecture
 
@@ -21,16 +21,25 @@ Atem is an intelligent CLI tool for developers working with Agora.io real-time c
 ### Token Management
 - `atem token rtc create` - Generate RTC access tokens
 - `atem token rtc decode` - Decode existing tokens
+- `atem token rtm create` - Generate RTM tokens
 
-### Project Management  
+### Project Management
 - `atem list project` - List all projects
-- `atem project id` - Display current project ID
+- `atem project use <APP_ID|N>` - Set active project
+- `atem project show` - Show current active project
 
-### Streaming Operations
-- `atem ingress <rtmp_url> <channel> <uid> <access_token>` - Initiate RTMP stream ingress
+### AI Agents
+- `atem agent list` - Scan and list detected AI agents (lockfiles + port scan)
+- `atem agent connect <WS_URL>` - Connect to ACP agent and show info
+- `atem agent prompt <WS_URL> "text"` - Send prompt to ACP agent
+- `atem agent probe <WS_URL>` - Probe URL for ACP support
+- `atem agent visualize "topic"` - Generate visual HTML diagram via ACP agent
+- `atem agent visualize "topic" --url <WS_URL>` - Explicit agent URL
+- `atem agent visualize "topic" --no-browser` - Skip browser open
 
 ### Interactive Mode
-- `atem` - Launch AI-enhanced REPL environment
+- `atem` - Launch TUI with multiple modes (Claude, Codex, Token Gen, Agent Panel)
+- `atem repl` - Interactive REPL with AI command interpretation
 
 ## Development Commands
 
@@ -67,28 +76,32 @@ Atem is an intelligent CLI tool for developers working with Agora.io real-time c
 ## File Structure
 
 ```
-├── src/
-│   ├── main.rs           # Entry point and command dispatcher
-│   ├── cli/              # CLI command implementations
-│   │   ├── mod.rs
-│   │   ├── token.rs      # Token management commands
-│   │   ├── project.rs    # Project operations
-│   │   └── streaming.rs  # Ingress and streaming commands
-│   ├── repl/             # Interactive AI shell
-│   │   ├── mod.rs
-│   │   └── ai_shell.rs
-│   ├── ai/               # AI integration module
-│   │   ├── mod.rs
-│   │   └── llm_client.rs
-│   ├── agora/            # Agora API client
-│   │   ├── mod.rs
-│   │   ├── auth.rs
-│   │   └── api.rs
-│   └── config/           # Configuration management
-│       ├── mod.rs
-│       └── settings.rs
-├── tests/                # Integration tests
-└── examples/             # Usage examples
+src/
+├── main.rs              # Entry point, CLI/TUI routing
+├── app.rs               # TUI state machine, mark task queue
+├── cli.rs               # clap command definitions and handlers
+├── websocket_client.rs  # Astation WebSocket protocol
+├── claude_client.rs     # Claude Code PTY subprocess
+├── codex_client.rs      # Codex PTY subprocess
+├── acp_client.rs        # ACP JSON-RPC 2.0 over WebSocket
+├── agent_client.rs      # Agent event types and PTY client
+├── agent_detector.rs    # Lockfile scan + ACP port probe
+├── agent_registry.rs    # Registry of known agents
+├── agent_visualize.rs   # Diagram generation via ACP agents
+├── token.rs             # Agora RTC/RTM token generation
+├── config.rs            # Config loading, encrypted credential store
+├── auth.rs              # Auth session management
+├── agora_api.rs         # Agora REST API client
+├── ai_client.rs         # Anthropic API client
+├── repl.rs              # Interactive REPL
+├── rtm_client.rs        # RTM FFI wrapper
+└── tui/
+    ├── mod.rs           # TUI event loop
+    └── voice_fx.rs      # Voice visualization
+designs/
+├── agent-visualize.md   # Agent diagram generation architecture
+├── HLD.md, LLD.md       # High/low-level design
+└── roadmap.md           # Project roadmap
 ```
 
 ## Integration Notes
@@ -96,6 +109,8 @@ Atem is an intelligent CLI tool for developers working with Agora.io real-time c
 - **Astation Integration**: Voice (Ctrl+V) and video collaboration (Ctrl+Shift+V) are managed externally
 - **Real-time Features**: Voice transcription and collaborative editing handled by Astation
 - **API Security**: Implement secure credential storage and token management
+- **ACP Agents**: Atem discovers and communicates with Claude Code, Codex, and other ACP agents via JSON-RPC 2.0 over WebSocket
+- **Agent Visualize**: Delegates diagram generation to ACP agents; detects output files via ToolCall events or filesystem snapshot diffing; opens in browser. Astation can trigger via `visualizeRequest` message.
 
 
 # Repository Guidelines

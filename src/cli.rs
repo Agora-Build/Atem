@@ -269,6 +269,20 @@ pub enum AgentCommands {
         #[arg(long, default_value = "2000")]
         timeout: u64,
     },
+    /// Generate a visual HTML diagram via an active ACP agent
+    Visualize {
+        /// Topic or system to visualize
+        topic: String,
+        /// WebSocket URL of the ACP server (auto-detected if omitted)
+        #[arg(long)]
+        url: Option<String>,
+        /// Timeout in milliseconds
+        #[arg(long, default_value = "120000")]
+        timeout: u64,
+        /// Skip opening the result in a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -750,6 +764,89 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 }
                 Ok(())
             }
+
+            AgentCommands::Visualize { topic, url, timeout, no_browser } => {
+                use crate::acp_client::AcpClient;
+                use crate::agent_client::AgentEvent;
+                use crate::agent_visualize::{
+                    build_visualize_prompt, detect_new_html_files,
+                    open_html_in_browser, resolve_agent_url, snapshot_diagrams_dir,
+                };
+                use std::time::Duration;
+
+                let agent_url = resolve_agent_url(url).await?;
+                println!("Connecting to {} …", agent_url);
+
+                let mut client = AcpClient::connect(&agent_url).await?;
+                let info = client.initialize().await?;
+                let _session_id = client.new_session().await?;
+                println!("Agent: {} — generating diagram …\n", info.kind);
+
+                // Snapshot diagrams dir before sending prompt
+                let pre_snapshot = snapshot_diagrams_dir();
+
+                let prompt = build_visualize_prompt(&topic);
+                client.send_prompt(&prompt)?;
+
+                // Poll for events; watch for Write tool calls targeting .html
+                let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
+                let mut detected_file: Option<String> = None;
+
+                loop {
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("\nTimeout waiting for agent.");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let events = client.drain_events();
+                    for event in events {
+                        match event {
+                            AgentEvent::TextDelta(t) => print!("{}", t),
+                            AgentEvent::ToolCall { name, input, .. } => {
+                                print!("\n[tool: {}] ", name);
+                                // Detect Write tool targeting an .html file
+                                if name == "Write" {
+                                    if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
+                                        if fp.ends_with(".html") {
+                                            detected_file = Some(fp.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            AgentEvent::ToolResult { .. } => print!("[done] "),
+                            AgentEvent::Done => {
+                                println!();
+
+                                // Determine which file to open
+                                let file_path = detected_file.or_else(|| {
+                                    detect_new_html_files(&pre_snapshot).into_iter().next()
+                                });
+
+                                match file_path {
+                                    Some(path) => {
+                                        println!("\nDiagram saved: {}", path);
+                                        if !no_browser {
+                                            open_html_in_browser(&path);
+                                            println!("Opened in browser.");
+                                        }
+                                    }
+                                    None => {
+                                        eprintln!("No HTML diagram file was detected.");
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            AgentEvent::Error(e) => {
+                                anyhow::bail!("Agent error: {}", e);
+                            }
+                            AgentEvent::Disconnected => {
+                                anyhow::bail!("Agent disconnected");
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
         },
         Commands::Serv { serv_command } => match serv_command {
             ServCommands::Rtc {
@@ -1056,6 +1153,121 @@ mod tests {
             }
             _ => panic!("expected Agent Probe"),
         }
+    }
+
+    // ── agent visualize ──────────────────────────────────────────────────
+
+    #[test]
+    fn cli_agent_visualize_parses() {
+        let cli = Cli::try_parse_from([
+            "atem", "agent", "visualize", "WebRTC data flow",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Agent {
+                agent_command: AgentCommands::Visualize { topic, url, timeout, no_browser },
+            }) => {
+                assert_eq!(topic, "WebRTC data flow");
+                assert!(url.is_none());
+                assert_eq!(timeout, 120000);
+                assert!(!no_browser);
+            }
+            _ => panic!("expected Agent Visualize"),
+        }
+    }
+
+    #[test]
+    fn cli_agent_visualize_with_url() {
+        let cli = Cli::try_parse_from([
+            "atem", "agent", "visualize", "auth system",
+            "--url", "ws://localhost:8765",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Agent {
+                agent_command: AgentCommands::Visualize { topic, url, .. },
+            }) => {
+                assert_eq!(topic, "auth system");
+                assert_eq!(url.as_deref(), Some("ws://localhost:8765"));
+            }
+            _ => panic!("expected Agent Visualize"),
+        }
+    }
+
+    #[test]
+    fn cli_agent_visualize_no_browser_flag() {
+        let cli = Cli::try_parse_from([
+            "atem", "agent", "visualize", "pipeline", "--no-browser",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Agent {
+                agent_command: AgentCommands::Visualize { no_browser, .. },
+            }) => {
+                assert!(no_browser);
+            }
+            _ => panic!("expected Agent Visualize"),
+        }
+    }
+
+    #[test]
+    fn cli_agent_visualize_custom_timeout() {
+        let cli = Cli::try_parse_from([
+            "atem", "agent", "visualize", "data flow", "--timeout", "60000",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Agent {
+                agent_command: AgentCommands::Visualize { timeout, .. },
+            }) => {
+                assert_eq!(timeout, 60000);
+            }
+            _ => panic!("expected Agent Visualize"),
+        }
+    }
+
+    #[test]
+    fn cli_agent_visualize_all_flags() {
+        let cli = Cli::try_parse_from([
+            "atem", "agent", "visualize", "Atem architecture",
+            "--url", "ws://10.0.0.1:9000",
+            "--timeout", "30000",
+            "--no-browser",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Agent {
+                agent_command: AgentCommands::Visualize { topic, url, timeout, no_browser },
+            }) => {
+                assert_eq!(topic, "Atem architecture");
+                assert_eq!(url.as_deref(), Some("ws://10.0.0.1:9000"));
+                assert_eq!(timeout, 30000);
+                assert!(no_browser);
+            }
+            _ => panic!("expected Agent Visualize"),
+        }
+    }
+
+    #[test]
+    fn cli_agent_visualize_topic_with_spaces() {
+        let cli = Cli::try_parse_from([
+            "atem", "agent", "visualize", "multi word topic with spaces",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Agent {
+                agent_command: AgentCommands::Visualize { topic, .. },
+            }) => {
+                assert_eq!(topic, "multi word topic with spaces");
+            }
+            _ => panic!("expected Agent Visualize"),
+        }
+    }
+
+    #[test]
+    fn cli_agent_visualize_missing_topic_fails() {
+        let result = Cli::try_parse_from(["atem", "agent", "visualize"]);
+        assert!(result.is_err(), "visualize without topic should fail");
     }
 
     // ── config set / clear ────────────────────────────────────────────────

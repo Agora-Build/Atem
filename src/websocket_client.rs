@@ -199,6 +199,25 @@ pub enum AstationMessage {
         message: String,
     },
 
+    /// Astation → Atem: request to generate a visual diagram via an agent.
+    #[serde(rename = "visualizeRequest")]
+    VisualizeRequest {
+        session_id: String,
+        topic: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
+    },
+
+    /// Atem → Astation: result of a visualize request.
+    #[serde(rename = "visualizeResult")]
+    VisualizeResult {
+        session_id: String,
+        success: bool,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_path: Option<String>,
+    },
+
     /// Astation → Atem: Agora REST API credentials for use without env vars.
     /// Priority: synced (this) > env vars > config file.
     #[serde(rename = "credentialSync")]
@@ -607,6 +626,22 @@ impl AstationClient {
             session_id: session_id.to_string(),
             success,
             message: message.to_string(),
+        };
+        self.send_message(msg).await
+    }
+
+    pub async fn send_visualize_result(
+        &self,
+        session_id: &str,
+        success: bool,
+        message: &str,
+        file_path: Option<String>,
+    ) -> Result<()> {
+        let msg = AstationMessage::VisualizeResult {
+            session_id: session_id.to_string(),
+            success,
+            message: message.to_string(),
+            file_path,
         };
         self.send_message(msg).await
     }
@@ -1781,6 +1816,166 @@ mod tests {
             assert_eq!(message, "ok");
         } else {
             panic!("expected VoiceResponse");
+        }
+    }
+
+    // ── VisualizeRequest / VisualizeResult tests ──────────────────────────
+
+    #[test]
+    fn visualize_request_deserialize() {
+        let json = r#"{"type":"visualizeRequest","data":{"session_id":"vis-1","topic":"WebRTC flow","relay_url":"https://relay.test"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VisualizeRequest { session_id, topic, relay_url } = msg {
+            assert_eq!(session_id, "vis-1");
+            assert_eq!(topic, "WebRTC flow");
+            assert_eq!(relay_url.as_deref(), Some("https://relay.test"));
+        } else {
+            panic!("expected VisualizeRequest");
+        }
+    }
+
+    #[test]
+    fn visualize_request_without_relay_url() {
+        let json = r#"{"type":"visualizeRequest","data":{"session_id":"vis-2","topic":"auth system"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VisualizeRequest { session_id, topic, relay_url } = msg {
+            assert_eq!(session_id, "vis-2");
+            assert_eq!(topic, "auth system");
+            assert!(relay_url.is_none());
+        } else {
+            panic!("expected VisualizeRequest");
+        }
+    }
+
+    #[test]
+    fn visualize_request_roundtrip() {
+        let msg = AstationMessage::VisualizeRequest {
+            session_id: "vis-rt".into(),
+            topic: "data pipeline".into(),
+            relay_url: Some("https://relay.example.com".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"visualizeRequest""#));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VisualizeRequest { session_id, topic, relay_url } = parsed {
+            assert_eq!(session_id, "vis-rt");
+            assert_eq!(topic, "data pipeline");
+            assert_eq!(relay_url.as_deref(), Some("https://relay.example.com"));
+        } else {
+            panic!("expected VisualizeRequest");
+        }
+    }
+
+    #[test]
+    fn visualize_result_serialize() {
+        let msg = AstationMessage::VisualizeResult {
+            session_id: "vis-1".into(),
+            success: true,
+            message: "Diagram generated".into(),
+            file_path: Some("/home/user/.agent/diagrams/webrtc.html".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"visualizeResult""#));
+        assert!(json.contains(r#""success":true"#));
+        assert!(json.contains("webrtc.html"));
+    }
+
+    #[test]
+    fn visualize_result_without_file_path() {
+        let msg = AstationMessage::VisualizeResult {
+            session_id: "vis-2".into(),
+            success: false,
+            message: "No HTML detected".into(),
+            file_path: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("file_path"));
+    }
+
+    #[test]
+    fn visualize_result_roundtrip() {
+        let msg = AstationMessage::VisualizeResult {
+            session_id: "vis-rt".into(),
+            success: true,
+            message: "OK".into(),
+            file_path: Some("/tmp/diagram.html".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VisualizeResult { session_id, success, message, file_path } = parsed {
+            assert_eq!(session_id, "vis-rt");
+            assert!(success);
+            assert_eq!(message, "OK");
+            assert_eq!(file_path.as_deref(), Some("/tmp/diagram.html"));
+        } else {
+            panic!("expected VisualizeResult");
+        }
+    }
+
+    #[test]
+    fn visualize_request_wire_format() {
+        // Verify exact wire format matches what Astation Swift would send
+        let json = r#"{"type":"visualizeRequest","data":{"session_id":"v1","topic":"WebRTC","relay_url":"https://relay.test"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VisualizeRequest { session_id, topic, relay_url } = msg {
+            assert_eq!(session_id, "v1");
+            assert_eq!(topic, "WebRTC");
+            assert_eq!(relay_url.as_deref(), Some("https://relay.test"));
+        } else {
+            panic!("expected VisualizeRequest");
+        }
+    }
+
+    #[test]
+    fn visualize_result_wire_format() {
+        // Verify exact wire format matches what Atem Rust sends
+        let json = r#"{"type":"visualizeResult","data":{"session_id":"v1","success":true,"message":"ok","file_path":"/tmp/x.html"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        if let AstationMessage::VisualizeResult { session_id, success, message, file_path } = msg {
+            assert_eq!(session_id, "v1");
+            assert!(success);
+            assert_eq!(message, "ok");
+            assert_eq!(file_path.as_deref(), Some("/tmp/x.html"));
+        } else {
+            panic!("expected VisualizeResult");
+        }
+    }
+
+    #[test]
+    fn visualize_request_special_characters() {
+        let msg = AstationMessage::VisualizeRequest {
+            session_id: "vis-special".into(),
+            topic: "design with \"quotes\" & <tags> 100%".into(),
+            relay_url: Some("https://relay.test/path?a=1&b=2".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VisualizeRequest { topic, relay_url, .. } = parsed {
+            assert!(topic.contains("\"quotes\""));
+            assert!(topic.contains("<tags>"));
+            assert!(topic.contains("100%"));
+            assert!(relay_url.unwrap().contains("a=1&b=2"));
+        } else {
+            panic!("expected VisualizeRequest");
+        }
+    }
+
+    #[test]
+    fn visualize_result_failure_case() {
+        let msg = AstationMessage::VisualizeResult {
+            session_id: "vis-fail".into(),
+            success: false,
+            message: "No HTML diagram file was detected".into(),
+            file_path: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        if let AstationMessage::VisualizeResult { success, message, file_path, .. } = parsed {
+            assert!(!success);
+            assert!(message.contains("No HTML"));
+            assert!(file_path.is_none());
+        } else {
+            panic!("expected VisualizeResult");
         }
     }
 

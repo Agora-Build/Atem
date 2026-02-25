@@ -113,7 +113,7 @@ Uses `.statusUpdate` internally for compatibility.
    - ✅ Waits up to 5 minutes for approval
    - ✅ Saves session credentials on success
 
-**See `CLIENT_AUTH_COMPLETE.md` for full details.**
+**See `designs/session-auth.md` (this file) for full details.**
 
 ### ⚠️ TODO: Relay Server
 
@@ -240,7 +240,7 @@ Activity on Machine B doesn't affect Machine C.
 - ✅ `src/auth.rs` - Session model + 8 new tests
 - ✅ `src/app.rs` - Session refresh on connection/messages
 - ✅ `config.example.toml` - VPN + relay examples
-- ✅ `CONNECTION_PRIORITY.md` - Architecture docs
+- ✅ `designs/connection-priority.md` - Architecture docs
 
 ### Astation
 - ✅ `Sources/Menubar/SessionStore.swift` - NEW FILE (session storage)
@@ -250,8 +250,8 @@ Activity on Machine B doesn't affect Machine C.
 - ✅ `Sources/Menubar/SettingsWindowController.swift` - Show network IPs
 
 ### Documentation
-- ✅ `SESSION_AUTH_IMPLEMENTATION.md` - THIS FILE
-- ✅ `CONNECTION_PRIORITY.md` - Updated with VPN support
+- ✅ `designs/session-auth.md` - THIS FILE
+- ✅ `designs/connection-priority.md` - Updated with VPN support
 
 ## Compilation Status
 

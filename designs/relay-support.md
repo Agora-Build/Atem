@@ -127,7 +127,7 @@ With the new configuration, Atem tries connections in this order:
 - `src/config.rs`: Added `astation_relay_code` field + env var support
 - `src/app.rs`: Updated relay connection to use astation_id as code
 - `config.example.toml`: Documented new config option
-- `RELAY_COMPLETE.md`: This file
+- `designs/relay-support.md`: This file
 
 **Astation:**
 - `AstationWebSocketServer.swift`: Handles session verification requests

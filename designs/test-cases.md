@@ -526,11 +526,69 @@ Nice to Have:
 
 ---
 
-## 🔧 Test Automation (Future)
+## Quick Validation Checklist
+
+Fast 5-minute validation for release testing.
+
+### Pre-Test Setup (1 min)
+
+```bash
+cd ~/Dev/Agora.Build/Atem
+git pull && cargo build --release
+
+cd ~/Dev/Agora.Build/Astation
+git pull && swift build --release
+
+# Clean slate:
+rm ~/.config/atem/session.json ~/.config/atem/config.toml
+```
+
+### Test 1: First Connection + Save Credentials
+```bash
+./target/release/atem
+```
+- [ ] Pairing dialog appears on Mac
+- [ ] Click "Allow" → "Connected to Astation"
+- [ ] Credential save prompt appears → press 'y'
+- [ ] Projects load in "List Agora Projects"
+
+### Test 2: Session Reuse (No Re-Pairing)
+```bash
+# Quit Atem (press 'q'), relaunch
+./target/release/atem
+```
+- [ ] NO pairing dialog (connects immediately)
+- [ ] NO credential prompt (already saved)
+- [ ] Projects load immediately
+
+### Test 3: Multiple Instances
+```bash
+./target/release/atem &  # Terminal 1
+./target/release/atem &  # Terminal 2
+```
+- [ ] Astation shows "2 online" clients
+- [ ] Quit one → immediately shows "1 online" (no OFFLINE)
+
+### Test 4: Temporary Credentials (Don't Save)
+```bash
+rm ~/.config/atem/config.toml
+./target/release/atem
+```
+- [ ] Reconnects (uses session, no re-pairing)
+- [ ] Press 'n' at credential prompt → credentials work in-memory
+- [ ] Quit + relaunch → prompt appears again
+
+### Pass Criteria
+
+**ALL 4 tests PASS** = Ready to ship
+
+---
+
+## Test Automation (Future)
 
 These test cases can be automated using:
 - Rust integration tests
 - Swift XCTest for Astation
 - GitHub Actions CI/CD
 
-Current: Manual testing required ✓
+Current: Manual testing required

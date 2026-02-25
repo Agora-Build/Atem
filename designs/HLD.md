@@ -106,10 +106,16 @@ High-Level Architecture
 │                                                                           │ │
 │  ┌───────────────────────────────────────────────────────────────────────┘ │
 │  │                                                                         │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                     │
-│  │  │   Codex    │  │   Claude    │  │  AI Client  │                      │
-│  │  │  (PTY)     │  │   (PTY)     │  │ (HTTP API)  │                      │
-│  │  └─────────────┘  └─────────────┘  └─────────────┘                     │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐   │
+│  │  │   Codex    │  │   Claude    │  │  AI Client  │  │  ACP Client  │   │
+│  │  │  (PTY)     │  │   (PTY)     │  │ (HTTP API)  │  │  (JSON-RPC)  │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └──────┬───────┘   │
+│  │                                                              │          │
+│  │                                                   ┌──────────▼───────┐  │
+│  │                                                   │ Agent Visualize  │  │
+│  │                                                   │ (diagram gen +   │  │
+│  │                                                   │  browser open)   │  │
+│  │                                                   └──────────────────┘  │
 │  │                                                                         │
 └──┴─────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -135,6 +141,21 @@ High-Level Architecture
 | Native FFI | libc + C++17 | Agora RTM SDK integration |
 | Configuration | toml + dirs | Config file management |
 | Line Editing | rustyline | REPL with history |
+| ACP | tokio-tungstenite + serde_json | JSON-RPC 2.0 agent protocol |
+| Agent Detection | glob | Lockfile scanning for running agents |
+
+Agent Visualization
+
+`atem agent visualize` delegates to a running ACP agent to generate self-contained HTML diagrams. The flow:
+1. Auto-detect a running agent (lockfile scan > port scan) or use an explicit `--url`
+2. Connect via ACP WebSocket, initialize, create session
+3. Snapshot `~/.agent/diagrams/` directory (list .html files + timestamps)
+4. Send a visualization prompt to the agent
+5. Monitor ACP events: detect `Write` tool calls targeting `.html` files
+6. On completion, fall back to filesystem diff if ToolCall detection missed the file
+7. Open the generated HTML in the default browser
+
+In TUI mode, Astation can trigger visualization via `visualizeRequest` / `visualizeResult` WebSocket messages, with completion detected by 3 seconds of PTY output inactivity.
 
 Future Considerations
 Add plugin architecture for community extensions.

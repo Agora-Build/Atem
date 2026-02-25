@@ -18,6 +18,13 @@ src/
 ├── claude_client.rs     # Claude PTY subprocess
 ├── ai_client.rs         # Claude API for NLU
 ├── repl.rs              # Interactive shell
+├── acp_client.rs        # ACP JSON-RPC 2.0 over WebSocket
+├── agent_client.rs      # Agent event types and PTY client
+├── agent_detector.rs    # Lockfile scan + ACP port probe
+├── agent_registry.rs    # Registry of known agents
+├── agent_visualize.rs   # Diagram generation via ACP agents
+├── command.rs           # Task queue and stream buffer
+├── dispatch.rs          # Work item dispatcher
 └── tui/
     ├── mod.rs           # TUI event loop
     ├── draw.rs          # Ratatui rendering
@@ -389,6 +396,82 @@ loop {
 
 ---
 
+### 10. ACP Client (`acp_client.rs`)
+
+**Purpose**: JSON-RPC 2.0 over WebSocket for communicating with ACP agents.
+
+**Key Types**:
+```rust
+pub struct AcpClient {
+    url: String,
+    next_id: u64,
+    session_id: Option<String>,
+    sender: Option<mpsc::UnboundedSender<String>>,
+    frame_rx: Option<mpsc::UnboundedReceiver<String>>,
+    pending_events: VecDeque<String>,
+}
+```
+
+**Lifecycle**:
+```
+1. AcpClient::connect(url) — WebSocket handshake
+2. client.initialize() — JSON-RPC initialize, returns AcpServerInfo
+3. client.new_session() — creates session, stores session_id
+4. client.send_prompt(text) — fire-and-forget into session
+5. client.try_recv_event() / drain_events() — poll streaming events
+```
+
+---
+
+### 11. Agent Detection (`agent_detector.rs`)
+
+**Purpose**: Discover running ACP agents via lockfile scanning and port probing.
+
+**Detection Strategies**:
+```
+1. Lockfile scan: ~/.claude/*.lock, ~/.codex/*.lock → parse {port, pid} JSON
+2. Port scan: ws://127.0.0.1:8765-8770 → ACP initialize probe (500ms timeout)
+```
+
+---
+
+### 12. Agent Visualize (`agent_visualize.rs`)
+
+**Purpose**: Generate visual HTML diagrams by delegating to ACP agents.
+
+**Key Functions**:
+```rust
+pub fn diagrams_dir() -> PathBuf                              // ~/.agent/diagrams/
+pub fn build_visualize_prompt(topic: &str) -> String          // Prompt for HTML generation
+pub fn snapshot_diagrams_dir() -> HashMap<PathBuf, SystemTime> // Pre-snapshot .html files
+pub fn detect_new_html_files(pre: &HashMap<...>) -> Vec<String> // Diff: new/modified, newest-first
+pub async fn resolve_agent_url(explicit: Option<String>) -> Result<String> // Auto-detect agent
+pub fn open_html_in_browser(path: &str)                       // Platform-conditional browser open
+```
+
+**File Detection Strategy**:
+```
+Primary:   ACP ToolCall { name: "Write", input.file_path: "...html" }
+Fallback:  Filesystem snapshot diff (before vs after prompt completion)
+```
+
+**TUI Integration** (`app.rs`):
+```rust
+pub struct PendingVisualize {
+    pub session_id: String,
+    pub relay_url: Option<String>,
+    pub sent_at: Instant,
+    pub pre_snapshot: HashMap<PathBuf, SystemTime>,
+    pub detected_file: Option<String>,
+    pub output_snapshot_len: usize,
+    pub last_output_at: Instant,
+}
+```
+
+Completion detected by 3 seconds of PTY output inactivity.
+
+---
+
 ## Native FFI Layer
 
 ### Header (`native/include/atem_rtm.h`)
@@ -515,11 +598,16 @@ pub fn connect(&mut self) -> Result<()> {
 | Module | Test Type | Coverage |
 |--------|-----------|----------|
 | `token.rs` | Unit | Roundtrip encoding, privilege levels, expiration |
-| `websocket_client.rs` | Unit | Message serialization (40+ tests) |
+| `websocket_client.rs` | Unit | Message serialization (60+ tests incl. visualize) |
 | `config.rs` | Unit | TOML parsing, env overrides, defaults |
 | `auth.rs` | Unit | OTP generation, deep link formatting |
 | `time_sync.rs` | Unit | Offset calculation, caching |
 | `rtm_client.rs` | Integration | FFI with stub implementation |
+| `acp_client.rs` | Unit + Integration | JSON-RPC builders, parsers, mock WS server |
+| `agent_detector.rs` | Unit + Integration | Lockfile parsing, port scan, probe result |
+| `agent_visualize.rs` | Unit | Prompt format, snapshot diff, file detection, URL resolution |
+| `cli.rs` | Unit | CLI parsing (all agent visualize variants) |
+| `app.rs` | Unit | PendingVisualize struct construction and clone |
 
 Run all tests:
 ```bash

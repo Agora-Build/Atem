@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Atem is an AI development terminal for Agora.io platforms. It provides a TUI (terminal user interface) with multiple modes: Claude Code integration, token generation, mark task execution, and RTM signaling for voice-driven coding workflows.
+Atem is a development terminal that connects human developers, Agora platform, and AI agents. It provides a CLI and TUI for managing Agora projects and tokens, routing tasks between Astation and AI coding agents (Claude Code, Codex), generating visual diagrams, voice-driven coding, and more.
 
 Distributed via npm: `npm install -g @agora-build/atem`
 
@@ -15,7 +15,7 @@ cargo build                              # Debug build
 cargo build --release                    # Release build
 cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
-cargo test                               # Run tests (124 tests)
+cargo test                               # Run tests (377+ tests)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
@@ -41,6 +41,13 @@ src/
 ├── auth.rs              # Auth session management, deep link flow
 ├── config.rs            # TOML config + env var loading (AtemConfig)
 ├── time_sync.rs         # HTTP Date-based time synchronization
+├── acp_client.rs        # ACP (Agent Communication Protocol) JSON-RPC 2.0 over WebSocket
+├── agent_client.rs      # Agent event types (TextDelta, ToolCall, Done, etc.) and PTY client
+├── agent_detector.rs    # Lockfile scan + ACP port probe for running agents
+├── agent_registry.rs    # Registry of all known agents (PTY + ACP)
+├── agent_visualize.rs   # Diagram generation: prompt builder, fs snapshot/diff, browser opener
+├── command.rs           # Task queue and stream buffer for voice commands
+├── dispatch.rs          # Work item dispatcher for mark tasks
 └── tui/
     ├── mod.rs           # Main event loop, rendering dispatch
     └── voice_fx.rs      # Voice activity visual effects
@@ -56,7 +63,17 @@ designs/
 ├── HLD.md               # High-level design
 ├── LLD.md               # Low-level design
 ├── roadmap.md           # Project roadmap
-└── data-flow-between-atem-and-astation.md  # Voice coding architecture
+├── agent-visualize.md   # Agent diagram generation
+├── credential-flow.md   # Credential encryption architecture
+├── session-auth.md      # Session-based pairing authentication
+├── universal-sessions.md # Universal sessions (astation_id keying)
+├── connection-priority.md # Connection cascade: local > relay
+├── relay-support.md     # Relay server support
+├── voice-coding-stages.md # Voice coding implementation stages
+├── validation-week0.md  # ConvoAI validation testing
+├── test-cases.md        # Manual release test cases
+├── data-flow-between-atem-and-astation.md  # Voice coding architecture
+└── codex-launcher-design.md  # Codex launcher design
 ```
 
 ### Core Components
@@ -84,11 +101,20 @@ Key methods:
 **Astation Integration** (`websocket_client.rs`): WebSocket protocol with `AstationMessage` enum:
 - `MarkTaskAssignment { task_id }` - received from Astation
 - `MarkTaskResult { task_id, success, message }` - sent back to Astation
-- Also: project lists, token requests, voice/video toggle, heartbeat, auth flow
+- `VoiceRequest { session_id, accumulated_text, relay_url }` - voice coding from Astation
+- `VisualizeRequest { session_id, topic, relay_url? }` - diagram generation from Astation
+- `VisualizeResult { session_id, success, message, file_path? }` - sent back to Astation
+- Also: project lists, token requests, voice/video toggle, heartbeat, auth flow, credential sync
 
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
 **RTM Signaling** (`rtm_client.rs`): FFI wrapper for native C RTM client with async Tokio channels. Default build uses a stub; enable `real_rtm` feature for Agora SDK.
+
+**ACP Client** (`acp_client.rs`): JSON-RPC 2.0 over WebSocket for communicating with ACP agents (Claude Code, Codex). Manages initialize handshake, session creation, prompt sending, and event polling.
+
+**Agent Detection** (`agent_detector.rs`): Discovers running agents by scanning lockfiles (`~/.claude/*.lock`, `~/.codex/*.lock`) and probing common ACP ports (8765-8770).
+
+**Agent Visualize** (`agent_visualize.rs`): Generates visual HTML diagrams via ACP agents. Snapshots `~/.agent/diagrams/` before sending a prompt, detects new HTML files via ToolCall events or filesystem diff, and opens results in the browser. Used by both CLI (`atem agent visualize`) and TUI (Astation `visualizeRequest`).
 
 ### Native FFI Layer
 
