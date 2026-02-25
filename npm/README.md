@@ -1,6 +1,6 @@
 # @agora-build/atem
 
-A development terminal that connects human developers, Agora platform, and AI agents. Manage Agora projects and tokens, route tasks between [Astation](https://github.com/Agora-Build/Astation) and AI coding agents, generate diagrams, drive voice-powered coding workflows, and more -- all from a single CLI/TUI.
+A terminal that connects people, Agora platform, and AI agents. Manage Agora projects and tokens, route tasks between [Astation](https://github.com/Agora-Build/Astation) and AI coding agents, generate diagrams, drive voice-powered coding workflows, and more -- all from a single CLI/TUI.
 
 ## Install
 
@@ -73,6 +73,9 @@ atem agent visualize "topic" --no-browser               # Skip opening browser
 atem serv rtc                           # Launch browser-based RTC test page (HTTPS)
 atem serv rtc --channel test --port 8443
 atem serv rtc --background              # Run as background daemon
+atem serv diagrams                      # Host diagrams from SQLite (HTTP)
+atem serv diagrams --port 9000          # Custom port (default: 8787)
+atem serv diagrams --background         # Run as background daemon
 atem serv list                          # List running background servers
 atem serv kill <ID>                     # Kill a background server
 atem serv killall                       # Kill all background servers
@@ -100,8 +103,7 @@ Credentials are encrypted at rest using AES-256-GCM with a machine-bound key.
 
 ```
 Priority: Astation sync (live) > env vars > encrypted store
-Storage:  ~/.config/atem/credentials.enc (Linux)
-          ~/Library/Application Support/atem/credentials.enc (macOS)
+Storage:  ~/.config/atem/credentials.enc
 ```
 
 ### Via Astation (recommended)

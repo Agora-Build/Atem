@@ -1,7 +1,7 @@
 {
   "name": "@agora-build/atem",
-  "version": "0.4.59",
-  "description": "Agora AI development terminal — TUI for managing projects, Claude Code, and eval agents",
+  "version": "0.4.60",
+  "description": "A terminal that connects people, Agora platform, and AI agents.",
   "bin": {
     "atem": "bin/atem"
   },
