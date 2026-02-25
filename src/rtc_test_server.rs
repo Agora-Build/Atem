@@ -551,7 +551,7 @@ fn build_html_page(app_id: &str, default_channel: &str) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agora RTC Test</title>
+<title>Hello, Agora RTC</title>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; }}
@@ -593,13 +593,15 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 #log div {{ padding: 1px 0; }}
 #log .error {{ color: #f85149; }}
 #log .success {{ color: #3fb950; }}
+.copy-btn {{ background: none; border: 1px solid #555; color: #8b949e; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-left: 6px; }}
+.copy-btn:hover {{ border-color: #58a6ff; color: #c9d1d9; }}
 </style>
 </head>
 <body>
 
 <div class="header">
-  <h1>Agora RTC Test</h1>
-  <span class="app-id">App ID: {app_id_display}</span>
+  <h1>Hello, Agora RTC</h1>
+  <span class="app-id">App ID: {app_id_display} <button class="copy-btn" onclick="copyText('{app_id}')">Copy</button></span>
 </div>
 
 <div class="controls">
@@ -615,9 +617,10 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 </div>
 
 <div class="token-row">
-  <label>Token</label>
+  <label>Access Token</label>
   <textarea id="tokenInput" rows="1" placeholder="Auto-generated on Join — or paste your own token here"></textarea>
   <button class="btn btn-mute" onclick="fetchToken()">Fetch</button>
+  <button class="copy-btn" onclick="copyText(document.getElementById('tokenInput').value)">Copy</button>
 </div>
 
 <div id="statsPanel" class="stats-panel"></div>
@@ -639,6 +642,12 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.22.0.js"></script>
 <script>
 const APP_ID = "{app_id}";
+function copyText(text) {{
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {{
+    log('Copied to clipboard', 'success');
+  }});
+}}
 let client = null;
 let localAudio = null;
 let localVideo = null;
@@ -746,18 +755,31 @@ async function doJoin() {{
     const joinedUid = await client.join(APP_ID, channel, token, uid || null);
     log('Joined as uid: ' + joinedUid, 'success');
 
-    // Create local tracks
-    [localAudio, localVideo] = await AgoraRTC.createMicrophoneAndCameraTracks();
-
-    // Show local video
-    const localCell = document.getElementById('localCell');
-    localCell.style.display = '';
-    localVideo.play('localVideo');
+    // Create local tracks (skip gracefully if no devices)
+    const tracks = [];
+    try {{
+      localAudio = await AgoraRTC.createMicrophoneAudioTrack();
+      tracks.push(localAudio);
+    }} catch (e) {{
+      log('No microphone found, joining without audio', 'warning');
+    }}
+    try {{
+      localVideo = await AgoraRTC.createCameraVideoTrack();
+      tracks.push(localVideo);
+      const localCell = document.getElementById('localCell');
+      localCell.style.display = '';
+      localVideo.play('localVideo');
+    }} catch (e) {{
+      log('No camera found, joining without video', 'warning');
+    }}
     document.getElementById('localLabel').textContent = 'Local (uid: ' + joinedUid + ')';
 
-    // Publish
-    await client.publish([localAudio, localVideo]);
-    log('Published local tracks', 'success');
+    if (tracks.length > 0) {{
+      await client.publish(tracks);
+      log('Published local tracks (' + tracks.length + ')', 'success');
+    }} else {{
+      log('No media devices, joined as viewer only', 'warning');
+    }}
 
     setStatus('connected', 'Connected - ' + channel);
     document.getElementById('joinBtn').style.display = 'none';
@@ -814,19 +836,48 @@ function removeRemoteVideo(uid) {{
 }}
 
 async function toggleMuteAudio() {{
-  if (!localAudio) return;
+  if (!client) return;
+  const btn = document.getElementById('muteAudioBtn');
+  if (!localAudio) {{
+    try {{
+      localAudio = await AgoraRTC.createMicrophoneAudioTrack();
+      await client.publish([localAudio]);
+      audioMuted = false;
+      btn.classList.remove('active');
+      btn.textContent = 'Mute Mic';
+      log('Microphone enabled', 'success');
+    }} catch (e) {{
+      log('Cannot access microphone: ' + e.message, 'error');
+    }}
+    return;
+  }}
   audioMuted = !audioMuted;
   await localAudio.setEnabled(!audioMuted);
-  const btn = document.getElementById('muteAudioBtn');
   btn.classList.toggle('active', audioMuted);
   btn.textContent = audioMuted ? 'Unmute Mic' : 'Mute Mic';
 }}
 
 async function toggleMuteVideo() {{
-  if (!localVideo) return;
+  if (!client) return;
+  const btn = document.getElementById('muteVideoBtn');
+  if (!localVideo) {{
+    try {{
+      localVideo = await AgoraRTC.createCameraVideoTrack();
+      await client.publish([localVideo]);
+      const localCell = document.getElementById('localCell');
+      localCell.style.display = '';
+      localVideo.play('localVideo');
+      videoMuted = false;
+      btn.classList.remove('active');
+      btn.textContent = 'Mute Cam';
+      log('Camera enabled', 'success');
+    }} catch (e) {{
+      log('Cannot access camera: ' + e.message, 'error');
+    }}
+    return;
+  }}
   videoMuted = !videoMuted;
   await localVideo.setEnabled(!videoMuted);
-  const btn = document.getElementById('muteVideoBtn');
   btn.classList.toggle('active', videoMuted);
   btn.textContent = videoMuted ? 'Unmute Cam' : 'Mute Cam';
 }}
