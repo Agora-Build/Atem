@@ -1,49 +1,16 @@
-# Atem Configuration Example
-# Copy to ~/.config/atem/config.toml and customize
+# Atem Configuration
+# Copy to ~/.config/atem/config.toml
 
-# Agora Console credentials (get from console.agora.io > RESTful API)
-customer_id = "your_customer_id_here"
-customer_secret = "your_customer_secret_here"
+# Agora credentials (console.agora.io > RESTful API)
+# Or use: atem login / env vars AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET
+# customer_id = ""
+# customer_secret = ""
 
-# RTM configuration for voice coding
-rtm_channel = "atem_channel"
-rtm_account = "atem01"
+# Astation WebSocket (local or VPN)
+# astation_ws = "ws://127.0.0.1:8080/ws"
 
-# === Astation Connection ===
+# Relay for remote connections
+# astation_relay_url = "https://station.agora.build"
 
-# Local WebSocket URL for direct Astation connection
-# Default: ws://127.0.0.1:8080/ws (same machine)
-#
-# For VPN connections (Netbird, Tailscale, ZeroTier):
-# 1. Find your Astation machine's VPN IP:
-#    - Netbird: Look in Netbird UI or run `netbird status`
-#    - Tailscale: Run `tailscale ip -4`
-#    - ZeroTier: Check ZeroTier Central or run `zerotier-cli listnetworks`
-# 2. Set astation_ws to ws://<vpn-ip>:8080/ws
-#
-# Examples:
-# astation_ws = "ws://127.0.0.1:8080/ws"          # Same machine (default)
-# astation_ws = "ws://192.168.1.5:8080/ws"        # LAN IP
-# astation_ws = "ws://100.64.0.2:8080/ws"         # Netbird IP
-# astation_ws = "ws://100.100.100.5:8080/ws"      # Tailscale IP
-# astation_ws = "ws://10.147.20.15:8080/ws"       # ZeroTier IP
-
-# Station relay URL for remote connections (fallback when local fails)
-# Use HTTP/HTTPS base URL - will be converted to ws:// or wss:// automatically
-# Examples:
-# astation_relay_url = "https://station.agora.build"    # Default
-# astation_relay_url = "http://100.117.91.44:8080"      # Custom relay server
-
-# Astation ID for relay routing (required for relay connections)
-# This is the unique identifier of your Astation instance.
-# Get it from: ~/Library/Application Support/Astation/identity.txt (on macOS)
-# With this configured, relay connections use sessions (no pairing needed after first time)
-#
-# Example:
-# astation_relay_code = "astation-abc123-def456-..."
-
-# === Connection Priority ===
-# 1. Try astation_ws (local/LAN/VPN) with session auth → seamless
-# 2. Try astation_ws direct → no auth needed for localhost
-# 3. Try relay with session auth → seamless remote (requires astation_relay_code)
-# 4. Try relay with pairing code → explicit approval required (legacy fallback)
+# Diagram hosting server
+# diagram_server_url = "http://localhost:8787"
