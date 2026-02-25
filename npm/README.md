@@ -19,8 +19,8 @@ atem                                    # Launch TUI
 ### Authentication
 
 ```bash
-atem login                              # Authenticate with Astation (OTP + deep link)
-atem login --save-credentials           # Login and auto-save Agora credentials
+atem login                              # Pair with Astation, sync credentials (interactive y/n save)
+atem login --save-credentials           # Pair and auto-save credentials (skip prompt)
 atem logout                             # Clear saved session
 ```
 

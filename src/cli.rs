@@ -41,9 +41,8 @@ async fn resolve_credentials(
             anyhow::anyhow!(
                 "No credentials found locally and could not connect to Astation ({ws_url}): {e}\n\
                 Fix options:\n\
-                1. Run `atem login` to authenticate, then `atem sync credentials`\n\
-                2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars\n\
-                3. Add customer_id / customer_secret to ~/.config/atem/config.toml"
+                1. Run `atem login` to authenticate with Astation\n\
+                2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars"
             )
         })?;
     }

@@ -7,35 +7,31 @@ Atem uses Agora customer credentials (`customer_id`, `customer_secret`) for API 
 ## Priority Chain
 
 ```
-Astation sync (live)  >  env vars  >  config.toml
-    overwrites all       bootstrap     base defaults
+Astation sync (live)  >  env vars  >  credentials.enc
+    overwrites all       bootstrap     encrypted store
 ```
 
 | Source | Lifetime | Persisted? | When used |
 |--------|----------|------------|-----------|
-| Astation sync | Until Atem exits (or saved) | In-memory; optionally to config.toml via y/n prompt | Always wins when Astation is connected |
+| Astation sync | Until Atem exits (or saved) | In-memory; optionally to `credentials.enc` via y/n prompt | Always wins when Astation is connected |
 | `AGORA_CUSTOMER_ID` / `AGORA_CUSTOMER_SECRET` env vars | Shell session | No | Before Astation connects, or standalone CLI usage |
-| `~/.config/atem/config.toml` | Permanent | Yes | Fallback when neither sync nor env vars are set |
+| `~/.config/atem/credentials.enc` | Permanent | Yes (AES-256-GCM encrypted) | Fallback when neither sync nor env vars are set |
 
 ## Credential Sources
 
-### 1. config.toml (lowest priority)
+### 1. Encrypted Store (lowest priority)
 
 ```
-~/.config/atem/config.toml
+~/.config/atem/credentials.enc    (Linux)
+~/Library/Application Support/atem/credentials.enc  (macOS)
 ```
 
-```toml
-customer_id = "abc123..."
-customer_secret = "def456..."
-```
+Binary file containing AES-256-GCM encrypted JSON with `customer_id` and `customer_secret`. Cannot be edited manually.
 
 Written by:
-- `atem config set` (interactive)
-- y/n save prompt after Astation sync
-- `atem login` save prompt
+- y/n save prompt after Astation sync (TUI or `atem login`)
 
-Loaded at startup by `AtemConfig::load()` in `config.rs`.
+Loaded at startup by `CredentialStore::load()` in `config.rs`.
 
 ### 2. Environment Variables (middle priority)
 
@@ -44,13 +40,13 @@ export AGORA_CUSTOMER_ID="abc123..."
 export AGORA_CUSTOMER_SECRET="def456..."
 ```
 
-Applied during `AtemConfig::load()` — env vars override config.toml values in the loaded struct. Used for CI, scripting, or quick override without editing config.
+Applied during `AtemConfig::load()` — env vars override `credentials.enc` values in the loaded struct. Used for CI, scripting, or quick override.
 
 ### 3. Astation Sync (highest priority)
 
 Astation pushes a `credentialSync` WebSocket message immediately when an Atem instance connects. The credentials originate from Astation's encrypted keychain (`CredentialManager` using AES-GCM).
 
-This is the **live source of truth** and overwrites whatever was loaded from env/config.
+This is the **live source of truth** and overwrites whatever was loaded from env/encrypted store.
 
 ## Data Flow
 
@@ -64,15 +60,15 @@ This is the **live source of truth** and overwrites whatever was loaded from env
     +----------------------------------------------------+
     |                    Atem                             |
     |                                                    |
-    |  config.toml ──load──> AtemConfig                  |
-    |       ^                    ^                       |
-    |       |                    |                       |
-    |  env vars ──override──>    |                       |
-    |                            |                       |
-    |  credentialSync ──overwrite─┘                      |
+    |  credentials.enc ──load──> AtemConfig              |
+    |       ^                        ^                   |
+    |       |                        |                   |
+    |  env vars ──override──>        |                   |
+    |                                |                   |
+    |  credentialSync ──overwrite────┘                   |
     |       |                                            |
     |       v                                            |
-    |  [y/n prompt] ──y──> save to config.toml           |
+    |  [y/n prompt] ──y──> save to credentials.enc       |
     |               ──n──> session-only (in-memory)      |
     +----------------------------------------------------+
 ```
@@ -84,22 +80,22 @@ This is the **live source of truth** and overwrites whatever was loaded from env
 ```
 Startup:
   AtemConfig::load()
-    ← reads config.toml
+    ← reads credentials.enc (CredentialStore)
     ← env vars override
 
 WebSocket connected:
   CredentialSync { customer_id, customer_secret }
     → self.synced_customer_id = Some(...)       # reference copy
     → self.config.customer_id = Some(...)       # active copy (overwrites all)
-    → if config.toml has credentials:
+    → if credentials already present:
         status: "Credentials synced from Astation"
     → else:
         pending_credential_save = Some(...)
         status: "Press 'y' to save, 'n' for session only"
 
 Key 'y':
-  → save to config.toml via AtemConfig::save_to_disk()
-  → clear synced_customer_id (now "from config")
+  → save to credentials.enc via AtemConfig::save_to_disk()
+  → clear synced_customer_id (now "from config file")
 
 Key 'n':
   → session-only, lost on exit
@@ -109,24 +105,23 @@ Key 'n':
 
 Two paths trigger credential sync:
 
-**`atem login` (explicit sync step):**
+**`atem login` (primary):**
 ```
 atem login
-  → authenticate with Astation
-  → "Sync Agora credentials from Astation? [Y/n]"
-  → wait for credentialSync message
-  → "Save credentials (xxxx...) to config? [Y/n]"
-    y → save to config.toml
-    n → session-only
+  → authenticate with Astation (pairing)
+  → sync credentials from Astation
+  → "Save credentials to encrypted store? [Y/n]"
+    y → save to credentials.enc
+    n → not saved
 ```
 
-**`ensure_credentials_from_astation()` (fallback for CLI commands):**
+**`resolve_credentials()` (fallback for CLI commands):**
 ```
 atem list project  (no local credentials)
   → connect to Astation WS
   → wait for credentialSync
-  → "Save credentials (xxxx...) to config? [Y/n]"
-    y → save to config.toml
+  → "Save credentials (xxxx...) to encrypted store? [Y/n]"
+    y → save to credentials.enc
     n → return credentials for this invocation only
 ```
 
@@ -149,8 +144,8 @@ The TUI main menu shows the credential source via `CredentialSource` enum (`conf
 ```
 CredentialSource::Astation   →  "🔑 Credentials: from Astation"
 CredentialSource::EnvVar     →  "🔑 Credentials: from ENV"
-CredentialSource::ConfigFile →  "🔑 Credentials: from config file"
-CredentialSource::None       →  "⚠️  No credentials — run `atem login` or set AGORA_CUSTOMER_ID"
+CredentialSource::ConfigFile →  "🔑 Credentials: from ~/.config/atem/credentials.enc"
+CredentialSource::None       →  "⚠️  No credentials — run `atem login` or set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET"
 ```
 
 The source is tracked through the full lifecycle:
@@ -184,7 +179,7 @@ Credentials are stored encrypted at `~/.config/atem/credentials.enc`, matching A
 
 **Machine-bound**: credentials cannot be transferred between machines — the AES key is derived from the hardware identity.
 
-**Migration**: if `config.toml` contains plaintext `customer_id`/`customer_secret`, they are read on load but `save_to_disk()` moves them to `credentials.enc` and removes them from `config.toml`.
+**No plaintext storage**: credentials are never written to `config.toml`. Only the encrypted `credentials.enc` file is used for persistence.
 
 ### Comparison with Astation
 

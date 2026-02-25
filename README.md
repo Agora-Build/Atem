@@ -28,8 +28,8 @@ atem                                    # Launch TUI
 ### Authentication
 
 ```bash
-atem login                              # Authenticate with Astation (OTP + deep link)
-atem login --save-credentials           # Login and auto-save Agora credentials
+atem login                              # Pair with Astation, sync credentials (interactive y/n save)
+atem login --save-credentials           # Pair and auto-save credentials (skip prompt)
 atem logout                             # Clear saved session
 ```
 
@@ -122,8 +122,9 @@ Astation captures mic audio via Agora RTC. A ConvoAI agent transcribes speech (A
 Credentials are encrypted at rest using AES-256-GCM with a machine-bound key. See `designs/credential-flow.md`.
 
 ```
-Priority: Astation sync (live) > env vars > config file
-Storage:  ~/.config/atem/credentials.enc (encrypted)
+Priority: Astation sync (live) > env vars > credentials.enc
+Storage:  ~/.config/atem/credentials.enc (Linux)
+          ~/Library/Application Support/atem/credentials.enc (macOS)
 ```
 
 ## Configuration
