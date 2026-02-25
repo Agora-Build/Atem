@@ -411,7 +411,6 @@ impl App {
             Navigation:\n\
             \u{2022} \u{2191}/\u{2193} or j/k: Navigate menu\n\
             \u{2022} Enter: Select item\n\
-            \u{2022} c: Copy mode (select/copy text)\n\
             \u{2022} b: Go back\n\
             \u{2022} q: Quit\n\n\
             Features:\n\
@@ -1850,39 +1849,6 @@ impl App {
                     "Received command: {}",
                     &command[..command.len().min(50)]
                 ));
-            }
-            AstationMessage::GenerateExplainer {
-                topic,
-                context,
-                request_id,
-            } => {
-                self.status_message = Some(format!("\u{1f5bc} Generating explainer: {}", topic));
-                match crate::visual_explainer::VisualExplainer::new() {
-                    Ok(explainer) => {
-                        match explainer.generate(&topic, context.as_deref()).await {
-                            Ok(html) => {
-                                let _ = self
-                                    .astation_client
-                                    .send_explainer_result(request_id, &topic, &html)
-                                    .await;
-                            }
-                            Err(e) => {
-                                self.status_message = Some(format!("\u{274c} Explainer failed: {}", e));
-                                let _ = self
-                                    .astation_client
-                                    .send_explainer_error(request_id, &topic, &e.to_string())
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.status_message = Some(format!("\u{274c} VisualExplainer init failed: {}", e));
-                        let _ = self
-                            .astation_client
-                            .send_explainer_error(request_id, &topic, &e.to_string())
-                            .await;
-                    }
-                }
             }
             AstationMessage::AgentListRequest => {
                 let agents = self.agent_registry.all();

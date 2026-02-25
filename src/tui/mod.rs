@@ -248,49 +248,6 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                                 app.status_message = Some(format!("\u{1f511} Using for session only ({}...)", id_preview));
                             }
                         }
-                        KeyCode::Char('c') | KeyCode::Char('C')
-                            if !ctrl
-                                && !matches!(
-                                    app.mode,
-                                    AppMode::CommandExecution
-                                ) =>
-                        {
-                            // Copy mode - just display content without leaving TUI
-                            app.show_popup = true;
-
-                            let content = match app.mode {
-                                AppMode::MainMenu => {
-                                    format!(
-                                        "\u{1f680} ATEM - Agora.io AI CLI Tool\n\nMain Menu:\n{}",
-                                        app.main_menu_items
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, item)| if i == app.selected_index {
-                                                format!("  \u{2192} {}", item)
-                                            } else {
-                                                format!("    {}", item)
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    )
-                                }
-                                _ => app.output_text.clone(),
-                            };
-
-                            app.popup_message = format!(
-                                "\u{1f4cb} COPY MODE\n\
-                                \u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\n\
-                                {}\n\
-                                \u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\n\
-                                Content displayed above. Use Ctrl+Shift+C or right-click\n\
-                                to copy from terminal. Press any key to close.",
-                                if content.is_empty() {
-                                    "No content to display".to_string()
-                                } else {
-                                    content
-                                }
-                            );
-                        }
                         KeyCode::Char('b') | KeyCode::Char('B') if !ctrl => {
                             app.mode = AppMode::MainMenu;
                             app.show_popup = false;

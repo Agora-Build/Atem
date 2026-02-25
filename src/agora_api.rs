@@ -57,16 +57,14 @@ pub async fn fetch_agora_projects() -> Result<Vec<AgoraApiProject>> {
     }
 
     // Fall back to env vars (existing behavior)
-    let customer_id = std::env::var("AGORA_CUSTOMER_ID").map_err(|_| {
-        anyhow::anyhow!(
-            "AGORA_CUSTOMER_ID not set. Run `atem login` or set as env var."
-        )
-    })?;
-    let customer_secret = std::env::var("AGORA_CUSTOMER_SECRET").map_err(|_| {
-        anyhow::anyhow!(
-            "AGORA_CUSTOMER_SECRET not set. Run `atem login` or set as env var."
-        )
-    })?;
+    let customer_id = std::env::var("AGORA_CUSTOMER_ID").ok();
+    let customer_secret = std::env::var("AGORA_CUSTOMER_SECRET").ok();
+    let (customer_id, customer_secret) = match (customer_id, customer_secret) {
+        (Some(id), Some(secret)) => (id, secret),
+        (None, None) => anyhow::bail!("No credentials found"),
+        (None, Some(_)) => anyhow::bail!("AGORA_CUSTOMER_ID not set"),
+        (Some(_), None) => anyhow::bail!("AGORA_CUSTOMER_SECRET not set"),
+    };
 
     fetch_agora_projects_with_credentials(&customer_id, &customer_secret).await
 }
@@ -176,8 +174,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("AGORA_CUSTOMER_ID"),
-            "Error should mention AGORA_CUSTOMER_ID, got: {}",
+            err_msg.contains("No credentials found"),
+            "Error should say 'No credentials found', got: {}",
             err_msg
         );
     }

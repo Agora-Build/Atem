@@ -71,12 +71,16 @@ impl AtemConfig {
         }
 
         // Env var overrides
-        if let Ok(val) = std::env::var("AGORA_CUSTOMER_ID") {
-            config.customer_id = Some(val);
+        let env_id = std::env::var("AGORA_CUSTOMER_ID").ok();
+        let env_secret = std::env::var("AGORA_CUSTOMER_SECRET").ok();
+        if env_id.is_some() || env_secret.is_some() {
+            if let Some(val) = env_id {
+                config.customer_id = Some(val);
+            }
+            if let Some(val) = env_secret {
+                config.customer_secret = Some(val);
+            }
             config.credential_source = CredentialSource::EnvVar;
-        }
-        if let Ok(val) = std::env::var("AGORA_CUSTOMER_SECRET") {
-            config.customer_secret = Some(val);
         }
         if let Ok(val) = std::env::var("ATEM_RTM_CHANNEL") {
             config.rtm_channel = Some(val);

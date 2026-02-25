@@ -55,7 +55,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
 
     // Footer
     let base_footer = match app.mode {
-        AppMode::MainMenu => "\u{2191}\u{2193}/jk: Navigate | Enter: Select | c: Copy Mode | q: Quit",
+        AppMode::MainMenu => "\u{2191}\u{2193}/jk: Navigate | Enter: Select | q: Quit",
         AppMode::CommandExecution => "Type command + Enter | b: Back | q: Quit",
         AppMode::CodexChat => "All input goes to Codex | Ctrl+B: Back to menu",
         AppMode::ClaudeChat => "All input goes to Claude | Ctrl+B: Back to menu",
@@ -105,7 +105,14 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
             format!("\u{1f511} Credentials: from Astation{}", suffix)
         }
         CredentialSource::EnvVar => {
-            "\u{1f511} Credentials: from ENV".to_string()
+            let has_id = app.config.customer_id.is_some();
+            let has_secret = app.config.customer_secret.is_some();
+            match (has_id, has_secret) {
+                (true, true) => "\u{1f511} Credentials: from ENV".to_string(),
+                (true, false) => "\u{26a0}\u{fe0f}  Credentials: from ENV, but AGORA_CUSTOMER_SECRET not set".to_string(),
+                (false, true) => "\u{26a0}\u{fe0f}  Credentials: from ENV, but AGORA_CUSTOMER_ID not set".to_string(),
+                (false, false) => "\u{26a0}\u{fe0f}  No credentials — run `atem login` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string(),
+            }
         }
         CredentialSource::ConfigFile => {
             format!("\u{1f511} Credentials: from {}", crate::config::CredentialStore::path().display())
@@ -115,10 +122,12 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
         }
     };
 
-    let cred_style = if app.config.credential_source != CredentialSource::None {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default().fg(Color::Yellow)
+    let cred_style = match &app.config.credential_source {
+        CredentialSource::None => Style::default().fg(Color::Yellow),
+        CredentialSource::EnvVar if app.config.customer_id.is_none() || app.config.customer_secret.is_none() => {
+            Style::default().fg(Color::Yellow)
+        }
+        _ => Style::default().fg(Color::Green),
     };
 
     let cred_paragraph = Paragraph::new(cred_line)

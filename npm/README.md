@@ -79,9 +79,6 @@ atem serv killall                       # Kill all background servers
 
 ```bash
 atem repl                               # Interactive REPL with AI command interpretation
-atem explain "topic"                    # Generate visual HTML explanation
-atem explain "topic" -c file.rs         # Explain with file context
-atem explain "topic" -o out.html        # Save to specific file
 ```
 
 ## TUI Modes
