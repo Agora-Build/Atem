@@ -219,7 +219,11 @@ pub enum ProjectCommands {
         app_id_or_index: String,
     },
     /// Show current active project
-    Show,
+    Show {
+        /// Show full app certificate (unmasked)
+        #[arg(long)]
+        with_certificate: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -513,12 +517,14 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 }
                 Ok(())
             }
-            ProjectCommands::Show => {
+            ProjectCommands::Show { with_certificate } => {
                 match crate::config::ActiveProject::load() {
                     Some(proj) => {
                         println!("Active project: {}", proj.name);
                         println!("App ID: {}", proj.app_id);
-                        let cert_display = if proj.app_certificate.len() > 4 {
+                        let cert_display = if with_certificate {
+                            proj.app_certificate.clone()
+                        } else if proj.app_certificate.len() > 4 {
                             format!(
                                 "{}...{}",
                                 &proj.app_certificate[..2],
@@ -988,12 +994,28 @@ mod tests {
     #[test]
     fn cli_project_show_parses() {
         let cli = Cli::try_parse_from(["atem", "project", "show"]).unwrap();
-        assert!(matches!(
-            cli.command,
+        match cli.command {
             Some(Commands::Project {
-                project_command: ProjectCommands::Show
-            })
-        ));
+                project_command: ProjectCommands::Show { with_certificate },
+            }) => {
+                assert!(!with_certificate);
+            }
+            _ => panic!("Expected Project Show command"),
+        }
+    }
+
+    #[test]
+    fn cli_project_show_with_certificate() {
+        let cli =
+            Cli::try_parse_from(["atem", "project", "show", "--with-certificate"]).unwrap();
+        match cli.command {
+            Some(Commands::Project {
+                project_command: ProjectCommands::Show { with_certificate },
+            }) => {
+                assert!(with_certificate);
+            }
+            _ => panic!("Expected Project Show command"),
+        }
     }
 
     #[test]
