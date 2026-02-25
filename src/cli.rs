@@ -136,11 +136,6 @@ pub enum Commands {
     },
     /// Clear saved authentication session
     Logout,
-    /// Sync credentials and state from the paired Astation app
-    Sync {
-        #[command(subcommand)]
-        sync_command: SyncCommands,
-    },
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {
         #[command(subcommand)]
@@ -252,11 +247,6 @@ pub enum ListCommands {
     },
 }
 
-#[derive(Subcommand)]
-pub enum SyncCommands {
-    /// Pull Agora credentials from the paired Astation app and save to config
-    Credentials,
-}
 
 #[derive(Subcommand)]
 pub enum AgentCommands {
@@ -552,31 +542,15 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 Ok(())
             }
         },
-        Commands::Sync { sync_command } => match sync_command {
-            SyncCommands::Credentials => {
-                // Force Astation WS path by using a config with no credentials set,
-                // so resolve_credentials always connects to Astation.
-                let mut cfg_no_creds = crate::config::AtemConfig::load().unwrap_or_default();
-                cfg_no_creds.customer_id = None;
-                cfg_no_creds.customer_secret = None;
-                let (cid, _) = resolve_credentials(&cfg_no_creds).await?;
-                println!(
-                    "Credentials synced (customer_id: {}...) — run `atem list project` to verify",
-                    &cid[..4.min(cid.len())]
-                );
-                Ok(())
-            }
-        },
         Commands::Repl => crate::repl::run_repl().await,
         Commands::Login { server: _, save_credentials } => {
+            use std::io::Write;
             use crate::websocket_client::AstationClient;
 
             println!("Authenticating with Astation...");
 
-            // Load config
             let config = crate::config::AtemConfig::load().unwrap_or_default();
 
-            // Connect using WebSocket (tries local first, falls back to relay)
             let mut client = AstationClient::new();
             let pairing_code = client.connect_with_pairing(&config).await?;
 
@@ -588,67 +562,61 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 println!("Check your Mac for pairing approval dialog");
             }
 
-            // Wait for successful authentication
-            // The pairing dialog approval will trigger session creation on Astation side
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            println!("Authenticated successfully!");
 
-            println!("✓ Authenticated successfully!");
+            // Sync credentials from Astation
+            println!("Syncing Agora credentials from Astation...");
 
-            // Determine whether to sync credentials: --save-credentials flag, or ask interactively.
-            let should_sync = if save_credentials {
-                true
-            } else {
-                print!("Sync Agora credentials from Astation? [Y/n] ");
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).unwrap_or(0);
-                !matches!(input.trim().to_lowercase().as_str(), "n" | "no")
-            };
-
-            if should_sync {
-                println!("Syncing Agora credentials from Astation...");
-
-                // Wait for CredentialSync message from Astation (on the existing authenticated client)
-                let timeout = tokio::time::Duration::from_secs(5);
-                let result = tokio::time::timeout(timeout, async {
-                    loop {
-                        match client.recv_message_async().await {
-                            Some(crate::websocket_client::AstationMessage::CredentialSync {
-                                customer_id,
-                                customer_secret,
-                            }) => return Some((customer_id, customer_secret)),
-                            Some(_) => continue,
-                            None => return None,
-                        }
+            let timeout = tokio::time::Duration::from_secs(5);
+            let result = tokio::time::timeout(timeout, async {
+                loop {
+                    match client.recv_message_async().await {
+                        Some(crate::websocket_client::AstationMessage::CredentialSync {
+                            customer_id,
+                            customer_secret,
+                        }) => return Some((customer_id, customer_secret)),
+                        Some(_) => continue,
+                        None => return None,
                     }
-                })
-                .await;
+                }
+            })
+            .await;
 
-                match result {
-                    Ok(Some((cid, csecret))) => {
-                        use std::io::Write;
-                        let id_preview = &cid[..4.min(cid.len())];
-                        print!("Save credentials ({}...) to config? [Y/n] ", id_preview);
+            match result {
+                Ok(Some((cid, csecret))) => {
+                    let id_preview = &cid[..4.min(cid.len())];
+                    println!("Credentials received ({}...)", id_preview);
+
+                    // --save-credentials skips the prompt
+                    let should_save = if save_credentials {
+                        true
+                    } else {
+                        print!("Save credentials to encrypted store? [Y/n] ");
                         std::io::stdout().flush().ok();
                         let mut input = String::new();
                         std::io::stdin().read_line(&mut input).unwrap_or(0);
-                        if !matches!(input.trim().to_lowercase().as_str(), "n" | "no") {
-                            let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                            cfg.customer_id = Some(cid.clone());
-                            cfg.customer_secret = Some(csecret.clone());
-                            if let Err(e) = cfg.save_to_disk() {
-                                eprintln!("Warning: could not persist credentials to config: {e}");
-                            } else {
-                                println!("✓ Credentials saved (customer_id: {}...)", id_preview);
-                            }
+                        !matches!(input.trim().to_lowercase().as_str(), "n" | "no")
+                    };
+
+                    if should_save {
+                        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                        cfg.customer_id = Some(cid);
+                        cfg.customer_secret = Some(csecret);
+                        if let Err(e) = cfg.save_to_disk() {
+                            eprintln!("Warning: could not persist credentials: {e}");
                         } else {
-                            println!("Credentials available for this session only.");
+                            println!(
+                                "Credentials saved to {}",
+                                crate::config::CredentialStore::path().display()
+                            );
                         }
+                    } else {
+                        println!("Credentials not saved.");
                     }
-                    Ok(None) => eprintln!("Warning: Astation disconnected before sending credentials"),
-                    Err(_) => eprintln!("Warning: Timed out waiting for credentials from Astation"),
                 }
+                Ok(None) => eprintln!("Warning: Astation disconnected before sending credentials"),
+                Err(_) => eprintln!("Warning: Timed out waiting for credentials from Astation"),
             }
             Ok(())
         }

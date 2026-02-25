@@ -31,7 +31,6 @@ atem                                    # Launch TUI
 atem login                              # Authenticate with Astation (OTP + deep link)
 atem login --save-credentials           # Login and auto-save Agora credentials
 atem logout                             # Clear saved session
-atem sync credentials                   # Pull Agora credentials from Astation
 ```
 
 ### Tokens
