@@ -233,7 +233,7 @@ impl AtemConfig {
             };
             lines.push(format!("Credentials: incomplete ({} not set)", missing));
         } else {
-            lines.push("Credentials: (none) — run `atem login` or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET".to_string());
+            lines.push("Credentials: (none) — run `atem pair` or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET".to_string());
         }
 
         // Show active project info

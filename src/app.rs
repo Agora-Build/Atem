@@ -46,6 +46,19 @@ pub enum AppMode {
     AgentPanel,
 }
 
+/// Actions available in the main menu. The menu is rebuilt dynamically
+/// based on whether Atem is paired with Astation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    ListProjects,
+    LaunchClaude,
+    LaunchCodex,
+    ExecuteShell,
+    AgentPanel,
+    Help,
+    Exit,
+}
+
 /// Which CLI backend is currently active for routing commands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveCli {
@@ -65,6 +78,7 @@ pub struct App {
     pub mode: AppMode,
     pub selected_index: usize,
     pub main_menu_items: Vec<String>,
+    pub menu_actions: Vec<MenuAction>,
     pub output_text: String,
     pub input_text: String,
     pub show_popup: bool,
@@ -180,18 +194,11 @@ impl App {
     pub fn new() -> Self {
         let config = crate::config::AtemConfig::load().unwrap_or_default();
         let rtm_client_id = config.rtm_account().to_string();
-        Self {
+        let mut app = Self {
             mode: AppMode::MainMenu,
             selected_index: 0,
-            main_menu_items: vec![
-                "\u{1f4cb} List Agora Projects".to_string(),
-                "\u{1f916} Launch Claude Code".to_string(),
-                "\u{1f9e0} Launch Codex".to_string(),
-                "\u{1f4bb} Execute Shell Command".to_string(),
-                "\u{1f916} Agent Panel".to_string(),
-                "\u{2753} Help".to_string(),
-                "\u{1f6aa} Exit".to_string(),
-            ],
+            main_menu_items: Vec::new(),
+            menu_actions: Vec::new(),
             output_text: String::new(),
             input_text: String::new(),
             show_popup: false,
@@ -258,7 +265,9 @@ impl App {
             pending_astation_command: None,
             pending_voice_request: None,
             pending_visualize: None,
-        }
+        };
+        app.rebuild_menu();
+        app
     }
 
     pub fn next_item(&mut self) {
@@ -285,10 +294,50 @@ impl App {
         }
     }
 
+    /// Rebuild the main menu items based on Astation connection state.
+    /// When not connected, agent-dependent items (Claude, Codex, Agent Panel)
+    /// are hidden to guide the user toward pairing first.
+    pub fn rebuild_menu(&mut self) {
+        self.menu_actions.clear();
+        self.main_menu_items.clear();
+
+        // Always available
+        self.menu_actions.push(MenuAction::ListProjects);
+        self.main_menu_items.push("\u{1f4cb} List Agora Projects".to_string());
+
+        if self.astation_connected {
+            self.menu_actions.push(MenuAction::LaunchClaude);
+            self.main_menu_items.push("\u{1f916} Launch Claude Code".to_string());
+
+            self.menu_actions.push(MenuAction::LaunchCodex);
+            self.main_menu_items.push("\u{1f9e0} Launch Codex".to_string());
+        }
+
+        self.menu_actions.push(MenuAction::ExecuteShell);
+        self.main_menu_items.push("\u{1f4bb} Execute Shell Command".to_string());
+
+        if self.astation_connected {
+            self.menu_actions.push(MenuAction::AgentPanel);
+            self.main_menu_items.push("\u{1f916} Agent Panel".to_string());
+        }
+
+        self.menu_actions.push(MenuAction::Help);
+        self.main_menu_items.push("\u{2753} Help".to_string());
+
+        self.menu_actions.push(MenuAction::Exit);
+        self.main_menu_items.push("\u{1f6aa} Exit".to_string());
+
+        // Clamp selected_index so it doesn't point past the new list
+        if self.selected_index >= self.menu_actions.len() {
+            self.selected_index = self.menu_actions.len().saturating_sub(1);
+        }
+    }
+
     pub async fn handle_selection(&mut self) -> Result<()> {
         self.status_message = None;
-        match self.selected_index {
-            0 => {
+        let action = self.menu_actions.get(self.selected_index).copied();
+        match action {
+            Some(MenuAction::ListProjects) => {
                 // List Agora Projects - Always fetch directly from Agora REST API
                 self.mode = AppMode::TokenGeneration; // Reusing this mode for project listing
                 self.output_text = "\u{1f4cb} Fetching Agora Projects...\n\n".to_string();
@@ -317,7 +366,7 @@ impl App {
                         self.cached_projects.clear();
                         self.output_text = format!(
                             "Failed to fetch Agora projects: {}\n\n\
-                            Run `atem login` or set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET\n\
+                            Run `atem pair` or set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET\n\
                             environment variables.\n\
                             Get these from https://console.agora.io -> RESTful API\n\n\
                             Press 'b' to go back to main menu",
@@ -326,7 +375,7 @@ impl App {
                     }
                 }
             }
-            1 => {
+            Some(MenuAction::LaunchClaude) => {
                 // Launch Claude Code - always launch locally from Atem (like Codex)
                 self.mode = AppMode::ClaudeChat;
                 self.active_cli = ActiveCli::Claude;
@@ -357,7 +406,7 @@ impl App {
                     }
                 }
             }
-            2 => {
+            Some(MenuAction::LaunchCodex) => {
                 // Launch Codex
                 self.mode = AppMode::CodexChat;
                 self.active_cli = ActiveCli::Codex;
@@ -388,7 +437,7 @@ impl App {
                     }
                 }
             }
-            3 => {
+            Some(MenuAction::ExecuteShell) => {
                 // Execute Shell Command
                 self.mode = AppMode::CommandExecution;
                 self.output_text = "\u{1f4bb} Shell Command Mode\n\n\
@@ -403,19 +452,18 @@ impl App {
                     .to_string();
                 self.input_text.clear();
             }
-            4 => {
+            Some(MenuAction::AgentPanel) => {
                 // Agent Panel
                 self.mode = AppMode::AgentPanel;
                 self.agent_panel_selected = 0;
             }
-            5 => {
+            Some(MenuAction::Help) => {
                 // Help
                 self.show_help_popup();
             }
-            6 => {
+            Some(MenuAction::Exit) | None => {
                 // Exit - handled by caller
             }
-            _ => {}
         }
         Ok(())
     }
@@ -1645,6 +1693,7 @@ impl App {
                     self.astation_client = client;
                     self.astation_connected = true;
                     self.pairing_code = code;
+                    self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
 
                     // Refresh session on successful connection
@@ -1675,6 +1724,7 @@ impl App {
                 Ok(code) => {
                     self.astation_connected = true;
                     self.pairing_code = Some(code);
+                    self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
                 }
                 Err(_) => {
@@ -1683,6 +1733,7 @@ impl App {
                     match self.astation_client.connect(&url).await {
                         Ok(_) => {
                             self.astation_connected = true;
+                            self.rebuild_menu();
                             self.status_message = Some("Connected to Astation".to_string());
                         }
                         Err(_) => {
@@ -1790,6 +1841,15 @@ impl App {
             }
             AstationMessage::VoiceToggle { active } => {
                 self.voice_active = active;
+                // PTT flush: when mic is released, send any buffered voice text to Claude
+                if !active && self.voice_commands.has_content() {
+                    let command = self.voice_commands.take();
+                    self.status_message = Some(format!("\u{1f3a4} PTT: {}", command));
+                    if let Err(err) = self.send_claude_prompt(&command).await {
+                        self.status_message =
+                            Some(format!("Failed to send PTT voice to Claude: {}", err));
+                    }
+                }
             }
             AstationMessage::VideoToggle { active } => {
                 self.video_active = active;
@@ -2634,5 +2694,50 @@ mod tests {
         assert_eq!(cloned.pre_snapshot.len(), 2);
         assert!(cloned.pre_snapshot.contains_key(&PathBuf::from("/tmp/a.html")));
         assert!(cloned.pre_snapshot.contains_key(&PathBuf::from("/tmp/b.html")));
+    }
+
+    // ── Dynamic menu tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_menu_disconnected_hides_agent_items() {
+        let app = App::new(); // astation_connected defaults to false
+        assert!(!app.astation_connected);
+        // Should NOT contain Claude, Codex, or Agent Panel
+        assert!(!app.menu_actions.contains(&MenuAction::LaunchClaude));
+        assert!(!app.menu_actions.contains(&MenuAction::LaunchCodex));
+        assert!(!app.menu_actions.contains(&MenuAction::AgentPanel));
+        // Should contain Projects, Shell, Help, Exit
+        assert!(app.menu_actions.contains(&MenuAction::ListProjects));
+        assert!(app.menu_actions.contains(&MenuAction::ExecuteShell));
+        assert!(app.menu_actions.contains(&MenuAction::Help));
+        assert!(app.menu_actions.contains(&MenuAction::Exit));
+        assert_eq!(app.menu_actions.len(), 4);
+        assert_eq!(app.main_menu_items.len(), 4);
+    }
+
+    #[test]
+    fn test_menu_connected_shows_all_items() {
+        let mut app = App::new();
+        app.astation_connected = true;
+        app.rebuild_menu();
+        assert!(app.menu_actions.contains(&MenuAction::LaunchClaude));
+        assert!(app.menu_actions.contains(&MenuAction::LaunchCodex));
+        assert!(app.menu_actions.contains(&MenuAction::AgentPanel));
+        assert_eq!(app.menu_actions.len(), 7);
+        assert_eq!(app.main_menu_items.len(), 7);
+    }
+
+    #[test]
+    fn test_menu_rebuild_clamps_selected_index() {
+        let mut app = App::new();
+        app.astation_connected = true;
+        app.rebuild_menu();
+        // Select last item (Exit at index 6)
+        app.selected_index = 6;
+        // Disconnect and rebuild — menu shrinks to 4 items
+        app.astation_connected = false;
+        app.rebuild_menu();
+        assert!(app.selected_index < app.menu_actions.len());
+        assert_eq!(app.selected_index, 3); // clamped to last valid index
     }
 }

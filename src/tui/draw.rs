@@ -111,14 +111,14 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
                 (true, true) => "\u{1f511} Credentials: from ENV".to_string(),
                 (true, false) => "\u{26a0}\u{fe0f}  Credentials: from ENV, but AGORA_CUSTOMER_SECRET not set".to_string(),
                 (false, true) => "\u{26a0}\u{fe0f}  Credentials: from ENV, but AGORA_CUSTOMER_ID not set".to_string(),
-                (false, false) => "\u{26a0}\u{fe0f}  No credentials — run `atem login` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string(),
+                (false, false) => "\u{26a0}\u{fe0f}  No credentials — run `atem pair` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string(),
             }
         }
         CredentialSource::ConfigFile => {
             format!("\u{1f511} Credentials: from {}", crate::config::CredentialStore::path().display())
         }
         CredentialSource::None => {
-            "\u{26a0}\u{fe0f}  No credentials — run `atem login` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string()
+            "\u{26a0}\u{fe0f}  No credentials — run `atem pair` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string()
         }
     };
 
@@ -135,16 +135,43 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
         .style(cred_style)
         .block(Block::default().borders(Borders::NONE));
 
-    // Split area: credential status bar (1 line) + menu list
+    // Pairing banner: show when not connected to Astation
+    let pairing_line = if !app.astation_connected {
+        Some("Pair with Astation to unlock Claude, Codex, and Agent features -- run: atem pair")
+    } else {
+        None
+    };
+
+    let num_status_lines = 1 + if pairing_line.is_some() { 1 } else { 0 };
+
+    // Split area: status lines + menu list
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(num_status_lines),
             Constraint::Min(0),
         ])
         .split(area);
 
-    frame.render_widget(cred_paragraph, chunks[0]);
+    if let Some(pairing_text) = pairing_line {
+        // Two status lines: credential + pairing
+        let status_chunks = ratatui::layout::Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(chunks[0]);
+
+        frame.render_widget(cred_paragraph, status_chunks[0]);
+
+        let pairing_paragraph = Paragraph::new(pairing_text)
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::NONE));
+        frame.render_widget(pairing_paragraph, status_chunks[1]);
+    } else {
+        frame.render_widget(cred_paragraph, chunks[0]);
+    }
 
     let items: Vec<ListItem> = app
         .main_menu_items
@@ -223,10 +250,15 @@ pub(crate) fn draw_command_input(frame: &mut Frame, area: ratatui::layout::Rect,
 }
 
 pub(crate) fn draw_codex_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let border_color = if app.voice_active {
+        super::voice_fx::border_color(app.voice_volume)
+    } else {
+        Color::Green
+    };
     let terminal_block = Block::default()
         .borders(Borders::ALL)
         .title("Codex Terminal [Ctrl+B: back to menu]")
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(border_color));
     let terminal_inner = terminal_block.inner(area);
     frame.render_widget(terminal_block, area);
 
@@ -311,10 +343,15 @@ pub(crate) fn draw_codex_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
 }
 
 pub(crate) fn draw_claude_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let border_color = if app.voice_active {
+        super::voice_fx::border_color(app.voice_volume)
+    } else {
+        Color::Green
+    };
     let terminal_block = Block::default()
         .borders(Borders::ALL)
         .title("Claude Terminal [Ctrl+B: back to menu]")
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(border_color));
     let terminal_inner = terminal_block.inner(area);
     frame.render_widget(terminal_block, area);
 

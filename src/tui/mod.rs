@@ -20,7 +20,7 @@ use std::io::{self, Stdout};
 use tokio::time::Duration;
 
 use crate::agora_api::format_projects;
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, MenuAction};
 use draw::draw_ui;
 
 pub async fn run_tui() -> Result<()> {
@@ -298,8 +298,7 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                                     KeyCode::Down | KeyCode::Char('j') => app.next_item(),
                                     KeyCode::Up | KeyCode::Char('k') => app.previous_item(),
                                     KeyCode::Enter => {
-                                        if app.selected_index == 6 {
-                                            // Exit
+                                        if app.menu_actions.get(app.selected_index) == Some(&MenuAction::Exit) {
                                             return Ok(());
                                         }
                                         app.handle_selection().await?;

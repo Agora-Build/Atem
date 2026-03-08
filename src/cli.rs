@@ -41,7 +41,7 @@ async fn resolve_credentials(
             anyhow::anyhow!(
                 "No credentials found locally and could not connect to Astation ({ws_url}): {e}\n\
                 Fix options:\n\
-                1. Run `atem login` to authenticate with Astation\n\
+                1. Run `atem pair` to pair with Astation\n\
                 2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars"
             )
         })?;
@@ -124,17 +124,17 @@ pub enum Commands {
     },
     /// Interactive REPL with AI-powered command interpretation
     Repl,
-    /// Authenticate with Astation (OTP + deep link pairing)
-    Login {
-        /// Astation server URL (defaults to https://station.agora.build)
+    /// Pair with Astation (local first, relay fallback) and optionally sync credentials
+    Pair {
+        /// Astation server URL override
         #[arg(long)]
         server: Option<String>,
-        /// After pairing, connect to Astation and save Agora credentials to config
-        #[arg(long)]
-        save_credentials: bool,
     },
-    /// Clear saved authentication session
-    Logout,
+    /// Manage authentication credentials
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommands,
+    },
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {
         #[command(subcommand)]
@@ -236,6 +236,14 @@ pub enum ListCommands {
     },
 }
 
+
+#[derive(Subcommand)]
+pub enum AuthCommands {
+    /// Show credential source and pairing state
+    Status,
+    /// Clear saved credentials and session
+    Clear,
+}
 
 #[derive(Subcommand)]
 pub enum AgentCommands {
@@ -560,11 +568,11 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
         },
         Commands::Repl => crate::repl::run_repl().await,
-        Commands::Login { server: _, save_credentials } => {
+        Commands::Pair { server: _ } => {
             use std::io::Write;
             use crate::websocket_client::AstationClient;
 
-            println!("Authenticating with Astation...");
+            println!("Pairing with Astation...");
 
             let config = crate::config::AtemConfig::load().unwrap_or_default();
 
@@ -572,19 +580,12 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             let pairing_code = client.connect_with_pairing(&config).await?;
 
             if pairing_code == "local" {
-                println!("Connected to local Astation!");
-                println!("Waiting for pairing approval...");
+                println!("Paired with local Astation!");
             } else {
-                println!("Connected via relay (code: {})", pairing_code);
-                println!("Check your Mac for pairing approval dialog");
+                println!("Paired via relay (code: {})", pairing_code);
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            println!("Authenticated successfully!");
-
-            // Sync credentials from Astation
-            println!("Syncing Agora credentials from Astation...");
-
+            // Wait for credential sync from Astation
             let timeout = tokio::time::Duration::from_secs(5);
             let result = tokio::time::timeout(timeout, async {
                 loop {
@@ -605,18 +606,11 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     let id_preview = &cid[..4.min(cid.len())];
                     println!("Credentials received ({}...)", id_preview);
 
-                    // --save-credentials skips the prompt
-                    let should_save = if save_credentials {
-                        true
-                    } else {
-                        print!("Save credentials to encrypted store? [Y/n] ");
-                        std::io::stdout().flush().ok();
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input).unwrap_or(0);
-                        !matches!(input.trim().to_lowercase().as_str(), "n" | "no")
-                    };
-
-                    if should_save {
+                    print!("Save credentials from Astation? [Y/n] ");
+                    std::io::stdout().flush().ok();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).unwrap_or(0);
+                    if !matches!(input.trim().to_lowercase().as_str(), "n" | "no") {
                         let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
                         cfg.customer_id = Some(cid);
                         cfg.customer_secret = Some(csecret);
@@ -632,16 +626,68 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         println!("Credentials not saved.");
                     }
                 }
-                Ok(None) => eprintln!("Warning: Astation disconnected before sending credentials"),
-                Err(_) => eprintln!("Warning: Timed out waiting for credentials from Astation"),
+                Ok(None) => println!("No credentials received (Astation disconnected)."),
+                Err(_) => println!("No credentials received (timed out). Session saved."),
             }
             Ok(())
         }
-        Commands::Logout => {
-            crate::auth::AuthSession::clear_saved()?;
-            println!("Logged out. Session cleared.");
-            Ok(())
-        }
+        Commands::Auth { auth_command } => match auth_command {
+            AuthCommands::Status => {
+                let config = crate::config::AtemConfig::load().unwrap_or_default();
+
+                // Credential source
+                use crate::config::CredentialSource;
+                let cred_display = match &config.credential_source {
+                    CredentialSource::ConfigFile => format!(
+                        "Credentials: from encrypted store ({})",
+                        crate::config::CredentialStore::path().display()
+                    ),
+                    CredentialSource::EnvVar => "Credentials: from ENV".to_string(),
+                    CredentialSource::Astation => "Credentials: from Astation".to_string(),
+                    CredentialSource::None => {
+                        "Credentials: (none) -- run 'atem pair' or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET".to_string()
+                    }
+                };
+                println!("{}", cred_display);
+
+                // Pairing state
+                let pairing_display =
+                    if let Some(session) = crate::auth::AuthSession::load_saved() {
+                        if session.is_valid() {
+                            let age = session.age_seconds();
+                            let days = age / 86400;
+                            if days > 0 {
+                                format!("Pairing: paired ({}d ago)", days)
+                            } else {
+                                "Pairing: paired (today)".to_string()
+                            }
+                        } else {
+                            "Pairing: expired -- run 'atem pair'".to_string()
+                        }
+                    } else {
+                        "Pairing: not paired -- run 'atem pair'".to_string()
+                    };
+                println!("{}", pairing_display);
+
+                Ok(())
+            }
+            AuthCommands::Clear => {
+                // Clear encrypted credentials
+                let cred_path = crate::config::CredentialStore::path();
+                if cred_path.exists() {
+                    std::fs::remove_file(&cred_path)?;
+                    println!("Credentials cleared.");
+                } else {
+                    println!("No saved credentials to clear.");
+                }
+
+                // Clear session
+                crate::auth::AuthSession::clear_saved()?;
+                println!("Session cleared.");
+
+                Ok(())
+            }
+        },
         Commands::Agent { agent_command } => match agent_command {
             AgentCommands::Launch { agent_type } => {
                 println!("Launching {} as PTY agent...", agent_type);
@@ -1084,44 +1130,48 @@ mod tests {
     }
 
     #[test]
-    fn cli_login_parses() {
-        let cli = Cli::try_parse_from(["atem", "login"]).unwrap();
+    fn cli_pair_parses() {
+        let cli = Cli::try_parse_from(["atem", "pair"]).unwrap();
         match cli.command {
-            Some(Commands::Login { server, save_credentials }) => {
+            Some(Commands::Pair { server }) => {
                 assert!(server.is_none());
-                assert!(!save_credentials);
             }
-            _ => panic!("Expected Login command"),
+            _ => panic!("Expected Pair command"),
         }
     }
 
     #[test]
-    fn cli_login_with_server_parses() {
+    fn cli_pair_with_server() {
         let cli =
-            Cli::try_parse_from(["atem", "login", "--server", "http://localhost:3000"]).unwrap();
+            Cli::try_parse_from(["atem", "pair", "--server", "http://localhost:3000"]).unwrap();
         match cli.command {
-            Some(Commands::Login { server, .. }) => {
+            Some(Commands::Pair { server }) => {
                 assert_eq!(server.as_deref(), Some("http://localhost:3000"));
             }
-            _ => panic!("Expected Login command with server"),
+            _ => panic!("Expected Pair command with server"),
         }
     }
 
     #[test]
-    fn cli_login_save_credentials_flag() {
-        let cli =
-            Cli::try_parse_from(["atem", "login", "--save-credentials"]).unwrap();
-        match cli.command {
-            Some(Commands::Login { save_credentials, .. }) => {
-                assert!(save_credentials);
-            }
-            _ => panic!("Expected Login command with save_credentials"),
-        }
+    fn cli_auth_status_parses() {
+        let cli = Cli::try_parse_from(["atem", "auth", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                auth_command: AuthCommands::Status
+            })
+        ));
     }
 
-    fn cli_logout_parses() {
-        let cli = Cli::try_parse_from(["atem", "logout"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Logout)));
+    #[test]
+    fn cli_auth_clear_parses() {
+        let cli = Cli::try_parse_from(["atem", "auth", "clear"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                auth_command: AuthCommands::Clear
+            })
+        ));
     }
 
     // ── agent command ─────────────────────────────────────────────────────
