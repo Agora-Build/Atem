@@ -777,23 +777,8 @@ impl AstationClient {
         let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
         self.connect_raw(&ws_url).await?;
 
-        // Build URLs for the user
-        let pair_url = format!("{}/pair?code={}", station_url, code);
-        let deep_link = format!("astation://pair?code={}", code);
-
-        // Print relay info
-        println!("Relay code: {}\n", code);
-        println!("  Page:      {}", pair_url);
-        println!("  Deep link: {}\n", deep_link);
-        println!("  A browser window should open. Click \"Open in Astation\" on the page.");
-        println!("  Or enter the code in Astation menu > Pair Remote Atem.\n");
-
-        // Try to open the browser (non-blocking, ignore errors)
-        let _ = crate::rtc_test_server::open_browser(&pair_url);
-
-        // In the relay flow, Astation connects and sends credentialSync directly
-        // (no auth_required challenge - the pairing code is the auth).
-        // Return here; the caller (atem pair) waits for credentialSync.
+        // Return the code — caller is responsible for any UI (println!, open_browser, etc.)
+        // so this function stays silent and TUI-safe.
         Ok(code)
     }
 

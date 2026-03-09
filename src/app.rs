@@ -1650,37 +1650,19 @@ impl App {
                 }
             }
 
-            // No valid session - try local with pairing flow (will authenticate)
+            // No valid session - try local with fresh auth (5s timeout)
             let mut client = crate::websocket_client::AstationClient::new();
-            match client.connect_with_pairing(&config).await {
-                Ok(code) => {
-                    // Successfully authenticated via pairing
-                    let _ = tx.send(Ok((client, Some(code))));
+            let local_url = config.astation_ws().to_string();
+            match client.connect(&local_url).await {
+                Ok(()) => {
+                    let _ = tx.send(Ok((client, Some("local".to_string()))));
                     return;
                 }
-                Err(_) => {
-                    // Local pairing failed, will try relay below
-                }
+                Err(_) => {}
             }
 
-            // Local failed, try relay
-            // Convert HTTP/HTTPS relay URL to WebSocket URL
-            let relay_base = config.astation_relay_url();
-            let relay_ws_url = relay_base
-                .replace("https://", "wss://")
-                .replace("http://", "ws://");
-
-            // Local failed - try relay with pairing
-            // (connect_with_pairing tries relay automatically)
-            let mut client = crate::websocket_client::AstationClient::new();
-            match client.connect_with_pairing(&config).await {
-                Ok(code) => {
-                    let _ = tx.send(Ok((client, Some(code))));
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
-            }
+            // Local unavailable — relay requires explicit `atem pair`
+            let _ = tx.send(Err(anyhow::anyhow!("Astation not reachable locally")));
         });
     }
 
@@ -1704,8 +1686,11 @@ impl App {
                     }
                 }
                 Ok(Err(_)) => {
-                    // Connection failed — stay in local mode
+                    // Local connection failed — relay requires explicit `atem pair`
                     self.astation_connect_rx = None;
+                    self.status_message = Some(
+                        "Astation not found — run 'atem pair' to connect via relay".to_string()
+                    );
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     // Still pending

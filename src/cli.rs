@@ -585,6 +585,19 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             if pairing_code == "local" {
                 println!("Paired with local Astation!");
             } else {
+                // Build and print relay URLs, then open browser
+                let relay_url = config.astation_relay_url().to_string();
+                let pair_url = format!("{}/pair?code={}", relay_url, pairing_code);
+                let deep_link = format!("astation://pair?code={}", pairing_code);
+
+                println!("Relay code: {}\n", pairing_code);
+                println!("  Page:      {}", pair_url);
+                println!("  Deep link: {}\n", deep_link);
+                println!("  A browser window should open. Click \"Open in Astation\" on the page.");
+                println!("  Or enter the code in Astation menu > Pair Remote Atem.\n");
+
+                let _ = crate::rtc_test_server::open_browser(&pair_url);
+
                 println!("Waiting for Astation to connect via relay...");
             }
 
