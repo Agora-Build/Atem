@@ -791,9 +791,9 @@ impl AstationClient {
         // Try to open the browser (non-blocking, ignore errors)
         let _ = crate::rtc_test_server::open_browser(&pair_url);
 
-        // Wait for Astation to connect via relay and send auth_required (5 min timeout)
-        self.authenticate(Duration::from_secs(300)).await?;
-
+        // In the relay flow, Astation connects and sends credentialSync directly
+        // (no auth_required challenge - the pairing code is the auth).
+        // Return here; the caller (atem pair) waits for credentialSync.
         Ok(code)
     }
 

@@ -585,11 +585,17 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             if pairing_code == "local" {
                 println!("Paired with local Astation!");
             } else {
-                println!("Paired via relay!");
+                println!("Waiting for Astation to connect via relay...");
             }
 
             // Wait for credential sync from Astation
-            let timeout = tokio::time::Duration::from_secs(5);
+            // Relay path: 5 min (user needs time to enter the code in Astation)
+            // Local path: already authenticated, credentials should arrive immediately
+            let timeout = if pairing_code == "local" {
+                tokio::time::Duration::from_secs(10)
+            } else {
+                tokio::time::Duration::from_secs(300)
+            };
             let result = tokio::time::timeout(timeout, async {
                 loop {
                     match client.recv_message_async().await {
@@ -606,6 +612,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
 
             match result {
                 Ok(Some((cid, csecret))) => {
+                    if pairing_code != "local" {
+                        println!("Paired via relay!");
+                    }
                     let id_preview = &cid[..4.min(cid.len())];
                     println!("Credentials received ({}...)", id_preview);
 
