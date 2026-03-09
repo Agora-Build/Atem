@@ -777,9 +777,19 @@ impl AstationClient {
         let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
         self.connect_raw(&ws_url).await?;
 
-        // Print code so user can enter it in Astation
-        println!("Relay code: {}", code);
-        println!("Enter this code in Astation to complete pairing...");
+        // Build URLs for the user
+        let pair_url = format!("{}/pair?code={}", station_url, code);
+        let deep_link = format!("astation://pair?code={}", code);
+
+        // Print relay info
+        println!("Relay code: {}\n", code);
+        println!("  Page:      {}", pair_url);
+        println!("  Deep link: {}\n", deep_link);
+        println!("  A browser window should open. Click \"Open in Astation\" on the page.");
+        println!("  Or enter the code in Astation menu > Pair Remote Atem.\n");
+
+        // Try to open the browser (non-blocking, ignore errors)
+        let _ = crate::rtc_test_server::open_browser(&pair_url);
 
         // Wait for Astation to connect via relay and send auth_required (5 min timeout)
         self.authenticate(Duration::from_secs(300)).await?;

@@ -568,13 +568,16 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
         },
         Commands::Repl => crate::repl::run_repl().await,
-        Commands::Pair { server: _ } => {
+        Commands::Pair { server } => {
             use std::io::Write;
             use crate::websocket_client::AstationClient;
 
             println!("Pairing with Astation...");
 
-            let config = crate::config::AtemConfig::load().unwrap_or_default();
+            let mut config = crate::config::AtemConfig::load().unwrap_or_default();
+            if let Some(url) = server {
+                config.astation_relay_url = Some(url);
+            }
 
             let mut client = AstationClient::new();
             let pairing_code = client.connect_with_pairing(&config).await?;

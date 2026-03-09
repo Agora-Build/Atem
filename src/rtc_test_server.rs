@@ -519,7 +519,7 @@ async fn send_response(
 }
 
 /// Open a URL in the default browser.
-fn open_browser(url: &str) -> Result<()> {
+pub(crate) fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(url).spawn()?;
@@ -595,6 +595,12 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 #log .success {{ color: #3fb950; }}
 .copy-btn {{ background: none; border: 1px solid #555; color: #8b949e; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-left: 6px; }}
 .copy-btn:hover {{ border-color: #58a6ff; color: #c9d1d9; }}
+.device-banner {{ margin: 8px 16px; padding: 10px 14px; border-radius: 6px; font-size: 13px; line-height: 1.5; }}
+.device-banner.warning {{ background: #2d1f00; border: 1px solid #d29922; color: #e3b341; }}
+.device-banner.info {{ background: #0d1f2d; border: 1px solid #388bfd; color: #79c0ff; }}
+.device-banner.success {{ background: #0d2818; border: 1px solid #3fb950; color: #56d364; }}
+.device-banner .grant-btn {{ background: #388bfd; color: #fff; border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-left: 8px; }}
+.device-banner .grant-btn:hover {{ background: #58a6ff; }}
 </style>
 </head>
 <body>
@@ -622,6 +628,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
   <button class="btn btn-mute" onclick="fetchToken()">Fetch</button>
   <button class="copy-btn" onclick="copyText(document.getElementById('tokenInput').value)">Copy</button>
 </div>
+
+<div id="deviceBanner" class="device-banner" style="display:none"></div>
 
 <div id="statsPanel" class="stats-panel"></div>
 
@@ -653,6 +661,80 @@ let localAudio = null;
 let localVideo = null;
 let audioMuted = false;
 let videoMuted = false;
+let creatingAudio = false;
+let creatingVideo = false;
+let hasMic = false;
+let hasCam = false;
+let permissionGranted = false;
+
+async function checkDevices() {{
+  const banner = document.getElementById('deviceBanner');
+  try {{
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    hasMic = devices.some(d => d.kind === 'audioinput' && d.deviceId);
+    hasCam = devices.some(d => d.kind === 'videoinput' && d.deviceId);
+    // If labels are empty, permission not yet granted
+    const hasLabels = devices.some(d => d.label);
+
+    if (!hasMic && !hasCam) {{
+      banner.className = 'device-banner warning';
+      banner.innerHTML = 'No microphone or camera detected. You can still join as a viewer.';
+      banner.style.display = '';
+    }} else if (!hasLabels) {{
+      banner.className = 'device-banner info';
+      banner.innerHTML = 'Microphone and camera access needed for audio/video. <button class="grant-btn" onclick="requestPermission()">Grant Access</button>';
+      banner.style.display = '';
+    }} else {{
+      const parts = [];
+      if (hasMic) parts.push('Mic');
+      if (hasCam) parts.push('Camera');
+      banner.className = 'device-banner success';
+      banner.innerHTML = parts.join(' + ') + ' ready';
+      banner.style.display = '';
+      permissionGranted = true;
+    }}
+  }} catch (e) {{
+    banner.className = 'device-banner warning';
+    banner.innerHTML = 'Cannot detect devices: ' + e.message;
+    banner.style.display = '';
+  }}
+}}
+
+async function requestPermission() {{
+  const banner = document.getElementById('deviceBanner');
+  try {{
+    const stream = await navigator.mediaDevices.getUserMedia({{ audio: true, video: true }});
+    stream.getTracks().forEach(t => t.stop());
+    permissionGranted = true;
+    await checkDevices();
+    log('Device access granted', 'success');
+  }} catch (e) {{
+    if (e.name === 'NotAllowedError') {{
+      banner.className = 'device-banner warning';
+      banner.innerHTML = 'Permission denied. Check browser settings to allow microphone/camera access.';
+      log('Device permission denied', 'error');
+    }} else if (e.name === 'NotFoundError') {{
+      // Try audio only
+      try {{
+        const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+        stream.getTracks().forEach(t => t.stop());
+        permissionGranted = true;
+        await checkDevices();
+        log('Microphone access granted (no camera)', 'success');
+      }} catch (e2) {{
+        banner.className = 'device-banner warning';
+        banner.innerHTML = 'No devices available. You can join as a viewer.';
+        log('No media devices found', 'warning');
+      }}
+    }} else {{
+      banner.className = 'device-banner warning';
+      banner.innerHTML = 'Device error: ' + e.message;
+      log('Device error: ' + e.message, 'error');
+    }}
+  }}
+}}
+
+checkDevices();
 let statsInterval = null;
 
 function log(msg, cls) {{
@@ -751,9 +833,22 @@ async function doJoin() {{
       document.getElementById('networkQuality').textContent = 'Up: ' + up + ' / Down: ' + down;
     }});
 
+    client.on('connection-state-change', (curState, prevState) => {{
+      log('Connection: ' + prevState + ' -> ' + curState);
+      if (curState === 'CONNECTED') {{
+        setStatus('connected', 'Connected - ' + channel);
+      }} else if (curState === 'RECONNECTING') {{
+        setStatus('connecting', 'Reconnecting...');
+      }} else if (curState === 'DISCONNECTED') {{
+        setStatus('disconnected', 'Disconnected');
+      }}
+    }});
+
     // Join
     const joinedUid = await client.join(APP_ID, channel, token, uid || null);
     log('Joined as uid: ' + joinedUid, 'success');
+    document.getElementById('joinBtn').style.display = 'none';
+    document.getElementById('leaveBtn').style.display = '';
 
     // Create local tracks (skip gracefully if no devices)
     const tracks = [];
@@ -780,10 +875,6 @@ async function doJoin() {{
     }} else {{
       log('No media devices, joined as viewer only', 'warning');
     }}
-
-    setStatus('connected', 'Connected - ' + channel);
-    document.getElementById('joinBtn').style.display = 'none';
-    document.getElementById('leaveBtn').style.display = '';
 
   }} catch (err) {{
     log('Error: ' + err.message, 'error');
@@ -837,8 +928,10 @@ function removeRemoteVideo(uid) {{
 
 async function toggleMuteAudio() {{
   if (!client) return;
+  if (creatingAudio) return;
   const btn = document.getElementById('muteAudioBtn');
   if (!localAudio) {{
+    creatingAudio = true;
     try {{
       localAudio = await AgoraRTC.createMicrophoneAudioTrack();
       await client.publish([localAudio]);
@@ -848,6 +941,8 @@ async function toggleMuteAudio() {{
       log('Microphone enabled', 'success');
     }} catch (e) {{
       log('Cannot access microphone: ' + e.message, 'error');
+    }} finally {{
+      creatingAudio = false;
     }}
     return;
   }}
@@ -859,8 +954,10 @@ async function toggleMuteAudio() {{
 
 async function toggleMuteVideo() {{
   if (!client) return;
+  if (creatingVideo) return;
   const btn = document.getElementById('muteVideoBtn');
   if (!localVideo) {{
+    creatingVideo = true;
     try {{
       localVideo = await AgoraRTC.createCameraVideoTrack();
       await client.publish([localVideo]);
@@ -873,6 +970,8 @@ async function toggleMuteVideo() {{
       log('Camera enabled', 'success');
     }} catch (e) {{
       log('Cannot access camera: ' + e.message, 'error');
+    }} finally {{
+      creatingVideo = false;
     }}
     return;
   }}
