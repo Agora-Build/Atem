@@ -277,7 +277,16 @@ impl AstationClient {
         self.connect(base_url).await
     }
 
+    /// Connect WebSocket and authenticate (local Astation connections).
     pub async fn connect(&mut self, url: &str) -> Result<()> {
+        self.connect_raw(url).await?;
+        self.authenticate(Duration::from_secs(5)).await?;
+        Ok(())
+    }
+
+    /// Connect WebSocket transport only, without authentication.
+    /// Used by relay flow where auth happens separately after code exchange.
+    pub async fn connect_raw(&mut self, url: &str) -> Result<()> {
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
@@ -323,18 +332,17 @@ impl AstationClient {
         self.sender = Some(msg_tx);
         self.receiver = Some(rx);
 
-        // Perform authentication handshake
-        self.authenticate().await?;
-
         Ok(())
     }
 
     /// Authenticate with Astation after WebSocket connection.
     /// Waits for auth_required, then sends session ID or pairing code.
-    async fn authenticate(&mut self) -> Result<()> {
+    /// `auth_timeout` controls how long to wait for Astation to send auth_required
+    /// (5s for local, 5 minutes for relay where user enters code manually).
+    async fn authenticate(&mut self, auth_timeout: Duration) -> Result<()> {
         // Wait for auth_required message (with timeout)
         let auth_required = tokio::time::timeout(
-            Duration::from_secs(5),
+            auth_timeout,
             self.wait_for_message(|msg| {
                 matches!(msg, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
             })
@@ -746,9 +754,7 @@ impl AstationClient {
         // 1. Try local Astation first (fast, no relay needed)
         let local_url = config.astation_ws().to_string();
         if self.connect(&local_url).await.is_ok() {
-            // Connected locally! Wait for pairing code from auth flow
-            // The code will be shown in the pairing dialog on Astation side
-            return Ok("local".to_string()); // Return dummy code - actual pairing happens via WebSocket
+            return Ok("local".to_string());
         }
 
         // 2. Local failed - fall back to relay
@@ -762,14 +768,22 @@ impl AstationClient {
         .await
         .map_err(|_| anyhow!("Relay registration timed out"))??;
 
-        // Connect to relay with the pairing code
+        // Connect WebSocket to relay (raw, no auth yet)
         let ws_scheme = if station_url.starts_with("https://") {
             station_url.replace("https://", "wss://")
         } else {
             station_url.replace("http://", "ws://")
         };
         let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
-        self.connect(&ws_url).await?;
+        self.connect_raw(&ws_url).await?;
+
+        // Print code so user can enter it in Astation
+        println!("Relay code: {}", code);
+        println!("Enter this code in Astation to complete pairing...");
+
+        // Wait for Astation to connect via relay and send auth_required (5 min timeout)
+        self.authenticate(Duration::from_secs(300)).await?;
+
         Ok(code)
     }
 

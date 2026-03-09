@@ -582,7 +582,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             if pairing_code == "local" {
                 println!("Paired with local Astation!");
             } else {
-                println!("Paired via relay (code: {})", pairing_code);
+                println!("Paired via relay!");
             }
 
             // Wait for credential sync from Astation
