@@ -54,6 +54,7 @@ async fn resolve_credentials(
                 Some(crate::websocket_client::AstationMessage::CredentialSync {
                     customer_id,
                     customer_secret,
+                    ..
                 }) => return Some((customer_id, customer_secret)),
                 Some(_) => continue,
                 None => return None,
@@ -615,7 +616,8 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         Some(crate::websocket_client::AstationMessage::CredentialSync {
                             customer_id,
                             customer_secret,
-                        }) => return Some((customer_id, customer_secret)),
+                            astation_id,
+                        }) => return Some((customer_id, customer_secret, astation_id)),
                         Some(_) => continue,
                         None => return None,
                     }
@@ -624,12 +626,25 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             .await;
 
             match result {
-                Ok(Some((cid, csecret))) => {
+                Ok(Some((cid, csecret, astation_id))) => {
                     if pairing_code != "local" {
                         println!("Paired via relay!");
                     }
                     let id_preview = &cid[..4.min(cid.len())];
                     println!("Credentials received ({}...)", id_preview);
+
+                    // Save the Astation identity so TUI can auto-reconnect via relay next time
+                    if pairing_code != "local" {
+                        if let Some(identity) = astation_id {
+                            let mut relay_cfg = crate::config::AtemConfig::load().unwrap_or_default();
+                            relay_cfg.astation_relay_code = Some(identity.clone());
+                            if let Err(e) = relay_cfg.save_to_disk() {
+                                eprintln!("Warning: could not save relay code: {e}");
+                            } else {
+                                println!("Relay code saved (TUI will auto-connect next time)");
+                            }
+                        }
+                    }
 
                     print!("Save credentials from Astation? [Y/n] ");
                     std::io::stdout().flush().ok();

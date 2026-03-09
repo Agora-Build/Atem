@@ -155,6 +155,9 @@ impl AtemConfig {
         if let Some(relay) = &self.astation_relay_url {
             table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
         }
+        if let Some(code) = &self.astation_relay_code {
+            table.insert("astation_relay_code".into(), toml::Value::String(code.clone()));
+        }
         if let Some(ds) = &self.diagram_server_url {
             table.insert("diagram_server_url".into(), toml::Value::String(ds.clone()));
         }

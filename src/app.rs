@@ -1661,8 +1661,20 @@ impl App {
                 Err(_) => {}
             }
 
-            // Local unavailable — relay requires explicit `atem pair`
-            let _ = tx.send(Err(anyhow::anyhow!("Astation not reachable locally")));
+            // Local unavailable — try relay identity if configured
+            if let Some(relay_code) = config.astation_relay_code.clone() {
+                let relay_url = config.astation_relay_url().to_string();
+                let mut relay_client = crate::websocket_client::AstationClient::new();
+                match relay_client.connect_relay_identity(&relay_url, &relay_code).await {
+                    Ok(()) => {
+                        let _ = tx.send(Ok((relay_client, Some(relay_code))));
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            let _ = tx.send(Err(anyhow::anyhow!("Astation not reachable")));
         });
     }
 
@@ -1686,10 +1698,10 @@ impl App {
                     }
                 }
                 Ok(Err(_)) => {
-                    // Local connection failed — relay requires explicit `atem pair`
+                    // Connection failed — relay requires explicit `atem pair` first
                     self.astation_connect_rx = None;
                     self.status_message = Some(
-                        "Astation not found — run 'atem pair' to connect via relay".to_string()
+                        "Astation not found — run 'atem pair' to connect".to_string()
                     );
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -1976,6 +1988,7 @@ impl App {
             AstationMessage::CredentialSync {
                 customer_id,
                 customer_secret,
+                ..
             } => {
                 let id_preview = customer_id[..4.min(customer_id.len())].to_string();
 

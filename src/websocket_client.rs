@@ -226,6 +226,9 @@ pub enum AstationMessage {
         customer_id: String,
         #[serde(rename = "customer_secret")]
         customer_secret: String,
+        /// Astation's persistent identity ID — store as astation_relay_code for future TUI auto-connect.
+        #[serde(rename = "astation_id", default)]
+        astation_id: Option<String>,
     },
 
 }
@@ -780,6 +783,38 @@ impl AstationClient {
         // Return the code — caller is responsible for any UI (println!, open_browser, etc.)
         // so this function stays silent and TUI-safe.
         Ok(code)
+    }
+
+    /// Connect to Astation's persistent identity relay room for TUI auto-reconnect.
+    ///
+    /// Astation registers its identity UUID as a permanent relay room on startup.
+    /// After `atem pair`, Atem stores the identity as `astation_relay_code` in config.
+    /// The TUI calls this to auto-connect without a new `atem pair`.
+    ///
+    /// Flow: connect_raw → send "hello" → Astation calls addClient → sends credentialSync.
+    pub async fn connect_relay_identity(&mut self, relay_url: &str, identity_code: &str) -> Result<()> {
+        let ws_scheme = if relay_url.starts_with("https://") {
+            relay_url.replace("https://", "wss://")
+        } else {
+            relay_url.replace("http://", "ws://")
+        };
+        let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, identity_code);
+        self.connect_raw(&ws_url).await?;
+
+        // Send hello to announce ourselves and trigger Astation to send credentials
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let mut hello_data = std::collections::HashMap::new();
+        hello_data.insert("hostname".to_string(), hostname);
+
+        self.send_message(AstationMessage::StatusUpdate {
+            status: "hello".to_string(),
+            data: hello_data,
+        }).await?;
+
+        Ok(())
     }
 
     /// Register with the relay service and get a pairing code.
@@ -1633,6 +1668,7 @@ mod tests {
         let msg = AstationMessage::CredentialSync {
             customer_id: "cid_abc123".into(),
             customer_secret: "csec_xyz789".into(),
+            astation_id: Some("astation-test-uuid".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"credentialSync""#));
@@ -1642,10 +1678,12 @@ mod tests {
         if let AstationMessage::CredentialSync {
             customer_id,
             customer_secret,
+            astation_id,
         } = parsed
         {
             assert_eq!(customer_id, "cid_abc123");
             assert_eq!(customer_secret, "csec_xyz789");
+            assert_eq!(astation_id, Some("astation-test-uuid".into()));
         } else {
             panic!("expected CredentialSync");
         }
@@ -1653,15 +1691,18 @@ mod tests {
 
     #[test]
     fn credential_sync_deserialize_from_json() {
+        // Old messages without astation_id should still parse (astation_id defaults to None)
         let json = r#"{"type":"credentialSync","data":{"customer_id":"my_id","customer_secret":"my_secret"}}"#;
         let msg: AstationMessage = serde_json::from_str(json).unwrap();
         if let AstationMessage::CredentialSync {
             customer_id,
             customer_secret,
+            astation_id,
         } = msg
         {
             assert_eq!(customer_id, "my_id");
             assert_eq!(customer_secret, "my_secret");
+            assert_eq!(astation_id, None);
         } else {
             panic!("expected CredentialSync");
         }
