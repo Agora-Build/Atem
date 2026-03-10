@@ -816,16 +816,23 @@ impl AstationClient {
         } else {
             relay_url.replace("http://", "ws://")
         };
-        let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, identity_code);
-        self.connect_raw(&ws_url).await?;
 
-        // Send hello to announce ourselves and trigger Astation to send credentials
+        // Use hostname as atem_id so the relay can distinguish multiple Atems in the same room.
+        // Sanitize to URL-safe chars (relay does the same server-side).
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
+        let atem_id: String = hostname.chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+            .collect();
+        let atem_id = if atem_id.is_empty() { "unknown".to_string() } else { atem_id };
 
+        let ws_url = format!("{}/ws?role=atem&code={}&atem_id={}", ws_scheme, identity_code, atem_id);
+        self.connect_raw(&ws_url).await?;
+
+        // Send hello to announce ourselves and trigger Astation to send credentials
         let mut hello_data = std::collections::HashMap::new();
-        hello_data.insert("hostname".to_string(), hostname);
+        hello_data.insert("hostname".to_string(), hostname.clone());
 
         self.send_message(AstationMessage::StatusUpdate {
             status: "hello".to_string(),
