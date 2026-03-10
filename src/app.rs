@@ -152,6 +152,10 @@ pub struct App {
     pub astation_connect_rx: Option<tokio::sync::oneshot::Receiver<
         Result<(crate::websocket_client::AstationClient, Option<String>)>
     >>,
+    /// When to next retry the Astation connection.
+    /// Uses `Instant` (monotonic clock — pauses during system sleep on both Linux and macOS),
+    /// so retries only fire when the device is actively awake. No battery drain while sleeping.
+    pub astation_reconnect_at: Option<Instant>,
     /// Pending command from Astation waiting for output relay.
     pub pending_astation_command: Option<PendingAstationCommand>,
     /// Pending voice coding request waiting for Claude to finish.
@@ -262,6 +266,7 @@ impl App {
             synced_customer_secret: None,
             pending_credential_save: None,
             astation_connect_rx: None,
+            astation_reconnect_at: None,
             pending_astation_command: None,
             pending_voice_request: None,
             pending_visualize: None,
@@ -1684,6 +1689,7 @@ impl App {
             match rx.try_recv() {
                 Ok(Ok((client, code))) => {
                     self.astation_connect_rx = None;
+                    self.astation_reconnect_at = None; // Clear any pending retry
                     self.astation_client = client;
                     self.astation_connected = true;
                     self.pairing_code = code;
@@ -1698,18 +1704,24 @@ impl App {
                     }
                 }
                 Ok(Err(_)) => {
-                    // Connection failed — relay requires explicit `atem pair` first
+                    // Connection failed — schedule background retry every 30s.
+                    // Instant is monotonic and pauses during system sleep, so the timer
+                    // only counts awake time — no battery drain while the device sleeps.
                     self.astation_connect_rx = None;
+                    self.astation_reconnect_at =
+                        Some(Instant::now() + std::time::Duration::from_secs(30));
                     self.status_message = Some(
-                        "Astation not found — run 'atem pair' to connect".to_string()
+                        "Astation offline — retrying…".to_string()
                     );
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     // Still pending
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    // Task dropped without sending — treat as failure
+                    // Task dropped without sending — treat as failure, schedule retry
                     self.astation_connect_rx = None;
+                    self.astation_reconnect_at =
+                        Some(Instant::now() + std::time::Duration::from_secs(30));
                 }
             }
         }
@@ -2484,6 +2496,16 @@ impl App {
             message_count += 1;
         }
 
+        // Detect WebSocket disconnect (channel closed after draining remaining messages)
+        if self.astation_connected && self.astation_client.is_ws_closed() {
+            self.astation_connected = false;
+            self.astation_client = crate::websocket_client::AstationClient::new();
+            self.rebuild_menu();
+            // Schedule immediate reconnect attempt
+            self.astation_reconnect_at = Some(Instant::now());
+            self.status_message = Some("Astation disconnected — reconnecting…".to_string());
+        }
+
         // Refresh session activity if we received any messages
         if message_count > 0 {
             if let Some(session) = crate::auth::AuthSession::load_saved() {
@@ -2501,6 +2523,26 @@ impl App {
 
         // Check if pending visualize request has completed
         self.check_visualize_completion().await;
+    }
+
+    /// Check if it is time to retry the Astation connection.
+    ///
+    /// Uses `Instant` (monotonic clock) which pauses during system sleep on both
+    /// Linux (CLOCK_MONOTONIC) and macOS (mach_absolute_time / CLOCK_UPTIME_RAW).
+    /// This means the retry timer only counts awake time — no battery drain while
+    /// the device is suspended, and no OS wake lock is held.
+    pub fn check_astation_reconnect(&mut self) {
+        if self.astation_connected || self.astation_connect_rx.is_some() {
+            // Already connected or a connect attempt is already in flight — clear retry
+            self.astation_reconnect_at = None;
+            return;
+        }
+        if let Some(reconnect_at) = self.astation_reconnect_at {
+            if Instant::now() >= reconnect_at {
+                self.astation_reconnect_at = None;
+                self.spawn_astation_connect();
+            }
+        }
     }
 }
 

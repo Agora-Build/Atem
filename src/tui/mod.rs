@@ -56,7 +56,10 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
         // Check if background Astation connection has completed
         app.poll_astation_connect();
 
-        // Process any pending Astation messages
+        // Check if a reconnect retry timer has elapsed (fires only while awake)
+        app.check_astation_reconnect();
+
+        // Process any pending Astation messages (also detects WS disconnect)
         app.process_astation_messages().await;
         app.process_codex_output();
         app.process_claude_output();

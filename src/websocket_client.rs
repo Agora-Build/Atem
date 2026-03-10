@@ -261,6 +261,8 @@ pub struct AtemInstance {
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<AstationMessage>>,
     receiver: Option<mpsc::UnboundedReceiver<AstationMessage>>,
+    /// Set to true when the WebSocket reader task exits (connection dropped).
+    ws_closed: bool,
 }
 
 impl AstationClient {
@@ -268,6 +270,7 @@ impl AstationClient {
         Self {
             sender: None,
             receiver: None,
+            ws_closed: false,
         }
     }
 
@@ -334,6 +337,7 @@ impl AstationClient {
 
         self.sender = Some(msg_tx);
         self.receiver = Some(rx);
+        self.ws_closed = false;
 
         Ok(())
     }
@@ -534,12 +538,26 @@ impl AstationClient {
     }
 
     /// Non-blocking: returns a message if one is already queued, None otherwise.
+    /// Sets `is_ws_closed()` to true when the WebSocket channel is dropped.
     pub fn recv_message(&mut self) -> Option<AstationMessage> {
         if let Some(receiver) = &mut self.receiver {
-            receiver.try_recv().ok()
+            match receiver.try_recv() {
+                Ok(msg) => Some(msg),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.ws_closed = true;
+                    None
+                }
+            }
         } else {
             None
         }
+    }
+
+    /// Returns true if the WebSocket connection has been closed.
+    /// Detected lazily when `recv_message()` encounters a closed channel.
+    pub fn is_ws_closed(&self) -> bool {
+        self.ws_closed
     }
 
     /// Blocking: waits until a message arrives (for CLI use only, not the TUI loop).
