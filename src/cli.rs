@@ -697,13 +697,15 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                             let age = session.age_seconds();
                             let days = age / 86400;
                             if days > 0 {
-                                format!("Pairing: paired ({}d ago)", days)
+                                format!("Pairing: paired locally ({}d ago)", days)
                             } else {
-                                "Pairing: paired (today)".to_string()
+                                "Pairing: paired locally (today)".to_string()
                             }
                         } else {
-                            "Pairing: expired -- run 'atem pair'".to_string()
+                            "Pairing: local session expired -- run 'atem pair'".to_string()
                         }
+                    } else if let Some(relay_code) = &config.astation_relay_code {
+                        format!("Pairing: paired via relay ({})", &relay_code[..relay_code.len().min(12)])
                     } else {
                         "Pairing: not paired -- run 'atem pair'".to_string()
                     };
