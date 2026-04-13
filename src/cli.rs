@@ -641,7 +641,14 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                             if let Err(e) = relay_cfg.save_to_disk() {
                                 eprintln!("Warning: could not save relay code: {e}");
                             } else {
-                                println!("Relay code saved (TUI will auto-connect next time)");
+                                // Build the identity relay status URL — this is the permanent
+                                // page that shows all connected Atems after TUI auto-reconnects.
+                                // (Different from the pairing code page shown above.)
+                                let relay_base = relay_cfg.astation_relay_url().to_string();
+                                let status_url = format!("{}/pair?code={}", relay_base, identity);
+                                println!("Relay code saved. Status page (bookmark this):");
+                                println!("  {}", status_url);
+                                let _ = crate::rtc_test_server::open_browser(&status_url);
                             }
                         }
                     }

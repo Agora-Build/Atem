@@ -54,7 +54,11 @@ struct EncryptedActiveProject {
 impl AtemConfig {
     /// Load config from file + encrypted credentials + env var overrides.
     ///
-    /// Credentials come from credentials.enc (encrypted) or env vars only.
+    /// Credential resolution order (lowest → highest priority at load time):
+    ///   1. credentials.enc — encrypted store, set by `atem pair` or credential sync
+    ///   2. ENV vars (AGORA_CUSTOMER_ID/SECRET) — override encrypted store
+    ///   3. Astation sync (CredentialSource::Astation) — applied at runtime, highest priority
+    ///
     /// config.toml holds non-sensitive settings; any legacy plaintext credentials are ignored.
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
