@@ -1,98 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Resolve Agora REST credentials following the canonical priority:
-///   runtime-synced (via WS) > env vars > config file
-///
-/// For CLI commands there is no in-memory synced state, so the effective
-/// priority here is: env vars > config file > Astation WS fallback.
-///
-/// Callers inside the TUI that already have synced credentials should use
-/// them directly and not call this function.
-async fn resolve_credentials(
-    config: &crate::config::AtemConfig,
-) -> Result<(String, String)> {
-    // 1. env vars override config — AtemConfig::load() already applied env vars,
-    //    so customer_id / customer_secret already reflect env > config file.
-    if let (Some(cid), Some(csecret)) =
-        (config.customer_id.clone(), config.customer_secret.clone())
-    {
-        return Ok((cid, csecret));
-    }
-
-    // 2. No local credentials — try Astation WS (receives credentialSync on connect).
-    let ws_url = config.astation_ws().to_string();
-    let mut client = crate::websocket_client::AstationClient::new();
-
-    // Try session-based connection first if we have a valid saved session
-    let connected = if let Some(session) = crate::auth::AuthSession::load_saved() {
-        if session.is_valid() {
-            client.connect_with_session(&ws_url, &session.session_id).await.is_ok()
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // Fall back to direct connection if session auth failed
-    if !connected {
-        client.connect(&ws_url).await.map_err(|e| {
-            anyhow::anyhow!(
-                "No credentials found locally and could not connect to Astation ({ws_url}): {e}\n\
-                Fix options:\n\
-                1. Run `atem pair` to pair with Astation\n\
-                2. Set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET env vars"
-            )
-        })?;
-    }
-
-    let timeout = tokio::time::Duration::from_secs(5);
-    let result = tokio::time::timeout(timeout, async {
-        loop {
-            match client.recv_message_async().await {
-                Some(crate::websocket_client::AstationMessage::CredentialSync {
-                    customer_id,
-                    customer_secret,
-                    ..
-                }) => return Some((customer_id, customer_secret)),
-                Some(_) => continue,
-                None => return None,
-            }
-        }
-    })
-    .await;
-
-    let (cid, csecret) = result
-        .map_err(|_| anyhow::anyhow!("Timed out waiting for credentials from Astation"))?
-        .ok_or_else(|| anyhow::anyhow!("Astation disconnected before sending credentials"))?;
-
-    // Ask whether to persist to config.toml
-    let id_preview = &cid[..4.min(cid.len())];
-    print!("Save credentials ({}...) to config? [Y/n] ", id_preview);
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap_or(0);
-    if !matches!(input.trim().to_lowercase().as_str(), "n" | "no") {
-        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
-        cfg.customer_id = Some(cid.clone());
-        cfg.customer_secret = Some(csecret.clone());
-        if let Err(e) = cfg.save_to_disk() {
-            eprintln!("Warning: could not persist credentials to config: {e}");
-        } else {
-            println!(
-                "Credentials saved to {}",
-                crate::config::AtemConfig::config_path().display()
-            );
-        }
-    } else {
-        println!("Credentials available for this session only.");
-    }
-
-    Ok((cid, csecret))
-}
-
 #[derive(Parser)]
 #[command(name = "atem")]
 #[command(version)]
@@ -125,17 +33,10 @@ pub enum Commands {
     },
     /// Interactive REPL with AI-powered command interpretation
     Repl,
-    /// Pair with Astation (local first, relay fallback) and optionally sync credentials
-    Pair {
-        /// Astation server URL override
-        #[arg(long)]
-        server: Option<String>,
-    },
-    /// Manage authentication credentials
-    Auth {
-        #[command(subcommand)]
-        auth_command: AuthCommands,
-    },
+    /// Log in to Agora Console via SSO (OAuth 2.0 + PKCE browser flow)
+    Login,
+    /// Log out (delete saved SSO session)
+    Logout,
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {
         #[command(subcommand)]
@@ -237,14 +138,6 @@ pub enum ListCommands {
     },
 }
 
-
-#[derive(Subcommand)]
-pub enum AuthCommands {
-    /// Show credential source and pairing state
-    Status,
-    /// Clear saved credentials and session
-    Clear,
-}
 
 #[derive(Subcommand)]
 pub enum AgentCommands {
@@ -482,7 +375,6 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         },
         Commands::Project { project_command } => match project_command {
             ProjectCommands::Use { app_id_or_index } => {
-                // If it parses as a number, treat as index into cached project list
                 if let Ok(idx) = app_id_or_index.parse::<usize>() {
                     let project = crate::config::ProjectCache::get(idx).ok_or_else(|| {
                         let hint = match crate::config::ProjectCache::load() {
@@ -495,30 +387,29 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         anyhow::anyhow!("Invalid project index {}. {}", idx, hint)
                     })?;
                     let active = crate::config::ActiveProject {
-                        app_id: project.vendor_key.clone(),
-                        app_certificate: project.sign_key.clone(),
+                        app_id: project.app_id.clone(),
+                        app_certificate: project.sign_key.clone().unwrap_or_default(),
                         name: project.name.clone(),
                     };
                     active.save()?;
-                    println!("Active project set: {} ({})", project.name, project.vendor_key);
+                    println!("Active project set: {} ({})", project.name, project.app_id);
                 } else {
-                    // Treat as App ID — fetch from API to resolve name + certificate
                     let config = crate::config::AtemConfig::load()?;
-                    let (cid, csecret) = resolve_credentials(&config).await?;
-                    let projects =
-                        crate::agora_api::fetch_agora_projects_with_credentials(&cid, &csecret).await?;
+                    let token = crate::sso_auth::valid_token(config.effective_sso_url()).await
+                        .map_err(|_| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+                    let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
                     if let Err(e) = crate::config::ProjectCache::save(&projects) {
                         eprintln!("Warning: could not cache projects: {}", e);
                     }
                     let project = projects
                         .iter()
-                        .find(|p| p.vendor_key == app_id_or_index)
+                        .find(|p| p.app_id == app_id_or_index)
                         .ok_or_else(|| {
                             anyhow::anyhow!("Project with App ID '{}' not found", app_id_or_index)
                         })?;
                     let active = crate::config::ActiveProject {
-                        app_id: project.vendor_key.clone(),
-                        app_certificate: project.sign_key.clone(),
+                        app_id: project.app_id.clone(),
+                        app_certificate: project.sign_key.clone().unwrap_or_default(),
                         name: project.name.clone(),
                     };
                     active.save()?;
@@ -556,11 +447,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::List { list_command } => match list_command {
             ListCommands::Project { show_certificates } => {
                 let config = crate::config::AtemConfig::load()?;
-                let (cid, csecret) = resolve_credentials(&config).await?;
-                let projects =
-                    crate::agora_api::fetch_agora_projects_with_credentials(&cid, &csecret)
-                        .await?;
-                // Cache for offline use (atem project use <N>)
+                let token = crate::sso_auth::valid_token(config.effective_sso_url()).await
+                    .map_err(|_| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+                let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
                 if let Err(e) = crate::config::ProjectCache::save(&projects) {
                     eprintln!("Warning: could not cache projects: {}", e);
                 }
@@ -569,174 +458,17 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
         },
         Commands::Repl => crate::repl::run_repl().await,
-        Commands::Pair { server } => {
-            use std::io::Write;
-            use crate::websocket_client::AstationClient;
-
-            println!("Pairing with Astation...");
-
-            let mut config = crate::config::AtemConfig::load().unwrap_or_default();
-            if let Some(url) = server {
-                config.astation_relay_url = Some(url);
-            }
-
-            let mut client = AstationClient::new();
-            let pairing_code = client.connect_with_pairing(&config).await?;
-
-            if pairing_code == "local" {
-                println!("Paired with local Astation!");
-            } else {
-                // Build and print relay URLs, then open browser
-                let relay_url = config.astation_relay_url().to_string();
-                let pair_url = format!("{}/pair?code={}", relay_url, pairing_code);
-                let deep_link = format!("astation://pair?code={}", pairing_code);
-
-                println!("Relay code: {}\n", pairing_code);
-                println!("  Page:      {}", pair_url);
-                println!("  Deep link: {}\n", deep_link);
-                println!("  A browser window should open. Click \"Open in Astation\" on the page.");
-                println!("  Or enter the code in Astation menu > Pair Remote Atem.\n");
-
-                let _ = crate::rtc_test_server::open_browser(&pair_url);
-
-                println!("Waiting for Astation to connect via relay...");
-            }
-
-            // Wait for credential sync from Astation
-            // Relay path: 5 min (user needs time to enter the code in Astation)
-            // Local path: already authenticated, credentials should arrive immediately
-            let timeout = if pairing_code == "local" {
-                tokio::time::Duration::from_secs(10)
-            } else {
-                tokio::time::Duration::from_secs(300)
-            };
-            let result = tokio::time::timeout(timeout, async {
-                loop {
-                    match client.recv_message_async().await {
-                        Some(crate::websocket_client::AstationMessage::CredentialSync {
-                            customer_id,
-                            customer_secret,
-                            astation_id,
-                        }) => return Some((customer_id, customer_secret, astation_id)),
-                        Some(_) => continue,
-                        None => return None,
-                    }
-                }
-            })
-            .await;
-
-            match result {
-                Ok(Some((cid, csecret, astation_id))) => {
-                    if pairing_code != "local" {
-                        println!("Paired via relay!");
-                    }
-                    let id_preview = &cid[..4.min(cid.len())];
-                    println!("Credentials received ({}...)", id_preview);
-
-                    // Save the Astation identity so TUI can auto-reconnect via relay next time
-                    if pairing_code != "local" {
-                        if let Some(identity) = astation_id {
-                            let mut relay_cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                            relay_cfg.astation_relay_code = Some(identity.clone());
-                            if let Err(e) = relay_cfg.save_to_disk() {
-                                eprintln!("Warning: could not save relay code: {e}");
-                            } else {
-                                // Build the identity relay status URL — this is the permanent
-                                // page that shows all connected Atems after TUI auto-reconnects.
-                                // (Different from the pairing code page shown above.)
-                                let relay_base = relay_cfg.astation_relay_url().to_string();
-                                let status_url = format!("{}/pair?code={}", relay_base, identity);
-                                println!("Relay code saved. Status page (bookmark this):");
-                                println!("  {}", status_url);
-                                let _ = crate::rtc_test_server::open_browser(&status_url);
-                            }
-                        }
-                    }
-
-                    print!("Save credentials from Astation? [Y/n] ");
-                    std::io::stdout().flush().ok();
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).unwrap_or(0);
-                    if !matches!(input.trim().to_lowercase().as_str(), "n" | "no") {
-                        let mut cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                        cfg.customer_id = Some(cid);
-                        cfg.customer_secret = Some(csecret);
-                        if let Err(e) = cfg.save_to_disk() {
-                            eprintln!("Warning: could not persist credentials: {e}");
-                        } else {
-                            println!(
-                                "Credentials saved to {}",
-                                crate::config::CredentialStore::path().display()
-                            );
-                        }
-                    } else {
-                        println!("Credentials not saved.");
-                    }
-                }
-                Ok(None) => println!("No credentials received (Astation disconnected)."),
-                Err(_) => println!("No credentials received (timed out). Session saved."),
-            }
+        Commands::Login => {
+            let config = crate::config::AtemConfig::load()?;
+            let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
+            println!("Logged in successfully. Session expires at {}.", session.expires_at);
             Ok(())
         }
-        Commands::Auth { auth_command } => match auth_command {
-            AuthCommands::Status => {
-                let config = crate::config::AtemConfig::load().unwrap_or_default();
-
-                // Credential source
-                use crate::config::CredentialSource;
-                let cred_display = match &config.credential_source {
-                    CredentialSource::ConfigFile => format!(
-                        "Credentials: from encrypted store ({})",
-                        crate::config::CredentialStore::path().display()
-                    ),
-                    CredentialSource::EnvVar => "Credentials: from ENV".to_string(),
-                    CredentialSource::Astation => "Credentials: from Astation".to_string(),
-                    CredentialSource::None => {
-                        "Credentials: (none) -- run 'atem pair' or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET".to_string()
-                    }
-                };
-                println!("{}", cred_display);
-
-                // Pairing state
-                let pairing_display =
-                    if let Some(session) = crate::auth::AuthSession::load_saved() {
-                        if session.is_valid() {
-                            let age = session.age_seconds();
-                            let days = age / 86400;
-                            if days > 0 {
-                                format!("Pairing: paired locally ({}d ago)", days)
-                            } else {
-                                "Pairing: paired locally (today)".to_string()
-                            }
-                        } else {
-                            "Pairing: local session expired -- run 'atem pair'".to_string()
-                        }
-                    } else if let Some(relay_code) = &config.astation_relay_code {
-                        format!("Pairing: paired via relay ({})", &relay_code[..relay_code.len().min(12)])
-                    } else {
-                        "Pairing: not paired -- run 'atem pair'".to_string()
-                    };
-                println!("{}", pairing_display);
-
-                Ok(())
-            }
-            AuthCommands::Clear => {
-                // Clear encrypted credentials
-                let cred_path = crate::config::CredentialStore::path();
-                if cred_path.exists() {
-                    std::fs::remove_file(&cred_path)?;
-                    println!("Credentials cleared.");
-                } else {
-                    println!("No saved credentials to clear.");
-                }
-
-                // Clear session
-                crate::auth::AuthSession::clear_saved()?;
-                println!("Session cleared.");
-
-                Ok(())
-            }
-        },
+        Commands::Logout => {
+            crate::sso_auth::SsoSession::delete()?;
+            println!("Logged out.");
+            Ok(())
+        }
         Commands::Agent { agent_command } => match agent_command {
             AgentCommands::Launch { agent_type } => {
                 println!("Launching {} as PTY agent...", agent_type);
@@ -1179,48 +911,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_pair_parses() {
-        let cli = Cli::try_parse_from(["atem", "pair"]).unwrap();
-        match cli.command {
-            Some(Commands::Pair { server }) => {
-                assert!(server.is_none());
-            }
-            _ => panic!("Expected Pair command"),
-        }
+    fn cli_login_parses() {
+        let cli = Cli::try_parse_from(["atem", "login"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Login)));
     }
 
     #[test]
-    fn cli_pair_with_server() {
-        let cli =
-            Cli::try_parse_from(["atem", "pair", "--server", "http://localhost:3000"]).unwrap();
-        match cli.command {
-            Some(Commands::Pair { server }) => {
-                assert_eq!(server.as_deref(), Some("http://localhost:3000"));
-            }
-            _ => panic!("Expected Pair command with server"),
-        }
-    }
-
-    #[test]
-    fn cli_auth_status_parses() {
-        let cli = Cli::try_parse_from(["atem", "auth", "status"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Auth {
-                auth_command: AuthCommands::Status
-            })
-        ));
-    }
-
-    #[test]
-    fn cli_auth_clear_parses() {
-        let cli = Cli::try_parse_from(["atem", "auth", "clear"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Auth {
-                auth_command: AuthCommands::Clear
-            })
-        ));
+    fn cli_logout_parses() {
+        let cli = Cli::try_parse_from(["atem", "logout"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Logout)));
     }
 
     // ── agent command ─────────────────────────────────────────────────────

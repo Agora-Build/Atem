@@ -21,7 +21,7 @@ use tokio::{
 };
 use vt100::Parser as VtParser;
 
-use crate::agora_api::{AgoraApiProject, fetch_agora_projects, format_projects};
+use crate::agora_api::{BffProject, format_projects};
 use crate::claude_client::{ClaudeClient, ClaudeResizeHandle};
 use crate::codex_client::{CodexClient, CodexResizeHandle};
 use crate::command::StreamBuffer;
@@ -121,7 +121,7 @@ pub struct App {
     pub pending_transcriptions: VecDeque<String>,
     pub rtm_token_expires_at: Option<Instant>,
     pub show_certificates: bool,
-    pub cached_projects: Vec<AgoraApiProject>,
+    pub cached_projects: Vec<BffProject>,
     pub voice_volume: f32,
     pub voice_active: bool,
     pub video_active: bool,
@@ -347,15 +347,12 @@ impl App {
                 self.mode = AppMode::TokenGeneration; // Reusing this mode for project listing
                 self.output_text = "\u{1f4cb} Fetching Agora Projects...\n\n".to_string();
 
-                // Priority: synced from Astation > env vars > config file
-                let fetch_result = if let (Some(cid), Some(csecret)) = (
-                    self.synced_customer_id.as_deref(),
-                    self.synced_customer_secret.as_deref(),
-                ) {
-                    crate::agora_api::fetch_agora_projects_with_credentials(cid, csecret).await
-                } else {
-                    fetch_agora_projects().await
-                };
+                // Fetch projects via SSO token
+                let fetch_result = async {
+                    let token = crate::sso_auth::valid_token(self.config.effective_sso_url()).await
+                        .map_err(|_| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+                    crate::agora_api::fetch_projects(&token, self.config.effective_bff_url()).await
+                }.await;
 
                 match fetch_result {
                     Ok(projects) => {
@@ -371,9 +368,7 @@ impl App {
                         self.cached_projects.clear();
                         self.output_text = format!(
                             "Failed to fetch Agora projects: {}\n\n\
-                            Run `atem pair` or set AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET\n\
-                            environment variables.\n\
-                            Get these from https://console.agora.io -> RESTful API\n\n\
+                            Run `atem login` to authenticate via SSO.\n\n\
                             Press 'b' to go back to main menu",
                             e
                         );
@@ -2007,27 +2002,11 @@ impl App {
                 // Store in memory for this session (available immediately)
                 self.synced_customer_id = Some(customer_id.clone());
                 self.synced_customer_secret = Some(customer_secret.clone());
-                // Astation sync overrides everything — it's the live source of truth
-                self.config.customer_id = Some(customer_id.clone());
-                self.config.customer_secret = Some(customer_secret.clone());
-                self.config.credential_source = crate::config::CredentialSource::Astation;
 
-                // Check if credentials already saved in config file
-                let cfg = crate::config::AtemConfig::load().unwrap_or_default();
-                if cfg.customer_id.is_some() {
-                    // Already saved - don't prompt again
-                    self.status_message = Some(format!(
-                        "\u{1f511} Credentials synced from Astation ({}...)",
-                        id_preview
-                    ));
-                } else {
-                    // Not saved yet - prompt user
-                    self.pending_credential_save = Some((customer_id, customer_secret));
-                    self.status_message = Some(format!(
-                        "\u{1f511} Credentials received ({}...) Press 'y' to save, 'n' for session only",
-                        id_preview
-                    ));
-                }
+                self.status_message = Some(format!(
+                    "\u{1f511} Credentials synced from Astation ({}...)",
+                    id_preview
+                ));
             }
             _ => {
                 // Unknown/unhandled message type — ignore silently

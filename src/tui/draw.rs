@@ -97,38 +97,19 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
 }
 
 pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Build credential status line showing the source
-    use crate::config::CredentialSource;
-    let cred_line = match &app.config.credential_source {
-        CredentialSource::Astation => {
-            let suffix = if app.astation_connected { " | \u{1f7e2} Astation connected" } else { "" };
-            format!("\u{1f511} Credentials: from Astation{}", suffix)
-        }
-        CredentialSource::EnvVar => {
-            let has_id = std::env::var("AGORA_CUSTOMER_ID").ok().filter(|s| !s.is_empty()).is_some();
-            let has_secret = std::env::var("AGORA_CUSTOMER_SECRET").ok().filter(|s| !s.is_empty()).is_some();
-            match (has_id, has_secret) {
-                (true, true) => "\u{1f511} Credentials: from ENV".to_string(),
-                (true, false) => "\u{26a0}\u{fe0f}  Credentials: from ENV, but AGORA_CUSTOMER_SECRET not set".to_string(),
-                (false, true) => "\u{26a0}\u{fe0f}  Credentials: from ENV, but AGORA_CUSTOMER_ID not set".to_string(),
-                (false, false) => "\u{26a0}\u{fe0f}  No credentials — run `atem pair` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string(),
-            }
-        }
-        CredentialSource::ConfigFile => {
-            format!("\u{1f511} Credentials: from {}", crate::config::CredentialStore::path().display())
-        }
-        CredentialSource::None => {
-            "\u{26a0}\u{fe0f}  No credentials — run `atem pair` or set AGORA_CUSTOMER_ID/AGORA_CUSTOMER_SECRET".to_string()
-        }
-    };
-
-    let cred_style = match &app.config.credential_source {
-        CredentialSource::None => Style::default().fg(Color::Yellow),
-        CredentialSource::EnvVar if std::env::var("AGORA_CUSTOMER_ID").ok().filter(|s| !s.is_empty()).is_none()
-            || std::env::var("AGORA_CUSTOMER_SECRET").ok().filter(|s| !s.is_empty()).is_none() => {
-            Style::default().fg(Color::Yellow)
-        }
-        _ => Style::default().fg(Color::Green),
+    // Build SSO session status line
+    let sso_session = crate::sso_auth::SsoSession::load();
+    let (cred_line, cred_style) = if let Some(session) = sso_session {
+        let ts = session.expires_at;
+        (
+            format!("\u{1f511} Logged in (SSO session expires: {})", ts),
+            Style::default().fg(Color::Green),
+        )
+    } else {
+        (
+            "\u{26a0}\u{fe0f}  Not logged in — run `atem login`".to_string(),
+            Style::default().fg(Color::Yellow),
+        )
     };
 
     let cred_paragraph = Paragraph::new(cred_line)

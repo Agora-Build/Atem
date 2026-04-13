@@ -22,16 +22,10 @@ impl TimeSync {
         // Try to load credentials from config for the HEAD request
         let config = crate::config::AtemConfig::load().unwrap_or_default();
 
-        let client = reqwest::Client::new();
-        let mut req = client.head("https://api.agora.io/dev/v1/projects");
+        let _ = config; // config no longer used for auth
 
-        // Add auth if available (makes the request more reliable)
-        if let (Some(cid), Some(csecret)) = (&config.customer_id, &config.customer_secret) {
-            use base64::{Engine as _, engine::general_purpose};
-            let credentials = format!("{}:{}", cid, csecret);
-            let encoded = general_purpose::STANDARD.encode(credentials.as_bytes());
-            req = req.header("Authorization", format!("Basic {}", encoded));
-        }
+        let client = reqwest::Client::new();
+        let req = client.head("https://api.agora.io/dev/v1/projects");
 
         let resp = req.send().await?;
 
