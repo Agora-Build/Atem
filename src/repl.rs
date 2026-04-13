@@ -136,7 +136,7 @@ fn print_help() {
     println!("    --channel <NAME>  --uid <ID>  --role publisher|subscriber  --expire <SECS>");
     println!("  token rtc decode <TOKEN>            Decode RTC token");
     println!("  token rtm create [options]           Generate RTM token");
-    println!("    --user-id <ID>  --expire <SECS>");
+    println!("    --rtm-user-id <ID>  --expire <SECS>");
     println!();
     println!("You can also type natural language and AI will interpret it.");
     println!("  Example: \"show me all my projects\"");

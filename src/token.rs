@@ -317,10 +317,10 @@ impl TokenInfo {
             if let Some(uid) = &svc.rtc_user_id {
                 // Token stores this as a raw string. Don't infer int-vs-string
                 // mode — that's a client-side concern and isn't encoded here.
-                lines.push(format!("  User: {}", uid));
+                lines.push(format!("  RTC User: {}", uid));
             }
             if let Some(uid) = &svc.rtm_user_id {
-                lines.push(format!("  User: {}", uid));
+                lines.push(format!("  RTM User: {}", uid));
             }
             for (&k, &v) in &svc.privileges {
                 let priv_name = match (svc.service_type, k) {
@@ -895,6 +895,181 @@ mod tests {
         )
         .unwrap();
         assert!(t.is_empty());
+    }
+
+    // ── Decode display + payload round-trip ───────────────────────────────
+
+    #[test]
+    fn decoded_rtc_token_surfaces_channel_and_user() {
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "mychan",
+            RtcAccount::parse("alice"), Role::Publisher, 3600, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let display = info.display();
+        assert!(display.contains("Channel: mychan"), "display missing channel: {display}");
+        assert!(display.contains("RTC User: alice"), "display missing RTC user: {display}");
+    }
+
+    #[test]
+    fn decoded_rtm_token_surfaces_user() {
+        let token =
+            build_token_rtm(TEST_APP_ID, TEST_APP_CERT, "alice_rtm", 3600, 0).unwrap();
+        let info = decode_token(&token).unwrap();
+        let display = info.display();
+        assert!(display.contains("RTM User: alice_rtm"), "display missing RTM user: {display}");
+    }
+
+    #[test]
+    fn decoded_combined_token_surfaces_both_users_and_channel() {
+        let token = build_token_rtc_with_rtm(
+            TEST_APP_ID, TEST_APP_CERT, "combined_chan",
+            RtcAccount::parse("42"), Role::Publisher, 3600, 3600,
+            Some("rtm_alice"),
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let display = info.display();
+        assert!(display.contains("Channel: combined_chan"));
+        assert!(display.contains("RTC User: 42"));
+        assert!(display.contains("RTM User: rtm_alice"));
+    }
+
+    #[test]
+    fn decoded_service_fields_are_preserved() {
+        // Structural check: decode_token's ServiceInfo should carry channel +
+        // rtc_user_id for RTC, rtm_user_id for RTM, and no cross-contamination.
+        let token = build_token_rtc_with_rtm(
+            TEST_APP_ID, TEST_APP_CERT, "xx",
+            RtcAccount::parse("rtc_acc"), Role::Publisher, 3600, 3600,
+            Some("rtm_acc"),
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+
+        let rtc = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTC).unwrap();
+        assert_eq!(rtc.channel.as_deref(), Some("xx"));
+        assert_eq!(rtc.rtc_user_id.as_deref(), Some("rtc_acc"));
+        assert!(rtc.rtm_user_id.is_none(), "RTC service must not carry rtm_user_id");
+
+        let rtm = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTM).unwrap();
+        assert_eq!(rtm.rtm_user_id.as_deref(), Some("rtm_acc"));
+        assert!(rtm.channel.is_none(), "RTM service must not carry channel");
+        assert!(rtm.rtc_user_id.is_none(), "RTM service must not carry rtc_user_id");
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rtc_account_at_u32_boundary_fits() {
+        // u32::MAX must still be Int — 10 digits but within range.
+        match RtcAccount::parse("4294967295") {
+            RtcAccount::Int(n) => assert_eq!(n, u32::MAX),
+            _ => panic!("u32::MAX must be Int"),
+        }
+    }
+
+    #[test]
+    fn rtc_account_just_over_u32_falls_back_to_str() {
+        // 4294967296 = u32::MAX + 1 → must NOT silently truncate
+        match RtcAccount::parse("4294967296") {
+            RtcAccount::Str(s) => assert_eq!(s, "4294967296"),
+            _ => panic!("overflowing digits must be Str, not Int"),
+        }
+    }
+
+    #[test]
+    fn long_string_account_255_chars_round_trips() {
+        // Agora caps string accounts at 255 bytes. Build one of exactly 255.
+        let long = "a".repeat(255);
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse(&long), Role::Publisher, 3600, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTC).unwrap();
+        assert_eq!(rtc.rtc_user_id.as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn channel_with_allowed_punctuation_survives_round_trip() {
+        // RTC channel allows a broad set of punctuation. Sanity check that
+        // our decode correctly reconstructs a realistic channel name.
+        let channel = "room-42@agora.io:1";
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, channel,
+            RtcAccount::parse("42"), Role::Publisher, 3600, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTC).unwrap();
+        assert_eq!(rtc.channel.as_deref(), Some(channel));
+    }
+
+    #[test]
+    fn uid_0_stores_empty_string_in_token() {
+        // Upstream convention: uid=0 means "server assigns a uid". The SDK's
+        // get_uid_str(0) returns "" (sentinel), so the token carries an empty
+        // uid string, not "0". This is the correct behaviour for int uid 0.
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("0"), Role::Publisher, 3600, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTC).unwrap();
+        assert_eq!(rtc.rtc_user_id.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn string_account_0_stores_literal_zero() {
+        // In contrast to int uid 0, a string account "0" (passed via s/0)
+        // stores the literal "0" in the token — no "server assigns" sentinel.
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("s/0"), Role::Publisher, 3600, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTC).unwrap();
+        assert_eq!(rtc.rtc_user_id.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn rtc_publisher_token_has_all_four_privileges() {
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Publisher, 3600, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTC).unwrap();
+        use agora_token::access_token::{
+            PRIVILEGE_JOIN_CHANNEL, PRIVILEGE_PUBLISH_AUDIO_STREAM,
+            PRIVILEGE_PUBLISH_VIDEO_STREAM, PRIVILEGE_PUBLISH_DATA_STREAM,
+        };
+        assert!(rtc.privileges.contains_key(&PRIVILEGE_JOIN_CHANNEL));
+        assert!(rtc.privileges.contains_key(&PRIVILEGE_PUBLISH_AUDIO_STREAM));
+        assert!(rtc.privileges.contains_key(&PRIVILEGE_PUBLISH_VIDEO_STREAM));
+        assert!(rtc.privileges.contains_key(&PRIVILEGE_PUBLISH_DATA_STREAM));
+    }
+
+    #[test]
+    fn rtc_subscriber_token_has_only_join_channel() {
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Subscriber, 3600, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == SERVICE_TYPE_RTC).unwrap();
+        use agora_token::access_token::{
+            PRIVILEGE_JOIN_CHANNEL, PRIVILEGE_PUBLISH_AUDIO_STREAM,
+        };
+        assert!(rtc.privileges.contains_key(&PRIVILEGE_JOIN_CHANNEL));
+        assert!(!rtc.privileges.contains_key(&PRIVILEGE_PUBLISH_AUDIO_STREAM));
     }
 
     #[test]

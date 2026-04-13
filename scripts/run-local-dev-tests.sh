@@ -155,10 +155,10 @@ if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HO
     run "atem token rtc create --uid (rejected)"     2     -- "$ATEM" token rtc create --channel smoketest --uid 42 --expire 600
 
     # Mode label in output must match auto-detection
-    out_int="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --expire 60 2>&1 | grep -E "^  RTC user id:")"
-    out_str="$("$ATEM" token rtc create --channel smoketest --rtc-user-id alice --expire 60 2>&1 | grep -E "^  RTC user id:")"
+    out_int="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --expire 60 2>&1 | grep -E "^  RTC User:")"
+    out_str="$("$ATEM" token rtc create --channel smoketest --rtc-user-id alice --expire 60 2>&1 | grep -E "^  RTC User:")"
     # Escape hatch: leading `s/` forces string mode (for all-digit string accounts)
-    out_sstr="$("$ATEM" token rtc create --channel smoketest --rtc-user-id s/1232 --expire 60 2>&1 | grep -E "^  RTC user id:")"
+    out_sstr="$("$ATEM" token rtc create --channel smoketest --rtc-user-id s/1232 --expire 60 2>&1 | grep -E "^  RTC User:")"
     printf "  %s ... " "$(dim "atem token rtc create classifies --rtc-user-id correctly")"
     if echo "$out_int"  | grep -q "int uid" \
         && echo "$out_str"  | grep -q "string account" \
@@ -185,6 +185,52 @@ if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HO
         red "FAIL"; echo " (bare=$BARE_TOK /=$SPFX_TOK)"
         FAIL=$((FAIL + 1))
         FAILED_NAMES+=("atem token rtc 1232 vs s/1232")
+    fi
+
+    # --rtm-user-id without --with-rtm must be rejected (silent no-op would confuse)
+    err_output="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --rtm-user-id alice 2>&1 || true)"
+    printf "  %s ... " "$(dim "atem token rtc create --rtm-user-id without --with-rtm rejected")"
+    if echo "$err_output" | grep -q "requires --with-rtm"; then
+        green "PASS"; echo
+        PASS=$((PASS + 1))
+    else
+        red "FAIL"; echo
+        echo "$err_output" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("--rtm-user-id without --with-rtm")
+    fi
+
+    # Decoded RTC+RTM token must show both "RTC User:" and "RTM User:" labels
+    COMBO_TOK="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --with-rtm --rtm-user-id alice --expire 600 2>/dev/null | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
+    if [[ -n "$COMBO_TOK" ]]; then
+        decoded="$("$ATEM" token rtc decode "$COMBO_TOK" 2>&1)"
+        printf "  %s ... " "$(dim "decoded RTC+RTM token shows RTC User / RTM User / Channel")"
+        if echo "$decoded" | grep -q "RTC User: 42" \
+            && echo "$decoded" | grep -q "RTM User: alice" \
+            && echo "$decoded" | grep -q "Channel: smoketest"; then
+            green "PASS"; echo
+            PASS=$((PASS + 1))
+        else
+            red "FAIL"; echo
+            echo "$decoded" | sed 's/^/      /'
+            FAIL=$((FAIL + 1))
+            FAILED_NAMES+=("decoded RTC+RTM labels")
+        fi
+    else
+        skip "decoded RTC+RTM labels" "couldn't extract combined token"
+    fi
+
+    # atem token rtm create output should show "RTM User:" label
+    rtm_out="$("$ATEM" token rtm create --rtm-user-id smoke_rtm --expire 60 2>&1)"
+    printf "  %s ... " "$(dim "atem token rtm create shows RTM User label")"
+    if echo "$rtm_out" | grep -q "RTM User: smoke_rtm"; then
+        green "PASS"; echo
+        PASS=$((PASS + 1))
+    else
+        red "FAIL"; echo
+        echo "$rtm_out" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("atem token rtm create label")
     fi
 
     # RTC+RTM round-trip (int uid): decoded token must mention both RTC and RTM services
@@ -240,9 +286,9 @@ echo
 # ── Token: RTM create + decode round-trip ───────────────────────────
 echo "$(yellow "Token RTM (Signaling)")"
 if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HOME/.config/atem/project_cache.enc" ]]; then
-    run "atem token rtm create"        -- "$ATEM" token rtm create --user-id smoke_user --expire 600
+    run "atem token rtm create"        -- "$ATEM" token rtm create --rtm-user-id smoke_user --expire 600
 
-    RTM_TOKEN="$("$ATEM" token rtm create --user-id smoke_user --expire 600 2>/dev/null \
+    RTM_TOKEN="$("$ATEM" token rtm create --rtm-user-id smoke_user --expire 600 2>/dev/null \
         | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
     if [[ -n "$RTM_TOKEN" ]]; then
         run_contains "atem token rtm decode"                    "RTM" -- "$ATEM" token rtm decode "$RTM_TOKEN"

@@ -52,7 +52,7 @@ Available commands:
 - atem token rtc create [--channel <NAME>] [--uid <ID>] [--role publisher|subscriber] [--expire <SECS>]
                                            — Generate an RTC token
 - atem token rtc decode <TOKEN>            — Decode an existing RTC token
-- atem token rtm create [--user-id <ID>] [--expire <SECS>]
+- atem token rtm create [--rtm-user-id <ID>] [--expire <SECS>]
                                            — Generate a Signaling (RTM) token
 - atem token rtm decode <TOKEN>            — Decode an existing Signaling (RTM) token
 

@@ -112,9 +112,9 @@ pub enum RtcCommands {
 pub enum RtmCommands {
     /// Create a Signaling (RTM) token
     Create {
-        /// User ID
-        #[arg(long)]
-        user_id: Option<String>,
+        /// RTM user id (string account)
+        #[arg(long = "rtm-user-id")]
+        rtm_user_id: Option<String>,
         /// Expiry in seconds
         #[arg(long, default_value = "3600")]
         expire: u32,
@@ -293,6 +293,14 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     let now = time_sync.now().await? as u32;
 
                     let rtc_account = crate::token::RtcAccount::parse(uid_str);
+                    // Reject --rtm-user-id without --with-rtm — otherwise it would
+                    // silently do nothing.
+                    if rtm_user_id.is_some() && !with_rtm {
+                        anyhow::bail!(
+                            "--rtm-user-id requires --with-rtm; add --with-rtm to embed an RTM login privilege"
+                        );
+                    }
+
                     let token = if with_rtm {
                         crate::token::build_token_rtc_with_rtm(
                             &app_id,
@@ -329,7 +337,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     // Show the account that actually went into the token (quote-stripped
                     // if the user passed `"..."`), not the raw CLI arg.
                     println!(
-                        "  RTC user id: {} ({})",
+                        "  RTC User: {} ({})",
                         rtc_account.as_str(),
                         rtc_account.mode_label()
                     );
@@ -355,12 +363,12 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 }
             },
             TokenCommands::Rtm { rtm_command } => match rtm_command {
-                RtmCommands::Create { user_id, expire } => {
+                RtmCommands::Create { rtm_user_id, expire } => {
                     let app_id = crate::config::ProjectCache::resolve_app_id(None)?;
                     let app_certificate =
                         crate::config::ProjectCache::resolve_app_certificate(None)?;
 
-                    let uid = user_id.as_deref().unwrap_or("atem01");
+                    let uid = rtm_user_id.as_deref().unwrap_or("atem01");
 
                     // Use time sync for accurate issued_at
                     let mut time_sync = crate::time_sync::TimeSync::new();
@@ -382,7 +390,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("RTM Token created successfully:");
                     println!("{}", token);
                     println!("\nToken Details:");
-                    println!("  User ID: {}", uid);
+                    println!("  RTM User: {}", uid);
                     println!("  Valid for: {}s", expire);
 
                     let offset = time_sync.offset();
@@ -1121,6 +1129,35 @@ mod tests {
     }
 
     #[test]
+    fn cli_token_rtm_create_rejects_old_user_id_flag() {
+        // --user-id was renamed to --rtm-user-id; old form must fail.
+        let res = Cli::try_parse_from([
+            "atem", "token", "rtm", "create", "--user-id", "alice",
+        ]);
+        assert!(res.is_err(), "--user-id must be rejected on rtm create");
+    }
+
+    #[test]
+    fn cli_token_rtm_create_accepts_rtm_user_id() {
+        let cli = Cli::try_parse_from([
+            "atem", "token", "rtm", "create", "--rtm-user-id", "alice",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Token {
+                token_command:
+                    TokenCommands::Rtm {
+                        rtm_command: RtmCommands::Create { rtm_user_id, expire },
+                    },
+            }) => {
+                assert_eq!(rtm_user_id.as_deref(), Some("alice"));
+                assert_eq!(expire, 3600);
+            }
+            _ => panic!("Expected RtmCommands::Create with rtm_user_id"),
+        }
+    }
+
+    #[test]
     fn cli_token_rtc_decode_parses() {
         let cli =
             Cli::try_parse_from(["atem", "token", "rtc", "decode", "007sometoken"]).unwrap();
@@ -1144,10 +1181,10 @@ mod tests {
             Some(Commands::Token {
                 token_command:
                     TokenCommands::Rtm {
-                        rtm_command: RtmCommands::Create { user_id, expire },
+                        rtm_command: RtmCommands::Create { rtm_user_id, expire },
                     },
             }) => {
-                assert!(user_id.is_none());
+                assert!(rtm_user_id.is_none());
                 assert_eq!(expire, 3600);
             }
             _ => panic!("Expected Token Rtm Create command"),
