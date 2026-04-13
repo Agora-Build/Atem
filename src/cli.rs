@@ -96,7 +96,7 @@ pub enum RtcCommands {
 
 #[derive(Subcommand)]
 pub enum RtmCommands {
-    /// Create an RTM token
+    /// Create a Signaling (RTM) token
     Create {
         /// User ID
         #[arg(long)]
@@ -104,6 +104,11 @@ pub enum RtmCommands {
         /// Expiry in seconds
         #[arg(long, default_value = "3600")]
         expire: u32,
+    },
+    /// Decode an existing Signaling (RTM) token
+    Decode {
+        /// Token to decode
+        token: String,
     },
 }
 
@@ -344,6 +349,12 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         println!("  Clock offset: {}s", offset);
                     }
 
+                    Ok(())
+                }
+                RtmCommands::Decode { token } => {
+                    let info = crate::token::decode_token(&token)?;
+                    println!("Decoded Token:");
+                    println!("{}", info.display());
                     Ok(())
                 }
             },

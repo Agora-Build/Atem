@@ -53,7 +53,8 @@ Available commands:
                                            — Generate an RTC token
 - atem token rtc decode <TOKEN>            — Decode an existing RTC token
 - atem token rtm create [--user-id <ID>] [--expire <SECS>]
-                                           — Generate an RTM token
+                                           — Generate a Signaling (RTM) token
+- atem token rtm decode <TOKEN>            — Decode an existing Signaling (RTM) token
 
 Respond with ONLY a JSON object in this exact format:
 {"command": "<the full atem command>", "explanation": "<brief explanation of what it does>"}

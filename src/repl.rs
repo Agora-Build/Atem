@@ -16,6 +16,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "token rtc create",
     "token rtc decode",
     "token rtm create",
+    "token rtm decode",
     "login",
     "logout",
     "pair",
