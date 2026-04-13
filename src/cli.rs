@@ -34,17 +34,17 @@ pub enum Commands {
     },
     /// Interactive REPL with AI-powered command interpretation
     Repl,
-    /// Log in with Agora Console
+    /// Log in with Agora Console (opens browser)
     Login,
-    /// Log out
+    /// Log out from SSO
     Logout,
-    /// Pair with an Astation instance and receive SSO credentials
+    /// Pair with Astation
     Pair {
-        /// Save credentials so they remain valid when Astation disconnects
+        /// Save credentials for offline use
         #[arg(long)]
         save: bool,
     },
-    /// Remove all paired Astation sessions
+    /// Unpair from Astation
     Unpair,
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {

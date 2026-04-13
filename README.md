@@ -30,18 +30,18 @@ atem repl                               # Interactive REPL with AI command inter
 
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
-atem logout                             # Log out (remove SSO entry from credentials.enc)
-atem pair                                # Pair with Astation and receive SSO credentials
-atem pair --save                         # Pair and persist credentials across disconnects
-atem unpair                              # Remove all paired Astation sessions
+atem logout                             # Log out from SSO
+atem pair                                # Pair with Astation
+atem pair --save                         # Pair and save credentials for offline use
+atem unpair                              # Unpair from Astation
 ```
 
 Two ways to authenticate:
 
-- **`atem login`** — your own Agora Console login. Always valid, auto-refreshes.
-- **`atem pair`** — receive SSO credentials from a connected Astation. Valid while Astation is connected (plus a 5-minute grace period). Pass `--save` to keep them offline-capable. If you don't pass `--save`, atem prompts interactively.
+- **`atem login`** — your own Agora Console login. Auto-refreshes.
+- **`atem pair`** — receive credentials from a connected Astation. Pass `--save` to keep them after disconnect (otherwise atem asks interactively).
 
-When connected to Astation, paired credentials take priority; otherwise your own SSO login is the fallback. See [`AGENTS.md`](AGENTS.md#credentials-credentialsrs) for the full resolution chain.
+When connected to Astation, paired credentials take priority; otherwise own login is the fallback.
 
 ### Tokens
 
@@ -95,10 +95,10 @@ atem serv killall                       # Kill all background servers
 ### Configuration
 
 ```bash
-atem config show                        # Show resolved config: SSO state + paired + active project
+atem config show                        # Show resolved config
 atem config set astation_ws <URL>       # Set Astation WebSocket URL
 atem config set astation_relay_url <URL> # Set Astation relay URL
-atem config clear                       # Clear the active project selection (keeps cache)
+atem config clear                       # Clear active project selection
 ```
 
 ## How It Works
