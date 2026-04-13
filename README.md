@@ -30,8 +30,18 @@ atem repl                               # Interactive REPL with AI command inter
 
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
-atem logout                             # Log out (delete saved session)
+atem logout                             # Log out (remove SSO entry from credentials.enc)
+atem pair                                # Pair with Astation and receive SSO credentials
+atem pair --save                         # Pair and persist credentials across disconnects
+atem unpair                              # Remove all paired Astation sessions
 ```
+
+Two ways to authenticate:
+
+- **`atem login`** — your own Agora Console login. Always valid, auto-refreshes.
+- **`atem pair`** — receive SSO credentials from a connected Astation. Valid while Astation is connected (plus a 5-minute grace period). Pass `--save` to keep them offline-capable. If you don't pass `--save`, atem prompts interactively.
+
+When connected to Astation, paired credentials take priority; otherwise your own SSO login is the fallback. See [`AGENTS.md`](AGENTS.md#credentials-credentialsrs) for the full resolution chain.
 
 ### Tokens
 
@@ -39,8 +49,9 @@ atem logout                             # Log out (delete saved session)
 atem token rtc create                   # Generate RTC token (interactive)
 atem token rtc create --channel test --uid 0 --expire 3600
 atem token rtc decode <token>           # Decode existing RTC token
-atem token rtm create                   # Generate RTM token
+atem token rtm create                   # Generate Signaling (RTM) token
 atem token rtm create --user-id bob --expire 3600
+atem token rtm decode <token>           # Decode existing Signaling (RTM) token
 ```
 
 ### Projects
@@ -84,10 +95,10 @@ atem serv killall                       # Kill all background servers
 ### Configuration
 
 ```bash
-atem config show                        # Show resolved config (secrets masked)
+atem config show                        # Show resolved config: SSO state + paired + active project
 atem config set astation_ws <URL>       # Set Astation WebSocket URL
 atem config set astation_relay_url <URL> # Set Astation relay URL
-atem config clear                       # Clear active project
+atem config clear                       # Clear the active project selection (keeps cache)
 ```
 
 ## How It Works
@@ -125,7 +136,20 @@ Speak to code: Astation captures audio, a ConvoAI agent transcribes it, and Atem
 atem login          # Opens browser to log in with Agora Console
 ```
 
-If the browser redirect doesn't complete (e.g. remote server), atem will prompt you to paste the callback URL from the browser address bar.
+If the browser redirect doesn't complete within 5 seconds (e.g. remote server), atem will prompt you to paste the callback URL from the browser address bar.
+
+### Storage
+
+Files in `~/.config/atem/`:
+
+| File | Contents | Encryption |
+|------|----------|------------|
+| `config.toml` | Non-sensitive settings (only created if you override a default) | None |
+| `credentials.enc` | SSO + paired tokens (multi-entry) | AES-256-GCM (machine-bound) |
+| `project_cache.enc` | Project list + active project selection | AES-256-GCM (machine-bound) |
+| `session.json` | Astation auth session (for reconnect) | None |
+
+Encrypted files are bound to the machine they were created on — copying them to another machine won't decrypt.
 
 ### Config file
 
@@ -153,13 +177,25 @@ AGORA_APP_CERTIFICATE=...  # Override active project certificate
 ## Development
 
 ```bash
-cargo build              # Debug build
-cargo build --release    # Release build
-cargo test               # Run tests (470+ tests)
-cargo check              # Type-check
-cargo fmt                # Format
-cargo clippy             # Lint
+cargo build                       # Debug build
+cargo build --release             # Release build
+cargo test                        # Run tests (500+ tests)
+cargo check                       # Type-check
+cargo fmt                         # Format
+cargo clippy                      # Lint
+./scripts/run-local-dev-tests.sh  # End-to-end CLI smoke test
+./scripts/release.sh              # Patch-bump Cargo.toml + commit + tag
+./scripts/release.sh 0.5.0        # Explicit version
 ```
+
+### Release
+
+Releases are tag-driven — pushing `vX.Y.Z` triggers
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which builds
+the binaries and publishes `@agora-build/atem` to npm.
+
+Use `./scripts/release.sh` rather than `git tag` directly — the script keeps
+`Cargo.toml` in sync with the tag, so `atem --version` reports the right number.
 
 ### Feature Flags
 

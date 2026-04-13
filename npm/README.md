@@ -21,8 +21,16 @@ atem repl                               # Interactive REPL with AI command inter
 
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
-atem logout                             # Log out
+atem logout                             # Log out (remove SSO entry from credentials.enc)
+atem pair                                # Pair with Astation (interactive save prompt)
+atem pair --save                         # Pair and persist credentials across disconnects
+atem unpair                              # Remove all paired Astation sessions
 ```
+
+Two ways to authenticate:
+
+- **`atem login`** — your own Agora Console login. Always valid, auto-refreshes.
+- **`atem pair`** — receive SSO credentials from a connected Astation. Paired tokens take priority when connected; own SSO login is the fallback.
 
 ### Tokens
 
@@ -30,8 +38,9 @@ atem logout                             # Log out
 atem token rtc create                   # Generate RTC token (interactive)
 atem token rtc create --channel test --uid 0 --expire 3600
 atem token rtc decode <token>           # Decode existing RTC token
-atem token rtm create                   # Generate RTM token
+atem token rtm create                   # Generate Signaling (RTM) token
 atem token rtm create --user-id bob --expire 3600
+atem token rtm decode <token>           # Decode existing Signaling (RTM) token
 ```
 
 ### Projects
@@ -47,11 +56,16 @@ atem project show                       # Show current active project
 ### Configuration
 
 ```bash
-atem config show                        # Show resolved config (SSO state, active project)
+atem config show                        # Show resolved config: SSO state + paired + active project
 atem config set astation_ws <URL>       # Set Astation WebSocket URL
 atem config set astation_relay_url <URL> # Set Astation relay URL
-atem config clear                       # Clear active project
+atem config clear                       # Clear the active project selection (keeps cache)
 ```
+
+Data in `~/.config/atem/`:
+- `credentials.enc` — SSO and paired tokens (AES-256-GCM, machine-bound)
+- `project_cache.enc` — project list + active project (AES-256-GCM, machine-bound)
+- `config.toml` — non-sensitive settings (only created if you override a default)
 
 ### AI Agents
 
