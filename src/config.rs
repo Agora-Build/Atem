@@ -1,5 +1,3 @@
-use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::{Aead, Nonce};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, Mac};
@@ -8,31 +6,17 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
-/// Where the active credentials were loaded from.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum CredentialSource {
-    #[default]
-    None,
-    ConfigFile,
-    EnvVar,
-    Astation,
-}
-
 /// Main Atem configuration loaded from ~/.config/atem/config.toml + env vars
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AtemConfig {
-    pub customer_id: Option<String>,
-    pub customer_secret: Option<String>,
     pub rtm_channel: Option<String>,
     pub rtm_account: Option<String>,
     pub astation_ws: Option<String>,
     pub astation_relay_url: Option<String>,
     pub astation_relay_code: Option<String>,
     pub diagram_server_url: Option<String>,
-
-    /// Tracks where credentials were loaded from (not serialized).
-    #[serde(skip)]
-    pub credential_source: CredentialSource,
+    pub bff_url: Option<String>,
+    pub sso_url: Option<String>,
 }
 
 /// Active project state (in-memory, plaintext).
@@ -52,14 +36,10 @@ struct EncryptedActiveProject {
 }
 
 impl AtemConfig {
-    /// Load config from file + encrypted credentials + env var overrides.
+    /// Load config from file + env var overrides.
     ///
-    /// Credential resolution order (lowest → highest priority at load time):
-    ///   1. credentials.enc — encrypted store, set by `atem pair` or credential sync
-    ///   2. ENV vars (AGORA_CUSTOMER_ID/SECRET) — override encrypted store
-    ///   3. Astation sync (CredentialSource::Astation) — applied at runtime, highest priority
-    ///
-    /// config.toml holds non-sensitive settings; any legacy plaintext credentials are ignored.
+    /// Env var resolution order (lowest → highest priority):
+    ///   config.toml → env vars
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
 
@@ -72,29 +52,6 @@ impl AtemConfig {
             AtemConfig::default()
         };
 
-        // Never read credentials from config.toml — they belong in credentials.enc
-        config.customer_id = None;
-        config.customer_secret = None;
-
-        // Load credentials from encrypted store
-        if let Some((cid, csecret)) = CredentialStore::load() {
-            config.customer_id = Some(cid);
-            config.customer_secret = Some(csecret);
-            config.credential_source = CredentialSource::ConfigFile;
-        }
-
-        // Env var overrides (ignore empty strings)
-        let env_id = std::env::var("AGORA_CUSTOMER_ID").ok().filter(|s| !s.is_empty());
-        let env_secret = std::env::var("AGORA_CUSTOMER_SECRET").ok().filter(|s| !s.is_empty());
-        if env_id.is_some() || env_secret.is_some() {
-            if let Some(val) = env_id {
-                config.customer_id = Some(val);
-            }
-            if let Some(val) = env_secret {
-                config.customer_secret = Some(val);
-            }
-            config.credential_source = CredentialSource::EnvVar;
-        }
         if let Ok(val) = std::env::var("ATEM_RTM_CHANNEL") {
             config.rtm_channel = Some(val);
         }
@@ -113,24 +70,28 @@ impl AtemConfig {
         if let Ok(val) = std::env::var("DIAGRAM_SERVER_URL") {
             config.diagram_server_url = Some(val);
         }
+        if let Ok(val) = std::env::var("ATEM_BFF_URL") {
+            if !val.is_empty() {
+                config.bff_url = Some(val);
+            }
+        }
+        if let Ok(val) = std::env::var("ATEM_SSO_URL") {
+            if !val.is_empty() {
+                config.sso_url = Some(val);
+            }
+        }
 
         Ok(config)
     }
 
     /// Persist the config to disk.
     ///
-    /// - Credentials → encrypted `~/.config/atem/credentials.enc` (AES-256-GCM)
-    /// - Non-sensitive settings → `~/.config/atem/config.toml` (plaintext)
+    /// Non-sensitive settings → `~/.config/atem/config.toml` (plaintext)
     pub fn save_to_disk(&self) -> Result<()> {
         let path = Self::config_path();
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
-
-        // Save credentials to encrypted store
-        if let (Some(cid), Some(cs)) = (&self.customer_id, &self.customer_secret) {
-            CredentialStore::save(cid, cs)?;
-        }
 
         // Load existing config.toml so we don't clobber other keys
         let mut existing = if path.exists() {
@@ -141,10 +102,6 @@ impl AtemConfig {
         };
 
         let table = existing.as_table_mut().expect("config is a TOML table");
-
-        // Remove plaintext credentials from config.toml (migrated to credentials.enc)
-        table.remove("customer_id");
-        table.remove("customer_secret");
 
         // Write non-sensitive settings
         if let Some(ch) = &self.rtm_channel {
@@ -164,6 +121,18 @@ impl AtemConfig {
         }
         if let Some(ds) = &self.diagram_server_url {
             table.insert("diagram_server_url".into(), toml::Value::String(ds.clone()));
+        }
+        if let Some(bff) = &self.bff_url {
+            table.insert("bff_url".into(), toml::Value::String(bff.clone()));
+        }
+        if let Some(sso) = &self.sso_url {
+            table.insert("sso_url".into(), toml::Value::String(sso.clone()));
+        }
+        if self.bff_url.is_none() {
+            table.remove("bff_url");
+        }
+        if self.sso_url.is_none() {
+            table.remove("sso_url");
         }
 
         let content = toml::to_string_pretty(&existing)
@@ -190,7 +159,12 @@ impl AtemConfig {
     pub fn display_masked(&self) -> String {
         let mask = |opt: &Option<String>| -> String {
             match opt {
-                Some(s) if s.len() > 4 => format!("{}...{}", &s[..2], &s[s.len() - 2..]),
+                Some(s) if s.len() > 4 => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let start: String = chars[..2].iter().collect();
+                    let end: String = chars[chars.len() - 2..].iter().collect();
+                    format!("{}...{}", start, end)
+                }
                 Some(s) if !s.is_empty() => "****".to_string(),
                 _ => "(not set)".to_string(),
             }
@@ -198,8 +172,6 @@ impl AtemConfig {
 
         let mut lines = Vec::new();
         lines.push(format!("Config file: {}", Self::config_path().display()));
-        lines.push(format!("customer_id: {}", mask(&self.customer_id)));
-        lines.push(format!("customer_secret: {}", mask(&self.customer_secret)));
         lines.push(format!(
             "rtm_channel: {}",
             self.rtm_channel.as_deref().unwrap_or("(not set)")
@@ -221,26 +193,19 @@ impl AtemConfig {
             self.diagram_server_url.as_deref().unwrap_or("(not set)")
         ));
 
-        // Show credential source
-        let has_credentials = self.customer_id.is_some() && self.customer_secret.is_some();
-        if has_credentials {
-            let source = match self.credential_source {
-                CredentialSource::EnvVar => "from ENV",
-                CredentialSource::ConfigFile => "from encrypted store",
-                CredentialSource::Astation => "from Astation",
-                CredentialSource::None => "loaded",
-            };
-            lines.push(format!("Credentials: {}", source));
-        } else if self.customer_id.is_some() || self.customer_secret.is_some() {
-            // Partial credentials
-            let missing = if self.customer_id.is_none() {
-                "AGORA_CUSTOMER_ID"
-            } else {
-                "AGORA_CUSTOMER_SECRET"
-            };
-            lines.push(format!("Credentials: incomplete ({} not set)", missing));
-        } else {
-            lines.push("Credentials: (none) — run `atem pair` or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET".to_string());
+        // SSO login state
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        match crate::sso_auth::SsoSession::load() {
+            Some(session) if session.expires_at > now_secs => {
+                let expires = format_unix_timestamp_hhmm(session.expires_at);
+                lines.push(format!("SSO:    logged in  (expires {})", expires));
+            }
+            _ => {
+                lines.push("SSO:    not logged in  (run 'atem login')".to_string());
+            }
         }
 
         // Show active project info
@@ -258,11 +223,7 @@ impl AtemConfig {
             }
             None => {
                 lines.push(String::new());
-                if has_credentials {
-                    lines.push("Active project: (none) — run `atem list project`, then `atem project use <APP_ID>`".to_string());
-                } else {
-                    lines.push("Active project: (none) — get credentials first, then `atem list project`".to_string());
-                }
+                lines.push("Active project: (none) — run `atem list project`, then `atem project use <APP_ID>`".to_string());
             }
         }
 
@@ -305,6 +266,16 @@ impl AtemConfig {
         self.astation_relay_url
             .as_deref()
             .unwrap_or("https://station.agora.build")
+    }
+
+    /// Get the BFF URL with fallback default
+    pub fn effective_bff_url(&self) -> &str {
+        self.bff_url.as_deref().unwrap_or("https://agora-cli-bff.staging.la3.agoralab.co")
+    }
+
+    /// Get the SSO URL with fallback default
+    pub fn effective_sso_url(&self) -> &str {
+        self.sso_url.as_deref().unwrap_or("https://sso.agora.io")
     }
 }
 
@@ -463,103 +434,6 @@ fn derive_cache_key() -> [u8; 32] {
     result.into_bytes().into()
 }
 
-// ── Encrypted credential store (AES-256-GCM, machine-bound) ─────────
-
-/// Encrypted credentials stored at ~/.config/atem/credentials.enc
-///
-/// File format: nonce (12 bytes) || ciphertext || auth tag (16 bytes)
-/// Key: HMAC-SHA256(salt="atem-credentials-v1", machine_id)
-/// Matches Astation's CredentialManager pattern (AES-GCM + hardware-bound key).
-pub struct CredentialStore;
-
-#[derive(Serialize, Deserialize)]
-struct StoredCredentials {
-    customer_id: String,
-    customer_secret: String,
-}
-
-impl CredentialStore {
-    /// Encrypted credentials file path: ~/.config/atem/credentials.enc
-    pub fn path() -> PathBuf {
-        AtemConfig::config_dir().join("credentials.enc")
-    }
-
-    /// Derive a 32-byte AES-256 key from the machine ID.
-    fn derive_key() -> [u8; 32] {
-        type HmacSha256 = Hmac<Sha256>;
-        let machine_id = get_machine_id();
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(b"atem-credentials-v1")
-            .expect("HMAC accepts any key size");
-        mac.update(machine_id.as_bytes());
-        mac.finalize().into_bytes().into()
-    }
-
-    /// Save credentials to encrypted file.
-    pub fn save(customer_id: &str, customer_secret: &str) -> Result<()> {
-        let path = Self::path();
-        let dir = path.parent().unwrap();
-        fs::create_dir_all(dir)?;
-
-        let creds = StoredCredentials {
-            customer_id: customer_id.to_string(),
-            customer_secret: customer_secret.to_string(),
-        };
-        let plaintext = serde_json::to_vec(&creds)?;
-
-        let key = Self::derive_key();
-        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
-
-        // Generate random 96-bit nonce
-        let mut nonce_bytes = [0u8; 12];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
-
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-
-        // Write: nonce (12) || ciphertext+tag
-        let mut combined = Vec::with_capacity(12 + ciphertext.len());
-        combined.extend_from_slice(&nonce_bytes);
-        combined.extend_from_slice(&ciphertext);
-        fs::write(&path, &combined)?;
-
-        Ok(())
-    }
-
-    /// Load and decrypt credentials. Returns None on any failure.
-    pub fn load() -> Option<(String, String)> {
-        let path = Self::path();
-        let combined = fs::read(&path).ok()?;
-
-        if combined.len() < 12 + 16 {
-            // Too short: need at least nonce (12) + tag (16)
-            return None;
-        }
-
-        let (nonce_bytes, ciphertext) = combined.split_at(12);
-        let nonce = Nonce::<Aes256Gcm>::from_slice(nonce_bytes);
-
-        let key = Self::derive_key();
-        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
-
-        let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
-        let creds: StoredCredentials = serde_json::from_slice(&plaintext).ok()?;
-
-        Some((creds.customer_id, creds.customer_secret))
-    }
-
-    /// Delete the encrypted credential file.
-    pub fn delete() -> Result<()> {
-        let path = Self::path();
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
-    }
-}
-
 /// XOR-encrypt `plaintext` with a SHA256-based keystream derived from `key`.
 pub fn encrypt_field(plaintext: &str, key: &[u8; 32]) -> String {
     let pt = plaintext.as_bytes();
@@ -601,12 +475,12 @@ fn generate_keystream(key: &[u8; 32], len: usize) -> Vec<u8> {
 /// A single cached project with encrypted sign_key.
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedProject {
+    project_id: String,
     name: String,
-    vendor_key: String,
+    app_id: String,
     sign_key_encrypted: String,
-    id: String,
-    status: i32,
-    created: u64,
+    status: String,
+    created_at: String,
 }
 
 /// Encrypted project cache stored at ~/.config/atem/project_cache.json
@@ -622,17 +496,20 @@ impl ProjectCache {
     }
 
     /// Save projects to the encrypted cache.
-    pub fn save(projects: &[crate::agora_api::AgoraApiProject]) -> Result<()> {
+    pub fn save(projects: &[crate::agora_api::BffProject]) -> Result<()> {
         let key = derive_cache_key();
         let cached: Vec<CachedProject> = projects
             .iter()
             .map(|p| CachedProject {
+                project_id: p.project_id.clone(),
                 name: p.name.clone(),
-                vendor_key: p.vendor_key.clone(),
-                sign_key_encrypted: encrypt_field(&p.sign_key, &key),
-                id: p.id.clone(),
-                status: p.status,
-                created: p.created,
+                app_id: p.app_id.clone(),
+                sign_key_encrypted: encrypt_field(
+                    p.sign_key.as_deref().unwrap_or(""),
+                    &key,
+                ),
+                status: p.status.clone(),
+                created_at: p.created_at.clone(),
             })
             .collect();
 
@@ -646,7 +523,7 @@ impl ProjectCache {
     }
 
     /// Load projects from the encrypted cache.
-    pub fn load() -> Option<Vec<crate::agora_api::AgoraApiProject>> {
+    pub fn load() -> Option<Vec<crate::agora_api::BffProject>> {
         let path = Self::path();
         if !path.exists() {
             return None;
@@ -655,19 +532,19 @@ impl ProjectCache {
         let cache: ProjectCache = serde_json::from_str(&content).ok()?;
         let key = derive_cache_key();
 
-        let projects: Vec<crate::agora_api::AgoraApiProject> = cache
+        let projects: Vec<crate::agora_api::BffProject> = cache
             .projects
             .iter()
             .filter_map(|cp| {
-                let sign_key = decrypt_field(&cp.sign_key_encrypted, &key).ok()?;
-                Some(crate::agora_api::AgoraApiProject {
-                    id: cp.id.clone(),
+                let sign_key_str = decrypt_field(&cp.sign_key_encrypted, &key).ok()?;
+                let sign_key = if sign_key_str.is_empty() { None } else { Some(sign_key_str) };
+                Some(crate::agora_api::BffProject {
+                    project_id: cp.project_id.clone(),
                     name: cp.name.clone(),
-                    vendor_key: cp.vendor_key.clone(),
+                    app_id: cp.app_id.clone(),
                     sign_key,
-                    recording_server: None,
-                    status: cp.status,
-                    created: cp.created,
+                    status: cp.status.clone(),
+                    created_at: cp.created_at.clone(),
                 })
             })
             .collect();
@@ -676,13 +553,49 @@ impl ProjectCache {
     }
 
     /// Get a project by 1-based index from the cache.
-    pub fn get(index: usize) -> Option<crate::agora_api::AgoraApiProject> {
+    pub fn get(index: usize) -> Option<crate::agora_api::BffProject> {
         let projects = Self::load()?;
         if index == 0 || index > projects.len() {
             return None;
         }
         Some(projects[index - 1].clone())
     }
+}
+
+/// Format a Unix timestamp (seconds) as "YYYY-MM-DD HH:MM UTC".
+fn format_unix_timestamp_hhmm(secs: u64) -> String {
+    use crate::agora_api::is_leap_year;
+
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    let mut remaining_days = days_since_epoch as i64;
+    let mut year = 1970i64;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+    let days_in_months: [i64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 0;
+    for (i, &dim) in days_in_months.iter().enumerate() {
+        if remaining_days < dim {
+            month = i + 1;
+            break;
+        }
+        remaining_days -= dim;
+    }
+    let day = remaining_days + 1;
+    format!("{:04}-{:02}-{:02} {:02}:{:02} UTC", year, month, day, hours, minutes)
 }
 
 /// Persisted auth session at ~/.config/atem/session.json
@@ -733,13 +646,13 @@ mod tests {
     #[test]
     fn default_config_has_none_fields() {
         let config = AtemConfig::default();
-        assert!(config.customer_id.is_none());
-        assert!(config.customer_secret.is_none());
         assert!(config.rtm_channel.is_none());
         assert!(config.rtm_account.is_none());
         assert!(config.astation_ws.is_none());
         assert!(config.astation_relay_url.is_none());
         assert!(config.diagram_server_url.is_none());
+        assert!(config.bff_url.is_none());
+        assert!(config.sso_url.is_none());
     }
 
     #[test]
@@ -752,33 +665,51 @@ mod tests {
     }
 
     #[test]
-    fn toml_parsing() {
-        let toml_str = r#"
-            customer_id = "test_id"
-            customer_secret = "test_secret"
-            rtm_channel = "my_channel"
-        "#;
-        let config: AtemConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.customer_id.as_deref(), Some("test_id"));
-        assert_eq!(config.customer_secret.as_deref(), Some("test_secret"));
-        assert_eq!(config.rtm_channel(), "my_channel");
-        assert_eq!(config.rtm_account(), "atem01"); // default fallback
+    fn effective_bff_url_default() {
+        let config = AtemConfig::default();
+        assert_eq!(
+            config.effective_bff_url(),
+            "https://agora-cli-bff.staging.la3.agoralab.co"
+        );
     }
 
     #[test]
-    fn display_masked_hides_secrets() {
+    fn effective_bff_url_custom() {
         let config = AtemConfig {
-            customer_id: Some("abcdef123456".to_string()),
-            customer_secret: Some("secret_key_here".to_string()),
+            bff_url: Some("https://my-bff.example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_bff_url(), "https://my-bff.example.com");
+    }
+
+    #[test]
+    fn effective_sso_url_default() {
+        let config = AtemConfig::default();
+        assert_eq!(config.effective_sso_url(), "https://sso.agora.io");
+    }
+
+    #[test]
+    fn effective_sso_url_custom() {
+        let config = AtemConfig {
+            sso_url: Some("https://my-sso.example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_sso_url(), "https://my-sso.example.com");
+    }
+
+    #[test]
+    fn display_masked_shows_sso_not_logged_in() {
+        let config = AtemConfig {
             rtm_channel: Some("test_channel".to_string()),
             ..Default::default()
         };
         let display = config.display_masked();
-        assert!(display.contains("ab...56")); // customer_id masked
-        assert!(display.contains("se...re")); // customer_secret masked
         assert!(display.contains("test_channel")); // non-secret shown
-        assert!(!display.contains("abcdef123456")); // full value NOT shown
-        assert!(!display.contains("secret_key_here")); // full value NOT shown
+        assert!(display.contains("SSO:"));
+        assert!(display.contains("not logged in"));
+        // No credentials in config anymore
+        assert!(!display.contains("customer_id"));
+        assert!(!display.contains("customer_secret"));
     }
 
     #[test]
@@ -978,108 +909,6 @@ mod tests {
         assert!(display.contains("astation_relay_url"));
     }
 
-    // ── credential store tests ──────────────────────────────────────────
-
-    /// Helper to test AES-GCM encryption directly (avoids shared file conflicts).
-    fn test_encrypt_decrypt_credentials(cid: &str, csecret: &str) {
-        let key = CredentialStore::derive_key();
-        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
-
-        let creds = super::StoredCredentials {
-            customer_id: cid.to_string(),
-            customer_secret: csecret.to_string(),
-        };
-        let plaintext = serde_json::to_vec(&creds).unwrap();
-
-        let mut nonce_bytes = [0u8; 12];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
-
-        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
-
-        // Verify ciphertext doesn't contain plaintext
-        let ct_str = String::from_utf8_lossy(&ciphertext);
-        assert!(!ct_str.contains(cid));
-        assert!(!ct_str.contains(csecret));
-
-        // Decrypt
-        let decrypted = cipher.decrypt(nonce, ciphertext.as_ref()).unwrap();
-        let loaded: super::StoredCredentials = serde_json::from_slice(&decrypted).unwrap();
-        assert_eq!(loaded.customer_id, cid);
-        assert_eq!(loaded.customer_secret, csecret);
-    }
-
-    #[test]
-    fn credential_store_encrypt_decrypt() {
-        test_encrypt_decrypt_credentials("test-cid-abc123", "test-secret-xyz");
-    }
-
-    #[test]
-    fn credential_store_file_round_trip() {
-        // Use a temp file to avoid races with other tests
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
-
-        let key = CredentialStore::derive_key();
-        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
-
-        let creds = super::StoredCredentials {
-            customer_id: "file-test-id".to_string(),
-            customer_secret: "file-test-secret".to_string(),
-        };
-        let plaintext = serde_json::to_vec(&creds).unwrap();
-
-        let mut nonce_bytes = [0u8; 12];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
-
-        // Write combined: nonce || ciphertext+tag
-        let mut combined = Vec::new();
-        combined.extend_from_slice(&nonce_bytes);
-        combined.extend_from_slice(&ciphertext);
-        fs::write(&path, &combined).unwrap();
-
-        // Verify file is not readable as plaintext
-        let raw_bytes = fs::read(&path).unwrap();
-        let raw = String::from_utf8_lossy(&raw_bytes);
-        assert!(!raw.contains("file-test-id"));
-
-        // Read back and decrypt
-        let data = fs::read(&path).unwrap();
-        let (n, ct) = data.split_at(12);
-        let decrypted = cipher.decrypt(
-            aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(n),
-            ct,
-        ).unwrap();
-        let loaded: super::StoredCredentials = serde_json::from_slice(&decrypted).unwrap();
-        assert_eq!(loaded.customer_id, "file-test-id");
-        assert_eq!(loaded.customer_secret, "file-test-secret");
-    }
-
-    #[test]
-    fn credential_store_tampered_data_fails() {
-        let key = CredentialStore::derive_key();
-        let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new((&key).into());
-
-        let plaintext = b"test data";
-        let mut nonce_bytes = [0u8; 12];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::from_slice(&nonce_bytes);
-        let mut ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
-
-        // Tamper: flip a byte
-        if !ciphertext.is_empty() {
-            ciphertext[0] ^= 0xFF;
-        }
-
-        // Decryption must fail (AES-GCM auth tag mismatch)
-        assert!(cipher.decrypt(nonce, ciphertext.as_ref()).is_err());
-    }
-
     // ── project cache + crypto tests ────────────────────────────────────
 
     #[test]
@@ -1102,26 +931,24 @@ mod tests {
 
     #[test]
     fn project_cache_round_trip() {
-        use crate::agora_api::AgoraApiProject;
+        use crate::agora_api::BffProject;
 
         let projects = vec![
-            AgoraApiProject {
-                id: "id1".to_string(),
+            BffProject {
+                project_id: "pid1".to_string(),
                 name: "Project One".to_string(),
-                vendor_key: "appid1".to_string(),
-                sign_key: "secret-cert-1".to_string(),
-                recording_server: None,
-                status: 1,
-                created: 1700000000,
+                app_id: "appid1".to_string(),
+                sign_key: Some("secret-cert-1".to_string()),
+                status: "active".to_string(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
             },
-            AgoraApiProject {
-                id: "id2".to_string(),
+            BffProject {
+                project_id: "pid2".to_string(),
                 name: "Project Two".to_string(),
-                vendor_key: "appid2".to_string(),
-                sign_key: "".to_string(),
-                recording_server: None,
-                status: 0,
-                created: 1700000001,
+                app_id: "appid2".to_string(),
+                sign_key: None,
+                status: "inactive".to_string(),
+                created_at: "2025-01-02T00:00:00Z".to_string(),
             },
         ];
 
@@ -1131,19 +958,19 @@ mod tests {
         // Verify the file exists and sign_key is NOT in plaintext
         let raw = fs::read_to_string(ProjectCache::path()).unwrap();
         assert!(!raw.contains("secret-cert-1"), "sign_key should be encrypted on disk");
-        assert!(raw.contains("appid1"), "vendor_key (non-sensitive) should be readable");
+        assert!(raw.contains("appid1"), "app_id (non-sensitive) should be readable");
 
         // Load and verify
         let loaded = ProjectCache::load().expect("cache should load");
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].name, "Project One");
-        assert_eq!(loaded[0].sign_key, "secret-cert-1");
-        assert_eq!(loaded[1].sign_key, "");
+        assert_eq!(loaded[0].sign_key.as_deref(), Some("secret-cert-1"));
+        assert!(loaded[1].sign_key.is_none());
 
         // Also test get-by-index (1-based) on the same data to avoid file races
         let p1 = ProjectCache::get(1).expect("index 1 should exist");
         assert_eq!(p1.name, "Project One");
-        assert_eq!(p1.sign_key, "secret-cert-1");
+        assert_eq!(p1.sign_key.as_deref(), Some("secret-cert-1"));
 
         let p2 = ProjectCache::get(2).expect("index 2 should exist");
         assert_eq!(p2.name, "Project Two");
@@ -1151,5 +978,15 @@ mod tests {
         // Out of range
         assert!(ProjectCache::get(0).is_none());
         assert!(ProjectCache::get(3).is_none());
+    }
+
+    #[test]
+    fn format_unix_timestamp_hhmm_known_date() {
+        // 1743497400 = 2025-04-01 08:50:00 UTC
+        let ts = 1743497400u64;
+        let result = format_unix_timestamp_hhmm(ts);
+        assert!(result.contains("UTC"), "should contain UTC");
+        assert!(result.contains("08:50"), "should contain HH:MM");
+        assert!(result.contains("2025-04-01"), "should contain date");
     }
 }
