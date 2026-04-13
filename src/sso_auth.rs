@@ -1,5 +1,7 @@
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -140,6 +142,99 @@ pub async fn refresh_token(refresh_token: &str, sso_url: &str) -> Result<SsoSess
     }
 
     parse_token_response(resp).await
+}
+
+/// Full OAuth 2.0 + PKCE browser login flow.
+/// Opens the browser (falls back to printing URL), waits for the loopback callback,
+/// exchanges the code for tokens, saves the session, and returns it.
+pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
+    let (verifier, challenge) = generate_pkce();
+    let state = generate_state();
+
+    // Bind on a random port
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", port);
+
+    let auth_url = format!(
+        "{}/api/v0/oauth/authorize?response_type=code&client_id={}\
+         &redirect_uri={}&scope=basic_info,console&state={}\
+         &code_challenge={}&code_challenge_method=S256",
+        sso_url,
+        CLIENT_ID,
+        urlencoding::encode(&redirect_uri),
+        state,
+        challenge,
+    );
+
+    println!("Opening browser for Agora Console login...");
+    println!("  {}", auth_url);
+    let _ = crate::rtc_test_server::open_browser(&auth_url);
+    println!("Waiting for login to complete...");
+
+    // Accept exactly one connection on the loopback
+    let (mut stream, _) = listener.accept().await?;
+    let mut buf = vec![0u8; 4096];
+    let n = stream.read(&mut buf).await?;
+    let request = String::from_utf8_lossy(&buf[..n]);
+
+    // Parse the request line: "GET /oauth/callback?code=xxx&state=yyy HTTP/1.1"
+    let query = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|path| path.split_once('?').map(|(_, q)| q))
+        .unwrap_or("");
+
+    let mut code = String::new();
+    let mut returned_state = String::new();
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("code=") {
+            code = urlencoding::decode(v).unwrap_or_default().into_owned();
+        } else if let Some(v) = pair.strip_prefix("state=") {
+            returned_state = urlencoding::decode(v).unwrap_or_default().into_owned();
+        }
+    }
+
+    // Send success page before validating (browser is waiting)
+    let body = "<html><body><h2>Login successful — return to the terminal.</h2></body></html>";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    drop(stream);
+
+    if returned_state != state {
+        anyhow::bail!("OAuth state mismatch — possible CSRF. Try 'atem login' again.");
+    }
+    if code.is_empty() {
+        anyhow::bail!("No authorization code received from OAuth server.");
+    }
+
+    // Exchange code for tokens
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v0/oauth/token", sso_url))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", code.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+        ])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Token exchange failed ({status}): {body}");
+    }
+
+    let session = parse_token_response(resp).await?;
+    session.save()?;
+    Ok(session)
 }
 
 /// Parse the JSON token response into an SsoSession.
