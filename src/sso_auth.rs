@@ -1,5 +1,9 @@
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::RngCore;
+use reqwest;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,9 +74,88 @@ impl SsoSession {
             .as_secs()
     }
 
-    pub fn is_expired(&self) -> bool {
+    pub fn needs_refresh(&self) -> bool {
         self.expires_at < Self::now_secs() + 60
     }
+}
+
+/// Generate a PKCE (code_verifier, code_challenge) pair.
+/// verifier: 32 random bytes → base64url
+/// challenge: SHA-256(verifier) → base64url
+pub fn generate_pkce() -> (String, String) {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let hash = Sha256::digest(verifier.as_bytes());
+    let challenge = URL_SAFE_NO_PAD.encode(hash);
+    (verifier, challenge)
+}
+
+/// Generate a random state token for CSRF protection.
+pub fn generate_state() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Load session from canonical path, refresh if near-expiry, return access token.
+/// Returns Err if no session file exists.
+pub async fn valid_token(sso_url: &str) -> Result<String> {
+    valid_token_from(&SsoSession::session_path(), sso_url).await
+}
+
+/// Path-injectable version used in tests.
+pub async fn valid_token_from(path: &std::path::Path, sso_url: &str) -> Result<String> {
+    let mut session = SsoSession::load_from(path)
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+
+    if session.needs_refresh() {
+        session = refresh_token(&session.refresh_token, sso_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("Session expired. Run 'atem login' to re-authenticate. ({e})"))?;
+        session.save_to(path)?;
+    }
+
+    Ok(session.access_token.clone())
+}
+
+/// Exchange a refresh_token for a new SsoSession.
+pub async fn refresh_token(refresh_token: &str, sso_url: &str) -> Result<SsoSession> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v0/oauth/token", sso_url))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "agora_web_cli"),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Token refresh failed ({status}): {body}");
+    }
+
+    parse_token_response(resp).await
+}
+
+/// Parse the JSON token response into an SsoSession.
+async fn parse_token_response(resp: reqwest::Response) -> Result<SsoSession> {
+    #[derive(Deserialize)]
+    struct TokenResp {
+        access_token: String,
+        refresh_token: String,
+        expires_in: u64,
+    }
+    let tr: TokenResp = resp.json().await?;
+    let expires_at = SsoSession::now_secs() + tr.expires_in;
+    Ok(SsoSession {
+        access_token: tr.access_token,
+        refresh_token: tr.refresh_token,
+        expires_at,
+    })
 }
 
 #[cfg(test)]
@@ -100,6 +183,7 @@ mod tests {
         let loaded = SsoSession::load_from(&path).unwrap();
         assert_eq!(loaded.access_token, "access_abc");
         assert_eq!(loaded.refresh_token, "refresh_xyz");
+        assert_eq!(loaded.expires_at, session.expires_at);
     }
 
     #[test]
@@ -123,5 +207,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no_such_file.json");
         assert!(SsoSession::load_from(&path).is_none());
+    }
+
+    #[test]
+    fn pkce_challenge_is_base64url_of_sha256_verifier() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use sha2::{Digest, Sha256};
+
+        let (v, c) = generate_pkce();
+        // Verify the challenge is SHA256(verifier) base64url
+        let computed = {
+            let hash = Sha256::digest(v.as_bytes());
+            URL_SAFE_NO_PAD.encode(hash)
+        };
+        assert_eq!(c, computed, "challenge must be base64url(SHA256(verifier))");
+        assert!(v.len() >= 40, "verifier must be at least 40 chars");
+    }
+
+    #[test]
+    fn valid_token_returns_error_when_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_session.json");
+        // No file written — should error
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(valid_token_from(&path, "https://sso.agora.io"));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Not logged in"), "got: {}", msg);
     }
 }
