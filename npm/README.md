@@ -22,9 +22,9 @@ atem repl                               # Interactive REPL with AI command inter
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
 atem logout                             # Log out from SSO
-atem pair                                # Pair with Astation
-atem pair --save                         # Pair and save credentials for offline use
-atem unpair                              # Unpair from Astation
+atem pair                               # Pair with Astation
+atem pair --save                        # Pair and save credentials for offline use
+atem unpair                             # Unpair from Astation
 ```
 
 Two ways to authenticate:
