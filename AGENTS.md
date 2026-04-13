@@ -15,7 +15,7 @@ cargo build                              # Debug build
 cargo build --release                    # Release build
 cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
-cargo test                               # Run tests (470+ tests)
+cargo test                               # Run tests (500+ tests)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
@@ -37,7 +37,8 @@ src/
 ├── token.rs             # Agora RTC/RTM token generation
 ├── rtm_client.rs        # Agora RTM FFI wrapper with async Tokio channels
 ├── ai_client.rs         # Anthropic API client for intent parsing
-├── sso_auth.rs          # OAuth 2.0 + PKCE login flow, token refresh, session storage
+├── sso_auth.rs          # OAuth 2.0 + PKCE login flow, token refresh primitives
+├── credentials.rs       # Encrypted multi-entry credential store (SSO + paired)
 ├── agora_api.rs         # BFF API client (BffProject, fetch_projects with Bearer auth)
 ├── auth.rs              # Astation auth session management, deep link flow
 ├── config.rs            # Config, SSO/BFF URL helpers, active project, project cache
@@ -130,25 +131,42 @@ Key methods:
 | File | Contents | Encryption |
 |------|----------|------------|
 | `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) | None |
-| `sso_session.json` | OAuth access token, refresh token, expiry | None (chmod 0600) |
+| `credentials.enc` | SSO + paired tokens (multi-entry `Vec<CredentialEntry>`) | AES-256-GCM (machine-bound) |
 | `active_project.json` | Selected project's `app_id`, `name`, encrypted `app_certificate` | XOR keystream |
 | `project_cache.json` | All projects from `atem list project` with encrypted certificates | XOR keystream |
 | `session.json` | Astation auth session ID + expiry | None |
 
+**Credentials** (`credentials.rs`):
+- `CredentialStore` wraps `Vec<CredentialEntry>`, AES-256-GCM encryption with HMAC-SHA256(machine-id) key derivation — file cannot be decrypted on another machine
+- Each entry is either `source: sso` (own login) or `source: astation_paired` (from `atem pair`)
+- `CredentialStore::resolve(connected_astation_id, now)` priority:
+  1. Paired entry matching the currently connected Astation (active connection wins)
+  2. Own SSO entry (from `atem login`)
+  3. Paired entry with `save_credentials: true` (offline-capable)
+  4. Paired entry within 5 min grace period after disconnect
+- `disconnected_at` is stamped when Astation WS drops; cleared on reconnect via `SsoTokenSync`
+
 **SSO auth** (`sso_auth.rs`):
-- `atem login` — OAuth 2.0 + PKCE browser flow against `sso2.agora.io`; loopback redirect on random port; falls back to paste-URL after 15s
-- `atem logout` — deletes `sso_session.json`
-- `SsoSession::valid_token(sso_url)` — loads session, refreshes if expiring within 60s, returns access token
-- Project listing and `project use <APP_ID>` both call `valid_token()` then hit the BFF API
+- `atem login` — OAuth 2.0 + PKCE browser flow against `sso2.agora.io`; writes an `sso` entry to `credentials.enc`
+- `atem logout` — removes the `sso` entry from `credentials.enc`
+- `atem pair [--save]` — connect to Astation, send `PairSavePreference`, wait for `SsoTokenSync`, write paired entry
+- `atem unpair` — remove all paired entries
+- `valid_token(connected_astation_id, sso_url)` — resolves via priority chain, refreshes if expiring within 60s, returns access token
 
 **BFF API** (`agora_api.rs`):
 - `fetch_projects(access_token, bff_url)` — `GET {bff_url}/api/cli/v1/projects`, Bearer auth, returns `Vec<BffProject>`
 - Default BFF URL: `https://agora-cli.agora.io` (override via `ATEM_BFF_URL` or `bff_url` in config.toml)
 - Default SSO URL: `https://sso2.agora.io` (override via `ATEM_SSO_URL` or `sso_url` in config.toml)
 
-**`atem config show`** displays SSO state and active project:
-- `SSO:    logged in  (expires YYYY-MM-DD HH:MM UTC)`
-- `SSO:    not logged in  (run 'atem login')`
+**`atem config show`** displays credentials + active project:
+```
+SSO:      logged in  (52a4f560...)
+Paired:   astation-<uuid>  (SSO: 52a4f560...)  [save: yes]
+```
+
+**WebSocket messages** (`websocket_client.rs`):
+- `SsoTokenSync { access_token, refresh_token, expires_at, login_id, astation_id, save_credentials }` — Astation → Atem, after pair or on Astation-side refresh
+- `PairSavePreference { save_credentials }` — Atem → Astation during `atem pair`, communicates user's save choice
 
 **Active project resolution** (`ActiveProject::resolve_app_id/resolve_app_certificate`):
 1. CLI flag (`--app-id`)
