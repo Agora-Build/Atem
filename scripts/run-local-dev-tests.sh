@@ -205,9 +205,12 @@ if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HO
     if [[ -n "$COMBO_TOK" ]]; then
         decoded="$("$ATEM" token rtc decode "$COMBO_TOK" 2>&1)"
         printf "  %s ... " "$(dim "decoded RTC+RTM token shows RTC User / RTM User / Channel")"
-        if echo "$decoded" | grep -q "RTC User: 42" \
-            && echo "$decoded" | grep -q "RTM User: alice" \
-            && echo "$decoded" | grep -q "Channel: smoketest"; then
+        if echo "$decoded" | grep -q "RTC User  *42" \
+            && echo "$decoded" | grep -q "RTM User  *alice" \
+            && echo "$decoded" | grep -q "Channel  *smoketest" \
+            && echo "$decoded" | grep -q "TOKEN INFO" \
+            && echo "$decoded" | grep -q "VALIDITY" \
+            && echo "$decoded" | grep -q "SERVICES"; then
             green "PASS"; echo
             PASS=$((PASS + 1))
         else
@@ -239,7 +242,7 @@ if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HO
     if [[ -n "$RTC_RTM_TOKEN" ]]; then
         DECODED="$("$ATEM" token rtc decode "$RTC_RTM_TOKEN" 2>&1)"
         printf "  %s ... " "$(dim "atem token rtc decode (int+with-rtm) shows both services")"
-        if echo "$DECODED" | grep -q "Service: RTC" && echo "$DECODED" | grep -q "Service: RTM"; then
+        if echo "$DECODED" | grep -q "^  RTC (type 1)" && echo "$DECODED" | grep -q "^  RTM (type 2)"; then
             green "PASS"; echo
             PASS=$((PASS + 1))
         else
@@ -268,7 +271,7 @@ if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HO
     RTC_TOKEN="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --expire 600 2>/dev/null \
         | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
     if [[ -n "$RTC_TOKEN" ]]; then
-        run_contains "atem token rtc decode"                    "Service" -- "$ATEM" token rtc decode "$RTC_TOKEN"
+        run_contains "atem token rtc decode"                    "SERVICES" -- "$ATEM" token rtc decode "$RTC_TOKEN"
         # Negative: garbage input should fail cleanly
         run "atem token rtc decode (garbage) fails" 1            -- "$ATEM" token rtc decode "not-a-real-token"
     else

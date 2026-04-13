@@ -257,6 +257,7 @@ pub fn decode_token(token: &str) -> Result<TokenInfo> {
     }
 
     Ok(TokenInfo {
+        version: access_token::VERSION.to_string(),
         app_id,
         issue_ts,
         expire,
@@ -268,6 +269,8 @@ pub fn decode_token(token: &str) -> Result<TokenInfo> {
 /// Decoded token info for display.
 #[derive(Debug)]
 pub struct TokenInfo {
+    /// Token format version — the 3-char prefix (e.g. "007").
+    pub version: String,
     pub app_id: String,
     pub issue_ts: u32,
     pub expire: u32,
@@ -289,60 +292,167 @@ pub struct ServiceInfo {
 }
 
 impl TokenInfo {
+    /// The absolute unix timestamp at which the token expires.
+    pub fn expires_at(&self) -> u64 {
+        self.issue_ts as u64 + self.expire as u64
+    }
+
+    /// Render the decoded token info as a human-readable multi-line string.
     pub fn display(&self) -> String {
-        let mut lines = Vec::new();
-        lines.push(format!("App ID: {}", self.app_id));
+        self.display_at(now_secs())
+    }
+
+    /// Same as `display` but with an injectable "now" for deterministic tests.
+    pub fn display_at(&self, now: u64) -> String {
+        const RULE: &str = "────────────────────────────────────────────────────────────────────────";
+        let mut lines: Vec<String> = Vec::new();
+
+        // ── Token info ────────────────────────────────────────────────
+        lines.push(String::new());
+        lines.push("  TOKEN INFO".to_string());
+        lines.push(format!("  {}", RULE));
+        lines.push(format!("     Version             {}", self.version));
+        lines.push(format!("     App ID              {}", self.app_id));
+
+        // ── Validity ─────────────────────────────────────────────────
+        let exp = self.expires_at();
+        lines.push(String::new());
+        lines.push("  VALIDITY".to_string());
+        lines.push(format!("  {}", RULE));
         lines.push(format!(
-            "Issued at: {} ({})",
-            self.issue_ts,
+            "     Valid from          {}",
             format_timestamp(self.issue_ts)
         ));
-        lines.push(format!("Expire: {}s", self.expire));
-        lines.push(format!("Salt: {}", self.salt));
+        lines.push(format!(
+            "     Valid until         {}",
+            format_timestamp_u64(exp)
+        ));
+        let status = if now < self.issue_ts as u64 {
+            format!(
+                "not yet valid — starts in {}",
+                format_relative_duration(self.issue_ts as u64 - now)
+            )
+        } else if now < exp {
+            format!(
+                "yes — expires in {}",
+                format_relative_duration(exp - now)
+            )
+        } else {
+            format!(
+                "EXPIRED — ended {} ago",
+                format_relative_duration(now - exp)
+            )
+        };
+        lines.push(format!("     Valid now           {}", status));
+
+        // ── Services ─────────────────────────────────────────────────
+        lines.push(String::new());
+        lines.push("  SERVICES".to_string());
+        lines.push(format!("  {}", RULE));
         for svc in &self.services {
-            let svc_name = match svc.service_type {
+            let name = match svc.service_type {
                 1 => "RTC",
                 2 => "RTM",
                 4 => "FPA",
                 5 => "Chat",
+                7 => "APaaS",
                 _ => "Unknown",
             };
-            lines.push(format!(
-                "Service: {} (type={})",
-                svc_name, svc.service_type
-            ));
+            lines.push(String::new());
+            lines.push(format!("  {} (type {})", name, svc.service_type));
             if let Some(ch) = &svc.channel {
-                lines.push(format!("  Channel: {}", ch));
+                lines.push(format!("     Channel             {}", ch));
             }
             if let Some(uid) = &svc.rtc_user_id {
-                // Token stores this as a raw string. Don't infer int-vs-string
-                // mode — that's a client-side concern and isn't encoded here.
-                lines.push(format!("  RTC User: {}", uid));
+                lines.push(format!("     RTC User            {}", uid));
             }
             if let Some(uid) = &svc.rtm_user_id {
-                lines.push(format!("  RTM User: {}", uid));
+                lines.push(format!("     RTM User            {}", uid));
             }
-            for (&k, &v) in &svc.privileges {
-                let priv_name = match (svc.service_type, k) {
-                    (1, 1) => "joinChannel",
-                    (1, 2) => "publishAudio",
-                    (1, 3) => "publishVideo",
-                    (1, 4) => "publishData",
-                    (2, 1) => "login",
-                    _ => "unknown",
-                };
-                lines.push(format!(
-                    "  {}: expire {}s",
-                    priv_name, v,
-                ));
+            if !svc.privileges.is_empty() {
+                lines.push("     Privileges".to_string());
+                // Sort privileges by key for stable output
+                let mut keys: Vec<u16> = svc.privileges.keys().copied().collect();
+                keys.sort();
+                for k in keys {
+                    let v = svc.privileges[&k];
+                    let priv_name = match (svc.service_type, k) {
+                        (1, 1) => "joinChannel",
+                        (1, 2) => "publishAudio",
+                        (1, 3) => "publishVideo",
+                        (1, 4) => "publishData",
+                        (2, 1) => "login",
+                        _ => "unknown",
+                    };
+                    lines.push(format!(
+                        "        {:<16}expires in {}",
+                        priv_name,
+                        format_relative_duration(v as u64)
+                    ));
+                }
             }
         }
+
+        lines.push(String::new());
+        lines.push(format!("  {}", RULE));
+        lines.push(format!("  Decoded at {}", format_timestamp_u64(now)));
         lines.join("\n")
     }
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Format a relative duration in the largest sensible unit (e.g. "3 days",
+/// "59 minutes", "42 seconds"). Always uses whole-number units for readability.
+fn format_relative_duration(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+
+    if secs >= DAY {
+        let d = secs / DAY;
+        let h = (secs % DAY) / HOUR;
+        if h > 0 {
+            format!("{}d {}h", d, h)
+        } else {
+            format!("{}d", d)
+        }
+    } else if secs >= HOUR {
+        let h = secs / HOUR;
+        let m = (secs % HOUR) / MIN;
+        if m > 0 {
+            format!("{}h {}m", h, m)
+        } else {
+            format!("{}h", h)
+        }
+    } else if secs >= MIN {
+        let m = secs / MIN;
+        let s = secs % MIN;
+        if s > 0 {
+            format!("{}m {}s", m, s)
+        } else {
+            format!("{}m", m)
+        }
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 fn format_timestamp(ts: u32) -> String {
-    let secs = ts as u64;
+    format_timestamp_impl(ts as u64)
+}
+
+/// Like format_timestamp but takes a u64 (for values that may exceed u32).
+fn format_timestamp_u64(ts: u64) -> String {
+    format_timestamp_impl(ts)
+}
+
+fn format_timestamp_impl(secs: u64) -> String {
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let h = time_of_day / 3600;
@@ -908,8 +1018,8 @@ mod tests {
         .unwrap();
         let info = decode_token(&token).unwrap();
         let display = info.display();
-        assert!(display.contains("Channel: mychan"), "display missing channel: {display}");
-        assert!(display.contains("RTC User: alice"), "display missing RTC user: {display}");
+        assert!(display.contains("Channel             mychan"), "display missing channel:\n{display}");
+        assert!(display.contains("RTC User            alice"), "display missing RTC user:\n{display}");
     }
 
     #[test]
@@ -918,7 +1028,7 @@ mod tests {
             build_token_rtm(TEST_APP_ID, TEST_APP_CERT, "alice_rtm", 3600, 0).unwrap();
         let info = decode_token(&token).unwrap();
         let display = info.display();
-        assert!(display.contains("RTM User: alice_rtm"), "display missing RTM user: {display}");
+        assert!(display.contains("RTM User            alice_rtm"), "display missing RTM user:\n{display}");
     }
 
     #[test]
@@ -931,9 +1041,90 @@ mod tests {
         .unwrap();
         let info = decode_token(&token).unwrap();
         let display = info.display();
-        assert!(display.contains("Channel: combined_chan"));
-        assert!(display.contains("RTC User: 42"));
-        assert!(display.contains("RTM User: rtm_alice"));
+        assert!(display.contains("Channel             combined_chan"));
+        assert!(display.contains("RTC User            42"));
+        assert!(display.contains("RTM User            rtm_alice"));
+    }
+
+    #[test]
+    fn display_shows_version_validity_and_sections() {
+        // Build a token issued at a known ts so we can check the validity output.
+        let token = build_token_rtc_with_rtm(
+            TEST_APP_ID, TEST_APP_CERT, "demo",
+            RtcAccount::parse("42"), Role::Publisher, 3600, 3600,
+            Some("alice"),
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        // Pretend "now" is exactly halfway through the token's lifetime.
+        let now = info.issue_ts as u64 + 1800;
+        let display = info.display_at(now);
+
+        // Section headers
+        assert!(display.contains("TOKEN INFO"),  "missing TOKEN INFO:\n{display}");
+        assert!(display.contains("VALIDITY"),    "missing VALIDITY:\n{display}");
+        assert!(display.contains("SERVICES"),    "missing SERVICES:\n{display}");
+
+        // Version
+        assert!(display.contains("Version"));
+        assert!(display.contains("007"));
+
+        // Validity lines
+        assert!(display.contains("Valid from"));
+        assert!(display.contains("Valid until"));
+        assert!(display.contains("Valid now"));
+        assert!(display.contains("expires in 30m"),
+            "expected 'expires in 30m', got:\n{display}");
+
+        // Service data
+        assert!(display.contains("RTC"));
+        assert!(display.contains("Channel             demo"));
+        assert!(display.contains("RTC User            42"));
+        assert!(display.contains("RTM User            alice"));
+        assert!(display.contains("joinChannel"));
+        assert!(display.contains("login"));
+
+        // Footer
+        assert!(display.contains("Decoded at"));
+    }
+
+    #[test]
+    fn display_flags_expired_token() {
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Publisher, 60, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        let way_later = info.issue_ts as u64 + 10_000;
+        let display = info.display_at(way_later);
+        assert!(display.contains("EXPIRED"), "expected EXPIRED:\n{display}");
+    }
+
+    #[test]
+    fn display_flags_not_yet_valid_token() {
+        let token = build_token_rtc(
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Publisher, 60, 0,
+        )
+        .unwrap();
+        let info = decode_token(&token).unwrap();
+        // Simulate a "now" before the token was issued (clock skew case)
+        let earlier = info.issue_ts as u64 - 120;
+        let display = info.display_at(earlier);
+        assert!(display.contains("not yet valid"), "expected 'not yet valid':\n{display}");
+    }
+
+    #[test]
+    fn format_relative_duration_boundaries() {
+        assert_eq!(format_relative_duration(0), "0s");
+        assert_eq!(format_relative_duration(45), "45s");
+        assert_eq!(format_relative_duration(60), "1m");
+        assert_eq!(format_relative_duration(90), "1m 30s");
+        assert_eq!(format_relative_duration(3600), "1h");
+        assert_eq!(format_relative_duration(3665), "1h 1m");
+        assert_eq!(format_relative_duration(86_400), "1d");
+        assert_eq!(format_relative_duration(90_061), "1d 1h");
     }
 
     #[test]
