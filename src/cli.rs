@@ -375,6 +375,8 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         },
         Commands::Project { project_command } => match project_command {
             ProjectCommands::Use { app_id_or_index } => {
+                // Index path reads from local ProjectCache — no network call needed.
+                // App ID path fetches from the BFF API to resolve name + certificate.
                 if let Ok(idx) = app_id_or_index.parse::<usize>() {
                     let project = crate::config::ProjectCache::get(idx).ok_or_else(|| {
                         let hint = match crate::config::ProjectCache::load() {
@@ -396,7 +398,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 } else {
                     let config = crate::config::AtemConfig::load()?;
                     let token = crate::sso_auth::valid_token(config.effective_sso_url()).await
-                        .map_err(|_| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
                     let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
                     if let Err(e) = crate::config::ProjectCache::save(&projects) {
                         eprintln!("Warning: could not cache projects: {}", e);
@@ -448,7 +450,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             ListCommands::Project { show_certificates } => {
                 let config = crate::config::AtemConfig::load()?;
                 let token = crate::sso_auth::valid_token(config.effective_sso_url()).await
-                    .map_err(|_| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
                 if let Err(e) = crate::config::ProjectCache::save(&projects) {
                     eprintln!("Warning: could not cache projects: {}", e);
@@ -461,7 +463,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Login => {
             let config = crate::config::AtemConfig::load()?;
             let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
-            println!("Logged in successfully. Session expires at {}.", session.expires_at);
+            let remaining = session.expires_at.saturating_sub(crate::sso_auth::SsoSession::now_secs());
+            let hours = remaining / 3600;
+            println!("Logged in. Session valid for {}h.", hours);
             Ok(())
         }
         Commands::Logout => {
