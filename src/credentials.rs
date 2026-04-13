@@ -697,6 +697,49 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_sets_timestamp_and_grace_applies() {
+        // Simulates what App::on_astation_disconnect does.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.enc");
+        let mut store = CredentialStore::load_from(&path);
+        store.upsert(CredentialEntry::new_paired(
+            "paired_tok".into(), "r".into(), now() + 3600, None,
+            "ast-1".into(), false, 100,
+        ));
+        store.save_to(&path).unwrap();
+
+        // simulate disconnect
+        let mut store = CredentialStore::load_from(&path);
+        if let Some(e) = store.find_paired_mut("ast-1") {
+            e.disconnected_at = Some(now());
+        }
+        store.save_to(&path).unwrap();
+
+        // Reload — disconnected_at persisted
+        let store = CredentialStore::load_from(&path);
+        let e = store.find_paired("ast-1").unwrap();
+        assert!(e.disconnected_at.is_some());
+
+        // Within grace: usable
+        assert!(store.resolve(None, now() + 60).is_ok());
+        // Past grace: not usable
+        assert!(store.resolve(None, now() + 400).is_err());
+    }
+
+    #[test]
+    fn saved_paired_survives_disconnect_forever() {
+        // save_credentials=true → grace period is irrelevant, always resolves
+        let mut e = CredentialEntry::new_paired(
+            "saved_tok".into(), "r".into(), now() + 3600, None,
+            "ast-1".into(), true, 100,
+        );
+        e.disconnected_at = Some(now() - 10_000); // disconnected forever
+        let store = CredentialStore { entries: vec![e] };
+        let r = store.resolve(None, now()).unwrap();
+        assert_eq!(r.access_token, "saved_tok");
+    }
+
+    #[test]
     fn paired_source_respects_save_credentials_flag() {
         let saved = CredentialEntry::new_paired(
             "t".into(), "r".into(), 100, None, "ast".into(), true, 100,

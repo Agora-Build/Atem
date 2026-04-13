@@ -87,6 +87,8 @@ pub struct App {
     pub token_info: Option<TokenInfo>,
     pub astation_client: AstationClient,
     pub astation_connected: bool,
+    /// Astation instance ID when currently connected (from CredentialSync or auth flow).
+    pub connected_astation_id: Option<String>,
     pub codex_client: CodexClient,
     pub codex_output_log: String,
     pub codex_raw_log: String,
@@ -211,6 +213,7 @@ impl App {
             token_info: None,
             astation_client: AstationClient::new(),
             astation_connected: false,
+            connected_astation_id: None,
             codex_client: CodexClient::new(),
             codex_output_log: String::new(),
             codex_raw_log: String::new(),
@@ -347,10 +350,11 @@ impl App {
                 self.mode = AppMode::TokenGeneration; // Reusing this mode for project listing
                 self.output_text = "\u{1f4cb} Fetching Agora Projects...\n\n".to_string();
 
-                // Fetch projects via SSO token
+                // Fetch projects via SSO token (paired Astation takes priority when connected)
+                let connected_aid = self.connected_astation_id.clone();
                 let fetch_result = async {
-                    let token = crate::sso_auth::valid_token(None, self.config.effective_sso_url()).await
-                        .map_err(|_| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+                    let token = crate::sso_auth::valid_token(connected_aid.as_deref(), self.config.effective_sso_url()).await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
                     crate::agora_api::fetch_projects(&token, self.config.effective_bff_url()).await
                 }.await;
 
@@ -1995,21 +1999,67 @@ impl App {
             AstationMessage::CredentialSync {
                 customer_id,
                 customer_secret,
-                ..
+                astation_id,
             } => {
                 let id_preview = customer_id[..4.min(customer_id.len())].to_string();
 
                 // Store in memory for this session (available immediately)
                 self.synced_customer_id = Some(customer_id.clone());
                 self.synced_customer_secret = Some(customer_secret.clone());
+                if let Some(aid) = astation_id {
+                    self.connected_astation_id = Some(aid);
+                }
 
                 self.status_message = Some(format!(
                     "\u{1f511} Credentials synced from Astation ({}...)",
                     id_preview
                 ));
             }
+            AstationMessage::SsoTokenSync {
+                access_token,
+                refresh_token,
+                expires_at,
+                login_id,
+                astation_id,
+                save_credentials,
+            } => {
+                let mut store = crate::credentials::CredentialStore::load();
+                let now = crate::credentials::CredentialEntry::now_secs();
+                store.upsert(crate::credentials::CredentialEntry::new_paired(
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    login_id.clone(),
+                    astation_id.clone(),
+                    save_credentials,
+                    now,
+                ));
+                if let Err(e) = store.save() {
+                    self.status_message = Some(format!("Failed to save paired credentials: {}", e));
+                } else {
+                    self.connected_astation_id = Some(astation_id.clone());
+                    let preview = login_id.as_deref().unwrap_or("—");
+                    self.status_message = Some(format!(
+                        "\u{1f517} Paired SSO credentials received ({})",
+                        preview
+                    ));
+                }
+            }
             _ => {
                 // Unknown/unhandled message type — ignore silently
+            }
+        }
+    }
+
+    /// Called when the Astation WebSocket connection drops.
+    /// Marks any paired credential entries for that Astation with `disconnected_at`
+    /// so the grace-period logic in `CredentialStore::resolve` can take effect.
+    pub fn on_astation_disconnect(&mut self) {
+        if let Some(aid) = self.connected_astation_id.take() {
+            let mut store = crate::credentials::CredentialStore::load();
+            if let Some(entry) = store.find_paired_mut(&aid) {
+                entry.disconnected_at = Some(crate::credentials::CredentialEntry::now_secs());
+                let _ = store.save();
             }
         }
     }
@@ -2478,6 +2528,7 @@ impl App {
         // Detect WebSocket disconnect (channel closed after draining remaining messages)
         if self.astation_connected && self.astation_client.is_ws_closed() {
             self.astation_connected = false;
+            self.on_astation_disconnect();
             self.astation_client = crate::websocket_client::AstationClient::new();
             self.rebuild_menu();
             // Schedule immediate reconnect attempt
