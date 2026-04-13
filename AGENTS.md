@@ -19,6 +19,8 @@ cargo test                               # Run tests (500+ tests)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
+./scripts/run-local-dev-tests.sh         # End-to-end CLI smoke test (build first)
+./scripts/release.sh [VERSION]           # Bump Cargo.toml + commit + tag (no push)
 ```
 
 ## Architecture
@@ -227,19 +229,41 @@ Atem receives assignment (websocket_client.rs)
 
 ## Release Process
 
-Releases are triggered by pushing a git tag:
+**Use `./scripts/release.sh`** — it keeps `Cargo.toml` in sync with the git tag and
+guards against common mistakes (dirty tree, duplicate tag, failed build).
 
 ```bash
-git tag v0.x.y
-git push origin v0.x.y
+# Patch-bump (reads current Cargo.toml version, adds 1 to the last segment)
+./scripts/release.sh
+
+# Or explicit version
+./scripts/release.sh 0.5.0
 ```
 
-GitHub Actions (`.github/workflows/release.yml`):
+What the script does:
+1. Resolves target version (auto patch-bump, or from argument)
+2. Refuses if tag exists or working tree is dirty (except Cargo.toml/Cargo.lock)
+3. Updates `Cargo.toml` → bumps version
+4. Runs `cargo build` to refresh `Cargo.lock`
+5. Creates a commit for `Cargo.toml` + `Cargo.lock`
+6. Creates the tag `vX.Y.Z` locally
+7. **Does NOT push** — prints the push command so you can review first
+
+To publish after running the script:
+```bash
+git show HEAD               # review the release commit
+git push && git push origin vX.Y.Z
+```
+
+Pushing the tag triggers GitHub Actions (`.github/workflows/release.yml`):
 1. Builds binaries for linux-x64, linux-arm64, darwin-x64, darwin-arm64
 2. Creates GitHub release with tarballed binaries
 3. Publishes `@agora-build/atem` to npm (version synced from tag)
 
 Requires `NPM_TOKEN` secret in GitHub repo settings.
+
+**Don't manually bump `Cargo.toml` + `git tag` separately** — the two can drift
+(any `atem --version` will show the stale Cargo.toml number even if the tag is newer).
 
 ## Integration Points
 
