@@ -38,6 +38,14 @@ pub enum Commands {
     Login,
     /// Log out
     Logout,
+    /// Pair with an Astation instance and receive SSO credentials
+    Pair {
+        /// Save credentials so they remain valid when Astation disconnects
+        #[arg(long)]
+        save: bool,
+    },
+    /// Remove all paired Astation sessions
+    Unpair,
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {
         #[command(subcommand)]
@@ -485,6 +493,26 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             println!("Logged out.");
             Ok(())
         }
+        Commands::Pair { save } => run_pair(save).await,
+        Commands::Unpair => {
+            let mut store = crate::credentials::CredentialStore::load();
+            let count = store
+                .entries
+                .iter()
+                .filter(|e| e.source == crate::credentials::CredentialSource::AstationPaired)
+                .count();
+            if count == 0 {
+                println!("No paired sessions to remove.");
+                return Ok(());
+            }
+            store
+                .entries
+                .retain(|e| e.source != crate::credentials::CredentialSource::AstationPaired);
+            store.save()?;
+            let plural = if count == 1 { "" } else { "s" };
+            println!("Unpaired ({count} session{plural} removed).");
+            Ok(())
+        }
         Commands::Agent { agent_command } => match agent_command {
             AgentCommands::Launch { agent_type } => {
                 println!("Launching {} as PTY agent...", agent_type);
@@ -769,6 +797,94 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             ServCommands::Kill { id } => crate::rtc_test_server::cmd_kill_server(&id),
             ServCommands::Killall => crate::rtc_test_server::cmd_kill_all_servers(),
         },
+    }
+}
+
+/// `atem pair [--save]` — connect to Astation, send PairSavePreference, wait for SsoTokenSync.
+async fn run_pair(save: bool) -> Result<()> {
+    use tokio::time::{Duration, timeout};
+    let config = crate::config::AtemConfig::load()?;
+
+    println!("Connecting to Astation...");
+    let mut client = crate::websocket_client::AstationClient::new();
+
+    // Try local-first-then-relay pairing flow. Returns pairing code (or "local").
+    let result = client.connect_with_pairing(&config).await?;
+    if result == "local" {
+        println!("Connected to local Astation.");
+    } else {
+        println!("Pairing code: {}", result);
+        println!("Approve the pairing in your Astation app.");
+    }
+
+    // Send save preference immediately. Astation uses this to decide what to put in
+    // the subsequent SsoTokenSync message.
+    client
+        .send_message(crate::websocket_client::AstationMessage::PairSavePreference {
+            save_credentials: save,
+        })
+        .await?;
+
+    println!("Waiting for Astation to send SSO credentials...");
+
+    // Wait up to 60s for SsoTokenSync.
+    let received = timeout(Duration::from_secs(60), async {
+        loop {
+            match client.recv_message_async().await {
+                Some(crate::websocket_client::AstationMessage::SsoTokenSync {
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    login_id,
+                    astation_id,
+                    save_credentials,
+                }) => {
+                    return Ok::<_, anyhow::Error>((
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                        login_id,
+                        astation_id,
+                        save_credentials,
+                    ));
+                }
+                Some(_) => continue,
+                None => anyhow::bail!("Astation connection closed before sending credentials."),
+            }
+        }
+    })
+    .await;
+
+    match received {
+        Ok(Ok((access_token, refresh_token, expires_at, login_id, astation_id, save_credentials))) => {
+            let mut store = crate::credentials::CredentialStore::load();
+            let now = crate::credentials::CredentialEntry::now_secs();
+            store.upsert(crate::credentials::CredentialEntry::new_paired(
+                access_token,
+                refresh_token,
+                expires_at,
+                login_id.clone(),
+                astation_id,
+                save_credentials,
+                now,
+            ));
+            store.save()?;
+            match login_id {
+                Some(id) => println!("Paired with Astation. (SSO: {})", id),
+                None => println!("Paired with Astation."),
+            }
+            if save_credentials {
+                println!("Credentials saved — will work offline.");
+            } else {
+                println!("Credentials are session-only (5 min grace period after disconnect).");
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => anyhow::bail!(
+            "Pairing timed out waiting for credentials. \
+             (Astation may not yet support SSO token sync — check Astation version.)"
+        ),
     }
 }
 
@@ -1381,5 +1497,37 @@ mod tests {
             }
             _ => panic!("expected Serv Diagrams command"),
         }
+    }
+
+    #[test]
+    fn cli_pair_without_save() {
+        let cli = Cli::try_parse_from(["atem", "pair"]).unwrap();
+        match cli.command {
+            Some(Commands::Pair { save }) => assert!(!save),
+            _ => panic!("expected Pair command"),
+        }
+    }
+
+    #[test]
+    fn cli_pair_with_save_flag() {
+        let cli = Cli::try_parse_from(["atem", "pair", "--save"]).unwrap();
+        match cli.command {
+            Some(Commands::Pair { save }) => assert!(save),
+            _ => panic!("expected Pair command with --save"),
+        }
+    }
+
+    #[test]
+    fn cli_unpair() {
+        let cli = Cli::try_parse_from(["atem", "unpair"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Unpair)));
+    }
+
+    #[test]
+    fn cli_login_and_logout_still_parse() {
+        let cli = Cli::try_parse_from(["atem", "login"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Login)));
+        let cli = Cli::try_parse_from(["atem", "logout"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Logout)));
     }
 }
