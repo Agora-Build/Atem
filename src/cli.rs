@@ -256,9 +256,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     role,
                     expire,
                 } => {
-                    let app_id = crate::config::ActiveProject::resolve_app_id(None)?;
+                    let app_id = crate::config::ProjectCache::resolve_app_id(None)?;
                     let app_certificate =
-                        crate::config::ActiveProject::resolve_app_certificate(None)?;
+                        crate::config::ProjectCache::resolve_app_certificate(None)?;
 
                     let channel_name = channel.as_deref().unwrap_or("test-channel");
                     let uid_str = uid.as_deref().unwrap_or("0");
@@ -310,9 +310,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             },
             TokenCommands::Rtm { rtm_command } => match rtm_command {
                 RtmCommands::Create { user_id, expire } => {
-                    let app_id = crate::config::ActiveProject::resolve_app_id(None)?;
+                    let app_id = crate::config::ProjectCache::resolve_app_id(None)?;
                     let app_certificate =
-                        crate::config::ActiveProject::resolve_app_certificate(None)?;
+                        crate::config::ProjectCache::resolve_app_certificate(None)?;
 
                     let uid = user_id.as_deref().unwrap_or("atem01");
 
@@ -377,7 +377,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Clear => {
-                crate::config::ActiveProject::clear()?;
+                crate::config::ProjectCache::clear_active()?;
                 println!("Active project cleared.");
                 Ok(())
             }
@@ -397,12 +397,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         };
                         anyhow::anyhow!("Invalid project index {}. {}", idx, hint)
                     })?;
-                    let active = crate::config::ActiveProject {
-                        app_id: project.app_id.clone(),
-                        app_certificate: project.sign_key.clone().unwrap_or_default(),
-                        name: project.name.clone(),
-                    };
-                    active.save()?;
+                    crate::config::ProjectCache::set_active(&project.app_id, None)?;
                     println!("Active project set: {} ({})", project.name, project.app_id);
                 } else {
                     let config = crate::config::AtemConfig::load()?;
@@ -418,30 +413,22 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         .ok_or_else(|| {
                             anyhow::anyhow!("Project with App ID '{}' not found", app_id_or_index)
                         })?;
-                    let active = crate::config::ActiveProject {
-                        app_id: project.app_id.clone(),
-                        app_certificate: project.sign_key.clone().unwrap_or_default(),
-                        name: project.name.clone(),
-                    };
-                    active.save()?;
-                    println!("Active project set: {} ({})", active.name, active.app_id);
+                    crate::config::ProjectCache::set_active(&project.app_id, None)?;
+                    println!("Active project set: {} ({})", project.name, project.app_id);
                 }
                 Ok(())
             }
             ProjectCommands::Show { with_certificate } => {
-                match crate::config::ActiveProject::load() {
+                match crate::config::ProjectCache::get_active() {
                     Some(proj) => {
                         println!("Active project: {}", proj.name);
                         println!("App ID: {}", proj.app_id);
+                        let cert = proj.sign_key.as_deref().unwrap_or("");
                         let cert_display = if with_certificate {
-                            proj.app_certificate.clone()
-                        } else if proj.app_certificate.len() > 4 {
-                            format!(
-                                "{}...{}",
-                                &proj.app_certificate[..2],
-                                &proj.app_certificate[proj.app_certificate.len() - 2..]
-                            )
-                        } else if !proj.app_certificate.is_empty() {
+                            cert.to_string()
+                        } else if cert.len() > 4 {
+                            format!("{}...{}", &cert[..2], &cert[cert.len() - 2..])
+                        } else if !cert.is_empty() {
                             "****".to_string()
                         } else {
                             "(empty)".to_string()
@@ -800,6 +787,24 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
     }
 }
 
+/// Prompt "Save credentials? ... [y/N]" on stdin. Defaults to false on empty / non-tty.
+fn prompt_save_credentials() -> bool {
+    use std::io::{self, BufRead, Write};
+
+    print!("Save credentials so they keep working when Astation disconnects? [y/N]: ");
+    let _ = io::stdout().flush();
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    if stdin.lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    )
+}
+
 /// `atem pair [--save]` — connect to Astation, send PairSavePreference, wait for SsoTokenSync.
 async fn run_pair(save: bool) -> Result<()> {
     use tokio::time::{Duration, timeout};
@@ -817,11 +822,18 @@ async fn run_pair(save: bool) -> Result<()> {
         println!("Approve the pairing in your Astation app.");
     }
 
-    // Send save preference immediately. Astation uses this to decide what to put in
+    // Resolve save preference: --save skips the prompt; otherwise ask interactively.
+    let save_credentials = if save {
+        true
+    } else {
+        prompt_save_credentials()
+    };
+
+    // Send save preference. Astation uses this to decide what to put in
     // the subsequent SsoTokenSync message.
     client
         .send_message(crate::websocket_client::AstationMessage::PairSavePreference {
-            save_credentials: save,
+            save_credentials,
         })
         .await?;
 

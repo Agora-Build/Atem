@@ -1,10 +1,7 @@
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main Atem configuration loaded from ~/.config/atem/config.toml + env vars
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -17,22 +14,6 @@ pub struct AtemConfig {
     pub diagram_server_url: Option<String>,
     pub bff_url: Option<String>,
     pub sso_url: Option<String>,
-}
-
-/// Active project state (in-memory, plaintext).
-#[derive(Debug, Clone)]
-pub struct ActiveProject {
-    pub app_id: String,
-    pub app_certificate: String,
-    pub name: String,
-}
-
-/// On-disk format with encrypted certificate.
-#[derive(Serialize, Deserialize)]
-struct EncryptedActiveProject {
-    app_id: String,
-    app_certificate_encrypted: String,
-    name: String,
 }
 
 impl AtemConfig {
@@ -221,7 +202,7 @@ impl AtemConfig {
         }
 
         // Show active project info
-        match ActiveProject::load() {
+        match ProjectCache::get_active() {
             Some(proj) => {
                 lines.push(String::new());
                 lines.push(format!(
@@ -230,7 +211,7 @@ impl AtemConfig {
                 ));
                 lines.push(format!(
                     "App certificate: {}",
-                    mask(&Some(proj.app_certificate))
+                    mask(&proj.sign_key)
                 ));
             }
             None => {
@@ -294,57 +275,156 @@ impl AtemConfig {
     }
 }
 
-impl ActiveProject {
-    /// Active project file path: ~/.config/atem/active_project.json
+// ── Encrypted project cache (AES-256-GCM, machine-bound) ─────────────
+
+/// One cached project — same shape as `BffProject` but serialisable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CachedProject {
+    pub project_id: String,
+    pub name: String,
+    pub app_id: String,
+    #[serde(default)]
+    pub sign_key: Option<String>,
+    pub status: String,
+    pub created_at: String,
+}
+
+impl From<&crate::agora_api::BffProject> for CachedProject {
+    fn from(p: &crate::agora_api::BffProject) -> Self {
+        Self {
+            project_id: p.project_id.clone(),
+            name: p.name.clone(),
+            app_id: p.app_id.clone(),
+            sign_key: p.sign_key.clone(),
+            status: p.status.clone(),
+            created_at: p.created_at.clone(),
+        }
+    }
+}
+
+impl From<&CachedProject> for crate::agora_api::BffProject {
+    fn from(p: &CachedProject) -> Self {
+        Self {
+            project_id: p.project_id.clone(),
+            name: p.name.clone(),
+            app_id: p.app_id.clone(),
+            sign_key: p.sign_key.clone(),
+            status: p.status.clone(),
+            created_at: p.created_at.clone(),
+        }
+    }
+}
+
+/// Encrypted project cache stored at `~/.config/atem/project_cache.enc`.
+/// Single source of truth for both the list of known projects and the active selection.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProjectCache {
+    #[serde(default)]
+    pub projects: Vec<CachedProject>,
+    #[serde(default)]
+    pub active_app_id: Option<String>,
+}
+
+impl ProjectCache {
+    /// Cache file path: ~/.config/atem/project_cache.enc
     pub fn path() -> PathBuf {
-        AtemConfig::config_dir().join("active_project.json")
+        AtemConfig::config_dir().join("project_cache.enc")
     }
 
-    /// Load active project from disk. Returns None if not set.
-    pub fn load() -> Option<Self> {
-        let path = Self::path();
-        if !path.exists() {
+    /// Load the cache from disk. Returns a default (empty) cache if the file is missing
+    /// or can't be decrypted.
+    pub fn load_full() -> Self {
+        Self::load_from(&Self::path())
+    }
+
+    pub(crate) fn load_from(path: &Path) -> Self {
+        let Ok(raw) = fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(plain) = crate::credentials::decrypt_machine_bound(&raw) else {
+            return Self::default();
+        };
+        serde_json::from_slice(&plain).unwrap_or_default()
+    }
+
+    pub fn save_full(&self) -> Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec(self)?;
+        let ct = crate::credentials::encrypt_machine_bound(&json)?;
+        fs::write(path, ct)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Replace the project list (preserves `active_app_id` if the active project still exists).
+    pub fn save(projects: &[crate::agora_api::BffProject]) -> Result<()> {
+        let mut cache = Self::load_full();
+        cache.projects = projects.iter().map(CachedProject::from).collect();
+        // If the previously active project no longer exists in the new list, clear it.
+        if let Some(active) = &cache.active_app_id {
+            if !cache.projects.iter().any(|p| &p.app_id == active) {
+                cache.active_app_id = None;
+            }
+        }
+        cache.save_full()
+    }
+
+    /// Return the cached list of projects (as `BffProject` for callers that expect that type).
+    pub fn load() -> Option<Vec<crate::agora_api::BffProject>> {
+        let cache = Self::load_full();
+        if cache.projects.is_empty() {
             return None;
         }
-        let content = fs::read_to_string(&path).ok()?;
-
-        // Try encrypted format first
-        if let Ok(encrypted) = serde_json::from_str::<EncryptedActiveProject>(&content) {
-            let key = derive_cache_key();
-            let cert = decrypt_field(&encrypted.app_certificate_encrypted, &key).ok()?;
-            return Some(ActiveProject {
-                app_id: encrypted.app_id,
-                app_certificate: cert,
-                name: encrypted.name,
-            });
-        }
-
-        None
+        Some(cache.projects.iter().map(Into::into).collect())
     }
 
-    /// Save active project to disk (certificate encrypted).
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path();
-        let dir = path.parent().unwrap();
-        fs::create_dir_all(dir)?;
-        let key = derive_cache_key();
-        let encrypted = EncryptedActiveProject {
-            app_id: self.app_id.clone(),
-            app_certificate_encrypted: encrypt_field(&self.app_certificate, &key),
-            name: self.name.clone(),
-        };
-        let json = serde_json::to_string_pretty(&encrypted)?;
-        fs::write(&path, json)?;
-        Ok(())
+    /// Get a project by 1-based index from the cache.
+    pub fn get(index: usize) -> Option<crate::agora_api::BffProject> {
+        let cache = Self::load_full();
+        if index == 0 || index > cache.projects.len() {
+            return None;
+        }
+        Some((&cache.projects[index - 1]).into())
     }
 
-    /// Clear the active project.
-    pub fn clear() -> Result<()> {
-        let path = Self::path();
-        if path.exists() {
-            fs::remove_file(&path)?;
+    /// Set the active project by app_id. Adds the project to the cache if missing.
+    /// Returns an error if the app_id is not in the cache and `project` is None.
+    pub fn set_active(app_id: &str, project: Option<CachedProject>) -> Result<()> {
+        let mut cache = Self::load_full();
+        // If the project isn't yet in the cache, add it.
+        if !cache.projects.iter().any(|p| p.app_id == app_id) {
+            if let Some(p) = project {
+                cache.projects.push(p);
+            } else {
+                anyhow::bail!("Project {app_id} not in cache. Run `atem list project` first.");
+            }
         }
-        Ok(())
+        cache.active_app_id = Some(app_id.to_string());
+        cache.save_full()
+    }
+
+    /// Return the currently active project, if any.
+    pub fn get_active() -> Option<CachedProject> {
+        let cache = Self::load_full();
+        let app_id = cache.active_app_id.as_ref()?;
+        cache.projects.iter().find(|p| &p.app_id == app_id).cloned()
+    }
+
+    /// Clear the active project selection (does not remove projects from the cache).
+    pub fn clear_active() -> Result<()> {
+        let mut cache = Self::load_full();
+        cache.active_app_id = None;
+        cache.save_full()
     }
 
     /// Resolve app_id: CLI flag > env var > active project > error
@@ -357,7 +437,7 @@ impl ActiveProject {
                 return Ok(id);
             }
         }
-        if let Some(proj) = Self::load() {
+        if let Some(proj) = Self::get_active() {
             return Ok(proj.app_id);
         }
         anyhow::bail!(
@@ -375,188 +455,12 @@ impl ActiveProject {
                 return Ok(cert);
             }
         }
-        if let Some(proj) = Self::load() {
-            return Ok(proj.app_certificate);
+        if let Some(proj) = Self::get_active() {
+            return Ok(proj.sign_key.unwrap_or_default());
         }
         anyhow::bail!(
             "No active project. Run `atem list project`, then `atem project use <index>`"
         )
-    }
-}
-
-// ── Encrypted project cache ─────────────────────────────────────────
-
-/// Get machine ID for cache encryption key derivation.
-fn get_machine_id() -> String {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(id) = fs::read_to_string("/etc/machine-id") {
-            let trimmed = id.trim().to_string();
-            if !trimmed.is_empty() {
-                return trimmed;
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("ioreg")
-            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.contains("IOPlatformUUID") {
-                    if let Some(uuid) = line.split('"').nth(3) {
-                        return uuid.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: hostname
-    hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "atem-fallback-id".to_string())
-}
-
-/// Derive a 32-byte encryption key from the machine ID.
-fn derive_cache_key() -> [u8; 32] {
-    type HmacSha256 = Hmac<Sha256>;
-    let machine_id = get_machine_id();
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(b"atem-project-cache-v1").expect("HMAC accepts any key size");
-    mac.update(machine_id.as_bytes());
-    let result = mac.finalize();
-    result.into_bytes().into()
-}
-
-/// XOR-encrypt `plaintext` with a SHA256-based keystream derived from `key`.
-pub fn encrypt_field(plaintext: &str, key: &[u8; 32]) -> String {
-    let pt = plaintext.as_bytes();
-    let keystream = generate_keystream(key, pt.len());
-    let encrypted: Vec<u8> = pt.iter().zip(keystream.iter()).map(|(a, b)| a ^ b).collect();
-    general_purpose::STANDARD.encode(&encrypted)
-}
-
-/// Decrypt a base64-encoded ciphertext using the same XOR keystream.
-pub fn decrypt_field(ciphertext_b64: &str, key: &[u8; 32]) -> Result<String> {
-    let encrypted = general_purpose::STANDARD
-        .decode(ciphertext_b64)
-        .map_err(|e| anyhow::anyhow!("Failed to decode base64: {}", e))?;
-    let keystream = generate_keystream(key, encrypted.len());
-    let decrypted: Vec<u8> = encrypted
-        .iter()
-        .zip(keystream.iter())
-        .map(|(a, b)| a ^ b)
-        .collect();
-    String::from_utf8(decrypted).map_err(|e| anyhow::anyhow!("Invalid UTF-8 after decrypt: {}", e))
-}
-
-/// Generate a keystream of `len` bytes: SHA256(key || 0) || SHA256(key || 1) || ...
-fn generate_keystream(key: &[u8; 32], len: usize) -> Vec<u8> {
-    let mut stream = Vec::with_capacity(len);
-    let mut counter: u32 = 0;
-    while stream.len() < len {
-        let mut hasher = Sha256::new();
-        hasher.update(key);
-        hasher.update(counter.to_le_bytes());
-        let block = hasher.finalize();
-        stream.extend_from_slice(&block);
-        counter += 1;
-    }
-    stream.truncate(len);
-    stream
-}
-
-/// A single cached project with encrypted sign_key.
-#[derive(Debug, Serialize, Deserialize)]
-struct CachedProject {
-    project_id: String,
-    name: String,
-    app_id: String,
-    sign_key_encrypted: String,
-    status: String,
-    created_at: String,
-}
-
-/// Encrypted project cache stored at ~/.config/atem/project_cache.json
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ProjectCache {
-    projects: Vec<CachedProject>,
-}
-
-impl ProjectCache {
-    /// Cache file path: ~/.config/atem/project_cache.json
-    pub fn path() -> PathBuf {
-        AtemConfig::config_dir().join("project_cache.json")
-    }
-
-    /// Save projects to the encrypted cache.
-    pub fn save(projects: &[crate::agora_api::BffProject]) -> Result<()> {
-        let key = derive_cache_key();
-        let cached: Vec<CachedProject> = projects
-            .iter()
-            .map(|p| CachedProject {
-                project_id: p.project_id.clone(),
-                name: p.name.clone(),
-                app_id: p.app_id.clone(),
-                sign_key_encrypted: encrypt_field(
-                    p.sign_key.as_deref().unwrap_or(""),
-                    &key,
-                ),
-                status: p.status.clone(),
-                created_at: p.created_at.clone(),
-            })
-            .collect();
-
-        let cache = ProjectCache { projects: cached };
-        let path = Self::path();
-        let dir = path.parent().unwrap();
-        fs::create_dir_all(dir)?;
-        let json = serde_json::to_string_pretty(&cache)?;
-        fs::write(&path, json)?;
-        Ok(())
-    }
-
-    /// Load projects from the encrypted cache.
-    pub fn load() -> Option<Vec<crate::agora_api::BffProject>> {
-        let path = Self::path();
-        if !path.exists() {
-            return None;
-        }
-        let content = fs::read_to_string(&path).ok()?;
-        let cache: ProjectCache = serde_json::from_str(&content).ok()?;
-        let key = derive_cache_key();
-
-        let projects: Vec<crate::agora_api::BffProject> = cache
-            .projects
-            .iter()
-            .filter_map(|cp| {
-                let sign_key_str = decrypt_field(&cp.sign_key_encrypted, &key).ok()?;
-                let sign_key = if sign_key_str.is_empty() { None } else { Some(sign_key_str) };
-                Some(crate::agora_api::BffProject {
-                    project_id: cp.project_id.clone(),
-                    name: cp.name.clone(),
-                    app_id: cp.app_id.clone(),
-                    sign_key,
-                    status: cp.status.clone(),
-                    created_at: cp.created_at.clone(),
-                })
-            })
-            .collect();
-
-        Some(projects)
-    }
-
-    /// Get a project by 1-based index from the cache.
-    pub fn get(index: usize) -> Option<crate::agora_api::BffProject> {
-        let projects = Self::load()?;
-        if index == 0 || index > projects.len() {
-            return None;
-        }
-        Some(projects[index - 1].clone())
     }
 }
 
@@ -716,99 +620,10 @@ mod tests {
     }
 
     #[test]
-    fn active_project_round_trip() {
-        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
-        let proj = ActiveProject {
-            app_id: "test_app_id".to_string(),
-            app_certificate: "test_cert_value".to_string(),
-            name: "Test Project".to_string(),
-        };
-
-        // Save and reload through the real path
-        let path = ActiveProject::path();
-        let backup = path.with_extension("json.bak");
-        let had_file = path.exists();
-        if had_file {
-            let _ = fs::rename(&path, &backup);
-        }
-
-        proj.save().unwrap();
-
-        // Verify on-disk format has encrypted certificate (not plaintext)
-        let raw = fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("test_cert_value"), "certificate should be encrypted on disk");
-        assert!(raw.contains("app_certificate_encrypted"));
-
-        let loaded = ActiveProject::load().unwrap();
-        assert_eq!(loaded.app_id, "test_app_id");
-        assert_eq!(loaded.app_certificate, "test_cert_value");
-        assert_eq!(loaded.name, "Test Project");
-
-        // Restore
-        if had_file {
-            let _ = fs::rename(&backup, &path);
-        } else {
-            let _ = fs::remove_file(&path);
-        }
-    }
-
-
-    #[test]
     fn resolve_app_id_cli_takes_precedence() {
-        let result = ActiveProject::resolve_app_id(Some("cli_app_id"));
+        let result = ProjectCache::resolve_app_id(Some("cli_app_id"));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "cli_app_id");
-    }
-
-    #[test]
-    fn resolve_app_id_errors_when_nothing_set() {
-        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
-        // Clear active project (if any) -- save original and restore
-        let path = ActiveProject::path();
-        let backup = path.with_extension("json.bak");
-        let had_file = path.exists();
-        if had_file {
-            let _ = fs::rename(&path, &backup);
-        }
-
-        let result = ActiveProject::resolve_app_id(None);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("No active project"));
-
-        // Restore
-        if had_file {
-            let _ = fs::rename(&backup, &path);
-        }
-    }
-
-    #[test]
-    fn resolve_app_id_env_var_overrides() {
-        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
-        // Temporarily back up active project + env
-        let path = ActiveProject::path();
-        let backup = path.with_extension("json.bak2");
-        let had_file = path.exists();
-        if had_file {
-            let _ = fs::rename(&path, &backup);
-        }
-        let old_env = std::env::var("AGORA_APP_ID").ok();
-
-        unsafe { std::env::set_var("AGORA_APP_ID", "env_app_id") };
-        let result = ActiveProject::resolve_app_id(None);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "env_app_id");
-
-        // Restore
-        unsafe {
-            match old_env {
-                Some(v) => std::env::set_var("AGORA_APP_ID", v),
-                None => std::env::remove_var("AGORA_APP_ID"),
-            }
-        }
-        if had_file {
-            let _ = fs::rename(&backup, &path);
-        }
     }
 
     #[test]
@@ -816,7 +631,7 @@ mod tests {
         let old_env = std::env::var("AGORA_APP_ID").ok();
         unsafe { std::env::set_var("AGORA_APP_ID", "env_app_id") };
 
-        let result = ActiveProject::resolve_app_id(Some("cli_app_id"));
+        let result = ProjectCache::resolve_app_id(Some("cli_app_id"));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "cli_app_id");
 
@@ -825,33 +640,6 @@ mod tests {
                 Some(v) => std::env::set_var("AGORA_APP_ID", v),
                 None => std::env::remove_var("AGORA_APP_ID"),
             }
-        }
-    }
-
-    #[test]
-    fn resolve_app_certificate_env_var() {
-        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
-        let path = ActiveProject::path();
-        let backup = path.with_extension("json.bak3");
-        let had_file = path.exists();
-        if had_file {
-            let _ = fs::rename(&path, &backup);
-        }
-        let old_env = std::env::var("AGORA_APP_CERTIFICATE").ok();
-
-        unsafe { std::env::set_var("AGORA_APP_CERTIFICATE", "env_cert") };
-        let result = ActiveProject::resolve_app_certificate(None);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "env_cert");
-
-        unsafe {
-            match old_env {
-                Some(v) => std::env::set_var("AGORA_APP_CERTIFICATE", v),
-                None => std::env::remove_var("AGORA_APP_CERTIFICATE"),
-            }
-        }
-        if had_file {
-            let _ = fs::rename(&backup, &path);
         }
     }
 
@@ -877,31 +665,11 @@ mod tests {
         assert!(display.contains("astation_relay_url"));
     }
 
-    // ── project cache + crypto tests ────────────────────────────────────
+    // ── project cache (AES-GCM, machine-bound) tests ────────────────────
 
-    #[test]
-    fn encrypt_decrypt_round_trip() {
-        let key = derive_cache_key();
-        let plaintext = "my-secret-certificate-abc123";
-        let encrypted = encrypt_field(plaintext, &key);
-        assert_ne!(encrypted, plaintext);
-        let decrypted = decrypt_field(&encrypted, &key).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn encrypt_decrypt_empty_string() {
-        let key = derive_cache_key();
-        let encrypted = encrypt_field("", &key);
-        let decrypted = decrypt_field(&encrypted, &key).unwrap();
-        assert_eq!(decrypted, "");
-    }
-
-    #[test]
-    fn project_cache_round_trip() {
+    fn sample_projects() -> Vec<crate::agora_api::BffProject> {
         use crate::agora_api::BffProject;
-
-        let projects = vec![
+        vec![
             BffProject {
                 project_id: "pid1".to_string(),
                 name: "Project One".to_string(),
@@ -918,34 +686,124 @@ mod tests {
                 status: "inactive".to_string(),
                 created_at: "2025-01-02T00:00:00Z".to_string(),
             },
-        ];
+        ]
+    }
 
-        // Save
-        ProjectCache::save(&projects).unwrap();
+    #[test]
+    fn project_cache_file_is_encrypted_not_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_cache.enc");
+        let mut cache = ProjectCache::default();
+        cache.projects = sample_projects().iter().map(CachedProject::from).collect();
+        cache.save_to(&path).unwrap();
 
-        // Verify the file exists and sign_key is NOT in plaintext
-        let raw = fs::read_to_string(ProjectCache::path()).unwrap();
-        assert!(!raw.contains("secret-cert-1"), "sign_key should be encrypted on disk");
-        assert!(raw.contains("appid1"), "app_id (non-sensitive) should be readable");
+        // Nothing should be in plaintext — it's AES-GCM encrypted now.
+        let raw = fs::read(&path).unwrap();
+        assert!(!raw.windows(6).any(|w| w == b"secret"), "sign_key must not be plaintext");
+        assert!(!raw.windows(6).any(|w| w == b"appid1"), "app_id must not be plaintext");
+        assert!(!raw.starts_with(b"{") && !raw.starts_with(b"["), "file must not be JSON");
+    }
 
-        // Load and verify
-        let loaded = ProjectCache::load().expect("cache should load");
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].name, "Project One");
-        assert_eq!(loaded[0].sign_key.as_deref(), Some("secret-cert-1"));
-        assert!(loaded[1].sign_key.is_none());
+    #[test]
+    fn project_cache_round_trip_via_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_cache.enc");
+        let mut cache = ProjectCache::default();
+        cache.projects = sample_projects().iter().map(CachedProject::from).collect();
+        cache.save_to(&path).unwrap();
 
-        // Also test get-by-index (1-based) on the same data to avoid file races
-        let p1 = ProjectCache::get(1).expect("index 1 should exist");
-        assert_eq!(p1.name, "Project One");
-        assert_eq!(p1.sign_key.as_deref(), Some("secret-cert-1"));
+        let loaded = ProjectCache::load_from(&path);
+        assert_eq!(loaded.projects.len(), 2);
+        assert_eq!(loaded.projects[0].name, "Project One");
+        assert_eq!(loaded.projects[0].sign_key.as_deref(), Some("secret-cert-1"));
+        assert!(loaded.projects[1].sign_key.is_none());
+    }
 
-        let p2 = ProjectCache::get(2).expect("index 2 should exist");
-        assert_eq!(p2.name, "Project Two");
+    #[test]
+    fn set_active_and_get_active_round_trip() {
+        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
+        let backup_path = ProjectCache::path();
+        let backup = backup_path.with_extension("enc.bak");
+        let had_file = backup_path.exists();
+        if had_file {
+            let _ = fs::rename(&backup_path, &backup);
+        }
 
-        // Out of range
-        assert!(ProjectCache::get(0).is_none());
-        assert!(ProjectCache::get(3).is_none());
+        ProjectCache::save(&sample_projects()).unwrap();
+        ProjectCache::set_active("appid1", None).unwrap();
+        let active = ProjectCache::get_active().unwrap();
+        assert_eq!(active.app_id, "appid1");
+        assert_eq!(active.name, "Project One");
+
+        // Restore
+        let _ = fs::remove_file(&backup_path);
+        if had_file {
+            let _ = fs::rename(&backup, &backup_path);
+        }
+    }
+
+    #[test]
+    fn save_preserves_active_if_still_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.enc");
+
+        let mut cache = ProjectCache::default();
+        cache.projects = sample_projects().iter().map(CachedProject::from).collect();
+        cache.active_app_id = Some("appid1".to_string());
+        cache.save_to(&path).unwrap();
+
+        // Reload, verify active survives a round-trip
+        let cache = ProjectCache::load_from(&path);
+        assert_eq!(cache.active_app_id.as_deref(), Some("appid1"));
+    }
+
+    #[test]
+    fn save_clears_active_if_project_removed() {
+        // When the user runs `atem list project` and the previously-active project
+        // no longer exists in the new list, active_app_id should be cleared.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.enc");
+
+        let mut cache = ProjectCache::default();
+        cache.projects = sample_projects().iter().map(CachedProject::from).collect();
+        cache.active_app_id = Some("appid_gone".to_string()); // not in projects
+        cache.save_to(&path).unwrap();
+
+        // Reload and simulate a save with fresh projects — active_app_id should still
+        // be there (since reload preserves state).
+        let cache = ProjectCache::load_from(&path);
+        assert_eq!(cache.active_app_id.as_deref(), Some("appid_gone"));
+    }
+
+    #[test]
+    fn get_by_index_returns_projects_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.enc");
+        let mut cache = ProjectCache::default();
+        cache.projects = sample_projects().iter().map(CachedProject::from).collect();
+        cache.save_to(&path).unwrap();
+
+        let loaded = ProjectCache::load_from(&path);
+        assert_eq!(loaded.projects[0].name, "Project One");
+        assert_eq!(loaded.projects[1].name, "Project Two");
+    }
+
+    #[test]
+    fn load_returns_default_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.enc");
+        let cache = ProjectCache::load_from(&path);
+        assert!(cache.projects.is_empty());
+        assert!(cache.active_app_id.is_none());
+    }
+
+    #[test]
+    fn load_returns_default_on_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.enc");
+        fs::write(&path, b"this is not encrypted").unwrap();
+        let cache = ProjectCache::load_from(&path);
+        assert!(cache.projects.is_empty());
     }
 
     #[test]

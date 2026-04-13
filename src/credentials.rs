@@ -269,6 +269,18 @@ fn machine_id() -> String {
     format!("{host}-{user}")
 }
 
+/// Encrypt bytes with machine-bound AES-256-GCM. Output prepends 12-byte nonce to ciphertext.
+/// Shared by credentials.enc and project_cache.enc.
+pub(crate) fn encrypt_machine_bound(plain: &[u8]) -> Result<Vec<u8>> {
+    encrypt_bytes(plain)
+}
+
+/// Decrypt bytes produced by `encrypt_machine_bound`. Returns Err if ciphertext is invalid
+/// or was encrypted on a different machine.
+pub(crate) fn decrypt_machine_bound(raw: &[u8]) -> Result<Vec<u8>> {
+    decrypt_bytes(raw)
+}
+
 fn encrypt_bytes(plain: &[u8]) -> Result<Vec<u8>> {
     let key = derive_key();
     let cipher = Aes256Gcm::new((&key).into());

@@ -204,8 +204,8 @@ pub fn generate_self_signed_cert(
 
 /// Run the HTTPS server for RTC testing.
 pub async fn run_server(config: RtcTestConfig) -> Result<()> {
-    let app_id = crate::config::ActiveProject::resolve_app_id(None)?;
-    let app_certificate = crate::config::ActiveProject::resolve_app_certificate(None)?;
+    let app_id = crate::config::ProjectCache::resolve_app_id(None)?;
+    let app_certificate = crate::config::ProjectCache::resolve_app_certificate(None)?;
 
     let lan_ip = get_lan_ip();
     let sslip = sslip_host(&lan_ip);

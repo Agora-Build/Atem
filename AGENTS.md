@@ -132,8 +132,7 @@ Key methods:
 |------|----------|------------|
 | `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) | None |
 | `credentials.enc` | SSO + paired tokens (multi-entry `Vec<CredentialEntry>`) | AES-256-GCM (machine-bound) |
-| `active_project.json` | Selected project's `app_id`, `name`, encrypted `app_certificate` | XOR keystream |
-| `project_cache.json` | All projects from `atem list project` with encrypted certificates | XOR keystream |
+| `project_cache.enc` | All projects + `active_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
 | `session.json` | Astation auth session ID + expiry | None |
 
 **Credentials** (`credentials.rs`):
