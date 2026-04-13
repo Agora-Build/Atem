@@ -122,7 +122,7 @@ Speak to code: Astation captures audio, a ConvoAI agent transcribes it, and Atem
 ### Login
 
 ```bash
-atem login          # OAuth 2.0 browser flow — session saved to ~/.config/atem/sso_session.json
+atem login          # Opens browser to log in with Agora Console
 ```
 
 If the browser redirect doesn't complete (e.g. remote server), atem will prompt you to paste the callback URL from the browser address bar.
