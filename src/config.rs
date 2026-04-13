@@ -200,8 +200,11 @@ impl AtemConfig {
             .as_secs();
         match crate::sso_auth::SsoSession::load() {
             Some(session) if session.expires_at > now_secs => {
-                let expires = format_unix_timestamp_hhmm(session.expires_at);
-                lines.push(format!("SSO:    logged in  (expires {})", expires));
+                let label = match &session.login_id {
+                    Some(id) => format!("logged in  ({})", id),
+                    None => "logged in".to_string(),
+                };
+                lines.push(format!("SSO:    {}", label));
             }
             _ => {
                 lines.push("SSO:    not logged in  (run 'atem login')".to_string());
@@ -562,6 +565,10 @@ impl ProjectCache {
 }
 
 /// Format a Unix timestamp (seconds) as "YYYY-MM-DD HH:MM UTC".
+pub fn format_unix_timestamp_hhmm_pub(secs: u64) -> String {
+    format_unix_timestamp_hhmm(secs)
+}
+
 fn format_unix_timestamp_hhmm(secs: u64) -> String {
     use crate::agora_api::is_leap_year;
 

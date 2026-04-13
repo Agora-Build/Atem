@@ -463,8 +463,11 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Repl => crate::repl::run_repl().await,
         Commands::Login => {
             let config = crate::config::AtemConfig::load()?;
-            let _session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
-            println!("Logged in.");
+            let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
+            match &session.login_id {
+                Some(id) => println!("Logged in. (SSO: {})", id),
+                None => println!("Logged in. (SSO)"),
+            }
             Ok(())
         }
         Commands::Logout => {

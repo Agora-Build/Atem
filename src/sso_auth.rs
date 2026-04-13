@@ -14,6 +14,8 @@ pub struct SsoSession {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: u64, // Unix seconds
+    #[serde(default)]
+    pub login_id: Option<String>,
 }
 
 impl SsoSession {
@@ -145,20 +147,23 @@ pub async fn refresh_token(refresh_token: &str, sso_url: &str) -> Result<SsoSess
     parse_token_response(resp).await
 }
 
-/// Parse `code` and `state` from an OAuth callback query string.
-/// Input: the raw query string after `?` (e.g. "code=abc&state=xyz")
-/// Returns: (code, state) — both URL-decoded, empty string if not present
-fn parse_callback_query(query: &str) -> (String, String) {
+/// Parse `code`, `state`, and `loginId` from an OAuth callback query string.
+/// Input: the raw query string after `?` (e.g. "code=abc&state=xyz&loginId=...")
+/// Returns: (code, state, login_id) — all URL-decoded, empty string if not present
+fn parse_callback_query(query: &str) -> (String, String, String) {
     let mut code = String::new();
     let mut state = String::new();
+    let mut login_id = String::new();
     for pair in query.split('&') {
         if let Some(v) = pair.strip_prefix("code=") {
             code = urlencoding::decode(v).unwrap_or_default().into_owned();
         } else if let Some(v) = pair.strip_prefix("state=") {
             state = urlencoding::decode(v).unwrap_or_default().into_owned();
+        } else if let Some(v) = pair.strip_prefix("loginId=") {
+            login_id = urlencoding::decode(v).unwrap_or_default().into_owned();
         }
     }
-    (code, state)
+    (code, state, login_id)
 }
 
 /// OAuth 2.0 + PKCE login flow.
@@ -190,14 +195,14 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     println!("  {}", auth_url);
     let _ = crate::rtc_test_server::open_browser(&auth_url);
 
-    // Channel: loopback callback OR stdin paste both send (code, state) here
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(String, String)>>(2);
+    // Channel: loopback callback OR stdin paste both send (code, state, login_id) here
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(String, String, String)>>(2);
 
     // Spawn loopback listener task
     let tx_loopback = tx.clone();
     let state_for_loopback = state.clone();
     tokio::spawn(async move {
-        let result: Result<(String, String)> = async {
+        let result: Result<(String, String, String)> = async {
             let (mut stream, _) = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
                 listener.accept(),
@@ -221,7 +226,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|p| p.split_once('?').map(|(_, q)| q))
                 .unwrap_or("");
-            let (code, ret_state) = parse_callback_query(query);
+            let (code, ret_state, login_id) = parse_callback_query(query);
 
             // Always respond to the browser
             let html = r##"<!DOCTYPE html>
@@ -312,7 +317,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             if code.is_empty() {
                 anyhow::bail!("No authorization code received from OAuth server.");
             }
-            Ok((code, ret_state))
+            Ok((code, ret_state, login_id))
         }.await;
         let _ = tx_loopback.send(result).await;
     });
@@ -323,7 +328,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
         rx.recv(),
     ).await;
 
-    let (code, _) = match first {
+    let (code, _, login_id) = match first {
         Ok(Some(result)) => {
             // Callback arrived within 15s
             println!("Login successful.");
@@ -344,18 +349,18 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
                     let mut s = String::new();
                     std::io::stdin().read_line(&mut s).map(|_| s)
                 }).await;
-                let outcome: Result<(String, String)> = match result {
+                let outcome: Result<(String, String, String)> = match result {
                     Ok(Ok(s)) => {
                         let pasted = s.trim();
                         let query = pasted
                             .split_once('?')
                             .map(|(_, q)| q.split('#').next().unwrap_or(q))
                             .unwrap_or("");
-                        let (code, state) = parse_callback_query(query);
+                        let (code, state, login_id) = parse_callback_query(query);
                         if code.is_empty() {
                             Err(anyhow::anyhow!("No authorization code found in the pasted URL."))
                         } else {
-                            Ok((code, state))
+                            Ok((code, state, login_id))
                         }
                     }
                     _ => Err(anyhow::anyhow!("Failed to read input.")),
@@ -397,7 +402,10 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
         anyhow::bail!("Token exchange failed ({status}): {body}");
     }
 
-    let session = parse_token_response(resp).await?;
+    let mut session = parse_token_response(resp).await?;
+    if !login_id.is_empty() {
+        session.login_id = Some(login_id);
+    }
     session.save()?;
     Ok(session)
 }
@@ -417,6 +425,7 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<SsoSession> {
         access_token: tr.access_token,
         refresh_token: tr.refresh_token,
         expires_at,
+        login_id: None,
     })
 }
 
@@ -439,6 +448,7 @@ mod tests {
             access_token: "access_abc".to_string(),
             refresh_token: "refresh_xyz".to_string(),
             expires_at: now() + 3600,
+            login_id: None,
         };
         session.save_to(&path).unwrap();
 
@@ -457,6 +467,7 @@ mod tests {
             access_token: "tok".to_string(),
             refresh_token: "ref".to_string(),
             expires_at: now() + 3600,
+            login_id: None,
         };
         session.save_to(&path).unwrap();
         assert!(path.exists());
@@ -500,35 +511,47 @@ mod tests {
 
     #[test]
     fn parse_callback_query_extracts_code_and_state() {
-        let (code, state) = parse_callback_query("code=mycode123&state=mystate456");
+        let (code, state, login_id) = parse_callback_query("code=mycode123&state=mystate456");
         assert_eq!(code, "mycode123");
         assert_eq!(state, "mystate456");
+        assert_eq!(login_id, "");
+    }
+
+    #[test]
+    fn parse_callback_query_extracts_login_id() {
+        let (code, state, login_id) = parse_callback_query("code=abc&loginId=52a4f560&state=xyz");
+        assert_eq!(code, "abc");
+        assert_eq!(state, "xyz");
+        assert_eq!(login_id, "52a4f560");
     }
 
     #[test]
     fn parse_callback_query_url_decodes_values() {
         // Spaces encoded as %20, plus other percent-encoded chars
-        let (code, state) = parse_callback_query("code=hello%20world&state=foo%2Bbar");
+        let (code, state, _) = parse_callback_query("code=hello%20world&state=foo%2Bbar");
         assert_eq!(code, "hello world");
         assert_eq!(state, "foo+bar");
     }
 
     #[test]
     fn parse_callback_query_handles_missing_params() {
-        let (code, state) = parse_callback_query("code=only_code");
+        let (code, state, login_id) = parse_callback_query("code=only_code");
         assert_eq!(code, "only_code");
         assert_eq!(state, "");
+        assert_eq!(login_id, "");
 
-        let (code2, state2) = parse_callback_query("");
+        let (code2, state2, login_id2) = parse_callback_query("");
         assert_eq!(code2, "");
         assert_eq!(state2, "");
+        assert_eq!(login_id2, "");
     }
 
     #[test]
     fn parse_callback_query_handles_extra_params() {
-        let (code, state) = parse_callback_query("session_state=ignored&code=abc&state=xyz&extra=irrelevant");
+        let (code, state, login_id) = parse_callback_query("session_state=ignored&code=abc&state=xyz&loginId=user123&extra=irrelevant");
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz");
+        assert_eq!(login_id, "user123");
     }
 
     #[test]
@@ -537,6 +560,7 @@ mod tests {
             access_token: "tok".to_string(),
             refresh_token: "ref".to_string(),
             expires_at: SsoSession::now_secs() + 30, // expires in 30s, buffer is 60s
+            login_id: None,
         };
         assert!(session.needs_refresh(), "should need refresh when < 60s remaining");
     }
@@ -547,6 +571,7 @@ mod tests {
             access_token: "tok".to_string(),
             refresh_token: "ref".to_string(),
             expires_at: SsoSession::now_secs() + 3600, // 1 hour remaining
+            login_id: None,
         };
         assert!(!session.needs_refresh(), "should not need refresh with 1h remaining");
     }

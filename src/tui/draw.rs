@@ -100,9 +100,12 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
     // Build SSO session status line
     let sso_session = crate::sso_auth::SsoSession::load();
     let (cred_line, cred_style) = if let Some(session) = sso_session {
-        let ts = session.expires_at;
+        let label = match &session.login_id {
+            Some(id) => format!("\u{1f511} Logged in (SSO: {})", id),
+            None => "\u{1f511} Logged in (SSO)".to_string(),
+        };
         (
-            format!("\u{1f511} Logged in (SSO session expires: {})", ts),
+            label,
             Style::default().fg(Color::Green),
         )
     } else {
