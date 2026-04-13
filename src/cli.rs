@@ -463,10 +463,8 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Repl => crate::repl::run_repl().await,
         Commands::Login => {
             let config = crate::config::AtemConfig::load()?;
-            let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
-            let remaining = session.expires_at.saturating_sub(crate::sso_auth::SsoSession::now_secs());
-            let hours = remaining / 3600;
-            println!("Session valid for {}h.", hours);
+            let _session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
+            println!("Logged in.");
             Ok(())
         }
         Commands::Logout => {
