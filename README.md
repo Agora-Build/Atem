@@ -29,9 +29,8 @@ atem repl                               # Interactive REPL with AI command inter
 ### Authentication
 
 ```bash
-atem login                              # Pair with Astation, sync credentials (interactive y/n save)
-atem login --save-credentials           # Pair and auto-save credentials (skip prompt)
-atem logout                             # Clear saved session
+atem login                              # Log in with Agora Console (opens browser)
+atem logout                             # Log out (delete saved session)
 ```
 
 ### Tokens
@@ -107,7 +106,6 @@ atem config clear                       # Clear active project
 [Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates between [Chisel](https://github.com/Agora-Build/chisel), Atem, and AI agents. It receives annotation tasks from the browser, routes them to the right Atem instance, and tracks task status — so you can talk to your coding agent from anywhere. Once paired, Atem can:
 
 - Receive task assignments from Chisel annotations and route them to AI agents
-- Sync Agora credentials automatically
 - Relay voice-coding sessions (speech-to-code and code-to-speech)
 - Request diagram generation from AI agents
 
@@ -121,37 +119,43 @@ Speak to code: Astation captures audio, a ConvoAI agent transcribes it, and Atem
 
 ## Configuration
 
-### Via Astation (recommended)
+### Login
 
 ```bash
-atem login          # Pair with Astation, credentials sync automatically
+atem login          # OAuth 2.0 browser flow — session saved to ~/.config/atem/sso_session.json
 ```
 
-### Via environment variables
-
-```bash
-export AGORA_CUSTOMER_ID="..."
-export AGORA_CUSTOMER_SECRET="..."
-```
+If the browser redirect doesn't complete (e.g. remote server), atem will prompt you to paste the callback URL from the browser address bar.
 
 ### Config file
 
-Non-sensitive settings in `~/.config/atem/config.toml`:
+`~/.config/atem/config.toml`:
 
 ```toml
 astation_ws = "ws://127.0.0.1:8080/ws"
 astation_relay_url = "https://station.agora.build"
 rtm_channel = "atem_channel"
+
+# Optional overrides
+# bff_url = "https://agora-cli.agora.io"
+# sso_url = "https://sso2.agora.io"
 ```
 
-Credentials are stored separately in an encrypted file (AES-256-GCM, machine-bound). See `designs/credential-flow.md`.
+### Environment variable overrides
+
+```bash
+ATEM_BFF_URL=...   # Override BFF API base URL
+ATEM_SSO_URL=...   # Override SSO base URL
+AGORA_APP_ID=...           # Override active project App ID
+AGORA_APP_CERTIFICATE=...  # Override active project certificate
+```
 
 ## Development
 
 ```bash
 cargo build              # Debug build
 cargo build --release    # Release build
-cargo test               # Run tests (400+ tests)
+cargo test               # Run tests (470+ tests)
 cargo check              # Type-check
 cargo fmt                # Format
 cargo clippy             # Lint
