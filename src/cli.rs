@@ -12,6 +12,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Generate Agora RTC/RTM tokens
     Token {
         #[command(subcommand)]
         token_command: TokenCommands,
@@ -33,9 +34,9 @@ pub enum Commands {
     },
     /// Interactive REPL with AI-powered command interpretation
     Repl,
-    /// Log in to Agora Console via SSO (OAuth 2.0 + PKCE browser flow)
+    /// Log in with Agora Console
     Login,
-    /// Log out (delete saved SSO session)
+    /// Log out
     Logout,
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {
@@ -465,7 +466,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
             let remaining = session.expires_at.saturating_sub(crate::sso_auth::SsoSession::now_secs());
             let hours = remaining / 3600;
-            println!("Logged in. Session valid for {}h.", hours);
+            println!("Session valid for {}h.", hours);
             Ok(())
         }
         Commands::Logout => {

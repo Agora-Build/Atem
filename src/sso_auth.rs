@@ -161,14 +161,16 @@ fn parse_callback_query(query: &str) -> (String, String) {
     (code, state)
 }
 
-/// Full OAuth 2.0 + PKCE browser login flow.
-/// Opens the browser (falls back to printing URL), waits for the loopback callback,
-/// exchanges the code for tokens, saves the session, and returns it.
+/// OAuth 2.0 + PKCE login flow.
+///
+/// Opens the browser and waits for the loopback redirect callback.
+/// If no callback arrives within 15 seconds, prints a hint asking the user to
+/// paste the callback URL from the browser address bar — both paths then race;
+/// whichever arrives first completes the login.
 pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     let (verifier, challenge) = generate_pkce();
     let state = generate_state();
 
-    // Bind on a random port
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", port);
@@ -187,66 +189,118 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     println!("Opening browser for Agora Console login...");
     println!("  {}", auth_url);
     let _ = crate::rtc_test_server::open_browser(&auth_url);
-    println!("Waiting for login to complete...");
 
-    // Accept exactly one connection on the loopback
-    let (mut stream, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        listener.accept(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Login timed out after 5 minutes."))?
-    .map_err(|e| anyhow::anyhow!("Loopback accept failed: {}", e))?;
+    // Channel: loopback callback OR stdin paste both send (code, state) here
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(String, String)>>(2);
 
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 { break; }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
-    }
-    let request = String::from_utf8_lossy(&buf);
+    // Spawn loopback listener task
+    let tx_loopback = tx.clone();
+    let state_for_loopback = state.clone();
+    tokio::spawn(async move {
+        let result: Result<(String, String)> = async {
+            let (mut stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                listener.accept(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Loopback timed out"))?
+            .map_err(|e| anyhow::anyhow!("Accept failed: {}", e))?;
 
-    // Parse the request line: "GET /oauth/callback?code=xxx&state=yyy HTTP/1.1"
-    let query = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|path| path.split_once('?').map(|(_, q)| q))
-        .unwrap_or("");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut tmp).await?;
+                if n == 0 { break; }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+            }
+            let request = String::from_utf8_lossy(&buf);
+            let query = request
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|p| p.split_once('?').map(|(_, q)| q))
+                .unwrap_or("");
+            let (code, ret_state) = parse_callback_query(query);
 
-    let (code, returned_state) = parse_callback_query(query);
+            // Always respond to the browser
+            let html = "<html><body><h2>Login successful — return to the terminal.</h2></body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(), html,
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
 
-    // Validate before responding to browser
-    let (html_body, error) = if returned_state != state {
-        (
-            "<html><body><h2>Login failed — state mismatch. Try again.</h2></body></html>",
-            Some("OAuth state mismatch — possible CSRF. Try 'atem login' again."),
-        )
-    } else if code.is_empty() {
-        (
-            "<html><body><h2>Login failed — no code received. Try again.</h2></body></html>",
-            Some("No authorization code received from OAuth server."),
-        )
-    } else {
-        (
-            "<html><body><h2>Login successful — return to the terminal.</h2></body></html>",
-            None,
-        )
+            if ret_state != state_for_loopback {
+                anyhow::bail!("OAuth state mismatch — possible CSRF. Try 'atem login' again.");
+            }
+            if code.is_empty() {
+                anyhow::bail!("No authorization code received from OAuth server.");
+            }
+            Ok((code, ret_state))
+        }.await;
+        let _ = tx_loopback.send(result).await;
+    });
+
+    // Wait 15s for the loopback callback; if none, show paste hint
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        rx.recv(),
+    ).await;
+
+    let (code, _) = match first {
+        Ok(Some(result)) => {
+            // Callback arrived within 15s
+            println!("Login successful.");
+            result?
+        }
+        _ => {
+            // No callback yet — show paste hint and also accept stdin
+            println!("\nIf the browser redirect didn't complete, copy the callback URL");
+            println!("from your browser's address bar and paste it here:");
+            print!("> ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+
+            // Spawn stdin reader
+            let tx_stdin = tx.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(|| {
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s).map(|_| s)
+                }).await;
+                let outcome: Result<(String, String)> = match result {
+                    Ok(Ok(s)) => {
+                        let pasted = s.trim();
+                        let query = pasted
+                            .split_once('?')
+                            .map(|(_, q)| q.split('#').next().unwrap_or(q))
+                            .unwrap_or("");
+                        let (code, state) = parse_callback_query(query);
+                        if code.is_empty() {
+                            Err(anyhow::anyhow!("No authorization code found in the pasted URL."))
+                        } else {
+                            Ok((code, state))
+                        }
+                    }
+                    _ => Err(anyhow::anyhow!("Failed to read input.")),
+                };
+                let _ = tx_stdin.send(outcome).await;
+            });
+
+            // Wait for whichever arrives first: loopback or stdin
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(285),
+                rx.recv(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Login timed out."))?
+            .ok_or_else(|| anyhow::anyhow!("Login failed."))??;
+
+            println!("Login successful.");
+            result
+        }
     };
-
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html_body.len(),
-        html_body,
-    );
-    stream.write_all(response.as_bytes()).await?;
-    drop(stream);
-
-    if let Some(err) = error {
-        anyhow::bail!("{}", err);
-    }
 
     // Exchange code for tokens
     let client = reqwest::Client::new();
@@ -272,6 +326,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     session.save()?;
     Ok(session)
 }
+
 
 /// Parse the JSON token response into an SsoSession.
 async fn parse_token_response(resp: reqwest::Response) -> Result<SsoSession> {

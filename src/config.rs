@@ -269,15 +269,14 @@ impl AtemConfig {
     }
 
     /// Get the BFF URL with fallback default.
-    /// NOTE: defaults to staging until the production URL (https://agora-cli.agora.io) is confirmed.
     /// Override via ATEM_BFF_URL env var or bff_url in config.toml.
     pub fn effective_bff_url(&self) -> &str {
-        self.bff_url.as_deref().unwrap_or("https://agora-cli-bff.staging.la3.agoralab.co")
+        self.bff_url.as_deref().unwrap_or("https://agora-cli.agora.io")
     }
 
     /// Get the SSO URL with fallback default
     pub fn effective_sso_url(&self) -> &str {
-        self.sso_url.as_deref().unwrap_or("https://sso.agora.io")
+        self.sso_url.as_deref().unwrap_or("https://sso2.agora.io")
     }
 }
 
@@ -363,8 +362,7 @@ impl ActiveProject {
             return Ok(proj.app_id);
         }
         anyhow::bail!(
-            "No active project. Run `atem config set --app-id <ID> --app-certificate <CERT>`, \
-             `atem project use <APP_ID>`, set AGORA_APP_ID env var, or pass `--app-id`"
+            "No active project. Run `atem list project`, then `atem project use <index>`"
         )
     }
 
@@ -382,8 +380,7 @@ impl ActiveProject {
             return Ok(proj.app_certificate);
         }
         anyhow::bail!(
-            "No active project. Run `atem config set --app-id <ID> --app-certificate <CERT>`, \
-             `atem project use <APP_ID>`, set AGORA_APP_CERTIFICATE env var, or pass `--app-id`"
+            "No active project. Run `atem list project`, then `atem project use <index>`"
         )
     }
 }
@@ -671,7 +668,7 @@ mod tests {
         let config = AtemConfig::default();
         assert_eq!(
             config.effective_bff_url(),
-            "https://agora-cli-bff.staging.la3.agoralab.co"
+            "https://agora-cli.agora.io"
         );
     }
 
@@ -687,7 +684,7 @@ mod tests {
     #[test]
     fn effective_sso_url_default() {
         let config = AtemConfig::default();
-        assert_eq!(config.effective_sso_url(), "https://sso.agora.io");
+        assert_eq!(config.effective_sso_url(), "https://sso2.agora.io");
     }
 
     #[test]
@@ -700,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn display_masked_shows_sso_not_logged_in() {
+    fn display_masked_shows_sso_section() {
         let config = AtemConfig {
             rtm_channel: Some("test_channel".to_string()),
             ..Default::default()
@@ -708,7 +705,8 @@ mod tests {
         let display = config.display_masked();
         assert!(display.contains("test_channel")); // non-secret shown
         assert!(display.contains("SSO:"));
-        assert!(display.contains("not logged in"));
+        // Shows either "logged in" or "not logged in" depending on real session state
+        assert!(display.contains("logged in") || display.contains("not logged in"));
         // No credentials in config anymore
         assert!(!display.contains("customer_id"));
         assert!(!display.contains("customer_secret"));

@@ -36,10 +36,10 @@ pub async fn fetch_projects(access_token: &str, bff_url: &str) -> Result<Vec<Bff
 
     #[derive(Deserialize)]
     struct BffResponse {
-        projects: Vec<BffProject>,
+        items: Vec<BffProject>,
     }
     let parsed: BffResponse = resp.json().await?;
-    Ok(parsed.projects)
+    Ok(parsed.items)
 }
 
 /// Format a project list for terminal output.
