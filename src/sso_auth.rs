@@ -1,7 +1,6 @@
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
-use reqwest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -67,7 +66,7 @@ impl SsoSession {
 
     // ── token access ─────────────────────────────────────────────────
 
-    pub fn now_secs() -> u64 {
+    pub(crate) fn now_secs() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -78,6 +77,8 @@ impl SsoSession {
         self.expires_at < Self::now_secs() + 60
     }
 }
+
+const CLIENT_ID: &str = "agora_web_cli";
 
 /// Generate a PKCE (code_verifier, code_challenge) pair.
 /// verifier: 32 random bytes → base64url
@@ -126,7 +127,7 @@ pub async fn refresh_token(refresh_token: &str, sso_url: &str) -> Result<SsoSess
         .post(format!("{}/api/v0/oauth/token", sso_url))
         .form(&[
             ("grant_type", "refresh_token"),
-            ("client_id", "agora_web_cli"),
+            ("client_id", CLIENT_ID),
             ("refresh_token", refresh_token),
         ])
         .send()
