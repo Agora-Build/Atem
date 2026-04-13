@@ -198,6 +198,100 @@ echo "$(yellow "Serv")"
 run "atem serv list" -- "$ATEM" serv list
 echo
 
+# ── RTC test server (/api/token over TLS) ───────────────────────────
+echo "$(yellow "RTC test server (/api/token)")"
+RTC_PORT=18443
+RTC_PID=""
+RTC_LOG="$(mktemp -t atem-rtc.XXXXXX.log)"
+
+# Only attempt if we have credentials (active project or env vars)
+if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HOME/.config/atem/project_cache.enc" ]]; then
+    "$ATEM" serv rtc --channel smoketest --port "$RTC_PORT" >"$RTC_LOG" 2>&1 &
+    RTC_PID=$!
+    # wait up to 10s for the TLS port to be accepting connections
+    for _ in $(seq 1 20); do
+        if curl -sk --max-time 1 "https://127.0.0.1:$RTC_PORT/" -o /dev/null 2>/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    # ── Test 1: 50× POST /api/token, count non-200 responses
+    printf "  %s ... " "$(dim "atem serv rtc — 50× /api/token (no 400s)")"
+    counts="$(for i in $(seq 1 50); do
+        curl -sk --max-time 5 -X POST "https://127.0.0.1:$RTC_PORT/api/token" \
+            -H 'Content-Type: application/json' \
+            -d '{"channel":"smoketest","uid":"123"}' \
+            -o /dev/null -w '%{http_code}\n'
+    done | sort | uniq -c)"
+    non_200="$(echo "$counts" | grep -v ' 200$' || true)"
+    if [[ -z "$non_200" ]]; then
+        green "PASS"; echo " (50× 200)"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL"; echo
+        echo "$counts" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("atem serv rtc — 50× /api/token")
+    fi
+
+    # ── Test 2: deterministic split-write reproduction
+    printf "  %s ... " "$(dim "atem serv rtc — split-write POST returns 200")"
+    if command -v python3 >/dev/null 2>&1; then
+        out="$(python3 - <<PY 2>&1
+import socket, ssl, time, sys
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+try:
+    sock = socket.create_connection(("127.0.0.1", $RTC_PORT), timeout=5)
+    ssock = ctx.wrap_socket(sock, server_hostname="localhost")
+    body = b'{"channel":"smoketest","uid":"123"}'
+    headers = (
+        f"POST /api/token HTTP/1.1\r\n"
+        f"Host: localhost:$RTC_PORT\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode()
+    ssock.sendall(headers)
+    time.sleep(0.5)
+    ssock.sendall(body)
+    data = b""
+    while True:
+        chunk = ssock.recv(4096)
+        if not chunk: break
+        data += chunk
+        if len(data) > 65536: break
+    print(data.decode(errors='replace').split('\\r\\n')[0])
+except Exception as e:
+    print(f"ERROR: {e}")
+PY
+)"
+        if echo "$out" | grep -q "200 OK"; then
+            green "PASS"; echo " ($out)"
+            PASS=$((PASS + 1))
+        else
+            red "FAIL"; echo " ($out)"
+            FAIL=$((FAIL + 1))
+            FAILED_NAMES+=("atem serv rtc — split-write POST")
+        fi
+    else
+        yellow "SKIP"; echo " (python3 not available)"
+        SKIP=$((SKIP + 1))
+    fi
+
+    # cleanup
+    if [[ -n "$RTC_PID" ]]; then
+        kill "$RTC_PID" 2>/dev/null || true
+        wait "$RTC_PID" 2>/dev/null || true
+    fi
+else
+    skip "atem serv rtc — 50× /api/token"        "no AGORA_APP_ID / active project"
+    skip "atem serv rtc — split-write POST"      "no AGORA_APP_ID / active project"
+fi
+rm -f "$RTC_LOG"
+echo
+
 # ── Interactive / external commands (intentionally skipped) ─────────
 echo "$(yellow "Interactive / external (skipped)")"
 skip "atem login"    "opens browser — interactive"
