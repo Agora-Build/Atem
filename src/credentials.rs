@@ -519,4 +519,192 @@ mod tests {
         let store = CredentialStore { entries: vec![] };
         assert!(store.resolve(None, now()).is_err());
     }
+
+    // ── Practical scenario tests ──────────────────────────────────────
+
+    #[test]
+    fn user_logs_in_then_pairs_with_astation() {
+        // Scenario: user runs `atem login`, then later runs `atem pair`.
+        // After pairing, resolve with connected astation should prefer paired tokens
+        // (Astation identity wins while connected).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.enc");
+        let mut store = CredentialStore::load_from(&path);
+
+        // Step 1: atem login
+        store.upsert(CredentialEntry::new_sso(
+            "sso_tok".into(), "sso_ref".into(), now() + 3600, Some("user@agora".into()),
+        ));
+        store.save_to(&path).unwrap();
+
+        // Step 2: atem pair
+        let mut store = CredentialStore::load_from(&path);
+        store.upsert(CredentialEntry::new_paired(
+            "paired_tok".into(), "paired_ref".into(), now() + 3600,
+            Some("user@agora".into()), "astation-1".into(), true, now(),
+        ));
+        store.save_to(&path).unwrap();
+
+        // Step 3: resolve while connected — paired wins
+        let store = CredentialStore::load_from(&path);
+        assert_eq!(store.entries.len(), 2);
+        let e = store.resolve(Some("astation-1"), now()).unwrap();
+        assert_eq!(e.access_token, "paired_tok");
+    }
+
+    #[test]
+    fn atem_falls_back_to_own_sso_when_paired_astation_different() {
+        // User paired with astation-1, but is now connected to astation-2 (no paired entry there)
+        let store = CredentialStore {
+            entries: vec![
+                CredentialEntry::new_sso("sso_tok".into(), "r".into(), now() + 3600, None),
+                CredentialEntry::new_paired(
+                    "p1".into(), "r".into(), now() + 3600, None,
+                    "astation-1".into(), true, 100,
+                ),
+            ],
+        };
+        // Connected to astation-2 — no matching paired entry → fallback to SSO
+        let e = store.resolve(Some("astation-2"), now()).unwrap();
+        assert_eq!(e.access_token, "sso_tok");
+    }
+
+    #[test]
+    fn disconnect_then_reconnect_within_grace_period() {
+        // Simulates: paired (no save), disconnect, reconnect within 5 min
+        let mut store = CredentialStore { entries: vec![] };
+        store.upsert(CredentialEntry::new_paired(
+            "paired_tok".into(), "r".into(), now() + 3600, None,
+            "astation-1".into(), false, 100,
+        ));
+
+        // Connected: resolves fine
+        assert!(store.resolve(Some("astation-1"), now()).is_ok());
+
+        // Mark disconnected
+        if let Some(e) = store.find_paired_mut("astation-1") {
+            e.disconnected_at = Some(now());
+        }
+
+        // Not connected but within grace (60s)
+        let e = store.resolve(None, now() + 60).unwrap();
+        assert_eq!(e.access_token, "paired_tok");
+
+        // Past grace — fails
+        assert!(store.resolve(None, now() + 400).is_err());
+
+        // Reconnect: clear disconnected_at
+        if let Some(e) = store.find_paired_mut("astation-1") {
+            e.disconnected_at = None;
+        }
+        let e = store.resolve(Some("astation-1"), now() + 500).unwrap();
+        assert_eq!(e.access_token, "paired_tok");
+    }
+
+    #[test]
+    fn multiple_astations_paired_simultaneously() {
+        let mut store = CredentialStore { entries: vec![] };
+        store.upsert(CredentialEntry::new_paired(
+            "tok_a".into(), "r".into(), now() + 3600, None,
+            "astation-A".into(), true, 100,
+        ));
+        store.upsert(CredentialEntry::new_paired(
+            "tok_b".into(), "r".into(), now() + 3600, None,
+            "astation-B".into(), true, 100,
+        ));
+        assert_eq!(store.entries.len(), 2);
+
+        // Connected to A → A's tokens
+        assert_eq!(store.resolve(Some("astation-A"), now()).unwrap().access_token, "tok_a");
+        // Connected to B → B's tokens
+        assert_eq!(store.resolve(Some("astation-B"), now()).unwrap().access_token, "tok_b");
+        // Not connected → first saved one wins (priority 3)
+        let r = store.resolve(None, now()).unwrap();
+        assert!(r.access_token == "tok_a" || r.access_token == "tok_b");
+    }
+
+    #[test]
+    fn remove_paired_leaves_others_intact() {
+        let mut store = CredentialStore { entries: vec![] };
+        store.upsert(CredentialEntry::new_sso("sso".into(), "r".into(), 1, None));
+        store.upsert(CredentialEntry::new_paired(
+            "a".into(), "r".into(), 1, None, "ast-A".into(), false, 100,
+        ));
+        store.upsert(CredentialEntry::new_paired(
+            "b".into(), "r".into(), 1, None, "ast-B".into(), false, 100,
+        ));
+
+        store.remove_paired("ast-A");
+        assert_eq!(store.entries.len(), 2);
+        assert!(store.find_sso().is_some());
+        assert!(store.find_paired("ast-A").is_none());
+        assert!(store.find_paired("ast-B").is_some());
+    }
+
+    #[test]
+    fn corrupted_file_returns_empty_store() {
+        // Any file that can't be decrypted (wrong machine, truncated, etc) should fall back
+        // to empty rather than panicking.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.enc");
+        std::fs::write(&path, b"this is not encrypted data").unwrap();
+        let store = CredentialStore::load_from(&path);
+        assert_eq!(store.entries.len(), 0);
+    }
+
+    #[test]
+    fn empty_store_saves_and_loads_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.enc");
+        let store = CredentialStore { entries: vec![] };
+        store.save_to(&path).unwrap();
+        let loaded = CredentialStore::load_from(&path);
+        assert_eq!(loaded.entries.len(), 0);
+    }
+
+    #[test]
+    fn file_permissions_are_0600_on_unix() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("creds.enc");
+            let mut store = CredentialStore { entries: vec![] };
+            store.upsert(CredentialEntry::new_sso("a".into(), "r".into(), 1, None));
+            store.save_to(&path).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0o600 permissions, got {:o}", mode);
+        }
+    }
+
+    #[test]
+    fn needs_refresh_true_when_near_expiry() {
+        let e = CredentialEntry::new_sso("t".into(), "r".into(), CredentialEntry::now_secs() + 30, None);
+        assert!(e.needs_refresh());
+    }
+
+    #[test]
+    fn needs_refresh_false_when_plenty_of_time() {
+        let e = CredentialEntry::new_sso("t".into(), "r".into(), CredentialEntry::now_secs() + 3600, None);
+        assert!(!e.needs_refresh());
+    }
+
+    #[test]
+    fn sso_source_always_has_save_credentials_true() {
+        let e = CredentialEntry::new_sso("t".into(), "r".into(), 100, None);
+        assert!(e.save_credentials, "SSO entries must always be saved");
+    }
+
+    #[test]
+    fn paired_source_respects_save_credentials_flag() {
+        let saved = CredentialEntry::new_paired(
+            "t".into(), "r".into(), 100, None, "ast".into(), true, 100,
+        );
+        let ephemeral = CredentialEntry::new_paired(
+            "t".into(), "r".into(), 100, None, "ast".into(), false, 100,
+        );
+        assert!(saved.save_credentials);
+        assert!(!ephemeral.save_credentials);
+    }
 }
