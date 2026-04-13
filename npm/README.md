@@ -20,9 +20,8 @@ atem repl                               # Interactive REPL with AI command inter
 ### Authentication
 
 ```bash
-atem login                              # Pair with Astation, sync credentials (interactive y/n save)
-atem login --save-credentials           # Pair and auto-save credentials (skip prompt)
-atem logout                             # Clear saved session
+atem login                              # Log in with Agora Console (opens browser)
+atem logout                             # Log out
 ```
 
 ### Tokens
@@ -40,15 +39,15 @@ atem token rtm create --user-id bob --expire 3600
 ```bash
 atem list project                       # List Agora projects
 atem list project --show-certificates   # List with app certificates visible
-atem project use <APP_ID>               # Set active project by App ID
 atem project use <N>                    # Set active project by index (1-based)
+atem project use <APP_ID>               # Set active project by App ID
 atem project show                       # Show current active project
 ```
 
 ### Configuration
 
 ```bash
-atem config show                        # Show resolved config (secrets masked)
+atem config show                        # Show resolved config (SSO state, active project)
 atem config set astation_ws <URL>       # Set Astation WebSocket URL
 atem config set astation_relay_url <URL> # Set Astation relay URL
 atem config clear                       # Clear active project
@@ -91,39 +90,6 @@ atem serv killall                       # Kill all background servers
 | **Codex Chat** | Codex terminal integration via PTY |
 | **Token Gen** | Generate Agora RTC/RTM tokens locally |
 | **Projects** | Browse Agora projects via API |
-
-## Credential Management
-
-Credentials are encrypted at rest using AES-256-GCM with a machine-bound key.
-
-```
-Priority: Astation sync (live) > env vars > encrypted store
-Storage:  ~/.config/atem/credentials.enc
-```
-
-### Via Astation (recommended)
-
-```bash
-atem login          # Pair with Astation, credentials sync automatically
-```
-
-### Via environment variables
-
-```bash
-export AGORA_CUSTOMER_ID="..."
-export AGORA_CUSTOMER_SECRET="..."
-```
-
-## Astation Pairing
-
-Atem registers with the Station relay service on startup and prints a pairing code:
-
-```
-Pairing code: ABCD-EFGH
-Open: https://station.agora.build/pair?code=ABCD-EFGH
-```
-
-Enter the code in Astation's Dev Console to pair. If a local Astation is running on `ws://127.0.0.1:8080/ws`, Atem connects directly instead.
 
 ## Supported Platforms
 
