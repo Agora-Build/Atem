@@ -4,6 +4,7 @@ mod app;
 mod command;
 mod dispatch;
 mod auth;
+mod sso_auth;
 mod claude_client;
 mod cli;
 mod codex_client;
