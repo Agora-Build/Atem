@@ -9,6 +9,7 @@ mod claude_client;
 mod cli;
 mod codex_client;
 mod config;
+mod credentials;
 mod repl;
 mod rtm_client;
 mod time_sync;
