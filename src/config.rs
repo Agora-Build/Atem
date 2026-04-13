@@ -226,7 +226,9 @@ impl AtemConfig {
             }
             None => {
                 lines.push(String::new());
-                lines.push("Active project: (none) — run `atem list project`, then `atem project use <APP_ID>`".to_string());
+                lines.push("Active project: (none)".to_string());
+                lines.push("  → run `atem list project` to see available projects".to_string());
+                lines.push("  → run `atem project use <N>` to set one".to_string());
             }
         }
 
@@ -308,22 +310,7 @@ impl ActiveProject {
             });
         }
 
-        // Fall back to legacy plaintext format (auto-migrate on next save)
-        #[derive(Deserialize)]
-        struct LegacyActiveProject {
-            app_id: String,
-            app_certificate: String,
-            name: String,
-        }
-        let legacy: LegacyActiveProject = serde_json::from_str(&content).ok()?;
-        let proj = ActiveProject {
-            app_id: legacy.app_id,
-            app_certificate: legacy.app_certificate,
-            name: legacy.name,
-        };
-        // Auto-migrate: re-save in encrypted format
-        let _ = proj.save();
-        Some(proj)
+        None
     }
 
     /// Save active project to disk (certificate encrypted).
@@ -756,41 +743,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn active_project_migrates_legacy_plaintext() {
-        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
-        let path = ActiveProject::path();
-        let backup = path.with_extension("json.bak");
-        let had_file = path.exists();
-        if had_file {
-            let _ = fs::rename(&path, &backup);
-        }
-
-        // Write legacy plaintext format
-        let legacy = serde_json::json!({
-            "app_id": "legacy_id",
-            "app_certificate": "legacy_cert",
-            "name": "Legacy Project"
-        });
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
-
-        // Load should succeed and auto-migrate
-        let loaded = ActiveProject::load().unwrap();
-        assert_eq!(loaded.app_id, "legacy_id");
-        assert_eq!(loaded.app_certificate, "legacy_cert");
-
-        // File should now be encrypted
-        let raw = fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("app_certificate_encrypted"));
-        assert!(!raw.contains("\"app_certificate\""));
-
-        if had_file {
-            let _ = fs::rename(&backup, &path);
-        } else {
-            let _ = fs::remove_file(&path);
-        }
-    }
 
     #[test]
     fn resolve_app_id_cli_takes_precedence() {
