@@ -8,6 +8,12 @@ on:
 permissions:
   contents: write
 
+# Only one release workflow runs at a time. Prevents a parallel release from
+# overwriting npm's `dist-tags.latest` when two tags are pushed close together.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
