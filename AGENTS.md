@@ -15,7 +15,7 @@ cargo build                              # Debug build
 cargo build --release                    # Release build
 cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
-cargo test                               # Run tests (460+ tests)
+cargo test                               # Run tests (470+ tests)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
@@ -37,9 +37,10 @@ src/
 ├── token.rs             # Agora RTC/RTM token generation
 ├── rtm_client.rs        # Agora RTM FFI wrapper with async Tokio channels
 ├── ai_client.rs         # Anthropic API client for intent parsing
-├── agora_api.rs         # Agora REST API client (projects, credentials)
-├── auth.rs              # Auth session management, deep link flow
-├── config.rs            # Config, encrypted credentials, active project, project cache
+├── sso_auth.rs          # OAuth 2.0 + PKCE login flow, token refresh, session storage
+├── agora_api.rs         # BFF API client (BffProject, fetch_projects with Bearer auth)
+├── auth.rs              # Astation auth session management, deep link flow
+├── config.rs            # Config, SSO/BFF URL helpers, active project, project cache
 ├── time_sync.rs         # HTTP Date-based time synchronization
 ├── acp_client.rs        # ACP (Agent Communication Protocol) JSON-RPC 2.0 over WebSocket
 ├── agent_client.rs      # Agent event types (TextDelta, ToolCall, Done, etc.) and PTY client
@@ -108,7 +109,7 @@ Key methods:
 - `VoiceRequest { session_id, accumulated_text, relay_url }` - voice coding from Astation
 - `VisualizeRequest { session_id, topic, relay_url? }` - diagram generation from Astation
 - `VisualizeResult { session_id, success, message, file_path? }` - sent back to Astation
-- Also: project lists, token requests, voice/video toggle, heartbeat, auth flow, credential sync
+- Also: project lists, token requests, voice/video toggle, heartbeat, auth flow
 
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
@@ -122,36 +123,40 @@ Key methods:
 
 **Diagram Server** (`diagram_server.rs`): SQLite-backed HTTP server for hosting diagrams. Stores HTML as blobs, serves at `/d/{id}`. Auto-starts as background daemon when needed. Integrates with server registry (`atem serv list/kill`).
 
-### Configuration & Credential Storage (`config.rs`)
-
-All sensitive data is encrypted at rest using machine-bound keys (HMAC-SHA256 from `/etc/machine-id` or macOS `IOPlatformUUID`).
+### Configuration & Storage (`config.rs`)
 
 **Files in `~/.config/atem/`:**
 
 | File | Contents | Encryption |
 |------|----------|------------|
-| `config.toml` | Non-sensitive settings (astation_ws, relay URL, diagram server URL) | None |
-| `credentials.enc` | `customer_id` + `customer_secret` (Agora REST API credentials) | AES-256-GCM |
+| `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) | None |
+| `sso_session.json` | OAuth access token, refresh token, expiry | None (chmod 0600) |
 | `active_project.json` | Selected project's `app_id`, `name`, encrypted `app_certificate` | XOR keystream |
 | `project_cache.json` | All projects from `atem list project` with encrypted certificates | XOR keystream |
 | `session.json` | Astation auth session ID + expiry | None |
 
-**Credential resolution order** (in `AtemConfig::load()`):
-1. Encrypted store (`credentials.enc`) — set by `atem login`
-2. Env vars (`AGORA_CUSTOMER_ID`, `AGORA_CUSTOMER_SECRET`) — override encrypted store
-3. Source tracked via `CredentialSource` enum: `None`, `ConfigFile`, `EnvVar`, `Astation`
+**SSO auth** (`sso_auth.rs`):
+- `atem login` — OAuth 2.0 + PKCE browser flow against `sso2.agora.io`; loopback redirect on random port; falls back to paste-URL after 15s
+- `atem logout` — deletes `sso_session.json`
+- `SsoSession::valid_token(sso_url)` — loads session, refreshes if expiring within 60s, returns access token
+- Project listing and `project use <APP_ID>` both call `valid_token()` then hit the BFF API
 
-**`atem config show`** displays credential source and actionable hints:
-- `Credentials: from ENV` / `from encrypted store` / `from Astation`
-- `Credentials: (none) — run 'atem login' or set AGORA_CUSTOMER_ID + AGORA_CUSTOMER_SECRET`
+**BFF API** (`agora_api.rs`):
+- `fetch_projects(access_token, bff_url)` — `GET {bff_url}/api/cli/v1/projects`, Bearer auth, returns `Vec<BffProject>`
+- Default BFF URL: `https://agora-cli.agora.io` (override via `ATEM_BFF_URL` or `bff_url` in config.toml)
+- Default SSO URL: `https://sso2.agora.io` (override via `ATEM_SSO_URL` or `sso_url` in config.toml)
+
+**`atem config show`** displays SSO state and active project:
+- `SSO:    logged in  (expires YYYY-MM-DD HH:MM UTC)`
+- `SSO:    not logged in  (run 'atem login')`
 
 **Active project resolution** (`ActiveProject::resolve_app_id/resolve_app_certificate`):
 1. CLI flag (`--app-id`)
 2. Env var (`AGORA_APP_ID`, `AGORA_APP_CERTIFICATE`)
 3. Active project file
-4. Error with guidance message
+4. Error: `"No active project. Run 'atem list project', then 'atem project use <index>'"`
 
-Note: RTC/RTM token generation needs only `app_id` + `app_certificate` (from active project). It does NOT need `customer_id`/`customer_secret`. Customer credentials are only for the Agora REST API (`atem list project`).
+Note: RTC/RTM token generation needs only `app_id` + `app_certificate` (from active project). It does NOT need SSO credentials.
 
 ### Native FFI Layer
 
