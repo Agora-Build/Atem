@@ -118,7 +118,7 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
 
     // Pairing banner: show when not connected to Astation
     let pairing_line = if !app.astation_connected {
-        Some("Pair with Astation to unlock Claude, Codex, and Agent features -- run: atem pair")
+        Some("Connect to Astation to unlock Claude, Codex, and Agent features")
     } else {
         None
     };

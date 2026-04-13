@@ -268,7 +268,9 @@ impl AtemConfig {
             .unwrap_or("https://station.agora.build")
     }
 
-    /// Get the BFF URL with fallback default
+    /// Get the BFF URL with fallback default.
+    /// NOTE: defaults to staging until the production URL (https://agora-cli.agora.io) is confirmed.
+    /// Override via ATEM_BFF_URL env var or bff_url in config.toml.
     pub fn effective_bff_url(&self) -> &str {
         self.bff_url.as_deref().unwrap_or("https://agora-cli-bff.staging.la3.agoralab.co")
     }
