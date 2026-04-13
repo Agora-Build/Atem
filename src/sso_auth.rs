@@ -224,7 +224,43 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             let (code, ret_state) = parse_callback_query(query);
 
             // Always respond to the browser
-            let html = "<html><body><h2>Login successful — return to the terminal.</h2></body></html>";
+            let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login successful</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:#0f0f11;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  }
+  .card{
+    text-align:center;padding:48px 56px;
+    background:#18181b;border:1px solid #2a2a2e;border-radius:16px;
+    box-shadow:0 8px 32px rgba(0,0,0,.4);
+  }
+  .icon{font-size:36px;margin-bottom:20px}
+  h1{font-size:20px;font-weight:600;color:#f4f4f5;margin-bottom:8px}
+  p{font-size:14px;color:#71717a;margin-bottom:28px}
+  button{
+    padding:9px 22px;border:none;border-radius:8px;
+    background:#3f3f46;color:#d4d4d8;font-size:14px;font-weight:500;
+    cursor:pointer;transition:background .15s;
+  }
+  button:hover{background:#52525b}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">✓</div>
+  <h1>Login successful</h1>
+  <p>Return to the terminal to continue.</p>
+  <button onclick="window.close()">Close</button>
+</div>
+</body>
+</html>"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 html.len(), html,
