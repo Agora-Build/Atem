@@ -381,12 +381,18 @@ async fn handle_connection(
     default_channel: &str,
     expire_secs: u32,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let request = String::from_utf8_lossy(&buf[..n]);
+    // Read until we have the full request (headers + Content-Length bytes of body).
+    // A single .read() can return only the headers if the browser splits the POST
+    // across TLS records — that previously caused intermittent 400s on /api/token.
+    let buf = match read_full_http_request(&mut stream).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            eprintln!("[rtc_test_server] read error: {e}");
+            return Ok(());
+        }
+    };
+    let request = String::from_utf8_lossy(&buf);
 
     // Parse first line: METHOD PATH HTTP/1.x
     let first_line = request.lines().next().unwrap_or("");
@@ -417,6 +423,76 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// Read an HTTP request from the TLS stream until headers are complete and
+/// `Content-Length` bytes of body have arrived. Returns:
+///   - Ok(Some(bytes)) — full request available
+///   - Ok(None)        — connection closed before any data
+///   - Err(_)          — IO error
+///
+/// Caps total request size at 64KiB to avoid memory exhaustion.
+async fn read_full_http_request(
+    stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Result<Option<Vec<u8>>> {
+    const MAX_BYTES: usize = 64 * 1024;
+    const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+
+    // Phase 1: read until \r\n\r\n is in the buffer (or limit hit).
+    let headers_end = loop {
+        let read_fut = stream.read(&mut tmp);
+        let n = match tokio::time::timeout(HEADER_TIMEOUT, read_fut).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("timeout waiting for headers"),
+        };
+        if n == 0 {
+            // Closed cleanly with no full request.
+            return Ok(if buf.is_empty() { None } else { Some(buf) });
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break idx + 4;
+        }
+        if buf.len() >= MAX_BYTES {
+            anyhow::bail!("request headers exceeded {} bytes", MAX_BYTES);
+        }
+    };
+
+    // Phase 2: parse Content-Length (case-insensitive) from headers.
+    let header_str = String::from_utf8_lossy(&buf[..headers_end]);
+    let content_length: usize = header_str
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.splitn(2, ':');
+            let name = parts.next()?.trim();
+            let value = parts.next()?.trim();
+            if name.eq_ignore_ascii_case("Content-Length") {
+                value.parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    // Phase 3: read until body is complete.
+    let target_total = headers_end + content_length;
+    if target_total > MAX_BYTES {
+        anyhow::bail!("Content-Length {} exceeds limit", content_length);
+    }
+    while buf.len() < target_total {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            // Connection closed mid-body — return what we have.
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+
+    Ok(Some(buf))
 }
 
 /// Extract the HTTP body (after the blank line).
@@ -580,6 +656,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .token-row .btn {{ flex-shrink: 0; }}
 .video-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 16px; flex: 1; }}
 .video-cell {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; position: relative; aspect-ratio: 16/9; }}
+/* The Agora SDK injects <video> inside a wrapper div; make the wrapper fill the cell. */
+.video-cell > div {{ position: absolute; inset: 0; }}
 .video-cell video {{ width: 100%; height: 100%; object-fit: cover; }}
 .video-label {{ position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; font-size: 12px; color: #e6edf3; }}
 .status-bar {{ background: #161b22; border-top: 1px solid #30363d; padding: 8px 20px; font-size: 12px; color: #7d8590; display: flex; justify-content: space-between; }}
