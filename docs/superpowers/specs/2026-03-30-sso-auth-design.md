@@ -107,7 +107,7 @@ pub async fn fetch_projects(access_token: &str, bff_url: &str) -> Result<Vec<Bff
 |---|---|---|
 | BFF base | `https://agora-cli-bff.staging.la3.agoralab.co` | `https://agora-cli.agora.io` |
 
-Default: production. Override via `bff_url` in `config.toml` or env var `ATEM_BFF_URL`.
+Default: staging (`https://agora-cli-bff.staging.la3.agoralab.co`) until the production URL is confirmed. Override via `bff_url` in `config.toml` or env var `ATEM_BFF_URL`.
 
 ### Kept from old file
 
