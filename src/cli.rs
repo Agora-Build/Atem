@@ -398,7 +398,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("Active project set: {} ({})", project.name, project.app_id);
                 } else {
                     let config = crate::config::AtemConfig::load()?;
-                    let token = crate::sso_auth::valid_token(config.effective_sso_url()).await
+                    let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
                     let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
                     if let Err(e) = crate::config::ProjectCache::save(&projects) {
@@ -450,7 +450,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::List { list_command } => match list_command {
             ListCommands::Project { show_certificates } => {
                 let config = crate::config::AtemConfig::load()?;
-                let token = crate::sso_auth::valid_token(config.effective_sso_url()).await
+                let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
                 if let Err(e) = crate::config::ProjectCache::save(&projects) {
@@ -464,6 +464,14 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Login => {
             let config = crate::config::AtemConfig::load()?;
             let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
+            let mut store = crate::credentials::CredentialStore::load();
+            store.upsert(crate::credentials::CredentialEntry::new_sso(
+                session.access_token.clone(),
+                session.refresh_token.clone(),
+                session.expires_at,
+                session.login_id.clone(),
+            ));
+            store.save()?;
             match &session.login_id {
                 Some(id) => println!("Logged in. (SSO: {})", id),
                 None => println!("Logged in. (SSO)"),
@@ -471,7 +479,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Logout => {
-            crate::sso_auth::SsoSession::delete()?;
+            let mut store = crate::credentials::CredentialStore::load();
+            store.remove_sso();
+            store.save()?;
             println!("Logged out.");
             Ok(())
         }

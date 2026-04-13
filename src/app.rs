@@ -349,7 +349,7 @@ impl App {
 
                 // Fetch projects via SSO token
                 let fetch_result = async {
-                    let token = crate::sso_auth::valid_token(self.config.effective_sso_url()).await
+                    let token = crate::sso_auth::valid_token(None, self.config.effective_sso_url()).await
                         .map_err(|_| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
                     crate::agora_api::fetch_projects(&token, self.config.effective_bff_url()).await
                 }.await;

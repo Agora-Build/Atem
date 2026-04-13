@@ -193,21 +193,30 @@ impl AtemConfig {
             self.diagram_server_url.as_deref().unwrap_or("(not set)")
         ));
 
-        // SSO login state
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        match crate::sso_auth::SsoSession::load() {
-            Some(session) if session.expires_at > now_secs => {
-                let label = match &session.login_id {
-                    Some(id) => format!("logged in  ({})", id),
-                    None => "logged in".to_string(),
-                };
-                lines.push(format!("SSO:    {}", label));
-            }
-            _ => {
-                lines.push("SSO:    not logged in  (run 'atem login')".to_string());
+        // SSO + paired credentials
+        let store = crate::credentials::CredentialStore::load();
+        if let Some(sso) = store.find_sso() {
+            let id = sso.login_id.as_deref().unwrap_or("-");
+            lines.push(format!("SSO:      logged in  ({})", id));
+        } else {
+            lines.push("SSO:      not logged in".to_string());
+        }
+        let paired: Vec<_> = store
+            .entries
+            .iter()
+            .filter(|e| e.source == crate::credentials::CredentialSource::AstationPaired)
+            .collect();
+        if paired.is_empty() {
+            lines.push("Paired:   none".to_string());
+        } else {
+            for p in paired {
+                let aid = p.astation_id.as_deref().unwrap_or("-");
+                let login = p.login_id.as_deref().unwrap_or("-");
+                let saved = if p.save_credentials { "yes" } else { "no" };
+                lines.push(format!(
+                    "Paired:   {}  (SSO: {})  [save: {}]",
+                    aid, login, saved
+                ));
             }
         }
 

@@ -5,8 +5,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,66 +17,11 @@ pub struct SsoSession {
 }
 
 impl SsoSession {
-    // ── canonical path ──────────────────────────────────────────────
-
-    pub fn session_path() -> PathBuf {
-        crate::config::AtemConfig::config_dir().join("sso_session.json")
-    }
-
-    // ── persistence (public path) ────────────────────────────────────
-
-    pub fn load() -> Option<Self> {
-        Self::load_from(&Self::session_path())
-    }
-
-    pub fn save(&self) -> Result<()> {
-        self.save_to(&Self::session_path())
-    }
-
-    pub fn delete() -> Result<()> {
-        Self::delete_at(&Self::session_path())
-    }
-
-    // ── persistence (path-injectable, for tests) ─────────────────────
-
-    pub fn load_from(path: &std::path::Path) -> Option<Self> {
-        let content = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
-
-    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, &json)?;
-        // chmod 0600
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
-    }
-
-    pub fn delete_at(path: &std::path::Path) -> Result<()> {
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
-    // ── token access ─────────────────────────────────────────────────
-
     pub(crate) fn now_secs() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
-    }
-
-    pub fn needs_refresh(&self) -> bool {
-        self.expires_at < Self::now_secs() + 60
     }
 }
 
@@ -104,25 +47,67 @@ pub fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Load session from canonical path, refresh if near-expiry, return access token.
-/// Returns Err if no session file exists.
-pub async fn valid_token(sso_url: &str) -> Result<String> {
-    valid_token_from(&SsoSession::session_path(), sso_url).await
+/// Load best credential entry, refresh if near-expiry, return access token.
+/// `connected_astation_id`: Some if Atem is currently connected to that Astation.
+pub async fn valid_token(connected_astation_id: Option<&str>, sso_url: &str) -> Result<String> {
+    valid_token_from(
+        &crate::credentials::CredentialStore::path(),
+        connected_astation_id,
+        sso_url,
+    )
+    .await
 }
 
 /// Path-injectable version used in tests.
-pub async fn valid_token_from(path: &std::path::Path, sso_url: &str) -> Result<String> {
-    let mut session = SsoSession::load_from(path)
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'atem login' first."))?;
+pub async fn valid_token_from(
+    path: &std::path::Path,
+    connected_astation_id: Option<&str>,
+    sso_url: &str,
+) -> Result<String> {
+    use crate::credentials::{CredentialEntry, CredentialSource, CredentialStore};
+    let mut store = CredentialStore::load_from(path);
+    let now = CredentialEntry::now_secs();
 
-    if session.needs_refresh() {
-        session = refresh_token(&session.refresh_token, sso_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("Session expired. Run 'atem login' to re-authenticate. ({e})"))?;
-        session.save_to(path)?;
+    let (source, astation_id, refresh, needs) = {
+        let entry = store.resolve(connected_astation_id, now)?;
+        (
+            entry.source,
+            entry.astation_id.clone(),
+            entry.refresh_token.clone(),
+            entry.needs_refresh(),
+        )
+    };
+
+    if !needs {
+        // Re-borrow to return access_token
+        let entry = store.resolve(connected_astation_id, now)?;
+        return Ok(entry.access_token.clone());
     }
 
-    Ok(session.access_token.clone())
+    let refreshed = refresh_token(&refresh, sso_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Session expired. Run 'atem login' or re-pair. ({e})"))?;
+
+    match source {
+        CredentialSource::Sso => {
+            if let Some(sso) = store.find_sso_mut() {
+                sso.access_token = refreshed.access_token.clone();
+                sso.refresh_token = refreshed.refresh_token.clone();
+                sso.expires_at = refreshed.expires_at;
+            }
+        }
+        CredentialSource::AstationPaired => {
+            if let Some(aid) = astation_id.as_deref() {
+                if let Some(p) = store.find_paired_mut(aid) {
+                    p.access_token = refreshed.access_token.clone();
+                    p.refresh_token = refreshed.refresh_token.clone();
+                    p.expires_at = refreshed.expires_at;
+                }
+            }
+        }
+    }
+    store.save_to(path)?;
+    Ok(refreshed.access_token)
 }
 
 /// Exchange a refresh_token for a new SsoSession.
@@ -406,7 +391,6 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     if !login_id.is_empty() {
         session.login_id = Some(login_id);
     }
-    session.save()?;
     Ok(session)
 }
 
@@ -439,50 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn sso_session_save_and_load_round_trip() {
-        // Use a temp path so we don't touch real config
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sso_session.json");
-
-        let session = SsoSession {
-            access_token: "access_abc".to_string(),
-            refresh_token: "refresh_xyz".to_string(),
-            expires_at: now() + 3600,
-            login_id: None,
-        };
-        session.save_to(&path).unwrap();
-
-        let loaded = SsoSession::load_from(&path).unwrap();
-        assert_eq!(loaded.access_token, "access_abc");
-        assert_eq!(loaded.refresh_token, "refresh_xyz");
-        assert_eq!(loaded.expires_at, session.expires_at);
-    }
-
-    #[test]
-    fn sso_session_delete_removes_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sso_session.json");
-
-        let session = SsoSession {
-            access_token: "tok".to_string(),
-            refresh_token: "ref".to_string(),
-            expires_at: now() + 3600,
-            login_id: None,
-        };
-        session.save_to(&path).unwrap();
-        assert!(path.exists());
-        SsoSession::delete_at(&path).unwrap();
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn load_returns_none_when_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("no_such_file.json");
-        assert!(SsoSession::load_from(&path).is_none());
-    }
-
-    #[test]
     fn pkce_challenge_is_base64url_of_sha256_verifier() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use sha2::{Digest, Sha256};
@@ -500,10 +440,10 @@ mod tests {
     #[test]
     fn valid_token_returns_error_when_no_session() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("no_session.json");
+        let path = dir.path().join("no_session.enc");
         // No file written — should error
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(valid_token_from(&path, "https://sso.agora.io"));
+        let result = rt.block_on(valid_token_from(&path, None, "https://sso.agora.io"));
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Not logged in"), "got: {}", msg);
@@ -552,28 +492,6 @@ mod tests {
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz");
         assert_eq!(login_id, "user123");
-    }
-
-    #[test]
-    fn needs_refresh_true_when_near_expiry() {
-        let session = SsoSession {
-            access_token: "tok".to_string(),
-            refresh_token: "ref".to_string(),
-            expires_at: SsoSession::now_secs() + 30, // expires in 30s, buffer is 60s
-            login_id: None,
-        };
-        assert!(session.needs_refresh(), "should need refresh when < 60s remaining");
-    }
-
-    #[test]
-    fn needs_refresh_false_when_plenty_of_time() {
-        let session = SsoSession {
-            access_token: "tok".to_string(),
-            refresh_token: "ref".to_string(),
-            expires_at: SsoSession::now_secs() + 3600, // 1 hour remaining
-            login_id: None,
-        };
-        assert!(!session.needs_refresh(), "should not need refresh with 1h remaining");
     }
 
     #[test]

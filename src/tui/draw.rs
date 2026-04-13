@@ -97,20 +97,27 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
 }
 
 pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Build SSO session status line
-    let sso_session = crate::sso_auth::SsoSession::load();
-    let (cred_line, cred_style) = if let Some(session) = sso_session {
-        let label = match &session.login_id {
-            Some(id) => format!("\u{1f511} Logged in (SSO: {})", id),
-            None => "\u{1f511} Logged in (SSO)".to_string(),
-        };
+    // Build credential status line
+    let store = crate::credentials::CredentialStore::load();
+    let (cred_line, cred_style) = if let Some(sso) = store.find_sso() {
+        let id = sso.login_id.as_deref().unwrap_or("-");
         (
-            label,
+            format!("\u{1f511} Logged in (SSO: {})", id),
             Style::default().fg(Color::Green),
+        )
+    } else if let Some(p) = store
+        .entries
+        .iter()
+        .find(|e| e.source == crate::credentials::CredentialSource::AstationPaired)
+    {
+        let id = p.login_id.as_deref().unwrap_or("-");
+        (
+            format!("\u{1f517} Paired (SSO: {})", id),
+            Style::default().fg(Color::Cyan),
         )
     } else {
         (
-            "\u{26a0}\u{fe0f}  Not logged in — run `atem login`".to_string(),
+            "\u{26a0}\u{fe0f}  Not logged in — run `atem login` or `atem pair`".to_string(),
             Style::default().fg(Color::Yellow),
         )
     };

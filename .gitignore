@@ -32,3 +32,11 @@ test.*.py
 
 # Superpowers planning docs (local only)
 docs/superpowers/
+
+# Node.js / local test scripts
+node_modules/
+package.json
+package-lock.json
+test-llm-server.js
+test-rtc-page.js
+tui_after_pair.png
