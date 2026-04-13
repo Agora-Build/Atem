@@ -434,6 +434,8 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     Some(proj) => {
                         println!("Active project: {}", proj.name);
                         println!("App ID: {}", proj.app_id);
+                        let vid_suffix = proj.vid.map(|v| format!("  |  vid: {}", v)).unwrap_or_default();
+                        println!("Project ID: {}{}", proj.project_id, vid_suffix);
                         let cert = proj.sign_key.as_deref().unwrap_or("");
                         let cert_display = if with_certificate {
                             cert.to_string()
@@ -445,6 +447,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                             "(empty)".to_string()
                         };
                         println!("Certificate: {}", cert_display);
+                        if !proj.created_at.is_empty() {
+                            println!("Created: {}", proj.created_at);
+                        }
                     }
                     None => {
                         println!("No active project set. Run `atem project use <APP_ID>`");

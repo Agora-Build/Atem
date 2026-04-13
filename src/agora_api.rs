@@ -14,6 +14,9 @@ pub struct BffProject {
     pub status: String,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Numeric vendor id from the BFF. Kept alongside `project_id` for reference.
+    #[serde(default)]
+    pub vid: Option<u64>,
 }
 
 /// Fetch all projects from the BFF API using a Bearer access token.
@@ -50,6 +53,8 @@ pub fn format_projects(projects: &[BffProject], show_certificates: bool) -> Stri
     let mut text = String::new();
     for (i, p) in projects.iter().enumerate() {
         text.push_str(&format!("{}. {}\n   App ID: {}\n", i + 1, p.name, p.app_id));
+        let vid_suffix = p.vid.map(|v| format!("  |  vid: {}", v)).unwrap_or_default();
+        text.push_str(&format!("   Project ID: {}{}\n", p.project_id, vid_suffix));
         if show_certificates {
             let cert = p.sign_key.as_deref().unwrap_or("(none)");
             text.push_str(&format!("   Certificate: {}\n", cert));
@@ -107,6 +112,7 @@ mod tests {
             sign_key: sign_key.map(str::to_string),
             status: status.to_string(),
             created_at: "2025-01-08T00:00:00Z".to_string(),
+            vid: Some(12345),
         }
     }
 

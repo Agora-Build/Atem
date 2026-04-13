@@ -295,6 +295,8 @@ pub struct CachedProject {
     pub sign_key: Option<String>,
     pub status: String,
     pub created_at: String,
+    #[serde(default)]
+    pub vid: Option<u64>,
 }
 
 impl From<&crate::agora_api::BffProject> for CachedProject {
@@ -306,6 +308,7 @@ impl From<&crate::agora_api::BffProject> for CachedProject {
             sign_key: p.sign_key.clone(),
             status: p.status.clone(),
             created_at: p.created_at.clone(),
+            vid: p.vid,
         }
     }
 }
@@ -319,6 +322,7 @@ impl From<&CachedProject> for crate::agora_api::BffProject {
             sign_key: p.sign_key.clone(),
             status: p.status.clone(),
             created_at: p.created_at.clone(),
+            vid: p.vid,
         }
     }
 }
@@ -692,6 +696,7 @@ mod tests {
                 sign_key: Some("secret-cert-1".to_string()),
                 status: "active".to_string(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
+                vid: Some(1001),
             },
             BffProject {
                 project_id: "pid2".to_string(),
@@ -700,6 +705,7 @@ mod tests {
                 sign_key: None,
                 status: "inactive".to_string(),
                 created_at: "2025-01-02T00:00:00Z".to_string(),
+                vid: Some(1002),
             },
         ]
     }
