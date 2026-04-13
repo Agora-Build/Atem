@@ -29,3 +29,6 @@ claude_logs/
 
 # Test scratch files
 test.*.py
+
+# Superpowers planning docs (local only)
+docs/superpowers/
