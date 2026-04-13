@@ -6,7 +6,7 @@ use crossterm::{
         enable_raw_mode,
     },
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -27,8 +27,7 @@ use crate::codex_client::{CodexClient, CodexResizeHandle};
 use crate::command::StreamBuffer;
 use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
-use crate::rtm_client::{RtmClient, RtmConfig, RtmEvent};
-use crate::token::generate_rtm_token;
+use crate::rtm_client::{RtmClient, RtmEvent};
 use crate::websocket_client::{AstationClient, AstationMessage};
 use crate::agent_client::{AgentEvent, AgentInfo, AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
 use crate::agent_registry::AgentRegistry;

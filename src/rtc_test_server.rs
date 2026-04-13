@@ -543,7 +543,7 @@ async fn handle_token_api(
         app_id,
         app_certificate,
         channel,
-        uid,
+        crate::token::RtcAccount::parse(uid),
         crate::token::Role::Publisher,
         expire_secs,
         now,

@@ -77,15 +77,29 @@ pub enum RtcCommands {
         /// Channel name
         #[arg(long)]
         channel: Option<String>,
-        /// User ID
-        #[arg(long)]
-        uid: Option<String>,
+        /// RTC user identifier.
+        ///
+        /// - All-digit value → int uid (SDK `joinChannel(uid:)`).
+        /// - Non-digit value → string account (SDK `joinChannelWithUserAccount(:)`).
+        /// - Leading `s/` → force string account mode. Use this for all-digit
+        ///   string accounts, e.g. `--rtc-user-id s/1232`. (`/` is not a legal
+        ///   RTC/RTM account character, so the prefix is unambiguous.)
+        #[arg(long = "rtc-user-id")]
+        rtc_user_id: Option<String>,
         /// Role: publisher or subscriber
         #[arg(long, default_value = "publisher")]
         role: String,
         /// Expiry in seconds
         #[arg(long, default_value = "3600")]
         expire: u32,
+        /// Also embed an RTM (Signaling) login privilege. Defaults to using
+        /// --rtc-user-id as the RTM account; pass --rtm-user-id to override.
+        #[arg(long)]
+        with_rtm: bool,
+        /// RTM user account to embed (only used with --with-rtm). If omitted,
+        /// --rtc-user-id is reused.
+        #[arg(long)]
+        rtm_user_id: Option<String>,
     },
     /// Decode an existing token
     Decode {
@@ -257,16 +271,18 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             TokenCommands::Rtc { rtc_command } => match rtc_command {
                 RtcCommands::Create {
                     channel,
-                    uid,
+                    rtc_user_id,
                     role,
                     expire,
+                    with_rtm,
+                    rtm_user_id,
                 } => {
                     let app_id = crate::config::ProjectCache::resolve_app_id(None)?;
                     let app_certificate =
                         crate::config::ProjectCache::resolve_app_certificate(None)?;
 
                     let channel_name = channel.as_deref().unwrap_or("test-channel");
-                    let uid_str = uid.as_deref().unwrap_or("0");
+                    let uid_str = rtc_user_id.as_deref().unwrap_or("0");
                     let token_role = match role.as_str() {
                         "subscriber" | "sub" => crate::token::Role::Subscriber,
                         _ => crate::token::Role::Publisher,
@@ -276,28 +292,53 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     let mut time_sync = crate::time_sync::TimeSync::new();
                     let now = time_sync.now().await? as u32;
 
-                    let token = crate::token::build_token_rtc(
-                        &app_id,
-                        &app_certificate,
-                        channel_name,
-                        uid_str,
-                        token_role,
-                        expire,
-                        now,
-                    )?;
+                    let rtc_account = crate::token::RtcAccount::parse(uid_str);
+                    let token = if with_rtm {
+                        crate::token::build_token_rtc_with_rtm(
+                            &app_id,
+                            &app_certificate,
+                            channel_name,
+                            rtc_account,
+                            token_role,
+                            expire,
+                            expire,
+                            rtm_user_id.as_deref(),
+                        )?
+                    } else {
+                        crate::token::build_token_rtc(
+                            &app_id,
+                            &app_certificate,
+                            channel_name,
+                            rtc_account,
+                            token_role,
+                            expire,
+                            now,
+                        )?
+                    };
 
                     if token.is_empty() {
                         println!("Error: App certificate is empty. Cannot generate token.");
                         return Ok(());
                     }
 
-                    println!("RTC Token created successfully:");
+                    let label = if with_rtm { "RTC+RTM Token" } else { "RTC Token" };
+                    println!("{} created successfully:", label);
                     println!("{}", token);
                     println!("\nToken Details:");
                     println!("  Channel: {}", channel_name);
-                    println!("  UID: {}", uid_str);
+                    // Show the account that actually went into the token (quote-stripped
+                    // if the user passed `"..."`), not the raw CLI arg.
+                    println!(
+                        "  RTC user id: {} ({})",
+                        rtc_account.as_str(),
+                        rtc_account.mode_label()
+                    );
                     println!("  Role: {:?}", token_role);
                     println!("  Valid for: {}s", expire);
+                    if with_rtm {
+                        let rtm_account = rtm_user_id.as_deref().unwrap_or(uid_str);
+                        println!("  RTM login: enabled (User = {})", rtm_account);
+                    }
 
                     let offset = time_sync.offset();
                     if offset != 0 {
@@ -1015,19 +1056,68 @@ mod tests {
                         rtc_command:
                             RtcCommands::Create {
                                 channel,
-                                uid,
+                                rtc_user_id,
                                 role,
                                 expire,
+                                with_rtm,
+                                rtm_user_id,
                             },
                     },
             }) => {
                 assert!(channel.is_none());
-                assert!(uid.is_none());
+                assert!(rtc_user_id.is_none());
                 assert_eq!(role, "publisher");
                 assert_eq!(expire, 3600);
+                assert!(!with_rtm);
+                assert!(rtm_user_id.is_none());
             }
             _ => panic!("Expected Token Rtc Create command"),
         }
+    }
+
+    #[test]
+    fn cli_token_rtc_create_with_rtm_flag() {
+        let cli = Cli::try_parse_from(["atem", "token", "rtc", "create", "--with-rtm"]).unwrap();
+        match cli.command {
+            Some(Commands::Token {
+                token_command:
+                    TokenCommands::Rtc {
+                        rtc_command: RtcCommands::Create { with_rtm, rtm_user_id, .. },
+                    },
+            }) => {
+                assert!(with_rtm);
+                assert!(rtm_user_id.is_none());
+            }
+            _ => panic!("Expected RtcCommands::Create with with_rtm=true"),
+        }
+    }
+
+    #[test]
+    fn cli_token_rtc_create_with_separate_rtm_user() {
+        let cli = Cli::try_parse_from([
+            "atem", "token", "rtc", "create",
+            "--rtc-user-id", "rtc_uid_42", "--with-rtm", "--rtm-user-id", "rtm_alice",
+        ]).unwrap();
+        match cli.command {
+            Some(Commands::Token {
+                token_command:
+                    TokenCommands::Rtc {
+                        rtc_command: RtcCommands::Create { rtc_user_id, with_rtm, rtm_user_id, .. },
+                    },
+            }) => {
+                assert_eq!(rtc_user_id.as_deref(), Some("rtc_uid_42"));
+                assert!(with_rtm);
+                assert_eq!(rtm_user_id.as_deref(), Some("rtm_alice"));
+            }
+            _ => panic!("Expected RtcCommands::Create with separate rtm_user_id"),
+        }
+    }
+
+    #[test]
+    fn cli_token_rtc_create_rejects_old_uid_flag() {
+        // --uid is no longer accepted — must fail.
+        let res = Cli::try_parse_from(["atem", "token", "rtc", "create", "--uid", "42"]);
+        assert!(res.is_err(), "--uid must be rejected");
     }
 
     #[test]

@@ -144,12 +144,82 @@ echo
 # ── Token: RTC create + decode round-trip ───────────────────────────
 echo "$(yellow "Token RTC")"
 if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HOME/.config/atem/project_cache.enc" ]]; then
-    run "atem token rtc create"        -- "$ATEM" token rtc create --channel smoketest --uid 42 --expire 600
+    run "atem token rtc create"        -- "$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --expire 600
 
     # Capture a token and decode it
-    run "atem token rtc create --role subscriber"   -- "$ATEM" token rtc create --channel smoketest --uid 42 --role subscriber --expire 600
+    run "atem token rtc create --role subscriber"          -- "$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --role subscriber --expire 600
+    run "atem token rtc create --with-rtm (int uid)"       -- "$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --with-rtm --expire 600
+    run "atem token rtc create --with-rtm (string account)"-- "$ATEM" token rtc create --channel smoketest --rtc-user-id alice --with-rtm --expire 600
+    run "atem token rtc create --with-rtm --rtm-user-id"   -- "$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --with-rtm --rtm-user-id rtm_bob --expire 600
+    # --uid flag was removed — must be rejected
+    run "atem token rtc create --uid (rejected)"     2     -- "$ATEM" token rtc create --channel smoketest --uid 42 --expire 600
 
-    RTC_TOKEN="$("$ATEM" token rtc create --channel smoketest --uid 42 --expire 600 2>/dev/null \
+    # Mode label in output must match auto-detection
+    out_int="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --expire 60 2>&1 | grep -E "^  RTC user id:")"
+    out_str="$("$ATEM" token rtc create --channel smoketest --rtc-user-id alice --expire 60 2>&1 | grep -E "^  RTC user id:")"
+    # Escape hatch: leading `s/` forces string mode (for all-digit string accounts)
+    out_sstr="$("$ATEM" token rtc create --channel smoketest --rtc-user-id s/1232 --expire 60 2>&1 | grep -E "^  RTC user id:")"
+    printf "  %s ... " "$(dim "atem token rtc create classifies --rtc-user-id correctly")"
+    if echo "$out_int"  | grep -q "int uid" \
+        && echo "$out_str"  | grep -q "string account" \
+        && echo "$out_sstr" | grep -q "string account"; then
+        green "PASS"; echo
+        PASS=$((PASS + 1))
+    else
+        red "FAIL"; echo
+        echo "    int:     $out_int"
+        echo "    string:  $out_str"
+        echo "    s/prefix: $out_sstr"
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("atem token rtc create classification")
+    fi
+
+    # Escape-hatch token must differ from bare-digit token even with same digits
+    BARE_TOK="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 1232   --expire 600 2>/dev/null | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
+    SPFX_TOK="$("$ATEM" token rtc create --channel smoketest --rtc-user-id s/1232 --expire 600 2>/dev/null | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
+    printf "  %s ... " "$(dim "atem token rtc: 1232 vs s/1232 yields different tokens")"
+    if [[ -n "$BARE_TOK" && -n "$SPFX_TOK" && "$BARE_TOK" != "$SPFX_TOK" ]]; then
+        green "PASS"; echo
+        PASS=$((PASS + 1))
+    else
+        red "FAIL"; echo " (bare=$BARE_TOK /=$SPFX_TOK)"
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("atem token rtc 1232 vs s/1232")
+    fi
+
+    # RTC+RTM round-trip (int uid): decoded token must mention both RTC and RTM services
+    RTC_RTM_TOKEN="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --with-rtm --expire 600 2>/dev/null \
+        | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
+    if [[ -n "$RTC_RTM_TOKEN" ]]; then
+        DECODED="$("$ATEM" token rtc decode "$RTC_RTM_TOKEN" 2>&1)"
+        printf "  %s ... " "$(dim "atem token rtc decode (int+with-rtm) shows both services")"
+        if echo "$DECODED" | grep -q "Service: RTC" && echo "$DECODED" | grep -q "Service: RTM"; then
+            green "PASS"; echo
+            PASS=$((PASS + 1))
+        else
+            red "FAIL"; echo
+            echo "$DECODED" | sed 's/^/      /'
+            FAIL=$((FAIL + 1))
+            FAILED_NAMES+=("atem token rtc decode (int+with-rtm)")
+        fi
+    else
+        skip "atem token rtc decode (int+with-rtm)" "couldn't extract combined token"
+    fi
+
+    # RTC+RTM with separate RTM account: both services present, token differs from same-account variant
+    SAME_ACCT="$("$ATEM" token rtc create --channel smoketest --rtc-user-id alice --with-rtm --expire 600 2>/dev/null | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
+    SEP_ACCT="$("$ATEM" token rtc create --channel smoketest --rtc-user-id alice --with-rtm --rtm-user-id bob --expire 600 2>/dev/null | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
+    printf "  %s ... " "$(dim "atem token rtc --rtm-user-id produces distinct token")"
+    if [[ -n "$SAME_ACCT" && -n "$SEP_ACCT" && "$SAME_ACCT" != "$SEP_ACCT" ]]; then
+        green "PASS"; echo
+        PASS=$((PASS + 1))
+    else
+        red "FAIL"; echo " (same=$SAME_ACCT sep=$SEP_ACCT)"
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("atem token rtc --rtm-user-id distinct")
+    fi
+
+    RTC_TOKEN="$("$ATEM" token rtc create --channel smoketest --rtc-user-id 42 --expire 600 2>/dev/null \
         | awk '/^00|^[0-9a-f]{10,}/ { print; exit }')"
     if [[ -n "$RTC_TOKEN" ]]; then
         run_contains "atem token rtc decode"                    "Service" -- "$ATEM" token rtc decode "$RTC_TOKEN"
