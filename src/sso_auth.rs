@@ -154,7 +154,7 @@ fn parse_callback_query(query: &str) -> (String, String, String) {
 /// OAuth 2.0 + PKCE login flow.
 ///
 /// Opens the browser and waits for the loopback redirect callback.
-/// If no callback arrives within 15 seconds, prints a hint asking the user to
+/// If no callback arrives within 5 seconds, prints a hint asking the user to
 /// paste the callback URL from the browser address bar — both paths then race;
 /// whichever arrives first completes the login.
 pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
@@ -307,15 +307,15 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
         let _ = tx_loopback.send(result).await;
     });
 
-    // Wait 15s for the loopback callback; if none, show paste hint
+    // Wait 5s for the loopback callback; if none, show paste hint
     let first = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(5),
         rx.recv(),
     ).await;
 
     let (code, _, login_id) = match first {
         Ok(Some(result)) => {
-            // Callback arrived within 15s
+            // Callback arrived within 5s
             println!("Login successful.");
             result?
         }

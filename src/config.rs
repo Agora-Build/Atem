@@ -277,6 +277,14 @@ impl AtemConfig {
 
 // ── Encrypted project cache (AES-256-GCM, machine-bound) ─────────────
 
+/// One-time cleanup of pre-0.4.77 files that are no longer readable.
+/// Called on every `ProjectCache::load_from` — cheap (just two stat syscalls).
+fn cleanup_legacy_files() {
+    let dir = AtemConfig::config_dir();
+    let _ = fs::remove_file(dir.join("project_cache.json"));
+    let _ = fs::remove_file(dir.join("active_project.json"));
+}
+
 /// One cached project — same shape as `BffProject` but serialisable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedProject {
@@ -338,6 +346,13 @@ impl ProjectCache {
     }
 
     pub(crate) fn load_from(path: &Path) -> Self {
+        // Best-effort one-time cleanup of pre-0.4.77 files (project_cache.json,
+        // active_project.json). Only runs against the real config dir; tests using
+        // tempdir paths skip this because legacy files can't exist there.
+        if path == Self::path() {
+            cleanup_legacy_files();
+        }
+
         let Ok(raw) = fs::read(path) else {
             return Self::default();
         };
@@ -795,6 +810,26 @@ mod tests {
         let cache = ProjectCache::load_from(&path);
         assert!(cache.projects.is_empty());
         assert!(cache.active_app_id.is_none());
+    }
+
+    #[test]
+    fn cleanup_legacy_files_removes_both() {
+        let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
+        let dir = AtemConfig::config_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let legacy_cache = dir.join("project_cache.json");
+        let legacy_active = dir.join("active_project.json");
+
+        fs::write(&legacy_cache, b"stale").unwrap();
+        fs::write(&legacy_active, b"stale").unwrap();
+        assert!(legacy_cache.exists());
+        assert!(legacy_active.exists());
+
+        // Trigger cleanup via loading the real path.
+        let _ = ProjectCache::load_from(&ProjectCache::path());
+
+        assert!(!legacy_cache.exists(), "project_cache.json should be removed");
+        assert!(!legacy_active.exists(), "active_project.json should be removed");
     }
 
     #[test]
