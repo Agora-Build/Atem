@@ -26,7 +26,7 @@ impl SsoSession {
 }
 
 /// OAuth 2.0 client_id registered in the Agora SSO server for CLI applications.
-const CLIENT_ID: &str = "agora_web_cli";
+const CLIENT_ID: &str = "atem";
 
 /// Generate a PKCE (code_verifier, code_challenge) pair.
 /// verifier: 32 random bytes → base64url
