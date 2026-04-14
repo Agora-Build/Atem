@@ -22,6 +22,8 @@ mod agent_client;
 mod agent_detector;
 mod agent_registry;
 mod agent_visualize;
+// Shared HTTPS scaffolding
+mod web_server;
 // RTC test server
 mod rtc_test_server;
 // Diagram hosting server

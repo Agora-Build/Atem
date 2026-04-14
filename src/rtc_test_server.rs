@@ -1,6 +1,4 @@
 use anyhow::Result;
-use rcgen::{CertificateParams, KeyPair, SanType};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -188,28 +186,6 @@ fn sslip_host(ip: &IpAddr) -> String {
     format!("{}.sslip.io", ip.to_string().replace('.', "-"))
 }
 
-/// Generate a self-signed TLS certificate for the given IP address,
-/// its sslip.io hostname, and localhost.
-pub fn generate_self_signed_cert(
-    ip: &IpAddr,
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let sslip = sslip_host(ip);
-
-    let mut params = CertificateParams::new(vec![sslip.clone(), "localhost".to_string()])?;
-    params
-        .subject_alt_names
-        .push(SanType::IpAddress((*ip).into()));
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-
-    let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der().to_vec()));
-
-    Ok((vec![cert_der], key_der))
-}
-
 /// Run the HTTPS server for RTC testing.
 pub async fn run_server(config: RtcTestConfig) -> Result<()> {
     let app_id = crate::config::ProjectCache::resolve_app_id(None)?;
@@ -219,7 +195,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
     let sslip = sslip_host(&lan_ip);
 
     // Generate self-signed cert
-    let (certs, key) = generate_self_signed_cert(&lan_ip)?;
+    let (certs, key) = crate::web_server::cert::generate_self_signed_cert(&lan_ip)?;
 
     let tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1500,15 +1476,6 @@ mod tests {
     fn sslip_host_formats_correctly() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42));
         assert_eq!(sslip_host(&ip), "192-168-1-42.sslip.io");
-    }
-
-    #[test]
-    fn generate_cert_succeeds() {
-        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let result = generate_self_signed_cert(&ip);
-        assert!(result.is_ok());
-        let (certs, _key) = result.unwrap();
-        assert_eq!(certs.len(), 1);
     }
 
     #[test]
