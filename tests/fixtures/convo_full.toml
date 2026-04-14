@@ -1,0 +1,45 @@
+channel = "demo"
+rtc_user_id = "42"
+agent_user_id = "1001"
+idle_timeout_secs = 120
+preset = "deepgram_nova_3,openai_gpt_5_mini,minimax_speech_2_6_turbo"
+
+[agent.llm]
+url = "https://api.groq.com/openai/v1/chat/completions"
+api_key = "test_key"
+greeting_message = "Hi"
+failure_message = "Oops"
+max_history = 32
+
+[[agent.llm.system_messages]]
+role = "system"
+content = "You are helpful."
+
+[agent.llm.params]
+model = "openai/gpt-oss-120b"
+
+[agent.asr]
+vendor = "soniox"
+language = "en-US"
+
+[agent.asr.params]
+api_key = "test_key"
+model = "stt-rt-v3"
+
+[agent.tts]
+vendor = "minimax"
+
+[agent.tts.params]
+key = "test_key"
+group_id = "gid"
+model = "speech-02-turbo"
+
+[agent.tts.params.voice_setting]
+voice_id = "voice_1"
+
+[agent.avatar]
+vendor = "heygen"
+avatar_id = "a1"
+
+[agent.avatar.params]
+quality = "high"
