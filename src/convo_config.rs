@@ -52,6 +52,7 @@ pub struct SystemMessage {
 pub struct ServiceConfig {
     pub vendor: Option<String>,
     pub language: Option<String>,
+    pub avatar_id: Option<String>,
     pub params: BTreeMap<String, toml::Value>,
 }
 
@@ -62,6 +63,114 @@ impl ConvoConfig {
         let cfg: ConvoConfig = toml::from_str(&content)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
         Ok(cfg)
+    }
+}
+
+use serde_json::{Map, Value, json};
+
+pub struct JoinArgs<'a> {
+    pub name:           &'a str,
+    pub channel:        &'a str,
+    pub token:          &'a str,
+    pub agent_rtc_uid:  &'a str,
+    pub remote_uids:    &'a [String],
+    pub include_avatar: bool,
+}
+
+impl ConvoConfig {
+    /// Build the Agora Conversational AI `/join` request body from this config.
+    ///
+    /// Mechanical mapping:
+    ///   - top-level scalars go under `properties.*`
+    ///   - [agent.llm] / .asr / .tts / .avatar go under `properties.llm` / etc.
+    ///   - `params` sub-tables map to `properties.<svc>.params` verbatim.
+    ///   - [[agent.llm.system_messages]] → `properties.llm.system_messages[]`
+    pub fn build_join_payload(&self, args: JoinArgs<'_>) -> Value {
+        let mut props = Map::new();
+        props.insert("channel".into(),         json!(args.channel));
+        props.insert("token".into(),           json!(args.token));
+        props.insert("agent_rtc_uid".into(),   json!(args.agent_rtc_uid));
+        props.insert("remote_rtc_uids".into(), json!(args.remote_uids));
+        if let Some(t) = self.idle_timeout_secs {
+            props.insert("idle_timeout".into(), json!(t));
+        }
+        if let Some(p) = &self.preset {
+            props.insert("preset".into(), json!(p));
+        }
+        if let Some(agent) = &self.agent {
+            if let Some(llm) = &agent.llm {
+                props.insert("llm".into(), llm_to_json(llm));
+            }
+            if let Some(asr) = &agent.asr {
+                props.insert("asr".into(), service_to_json(asr));
+            }
+            if let Some(tts) = &agent.tts {
+                props.insert("tts".into(), service_to_json(tts));
+            }
+            if args.include_avatar {
+                if let Some(av) = &agent.avatar {
+                    props.insert("avatar".into(), service_to_json(av));
+                }
+            }
+        }
+        json!({ "name": args.name, "properties": Value::Object(props) })
+    }
+}
+
+fn llm_to_json(c: &LlmConfig) -> Value {
+    let mut m = Map::new();
+    if let Some(v) = &c.url              { m.insert("url".into(), json!(v)); }
+    if let Some(v) = &c.api_key          { m.insert("api_key".into(), json!(v)); }
+    if let Some(v) = &c.greeting_message { m.insert("greeting_message".into(), json!(v)); }
+    if let Some(v) = &c.failure_message  { m.insert("failure_message".into(), json!(v)); }
+    if let Some(v) = c.max_history       { m.insert("max_history".into(), json!(v)); }
+    if !c.system_messages.is_empty() {
+        let arr: Vec<Value> = c.system_messages
+            .iter()
+            .map(|sm| json!({ "role": sm.role, "content": sm.content }))
+            .collect();
+        m.insert("system_messages".into(), Value::Array(arr));
+    }
+    if !c.params.is_empty() {
+        m.insert("params".into(), toml_map_to_json(&c.params));
+    }
+    Value::Object(m)
+}
+
+fn service_to_json(c: &ServiceConfig) -> Value {
+    let mut m = Map::new();
+    if let Some(v) = &c.vendor    { m.insert("vendor".into(), json!(v)); }
+    if let Some(v) = &c.language  { m.insert("language".into(), json!(v)); }
+    if let Some(v) = &c.avatar_id { m.insert("avatar_id".into(), json!(v)); }
+    if !c.params.is_empty() {
+        m.insert("params".into(), toml_map_to_json(&c.params));
+    }
+    Value::Object(m)
+}
+
+fn toml_map_to_json(m: &BTreeMap<String, toml::Value>) -> Value {
+    let mut out = Map::new();
+    for (k, v) in m {
+        out.insert(k.clone(), toml_value_to_json(v));
+    }
+    Value::Object(out)
+}
+
+fn toml_value_to_json(v: &toml::Value) -> Value {
+    match v {
+        toml::Value::String(s)   => Value::String(s.clone()),
+        toml::Value::Integer(n)  => json!(n),
+        toml::Value::Float(f)    => json!(f),
+        toml::Value::Boolean(b)  => Value::Bool(*b),
+        toml::Value::Datetime(d) => Value::String(d.to_string()),
+        toml::Value::Array(a)    => Value::Array(a.iter().map(toml_value_to_json).collect()),
+        toml::Value::Table(t)    => {
+            let mut m = Map::new();
+            for (k, vv) in t {
+                m.insert(k.clone(), toml_value_to_json(vv));
+            }
+            Value::Object(m)
+        }
     }
 }
 
@@ -118,5 +227,66 @@ mod tests {
             voice_setting.get("voice_id").and_then(|v| v.as_str()),
             Some("voice_1")
         );
+    }
+
+    #[test]
+    fn build_join_payload_maps_toml_to_agora_shape() {
+        let cfg = ConvoConfig::from_file(&fixtures().join("convo_full.toml")).unwrap();
+
+        let body = cfg.build_join_payload(JoinArgs {
+            name:          "atem-convo-1234",
+            channel:       "demo",
+            token:         "007TOK",
+            agent_rtc_uid: "1001",
+            remote_uids:   &["42".to_string()],
+            include_avatar: true,
+        });
+
+        // Top-level
+        assert_eq!(body["name"], "atem-convo-1234");
+        let props = &body["properties"];
+        assert_eq!(props["channel"], "demo");
+        assert_eq!(props["token"], "007TOK");
+        assert_eq!(props["agent_rtc_uid"], "1001");
+        assert_eq!(props["remote_rtc_uids"][0], "42");
+        assert_eq!(props["idle_timeout"], 120);
+        assert_eq!(
+            props["preset"],
+            "deepgram_nova_3,openai_gpt_5_mini,minimax_speech_2_6_turbo"
+        );
+
+        // LLM
+        assert_eq!(props["llm"]["url"], "https://api.groq.com/openai/v1/chat/completions");
+        assert_eq!(props["llm"]["greeting_message"], "Hi");
+        assert_eq!(props["llm"]["system_messages"][0]["role"], "system");
+        assert_eq!(props["llm"]["params"]["model"], "openai/gpt-oss-120b");
+
+        // ASR
+        assert_eq!(props["asr"]["vendor"], "soniox");
+        assert_eq!(props["asr"]["language"], "en-US");
+        assert_eq!(props["asr"]["params"]["model"], "stt-rt-v3");
+
+        // TTS (nested params sub-table)
+        assert_eq!(props["tts"]["vendor"], "minimax");
+        assert_eq!(props["tts"]["params"]["model"], "speech-02-turbo");
+        assert_eq!(props["tts"]["params"]["voice_setting"]["voice_id"], "voice_1");
+
+        // Avatar included when the flag is true
+        assert_eq!(props["avatar"]["vendor"], "heygen");
+        assert_eq!(props["avatar"]["avatar_id"], "a1");
+    }
+
+    #[test]
+    fn build_join_payload_omits_avatar_when_flag_false() {
+        let cfg = ConvoConfig::from_file(&fixtures().join("convo_full.toml")).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x",
+            channel: "c",
+            token: "t",
+            agent_rtc_uid: "1",
+            remote_uids: &["2".to_string()],
+            include_avatar: false,
+        });
+        assert!(body["properties"].get("avatar").is_none());
     }
 }
