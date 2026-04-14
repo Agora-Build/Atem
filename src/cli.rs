@@ -883,8 +883,16 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 };
                 crate::rtc_test_server::run_server(config).await
             }
-            ServCommands::Convo { .. } => {
-                anyhow::bail!("atem serv convo not yet implemented (Task 7 scaffolding only)")
+            ServCommands::Convo {
+                channel, rtc_user_id, agent_user_id, config, port,
+                no_browser, background, _serv_daemon,
+            } => {
+                crate::convo_test_server::run_server(crate::convo_test_server::ServeConvoConfig {
+                    channel, rtc_user_id, agent_user_id,
+                    config_path: config,
+                    port, no_browser, background,
+                    _daemon: _serv_daemon,
+                }).await
             }
             ServCommands::Diagrams {
                 port,

@@ -10,6 +10,7 @@ mod cli;
 mod codex_client;
 mod config;
 mod convo_config;
+mod convo_test_server;
 mod credentials;
 mod repl;
 mod rtm_client;
