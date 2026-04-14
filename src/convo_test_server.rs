@@ -14,6 +14,24 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::convo_config::{CliOverrides, ConvoConfig, ResolvedConfig};
 
+/// Agora Conversational AI v2 REST base URL. Overridable via `ATEM_CONVOAI_API_URL`
+/// for integration tests that point at a local mock.
+fn convoai_base_url() -> String {
+    std::env::var("ATEM_CONVOAI_API_URL")
+        .unwrap_or_else(|_| "https://api.agora.io".to_string())
+}
+
+/// Generate a unique agent name for this session.
+fn gen_agent_name() -> String {
+    use rand::RngCore;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rand = rand::thread_rng().next_u32();
+    format!("atem-convo-{ts}-{:04x}", rand & 0xffff)
+}
+
 pub struct ServeConvoConfig {
     pub channel:       Option<String>,
     pub rtc_user_id:   Option<String>,
@@ -119,8 +137,8 @@ async fn handle_connection(
     app_id:     &str,
     app_cert:   &str,
     resolved:   &Arc<ResolvedConfig>,
-    _convo_cfg: &Arc<ConvoConfig>,
-    _state:     Arc<Mutex<AgentState>>,
+    convo_cfg:  &Arc<ConvoConfig>,
+    state:      Arc<Mutex<AgentState>>,
 ) -> Result<()> {
     use crate::web_server::request::{read_full_http_request, send_response};
     let buf = match read_full_http_request(&mut stream).await {
@@ -155,6 +173,170 @@ async fn handle_connection(
                 Some(resolved.agent_user_id.as_str()),
             ).await?;
         }
+        ("POST", "/api/convo/start") => {
+            let body = crate::web_server::request::extract_body(&request);
+            let req: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            let include_avatar = req["avatar"].as_bool().unwrap_or(false);
+
+            // Only one agent at a time per process.
+            {
+                let st = state.lock().await;
+                if st.running {
+                    let err = serde_json::json!({
+                        "error": "agent already running",
+                        "agent_id": st.agent_id,
+                    });
+                    crate::web_server::request::send_response(
+                        &mut stream, 409, "application/json", err.to_string().as_bytes()
+                    ).await?;
+                    return Ok(());
+                }
+            }
+
+            // Mint an RTC+RTM token for the agent's uid, same channel.
+            let expire = resolved.idle_timeout_secs
+                .unwrap_or(3600)
+                .max(3600)
+                .saturating_mul(2);
+            let agent_token = crate::token::build_token_rtc_with_rtm(
+                app_id,
+                app_cert,
+                &resolved.channel,
+                crate::token::RtcAccount::parse(&resolved.agent_user_id),
+                crate::token::Role::Publisher,
+                expire,
+                expire,
+                Some(resolved.agent_user_id.as_str()),
+            )?;
+
+            let name = gen_agent_name();
+            let payload = convo_cfg.build_join_payload(crate::convo_config::JoinArgs {
+                name: &name,
+                channel: &resolved.channel,
+                token: &agent_token,
+                agent_rtc_uid: &resolved.agent_user_id,
+                remote_uids: &[resolved.rtc_user_id.clone()],
+                include_avatar,
+            });
+
+            let url = format!(
+                "{}/api/conversational-ai-agent/v2/projects/{}/join",
+                convoai_base_url(), app_id
+            );
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("agora token={}", agent_token))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let body_json: serde_json::Value =
+                        r.json().await.unwrap_or_else(|_| serde_json::json!({}));
+                    let agent_id = body_json["agent_id"].as_str().unwrap_or("").to_string();
+                    let started = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    {
+                        let mut st = state.lock().await;
+                        st.running    = true;
+                        st.agent_id   = Some(agent_id.clone());
+                        st.name       = Some(name.clone());
+                        st.started_at = Some(started);
+                    }
+                    let out = serde_json::json!({
+                        "agent_id":   agent_id,
+                        "name":       name,
+                        "started_at": started,
+                    });
+                    crate::web_server::request::send_response(
+                        &mut stream, 200, "application/json", out.to_string().as_bytes()
+                    ).await?;
+                }
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    let body = r.text().await.unwrap_or_default();
+                    let err = serde_json::json!({
+                        "error": format!("agora /join failed: {} {}", status, body),
+                    });
+                    crate::web_server::request::send_response(
+                        &mut stream, status, "application/json", err.to_string().as_bytes()
+                    ).await?;
+                }
+                Err(e) => {
+                    let err = serde_json::json!({ "error": format!("request failed: {}", e) });
+                    crate::web_server::request::send_response(
+                        &mut stream, 502, "application/json", err.to_string().as_bytes()
+                    ).await?;
+                }
+            }
+        }
+
+        ("POST", "/api/convo/stop") => {
+            let agent_id = {
+                let st = state.lock().await;
+                st.agent_id.clone()
+            };
+            let agent_id = match agent_id {
+                Some(id) => id,
+                None => {
+                    crate::web_server::request::send_response(
+                        &mut stream, 200, "application/json",
+                        b"{\"stopped\":true,\"note\":\"no agent\"}"
+                    ).await?;
+                    return Ok(());
+                }
+            };
+
+            let token = crate::token::build_token_rtc_with_rtm(
+                app_id,
+                app_cert,
+                &resolved.channel,
+                crate::token::RtcAccount::parse(&resolved.agent_user_id),
+                crate::token::Role::Publisher,
+                3600,
+                3600,
+                Some(resolved.agent_user_id.as_str()),
+            )?;
+            let url = format!(
+                "{}/api/conversational-ai-agent/v2/projects/{}/agents/{}/leave",
+                convoai_base_url(), app_id, agent_id
+            );
+            let client = reqwest::Client::new();
+            let _ = client
+                .post(&url)
+                .header("Authorization", format!("agora token={}", token))
+                .send()
+                .await;
+
+            {
+                let mut st = state.lock().await;
+                *st = AgentState::default();
+            }
+            crate::web_server::request::send_response(
+                &mut stream, 200, "application/json", b"{\"stopped\":true}"
+            ).await?;
+        }
+
+        ("GET", "/api/convo/status") => {
+            let st = state.lock().await.clone();
+            let body = serde_json::json!({
+                "running":           st.running,
+                "agent_id":          st.agent_id,
+                "name":              st.name,
+                "started_at":        st.started_at,
+                "avatar_configured": resolved.avatar_configured,
+            });
+            crate::web_server::request::send_response(
+                &mut stream, 200, "application/json", body.to_string().as_bytes()
+            ).await?;
+        }
+
         _ => {
             send_response(&mut stream, 404, "text/plain", b"Not Found").await?;
         }
@@ -179,5 +361,29 @@ mod tests {
     fn source_contains_api_token_route() {
         let src = include_str!("convo_test_server.rs");
         assert!(src.contains("\"/api/token\""), "missing /api/token route");
+    }
+
+    #[test]
+    fn convoai_base_url_defaults_to_agora() {
+        // Unset to guarantee default.
+        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
+        assert_eq!(convoai_base_url(), "https://api.agora.io");
+    }
+
+    #[test]
+    fn convoai_base_url_honours_env_override() {
+        unsafe { std::env::set_var("ATEM_CONVOAI_API_URL", "http://127.0.0.1:9999"); }
+        assert_eq!(convoai_base_url(), "http://127.0.0.1:9999");
+        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
+    }
+
+    #[test]
+    fn gen_agent_name_has_expected_shape() {
+        let n = gen_agent_name();
+        assert!(n.starts_with("atem-convo-"), "got: {n}");
+        // 4-hex suffix after the last dash
+        let last = n.rsplit('-').next().unwrap();
+        assert_eq!(last.len(), 4);
+        assert!(last.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
