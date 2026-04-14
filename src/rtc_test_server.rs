@@ -927,7 +927,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .stats-panel.visible {{ display: block; }}
 #log {{ max-height: 200px; overflow-y: auto; padding: 8px 16px; font-size: 11px; font-family: monospace; color: #7d8590; }}
 #log div {{ padding: 1px 0; }}
-#log .error {{ color: #f85149; }}
+#log .error   {{ color: #f85149; }}
+#log .warning {{ color: #d29922; }}
 #log .success {{ color: #3fb950; }}
 .copy-btn {{ background: none; border: 1px solid #555; color: #8b949e; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-left: 6px; }}
 .copy-btn:hover {{ border-color: #58a6ff; color: #c9d1d9; }}
@@ -944,6 +945,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .block .controls:last-child, .block .token-row:last-child, .block .status-bar {{ border-bottom: none; }}
 .app-id-value {{ font-family: monospace; font-size: 13px; color: #c9d1d9; }}
 .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+#slogan {{ font-size: 13px; font-weight: 400; color: #7d8590; }}
 {rtm_css}
 </style>
 </head>
@@ -1106,16 +1108,51 @@ function setStatus(state, text) {{
   txt.textContent = text;
 }}
 
+// Mirror the server-side RtcAccount::parse rules exactly:
+//   - all digits         → int uid (uint32)
+//   - non-digits         → string account
+//   - `s/` prefix        → string account (prefix stripped — so s/1232 means "1232" as string)
+// Never silently coerces "423dd" to 423 like parseInt does.
+//
+// Returns:
+//   kind       : 'int' | 'str'
+//   num        : Number when kind==='int'
+//   account    : String when kind==='str' (stripped of s/ prefix)
+//   tokenArg   : what to send in the /api/token "uid" field (raw input is fine;
+//                server understands s/ prefix). We just send the unmodified raw.
+//   joinArg    : what to pass to AgoraRTC client.join (number or string)
+//   label      : human-readable mode tag for logs
+function classifyUid(raw) {{
+  if (!raw) return {{ kind: 'int', num: 0, account: '',  tokenArg: '0',   joinArg: null,  label: 'int (auto)' }};
+
+  // Rule 3 first — "s/" prefix forces string even for all-digit payloads
+  if (raw.startsWith('s/')) {{
+    const stripped = raw.slice(2);
+    return {{ kind: 'str', num: 0, account: stripped, tokenArg: raw, joinArg: stripped, label: 'string account' }};
+  }}
+  // Rule 1 — all digits within u32 range
+  if (/^\d+$/.test(raw)) {{
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0 && n <= 4294967295) {{
+      return {{ kind: 'int', num: n, account: '', tokenArg: String(n), joinArg: n, label: 'int' }};
+    }}
+  }}
+  // Rule 2 — fallback: everything else is a string account
+  return {{ kind: 'str', num: 0, account: raw, tokenArg: raw, joinArg: raw, label: 'string account' }};
+}}
+
 async function fetchToken() {{
   const channel = document.getElementById('channelInput').value.trim() || 'test';
   const uidInput = document.getElementById('uidInput').value.trim();
-  const uid = uidInput ? parseInt(uidInput) || 0 : 0;
+  const uidKind = classifyUid(uidInput);
 
   // When the RTM panel is present, include the requested RTM user so the
   // fetched token covers both RTC + RTM for a consistent (uid, rtm_user) pair.
   // The server may override rtm_user_id when --rtm-user-id was pinned; we
   // reflect the authoritative value back into the input below.
-  const body = {{ channel: channel, uid: String(uid) }};
+  // Send the raw uid as typed. The server's RtcAccount::parse mirrors the
+  // client rules: "423" → int, "423dd" → string, "s/1232" → string "1232".
+  const body = {{ channel: channel, uid: uidKind.tokenArg }};
   const rtmInput = document.getElementById('rtmUserInput');
   if (rtmInput) {{
     const requested = rtmInput.value.trim();
@@ -1141,26 +1178,27 @@ async function fetchToken() {{
 async function doJoin() {{
   const channel = document.getElementById('channelInput').value.trim() || 'test';
   const uidInput = document.getElementById('uidInput').value.trim();
-  const uid = uidInput ? parseInt(uidInput) || 0 : 0;
+  const uidKind = classifyUid(uidInput);
+  // Agora RTC Web SDK accepts either a number (int uid) or a string (user
+  // account). classifyUid gives us the correctly-typed value — never
+  // coerced. `joinArg` is null when uid=0 (auto-assign by server).
+  const joinUid = uidKind.joinArg;
 
   setStatus('connecting', 'Connecting...');
-  log('Joining channel: ' + channel + ' uid: ' + (uid || 'auto'));
+  log('Joining channel: ' + channel + ' uid: ' + (joinUid === null ? 'auto' : joinUid)
+      + ' (' + uidKind.label + ')');
 
+  // Use the token that's already in the textbox. If the user edited
+  // channel/UID without clicking Fetch, the token won't match and the
+  // RTC server rejects with invalid-token — which is what we want.
+  const token = document.getElementById('tokenInput').value.trim();
+  if (!token) {{
+    log('No token — click Fetch first', 'error');
+    setStatus('disconnected', 'No token');
+    return;
+  }}
   try {{
-    // Use token from textarea, or fetch one if empty
-    let token = document.getElementById('tokenInput').value.trim();
-    if (!token) {{
-      const resp = await fetch('/api/token', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ channel: channel, uid: String(uid) }})
-      }});
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error);
-      token = data.token;
-      document.getElementById('tokenInput').value = token;
-    }}
-    log('Token received', 'success');
+    log('Using token from textbox', 'success');
     console.log('App ID:', APP_ID);
     console.log('Channel:', channel);
     console.log('Token:', token);
@@ -1210,7 +1248,7 @@ async function doJoin() {{
     }});
 
     // Join
-    const joinedUid = await client.join(APP_ID, channel, token, uid || null);
+    const joinedUid = await client.join(APP_ID, channel, token, joinUid);
     log('Joined as uid: ' + joinedUid, 'success');
     document.getElementById('joinBtn').style.display = 'none';
     document.getElementById('leaveBtn').style.display = '';
@@ -1394,7 +1432,11 @@ const SLOGANS = [
 document.getElementById('slogan').textContent = SLOGANS[Math.floor(Math.random() * SLOGANS.length)];
 
 // ── Fetch button enable/disable ─────────────────────────────────
-// Enabled only when all required user-id fields are filled.
+// Enabled only when all required user-id fields are filled. The token
+// is NOT auto-cleared when inputs change — the user drives it: if they
+// edit without clicking Fetch, Join/Login will use the stale token and
+// the server will reject with an invalid-token error, which is
+// intentional and informative.
 function updateFetchState() {{
   const channel = document.getElementById('channelInput').value.trim();
   const uid     = document.getElementById('uidInput').value.trim();
