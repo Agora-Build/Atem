@@ -1418,6 +1418,7 @@ async function updateStats() {{
 
 // ── Slogan: random per page load, fixed for the session ─────────
 const SLOGANS = [
+  // real-time / networking
   "real-time is the only time",
   "latency is a suggestion, not a law",
   "every millisecond matters",
@@ -1428,6 +1429,22 @@ const SLOGANS = [
   "ping travels at the speed of light",
   "if it's not real-time, it's history",
   "packets fly, conversations thrive",
+  // voice / natural conversation
+  "your true voice, heard",
+  "nature's voice, zero friction",
+  "real conversations, at the speed of speech",
+  "voice is better, always",
+  "speak naturally, be understood",
+  "no keyboards, no clicks — just talk",
+  "the fastest interface is your voice",
+  "from thought to speech to action",
+  "say it once, mean it always",
+  "talk like you mean it",
+  "conversations that flow",
+  "every word in its moment",
+  "audio is the new UI",
+  "speech was the first API",
+  "presence over pixels",
 ];
 document.getElementById('slogan').textContent = SLOGANS[Math.floor(Math.random() * SLOGANS.length)];
 
