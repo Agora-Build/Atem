@@ -321,11 +321,11 @@ impl TokenInfo {
         lines.push(format!("  {}", RULE));
         lines.push(format!(
             "     Valid from          {}",
-            format_timestamp(self.issue_ts)
+            format_timestamp_with_local(self.issue_ts as u64)
         ));
         lines.push(format!(
             "     Valid until         {}",
-            format_timestamp_u64(exp)
+            format_timestamp_with_local(exp)
         ));
         let status = if now < self.issue_ts as u64 {
             format!(
@@ -384,8 +384,10 @@ impl TokenInfo {
                         (2, 1) => "login",
                         _ => "unknown",
                     };
+                    // 8-space indent + 17-char label pad puts the content at
+                    // the same column (26) as the label-section values above.
                     lines.push(format!(
-                        "        {:<16}expires in {}",
+                        "        {:<17}expires in {}",
                         priv_name,
                         format_relative_duration(v as u64)
                     ));
@@ -395,7 +397,7 @@ impl TokenInfo {
 
         lines.push(String::new());
         lines.push(format!("  {}", RULE));
-        lines.push(format!("  Decoded at {}", format_timestamp_u64(now)));
+        lines.push(format!("  Decoded at {}", format_timestamp_with_local(now)));
         lines.join("\n")
     }
 }
@@ -407,8 +409,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Format a relative duration in the largest sensible unit (e.g. "3 days",
-/// "59 minutes", "42 seconds"). Always uses whole-number units for readability.
+/// Format a relative duration with seconds precision. Starts at the largest
+/// applicable unit and always ends at seconds so outputs are comparable:
+///   0         → "0s"
+///   45        → "45s"
+///   90        → "1m 30s"
+///   3600      → "1h 0m 0s"
+///   3665      → "1h 1m 5s"
+///   90061     → "1d 1h 1m 1s"
 fn format_relative_duration(secs: u64) -> String {
     const MIN: u64 = 60;
     const HOUR: u64 = 60 * MIN;
@@ -417,27 +425,18 @@ fn format_relative_duration(secs: u64) -> String {
     if secs >= DAY {
         let d = secs / DAY;
         let h = (secs % DAY) / HOUR;
-        if h > 0 {
-            format!("{}d {}h", d, h)
-        } else {
-            format!("{}d", d)
-        }
+        let m = (secs % HOUR) / MIN;
+        let s = secs % MIN;
+        format!("{}d {}h {}m {}s", d, h, m, s)
     } else if secs >= HOUR {
         let h = secs / HOUR;
         let m = (secs % HOUR) / MIN;
-        if m > 0 {
-            format!("{}h {}m", h, m)
-        } else {
-            format!("{}h", h)
-        }
+        let s = secs % MIN;
+        format!("{}h {}m {}s", h, m, s)
     } else if secs >= MIN {
         let m = secs / MIN;
         let s = secs % MIN;
-        if s > 0 {
-            format!("{}m {}s", m, s)
-        } else {
-            format!("{}m", m)
-        }
+        format!("{}m {}s", m, s)
     } else {
         format!("{}s", secs)
     }
@@ -460,6 +459,54 @@ fn format_timestamp_impl(secs: u64) -> String {
     let s = time_of_day % 60;
     let (y, mo, d) = civil_from_days(days as i64);
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, mo, d, h, m, s)
+}
+
+/// Format a unix timestamp in the system's local timezone.
+/// Returns `None` if libc's localtime_r fails (shouldn't happen on Unix).
+#[cfg(unix)]
+fn format_local_timestamp(secs: u64) -> Option<String> {
+    use std::ffi::CStr;
+    let t: libc::time_t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::localtime_r(&t, &mut tm) };
+    if res.is_null() {
+        return None;
+    }
+    let tz = unsafe {
+        if tm.tm_zone.is_null() {
+            String::from("local")
+        } else {
+            CStr::from_ptr(tm.tm_zone)
+                .to_str()
+                .unwrap_or("local")
+                .to_string()
+        }
+    };
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        tz
+    ))
+}
+
+#[cfg(not(unix))]
+fn format_local_timestamp(_secs: u64) -> Option<String> {
+    None
+}
+
+/// Return `"<UTC time>  (<local time>)"` if local-time conversion works; else
+/// just the UTC string. Used to keep the Validity block aligned.
+fn format_timestamp_with_local(secs: u64) -> String {
+    let utc = format_timestamp_impl(secs);
+    match format_local_timestamp(secs) {
+        Some(local) if local != utc => format!("{} ({})", utc, local),
+        _ => utc,
+    }
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -1073,8 +1120,8 @@ mod tests {
         assert!(display.contains("Valid from"));
         assert!(display.contains("Valid until"));
         assert!(display.contains("Valid now"));
-        assert!(display.contains("expires in 30m"),
-            "expected 'expires in 30m', got:\n{display}");
+        assert!(display.contains("expires in 30m 0s"),
+            "expected 'expires in 30m 0s', got:\n{display}");
 
         // Service data
         assert!(display.contains("RTC"));
@@ -1116,15 +1163,15 @@ mod tests {
     }
 
     #[test]
-    fn format_relative_duration_boundaries() {
-        assert_eq!(format_relative_duration(0), "0s");
-        assert_eq!(format_relative_duration(45), "45s");
-        assert_eq!(format_relative_duration(60), "1m");
-        assert_eq!(format_relative_duration(90), "1m 30s");
-        assert_eq!(format_relative_duration(3600), "1h");
-        assert_eq!(format_relative_duration(3665), "1h 1m");
-        assert_eq!(format_relative_duration(86_400), "1d");
-        assert_eq!(format_relative_duration(90_061), "1d 1h");
+    fn format_relative_duration_always_ends_in_seconds() {
+        assert_eq!(format_relative_duration(0),      "0s");
+        assert_eq!(format_relative_duration(45),     "45s");
+        assert_eq!(format_relative_duration(60),     "1m 0s");
+        assert_eq!(format_relative_duration(90),     "1m 30s");
+        assert_eq!(format_relative_duration(3600),   "1h 0m 0s");
+        assert_eq!(format_relative_duration(3665),   "1h 1m 5s");
+        assert_eq!(format_relative_duration(86_400), "1d 0h 0m 0s");
+        assert_eq!(format_relative_duration(90_061), "1d 1h 1m 1s");
     }
 
     #[test]

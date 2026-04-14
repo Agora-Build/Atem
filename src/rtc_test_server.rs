@@ -13,6 +13,14 @@ pub struct RtcTestConfig {
     pub channel: String,
     pub port: u16,
     pub expire_secs: u32,
+    /// Optional RTC user id / account. None → server default ("0" / auto-assign).
+    /// Honours the same `s/` prefix convention as `atem token rtc create`.
+    pub rtc_user_id: Option<String>,
+    /// When true, issue an RTC+RTM combined token and render the RTM UI.
+    pub with_rtm: bool,
+    /// RTM user account to embed. Only used when `with_rtm` is true.
+    /// If None, falls back to `rtc_user_id`.
+    pub rtm_user_id: Option<String>,
     pub no_browser: bool,
     pub background: bool,
     pub _daemon: bool,
@@ -236,19 +244,32 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
         let log_path = log_dir.join(format!("{}.log", sid));
         let log_file = std::fs::File::create(&log_path)?;
 
+        let mut daemon_args: Vec<String> = vec![
+            "serv".into(),
+            "rtc".into(),
+            "--channel".into(),
+            config.channel.clone(),
+            "--port".into(),
+            port.to_string(),
+            "--expire".into(),
+            config.expire_secs.to_string(),
+        ];
+        if let Some(uid) = &config.rtc_user_id {
+            daemon_args.push("--rtc-user-id".into());
+            daemon_args.push(uid.clone());
+        }
+        if config.with_rtm {
+            daemon_args.push("--with-rtm".into());
+        }
+        if let Some(rtm_uid) = &config.rtm_user_id {
+            daemon_args.push("--rtm-user-id".into());
+            daemon_args.push(rtm_uid.clone());
+        }
+        daemon_args.push("--no-browser".into());
+        daemon_args.push("--serv-daemon".into());
+
         let child = std::process::Command::new(exe)
-            .args([
-                "serv",
-                "rtc",
-                "--channel",
-                &config.channel,
-                "--port",
-                &port.to_string(),
-                "--expire",
-                &config.expire_secs.to_string(),
-                "--no-browser",
-                "--serv-daemon",
-            ])
+            .args(&daemon_args)
             .stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
@@ -338,6 +359,9 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
     let app_certificate = Arc::new(app_certificate);
     let channel = Arc::new(config.channel);
     let expire_secs = config.expire_secs;
+    let rtc_user_id = Arc::new(config.rtc_user_id);
+    let with_rtm = config.with_rtm;
+    let rtm_user_id = Arc::new(config.rtm_user_id);
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -345,6 +369,8 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
         let app_id = app_id.clone();
         let app_certificate = app_certificate.clone();
         let channel = channel.clone();
+        let rtc_user_id = rtc_user_id.clone();
+        let rtm_user_id = rtm_user_id.clone();
 
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
@@ -363,6 +389,9 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
                 &app_certificate,
                 &channel,
                 expire_secs,
+                rtc_user_id.as_deref(),
+                with_rtm,
+                rtm_user_id.as_deref(),
             )
             .await
             {
@@ -373,6 +402,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
 }
 
 /// Handle a single TLS connection — parse the HTTP request and route.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     _peer: SocketAddr,
@@ -380,6 +410,9 @@ async fn handle_connection(
     app_certificate: &str,
     default_channel: &str,
     expire_secs: u32,
+    rtc_user_id: Option<&str>,
+    with_rtm: bool,
+    rtm_user_id: Option<&str>,
 ) -> Result<()> {
     // Read until we have the full request (headers + Content-Length bytes of body).
     // A single .read() can return only the headers if the browser splits the POST
@@ -406,16 +439,33 @@ async fn handle_connection(
 
     match (method, path) {
         ("GET", "/") => {
-            let html = build_html_page(app_id, default_channel);
+            let default_uid = rtc_user_id.unwrap_or("0");
+            let default_rtm_uid = rtm_user_id.unwrap_or(default_uid);
+            let html = build_html_page(
+                app_id, default_channel, default_uid, with_rtm, default_rtm_uid,
+            );
             send_response(&mut stream, 200, "text/html; charset=utf-8", html.as_bytes()).await?;
         }
         ("GET", "/favicon.ico") => {
             send_response(&mut stream, 204, "text/plain", b"").await?;
         }
+        ("GET", "/vendor/agora-rtm-sdk.js") => {
+            // Vendored SDK embedded at compile time — no CDN dependency.
+            const RTM_SDK: &str = include_str!("../assets/agora-rtm-sdk.js");
+            send_response(
+                &mut stream,
+                200,
+                "application/javascript; charset=utf-8",
+                RTM_SDK.as_bytes(),
+            )
+            .await?;
+        }
         ("POST", "/api/token") => {
-            // Extract JSON body
             let body = extract_body(&request);
-            handle_token_api(&mut stream, &body, app_id, app_certificate, expire_secs).await?;
+            handle_token_api(
+                &mut stream, &body, app_id, app_certificate, expire_secs, with_rtm, rtm_user_id,
+            )
+            .await?;
         }
         _ => {
             send_response(&mut stream, 404, "text/plain", b"Not Found").await?;
@@ -506,15 +556,17 @@ fn extract_body(request: &str) -> String {
     }
 }
 
-/// Handle POST /api/token — generate an RTC token.
+/// Handle POST /api/token — generate an RTC (or RTC+RTM) token.
 async fn handle_token_api(
     stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     body: &str,
     app_id: &str,
     app_certificate: &str,
     expire_secs: u32,
+    with_rtm: bool,
+    default_rtm_user: Option<&str>,
 ) -> Result<()> {
-    // Parse body as JSON: { "channel": "...", "uid": "..." }
+    // Parse body as JSON: { "channel": "...", "uid": "...", "rtm_user_id"?: "..." }
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => {
@@ -526,6 +578,8 @@ async fn handle_token_api(
 
     let channel = parsed["channel"].as_str().unwrap_or("test");
     let uid = parsed["uid"].as_str().unwrap_or("0");
+    // Only honoured when the server was launched with --with-rtm.
+    let rtm_user_id_req = parsed["rtm_user_id"].as_str();
 
     // Use time sync for accurate issued_at
     let mut time_sync = crate::time_sync::TimeSync::new();
@@ -539,28 +593,68 @@ async fn handle_token_api(
         }
     };
 
-    let token = match crate::token::build_token_rtc(
-        app_id,
-        app_certificate,
-        channel,
-        crate::token::RtcAccount::parse(uid),
-        crate::token::Role::Publisher,
-        expire_secs,
-        now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Token generation failed: {}", e)});
-            send_response(stream, 500, "application/json", err.to_string().as_bytes()).await?;
-            return Ok(());
+    let rtc_account = crate::token::RtcAccount::parse(uid);
+
+    let token = if with_rtm {
+        // Resolve RTM account: request body > CLI default > fallback to RTC uid.
+        // The client is trusted — if it sends a mismatched rtm_user_id, login
+        // with a stale token will simply fail, which is the desired behaviour.
+        let rtm_uid = rtm_user_id_req
+            .or(default_rtm_user)
+            .map(str::to_string)
+            .unwrap_or_else(|| rtc_account.as_str());
+        match crate::token::build_token_rtc_with_rtm(
+            app_id,
+            app_certificate,
+            channel,
+            rtc_account,
+            crate::token::Role::Publisher,
+            expire_secs,
+            expire_secs,
+            Some(&rtm_uid),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let err = serde_json::json!({"error": format!("Token generation failed: {}", e)});
+                send_response(stream, 500, "application/json", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        match crate::token::build_token_rtc(
+            app_id,
+            app_certificate,
+            channel,
+            rtc_account,
+            crate::token::Role::Publisher,
+            expire_secs,
+            now,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let err = serde_json::json!({"error": format!("Token generation failed: {}", e)});
+                send_response(stream, 500, "application/json", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
         }
     };
 
+    // Echo which RTM user this token was issued for (for client UX).
+    let actual_rtm_user = if with_rtm {
+        rtm_user_id_req
+            .or(default_rtm_user)
+            .map(str::to_string)
+            .unwrap_or_else(|| rtc_account.as_str())
+    } else {
+        String::new()
+    };
     let resp = serde_json::json!({
         "token": token,
         "app_id": app_id,
         "channel": channel,
         "uid": uid,
+        "with_rtm": with_rtm,
+        "rtm_user_id": actual_rtm_user,
     });
 
     send_response(stream, 200, "application/json", resp.to_string().as_bytes()).await?;
@@ -614,11 +708,175 @@ pub(crate) fn open_browser(url: &str) -> Result<()> {
 }
 
 /// Build the self-contained HTML page for RTC testing.
-fn build_html_page(app_id: &str, default_channel: &str) -> String {
+fn build_html_page(
+    app_id: &str,
+    default_channel: &str,
+    default_uid: &str,
+    with_rtm: bool,
+    default_rtm_uid: &str,
+) -> String {
     let app_id_display = if app_id.len() > 12 {
         format!("{}...{}", &app_id[..6], &app_id[app_id.len() - 4..])
     } else {
         app_id.to_string()
+    };
+
+    // Fragments that are only rendered when --with-rtm is active.
+    let rtm_css = if with_rtm {
+        // RTM-only styles. The two input rows reuse `.controls` and the log
+        // reuses `#log`'s visual treatment (inherits block background), so
+        // RTC and RTM blocks look identical. Only dot state + line colours
+        // live here.
+        r##"#rtmLog { max-height:200px; overflow-y:auto; padding:8px 16px; font-size:11px; font-family:monospace; color:#7d8590; }
+#rtmLog div { padding:1px 0; }
+#rtmLog .inbound  { color:#79c0ff; }
+#rtmLog .outbound { color:#3fb950; }
+#rtmLog .info     { color:#7d8590; }
+#rtmLog .error    { color:#f85149; }
+#rtmDot.ok  { background:#3fb950 !important; }
+#rtmDot.err { background:#f85149 !important; }"##
+    } else {
+        ""
+    };
+
+    let rtm_section = if with_rtm {
+        format!(r##"
+<section class="block">
+  <h2 class="block-title"><span class="status-dot disconnected" id="rtmDot"></span>Signaling (RTM) — <span id="rtmStatusText" style="font-weight:400;color:#7d8590">not logged in</span></h2>
+  <div class="controls">
+    <label>RTM User</label>
+    <input id="rtmUserInput" type="text" value="{default_rtm_uid}" placeholder="user id" oninput="updateFetchState()">
+    <button id="rtmLoginBtn" class="btn btn-mute" onclick="rtmLogin()">Login</button>
+    <button id="rtmLogoutBtn" class="btn btn-leave" onclick="rtmLogout()" style="display:none">Logout</button>
+  </div>
+  <div class="controls">
+    <label>Send to</label>
+    <input id="rtmPeerInput" type="text" placeholder="peer user id (leave blank = channel)" style="width:360px">
+  </div>
+  <div class="controls">
+    <label>Message</label>
+    <input id="rtmMsgInput" type="text" placeholder="message" style="flex:1;min-width:200px">
+    <button id="rtmSendBtn" class="btn btn-mute" onclick="rtmSend()" disabled>Send</button>
+  </div>
+  <div id="rtmLog"></div>
+</section>"##,
+            default_rtm_uid = default_rtm_uid)
+    } else {
+        String::new()
+    };
+
+    // RTM SDK v2 served from atem itself (vendored at build time from
+    // agora-rtm-sdk@2.2.4). Avoids CDN flakiness / 404s and works offline.
+    let rtm_sdk_script = if with_rtm {
+        r#"<script src="/vendor/agora-rtm-sdk.js"></script>"#
+    } else {
+        ""
+    };
+
+    let rtm_js = if with_rtm {
+        r##"
+// ── Signaling (RTM v2) ────────────────────────────────────────────
+let rtm = null;
+let rtmChannelName = null;
+function rtmLog(msg, cls) {
+  const el = document.getElementById('rtmLog');
+  const d = document.createElement('div');
+  d.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  if (cls) d.className = cls;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+function rtmSetStatus(state, text) {
+  // Preserve `status-dot` base class; state ∈ {'', 'ok', 'err'}
+  const dot = document.getElementById('rtmDot');
+  dot.className = 'status-dot' + (state ? ' ' + state : ' disconnected');
+  document.getElementById('rtmStatusText').textContent = text;
+}
+async function rtmLogin() {
+  const actualUser = document.getElementById('rtmUserInput').value.trim();
+  if (!actualUser) { rtmLog('Enter an RTM user id first', 'error'); return; }
+  if (!window.AgoraRTM) { rtmLog('RTM SDK not loaded', 'error'); return; }
+
+  // Use the token that's already in the textbox. If the user changed the RTM
+  // user id but didn't click Fetch, the existing token won't match and RTM
+  // will reject the login — which is the correct behaviour.
+  const token = document.getElementById('tokenInput').value.trim();
+  if (!token) {
+    rtmLog('No token — click Fetch first', 'error');
+    return;
+  }
+
+  try {
+    rtm = new AgoraRTM.RTM(APP_ID, actualUser);
+    rtm.addEventListener('message', (evt) => {
+      const from = evt.publisher || '?';
+      const chan = evt.channelName ? ' [' + evt.channelName + ']' : '';
+      rtmLog('← ' + from + chan + ': ' + evt.message, 'inbound');
+    });
+    rtm.addEventListener('status', (evt) => {
+      rtmLog('RTM status: ' + evt.state + (evt.reason ? ' (' + evt.reason + ')' : ''), 'info');
+    });
+    await rtm.login({ token });
+
+    // Subscribe to the RTC channel so channel messages arrive here too.
+    rtmChannelName = document.getElementById('channelInput').value.trim() || 'test';
+    try {
+      await rtm.subscribe(rtmChannelName);
+      rtmLog('Subscribed to channel ' + rtmChannelName, 'info');
+    } catch (e) {
+      rtmLog('Subscribe failed (non-fatal): ' + e.message, 'info');
+    }
+
+    rtmSetStatus('ok', 'logged in as ' + actualUser);
+    document.getElementById('rtmLoginBtn').style.display = 'none';
+    document.getElementById('rtmLogoutBtn').style.display = '';
+    document.getElementById('rtmSendBtn').disabled = false;
+    rtmLog('Logged in as ' + actualUser, 'info');
+  } catch (e) {
+    rtmLog('Login failed: ' + e.message, 'error');
+    rtmSetStatus('err', 'login failed');
+  }
+}
+async function rtmLogout() {
+  if (!rtm) return;
+  try {
+    if (rtmChannelName) {
+      try { await rtm.unsubscribe(rtmChannelName); } catch (_) {}
+      rtmChannelName = null;
+    }
+    await rtm.logout();
+  } catch (e) {
+    rtmLog('Logout error: ' + e.message, 'error');
+  }
+  rtm = null;
+  rtmSetStatus('', 'not logged in');
+  document.getElementById('rtmLoginBtn').style.display = '';
+  document.getElementById('rtmLogoutBtn').style.display = 'none';
+  document.getElementById('rtmSendBtn').disabled = true;
+  rtmLog('Logged out', 'info');
+}
+async function rtmSend() {
+  if (!rtm) { rtmLog('Not logged in', 'error'); return; }
+  const peer = document.getElementById('rtmPeerInput').value.trim();
+  const msg  = document.getElementById('rtmMsgInput').value;
+  if (!msg) { rtmLog('Enter a message', 'error'); return; }
+  try {
+    if (peer) {
+      await rtm.publish(peer, msg, { channelType: 'USER' });
+      rtmLog('→ ' + peer + ': ' + msg, 'outbound');
+    } else {
+      const chan = rtmChannelName || (document.getElementById('channelInput').value.trim() || 'test');
+      await rtm.publish(chan, msg);
+      rtmLog('→ [' + chan + ']: ' + msg, 'outbound');
+    }
+    document.getElementById('rtmMsgInput').value = '';
+  } catch (e) {
+    rtmLog('Send failed: ' + e.message, 'error');
+  }
+}
+"##
+    } else {
+        ""
     };
 
     format!(
@@ -679,53 +937,70 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .device-banner.success {{ background: #0d2818; border: 1px solid #3fb950; color: #56d364; }}
 .device-banner .grant-btn {{ background: #388bfd; color: #fff; border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-left: 8px; }}
 .device-banner .grant-btn:hover {{ background: #58a6ff; }}
+/* Block sections — General / RTC / RTM */
+.block {{ margin: 16px 20px; border: 1px solid #30363d; border-radius: 8px; background: #161b22; overflow: hidden; }}
+.block-title {{ padding: 10px 16px; background: #1c2128; border-bottom: 1px solid #30363d; font-size: 14px; font-weight: 600; color: #c9d1d9; }}
+.block .controls, .block .token-row {{ border-bottom: 1px solid #30363d; background: transparent; }}
+.block .controls:last-child, .block .token-row:last-child, .block .status-bar {{ border-bottom: none; }}
+.app-id-value {{ font-family: monospace; font-size: 13px; color: #c9d1d9; }}
+.btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+{rtm_css}
 </style>
 </head>
 <body>
 
 <div class="header">
-  <h1>Hello, Agora RTC</h1>
-  <span class="app-id">App ID: {app_id_display} <button class="copy-btn" onclick="copyText('{app_id}')">Copy</button></span>
+  <h1>Welcome to Agora, <span id="slogan">real-time is the only time</span></h1>
 </div>
 
-<div class="controls">
-  <label>Channel</label>
-  <input id="channelInput" type="text" value="{default_channel}" placeholder="channel name">
-  <label>UID</label>
-  <input id="uidInput" type="text" placeholder="auto" style="width:100px">
-  <button id="joinBtn" class="btn btn-join" onclick="doJoin()">Join</button>
-  <button id="leaveBtn" class="btn btn-leave" onclick="doLeave()">Leave</button>
-  <button id="muteAudioBtn" class="btn btn-mute" onclick="toggleMuteAudio()">Mute Mic</button>
-  <button id="muteVideoBtn" class="btn btn-mute" onclick="toggleMuteVideo()">Mute Cam</button>
-  <button id="statsBtn" class="btn btn-stats" onclick="toggleStats()">Stats</button>
-</div>
-
-<div class="token-row">
-  <label>Access Token</label>
-  <textarea id="tokenInput" rows="1" placeholder="Auto-generated on Join — or paste your own token here"></textarea>
-  <button class="btn btn-mute" onclick="fetchToken()">Fetch</button>
-  <button class="copy-btn" onclick="copyText(document.getElementById('tokenInput').value)">Copy</button>
-</div>
-
-<div id="deviceBanner" class="device-banner" style="display:none"></div>
-
-<div id="statsPanel" class="stats-panel"></div>
-
-<div class="video-grid" id="videoGrid">
-  <div class="video-cell" id="localCell" style="display:none">
-    <div id="localVideo"></div>
-    <span class="video-label" id="localLabel">Local</span>
+<!-- ── General ─────────────────────────────────────────────────── -->
+<section class="block">
+  <h2 class="block-title">General</h2>
+  <div class="controls">
+    <label>App ID</label>
+    <span class="app-id-value">{app_id_display}</span>
+    <button class="copy-btn" onclick="copyText('{app_id}')">Copy</button>
   </div>
-</div>
+  <div class="controls">
+    <label>Channel</label>
+    <input id="channelInput" type="text" value="{default_channel}" placeholder="channel name" oninput="updateFetchState()">
+  </div>
+  <div class="token-row">
+    <label>Access Token</label>
+    <textarea id="tokenInput" rows="1" placeholder="Auto-generated on Join — or paste your own token here"></textarea>
+    <button id="fetchBtn" class="btn btn-mute" onclick="fetchToken()" disabled>Fetch</button>
+    <button class="copy-btn" onclick="copyText(document.getElementById('tokenInput').value)">Copy</button>
+  </div>
+</section>
 
-<div id="log"></div>
+<!-- ── RTC ─────────────────────────────────────────────────────── -->
+<section class="block">
+  <h2 class="block-title"><span class="status-dot disconnected" id="statusDot"></span>RTC — <span id="statusText" style="font-weight:400;color:#7d8590">Disconnected</span></h2>
+  <div class="controls">
+    <label>UID</label>
+    <input id="uidInput" type="text" placeholder="auto" value="{default_uid}" style="width:100px" oninput="updateFetchState()">
+    <button id="joinBtn" class="btn btn-join" onclick="doJoin()">Join</button>
+    <button id="leaveBtn" class="btn btn-leave" onclick="doLeave()">Leave</button>
+    <button id="muteAudioBtn" class="btn btn-mute" onclick="toggleMuteAudio()">Mute Mic</button>
+    <button id="muteVideoBtn" class="btn btn-mute" onclick="toggleMuteVideo()">Mute Cam</button>
+    <button id="statsBtn" class="btn btn-stats" onclick="toggleStats()">Stats</button>
+    <span id="networkQuality" style="margin-left:auto;font-size:12px;color:#7d8590"></span>
+  </div>
+  <div id="deviceBanner" class="device-banner" style="display:none"></div>
+  <div id="statsPanel" class="stats-panel"></div>
+  <div class="video-grid" id="videoGrid">
+    <div class="video-cell" id="localCell" style="display:none">
+      <div id="localVideo"></div>
+      <span class="video-label" id="localLabel">Local</span>
+    </div>
+  </div>
+  <div id="log"></div>
+</section>
 
-<div class="status-bar">
-  <span><span class="status-dot disconnected" id="statusDot"></span><span id="statusText">Disconnected</span></span>
-  <span id="networkQuality"></span>
-</div>
+{rtm_section}
 
-<script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.22.0.js"></script>
+<script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.23.0.js"></script>
+{rtm_sdk_script}
 <script>
 const APP_ID = "{app_id}";
 function copyText(text) {{
@@ -836,16 +1111,28 @@ async function fetchToken() {{
   const uidInput = document.getElementById('uidInput').value.trim();
   const uid = uidInput ? parseInt(uidInput) || 0 : 0;
 
+  // When the RTM panel is present, include the requested RTM user so the
+  // fetched token covers both RTC + RTM for a consistent (uid, rtm_user) pair.
+  // The server may override rtm_user_id when --rtm-user-id was pinned; we
+  // reflect the authoritative value back into the input below.
+  const body = {{ channel: channel, uid: String(uid) }};
+  const rtmInput = document.getElementById('rtmUserInput');
+  if (rtmInput) {{
+    const requested = rtmInput.value.trim();
+    if (requested) body.rtm_user_id = requested;
+  }}
+
   try {{
     const resp = await fetch('/api/token', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ channel: channel, uid: String(uid) }})
+      body: JSON.stringify(body)
     }});
     const data = await resp.json();
     if (data.error) throw new Error(data.error);
     document.getElementById('tokenInput').value = data.token;
-    log('Token fetched', 'success');
+
+    log('Token fetched' + (data.with_rtm ? ' (RTC + RTM)' : ''), 'success');
   }} catch (err) {{
     log('Fetch token error: ' + err.message, 'error');
   }}
@@ -1091,14 +1378,51 @@ async function updateStats() {{
   }}
 }}
 
-// Pre-fill token on page load
-fetchToken();
+// ── Slogan: random per page load, fixed for the session ─────────
+const SLOGANS = [
+  "real-time is the only time",
+  "latency is a suggestion, not a law",
+  "every millisecond matters",
+  "speed of thought, speed of sound",
+  "bits in motion, minds in sync",
+  "zero delay, all play",
+  "the network is now",
+  "ping travels at the speed of light",
+  "if it's not real-time, it's history",
+  "packets fly, conversations thrive",
+];
+document.getElementById('slogan').textContent = SLOGANS[Math.floor(Math.random() * SLOGANS.length)];
+
+// ── Fetch button enable/disable ─────────────────────────────────
+// Enabled only when all required user-id fields are filled.
+function updateFetchState() {{
+  const channel = document.getElementById('channelInput').value.trim();
+  const uid     = document.getElementById('uidInput').value.trim();
+  const rtmIn   = document.getElementById('rtmUserInput');
+  const rtmVal  = rtmIn ? rtmIn.value.trim() : 'n/a';
+  const ok = channel && uid && rtmVal;
+  const btn = document.getElementById('fetchBtn');
+  if (btn) btn.disabled = !ok;
+}}
+updateFetchState();
+
+// Auto-fetch on load only if all inputs are ready.
+if (!document.getElementById('fetchBtn').disabled) {{
+  fetchToken();
+}}
+
+{rtm_js}
 </script>
 </body>
 </html>"##,
         app_id_display = app_id_display,
         default_channel = default_channel,
+        default_uid = default_uid,
         app_id = app_id,
+        rtm_css = rtm_css,
+        rtm_section = rtm_section,
+        rtm_sdk_script = rtm_sdk_script,
+        rtm_js = rtm_js,
     )
 }
 
@@ -1130,10 +1454,36 @@ mod tests {
 
     #[test]
     fn html_page_contains_app_id_and_channel() {
-        let html = build_html_page("abc123def456ghij", "my-test-channel");
+        let html = build_html_page(
+            "abc123def456ghij", "my-test-channel", "0", false, "0",
+        );
         assert!(html.contains("abc123...ghij")); // truncated display
         assert!(html.contains("my-test-channel"));
         assert!(html.contains("abc123def456ghij")); // full ID in JS config
+    }
+
+    #[test]
+    fn html_page_has_rtm_section_when_enabled() {
+        let html = build_html_page(
+            "abc123def456ghij", "chan", "42", true, "alice",
+        );
+        // RTM SDK loaded
+        assert!(html.contains("agora-rtm"), "RTM SDK script missing");
+        // RTM UI region visible
+        assert!(html.contains("Signaling"),      "RTM UI header missing");
+        assert!(html.contains("rtmLoginBtn"),    "RTM login button missing");
+        assert!(html.contains("rtmSendBtn"),     "RTM send button missing");
+        // Default RTM user is embedded
+        assert!(html.contains("alice"),          "default RTM user missing");
+    }
+
+    #[test]
+    fn html_page_has_no_rtm_section_when_disabled() {
+        let html = build_html_page(
+            "abc123def456ghij", "chan", "42", false, "0",
+        );
+        assert!(!html.contains("Signaling"),   "RTM UI should not render without --with-rtm");
+        assert!(!html.contains("rtmLoginBtn"), "RTM button should not render");
     }
 
     #[test]

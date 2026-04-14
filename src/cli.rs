@@ -232,6 +232,18 @@ pub enum ServCommands {
         /// Token expiry in seconds
         #[arg(long, default_value = "3600")]
         expire: u32,
+        /// RTC user identifier. All-digit → int uid. Non-digit → string account.
+        /// Leading `s/` forces string mode (e.g. `s/1232`).
+        #[arg(long = "rtc-user-id")]
+        rtc_user_id: Option<String>,
+        /// Also embed an RTM (Signaling) login privilege in the token.
+        /// Defaults to using --rtc-user-id as the RTM account.
+        #[arg(long)]
+        with_rtm: bool,
+        /// RTM user account to embed (only used with --with-rtm).
+        /// If omitted, the RTC user id is reused.
+        #[arg(long)]
+        rtm_user_id: Option<String>,
         /// Don't auto-open the browser
         #[arg(long)]
         no_browser: bool,
@@ -819,14 +831,25 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 channel,
                 port,
                 expire,
+                rtc_user_id,
+                with_rtm,
+                rtm_user_id,
                 no_browser,
                 background,
                 _serv_daemon,
             } => {
+                if rtm_user_id.is_some() && !with_rtm {
+                    anyhow::bail!(
+                        "--rtm-user-id requires --with-rtm; add --with-rtm to enable RTM on the test page"
+                    );
+                }
                 let config = crate::rtc_test_server::RtcTestConfig {
                     channel,
                     port,
                     expire_secs: expire,
+                    rtc_user_id,
+                    with_rtm,
+                    rtm_user_id,
                     no_browser,
                     background,
                     _daemon: _serv_daemon,
