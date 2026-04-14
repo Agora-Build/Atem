@@ -143,13 +143,22 @@ async fn handle_connection(
             );
             send_response(&mut stream, 200, "text/html; charset=utf-8", html.as_bytes()).await?;
         }
+        ("POST", "/api/token") => {
+            use crate::web_server::{request::extract_body, token_endpoint::handle_token_api};
+            let body = extract_body(&request);
+            // serv convo always issues RTC+RTM tokens — the ConvoAI toolkit
+            // needs RTM for word-by-word transcription.
+            handle_token_api(
+                &mut stream, &body, app_id, app_cert,
+                3600,                                // 1h expiry
+                true,                                // with_rtm
+                Some(resolved.agent_user_id.as_str()),
+            ).await?;
+        }
         _ => {
             send_response(&mut stream, 404, "text/plain", b"Not Found").await?;
         }
     }
-    // Suppress unused warnings in this task; later tasks wire up /api/token + /api/convo/*
-    let _ = app_id;
-    let _ = app_cert;
     Ok(())
 }
 
@@ -161,5 +170,14 @@ mod tests {
     fn default_config_path_ends_with_convo_toml() {
         let p = default_config_path();
         assert!(p.ends_with("convo.toml"));
+    }
+
+    // Real /api/token behaviour is exercised in scripts/run-local-dev-tests.sh
+    // via a running server. This unit test just checks that the route constant
+    // text is present in the source (cheap guard against accidental removal).
+    #[test]
+    fn source_contains_api_token_route() {
+        let src = include_str!("convo_test_server.rs");
+        assert!(src.contains("\"/api/token\""), "missing /api/token route");
     }
 }
