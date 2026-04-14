@@ -5,3 +5,4 @@
 //! and adds its own HTML + domain-specific routes.
 
 pub mod cert;
+pub mod request;
