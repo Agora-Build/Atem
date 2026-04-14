@@ -174,6 +174,57 @@ fn toml_value_to_json(v: &toml::Value) -> Value {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct CliOverrides {
+    pub channel:       Option<String>,
+    pub rtc_user_id:   Option<String>,
+    pub agent_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConfig {
+    pub channel:           String,
+    pub rtc_user_id:       String,
+    pub agent_user_id:     String,
+    pub idle_timeout_secs: Option<u32>,
+    pub avatar_configured: bool,
+}
+
+impl ConvoConfig {
+    /// Resolve runtime values from CLI overrides + TOML + defaults.
+    /// Precedence: CLI > TOML > default/error.
+    ///
+    /// - `channel`: required (CLI or TOML); errors if missing.
+    /// - `rtc_user_id`: optional (CLI > TOML > "0" default).
+    /// - `agent_user_id`: required (CLI or TOML); errors if missing.
+    /// - `avatar_configured`: true iff `[agent.avatar]` is present in TOML.
+    pub fn resolve(&self, cli: &CliOverrides) -> Result<ResolvedConfig> {
+        let channel = cli.channel.clone()
+            .or_else(|| self.channel.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "channel required (pass --channel or set 'channel' in convo.toml)"
+            ))?;
+        let rtc_user_id = cli.rtc_user_id.clone()
+            .or_else(|| self.rtc_user_id.clone())
+            .unwrap_or_else(|| "0".to_string());
+        let agent_user_id = cli.agent_user_id.clone()
+            .or_else(|| self.agent_user_id.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "agent_user_id required (pass --agent-user-id or set 'agent_user_id' in convo.toml)"
+            ))?;
+        let avatar_configured = self.agent.as_ref()
+            .and_then(|a| a.avatar.as_ref())
+            .is_some();
+        Ok(ResolvedConfig {
+            channel,
+            rtc_user_id,
+            agent_user_id,
+            idle_timeout_secs: self.idle_timeout_secs,
+            avatar_configured,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +339,59 @@ mod tests {
             include_avatar: false,
         });
         assert!(body["properties"].get("avatar").is_none());
+    }
+
+    #[test]
+    fn resolve_uses_cli_over_toml() {
+        let cfg = ConvoConfig::from_file(&fixtures().join("convo_full.toml")).unwrap();
+        let r = cfg.resolve(&CliOverrides {
+            channel:       Some("override_channel".into()),
+            rtc_user_id:   None,
+            agent_user_id: None,
+        }).unwrap();
+        assert_eq!(r.channel, "override_channel");
+        assert_eq!(r.rtc_user_id, "42");         // from TOML
+        assert_eq!(r.agent_user_id, "1001");     // from TOML
+        assert!(r.avatar_configured);
+    }
+
+    #[test]
+    fn resolve_errors_when_channel_missing() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            rtc_user_id = "1"
+            agent_user_id = "9"
+        "#).unwrap();
+        let err = cfg.resolve(&CliOverrides::default()).unwrap_err().to_string();
+        assert!(err.contains("channel"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_errors_when_agent_user_id_missing() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            channel = "c"
+            rtc_user_id = "1"
+        "#).unwrap();
+        let err = cfg.resolve(&CliOverrides::default()).unwrap_err().to_string();
+        assert!(err.contains("agent_user_id"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_defaults_rtc_user_id_to_0() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            channel = "c"
+            agent_user_id = "9"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides::default()).unwrap();
+        assert_eq!(r.rtc_user_id, "0");
+    }
+
+    #[test]
+    fn resolve_avatar_configured_false_when_section_absent() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            channel = "c"
+            agent_user_id = "9"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides::default()).unwrap();
+        assert!(!r.avatar_configured);
     }
 }
