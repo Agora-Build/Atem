@@ -254,6 +254,33 @@ pub enum ServCommands {
         #[arg(long, hide = true)]
         _serv_daemon: bool,
     },
+    /// Launch a browser-based Conversational AI agent test page (HTTPS).
+    Convo {
+        /// Channel to join
+        #[arg(long)]
+        channel: Option<String>,
+        /// Human's RTC uid. Defaults to "0" (server-assigned).
+        #[arg(long = "rtc-user-id")]
+        rtc_user_id: Option<String>,
+        /// Agent's RTC uid. Required via CLI or TOML.
+        #[arg(long = "agent-user-id")]
+        agent_user_id: Option<String>,
+        /// Config TOML path. Default: ~/.config/atem/convo.toml
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// HTTPS port (0 = auto). Ignored with --background.
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Don't auto-open the browser
+        #[arg(long)]
+        no_browser: bool,
+        /// Daemon mode: no HTTPS server, agent started immediately.
+        #[arg(long)]
+        background: bool,
+        /// Internal: daemon marker (hidden)
+        #[arg(long, hide = true)]
+        _serv_daemon: bool,
+    },
     /// Host diagrams from SQLite — serves HTML at /d/{id}
     Diagrams {
         /// HTTP port (default: 8787)
@@ -855,6 +882,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     _daemon: _serv_daemon,
                 };
                 crate::rtc_test_server::run_server(config).await
+            }
+            ServCommands::Convo { .. } => {
+                anyhow::bail!("atem serv convo not yet implemented (Task 7 scaffolding only)")
             }
             ServCommands::Diagrams {
                 port,
@@ -1674,6 +1704,54 @@ mod tests {
                 assert!(background);
             }
             _ => panic!("expected Serv Diagrams command"),
+        }
+    }
+
+    // ── serv convo command ────────────────────────────────────────────────
+
+    #[test]
+    fn cli_serv_convo_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "atem", "serv", "convo",
+            "--channel", "demo",
+            "--rtc-user-id", "42",
+            "--agent-user-id", "1001",
+            "--config", "/tmp/x.toml",
+            "--port", "9443",
+            "--no-browser",
+            "--background",
+        ]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Convo {
+                    channel, rtc_user_id, agent_user_id, config, port, no_browser, background, ..
+                }
+            }) => {
+                assert_eq!(channel.as_deref(), Some("demo"));
+                assert_eq!(rtc_user_id.as_deref(), Some("42"));
+                assert_eq!(agent_user_id.as_deref(), Some("1001"));
+                assert_eq!(config.as_deref().and_then(|p| p.to_str()), Some("/tmp/x.toml"));
+                assert_eq!(port, 9443);
+                assert!(no_browser);
+                assert!(background);
+            }
+            _ => panic!("Expected ServCommands::Convo"),
+        }
+    }
+
+    #[test]
+    fn cli_serv_convo_parses_with_no_flags() {
+        // All flags optional (resolved from TOML / defaults later).
+        let cli = Cli::try_parse_from(["atem", "serv", "convo"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Convo { channel, port, background, .. }
+            }) => {
+                assert!(channel.is_none());
+                assert_eq!(port, 0);
+                assert!(!background);
+            }
+            _ => panic!("Expected ServCommands::Convo"),
         }
     }
 
