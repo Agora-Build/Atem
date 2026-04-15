@@ -161,6 +161,14 @@ async fn handle_connection(
             );
             send_response(&mut stream, 200, "text/html; charset=utf-8", html.as_bytes()).await?;
         }
+        ("GET", "/vendor/agora-rtm-sdk.js") => {
+            const RTM: &str = include_str!("../assets/agora-rtm-sdk.js");
+            send_response(&mut stream, 200, "application/javascript; charset=utf-8", RTM.as_bytes()).await?;
+        }
+        ("GET", "/vendor/conversational-ai-api.js") => {
+            const TOOLKIT: &str = include_str!("../assets/convo/conversational-ai-api.js");
+            send_response(&mut stream, 200, "application/javascript; charset=utf-8", TOOLKIT.as_bytes()).await?;
+        }
         ("POST", "/api/token") => {
             use crate::web_server::{request::extract_body, token_endpoint::handle_token_api};
             let body = extract_body(&request);
