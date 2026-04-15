@@ -473,6 +473,17 @@ impl ProjectCache {
         cache.save_full()
     }
 
+    /// Look up the cached project name for a given app_id.
+    /// Returns None if no matching project is cached (e.g. app_id came
+    /// from CLI flag or env var, not from the cache).
+    pub fn name_for_app_id(app_id: &str) -> Option<String> {
+        Self::load_full()
+            .projects
+            .into_iter()
+            .find(|p| p.app_id == app_id)
+            .map(|p| p.name)
+    }
+
     /// Resolve app_id: CLI flag > env var > active project > error
     pub fn resolve_app_id(cli_app_id: Option<&str>) -> Result<String> {
         if let Some(id) = cli_app_id {

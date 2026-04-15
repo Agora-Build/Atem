@@ -113,6 +113,8 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         .map(|h| format!("https://{}:{}/", h.trim(), bound_port))
         .collect();
 
+    let project_name = crate::config::ProjectCache::name_for_app_id(&app_id);
+
     println!("Convo AI Engine running:");
     println!("  Local:   {}", local_url);
     println!("  Network: {}", network_url);
@@ -125,6 +127,9 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         &app_id[..4.min(app_id.len())],
         if app_id.len() > 8 { &app_id[app_id.len() - 4..] } else { "" }
     );
+    if let Some(ref name) = project_name {
+        println!("  Project: {}", name);
+    }
     println!("  Channel: {}", resolved.channel);
     println!("  Config:  {}", toml_path.display());
     println!("  RTC UID: {}", resolved.rtc_user_id);
@@ -499,6 +504,13 @@ fn build_html_page(app_id: &str, resolved: &ResolvedConfig) -> String {
     } else {
         app_id.to_string()
     };
+    // "App ID" or "App ID (Project Name)" — project name comes from the
+    // project cache when the active app_id matches a known project. The
+    // parenthetical is omitted when app_id came from --app-id / env var.
+    let app_id_label = match crate::config::ProjectCache::name_for_app_id(app_id) {
+        Some(name) => format!("App ID ({})", crate::web_server::html::escape(&name)),
+        None => "App ID".to_string(),
+    };
 
     let channel   = resolved.channel.as_str();
     let rtc_uid   = resolved.rtc_user_id.as_str();
@@ -587,7 +599,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 <section class="block">
   <h2 class="block-title">General</h2>
   <div class="controls">
-    <label>App ID</label>
+    <label>{app_id_label}</label>
     <span class="app-id-value">{app_id_display}</span>
     <button class="copy-btn" onclick="copyText('{app_id}')">Copy</button>
   </div>
@@ -1079,9 +1091,14 @@ document.getElementById('agentUidDisplay').textContent = AGENT_UID;
 document.getElementById('presetDisplay').textContent   = PRESET || "—";
 document.getElementById('avatarCheckbox').disabled = !AVATAR_OK;
 
-// On page load, query the server for any already-running agent so the UI
-// reflects reality if the user reloads mid-session.
+// On page load:
+//   1. Auto-fetch an Access Token so the user doesn't have to click Fetch
+//      before Join. (Same UX as `serv rtc`.)
+//   2. Query the server for any already-running agent so the UI reflects
+//      reality if the user reloads mid-session.
 window.addEventListener('load', async () => {{
+  try {{ await fetchToken(); }} catch (_) {{ /* ignored — user can click Fetch */ }}
+
   try {{
     const resp = await fetch('/api/convo/status');
     const st = await resp.json();
@@ -1099,6 +1116,7 @@ window.addEventListener('load', async () => {{
 </body>
 </html>"##,
         app_id_display = app_id_display,
+        app_id_label   = app_id_label,
         app_id         = app_id,
         channel        = channel,
         rtc_uid        = rtc_uid,

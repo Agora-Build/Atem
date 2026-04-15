@@ -6,6 +6,7 @@
 
 pub mod browser;
 pub mod cert;
+pub mod html;
 pub mod net;
 pub mod request;
 pub mod token_endpoint;

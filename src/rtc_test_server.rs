@@ -300,6 +300,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
     }
 
     // ── Foreground output ───────────────────────────────────────────────
+    let project_name = crate::config::ProjectCache::name_for_app_id(&app_id);
     println!("RTC Test Server running:");
     println!("  Local:   {}", local_url);
     println!("  Network: {}", network_url);
@@ -316,6 +317,9 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
             ""
         }
     );
+    if let Some(ref name) = project_name {
+        println!("  Project: {}", name);
+    }
     println!("  Channel: {}", config.channel);
     println!();
     println!("Press Ctrl+C to stop.");
@@ -460,6 +464,13 @@ fn build_html_page(
         format!("{}...{}", &app_id[..6], &app_id[app_id.len() - 4..])
     } else {
         app_id.to_string()
+    };
+    // "App ID" or "App ID (Project Name)" — project name comes from the
+    // project cache when the active app_id matches a known project. The
+    // parenthetical is omitted when app_id came from --app-id / env var.
+    let app_id_label = match crate::config::ProjectCache::name_for_app_id(app_id) {
+        Some(name) => format!("App ID ({})", crate::web_server::html::escape(&name)),
+        None => "App ID".to_string(),
     };
 
     // Fragments that are only rendered when --with-rtm is active.
@@ -700,7 +711,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 <section class="block">
   <h2 class="block-title">General</h2>
   <div class="controls">
-    <label>App ID</label>
+    <label>{app_id_label}</label>
     <span class="app-id-value">{app_id_display}</span>
     <button class="copy-btn" onclick="copyText('{app_id}')">Copy</button>
   </div>
@@ -1216,6 +1227,7 @@ if (!document.getElementById('fetchBtn').disabled) {{
 </body>
 </html>"##,
         app_id_display = app_id_display,
+        app_id_label = app_id_label,
         default_channel = default_channel,
         default_uid = default_uid,
         app_id = app_id,
