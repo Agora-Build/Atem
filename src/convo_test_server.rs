@@ -91,7 +91,11 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     // (via sslip.io) so browsers on either hostname trust it.
     let lan_ip = crate::web_server::net::get_lan_ip();
     let sslip  = crate::web_server::net::sslip_host(&lan_ip);
-    let (certs, key) = crate::web_server::cert::generate_self_signed_cert(&lan_ip)?;
+    let extra_hostnames = crate::config::AtemConfig::load()
+        .map(|c| c.extra_hostnames())
+        .unwrap_or_default();
+    let (certs, key) =
+        crate::web_server::cert::generate_self_signed_cert(&lan_ip, &extra_hostnames)?;
 
     let tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -104,10 +108,17 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
 
     let local_url   = format!("https://localhost:{}/", bound_port);
     let network_url = format!("https://{}:{}/", sslip, bound_port);
+    let custom_urls: Vec<String> = extra_hostnames
+        .iter()
+        .map(|h| format!("https://{}:{}/", h.trim(), bound_port))
+        .collect();
 
     println!("Convo AI Engine running:");
     println!("  Local:   {}", local_url);
     println!("  Network: {}", network_url);
+    for u in &custom_urls {
+        println!("  Custom:  {}", u);
+    }
     println!();
     println!(
         "  App ID:  {}...{}",

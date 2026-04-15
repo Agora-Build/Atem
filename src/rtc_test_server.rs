@@ -175,9 +175,14 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
 
     let lan_ip = get_lan_ip();
     let sslip = sslip_host(&lan_ip);
+    let extra_hostnames = crate::config::AtemConfig::load()
+        .map(|c| c.extra_hostnames())
+        .unwrap_or_default();
 
-    // Generate self-signed cert
-    let (certs, key) = crate::web_server::cert::generate_self_signed_cert(&lan_ip)?;
+    // Generate self-signed cert (covers loopback, LAN sslip, + any tunnel
+    // hostnames the user listed in config.toml's `extra_hostnames`).
+    let (certs, key) =
+        crate::web_server::cert::generate_self_signed_cert(&lan_ip, &extra_hostnames)?;
 
     let tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -192,6 +197,10 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
 
     let local_url = format!("https://localhost:{}/", port);
     let network_url = format!("https://{}:{}/", sslip, port);
+    let custom_urls: Vec<String> = extra_hostnames
+        .iter()
+        .map(|h| format!("https://{}:{}/", h.trim(), port))
+        .collect();
 
     // ── Background mode: re-exec as daemon ──────────────────────────────
     if config.background && !config._daemon {
@@ -253,6 +262,9 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
         println!("  PID:     {}", child.id());
         println!("  Local:   {}", local_url);
         println!("  Network: {}", network_url);
+        for u in &custom_urls {
+            println!("  Custom:  {}", u);
+        }
         println!("  Log:     {}", log_path.display());
         println!();
         println!("Use `atem serv list` to see running servers.");
@@ -291,6 +303,9 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
     println!("RTC Test Server running:");
     println!("  Local:   {}", local_url);
     println!("  Network: {}", network_url);
+    for u in &custom_urls {
+        println!("  Custom:  {}", u);
+    }
     println!();
     println!(
         "  App ID:  {}...{}",

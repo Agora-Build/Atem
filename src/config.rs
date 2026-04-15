@@ -14,6 +14,18 @@ pub struct AtemConfig {
     pub diagram_server_url: Option<String>,
     pub bff_url: Option<String>,
     pub sso_url: Option<String>,
+
+    /// Extra hostnames the machine is reachable on, beyond loopback + LAN IP.
+    /// Each entry is baked into the self-signed cert's SAN list so browsers
+    /// that hit any of these names get a valid TLS handshake, and the URL
+    /// is printed alongside Local/Network when a server starts.
+    ///
+    /// Typical examples:
+    ///   extra_hostnames = ["genie.netbird.cloud", "dev.mytailnet.ts.net"]
+    ///
+    /// Env var override: `ATEM_EXTRA_HOSTNAMES` (comma-separated).
+    #[serde(default)]
+    pub extra_hostnames: Option<Vec<String>>,
 }
 
 impl AtemConfig {
@@ -61,8 +73,23 @@ impl AtemConfig {
                 config.sso_url = Some(val);
             }
         }
+        if let Ok(val) = std::env::var("ATEM_EXTRA_HOSTNAMES") {
+            let hosts: Vec<String> = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !hosts.is_empty() {
+                config.extra_hostnames = Some(hosts);
+            }
+        }
 
         Ok(config)
+    }
+
+    /// Resolved extra hostnames — always a Vec (possibly empty).
+    pub fn extra_hostnames(&self) -> Vec<String> {
+        self.extra_hostnames.clone().unwrap_or_default()
     }
 
     /// Persist the config to disk.
