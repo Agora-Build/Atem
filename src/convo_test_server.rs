@@ -78,13 +78,13 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         if resolved.avatar_configured { "configured" } else { "not configured" }
     );
 
-    if cfg.background {
-        anyhow::bail!("background mode not implemented yet");
-    }
-
     // Get app_id + app_certificate from active project.
     let app_id   = crate::config::ProjectCache::resolve_app_id(None)?;
     let app_cert = crate::config::ProjectCache::resolve_app_certificate(None)?;
+
+    if cfg.background {
+        return run_background(&app_id, &app_cert, &resolved, &convo).await;
+    }
 
     // Bind and set up TLS. We use loopback-only cert (127.0.0.1) because
     // serv convo is developer-local by design.
@@ -130,6 +130,103 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
 
 fn default_config_path() -> PathBuf {
     crate::config::AtemConfig::config_dir().join("convo.toml")
+}
+
+/// Headless mode: no HTTPS server, no browser, no local RTC. atem just
+/// POSTs /join to the ConvoAI REST API, prints the agent id, and waits
+/// for SIGINT/SIGTERM to POST /leave. Useful when an external device
+/// (phone, ConvoAI-capable hardware) joins the channel on its own and
+/// atem's only role is to keep the agent alive on the other side.
+async fn run_background(
+    app_id:   &str,
+    app_cert: &str,
+    resolved: &ResolvedConfig,
+    convo:    &ConvoConfig,
+) -> Result<()> {
+    println!("  mode:      background (no HTTPS server)");
+
+    let name = gen_agent_name();
+    // Token expiry: at least 2h, or 2× idle_timeout — whichever is longer.
+    let expire = resolved
+        .idle_timeout_secs
+        .unwrap_or(3600)
+        .max(3600)
+        .saturating_mul(2);
+
+    let agent_token = crate::token::build_token_rtc_with_rtm(
+        app_id,
+        app_cert,
+        &resolved.channel,
+        crate::token::RtcAccount::parse(&resolved.agent_user_id),
+        crate::token::Role::Publisher,
+        expire,
+        expire,
+        Some(resolved.agent_user_id.as_str()),
+    )?;
+
+    let payload = convo.build_join_payload(crate::convo_config::JoinArgs {
+        name: &name,
+        channel: &resolved.channel,
+        token: &agent_token,
+        agent_rtc_uid: &resolved.agent_user_id,
+        remote_uids: &[resolved.rtc_user_id.clone()],
+        include_avatar: resolved.avatar_configured,
+    });
+
+    let url = format!(
+        "{}/api/conversational-ai-agent/v2/projects/{}/join",
+        convoai_base_url(),
+        app_id
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("agora token={}", agent_token))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("agora /join failed: {} {}", status, body);
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let agent_id = body["agent_id"].as_str().unwrap_or("").to_string();
+    println!("  agent_id:  {}", agent_id);
+    println!("  name:      {}", name);
+    println!("\nAgent running. Ctrl+C to stop.");
+
+    // Block until SIGINT/SIGTERM, then POST /leave.
+    tokio::signal::ctrl_c().await?;
+    println!("\nStopping agent...");
+
+    // Mint a fresh short-lived token for the /leave call.
+    let leave_token = crate::token::build_token_rtc_with_rtm(
+        app_id,
+        app_cert,
+        &resolved.channel,
+        crate::token::RtcAccount::parse(&resolved.agent_user_id),
+        crate::token::Role::Publisher,
+        3600,
+        3600,
+        Some(resolved.agent_user_id.as_str()),
+    )?;
+    let leave_url = format!(
+        "{}/api/conversational-ai-agent/v2/projects/{}/agents/{}/leave",
+        convoai_base_url(),
+        app_id,
+        agent_id
+    );
+    let _ = client
+        .post(&leave_url)
+        .header("Authorization", format!("agora token={}", leave_token))
+        .send()
+        .await;
+    println!("Stopped.");
+    Ok(())
 }
 
 async fn handle_connection(
