@@ -52,6 +52,9 @@ src/
 ├── agent_visualize.rs   # Diagram generation: prompt builder, fs snapshot/diff, upload
 ├── diagram_server.rs    # Diagram hosting: SQLite blob store + HTTP server
 ├── rtc_test_server.rs   # Browser-based RTC test page server
+├── convo_config.rs      # ConvoAI TOML parsing + Agora REST /join body builder
+├── convo_test_server.rs # atem serv convo — ConvoAI test server + --background mode
+├── web_server/          # Shared HTTPS scaffolding (cert, request, /api/token)
 ├── command.rs           # Task queue and stream buffer for voice commands
 ├── dispatch.rs          # Work item dispatcher for mark tasks
 └── tui/
@@ -272,3 +275,10 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
 - **Claude Code CLI**: Spawned as PTY subprocess for AI-powered code implementation
 - **Agora RTM SDK**: Native library for real-time messaging (voice coding)
 - **Agora REST API**: Project management, credential fetching
+- **Conversational AI (`atem serv convo`)**: Launches a local HTTPS test page that
+  drives Agora ConvoAI v2 (`/join`, `/leave`). Config loaded from
+  `~/.config/atem/convo.toml` (override via `--config`). Page uses the vendored
+  Conversational-AI-Demo toolkit at `assets/convo/` (refreshed by
+  `scripts/update-convoai-toolkit.sh`, stale bundles blocked at release time).
+  `--background` runs headless for scenarios where an external device joins the
+  channel on its own and atem's only job is to keep the agent alive.
