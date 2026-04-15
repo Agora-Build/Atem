@@ -255,6 +255,10 @@ async fn handle_connection(
             let html = build_html_page(app_id, resolved);
             send_response(&mut stream, 200, "text/html; charset=utf-8", html.as_bytes()).await?;
         }
+        ("GET", "/favicon.ico") => {
+            // No icon yet — return 204 so the browser stops logging 404s.
+            send_response(&mut stream, 204, "image/x-icon", b"").await?;
+        }
         ("GET", "/vendor/agora-rtm-sdk.js") => {
             const RTM: &str = include_str!("../assets/agora-rtm-sdk.js");
             send_response(&mut stream, 200, "application/javascript; charset=utf-8", RTM.as_bytes()).await?;
