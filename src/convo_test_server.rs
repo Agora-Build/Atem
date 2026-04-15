@@ -211,6 +211,8 @@ async fn run_background(
         agent_rtc_uid: &resolved.agent_user_id,
         remote_uids: &[resolved.rtc_user_id.clone()],
         include_avatar: resolved.avatar_configured,
+        // Background mode: no UI, use config-level preset as-is.
+        preset: None,
     });
 
     let url = format!(
@@ -324,6 +326,12 @@ async fn handle_connection(
             let req: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
             let include_avatar = req["avatar"].as_bool().unwrap_or(false);
+            // Optional preset selected by the browser dropdown. Empty
+            // string / missing key falls back to config-level preset.
+            let preset_override: Option<String> = req["preset"]
+                .as_str()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
 
             // Only one agent at a time per process.
             {
@@ -364,6 +372,7 @@ async fn handle_connection(
                 agent_rtc_uid: &resolved.agent_user_id,
                 remote_uids: &[resolved.rtc_user_id.clone()],
                 include_avatar,
+                preset: preset_override.as_deref(),
             });
 
             let url = format!(
@@ -517,6 +526,10 @@ fn build_html_page(app_id: &str, resolved: &ResolvedConfig) -> String {
     let agent_uid = resolved.agent_user_id.as_str();
     let preset    = resolved.preset.clone().unwrap_or_default();
     let avatar_ok = if resolved.avatar_configured { "true" } else { "false" };
+    // JSON-encode the preset list so it embeds safely as a JS array
+    // literal regardless of quotes / odd chars in preset names.
+    let presets_js = serde_json::to_string(&resolved.presets)
+        .unwrap_or_else(|_| "[]".to_string());
 
     format!(
         r##"<!DOCTYPE html>
@@ -538,7 +551,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .btn {{ padding: 6px 14px; border: 1px solid #30363d; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; transition: 0.15s; }}
 .btn-join {{ background: #238636; border-color: #238636; color: #fff; }}
 .btn-join:hover {{ background: #2ea043; }}
-.btn-leave {{ background: #da3633; border-color: #da3633; color: #fff; display: none; }}
+.btn-leave {{ background: #da3633; border-color: #da3633; color: #fff; }}
 .btn-leave:hover {{ background: #f85149; }}
 .btn-mute {{ background: #21262d; color: #e6edf3; }}
 .btn-mute:hover {{ background: #30363d; }}
@@ -622,7 +635,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <label>UID</label>
     <input id="uidInput" type="text" placeholder="auto" value="{rtc_uid}" style="width:100px">
     <button id="joinBtn"  class="btn btn-join"  onclick="doJoin()">Join</button>
-    <button id="leaveBtn" class="btn btn-leave" onclick="doLeave()">Leave</button>
+    <button id="leaveBtn" class="btn btn-leave" onclick="doLeave()" style="display:none">Leave</button>
     <button id="muteBtn"  class="btn btn-mute"  onclick="toggleMute()">Mute Mic</button>
   </div>
   <div class="video-grid">
@@ -645,15 +658,16 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <span id="agentUidDisplay" class="read-only-value">—</span>
   </div>
   <div class="controls">
-    <label>Preset</label>
-    <span id="presetDisplay" class="read-only-value">—</span>
+    <label>Presets</label>
+    <div id="presetCheckboxes"
+         style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px"></div>
   </div>
   <div class="controls avatar-row">
     <input type="checkbox" id="avatarCheckbox" title="No avatar configured in TOML">
     <label for="avatarCheckbox">Enable avatar</label>
   </div>
   <div class="controls">
-    <button id="startAgentBtn" class="btn btn-join" onclick="startAgent()" disabled>Start Agent</button>
+    <button id="startAgentBtn" class="btn btn-join" onclick="startAgent()">Start Agent</button>
     <button id="stopAgentBtn"  class="btn btn-leave" onclick="stopAgent()"  style="display:none">Stop Agent</button>
   </div>
   <div class="convo-sub-title">Live transcription</div>
@@ -669,6 +683,7 @@ const CHANNEL   = "{channel}";
 const RTC_UID   = "{rtc_uid}";
 const AGENT_UID = "{agent_uid}";
 const PRESET    = "{preset}";
+const PRESETS   = {presets_js};    // e.g. ["expertise_ai_poc", ...] or []
 const AVATAR_OK = {avatar_ok};
 
 function copyText(text) {{
@@ -866,7 +881,6 @@ async function doJoin() {{
     setRtcDot('connected', 'Connected');
     document.getElementById('joinBtn').style.display  = 'none';
     document.getElementById('leaveBtn').style.display = '';
-    document.getElementById('startAgentBtn').disabled = false;
   }} catch (err) {{
     logEvent('Join error: ' + err.message, 'error');
     setRtcDot('disconnected', 'Error');
@@ -903,7 +917,6 @@ async function doLeave() {{
     setAgentDot('idle', 'idle');
     document.getElementById('joinBtn').style.display  = '';
     document.getElementById('leaveBtn').style.display = 'none';
-    document.getElementById('startAgentBtn').disabled = true;
     logEvent('Left channel');
   }} catch (err) {{
     logEvent('Leave error: ' + err.message, 'error');
@@ -955,12 +968,17 @@ async function startAgent() {{
   if (agentRunning) {{ logEvent('Agent already running', 'warning'); return; }}
 
   const includeAvatar = document.getElementById('avatarCheckbox').checked;
+  // Checked presets, comma-joined (e.g. "expertise_ai_poc,_akool_test_expertise").
+  // Empty string → fall back to whatever preset/presets is set in convo.toml.
+  const presetName = selectedPresetString();
   setAgentDot('transitioning', 'starting...');
   try {{
+    const startBody = {{ avatar: includeAvatar }};
+    if (presetName) startBody.preset = presetName;
     const resp = await fetch('/api/convo/start', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ avatar: includeAvatar }}),
+      body: JSON.stringify(startBody),
     }});
     const data = await resp.json().catch(() => ({{}}));
     if (!resp.ok || data.error) {{
@@ -1088,8 +1106,54 @@ document.getElementById('slogan').textContent = SLOGANS[Math.floor(Math.random()
 document.getElementById('channelInput').value = CHANNEL;
 document.getElementById('uidInput').value     = RTC_UID;
 document.getElementById('agentUidDisplay').textContent = AGENT_UID;
-document.getElementById('presetDisplay').textContent   = PRESET || "—";
 document.getElementById('avatarCheckbox').disabled = !AVATAR_OK;
+
+// Populate the Presets checkboxes from the `presets` list in convo.toml.
+// All boxes are CHECKED by default. When Start Agent fires, the checked
+// values are joined with commas into a single `preset` string (Agora's
+// /join expects `properties.preset` = "id1,id2,…"). Empty list renders
+// a placeholder — config-level `preset` (singular) still applies
+// server-side in that case.
+(function populatePresets() {{
+  const box = document.getElementById('presetCheckboxes');
+  box.innerHTML = '';
+  if (!Array.isArray(PRESETS) || PRESETS.length === 0) {{
+    const span = document.createElement('span');
+    span.style.color = '#7d8590';
+    span.textContent = PRESET ? PRESET + '  (single, config-level)' : '—';
+    box.appendChild(span);
+    return;
+  }}
+  for (const p of PRESETS) {{
+    const id = 'preset_cb_' + p.replace(/[^a-zA-Z0-9_]/g, '_');
+    const wrap = document.createElement('label');
+    wrap.style.display       = 'inline-flex';
+    wrap.style.alignItems    = 'center';
+    wrap.style.gap           = '6px';
+    wrap.style.cursor        = 'pointer';
+    wrap.style.color         = '#c9d1d9';
+    wrap.style.fontFamily    = 'monospace';
+    const cb = document.createElement('input');
+    cb.type    = 'checkbox';
+    cb.value   = p;
+    cb.checked = true;                    // all checked by default
+    cb.className = 'preset-checkbox';
+    cb.id      = id;
+    const txt = document.createElement('span');
+    txt.textContent = p;
+    wrap.appendChild(cb);
+    wrap.appendChild(txt);
+    box.appendChild(wrap);
+  }}
+}})();
+
+// Helper: comma-joined list of currently-checked preset names (may be empty).
+function selectedPresetString() {{
+  return Array.from(document.querySelectorAll('.preset-checkbox'))
+    .filter(cb => cb.checked)
+    .map(cb => cb.value)
+    .join(',');
+}}
 
 // On page load:
 //   1. Auto-fetch an Access Token so the user doesn't have to click Fetch
@@ -1122,6 +1186,7 @@ window.addEventListener('load', async () => {{
         rtc_uid        = rtc_uid,
         agent_uid      = agent_uid,
         preset         = preset,
+        presets_js     = presets_js,
         avatar_ok      = avatar_ok,
     )
 }
@@ -1168,12 +1233,32 @@ mod tests {
             idle_timeout_secs: Some(120),
             avatar_configured: true,
             preset:            None,
+            presets:           vec![],
         };
         let html = build_html_page("app-xx", &resolved);
         assert!(html.contains("/vendor/conversational-ai-api.js"));
         assert!(html.contains("id=\"agentUidDisplay\""));
         assert!(html.contains("id=\"avatarCheckbox\""));
         assert!(html.contains("Welcome to Agora"));
+        assert!(html.contains("id=\"presetCheckboxes\""));
+    }
+
+    #[test]
+    fn html_embeds_preset_list_as_js_array() {
+        let resolved = ResolvedConfig {
+            channel:           "c".into(),
+            rtc_user_id:       "1".into(),
+            agent_user_id:     "2".into(),
+            idle_timeout_secs: None,
+            avatar_configured: false,
+            preset:            None,
+            presets:           vec!["expertise_ai_poc".into(), "_akool_test_expertise".into()],
+        };
+        let html = build_html_page("app", &resolved);
+        // JSON-encoded array literal must appear in the page.
+        assert!(html.contains(r#"["expertise_ai_poc","_akool_test_expertise"]"#),
+            "preset list not embedded — got: {}",
+            html.lines().find(|l| l.contains("PRESETS")).unwrap_or(""));
     }
 
     #[test]

@@ -651,7 +651,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .btn {{ padding: 6px 14px; border: 1px solid #30363d; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; transition: 0.15s; }}
 .btn-join {{ background: #238636; border-color: #238636; color: #fff; }}
 .btn-join:hover {{ background: #2ea043; }}
-.btn-leave {{ background: #da3633; border-color: #da3633; color: #fff; display: none; }}
+.btn-leave {{ background: #da3633; border-color: #da3633; color: #fff; }}
 .btn-leave:hover {{ background: #f85149; }}
 .btn-mute {{ background: #21262d; color: #e6edf3; }}
 .btn-mute:hover {{ background: #30363d; }}
@@ -734,7 +734,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <label>UID</label>
     <input id="uidInput" type="text" placeholder="auto" value="{default_uid}" style="width:100px" oninput="updateFetchState()">
     <button id="joinBtn" class="btn btn-join" onclick="doJoin()">Join</button>
-    <button id="leaveBtn" class="btn btn-leave" onclick="doLeave()">Leave</button>
+    <button id="leaveBtn" class="btn btn-leave" onclick="doLeave()" style="display:none">Leave</button>
     <button id="muteAudioBtn" class="btn btn-mute" onclick="toggleMuteAudio()">Mute Mic</button>
     <button id="muteVideoBtn" class="btn btn-mute" onclick="toggleMuteVideo()">Mute Cam</button>
     <button id="statsBtn" class="btn btn-stats" onclick="toggleStats()">Stats</button>

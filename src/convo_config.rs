@@ -16,8 +16,28 @@ pub struct ConvoConfig {
     pub rtc_user_id: Option<String>,
     pub agent_user_id: Option<String>,
     pub idle_timeout_secs: Option<u32>,
+    /// Single preset name — backward compat. Ignored if `presets` is non-empty.
     pub preset: Option<String>,
+    /// Named preset bundles the page can switch between via dropdown.
+    /// The selected name is forwarded verbatim as `properties.preset`
+    /// in the Agora ConvoAI `/join` body, so entries here must be valid
+    /// preset identifiers on the Agora side.
+    pub presets: Option<Vec<String>>,
     pub agent: Option<AgentConfig>,
+}
+
+impl ConvoConfig {
+    /// The effective list of selectable preset names: prefer `presets`
+    /// when set + non-empty, otherwise fall back to the single `preset`
+    /// field (as a one-element list), otherwise empty.
+    pub fn preset_list(&self) -> Vec<String> {
+        if let Some(list) = &self.presets {
+            if !list.is_empty() {
+                return list.clone();
+            }
+        }
+        self.preset.clone().map(|p| vec![p]).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -75,6 +95,10 @@ pub struct JoinArgs<'a> {
     pub agent_rtc_uid:  &'a str,
     pub remote_uids:    &'a [String],
     pub include_avatar: bool,
+    /// Runtime override for `properties.preset`. When `Some`, replaces
+    /// the config-level `preset` / `presets[0]`. Usually comes from the
+    /// browser dropdown selection via /api/convo/start's body.
+    pub preset:         Option<&'a str>,
 }
 
 impl ConvoConfig {
@@ -94,8 +118,14 @@ impl ConvoConfig {
         if let Some(t) = self.idle_timeout_secs {
             props.insert("idle_timeout".into(), json!(t));
         }
-        if let Some(p) = &self.preset {
-            props.insert("preset".into(), json!(p));
+        // Runtime override (browser dropdown) > self.preset > first entry of presets.
+        let effective_preset: Option<&str> = args.preset
+            .or(self.preset.as_deref())
+            .or_else(|| self.presets.as_ref().and_then(|v| v.first().map(|s| s.as_str())));
+        if let Some(p) = effective_preset {
+            if !p.is_empty() {
+                props.insert("preset".into(), json!(p));
+            }
         }
         if let Some(agent) = &self.agent {
             if let Some(llm) = &agent.llm {
@@ -188,7 +218,13 @@ pub struct ResolvedConfig {
     pub agent_user_id:     String,
     pub idle_timeout_secs: Option<u32>,
     pub avatar_configured: bool,
+    /// Legacy single-preset field (kept for page display fallback when
+    /// the full `presets` list is empty).
     pub preset:            Option<String>,
+    /// Selectable preset names for the page dropdown. Derived from
+    /// `presets` in TOML, falling back to `preset` as a one-element
+    /// list. Empty means no dropdown rendered.
+    pub presets:           Vec<String>,
 }
 
 impl ConvoConfig {
@@ -223,6 +259,7 @@ impl ConvoConfig {
             idle_timeout_secs: self.idle_timeout_secs,
             avatar_configured,
             preset: self.preset.clone(),
+            presets: self.preset_list(),
         })
     }
 }
@@ -293,6 +330,7 @@ mod tests {
             agent_rtc_uid: "1001",
             remote_uids:   &["42".to_string()],
             include_avatar: true,
+            preset:        None,
         });
 
         // Top-level
@@ -339,8 +377,63 @@ mod tests {
             agent_rtc_uid: "1",
             remote_uids: &["2".to_string()],
             include_avatar: false,
+            preset: None,
         });
         assert!(body["properties"].get("avatar").is_none());
+    }
+
+    #[test]
+    fn preset_list_from_presets_array() {
+        let toml_str = r#"
+            channel = "c"
+            agent_user_id = "a"
+            presets = ["first", "second"]
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.preset_list(), vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn preset_list_falls_back_to_single_preset() {
+        let toml_str = r#"
+            channel = "c"
+            agent_user_id = "a"
+            preset = "only_one"
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.preset_list(), vec!["only_one".to_string()]);
+    }
+
+    #[test]
+    fn preset_list_empty_when_neither_set() {
+        let cfg: ConvoConfig = toml::from_str("").unwrap();
+        assert!(cfg.preset_list().is_empty());
+    }
+
+    #[test]
+    fn join_payload_runtime_preset_overrides_config() {
+        let toml_str = r#"preset = "from_config""#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            preset: Some("from_runtime"),
+        });
+        assert_eq!(body["properties"]["preset"], "from_runtime");
+    }
+
+    #[test]
+    fn join_payload_uses_first_preset_from_list_when_no_runtime() {
+        let toml_str = r#"presets = ["first", "second"]"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            preset: None,
+        });
+        assert_eq!(body["properties"]["preset"], "first");
     }
 
     #[test]
