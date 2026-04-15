@@ -539,16 +539,362 @@ function logEvent(msg, cls) {{
   d.textContent = hh + ':' + mm + ':' + ss + '.' + ms + '  ' + msg;
   if (cls) d.className = cls;
   el.appendChild(d);
+  // Cap at ~200 entries — oldest first.
+  while (el.childElementCount > 200) el.removeChild(el.firstChild);
   el.scrollTop = el.scrollHeight;
 }}
 
-// Placeholder handlers — Task 14 wires these to RTC / ConvoAI toolkit.
-async function fetchToken()  {{ logEvent('fetchToken: not implemented yet',  'warning'); }}
-async function doJoin()      {{ logEvent('doJoin: not implemented yet',      'warning'); }}
-async function doLeave()     {{ logEvent('doLeave: not implemented yet',     'warning'); }}
-async function toggleMute()  {{ logEvent('toggleMute: not implemented yet',  'warning'); }}
-async function startAgent()  {{ logEvent('startAgent: not implemented yet',  'warning'); }}
-async function stopAgent()   {{ logEvent('stopAgent: not implemented yet',   'warning'); }}
+// ── Session state ────────────────────────────────────────────────
+let rtcClient  = null;   // AgoraRTC client
+let localAudio = null;
+let localVideo = null;
+let audioMuted = false;
+let rtm        = null;   // AgoraRTM.RTM instance
+let convoApi   = null;   // ConversationalAIAPI singleton
+let rtcJoined  = false;
+let agentRunning = false;
+
+// Mirror the server-side RtcAccount::parse rules exactly:
+//   - all digits (within u32) → int uid
+//   - `s/` prefix             → string account (prefix stripped)
+//   - anything else           → string account
+// Never silently coerces "423dd" to 423 like parseInt does.
+function classifyUid(raw) {{
+  if (!raw) return {{ kind: 'int', num: 0, account: '',  tokenArg: '0',   joinArg: null,  label: 'int (auto)' }};
+  if (raw.startsWith('s/')) {{
+    const stripped = raw.slice(2);
+    return {{ kind: 'str', num: 0, account: stripped, tokenArg: raw, joinArg: stripped, label: 'string account' }};
+  }}
+  if (/^\d+$/.test(raw)) {{
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0 && n <= 4294967295) {{
+      return {{ kind: 'int', num: n, account: '', tokenArg: String(n), joinArg: n, label: 'int' }};
+    }}
+  }}
+  return {{ kind: 'str', num: 0, account: raw, tokenArg: raw, joinArg: raw, label: 'string account' }};
+}}
+
+// Return the string form of the local uid used for RTM login. The RTM user
+// must match the `rtm_user_id` baked into the token, so we pass this value
+// to the /api/token endpoint AND to `new AgoraRTM.RTM(appId, uid)`.
+function rtmUserIdForLocal() {{
+  const k = classifyUid(document.getElementById('uidInput').value.trim() || RTC_UID);
+  return k.kind === 'int' ? String(k.num) : k.account;
+}}
+
+function setRtcDot(cls, label) {{
+  const dot = document.getElementById('rtcDot');
+  dot.className = 'status-dot ' + cls;
+  document.getElementById('rtcState').textContent = label;
+}}
+function setAgentDot(cls, label) {{
+  const dot = document.getElementById('agentDot');
+  dot.className = 'status-dot ' + cls;
+  document.getElementById('agentState').textContent = label;
+}}
+
+// Toolkit state string → dot class.
+function mapState(s) {{
+  if (!s || s === 'idle') return 'idle';
+  // listening / thinking / speaking / silent → active (connected)
+  return 'connected';
+}}
+
+async function fetchToken() {{
+  const channel  = document.getElementById('channelInput').value.trim() || CHANNEL;
+  const uidInput = document.getElementById('uidInput').value.trim();
+  const uidKind  = classifyUid(uidInput);
+
+  // We MUST send our own rtm_user_id so the minted token's RTM pin matches
+  // the (uid) we'll use to log into RTM from this browser. The server's
+  // default_rtm_user is the agent's uid — if we omitted this field, the
+  // token would be pinned to the agent, and our RTM login would fail.
+  const body = {{
+    channel: channel,
+    uid: uidKind.tokenArg,
+    rtm_user_id: rtmUserIdForLocal(),
+  }};
+
+  try {{
+    const resp = await fetch('/api/token', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    document.getElementById('tokenInput').value = data.token;
+    logEvent('Token fetched (RTC + RTM, rtm_user_id=' + (data.rtm_user_id || '?') + ')', 'success');
+  }} catch (err) {{
+    logEvent('Fetch token error: ' + err.message, 'error');
+  }}
+}}
+
+async function doJoin() {{
+  if (rtcJoined) {{ logEvent('Already joined', 'warning'); return; }}
+
+  if (!document.getElementById('tokenInput').value.trim()) {{
+    await fetchToken();
+  }}
+  const token = document.getElementById('tokenInput').value.trim();
+  if (!token) {{ logEvent('No token — aborting join', 'error'); return; }}
+
+  const channel  = document.getElementById('channelInput').value.trim() || CHANNEL;
+  const uidInput = document.getElementById('uidInput').value.trim();
+  const uidKind  = classifyUid(uidInput);
+  const joinUid  = uidKind.joinArg;
+
+  setRtcDot('connecting', 'Connecting...');
+  logEvent('Joining channel ' + channel + ' uid=' + (joinUid === null ? 'auto' : joinUid)
+      + ' (' + uidKind.label + ')');
+
+  try {{
+    // Toolkit requirement: enable audio-PTS metadata BEFORE creating the client.
+    // Old SDKs may not have this parameter — log a warning and keep going.
+    try {{
+      if (typeof AgoraRTC.setParameter === 'function') {{
+        AgoraRTC.setParameter('ENABLE_AUDIO_PTS_METADATA', true);
+      }} else {{
+        logEvent('AgoraRTC.setParameter not available — ENABLE_AUDIO_PTS_METADATA skipped', 'warning');
+      }}
+    }} catch (e) {{
+      logEvent('setParameter ENABLE_AUDIO_PTS_METADATA failed: ' + e.message, 'warning');
+    }}
+
+    rtcClient = AgoraRTC.createClient({{ mode: 'rtc', codec: 'vp8' }});
+
+    rtcClient.on('user-published', async (user, mediaType) => {{
+      await rtcClient.subscribe(user, mediaType);
+      logEvent('Subscribed to ' + user.uid + ' (' + mediaType + ')', 'success');
+      if (mediaType === 'audio') {{
+        user.audioTrack && user.audioTrack.play();
+      }}
+      if (mediaType === 'video') {{
+        const cell = document.getElementById('agentCell');
+        cell.style.display = '';
+        user.videoTrack && user.videoTrack.play('agentVideo');
+      }}
+    }});
+    rtcClient.on('user-unpublished', (user, mediaType) => {{
+      logEvent('User ' + user.uid + ' unpublished ' + mediaType);
+      if (mediaType === 'video') {{
+        document.getElementById('agentCell').style.display = 'none';
+      }}
+    }});
+    rtcClient.on('connection-state-change', (cur, prev) => {{
+      logEvent('RTC: ' + prev + ' -> ' + cur);
+      if (cur === 'CONNECTED') setRtcDot('connected', 'Connected');
+      else if (cur === 'RECONNECTING') setRtcDot('connecting', 'Reconnecting...');
+      else if (cur === 'DISCONNECTED') setRtcDot('disconnected', 'Disconnected');
+    }});
+
+    const joinedUid = await rtcClient.join(APP_ID, channel, token, joinUid);
+    logEvent('Joined as uid ' + joinedUid, 'success');
+
+    // Local mic — best effort. Voice agent doesn't need local video.
+    try {{
+      localAudio = await AgoraRTC.createMicrophoneAudioTrack();
+      await rtcClient.publish([localAudio]);
+      logEvent('Published local audio', 'success');
+    }} catch (e) {{
+      logEvent('No microphone — joined as listener: ' + e.message, 'warning');
+    }}
+
+    // RTM v2 login, using OUR stringified uid so it matches the token's RTM pin.
+    try {{
+      if (!window.AgoraRTM) throw new Error('RTM SDK not loaded');
+      const rtmUser = rtmUserIdForLocal();
+      rtm = new AgoraRTM.RTM(APP_ID, rtmUser);
+      rtm.addEventListener('status', (evt) => {{
+        logEvent('RTM status: ' + evt.state + (evt.reason ? ' (' + evt.reason + ')' : ''));
+      }});
+      await rtm.login({{ token }});
+      logEvent('RTM logged in as ' + rtmUser, 'success');
+    }} catch (e) {{
+      logEvent('RTM login failed: ' + e.message, 'error');
+    }}
+
+    rtcJoined = true;
+    setRtcDot('connected', 'Connected');
+    document.getElementById('joinBtn').style.display  = 'none';
+    document.getElementById('leaveBtn').style.display = '';
+    document.getElementById('startAgentBtn').disabled = false;
+  }} catch (err) {{
+    logEvent('Join error: ' + err.message, 'error');
+    setRtcDot('disconnected', 'Error');
+  }}
+}}
+
+async function doLeave() {{
+  try {{
+    if (agentRunning) {{
+      try {{ await stopAgent(); }} catch (_) {{}}
+    }}
+    if (convoApi) {{
+      try {{ convoApi.destroy(); }} catch (_) {{}}
+      convoApi = null;
+    }}
+    if (rtm) {{
+      try {{ await rtm.logout(); }} catch (_) {{}}
+      rtm = null;
+    }}
+    if (localAudio) {{ localAudio.close(); localAudio = null; }}
+    if (localVideo) {{ localVideo.close(); localVideo = null; }}
+    if (rtcClient) {{
+      try {{ await rtcClient.leave(); }} catch (_) {{}}
+      rtcClient = null;
+    }}
+    rtcJoined = false;
+    audioMuted = false;
+    const muteBtn = document.getElementById('muteBtn');
+    muteBtn.classList.remove('active');
+    muteBtn.textContent = 'Mute Mic';
+    document.getElementById('agentCell').style.display = 'none';
+
+    setRtcDot('disconnected', 'Disconnected');
+    setAgentDot('idle', 'idle');
+    document.getElementById('joinBtn').style.display  = '';
+    document.getElementById('leaveBtn').style.display = 'none';
+    document.getElementById('startAgentBtn').disabled = true;
+    logEvent('Left channel');
+  }} catch (err) {{
+    logEvent('Leave error: ' + err.message, 'error');
+  }}
+}}
+
+async function toggleMute() {{
+  if (!rtcClient) return;
+  const btn = document.getElementById('muteBtn');
+  if (!localAudio) {{
+    try {{
+      localAudio = await AgoraRTC.createMicrophoneAudioTrack();
+      await rtcClient.publish([localAudio]);
+      audioMuted = false;
+      btn.classList.remove('active');
+      btn.textContent = 'Mute Mic';
+      logEvent('Microphone enabled', 'success');
+    }} catch (e) {{
+      logEvent('Cannot access microphone: ' + e.message, 'error');
+    }}
+    return;
+  }}
+  audioMuted = !audioMuted;
+  await localAudio.setEnabled(!audioMuted);
+  btn.classList.toggle('active', audioMuted);
+  btn.textContent = audioMuted ? 'Unmute Mic' : 'Mute Mic';
+}}
+
+function renderTranscript(list) {{
+  if (!Array.isArray(list)) return;
+  const el = document.getElementById('transcript');
+  const agentUidStr = String(AGENT_UID);
+  const rows = list.map((item) => {{
+    const who = String(item.userId ?? item.uid ?? '') === agentUidStr ? 'agent' : 'user';
+    const label = who === 'agent' ? 'agent' : 'user';
+    const text = (item.text ?? '') + '';
+    const div = document.createElement('div');
+    div.className = who;
+    div.textContent = label + ': ' + text;
+    return div;
+  }});
+  el.innerHTML = '';
+  rows.forEach((r) => el.appendChild(r));
+  el.scrollTop = el.scrollHeight;
+}}
+
+async function startAgent() {{
+  if (!rtcJoined) {{ logEvent('Join RTC before starting the agent', 'warning'); return; }}
+  if (agentRunning) {{ logEvent('Agent already running', 'warning'); return; }}
+
+  const includeAvatar = document.getElementById('avatarCheckbox').checked;
+  setAgentDot('transitioning', 'starting...');
+  try {{
+    const resp = await fetch('/api/convo/start', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ avatar: includeAvatar }}),
+    }});
+    const data = await resp.json().catch(() => ({{}}));
+    if (!resp.ok || data.error) {{
+      logEvent('Start failed: ' + (data.error || ('HTTP ' + resp.status)), 'error');
+      setAgentDot('idle', 'idle');
+      return;
+    }}
+    logEvent('Agent started: ' + (data.agent_id || '?') + ' (' + (data.name || '?') + ')', 'success');
+
+    // Initialize the ConvoAI toolkit. It wires RTC + RTM events to provide
+    // word-by-word transcription and agent state signals.
+    if (!window.ConversationalAIAPI) {{
+      logEvent('ConversationalAIAPI not loaded — skipping toolkit init', 'warning');
+    }} else {{
+      try {{
+        convoApi = ConversationalAIAPI.init({{
+          rtcEngine:  rtcClient,
+          rtmEngine:  rtm,
+          renderMode: 'word',
+          enableLog:  false,
+        }});
+
+        convoApi.on('transcript-updated', (list) => {{
+          renderTranscript(list);
+        }});
+        convoApi.on('agent-state-changed', (ev) => {{
+          const state = (ev && (ev.state || ev.newState)) || 'unknown';
+          setAgentDot(mapState(state), state);
+          logEvent('agent-state-changed: ' + state);
+        }});
+        convoApi.on('agent-metrics', (m) => {{
+          logEvent('agent-metrics: ' + JSON.stringify(m));
+        }});
+        convoApi.on('agent-interrupted', (ev) => {{
+          logEvent('agent-interrupted: ' + JSON.stringify(ev || {{}}), 'warning');
+        }});
+        convoApi.on('agent-error', (err) => {{
+          logEvent('agent-error: ' + JSON.stringify(err || {{}}), 'error');
+        }});
+
+        // Subscribe to the toolkit messaging for this channel. The toolkit
+        // internally pairs channel + agent uid via the RTM presence data.
+        const channel = document.getElementById('channelInput').value.trim() || CHANNEL;
+        await convoApi.subscribeMessage(channel);
+        logEvent('Toolkit subscribed to channel ' + channel, 'success');
+      }} catch (e) {{
+        logEvent('Toolkit init failed: ' + e.message, 'error');
+      }}
+    }}
+
+    agentRunning = true;
+    setAgentDot('connected', 'connected');
+    document.getElementById('startAgentBtn').style.display = 'none';
+    document.getElementById('stopAgentBtn').style.display  = '';
+    document.getElementById('stopAgentBtn').disabled       = false;
+  }} catch (err) {{
+    logEvent('Start error: ' + err.message, 'error');
+    setAgentDot('idle', 'idle');
+  }}
+}}
+
+async function stopAgent() {{
+  setAgentDot('transitioning', 'stopping...');
+  try {{
+    const resp = await fetch('/api/convo/stop', {{ method: 'POST' }});
+    const data = await resp.json().catch(() => ({{}}));
+    if (data.error) logEvent('Stop error: ' + data.error, 'error');
+    else logEvent('Agent stopped', 'success');
+  }} catch (err) {{
+    logEvent('Stop request failed: ' + err.message, 'error');
+  }}
+  if (convoApi) {{
+    try {{ convoApi.destroy(); }} catch (_) {{}}
+    convoApi = null;
+  }}
+  agentRunning = false;
+  setAgentDot('idle', 'idle');
+  document.getElementById('agentCell').style.display = 'none';
+  document.getElementById('startAgentBtn').style.display = '';
+  document.getElementById('startAgentBtn').disabled     = !rtcJoined;
+  document.getElementById('stopAgentBtn').style.display  = 'none';
+}}
 
 // ── Slogan: random per page load, fixed for the session ─────────
 const SLOGANS = [
@@ -588,6 +934,23 @@ document.getElementById('uidInput').value     = RTC_UID;
 document.getElementById('agentUidDisplay').textContent = AGENT_UID;
 document.getElementById('presetDisplay').textContent   = PRESET || "—";
 document.getElementById('avatarCheckbox').disabled = !AVATAR_OK;
+
+// On page load, query the server for any already-running agent so the UI
+// reflects reality if the user reloads mid-session.
+window.addEventListener('load', async () => {{
+  try {{
+    const resp = await fetch('/api/convo/status');
+    const st = await resp.json();
+    if (st && st.running) {{
+      setAgentDot('connected', 'connected (existing)');
+      agentRunning = true;
+      document.getElementById('startAgentBtn').style.display = 'none';
+      document.getElementById('stopAgentBtn').style.display  = '';
+      document.getElementById('stopAgentBtn').disabled       = false;
+      logEvent('Existing agent detected: ' + (st.agent_id || '?') + ' (' + (st.name || '?') + ')', 'info');
+    }}
+  }} catch (_) {{ /* ignore */ }}
+}});
 </script>
 </body>
 </html>"##,
