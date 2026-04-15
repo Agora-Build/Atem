@@ -68,29 +68,29 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         agent_user_id: cfg.agent_user_id.clone(),
     })?;
 
-    println!("atem serv convo");
-    println!("  config:    {}", toml_path.display());
-    println!("  channel:   {}", resolved.channel);
-    println!("  rtc uid:   {}", resolved.rtc_user_id);
-    println!("  agent uid: {}", resolved.agent_user_id);
-    println!(
-        "  avatar:    {}",
-        if resolved.avatar_configured { "configured" } else { "not configured" }
-    );
-
     // Get app_id + app_certificate from active project.
     let app_id   = crate::config::ProjectCache::resolve_app_id(None)?;
     let app_cert = crate::config::ProjectCache::resolve_app_certificate(None)?;
 
     if cfg.background {
+        println!("atem serv convo");
+        println!("  config:    {}", toml_path.display());
+        println!("  channel:   {}", resolved.channel);
+        println!("  rtc uid:   {}", resolved.rtc_user_id);
+        println!("  agent uid: {}", resolved.agent_user_id);
+        println!(
+            "  avatar:    {}",
+            if resolved.avatar_configured { "configured" } else { "not configured" }
+        );
         return run_background(&app_id, &app_cert, &resolved, &convo).await;
     }
 
-    // Bind and set up TLS. We use loopback-only cert (127.0.0.1) because
-    // serv convo is developer-local by design.
-    let listener = TcpListener::bind(("127.0.0.1", cfg.port)).await?;
-    let bound_port = listener.local_addr()?.port();
-    let lan_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+    // Bind and set up TLS. Bind on 0.0.0.0 so the page is reachable from
+    // phones/other devices on the LAN — same pattern as `serv rtc`. The
+    // self-signed cert covers both loopback and the detected LAN IP
+    // (via sslip.io) so browsers on either hostname trust it.
+    let lan_ip = crate::web_server::net::get_lan_ip();
+    let sslip  = crate::web_server::net::sslip_host(&lan_ip);
     let (certs, key) = crate::web_server::cert::generate_self_signed_cert(&lan_ip)?;
 
     let tls_config = rustls::ServerConfig::builder()
@@ -98,10 +98,34 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         .with_single_cert(certs, key)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-    let url = format!("https://127.0.0.1:{}/", bound_port);
-    println!("\nServing on {}", url);
+    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    let listener = TcpListener::bind(bind_addr).await?;
+    let bound_port = listener.local_addr()?.port();
+
+    let local_url   = format!("https://localhost:{}/", bound_port);
+    let network_url = format!("https://{}:{}/", sslip, bound_port);
+
+    println!("Convo AI Engine running:");
+    println!("  Local:   {}", local_url);
+    println!("  Network: {}", network_url);
+    println!();
+    println!(
+        "  App ID:  {}...{}",
+        &app_id[..4.min(app_id.len())],
+        if app_id.len() > 8 { &app_id[app_id.len() - 4..] } else { "" }
+    );
+    println!("  Channel: {}", resolved.channel);
+    println!("  Config:  {}", toml_path.display());
+    println!("  RTC UID: {}", resolved.rtc_user_id);
+    println!("  Agent:   {} (avatar {})",
+             resolved.agent_user_id,
+             if resolved.avatar_configured { "configured" } else { "off" });
+    println!();
+    println!("Press Ctrl+C to stop.");
+    println!();
+
     if !cfg.no_browser {
-        let _ = crate::rtc_test_server::open_browser(&url);
+        let _ = crate::web_server::browser::open_browser(&local_url);
     }
 
     let state: Arc<Mutex<AgentState>> = Arc::new(Mutex::new(AgentState::default()));

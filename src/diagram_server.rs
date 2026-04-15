@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::rtc_test_server::{ServerEntry, get_lan_ip, servers_dir};
+use crate::rtc_test_server::{ServerEntry, servers_dir};
+use crate::web_server::net::get_lan_ip;
 
 /// Default port for the diagram server.
 pub const DEFAULT_PORT: u16 = 8787;

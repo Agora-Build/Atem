@@ -1,5 +1,8 @@
 use anyhow::Result;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+
+use crate::web_server::browser::open_browser;
+use crate::web_server::net::{get_lan_ip, sslip_host};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -163,26 +166,6 @@ pub fn cmd_kill_all_servers() -> Result<()> {
     kill_all_servers()?;
     println!("Killed {} server(s).", count);
     Ok(())
-}
-
-/// Detect the LAN IP address by connecting a UDP socket to an external address.
-/// This doesn't actually send any data — it just causes the OS to pick the
-/// outbound interface, from which we read back the local address.
-pub fn get_lan_ip() -> IpAddr {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok();
-    let ip = socket
-        .and_then(|s| {
-            s.connect("8.8.8.8:80").ok()?;
-            s.local_addr().ok()
-        })
-        .map(|a| a.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    ip
-}
-
-/// Format an IP address for sslip.io: dots become dashes.
-fn sslip_host(ip: &IpAddr) -> String {
-    format!("{}.sslip.io", ip.to_string().replace('.', "-"))
 }
 
 /// Run the HTTPS server for RTC testing.
@@ -447,25 +430,6 @@ async fn handle_connection(
         }
     }
 
-    Ok(())
-}
-
-/// Open a URL in the default browser.
-pub(crate) fn open_browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(url).spawn()?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open").arg(url).spawn()?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", url])
-            .spawn()?;
-    }
     Ok(())
 }
 
@@ -1250,19 +1214,6 @@ if (!document.getElementById('fetchBtn').disabled) {{
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn get_lan_ip_returns_non_unspecified() {
-        let ip = get_lan_ip();
-        // Should be a real IP or localhost, never 0.0.0.0
-        assert!(!ip.is_unspecified());
-    }
-
-    #[test]
-    fn sslip_host_formats_correctly() {
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42));
-        assert_eq!(sslip_host(&ip), "192-168-1-42.sslip.io");
-    }
 
     #[test]
     fn html_page_contains_app_id_and_channel() {

@@ -178,7 +178,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
 
     println!("Opening browser for Agora Console login...");
     println!("  {}", auth_url);
-    let _ = crate::rtc_test_server::open_browser(&auth_url);
+    let _ = crate::web_server::browser::open_browser(&auth_url);
 
     // Channel: loopback callback OR stdin paste both send (code, state, login_id) here
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(String, String, String)>>(2);
