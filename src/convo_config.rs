@@ -217,14 +217,27 @@ pub struct ResolvedConfig {
     pub rtc_user_id:       String,
     pub agent_user_id:     String,
     pub idle_timeout_secs: Option<u32>,
+    /// True iff `[agent.avatar]` is present in convo.toml.
     pub avatar_configured: bool,
+    /// Non-secret summary of the `[agent.avatar]` block for display on
+    /// the page (vendor + avatar_id). `None` when no avatar block is
+    /// configured. Never includes `params` — those may carry secrets.
+    pub avatar_summary:    Option<AvatarSummary>,
     /// Legacy single-preset field (kept for page display fallback when
     /// the full `presets` list is empty).
     pub preset:            Option<String>,
-    /// Selectable preset names for the page dropdown. Derived from
+    /// Selectable preset names for the page checkboxes. Derived from
     /// `presets` in TOML, falling back to `preset` as a one-element
-    /// list. Empty means no dropdown rendered.
+    /// list. Empty means no checkboxes rendered.
     pub presets:           Vec<String>,
+}
+
+/// Public display fields from `[agent.avatar]`. Excludes `params`,
+/// which can contain API keys or session tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvatarSummary {
+    pub vendor:    Option<String>,
+    pub avatar_id: Option<String>,
 }
 
 impl ConvoConfig {
@@ -249,15 +262,19 @@ impl ConvoConfig {
             .ok_or_else(|| anyhow::anyhow!(
                 "agent_user_id required (pass --agent-user-id or set 'agent_user_id' in convo.toml)"
             ))?;
-        let avatar_configured = self.agent.as_ref()
-            .and_then(|a| a.avatar.as_ref())
-            .is_some();
+        let avatar_block = self.agent.as_ref().and_then(|a| a.avatar.as_ref());
+        let avatar_configured = avatar_block.is_some();
+        let avatar_summary = avatar_block.map(|av| AvatarSummary {
+            vendor:    av.vendor.clone(),
+            avatar_id: av.avatar_id.clone(),
+        });
         Ok(ResolvedConfig {
             channel,
             rtc_user_id,
             agent_user_id,
             idle_timeout_secs: self.idle_timeout_secs,
             avatar_configured,
+            avatar_summary,
             preset: self.preset.clone(),
             presets: self.preset_list(),
         })

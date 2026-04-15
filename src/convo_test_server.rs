@@ -52,6 +52,46 @@ pub struct AgentState {
     pub started_at: Option<u64>,
 }
 
+/// One entry in the ConvoAI REST history log. Captures exactly what
+/// atem sent to / received from `api.agora.io` for this process's
+/// lifetime. Bounded capacity (oldest evicted) so it can't grow unbounded.
+#[derive(Clone, serde::Serialize)]
+pub struct HistoryEntry {
+    /// Unix epoch milliseconds. Milliseconds give enough precision to
+    /// tell request and response apart when they're close together.
+    pub ts_ms:    u64,
+    /// `"request"` or `"response"`.
+    pub kind:     String,
+    /// HTTP method (request entries only).
+    pub method:   Option<String>,
+    pub url:      String,
+    /// HTTP status (response entries only).
+    pub status:   Option<u16>,
+    /// Raw body. JSON-shaped where applicable, otherwise the text.
+    pub body:     String,
+}
+
+const HISTORY_CAPACITY: usize = 200;
+
+/// Append to the history log, evicting oldest entries past CAPACITY.
+async fn history_push(
+    log: &Arc<Mutex<std::collections::VecDeque<HistoryEntry>>>,
+    entry: HistoryEntry,
+) {
+    let mut g = log.lock().await;
+    if g.len() >= HISTORY_CAPACITY {
+        g.pop_front();
+    }
+    g.push_back(entry);
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     let toml_path = cfg.config_path.clone().unwrap_or_else(default_config_path);
     let convo = if toml_path.exists() {
@@ -145,6 +185,8 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     }
 
     let state: Arc<Mutex<AgentState>> = Arc::new(Mutex::new(AgentState::default()));
+    let history: Arc<Mutex<std::collections::VecDeque<HistoryEntry>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let app_id    = Arc::new(app_id);
     let app_cert  = Arc::new(app_cert);
     let resolved  = Arc::new(resolved);
@@ -158,12 +200,13 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         let resolved  = resolved.clone();
         let convo_cfg = convo_cfg.clone();
         let state     = state.clone();
+        let history   = history.clone();
         tokio::spawn(async move {
             let tls = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let _ = handle_connection(tls, &app_id, &app_cert, &resolved, &convo_cfg, state).await;
+            let _ = handle_connection(tls, &app_id, &app_cert, &resolved, &convo_cfg, state, history).await;
         });
     }
 }
@@ -278,6 +321,7 @@ async fn handle_connection(
     resolved:   &Arc<ResolvedConfig>,
     convo_cfg:  &Arc<ConvoConfig>,
     state:      Arc<Mutex<AgentState>>,
+    history:    Arc<Mutex<std::collections::VecDeque<HistoryEntry>>>,
 ) -> Result<()> {
     use crate::web_server::request::{read_full_http_request, send_response};
     let buf = match read_full_http_request(&mut stream).await {
@@ -379,6 +423,12 @@ async fn handle_connection(
                 "{}/api/conversational-ai-agent/v2/projects/{}/join",
                 convoai_base_url(), app_id
             );
+            history_push(&history, HistoryEntry {
+                ts_ms: unix_ms(), kind: "request".into(),
+                method: Some("POST".into()), url: url.clone(), status: None,
+                body: serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| payload.to_string()),
+            }).await;
             let client = reqwest::Client::new();
             let resp = client
                 .post(&url)
@@ -390,8 +440,15 @@ async fn handle_connection(
 
             match resp {
                 Ok(r) if r.status().is_success() => {
+                    let status_u16 = r.status().as_u16();
+                    let raw = r.text().await.unwrap_or_default();
+                    history_push(&history, HistoryEntry {
+                        ts_ms: unix_ms(), kind: "response".into(),
+                        method: None, url: url.clone(), status: Some(status_u16),
+                        body: raw.clone(),
+                    }).await;
                     let body_json: serde_json::Value =
-                        r.json().await.unwrap_or_else(|_| serde_json::json!({}));
+                        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
                     let agent_id = body_json["agent_id"].as_str().unwrap_or("").to_string();
                     let started = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -416,6 +473,11 @@ async fn handle_connection(
                 Ok(r) => {
                     let status = r.status().as_u16();
                     let body = r.text().await.unwrap_or_default();
+                    history_push(&history, HistoryEntry {
+                        ts_ms: unix_ms(), kind: "response".into(),
+                        method: None, url: url.clone(), status: Some(status),
+                        body: body.clone(),
+                    }).await;
                     let err = serde_json::json!({
                         "error": format!("agora /join failed: {} {}", status, body),
                     });
@@ -462,12 +524,26 @@ async fn handle_connection(
                 "{}/api/conversational-ai-agent/v2/projects/{}/agents/{}/leave",
                 convoai_base_url(), app_id, agent_id
             );
+            history_push(&history, HistoryEntry {
+                ts_ms: unix_ms(), kind: "request".into(),
+                method: Some("POST".into()), url: url.clone(), status: None,
+                body: "".into(),
+            }).await;
             let client = reqwest::Client::new();
-            let _ = client
+            let resp = client
                 .post(&url)
                 .header("Authorization", format!("agora token={}", token))
                 .send()
                 .await;
+            if let Ok(r) = resp {
+                let status_u16 = r.status().as_u16();
+                let raw = r.text().await.unwrap_or_default();
+                history_push(&history, HistoryEntry {
+                    ts_ms: unix_ms(), kind: "response".into(),
+                    method: None, url: url.clone(), status: Some(status_u16),
+                    body: raw,
+                }).await;
+            }
 
             {
                 let mut st = state.lock().await;
@@ -487,6 +563,18 @@ async fn handle_connection(
                 "started_at":        st.started_at,
                 "avatar_configured": resolved.avatar_configured,
             });
+            crate::web_server::request::send_response(
+                &mut stream, 200, "application/json", body.to_string().as_bytes()
+            ).await?;
+        }
+
+        ("GET", "/api/convo/history") => {
+            // Process-lifetime log of every request/response atem has made
+            // against Agora's ConvoAI REST endpoints. Bounded at
+            // HISTORY_CAPACITY entries (oldest evicted). Consumed by the
+            // "Show History" button on the page.
+            let entries: Vec<HistoryEntry> = history.lock().await.iter().cloned().collect();
+            let body = serde_json::json!({ "entries": entries, "capacity": HISTORY_CAPACITY });
             crate::web_server::request::send_response(
                 &mut stream, 200, "application/json", body.to_string().as_bytes()
             ).await?;
@@ -530,6 +618,15 @@ fn build_html_page(app_id: &str, resolved: &ResolvedConfig) -> String {
     // literal regardless of quotes / odd chars in preset names.
     let presets_js = serde_json::to_string(&resolved.presets)
         .unwrap_or_else(|_| "[]".to_string());
+    // JSON-encode the avatar summary as a JS object (or null). Only
+    // non-secret fields from [agent.avatar] — never `params`.
+    let avatar_info_js = match &resolved.avatar_summary {
+        Some(s) => serde_json::to_string(&serde_json::json!({
+            "vendor":    s.vendor,
+            "avatar_id": s.avatar_id,
+        })).unwrap_or_else(|_| "null".to_string()),
+        None => "null".to_string(),
+    };
 
     format!(
         r##"<!DOCTYPE html>
@@ -556,6 +653,11 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .btn-mute {{ background: #21262d; color: #e6edf3; }}
 .btn-mute:hover {{ background: #30363d; }}
 .btn-mute.active {{ background: #da3633; border-color: #da3633; }}
+.btn-stats {{ background: #1f6feb; border-color: #1f6feb; color: #fff; }}
+.btn-stats:hover {{ background: #388bfd; }}
+.btn-stats.active {{ background: #0969da; }}
+.stats-panel, .history-panel {{ display: none; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 14px; margin: 8px 16px; font-size: 11px; font-family: monospace; color: #c9d1d9; line-height: 1.5; max-height: 260px; overflow-y: auto; white-space: pre-wrap; }}
+.stats-panel.visible, .history-panel.visible {{ display: block; }}
 .token-row {{ background: #161b22; border-bottom: 1px solid #30363d; padding: 8px 20px; display: flex; align-items: center; gap: 10px; }}
 .token-row label {{ font-size: 12px; color: #7d8590; white-space: nowrap; }}
 .token-row textarea {{ background: #0d1117; border: 1px solid #30363d; color: #e6edf3; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-family: monospace; flex: 1; resize: vertical; min-height: 32px; max-height: 120px; line-height: 1.4; }}
@@ -634,10 +736,13 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
   <div class="controls">
     <label>UID</label>
     <input id="uidInput" type="text" placeholder="auto" value="{rtc_uid}" style="width:100px">
-    <button id="joinBtn"  class="btn btn-join"  onclick="doJoin()">Join</button>
-    <button id="leaveBtn" class="btn btn-leave" onclick="doLeave()" style="display:none">Leave</button>
-    <button id="muteBtn"  class="btn btn-mute"  onclick="toggleMute()">Mute Mic</button>
+    <button id="joinBtn"    class="btn btn-join"  onclick="doJoin()">Join</button>
+    <button id="leaveBtn"   class="btn btn-leave" onclick="doLeave()" style="display:none">Leave</button>
+    <button id="muteBtn"    class="btn btn-mute"  onclick="toggleMute()">Mute Mic</button>
+    <button id="cameraBtn"  class="btn btn-mute"  onclick="toggleCamera()">Camera Off</button>
+    <button id="statsBtn"   class="btn btn-stats" onclick="toggleStats()">Stats</button>
   </div>
+  <div id="statsPanel" class="stats-panel"></div>
   <div class="video-grid">
     <div class="video-cell" id="localCell">
       <div id="localVideo"></div>
@@ -663,13 +768,20 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
          style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px"></div>
   </div>
   <div class="controls avatar-row">
-    <input type="checkbox" id="avatarCheckbox" title="No avatar configured in TOML">
-    <label for="avatarCheckbox">Enable avatar</label>
+    <label for="avatarCheckbox">Enable Avatar</label>
+    <input type="checkbox" id="avatarCheckbox">
+  </div>
+  <div class="controls" id="avatarInfo"
+       style="flex-direction:column;align-items:flex-start;gap:4px;padding-left:16px;color:#7d8590;font-family:monospace;font-size:12px">
+    <!-- Filled by JS from AVATAR_INFO. Shows non-secret fields from
+         [agent.avatar], or a note when the block is absent. -->
   </div>
   <div class="controls">
     <button id="startAgentBtn" class="btn btn-join" onclick="startAgent()">Start Agent</button>
     <button id="stopAgentBtn"  class="btn btn-leave" onclick="stopAgent()"  style="display:none">Stop Agent</button>
+    <button id="historyBtn"    class="btn btn-stats" onclick="toggleHistory()">API History</button>
   </div>
+  <div id="historyPanel" class="history-panel"></div>
   <div class="convo-sub-title">Live transcription</div>
   <div id="transcript"></div>
   <div class="convo-sub-title">Events</div>
@@ -678,13 +790,14 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 
 <script>
 // Constants populated from the server's ResolvedConfig.
-const APP_ID    = "{app_id}";
-const CHANNEL   = "{channel}";
-const RTC_UID   = "{rtc_uid}";
-const AGENT_UID = "{agent_uid}";
-const PRESET    = "{preset}";
-const PRESETS   = {presets_js};    // e.g. ["expertise_ai_poc", ...] or []
-const AVATAR_OK = {avatar_ok};
+const APP_ID      = "{app_id}";
+const CHANNEL     = "{channel}";
+const RTC_UID     = "{rtc_uid}";
+const AGENT_UID   = "{agent_uid}";
+const PRESET      = "{preset}";
+const PRESETS     = {presets_js};    // e.g. ["expertise_ai_poc", ...] or []
+const AVATAR_OK   = {avatar_ok};     // [agent.avatar] block present in TOML
+const AVATAR_INFO = {avatar_info_js};  // {{vendor, avatar_id}} or null
 
 function copyText(text) {{
   if (!text) return;
@@ -911,6 +1024,13 @@ async function doLeave() {{
     const muteBtn = document.getElementById('muteBtn');
     muteBtn.classList.remove('active');
     muteBtn.textContent = 'Mute Mic';
+    const camBtn = document.getElementById('cameraBtn');
+    if (camBtn) {{
+      camBtn.classList.remove('active');
+      camBtn.textContent = 'Camera Off';
+    }}
+    const localDiv = document.getElementById('localVideo');
+    if (localDiv) localDiv.innerHTML = '';
     document.getElementById('agentCell').style.display = 'none';
 
     setRtcDot('disconnected', 'Disconnected');
@@ -943,6 +1063,133 @@ async function toggleMute() {{
   await localAudio.setEnabled(!audioMuted);
   btn.classList.toggle('active', audioMuted);
   btn.textContent = audioMuted ? 'Unmute Mic' : 'Mute Mic';
+}}
+
+// Local camera toggle. OFF by default — avatar agents publish remote
+// video on their side; the user only needs a local camera if they
+// want to show themselves (optional). Click to start; click again
+// to stop and close the track.
+async function toggleCamera() {{
+  if (!rtcClient) {{
+    logEvent('Join RTC first, then toggle Camera.', 'warning');
+    return;
+  }}
+  const btn = document.getElementById('cameraBtn');
+  if (!localVideo) {{
+    try {{
+      localVideo = await AgoraRTC.createCameraVideoTrack();
+      await rtcClient.publish([localVideo]);
+      localVideo.play('localVideo');
+      btn.classList.add('active');
+      btn.textContent = 'Camera On';
+      logEvent('Local camera enabled', 'success');
+    }} catch (e) {{
+      logEvent('Cannot access camera: ' + e.message, 'error');
+      localVideo = null;
+    }}
+    return;
+  }}
+  try {{
+    await rtcClient.unpublish([localVideo]);
+    localVideo.close();
+    localVideo = null;
+    const cell = document.getElementById('localVideo');
+    if (cell) cell.innerHTML = '';
+    btn.classList.remove('active');
+    btn.textContent = 'Camera Off';
+    logEvent('Local camera disabled');
+  }} catch (e) {{
+    logEvent('Camera toggle error: ' + e.message, 'error');
+  }}
+}}
+
+// ── Stats panel (RTC side) ──────────────────────────────────────
+// Mirrors `serv rtc`'s Stats button: every 1s, pulls rtcClient's
+// RTC stats and renders them. Click again to stop + collapse.
+let statsInterval = null;
+function toggleStats() {{
+  const panel = document.getElementById('statsPanel');
+  const btn   = document.getElementById('statsBtn');
+  const visible = panel.classList.toggle('visible');
+  btn.classList.toggle('active', visible);
+  if (visible) {{
+    updateStats();
+    statsInterval = setInterval(updateStats, 1000);
+  }} else {{
+    clearInterval(statsInterval);
+    statsInterval = null;
+  }}
+}}
+async function updateStats() {{
+  const panel = document.getElementById('statsPanel');
+  if (!rtcClient) {{ panel.textContent = 'Not joined — click Join first.'; return; }}
+  try {{
+    const r = rtcClient.getRTCStats();
+    const la = localAudio ? rtcClient.getLocalAudioStats() : null;
+    const lv = localVideo ? rtcClient.getLocalVideoStats() : null;
+    let text = '';
+    text += 'Duration:      ' + (r.Duration || 0) + ' s\n';
+    text += 'Users in room: ' + (r.UserCount || 0) + '\n';
+    text += 'Send bitrate:  ' + (((r.SendBitrate || 0) / 1000).toFixed(0)) + ' kbps\n';
+    text += 'Recv bitrate:  ' + (((r.RecvBitrate || 0) / 1000).toFixed(0)) + ' kbps\n';
+    text += 'RTT:           ' + (r.RTT || 0) + ' ms\n';
+    text += 'Packet loss:   tx=' + (r.OutgoingAvailableBandwidth || 0) + ' rx=' + (r.RecvType || '') + '\n';
+    if (la) {{
+      text += '\n[local audio]\n';
+      text += 'codec=' + (la.codecType || '?') + '  sendBitrate=' + ((la.sendBitrate || 0) / 1000).toFixed(0) + ' kbps\n';
+      text += 'sendVolumeLevel=' + (la.sendVolumeLevel || 0) + '\n';
+    }}
+    if (lv) {{
+      text += '\n[local video]\n';
+      text += (lv.sendResolutionWidth || '?') + 'x' + (lv.sendResolutionHeight || '?')
+           + ' @ ' + (lv.sendFrameRate || 0) + 'fps, '
+           + ((lv.sendBitrate || 0) / 1000).toFixed(0) + ' kbps\n';
+    }}
+    panel.textContent = text;
+  }} catch (e) {{
+    panel.textContent = 'Stats error: ' + e.message;
+  }}
+}}
+
+// ── API history panel (ConvoAI REST calls) ──────────────────────
+// Fetches /api/convo/history (process-lifetime ring buffer) and
+// renders each entry. Click again to collapse.
+async function toggleHistory() {{
+  const panel = document.getElementById('historyPanel');
+  const btn   = document.getElementById('historyBtn');
+  const visible = panel.classList.toggle('visible');
+  btn.classList.toggle('active', visible);
+  if (visible) await refreshHistory();
+}}
+async function refreshHistory() {{
+  const panel = document.getElementById('historyPanel');
+  try {{
+    const r = await fetch('/api/convo/history');
+    const data = await r.json();
+    const entries = data.entries || [];
+    if (entries.length === 0) {{
+      panel.textContent = '(no ConvoAI API calls yet — click Start Agent to see /join + /leave request/response bodies)';
+      return;
+    }}
+    const fmt = (e) => {{
+      const ts = new Date(e.ts_ms).toISOString().slice(11, 23);
+      const head = e.kind === 'request'
+        ? '→ ' + (e.method || 'POST') + ' ' + e.url
+        : '← ' + (e.status || '') + ' ' + e.url;
+      let body = e.body || '';
+      // Pretty-print JSON bodies that came back as raw strings.
+      try {{
+        if (body && (body.trim().startsWith('{{') || body.trim().startsWith('['))) {{
+          body = JSON.stringify(JSON.parse(body), null, 2);
+        }}
+      }} catch (_) {{}}
+      return '[' + ts + '] ' + head + (body ? '\n' + body : '');
+    }};
+    panel.textContent = entries.map(fmt).join('\n\n');
+    panel.scrollTop = panel.scrollHeight;
+  }} catch (e) {{
+    panel.textContent = 'Could not fetch history: ' + e.message;
+  }}
 }}
 
 function renderTranscript(list) {{
@@ -1106,7 +1353,41 @@ document.getElementById('slogan').textContent = SLOGANS[Math.floor(Math.random()
 document.getElementById('channelInput').value = CHANNEL;
 document.getElementById('uidInput').value     = RTC_UID;
 document.getElementById('agentUidDisplay').textContent = AGENT_UID;
-document.getElementById('avatarCheckbox').disabled = !AVATAR_OK;
+
+// Avatar checkbox is ALWAYS clickable. An avatar can come from either
+// an explicit [agent.avatar] TOML block OR from a selected preset
+// (atem can't know which presets imply avatar). If the user checks the
+// box without a TOML block we log an informational warning at click
+// time but still let Start Agent run.
+(function renderAvatarInfo() {{
+  const info = document.getElementById('avatarInfo');
+  info.innerHTML = '';
+  if (AVATAR_INFO && (AVATAR_INFO.vendor || AVATAR_INFO.avatar_id)) {{
+    if (AVATAR_INFO.vendor) {{
+      const d = document.createElement('div');
+      d.textContent = 'vendor:    ' + AVATAR_INFO.vendor;
+      info.appendChild(d);
+    }}
+    if (AVATAR_INFO.avatar_id) {{
+      const d = document.createElement('div');
+      d.textContent = 'avatar_id: ' + AVATAR_INFO.avatar_id;
+      info.appendChild(d);
+    }}
+  }} else {{
+    const d = document.createElement('div');
+    d.textContent = '(no [agent.avatar] in convo.toml — only enable if your preset includes avatar)';
+    info.appendChild(d);
+  }}
+}})();
+
+// Warn when user ticks the box with no TOML config — some presets do
+// provide avatar, but most don't. Don't block: user knows their preset.
+document.getElementById('avatarCheckbox').addEventListener('change', (ev) => {{
+  if (ev.target.checked && !AVATAR_OK) {{
+    logEvent('Enable Avatar is checked but no [agent.avatar] block in convo.toml — '
+      + 'only expect an avatar if a selected preset includes one.', 'warning');
+  }}
+}});
 
 // Populate the Presets checkboxes from the `presets` list in convo.toml.
 // All boxes are CHECKED by default. When Start Agent fires, the checked
@@ -1188,6 +1469,7 @@ window.addEventListener('load', async () => {{
         preset         = preset,
         presets_js     = presets_js,
         avatar_ok      = avatar_ok,
+        avatar_info_js = avatar_info_js,
     )
 }
 
@@ -1232,6 +1514,9 @@ mod tests {
             agent_user_id:     "9".into(),
             idle_timeout_secs: Some(120),
             avatar_configured: true,
+            avatar_summary:    Some(crate::convo_config::AvatarSummary {
+                vendor: Some("heygen".into()), avatar_id: Some("abc".into()),
+            }),
             preset:            None,
             presets:           vec![],
         };
@@ -1241,6 +1526,10 @@ mod tests {
         assert!(html.contains("id=\"avatarCheckbox\""));
         assert!(html.contains("Welcome to Agora"));
         assert!(html.contains("id=\"presetCheckboxes\""));
+        assert!(html.contains("id=\"avatarInfo\""));
+        // Avatar info block should render the non-secret fields
+        assert!(html.contains("heygen"));
+        assert!(html.contains("abc"));
     }
 
     #[test]
@@ -1251,6 +1540,7 @@ mod tests {
             agent_user_id:     "2".into(),
             idle_timeout_secs: None,
             avatar_configured: false,
+            avatar_summary:    None,
             preset:            None,
             presets:           vec!["expertise_ai_poc".into(), "_akool_test_expertise".into()],
         };
