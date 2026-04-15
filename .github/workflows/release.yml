@@ -18,8 +18,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  toolkit-freshness:
+    name: Verify ConvoAI toolkit is fresh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Refresh ConvoAI toolkit
+        run: |
+          ./scripts/update-convoai-toolkit.sh
+          if ! git diff --quiet -- assets/convo/; then
+            echo "::error::Vendored toolkit is stale. Run scripts/update-convoai-toolkit.sh locally and commit."
+            git --no-pager diff -- assets/convo/
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: toolkit-freshness
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
