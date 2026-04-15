@@ -24,6 +24,39 @@ pub struct ConvoConfig {
     /// preset identifiers on the Agora side.
     pub presets: Option<Vec<String>>,
     pub agent: Option<AgentConfig>,
+
+    // ── Pass-through top-level properties ────────────────────────────
+    //
+    // Agora ConvoAI's /join body accepts several top-level keys that atem
+    // has no opinion on (enable_string_uid, advanced_features, vad, sal,
+    // parameters). Rather than type each one, we pass them through
+    // verbatim so the user can set any Agora-supported field in
+    // `convo.toml` without waiting for an atem release. Notably:
+    //
+    //   [advanced_features]
+    //   enable_rtm = true      # required for word-by-word transcripts
+    //   enable_sal = true
+    //   [parameters]
+    //   data_channel = "rtm"
+    //   [parameters.transcript]
+    //   enable_words = true
+    //
+    // Without `enable_rtm=true` + `data_channel=rtm` + `transcript
+    // .enable_words=true` the agent runs but never streams transcripts.
+
+    /// `properties.advanced_features` — pass-through sub-table.
+    pub advanced_features: Option<BTreeMap<String, toml::Value>>,
+
+    /// `properties.vad` — pass-through sub-table.
+    pub vad: Option<BTreeMap<String, toml::Value>>,
+
+    /// `properties.sal` — pass-through sub-table.
+    pub sal: Option<BTreeMap<String, toml::Value>>,
+
+    /// `properties.parameters` — pass-through sub-table. Can carry
+    /// arbitrary nested tables like `[parameters.transcript]` and
+    /// `[parameters.turn_detector]`.
+    pub parameters: Option<BTreeMap<String, toml::Value>>,
 }
 
 impl ConvoConfig {
@@ -143,6 +176,22 @@ impl ConvoConfig {
                 }
             }
         }
+
+        // Pass-through top-level properties from convo.toml. Any sub-table
+        // (e.g. [parameters.transcript]) is preserved as nested JSON.
+        if let Some(m) = &self.advanced_features {
+            props.insert("advanced_features".into(), map_to_json(m));
+        }
+        if let Some(m) = &self.vad {
+            props.insert("vad".into(), map_to_json(m));
+        }
+        if let Some(m) = &self.sal {
+            props.insert("sal".into(), map_to_json(m));
+        }
+        if let Some(m) = &self.parameters {
+            props.insert("parameters".into(), map_to_json(m));
+        }
+
         json!({ "name": args.name, "properties": Value::Object(props) })
     }
 }
@@ -179,6 +228,16 @@ fn service_to_json(c: &ServiceConfig) -> Value {
 }
 
 fn toml_map_to_json(m: &BTreeMap<String, toml::Value>) -> Value {
+    let mut out = Map::new();
+    for (k, v) in m {
+        out.insert(k.clone(), toml_value_to_json(v));
+    }
+    Value::Object(out)
+}
+
+/// Convert a BTreeMap<String, toml::Value> (our sub-table shape for
+/// pass-through config blocks) into a JSON Object.
+fn map_to_json(m: &BTreeMap<String, toml::Value>) -> Value {
     let mut out = Map::new();
     for (k, v) in m {
         out.insert(k.clone(), toml_value_to_json(v));
@@ -438,6 +497,51 @@ mod tests {
             preset: Some("from_runtime"),
         });
         assert_eq!(body["properties"]["preset"], "from_runtime");
+    }
+
+    #[test]
+    fn join_payload_passes_through_top_level_tables() {
+        // Pass-through blocks at the top level of convo.toml land as
+        // nested JSON in properties.*, including deeply nested tables.
+        let toml_str = r#"
+[advanced_features]
+enable_rtm  = true
+enable_sal  = true
+enable_aivad = false
+
+[vad]
+silence_duration_ms = 800
+
+[sal]
+sal_mode = "locking"
+
+[parameters]
+audio_scenario = "default"
+data_channel   = "rtm"
+enable_dump    = true
+
+[parameters.transcript]
+enable_words = true
+
+[parameters.turn_detector]
+validate_asr_result_timestamp = false
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            preset: None,
+        });
+        let props = &body["properties"];
+        assert_eq!(props["advanced_features"]["enable_rtm"],  true);
+        assert_eq!(props["advanced_features"]["enable_sal"],  true);
+        assert_eq!(props["advanced_features"]["enable_aivad"], false);
+        assert_eq!(props["vad"]["silence_duration_ms"], 800);
+        assert_eq!(props["sal"]["sal_mode"], "locking");
+        assert_eq!(props["parameters"]["data_channel"], "rtm");
+        assert_eq!(props["parameters"]["transcript"]["enable_words"], true);
+        assert_eq!(props["parameters"]["turn_detector"]["validate_asr_result_timestamp"], false);
     }
 
     #[test]

@@ -940,7 +940,12 @@ async function doJoin() {{
     rtcClient = AgoraRTC.createClient({{ mode: 'rtc', codec: 'vp8' }});
 
     rtcClient.on('user-published', async (user, mediaType) => {{
-      await rtcClient.subscribe(user, mediaType);
+      try {{
+        await rtcClient.subscribe(user, mediaType);
+      }} catch (e) {{
+        logEvent('Subscribe failed for ' + user.uid + ' (' + mediaType + '): ' + e.message, 'error');
+        return;
+      }}
       logEvent('Subscribed to ' + user.uid + ' (' + mediaType + ')', 'success');
       if (mediaType === 'audio') {{
         user.audioTrack && user.audioTrack.play();
@@ -948,14 +953,19 @@ async function doJoin() {{
       if (mediaType === 'video') {{
         const cell = document.getElementById('agentCell');
         cell.style.display = '';
-        user.videoTrack && user.videoTrack.play('agentVideo');
+        if (user.videoTrack) user.videoTrack.play('agentVideo');
       }}
     }});
     rtcClient.on('user-unpublished', (user, mediaType) => {{
-      logEvent('User ' + user.uid + ' unpublished ' + mediaType);
       if (mediaType === 'video') {{
         document.getElementById('agentCell').style.display = 'none';
       }}
+    }});
+    rtcClient.on('user-joined', (user) => {{
+      logEvent('Remote uid=' + user.uid + ' joined');
+    }});
+    rtcClient.on('user-left', (user) => {{
+      logEvent('Remote uid=' + user.uid + ' left');
     }});
     rtcClient.on('connection-state-change', (cur, prev) => {{
       logEvent('RTC: ' + prev + ' -> ' + cur);
@@ -980,12 +990,29 @@ async function doJoin() {{
     try {{
       if (!window.AgoraRTM) throw new Error('RTM SDK not loaded');
       const rtmUser = rtmUserIdForLocal();
-      rtm = new AgoraRTM.RTM(APP_ID, rtmUser);
+      // useStringUserId:true matches the working Agora ConvoAI coding-assistant
+      // demo. Without it the SDK treats the uid as numeric and message/
+      // presence routing misbehaves when our uid doesn't parse as an int.
+      rtm = new AgoraRTM.RTM(APP_ID, rtmUser, {{ useStringUserId: true }});
       rtm.addEventListener('status', (evt) => {{
         logEvent('RTM status: ' + evt.state + (evt.reason ? ' (' + evt.reason + ')' : ''));
       }});
       await rtm.login({{ token }});
       logEvent('RTM logged in as ' + rtmUser, 'success');
+      // Subscribe to the RTM channel. The ConvoAI toolkit only LISTENS
+      // for MESSAGE events; it does NOT issue the subscribe itself.
+      // Match the upstream Conversational-AI-Demo's default call
+      // (withMessage + withPresence). Projects without Presence enabled
+      // log a non-fatal -13001 warning but the subscribe still succeeds.
+      try {{
+        await rtm.subscribe(channel, {{
+          withMessage:  true,
+          withPresence: true,
+        }});
+        logEvent('RTM subscribed to channel ' + channel, 'success');
+      }} catch (subErr) {{
+        logEvent('RTM subscribe failed: ' + subErr.message, 'error');
+      }}
     }} catch (e) {{
       logEvent('RTM login failed: ' + e.message, 'error');
     }}
@@ -1010,6 +1037,7 @@ async function doLeave() {{
       convoApi = null;
     }}
     if (rtm) {{
+      try {{ await rtm.unsubscribe(CHANNEL); }} catch (_) {{}}
       try {{ await rtm.logout(); }} catch (_) {{}}
       rtm = null;
     }}
@@ -1192,17 +1220,50 @@ async function refreshHistory() {{
   }}
 }}
 
+// Extract display text from a toolkit transcript item. Agora's item
+// shape varies by render mode and turn status — `text` is the
+// accumulated turn text in word/text mode, but in some flows the
+// useful field is on `metadata` (partial transcription) or in a
+// `words` array. Try the common locations in order.
+function extractItemText(item) {{
+  if (!item) return '';
+  if (typeof item.text === 'string' && item.text) return item.text;
+  const md = item.metadata;
+  if (md && typeof md === 'object') {{
+    if (typeof md.text === 'string' && md.text) return md.text;
+    if (typeof md.transcription === 'string' && md.transcription) return md.transcription;
+    if (Array.isArray(md.words)) {{
+      const joined = md.words.map(w => (w && (w.word ?? w.text ?? '')) || '').join('').trim();
+      if (joined) return joined;
+    }}
+  }}
+  if (Array.isArray(item.words)) {{
+    const joined = item.words.map(w => (w && (w.word ?? w.text ?? '')) || '').join('').trim();
+    if (joined) return joined;
+  }}
+  return '';
+}}
+
+// Status-to-suffix mapping — helps make in-progress vs final visually
+// distinct.  0 = IN_PROGRESS, 1 = END, 2 = INTERRUPTED
+function turnStatusSuffix(s) {{
+  if (s === 1) return '';         // finalised — plain text
+  if (s === 2) return ' ⟂';       // interrupted
+  return ' …';                    // in progress
+}}
+
 function renderTranscript(list) {{
   if (!Array.isArray(list)) return;
   const el = document.getElementById('transcript');
   const agentUidStr = String(AGENT_UID);
   const rows = list.map((item) => {{
-    const who = String(item.userId ?? item.uid ?? '') === agentUidStr ? 'agent' : 'user';
+    const who   = String(item.userId ?? item.uid ?? '') === agentUidStr ? 'agent' : 'user';
+    const text  = extractItemText(item);
     const label = who === 'agent' ? 'agent' : 'user';
-    const text = (item.text ?? '') + '';
-    const div = document.createElement('div');
+    const suffix = turnStatusSuffix(item.status);
+    const div   = document.createElement('div');
     div.className = who;
-    div.textContent = label + ': ' + text;
+    div.textContent = label + ': ' + text + suffix;
     return div;
   }});
   el.innerHTML = '';
@@ -1219,6 +1280,64 @@ async function startAgent() {{
   // Empty string → fall back to whatever preset/presets is set in convo.toml.
   const presetName = selectedPresetString();
   setAgentDot('transitioning', 'starting...');
+
+  // STEP 1: Initialize the ConvoAI toolkit and wire all listeners
+  // BEFORE firing /api/convo/start. The upstream demo does this same
+  // order — if we wire listeners after the agent is already speaking
+  // its greeting, we miss the first batch of transcripts.
+  const ToolkitClass =
+    (ConversationalAIAPI && ConversationalAIAPI.ConversationalAIAPI)
+    || ConversationalAIAPI;
+  if (ToolkitClass && typeof ToolkitClass.init === 'function') {{
+    try {{
+      if (!convoApi) {{
+        convoApi = ToolkitClass.init({{
+          rtcEngine:  rtcClient,
+          rtmEngine:  rtm,
+          renderMode: 'word',
+          enableRenderModeFallback: true,
+          enableLog:  true,
+        }});
+        convoApi.on('transcript-updated', (list) => {{
+          renderTranscript(list);
+        }});
+        convoApi.on('agent-state-changed', (ev) => {{
+          // The toolkit emits either a string ("idle"/"listening"/...)
+          // or an object (uid + state) depending on event source.
+          // Prefer the explicit state field over any uid that might
+          // sit at the object root, otherwise fall back to string form.
+          let state = 'unknown';
+          if (typeof ev === 'string') {{
+            state = ev;
+          }} else if (ev && typeof ev === 'object') {{
+            state = ev.state || ev.newState || ev.agent_state || state;
+          }}
+          setAgentDot(mapState(state), state);
+          logEvent('agent: ' + state);
+        }});
+        // Keep these event handlers lean — noisy toolkit internals go
+        // to the browser console via enableLog:true. Here we surface
+        // only the events the user cares about in the #events panel.
+        convoApi.on('agent-interrupted', (ev) => {{
+          logEvent('agent-interrupted', 'warning');
+        }});
+        convoApi.on('agent-error', (err) => {{
+          logEvent('agent-error: ' + (err?.message || JSON.stringify(err || {{}}).slice(0, 120)), 'error');
+        }});
+        const ch = document.getElementById('channelInput').value.trim() || CHANNEL;
+        await convoApi.subscribeMessage(ch);
+        logEvent('Toolkit listeners ready, subscribed to channel ' + ch, 'success');
+      }}
+    }} catch (e) {{
+      logEvent('Toolkit init failed: ' + e.message, 'error');
+    }}
+  }} else {{
+    logEvent('ConversationalAIAPI not loaded — transcripts disabled', 'warning');
+  }}
+
+  // STEP 2: Now that the toolkit is listening, fire /api/convo/start
+  // (which does the Agora /join). First transcripts from the agent's
+  // greeting will land in the already-attached listeners.
   try {{
     const startBody = {{ avatar: includeAvatar }};
     if (presetName) startBody.preset = presetName;
@@ -1234,55 +1353,6 @@ async function startAgent() {{
       return;
     }}
     logEvent('Agent started: ' + (data.agent_id || '?') + ' (' + (data.name || '?') + ')', 'success');
-
-    // Initialize the ConvoAI toolkit. It wires RTC + RTM events to provide
-    // word-by-word transcription and agent state signals.
-    //
-    // The esbuild IIFE bundle wraps the module exports under the
-    // `ConversationalAIAPI` global, so the class sits at
-    // `ConversationalAIAPI.ConversationalAIAPI`. Fall back to the global
-    // itself in case a future bundle config inlines the class.
-    const ToolkitClass =
-      (ConversationalAIAPI && ConversationalAIAPI.ConversationalAIAPI)
-      || ConversationalAIAPI;
-    if (!ToolkitClass || typeof ToolkitClass.init !== 'function') {{
-      logEvent('ConversationalAIAPI not loaded — skipping toolkit init', 'warning');
-    }} else {{
-      try {{
-        convoApi = ToolkitClass.init({{
-          rtcEngine:  rtcClient,
-          rtmEngine:  rtm,
-          renderMode: 'word',
-          enableLog:  false,
-        }});
-
-        convoApi.on('transcript-updated', (list) => {{
-          renderTranscript(list);
-        }});
-        convoApi.on('agent-state-changed', (ev) => {{
-          const state = (ev && (ev.state || ev.newState)) || 'unknown';
-          setAgentDot(mapState(state), state);
-          logEvent('agent-state-changed: ' + state);
-        }});
-        convoApi.on('agent-metrics', (m) => {{
-          logEvent('agent-metrics: ' + JSON.stringify(m));
-        }});
-        convoApi.on('agent-interrupted', (ev) => {{
-          logEvent('agent-interrupted: ' + JSON.stringify(ev || {{}}), 'warning');
-        }});
-        convoApi.on('agent-error', (err) => {{
-          logEvent('agent-error: ' + JSON.stringify(err || {{}}), 'error');
-        }});
-
-        // Subscribe to the toolkit messaging for this channel. The toolkit
-        // internally pairs channel + agent uid via the RTM presence data.
-        const channel = document.getElementById('channelInput').value.trim() || CHANNEL;
-        await convoApi.subscribeMessage(channel);
-        logEvent('Toolkit subscribed to channel ' + channel, 'success');
-      }} catch (e) {{
-        logEvent('Toolkit init failed: ' + e.message, 'error');
-      }}
-    }}
 
     agentRunning = true;
     setAgentDot('connected', 'connected');
