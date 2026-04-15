@@ -188,6 +188,7 @@ pub struct ResolvedConfig {
     pub agent_user_id:     String,
     pub idle_timeout_secs: Option<u32>,
     pub avatar_configured: bool,
+    pub preset:            Option<String>,
 }
 
 impl ConvoConfig {
@@ -221,6 +222,7 @@ impl ConvoConfig {
             agent_user_id,
             idle_timeout_secs: self.idle_timeout_secs,
             avatar_configured,
+            preset: self.preset.clone(),
         })
     }
 }
