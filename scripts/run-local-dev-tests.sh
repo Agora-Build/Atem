@@ -411,6 +411,54 @@ fi
 rm -f "$RTC_LOG"
 echo
 
+# ── Convo test server ───────────────────────────────────────────────
+echo "$(yellow "Convo test server")"
+
+# Vendored toolkit must exist and carry a version marker.
+run "assets/convo/conversational-ai-api.js exists" -- test -s assets/convo/conversational-ai-api.js
+run "assets/convo/VERSION has sha"                 -- bash -c "grep -q '^sha:' assets/convo/VERSION"
+
+if [[ -f tests/fixtures/convo_full.toml ]] && {
+    [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] \
+    || [[ -f "$HOME/.config/atem/project_cache.enc" ]]
+}; then
+    CONVO_PORT=19911
+    CONVO_LOG="$(mktemp -t atem-convo.XXXXXX.log)"
+    "$ATEM" serv convo --config tests/fixtures/convo_full.toml \
+        --port "$CONVO_PORT" --no-browser >"$CONVO_LOG" 2>&1 &
+    CONVO_PID=$!
+    # Wait up to 10s for TLS port
+    for _ in $(seq 1 20); do
+        curl -sk --max-time 1 "https://127.0.0.1:$CONVO_PORT/" -o /dev/null 2>/dev/null && break
+        sleep 0.5
+    done
+
+    run_contains "atem serv convo — GET /" "Welcome to Agora" \
+        -- curl -sk "https://127.0.0.1:$CONVO_PORT/"
+    run_contains "atem serv convo — GET /vendor/conversational-ai-api.js" "ConversationalAIAPI" \
+        -- curl -sk "https://127.0.0.1:$CONVO_PORT/vendor/conversational-ai-api.js"
+    run_contains "atem serv convo — POST /api/token" "007" \
+        -- bash -c "curl -sk -X POST https://127.0.0.1:$CONVO_PORT/api/token -H 'Content-Type: application/json' -d '{\"channel\":\"demo\",\"uid\":\"42\"}'"
+    run_contains "atem serv convo — GET /api/convo/status" "\"running\":false" \
+        -- curl -sk "https://127.0.0.1:$CONVO_PORT/api/convo/status"
+
+    # Cleanup
+    kill "$CONVO_PID" 2>/dev/null || true
+    wait "$CONVO_PID" 2>/dev/null || true
+    rm -f "$CONVO_LOG"
+elif [[ ! -f tests/fixtures/convo_full.toml ]]; then
+    skip "atem serv convo — GET /"                              "no tests/fixtures/convo_full.toml"
+    skip "atem serv convo — GET /vendor/conversational-ai-api.js" "no tests/fixtures/convo_full.toml"
+    skip "atem serv convo — POST /api/token"                    "no tests/fixtures/convo_full.toml"
+    skip "atem serv convo — GET /api/convo/status"              "no tests/fixtures/convo_full.toml"
+else
+    skip "atem serv convo — GET /"                              "no AGORA_APP_ID / active project"
+    skip "atem serv convo — GET /vendor/conversational-ai-api.js" "no AGORA_APP_ID / active project"
+    skip "atem serv convo — POST /api/token"                    "no AGORA_APP_ID / active project"
+    skip "atem serv convo — GET /api/convo/status"              "no AGORA_APP_ID / active project"
+fi
+echo
+
 # ── Interactive / external commands (intentionally skipped) ─────────
 echo "$(yellow "Interactive / external (skipped)")"
 skip "atem login"    "opens browser — interactive"
