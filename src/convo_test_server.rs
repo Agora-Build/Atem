@@ -925,11 +925,19 @@ async function startAgent() {{
 
     // Initialize the ConvoAI toolkit. It wires RTC + RTM events to provide
     // word-by-word transcription and agent state signals.
-    if (!window.ConversationalAIAPI) {{
+    //
+    // The esbuild IIFE bundle wraps the module exports under the
+    // `ConversationalAIAPI` global, so the class sits at
+    // `ConversationalAIAPI.ConversationalAIAPI`. Fall back to the global
+    // itself in case a future bundle config inlines the class.
+    const ToolkitClass =
+      (ConversationalAIAPI && ConversationalAIAPI.ConversationalAIAPI)
+      || ConversationalAIAPI;
+    if (!ToolkitClass || typeof ToolkitClass.init !== 'function') {{
       logEvent('ConversationalAIAPI not loaded — skipping toolkit init', 'warning');
     }} else {{
       try {{
-        convoApi = ConversationalAIAPI.init({{
+        convoApi = ToolkitClass.init({{
           rtcEngine:  rtcClient,
           rtmEngine:  rtm,
           renderMode: 'word',
