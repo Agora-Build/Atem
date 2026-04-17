@@ -308,13 +308,11 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
         let _ = tx_loopback.send(result).await;
     });
 
-    // Wait for the loopback callback. 30s is generous enough for slow
-    // browsers / VPN-redirected machines. Only shows the paste-URL
-    // fallback if the browser really didn't make it back in time.
-    // (Previous 5s timeout was too short — the fallback prompt raced
-    // with late-arriving callbacks and confused the token exchange.)
+    // Wait 5s for the browser callback. If it doesn't arrive, show
+    // a paste-URL fallback. Both paths (loopback + stdin) race via
+    // the same channel — whichever delivers a valid code first wins.
     let first = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(5),
         rx.recv(),
     ).await;
 
@@ -325,7 +323,10 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             result?
         }
         _ => {
-            // No callback yet — show paste hint and also accept stdin
+            // No callback yet — show paste hint and also accept stdin.
+            // The loopback listener is still running, so a late callback
+            // will also arrive via the same channel.
+            let paste_prompt_lines = 3; // lines we'll clear on success
             println!("\nIf the browser redirect didn't complete, copy the callback URL");
             println!("from your browser's address bar and paste it here:");
             print!("> ");
@@ -342,6 +343,11 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
                 let outcome: Result<(String, String, String)> = match result {
                     Ok(Ok(s)) => {
                         let pasted = s.trim();
+                        if pasted.is_empty() {
+                            // User pressed Enter without pasting — ignore
+                            // silently so the loopback can still win.
+                            return;
+                        }
                         let query = pasted
                             .split_once('?')
                             .map(|(_, q)| q.split('#').next().unwrap_or(q))
@@ -367,7 +373,13 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             .map_err(|_| anyhow::anyhow!("Login timed out."))?
             .ok_or_else(|| anyhow::anyhow!("Login failed."))??;
 
-            println!("Login successful.");
+            // Clear the paste prompt so the terminal looks clean
+            // regardless of which path won (loopback vs stdin).
+            // Move cursor up N lines, clear each, move back down.
+            for _ in 0..paste_prompt_lines {
+                eprint!("\x1b[A\x1b[2K"); // up one line + clear line
+            }
+            eprintln!("Login successful.");
             result
         }
     };
