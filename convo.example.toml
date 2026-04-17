@@ -18,7 +18,7 @@ idle_timeout_secs = 120      # server-side safety timeout (seconds)
 # values are comma-joined into properties.preset in the /join body.
 # Single preset also supported: preset = "my_preset"
 #
-# presets = ["expertise_ai_poc", "_akool_test_expertise"]
+# presets = ["my_preset_1", "my_preset_2"]
 
 # ── Transcript wiring ────────────────────────────────────────────────
 # Required for live transcription. Without these, the agent runs but
