@@ -292,21 +292,14 @@ impl ConvoConfig {
             props.insert("parameters".into(), map_to_json(m));
         }
 
-        // Top-level request envelope. Shape per the observed working
-        // /join request:
-        //   { "name": "atem-convo-<app_id[..12]>-<ts>-<hex>",
-        //     "info": { "preset": "<preset_name>" },
-        //     "properties": { ... } }
-        //
-        // Caller builds `name` (see gen_agent_name in convo_test_server).
-        // `info.preset` replaces the older properties.preset location.
+        // Top-level request envelope:
+        //   { "name": "...", "preset": "...", "properties": { ... } }
+        // `preset` sits at the same level as `properties`, before it.
         let mut envelope = Map::new();
         envelope.insert("name".into(), json!(args.name));
         if let Some(p) = effective_preset {
             if !p.is_empty() {
-                let mut info = Map::new();
-                info.insert("preset".into(), json!(p));
-                envelope.insert("info".into(), Value::Object(info));
+                envelope.insert("preset".into(), json!(p));
             }
         }
         envelope.insert("properties".into(), Value::Object(props));
@@ -539,7 +532,7 @@ mod tests {
         assert_eq!(props["remote_rtc_uids"][0], "42");
         assert_eq!(props["idle_timeout"], 120);
         assert_eq!(
-            body["info"]["preset"],
+            body["preset"],
             "deepgram_nova_3,openai_gpt_5_mini,minimax_speech_2_6_turbo"
         );
 
@@ -627,7 +620,7 @@ mod tests {
             avatar_token:   None,
             preset: Some("from_runtime"),
         });
-        assert_eq!(body["info"]["preset"], "from_runtime");
+        assert_eq!(body["preset"], "from_runtime");
     }
 
     #[test]
@@ -685,7 +678,7 @@ api_key = "secret"
         assert_eq!(av["params"]["avatar_id"],    "abc");
         assert_eq!(av["params"]["api_key"],      "secret");
         assert_eq!(av["params"]["agora_uid"],    "777");
-        assert_eq!(body["info"]["preset"], "some_preset");
+        assert_eq!(body["preset"], "some_preset");
     }
 
     #[test]
@@ -917,7 +910,7 @@ validate_asr_result_timestamp = false
             avatar_token:   None,
             preset: None,
         });
-        assert_eq!(body["info"]["preset"], "first");
+        assert_eq!(body["preset"], "first");
     }
 
     #[test]
