@@ -31,9 +31,12 @@ jobs:
       - name: Refresh ConvoAI toolkit
         run: |
           ./scripts/update-convoai-toolkit.sh
-          if ! git diff --quiet -- assets/convo/; then
+          # Only check the JS bundle — VERSION has a `built:` timestamp
+          # that always differs between runs even when the source hasn't
+          # changed (same upstream SHA → same .js output).
+          if ! git diff --quiet -- assets/convo/conversational-ai-api.js; then
             echo "::error::Vendored toolkit is stale. Run scripts/update-convoai-toolkit.sh locally and commit."
-            git --no-pager diff -- assets/convo/
+            git --no-pager diff --stat -- assets/convo/
             exit 1
           fi
 
