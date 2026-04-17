@@ -65,7 +65,6 @@ validate_asr_result_timestamp = false
 # api_key        = "<vendor api key>"
 # host           = "ws://..."                # vendor-specific endpoint
 # agora_appid    = "..."                     # override project for minting
-# agora_app_cert = "..."                     # cert for override (secret — stripped from wire)
 # agora_token    = "..."                     # pre-minted; atem uses verbatim
 
 # ── LLM ──────────────────────────────────────────────────────────────
