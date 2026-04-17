@@ -22,14 +22,85 @@ fn convoai_base_url() -> String {
 }
 
 /// Generate a unique agent name for this session.
-fn gen_agent_name() -> String {
+/// Build the session name sent as `name` in /join.
+/// Format: `atem-convo-<app_id[..12]>-<unix_ts>-<rand4>`
+/// Embedding a short app_id prefix makes session names unambiguously
+/// bound to the project they belong to — useful in logs and when
+/// multiple projects share infrastructure.
+fn gen_agent_name(app_id: &str) -> String {
     use rand::RngCore;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let rand = rand::thread_rng().next_u32();
-    format!("atem-convo-{ts}-{:04x}", rand & 0xffff)
+    let prefix: String = app_id.chars().take(12).collect();
+    format!("atem-convo-{prefix}-{ts}-{:04x}", rand & 0xffff)
+}
+
+/// Generate a random RTC uid (as a short decimal string) for the
+/// avatar's video stream. Range [10000, 99999] — 5 digits, matching
+/// the upstream demo's `avatar_rtc_uid` shape (e.g. "33830"). Short
+/// enough to be readable in logs, large enough to avoid common
+/// collisions with the human's uid (typically small) or the agent's
+/// uid (typically "1001").
+fn gen_avatar_uid() -> String {
+    use rand::RngCore;
+    let n = (rand::thread_rng().next_u32() % 90000) + 10000;
+    n.to_string()
+}
+
+/// Mint an RTC token for the avatar's video uid on the SAME channel
+/// the voice agent is running in. The avatar needs to publish into
+/// the user's channel for the browser to receive the remote video —
+/// putting it in a separate channel means the video never reaches us.
+///
+/// Credential resolution:
+///   1. User pre-supplied `agora_token` in [agent.avatar.params] →
+///      return (None, None); build_join_payload emits the user's
+///      token + whatever `agora_channel` they set verbatim.
+///   2. [agent.avatar.params] has agora_appid + agora_app_cert → mint
+///      with those (avatar lives in a different Agora project).
+///   3. Fall back to the active project's appid + cert (avatar shares
+///      the voice channel in the main project — the typical case).
+///
+/// Returns (Some(channel), Some(token)) where `channel` is the voice
+/// channel itself, or (None, None) when no cert is available.
+fn mint_avatar_channel_and_token(
+    convo: &crate::convo_config::ConvoConfig,
+    voice_channel: &str,
+    fallback_app_id: &str,
+    fallback_app_cert: &str,
+    avatar_uid: &str,
+) -> (Option<String>, Option<String>) {
+    if convo.avatar_has_preset_token() {
+        return (None, None);
+    }
+    let (appid, cert) = convo
+        .avatar_mint_credentials()
+        .unwrap_or_else(|| (fallback_app_id.to_string(), fallback_app_cert.to_string()));
+    if cert.is_empty() {
+        return (None, None);
+    }
+    // Reuse the voice channel so avatar video lands in the browser's
+    // already-joined channel.
+    let channel = voice_channel.to_string();
+    // 1 h expiry — avatar is torn down with /leave when the user stops.
+    let token = crate::token::build_token_rtc(
+        &appid,
+        &cert,
+        &channel,
+        crate::token::RtcAccount::parse(avatar_uid),
+        crate::token::Role::Publisher,
+        3600,
+        0,
+    )
+    .ok()
+    .filter(|s| !s.is_empty());
+    match token {
+        Some(t) => (Some(channel), Some(t)),
+        None => (None, None),
+    }
 }
 
 pub struct ServeConvoConfig {
@@ -102,15 +173,22 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
             toml_path.display()
         )
     };
-    let resolved = convo.resolve(&CliOverrides {
-        channel:       cfg.channel.clone(),
-        rtc_user_id:   cfg.rtc_user_id.clone(),
-        agent_user_id: cfg.agent_user_id.clone(),
-    })?;
-
     // Get app_id + app_certificate from active project.
     let app_id   = crate::config::ProjectCache::resolve_app_id(None)?;
     let app_cert = crate::config::ProjectCache::resolve_app_certificate(None)?;
+
+    // Auto-generate channel when neither CLI nor TOML provides one.
+    // Uses the same naming rule as `atem serv rtc`'s auto-channel:
+    // `atem-rtc-<app_id[..12]>-<ts>-<rand4>`.
+    let cli_channel = cfg.channel.clone()
+        .or_else(|| convo.channel.clone())
+        .unwrap_or_else(|| crate::rtc_test_server::gen_rtc_channel(&app_id));
+
+    let resolved = convo.resolve(&CliOverrides {
+        channel:       Some(cli_channel),
+        rtc_user_id:   cfg.rtc_user_id.clone(),
+        agent_user_id: cfg.agent_user_id.clone(),
+    })?;
 
     if cfg.background {
         println!("atem serv convo");
@@ -228,7 +306,7 @@ async fn run_background(
 ) -> Result<()> {
     println!("  mode:      background (no HTTPS server)");
 
-    let name = gen_agent_name();
+    let name = gen_agent_name(app_id);
     // Token expiry: at least 2h, or 2× idle_timeout — whichever is longer.
     let expire = resolved
         .idle_timeout_secs
@@ -247,6 +325,13 @@ async fn run_background(
         Some(resolved.agent_user_id.as_str()),
     )?;
 
+    let avatar_user_id = gen_avatar_uid();
+    // Avatar video runs in the vendor's OWN Agora project (akool etc.).
+    // Mint a fresh channel + token for the avatar. Uses [agent.avatar
+    // .params].agora_appid/agora_app_cert if set, otherwise falls back
+    // to the active project's appid+cert.
+    let (avatar_channel, avatar_token) =
+        mint_avatar_channel_and_token(convo, &resolved.channel, app_id, app_cert, &avatar_user_id);
     let payload = convo.build_join_payload(crate::convo_config::JoinArgs {
         name: &name,
         channel: &resolved.channel,
@@ -254,6 +339,9 @@ async fn run_background(
         agent_rtc_uid: &resolved.agent_user_id,
         remote_uids: &[resolved.rtc_user_id.clone()],
         include_avatar: resolved.avatar_configured,
+        avatar_user_id: &avatar_user_id,
+        avatar_channel: avatar_channel.as_deref(),
+        avatar_token:   avatar_token.as_deref(),
         // Background mode: no UI, use config-level preset as-is.
         preset: None,
     });
@@ -408,7 +496,10 @@ async fn handle_connection(
                 Some(resolved.agent_user_id.as_str()),
             )?;
 
-            let name = gen_agent_name();
+            let name = gen_agent_name(app_id);
+            let avatar_user_id = gen_avatar_uid();
+            let (avatar_channel, avatar_token) =
+                mint_avatar_channel_and_token(convo_cfg, &resolved.channel, app_id, app_cert, &avatar_user_id);
             let payload = convo_cfg.build_join_payload(crate::convo_config::JoinArgs {
                 name: &name,
                 channel: &resolved.channel,
@@ -416,6 +507,9 @@ async fn handle_connection(
                 agent_rtc_uid: &resolved.agent_user_id,
                 remote_uids: &[resolved.rtc_user_id.clone()],
                 include_avatar,
+                avatar_user_id: &avatar_user_id,
+                avatar_channel: avatar_channel.as_deref(),
+                avatar_token:   avatar_token.as_deref(),
                 preset: preset_override.as_deref(),
             });
 
@@ -643,6 +737,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .header .app-id {{ font-size: 12px; color: #7d8590; font-family: monospace; }}
 .controls {{ background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
 .controls input {{ background: #0d1117; border: 1px solid #30363d; color: #e6edf3; padding: 6px 10px; border-radius: 6px; font-size: 14px; width: 180px; }}
+#channelInput {{ width: 360px; }}
 .controls input:focus {{ border-color: #58a6ff; outline: none; }}
 .controls label {{ font-size: 12px; color: #7d8590; }}
 .btn {{ padding: 6px 14px; border: 1px solid #30363d; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; transition: 0.15s; }}
@@ -687,7 +782,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 #slogan {{ font-size: 13px; font-weight: 400; color: #7d8590; }}
 /* ConvoAI transcription + events */
 .convo-sub-title {{ padding: 8px 16px; background: #1c2128; border-top: 1px solid #30363d; border-bottom: 1px solid #30363d; font-size: 12px; font-weight: 500; color: #7d8590; text-transform: uppercase; letter-spacing: 0.5px; }}
-#transcript {{ max-height: 180px; overflow-y: auto; padding: 8px 16px; font-size: 13px; line-height: 1.5; color: #e6edf3; }}
+#transcript {{ max-height: 400px; overflow-y: auto; padding: 8px 16px; font-size: 13px; line-height: 1.5; color: #e6edf3; scroll-behavior: smooth; }}
 #transcript div {{ padding: 2px 0; }}
 #transcript .user  {{ color: #79c0ff; }}
 #transcript .agent {{ color: #3fb950; }}
@@ -744,13 +839,16 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
   </div>
   <div id="statsPanel" class="stats-panel"></div>
   <div class="video-grid">
-    <div class="video-cell" id="localCell">
+    <!-- Both cells start hidden. #localCell becomes visible when the
+         Camera button is ON; #agentCell becomes visible when the agent
+         publishes a remote video track (e.g. avatar). -->
+    <div class="video-cell" id="localCell" style="display:none">
       <div id="localVideo"></div>
       <span class="video-label">Local</span>
     </div>
     <div class="video-cell" id="agentCell" style="display:none">
       <div id="agentVideo"></div>
-      <span class="video-label">Agent</span>
+      <span class="video-label">Agent (avatar)</span>
     </div>
   </div>
 </section>
@@ -765,7 +863,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
   <div class="controls">
     <label>Presets</label>
     <div id="presetCheckboxes"
-         style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px"></div>
+         style="display:inline-flex;flex-wrap:wrap;gap:10px 14px;align-items:center;font-size:13px;width:fit-content"></div>
   </div>
   <div class="controls avatar-row">
     <label for="avatarCheckbox">Enable Avatar</label>
@@ -817,7 +915,7 @@ function logEvent(msg, cls) {{
   el.appendChild(d);
   // Cap at ~200 entries — oldest first.
   while (el.childElementCount > 200) el.removeChild(el.firstChild);
-  el.scrollTop = el.scrollHeight;
+  requestAnimationFrame(() => {{ el.scrollTop = el.scrollHeight; }});
 }}
 
 // ── Session state ────────────────────────────────────────────────
@@ -829,6 +927,7 @@ let rtm        = null;   // AgoraRTM.RTM instance
 let convoApi   = null;   // ConversationalAIAPI singleton
 let rtcJoined  = false;
 let agentRunning = false;
+let avatarWatchdog = null;   // setTimeout handle; fires if no remote video
 
 // Mirror the server-side RtcAccount::parse rules exactly:
 //   - all digits (within u32) → int uid
@@ -954,6 +1053,8 @@ async function doJoin() {{
         const cell = document.getElementById('agentCell');
         cell.style.display = '';
         if (user.videoTrack) user.videoTrack.play('agentVideo');
+        if (avatarWatchdog) {{ clearTimeout(avatarWatchdog); avatarWatchdog = null; }}
+        logEvent('Avatar video playing', 'success');
       }}
     }});
     rtcClient.on('user-unpublished', (user, mediaType) => {{
@@ -966,6 +1067,20 @@ async function doJoin() {{
     }});
     rtcClient.on('user-left', (user) => {{
       logEvent('Remote uid=' + user.uid + ' left');
+    }});
+    // audio-pts counter — the ConversationalAIAPI toolkit relies on
+    // this event for word-by-word timing. If the counter stays at 0,
+    // PTS metadata isn't flowing from the agent's audio stream and
+    // word mode can't reveal words progressively.
+    window.__ptsCount = 0;
+    rtcClient.on('audio-pts', (pts) => {{
+      window.__ptsCount += 1;
+      if (window.__ptsCount === 1) {{
+        logEvent('audio-pts: first PTS=' + pts + ' — word-by-word sync active', 'success');
+      }}
+      if (window.__ptsCount % 100 === 0) {{
+        logEvent('audio-pts: count=' + window.__ptsCount + ' latest=' + pts);
+      }}
     }});
     rtcClient.on('connection-state-change', (cur, prev) => {{
       logEvent('RTC: ' + prev + ' -> ' + cur);
@@ -1028,6 +1143,7 @@ async function doJoin() {{
 }}
 
 async function doLeave() {{
+  if (avatarWatchdog) {{ clearTimeout(avatarWatchdog); avatarWatchdog = null; }}
   try {{
     if (agentRunning) {{
       try {{ await stopAgent(); }} catch (_) {{}}
@@ -1059,6 +1175,7 @@ async function doLeave() {{
     }}
     const localDiv = document.getElementById('localVideo');
     if (localDiv) localDiv.innerHTML = '';
+    document.getElementById('localCell').style.display = 'none';
     document.getElementById('agentCell').style.display = 'none';
 
     setRtcDot('disconnected', 'Disconnected');
@@ -1107,6 +1224,7 @@ async function toggleCamera() {{
     try {{
       localVideo = await AgoraRTC.createCameraVideoTrack();
       await rtcClient.publish([localVideo]);
+      document.getElementById('localCell').style.display = '';
       localVideo.play('localVideo');
       btn.classList.add('active');
       btn.textContent = 'Camera On';
@@ -1121,8 +1239,9 @@ async function toggleCamera() {{
     await rtcClient.unpublish([localVideo]);
     localVideo.close();
     localVideo = null;
-    const cell = document.getElementById('localVideo');
-    if (cell) cell.innerHTML = '';
+    const inner = document.getElementById('localVideo');
+    if (inner) inner.innerHTML = '';
+    document.getElementById('localCell').style.display = 'none';
     btn.classList.remove('active');
     btn.textContent = 'Camera Off';
     logEvent('Local camera disabled');
@@ -1268,7 +1387,7 @@ function renderTranscript(list) {{
   }});
   el.innerHTML = '';
   rows.forEach((r) => el.appendChild(r));
-  el.scrollTop = el.scrollHeight;
+  requestAnimationFrame(() => {{ el.scrollTop = el.scrollHeight; }});
 }}
 
 async function startAgent() {{
@@ -1294,26 +1413,71 @@ async function startAgent() {{
         convoApi = ToolkitClass.init({{
           rtcEngine:  rtcClient,
           rtmEngine:  rtm,
-          renderMode: 'word',
+          renderMode: 'text',
           enableRenderModeFallback: true,
           enableLog:  true,
         }});
         convoApi.on('transcript-updated', (list) => {{
+          // Word-by-word streaming sanity check. For each (uid, turn_id)
+          // pair, count how many times the toolkit has emitted an update
+          // and remember the longest text length we saw. On turn END
+          // (status === 1) we log:
+          //   "turn <who>:<turn_id> final: N updates (max text=L chars)"
+          // Expected with word mode + "enable_words":true: N should be
+          // many (one per word — typically 10-80). If N == 1 the text
+          // arrived all at once → word streaming isn't active.
+          if (Array.isArray(list)) {{
+            const agentUidStr = String(AGENT_UID);
+            for (const it of list) {{
+              const who = String(it.uid || '') === agentUidStr ? 'agent' : 'user';
+              const key = who + ':' + (it.turn_id ?? '?');
+              window.__turnUpdates = window.__turnUpdates || {{}};
+              const prev = window.__turnUpdates[key] || {{count: 0, maxLen: 0}};
+              const txt = extractItemText(it);
+              prev.count += 1;
+              if (txt.length > prev.maxLen) prev.maxLen = txt.length;
+              window.__turnUpdates[key] = prev;
+              if (it.status === 1 && !prev.logged) {{
+                prev.logged = true;
+                const kind = prev.count >= 10 ? 'streamed' : 'single-shot';
+                logEvent('turn ' + key + ' final [' + kind + ']: '
+                  + prev.count + ' updates, max text=' + prev.maxLen + ' chars');
+              }}
+            }}
+          }}
           renderTranscript(list);
         }});
-        convoApi.on('agent-state-changed', (ev) => {{
-          // The toolkit emits either a string ("idle"/"listening"/...)
-          // or an object (uid + state) depending on event source.
-          // Prefer the explicit state field over any uid that might
-          // sit at the object root, otherwise fall back to string form.
-          let state = 'unknown';
-          if (typeof ev === 'string') {{
-            state = ev;
-          }} else if (ev && typeof ev === 'object') {{
-            state = ev.state || ev.newState || ev.agent_state || state;
+        convoApi.on('agent-state-changed', (uid, payload) => {{
+          // Toolkit emits TWO args: (agent_uid, state_payload). The
+          // state lives in the 2nd arg — either a bare string like
+          // "listening" or an object with a `.state` field. We accept
+          // both, and fall back to the 1st arg only if the 2nd is
+          // missing entirely.
+          const looksLikeState = s =>
+            typeof s === 'string' && s.length > 0 && !/^\d+$/.test(s);
+          let state = null;
+          if (looksLikeState(payload)) {{
+            state = payload;
+          }} else if (payload && typeof payload === 'object') {{
+            const candidates = [payload.state, payload.newState,
+                                payload.agent_state, payload.current,
+                                payload.status, payload.name, payload.type];
+            for (const c of candidates) {{
+              if (looksLikeState(c)) {{ state = c; break; }}
+            }}
+          }} else if (looksLikeState(uid)) {{
+            // Rare shim: some versions emit only one arg (the state).
+            state = uid;
           }}
-          setAgentDot(mapState(state), state);
-          logEvent('agent: ' + state);
+          if (state) {{
+            setAgentDot(mapState(state), state);
+            logEvent('agent: ' + state + ' (uid=' + uid + ')');
+          }} else {{
+            let dump;
+            try {{ dump = JSON.stringify(payload).slice(0, 200); }}
+            catch (_) {{ dump = String(payload); }}
+            logEvent('agent-state-changed (uid=' + uid + ', payload=' + dump + ')');
+          }}
         }});
         // Keep these event handlers lean — noisy toolkit internals go
         // to the browser console via enableLog:true. Here we surface
@@ -1359,6 +1523,25 @@ async function startAgent() {{
     document.getElementById('startAgentBtn').style.display = 'none';
     document.getElementById('stopAgentBtn').style.display  = '';
     document.getElementById('stopAgentBtn').disabled       = false;
+
+    // Avatar watchdog: if the user ticked Enable Avatar but no remote
+    // video shows up within 10s, tell them plainly so they can debug
+    // their preset or [agent.avatar] block instead of staring at an
+    // empty agent cell.
+    if (includeAvatar) {{
+      avatarWatchdog = setTimeout(() => {{
+        const agentCellVisible = document.getElementById('agentCell').style.display !== 'none';
+        if (!agentCellVisible) {{
+          logEvent(
+            'Avatar enabled but no remote video received within 10s. '
+            + 'Check that [agent.avatar] in convo.toml has a supported '
+            + 'vendor + avatar_id + api_key combination that your Agora '
+            + 'project actually provisions.',
+            'warning'
+          );
+        }}
+      }}, 10000);
+    }}
   }} catch (err) {{
     logEvent('Start error: ' + err.message, 'error');
     setAgentDot('idle', 'idle');
@@ -1367,6 +1550,7 @@ async function startAgent() {{
 
 async function stopAgent() {{
   setAgentDot('transitioning', 'stopping...');
+  if (avatarWatchdog) {{ clearTimeout(avatarWatchdog); avatarWatchdog = null; }}
   try {{
     const resp = await fetch('/api/convo/stop', {{ method: 'POST' }});
     const data = await resp.json().catch(() => ({{}}));
@@ -1450,12 +1634,15 @@ document.getElementById('agentUidDisplay').textContent = AGENT_UID;
   }}
 }})();
 
-// Warn when user ticks the box with no TOML config — some presets do
-// provide avatar, but most don't. Don't block: user knows their preset.
+// Warn when user ticks the box with no [agent.avatar] block in TOML.
+// Agora's /join requires a concrete `vendor` — the preset alone does
+// NOT back-fill it (returns 400 "unsupported avatar vendor"). atem
+// will silently skip the avatar block rather than let the /join fail.
 document.getElementById('avatarCheckbox').addEventListener('change', (ev) => {{
   if (ev.target.checked && !AVATAR_OK) {{
-    logEvent('Enable Avatar is checked but no [agent.avatar] block in convo.toml — '
-      + 'only expect an avatar if a selected preset includes one.', 'warning');
+    logEvent('Enable Avatar is checked but no [agent.avatar] block in convo.toml. '
+      + 'Agora requires vendor + avatar_id + api_key to activate avatar — '
+      + 'the avatar block will be skipped.', 'warning');
   }}
 }});
 
@@ -1480,10 +1667,12 @@ document.getElementById('avatarCheckbox').addEventListener('change', (ev) => {{
     const wrap = document.createElement('label');
     wrap.style.display       = 'inline-flex';
     wrap.style.alignItems    = 'center';
-    wrap.style.gap           = '6px';
+    wrap.style.gap           = '4px';
     wrap.style.cursor        = 'pointer';
     wrap.style.color         = '#c9d1d9';
     wrap.style.fontFamily    = 'monospace';
+    wrap.style.whiteSpace    = 'nowrap';   // each preset stays one line
+    wrap.style.flex          = '0 0 auto'; // hug content; don't grow/shrink
     const cb = document.createElement('input');
     cb.type    = 'checkbox';
     cb.value   = p;
@@ -1623,8 +1812,8 @@ mod tests {
 
     #[test]
     fn gen_agent_name_has_expected_shape() {
-        let n = gen_agent_name();
-        assert!(n.starts_with("atem-convo-"), "got: {n}");
+        let n = gen_agent_name("7dcc42cab6404f7b9ea0a36b1500d1f1");
+        assert!(n.starts_with("atem-convo-7dcc42cab640-"), "got: {n}");
         // 4-hex suffix after the last dash
         let last = n.rsplit('-').next().unwrap();
         assert_eq!(last.len(), 4);

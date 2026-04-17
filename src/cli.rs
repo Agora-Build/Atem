@@ -223,9 +223,10 @@ pub enum AgentCommands {
 pub enum ServCommands {
     /// Launch a browser-based RTC audio/video test page (HTTPS)
     Rtc {
-        /// Channel name
-        #[arg(long, default_value = "test")]
-        channel: String,
+        /// Channel name. If omitted, atem auto-generates one in the shape
+        /// `atem-rtc-<app_id[..12]>-<unix_ts>-<rand4>`.
+        #[arg(long)]
+        channel: Option<String>,
         /// HTTPS port (0 = auto-assign)
         #[arg(long, default_value = "0")]
         port: u16,
@@ -1578,7 +1579,8 @@ mod tests {
                         ..
                     },
             }) => {
-                assert_eq!(channel, "test");
+                // --channel now defaults to None (auto-generated at runtime).
+                assert!(channel.is_none());
                 assert_eq!(port, 0);
                 assert_eq!(expire, 3600);
                 assert!(!no_browser);
@@ -1614,7 +1616,7 @@ mod tests {
                         ..
                     },
             }) => {
-                assert_eq!(channel, "demo");
+                assert_eq!(channel.as_deref(), Some("demo"));
                 assert_eq!(port, 8443);
                 assert_eq!(expire, 7200);
                 assert!(no_browser);

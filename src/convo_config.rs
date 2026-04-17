@@ -60,6 +60,32 @@ pub struct ConvoConfig {
 }
 
 impl ConvoConfig {
+    /// If `[agent.avatar.params]` carries both `agora_appid` and
+    /// `agora_app_cert`, return them. These are used by the caller to
+    /// mint a fresh avatar RTC token (akool and similar vendors run
+    /// their video in their OWN Agora project, not the user's, so we
+    /// need a token scoped to that appid). Returns None when the user
+    /// has pre-minted a token and put it in `agora_token` directly.
+    pub fn avatar_mint_credentials(&self) -> Option<(String, String)> {
+        let av = self.agent.as_ref()?.avatar.as_ref()?;
+        let appid = av.params.get("agora_appid")?.as_str()?.to_string();
+        let cert  = av.params.get("agora_app_cert")?.as_str()?.to_string();
+        if appid.is_empty() || cert.is_empty() { return None; }
+        Some((appid, cert))
+    }
+
+    /// True iff `[agent.avatar.params]` already has an agora_token.
+    /// When true, the caller should skip minting and let the pre-set
+    /// token flow through verbatim.
+    pub fn avatar_has_preset_token(&self) -> bool {
+        self.agent.as_ref()
+            .and_then(|a| a.avatar.as_ref())
+            .and_then(|av| av.params.get("agora_token"))
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
     /// The effective list of selectable preset names: prefer `presets`
     /// when set + non-empty, otherwise fall back to the single `preset`
     /// field (as a one-element list), otherwise empty.
@@ -128,6 +154,21 @@ pub struct JoinArgs<'a> {
     pub agent_rtc_uid:  &'a str,
     pub remote_uids:    &'a [String],
     pub include_avatar: bool,
+    /// Dedicated RTC uid for the avatar's video stream. Required when
+    /// `include_avatar` is true — the Agora ConvoAI backend publishes
+    /// the avatar video as this uid (distinct from agent_rtc_uid which
+    /// publishes voice). Caller generates a random number so it doesn't
+    /// collide with the agent or the user.
+    pub avatar_user_id: &'a str,
+    /// Fresh RTC channel name for the avatar's own Agora project
+    /// (akool etc. run in their own project, not the user's). Injected
+    /// as `avatar.params.agora_channel` when the user's TOML didn't
+    /// already provide one. Typical shape: "convoai-<uuid>".
+    pub avatar_channel: Option<&'a str>,
+    /// RTC token minted by atem for (agora_appid, avatar_channel,
+    /// avatar_user_id) using `agora_app_cert` from [agent.avatar.params].
+    /// Injected as `avatar.params.agora_token`.
+    pub avatar_token:   Option<&'a str>,
     /// Runtime override for `properties.preset`. When `Some`, replaces
     /// the config-level `preset` / `presets[0]`. Usually comes from the
     /// browser dropdown selection via /api/convo/start's body.
@@ -151,15 +192,12 @@ impl ConvoConfig {
         if let Some(t) = self.idle_timeout_secs {
             props.insert("idle_timeout".into(), json!(t));
         }
-        // Runtime override (browser dropdown) > self.preset > first entry of presets.
+        // Preset moves to top-level `info.preset` per the current
+        // Agora /join contract. Resolution order: runtime (browser
+        // dropdown) > self.preset > first entry of presets.
         let effective_preset: Option<&str> = args.preset
             .or(self.preset.as_deref())
             .or_else(|| self.presets.as_ref().and_then(|v| v.first().map(|s| s.as_str())));
-        if let Some(p) = effective_preset {
-            if !p.is_empty() {
-                props.insert("preset".into(), json!(p));
-            }
-        }
         if let Some(agent) = &self.agent {
             if let Some(llm) = &agent.llm {
                 props.insert("llm".into(), llm_to_json(llm));
@@ -170,11 +208,73 @@ impl ConvoConfig {
             if let Some(tts) = &agent.tts {
                 props.insert("tts".into(), service_to_json(tts));
             }
-            if args.include_avatar {
-                if let Some(av) = &agent.avatar {
-                    props.insert("avatar".into(), service_to_json(av));
+        }
+
+        // Avatar emission. The Agora ConvoAI /join endpoint requires a
+        // concrete `vendor` when an `avatar` block is present, and will
+        // return 400 "unsupported avatar vendor" if vendor is empty.
+        // The preset does NOT back-fill the vendor, so the browser
+        // "Enable Avatar" checkbox alone is not enough — the user must
+        // also have at least `vendor = "..."` in [agent.avatar].
+        //
+        // Emitted shape (matches Agora's Conversational-AI-Demo):
+        //   avatar: {
+        //     enable: true,
+        //     vendor: <[agent.avatar].vendor — required>,
+        //     params: {
+        //       agora_uid: <args.avatar_user_id — dedicated RTC uid
+        //                   the avatar video publishes to>,
+        //       avatar_id: <[agent.avatar].avatar_id if set>,
+        //       …any pass-through keys from [agent.avatar.params]
+        //     }
+        //   }
+        //
+        // When Enable Avatar is ticked but no vendor configured we skip
+        // the avatar block entirely so the /join doesn't error. The
+        // browser surfaces a warning in that case (see startAgent()).
+        if args.include_avatar {
+            // Emit avatar whenever Enable Avatar is ticked. We send
+            // whatever atem can compute locally (enable, channel, uid,
+            // token); everything else — vendor, avatar_id, api_key,
+            // host, etc. — is pulled from [agent.avatar] in TOML when
+            // provided, otherwise left for the downstream preset or
+            // proxy backend to back-fill.
+            //
+            // agora_app_cert (when present in TOML) is a secret that
+            // atem used internally to mint agora_token — it must NEVER
+            // leak to the wire.
+            let mut av_obj = Map::new();
+            av_obj.insert("enable".into(), json!(true));
+            let mut av_params = Map::new();
+            if let Some(av) = self.agent.as_ref().and_then(|a| a.avatar.as_ref()) {
+                if let Some(vendor) = &av.vendor {
+                    av_obj.insert("vendor".into(), json!(vendor));
+                }
+                if let Some(id) = &av.avatar_id {
+                    av_params.insert("avatar_id".into(), json!(id));
+                }
+                for (k, v) in &av.params {
+                    if k == "agora_app_cert" { continue; }
+                    av_params.insert(k.clone(), toml_value_to_json(v));
                 }
             }
+            // Inject computed fields only if not already in TOML — user
+            // explicit values win (e.g. pre-minted agora_token).
+            av_params
+                .entry("agora_uid".to_string())
+                .or_insert_with(|| json!(args.avatar_user_id));
+            if let Some(ch) = args.avatar_channel {
+                av_params
+                    .entry("agora_channel".to_string())
+                    .or_insert_with(|| json!(ch));
+            }
+            if let Some(tk) = args.avatar_token {
+                av_params
+                    .entry("agora_token".to_string())
+                    .or_insert_with(|| json!(tk));
+            }
+            av_obj.insert("params".into(), Value::Object(av_params));
+            props.insert("avatar".into(), Value::Object(av_obj));
         }
 
         // Pass-through top-level properties from convo.toml. Any sub-table
@@ -192,7 +292,25 @@ impl ConvoConfig {
             props.insert("parameters".into(), map_to_json(m));
         }
 
-        json!({ "name": args.name, "properties": Value::Object(props) })
+        // Top-level request envelope. Shape per the observed working
+        // /join request:
+        //   { "name": "atem-convo-<app_id[..12]>-<ts>-<hex>",
+        //     "info": { "preset": "<preset_name>" },
+        //     "properties": { ... } }
+        //
+        // Caller builds `name` (see gen_agent_name in convo_test_server).
+        // `info.preset` replaces the older properties.preset location.
+        let mut envelope = Map::new();
+        envelope.insert("name".into(), json!(args.name));
+        if let Some(p) = effective_preset {
+            if !p.is_empty() {
+                let mut info = Map::new();
+                info.insert("preset".into(), json!(p));
+                envelope.insert("info".into(), Value::Object(info));
+            }
+        }
+        envelope.insert("properties".into(), Value::Object(props));
+        Value::Object(envelope)
     }
 }
 
@@ -406,6 +524,9 @@ mod tests {
             agent_rtc_uid: "1001",
             remote_uids:   &["42".to_string()],
             include_avatar: true,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
             preset:        None,
         });
 
@@ -418,7 +539,7 @@ mod tests {
         assert_eq!(props["remote_rtc_uids"][0], "42");
         assert_eq!(props["idle_timeout"], 120);
         assert_eq!(
-            props["preset"],
+            body["info"]["preset"],
             "deepgram_nova_3,openai_gpt_5_mini,minimax_speech_2_6_turbo"
         );
 
@@ -438,9 +559,13 @@ mod tests {
         assert_eq!(props["tts"]["params"]["model"], "speech-02-turbo");
         assert_eq!(props["tts"]["params"]["voice_setting"]["voice_id"], "voice_1");
 
-        // Avatar included when the flag is true
-        assert_eq!(props["avatar"]["vendor"], "heygen");
-        assert_eq!(props["avatar"]["avatar_id"], "a1");
+        // Avatar included when the flag is true — new shape:
+        //   enable: true, vendor at top, avatar_id inside params,
+        //   agora_uid auto-injected from caller.
+        assert_eq!(props["avatar"]["enable"],            true);
+        assert_eq!(props["avatar"]["vendor"],            "heygen");
+        assert_eq!(props["avatar"]["params"]["avatar_id"], "a1");
+        assert_eq!(props["avatar"]["params"]["agora_uid"], "999");
     }
 
     #[test]
@@ -453,6 +578,9 @@ mod tests {
             agent_rtc_uid: "1",
             remote_uids: &["2".to_string()],
             include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
             preset: None,
         });
         assert!(body["properties"].get("avatar").is_none());
@@ -494,9 +622,238 @@ mod tests {
             name: "x", channel: "c", token: "t",
             agent_rtc_uid: "1", remote_uids: &[],
             include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
             preset: Some("from_runtime"),
         });
-        assert_eq!(body["properties"]["preset"], "from_runtime");
+        assert_eq!(body["info"]["preset"], "from_runtime");
+    }
+
+    #[test]
+    fn join_payload_avatar_emits_skeleton_without_vendor() {
+        // [agent.avatar] empty + include_avatar=true → still emit the
+        // block with just enable + agora_uid. vendor/avatar_id/etc.
+        // are expected to be back-filled by the downstream preset or
+        // proxy backend.
+        let toml_str = r#"
+[agent.avatar]
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: true,
+            avatar_user_id: "777",
+            avatar_channel: None,
+            avatar_token:   None,
+            preset: None,
+        });
+        let av = &body["properties"]["avatar"];
+        assert_eq!(av["enable"], true);
+        assert_eq!(av["params"]["agora_uid"], "777");
+        assert!(av.get("vendor").is_none(),
+            "vendor absent from TOML → not emitted (backend/preset back-fills)");
+    }
+
+    #[test]
+    fn join_payload_avatar_block_overrides_preset_when_fields_present() {
+        // [agent.avatar] with concrete fields → explicit override.
+        // enable:true + vendor + params.avatar_id + params.api_key +
+        // auto-injected params.agora_uid.
+        let toml_str = r#"
+preset = "some_preset"
+[agent.avatar]
+vendor = "akool"
+avatar_id = "abc"
+[agent.avatar.params]
+api_key = "secret"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: true,
+            avatar_user_id: "777",
+            avatar_channel: None,
+            avatar_token:   None,
+            preset: None,
+        });
+        let av = &body["properties"]["avatar"];
+        assert_eq!(av["enable"],                 true);
+        assert_eq!(av["vendor"],                 "akool");
+        assert_eq!(av["params"]["avatar_id"],    "abc");
+        assert_eq!(av["params"]["api_key"],      "secret");
+        assert_eq!(av["params"]["agora_uid"],    "777");
+        assert_eq!(body["info"]["preset"], "some_preset");
+    }
+
+    #[test]
+    fn join_payload_avatar_absent_when_checkbox_unchecked() {
+        // include_avatar=false → no avatar key emitted, regardless of
+        // whether [agent.avatar] is configured.
+        let toml_str = r#"
+[agent.avatar]
+vendor = "akool"
+avatar_id = "abc"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "777",
+            avatar_channel: None,
+            avatar_token:   None,
+            preset: None,
+        });
+        assert!(body["properties"].get("avatar").is_none());
+    }
+
+    #[test]
+    fn join_payload_avatar_emits_even_without_toml_block() {
+        // No [agent.avatar] block at all + include_avatar=true → still
+        // emit the avatar skeleton (enable + agora_uid). Downstream
+        // preset/proxy is expected to provide vendor + avatar_id +
+        // credentials.
+        let toml_str = r#"preset = "x""#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: true,
+            avatar_user_id: "777",
+            avatar_channel: Some("convoai-ch"),
+            avatar_token:   Some("007tk"),
+            preset: None,
+        });
+        let av = &body["properties"]["avatar"];
+        assert_eq!(av["enable"], true);
+        assert_eq!(av["params"]["agora_uid"],     "777");
+        assert_eq!(av["params"]["agora_channel"], "convoai-ch");
+        assert_eq!(av["params"]["agora_token"],   "007tk");
+    }
+
+    #[test]
+    fn join_payload_avatar_strips_cert_and_injects_channel_token() {
+        // agora_app_cert in TOML is secret — must NOT reach the wire.
+        // Computed channel + token are injected when not in TOML.
+        let toml_str = r#"
+[agent.avatar]
+vendor = "akool"
+avatar_id = "dvp_Sean_agora"
+[agent.avatar.params]
+api_key        = "pma-test"
+host           = "ws://1.2.3.4:8055"
+agora_appid    = "54faa34804aa4411a5a1c5f81a2a95b3"
+agora_app_cert = "<SECRET>"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: true,
+            avatar_user_id: "333",
+            avatar_channel: Some("convoai-fake-uuid"),
+            avatar_token:   Some("007fake"),
+            preset: None,
+        });
+        let ap = &body["properties"]["avatar"]["params"];
+        assert_eq!(ap["agora_appid"],   "54faa34804aa4411a5a1c5f81a2a95b3");
+        assert_eq!(ap["agora_channel"], "convoai-fake-uuid");
+        assert_eq!(ap["agora_token"],   "007fake");
+        assert_eq!(ap["agora_uid"],     "333");
+        assert_eq!(ap["avatar_id"],     "dvp_Sean_agora");
+        assert_eq!(ap["api_key"],       "pma-test");
+        assert_eq!(ap["host"],          "ws://1.2.3.4:8055");
+        // Cert never leaves atem.
+        assert!(ap.get("agora_app_cert").is_none(),
+            "agora_app_cert is a secret — must be stripped from the outgoing request");
+    }
+
+    #[test]
+    fn avatar_mint_credentials_reads_appid_and_cert() {
+        let toml_str = r#"
+[agent.avatar]
+vendor = "akool"
+[agent.avatar.params]
+agora_appid    = "54fa"
+agora_app_cert = "cert-bytes"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let (appid, cert) = cfg.avatar_mint_credentials().unwrap();
+        assert_eq!(appid, "54fa");
+        assert_eq!(cert,  "cert-bytes");
+    }
+
+    #[test]
+    fn avatar_mint_credentials_none_without_both() {
+        let toml_str = r#"
+[agent.avatar.params]
+agora_appid = "54fa"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.avatar_mint_credentials().is_none());
+    }
+
+    #[test]
+    fn avatar_has_preset_token_detects_user_supplied_value() {
+        let toml_str = r#"
+[agent.avatar.params]
+agora_token = "007pre-minted"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.avatar_has_preset_token());
+    }
+
+    #[test]
+    fn avatar_user_supplied_token_not_overridden_by_caller() {
+        // If the TOML already has agora_token, caller-provided one
+        // must NOT overwrite it (user intent wins).
+        let toml_str = r#"
+[agent.avatar]
+vendor = "akool"
+avatar_id = "abc"
+[agent.avatar.params]
+agora_token = "007user"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: true,
+            avatar_user_id: "333",
+            avatar_channel: Some("convoai-caller"),
+            avatar_token:   Some("007caller"),
+            preset: None,
+        });
+        assert_eq!(body["properties"]["avatar"]["params"]["agora_token"], "007user");
+    }
+
+    #[test]
+    fn join_payload_avatar_params_agora_uid_override_wins() {
+        // If user explicitly set agora_uid in [agent.avatar.params],
+        // it wins over the caller-provided avatar_user_id arg.
+        // (vendor + avatar_id both required for avatar block to be emitted)
+        let toml_str = r#"
+[agent.avatar]
+vendor = "akool"
+avatar_id = "abc"
+[agent.avatar.params]
+agora_uid = "explicit_from_toml"
+"#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: true,
+            avatar_user_id: "caller_provided",
+            avatar_channel: None,
+            avatar_token:   None,
+            preset: None,
+        });
+        assert_eq!(body["properties"]["avatar"]["params"]["agora_uid"],
+                   "explicit_from_toml");
     }
 
     #[test]
@@ -531,6 +888,9 @@ validate_asr_result_timestamp = false
             name: "x", channel: "c", token: "t",
             agent_rtc_uid: "1", remote_uids: &[],
             include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
             preset: None,
         });
         let props = &body["properties"];
@@ -552,9 +912,12 @@ validate_asr_result_timestamp = false
             name: "x", channel: "c", token: "t",
             agent_rtc_uid: "1", remote_uids: &[],
             include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
             preset: None,
         });
-        assert_eq!(body["properties"]["preset"], "first");
+        assert_eq!(body["info"]["preset"], "first");
     }
 
     #[test]

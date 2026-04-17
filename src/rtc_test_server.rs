@@ -8,9 +8,24 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+/// Generate a channel name for `atem serv rtc` when the user didn't
+/// provide `--channel`. Format: `atem-rtc-<app_id[..12]>-<ts>-<rand4>`.
+/// Mirrors the convo session-name convention.
+pub fn gen_rtc_channel(app_id: &str) -> String {
+    use rand::RngCore;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rand = rand::thread_rng().next_u32();
+    let prefix: String = app_id.chars().take(12).collect();
+    format!("atem-rtc-{prefix}-{ts}-{:04x}", rand & 0xffff)
+}
+
 /// Configuration for the RTC test server.
 pub struct RtcTestConfig {
-    pub channel: String,
+    /// None → auto-generate via gen_rtc_channel().
+    pub channel: Option<String>,
     pub port: u16,
     pub expire_secs: u32,
     /// Optional RTC user id / account. None → server default ("0" / auto-assign).
@@ -169,9 +184,18 @@ pub fn cmd_kill_all_servers() -> Result<()> {
 }
 
 /// Run the HTTPS server for RTC testing.
-pub async fn run_server(config: RtcTestConfig) -> Result<()> {
+pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
     let app_id = crate::config::ProjectCache::resolve_app_id(None)?;
     let app_certificate = crate::config::ProjectCache::resolve_app_certificate(None)?;
+
+    // Resolve channel: explicit --channel wins, else auto-generate
+    // `atem-rtc-<app_id[..12]>-<ts>-<rand4>` so each run gets a unique
+    // channel and you can't accidentally step on another session.
+    let channel: String = config.channel.take()
+        .unwrap_or_else(|| gen_rtc_channel(&app_id));
+    // From this point `channel` is the authoritative value; the rest
+    // of the code reads it from a local shadow instead of config.channel.
+    config.channel = Some(channel.clone());
 
     let lan_ip = get_lan_ip();
     let sslip = sslip_host(&lan_ip);
@@ -207,7 +231,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
         let exe = std::env::current_exe()?;
         let log_dir = servers_dir();
         std::fs::create_dir_all(&log_dir)?;
-        let sid = server_id("rtc", &config.channel, port);
+        let sid = server_id("rtc", &channel, port);
         let log_path = log_dir.join(format!("{}.log", sid));
         let log_file = std::fs::File::create(&log_path)?;
 
@@ -215,7 +239,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
             "serv".into(),
             "rtc".into(),
             "--channel".into(),
-            config.channel.clone(),
+            channel.clone(),
             "--port".into(),
             port.to_string(),
             "--expire".into(),
@@ -247,7 +271,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
             pid: child.id(),
             kind: "rtc".to_string(),
             port,
-            channel: config.channel.clone(),
+            channel: channel.clone(),
             local_url: local_url.clone(),
             network_url: network_url.clone(),
             started_at: std::time::SystemTime::now()
@@ -274,13 +298,13 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
 
     // ── Daemon mode: register self and set up cleanup ───────────────────
     if config._daemon {
-        let sid = server_id("rtc", &config.channel, port);
+        let sid = server_id("rtc", &channel, port);
         let entry = ServerEntry {
             id: sid.clone(),
             pid: std::process::id(),
             kind: "rtc".to_string(),
             port,
-            channel: config.channel.clone(),
+            channel: channel.clone(),
             local_url: local_url.clone(),
             network_url: network_url.clone(),
             started_at: std::time::SystemTime::now()
@@ -320,7 +344,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
     if let Some(ref name) = project_name {
         println!("  Project: {}", name);
     }
-    println!("  Channel: {}", config.channel);
+    println!("  Channel: {}", channel);
     println!();
     println!("Press Ctrl+C to stop.");
     println!();
@@ -334,7 +358,7 @@ pub async fn run_server(config: RtcTestConfig) -> Result<()> {
 
     let app_id = Arc::new(app_id);
     let app_certificate = Arc::new(app_certificate);
-    let channel = Arc::new(config.channel);
+    let channel = Arc::new(channel);
     let expire_secs = config.expire_secs;
     let rtc_user_id = Arc::new(config.rtc_user_id);
     let with_rtm = config.with_rtm;
@@ -646,6 +670,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .header .app-id {{ font-size: 12px; color: #7d8590; font-family: monospace; }}
 .controls {{ background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
 .controls input {{ background: #0d1117; border: 1px solid #30363d; color: #e6edf3; padding: 6px 10px; border-radius: 6px; font-size: 14px; width: 180px; }}
+#channelInput {{ width: 360px; }}
 .controls input:focus {{ border-color: #58a6ff; outline: none; }}
 .controls label {{ font-size: 12px; color: #7d8590; }}
 .btn {{ padding: 6px 14px; border: 1px solid #30363d; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; transition: 0.15s; }}
