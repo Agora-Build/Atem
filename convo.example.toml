@@ -1,0 +1,113 @@
+# atem serv convo — ConvoAI agent configuration
+# Copy to ~/.config/atem/convo.toml (chmod 0600 — contains API keys)
+#
+# Override any field via CLI: --channel, --rtc-user-id, --agent-user-id, --config
+
+# ── Channel & UIDs ───────────────────────────────────────────────────
+# channel is auto-generated when omitted:
+#   "atem-rtc-<app_id[..12]>-<ts>-<rand4>"
+# Uncomment to pin a fixed channel:
+# channel         = "demo"
+
+rtc_user_id       = "0"      # human's RTC uid ("0" = server-assigned)
+agent_user_id     = "1001"   # agent's RTC uid (voice)
+idle_timeout_secs = 120      # server-side safety timeout (seconds)
+
+# ── Presets ──────────────────────────────────────────────────────────
+# Shown as checkboxes on the page (all checked by default). Checked
+# values are comma-joined into properties.preset in the /join body.
+# Single preset also supported: preset = "my_preset"
+#
+# presets = ["expertise_ai_poc", "_akool_test_expertise"]
+
+# ── Transcript wiring ────────────────────────────────────────────────
+# Required for live transcription. Without these, the agent runs but
+# never emits subtitle data.
+
+[advanced_features]
+enable_rtm   = true
+enable_sal   = true
+enable_aivad = false
+
+[vad]
+silence_duration_ms = 800
+
+[sal]
+sal_mode = "locking"
+
+[parameters]
+audio_scenario = "default"
+data_channel   = "rtm"       # transcripts via RTM (not RTC data stream)
+enable_dump    = true
+
+[parameters.transcript]
+enable_words = true
+
+[parameters.turn_detector]
+validate_asr_result_timestamp = false
+
+# ── Avatar (optional) ────────────────────────────────────────────────
+# Declaring [agent.avatar] enables the avatar block in /join when the
+# user ticks "Enable Avatar" on the page. atem auto-generates
+# agora_channel (= voice channel), agora_uid (random 5-digit), and
+# agora_token (minted from active project's appid + cert).
+#
+# vendor + avatar_id are required by Agora — sending without them
+# causes a 400 or a silent agent failure. Your downstream preset /
+# proxy backend can back-fill them if you leave them commented.
+#
+# [agent.avatar]
+# vendor    = "akool"
+# avatar_id = "dvp_Sean_agora"
+#
+# [agent.avatar.params]
+# api_key        = "<vendor api key>"
+# host           = "ws://..."                # vendor-specific endpoint
+# agora_appid    = "..."                     # override project for minting
+# agora_app_cert = "..."                     # cert for override (secret — stripped from wire)
+# agora_token    = "..."                     # pre-minted; atem uses verbatim
+
+# ── LLM ──────────────────────────────────────────────────────────────
+[agent.llm]
+url              = "https://api.groq.com/openai/v1/chat/completions"
+api_key          = "<llm api key>"
+greeting_message = "Hi, how can I help?"
+failure_message  = "Error, please hold on."
+
+[[agent.llm.system_messages]]
+role    = "system"
+content = "You are a helpful conversational AI agent."
+
+[agent.llm.params]
+model = "openai/gpt-oss-120b"
+
+# ── ASR ──────────────────────────────────────────────────────────────
+[agent.asr]
+vendor   = "soniox"
+language = "en-US"
+
+[agent.asr.params]
+api_key        = "<asr api key>"
+language_hints = ["en"]
+model          = "stt-rt-v3"
+
+[agent.asr.params.turn_detector]
+validate_asr_result_timestamp = false
+
+# ── TTS ──────────────────────────────────────────────────────────────
+[agent.tts]
+vendor = "minimax"
+
+[agent.tts.params]
+key                   = "<tts api key>"
+group_id              = "<minimax group id>"
+model                 = "speech-02-turbo"
+url                   = "wss://api-uw.minimax.io/ws/v1/t2a_v2"
+english_normalization = true
+
+[agent.tts.params.voice_setting]
+voice_id = "pvc_voice_pamela_spanish_0919"
+emotion  = "happy"
+
+[agent.tts.params.audio_setting]
+sample_rate = 16000
