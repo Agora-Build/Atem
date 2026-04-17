@@ -38,8 +38,8 @@ sal_mode = "locking"
 [parameters]
 audio_scenario = "default"
 data_channel   = "rtm"       # transcripts via RTM (not RTC data stream)
-# enable_dump  = true         # Agora server-side debug dump — enable only
-                               # when troubleshooting with Agora support
+# enable_dump  = true        # Agora server-side debug dump — enable only
+                             # when troubleshooting with Agora support
 
 [parameters.transcript]
 enable_words = true
