@@ -319,7 +319,9 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     let (code, _, login_id) = match first {
         Ok(Some(result)) => {
             // Callback arrived within 5s
-            println!("Login successful.");
+            print!("Validating...");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
             result?
         }
         _ => {
@@ -386,7 +388,8 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             for _ in 0..paste_prompt_lines {
                 eprint!("\x1b[A\x1b[2K"); // up one line + clear line
             }
-            eprintln!("Login successful.");
+            eprint!("Validating...");
+            std::io::Write::flush(&mut std::io::stderr()).ok();
             result
         }
     };
@@ -408,8 +411,10 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        eprintln!(" failed.");
         anyhow::bail!("Token exchange failed ({status}): {body}");
     }
+    eprintln!(" ok.");
 
     let mut session = parse_token_response(resp).await?;
     if !login_id.is_empty() {
