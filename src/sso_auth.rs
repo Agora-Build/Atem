@@ -333,35 +333,42 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             use std::io::Write;
             std::io::stdout().flush().ok();
 
-            // Spawn stdin reader
+            // Spawn stdin reader — loops until it gets a non-empty line
+            // with a valid authorization code. Empty lines (accidental
+            // Enter) are silently ignored so the user can retry, and
+            // the loopback callback can still win the race at any time.
             let tx_stdin = tx.clone();
             tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(|| {
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s).map(|_| s)
-                }).await;
-                let outcome: Result<(String, String, String)> = match result {
-                    Ok(Ok(s)) => {
-                        let pasted = s.trim();
-                        if pasted.is_empty() {
-                            // User pressed Enter without pasting — ignore
-                            // silently so the loopback can still win.
-                            return;
+                loop {
+                    let line = tokio::task::spawn_blocking(|| {
+                        let mut s = String::new();
+                        std::io::stdin().read_line(&mut s).map(|_| s)
+                    }).await;
+                    match line {
+                        Ok(Ok(s)) => {
+                            let pasted = s.trim();
+                            if pasted.is_empty() {
+                                // Blank Enter — silently loop for another line.
+                                continue;
+                            }
+                            let query = pasted
+                                .split_once('?')
+                                .map(|(_, q)| q.split('#').next().unwrap_or(q))
+                                .unwrap_or("");
+                            let (code, state, login_id) = parse_callback_query(query);
+                            if code.is_empty() {
+                                eprintln!("No authorization code found — paste the full callback URL.");
+                                continue;
+                            }
+                            let _ = tx_stdin.send(Ok((code, state, login_id))).await;
+                            break;
                         }
-                        let query = pasted
-                            .split_once('?')
-                            .map(|(_, q)| q.split('#').next().unwrap_or(q))
-                            .unwrap_or("");
-                        let (code, state, login_id) = parse_callback_query(query);
-                        if code.is_empty() {
-                            Err(anyhow::anyhow!("No authorization code found in the pasted URL."))
-                        } else {
-                            Ok((code, state, login_id))
+                        _ => {
+                            let _ = tx_stdin.send(Err(anyhow::anyhow!("Failed to read input."))).await;
+                            break;
                         }
                     }
-                    _ => Err(anyhow::anyhow!("Failed to read input.")),
-                };
-                let _ = tx_stdin.send(outcome).await;
+                }
             });
 
             // Wait for whichever arrives first: loopback or stdin
