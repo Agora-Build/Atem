@@ -3,19 +3,13 @@
 #
 # Credentials: run `atem login` (SSO via browser) or set env vars:
 #   AGORA_APP_ID, AGORA_APP_CERTIFICATE — for token generation
-#   (No customer_id/secret needed — SSO replaced the old auth flow.)
 
 # ── Astation ─────────────────────────────────────────────────────────
 # astation_ws         = "ws://127.0.0.1:8080/ws"
 # astation_relay_url  = "https://station.agora.build"
-# astation_relay_code = ""
 
 # ── Diagram hosting server ───────────────────────────────────────────
 # diagram_server_url = "http://localhost:8787"
-
-# ── RTM (voice coding) ──────────────────────────────────────────────
-# rtm_channel = ""
-# rtm_account = ""
 
 # ── SSO / BFF overrides (defaults usually fine) ─────────────────────
 # bff_url = "https://agora-cli.agora.io"

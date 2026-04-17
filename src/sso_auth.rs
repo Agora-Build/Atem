@@ -179,6 +179,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     println!("Opening browser for Agora Console login...");
     println!("  {}", auth_url);
     let _ = crate::web_server::browser::open_browser(&auth_url);
+    println!("Waiting for browser callback...");
 
     // Channel: loopback callback OR stdin paste both send (code, state, login_id) here
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(String, String, String)>>(2);
@@ -307,9 +308,13 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
         let _ = tx_loopback.send(result).await;
     });
 
-    // Wait 5s for the loopback callback; if none, show paste hint
+    // Wait for the loopback callback. 30s is generous enough for slow
+    // browsers / VPN-redirected machines. Only shows the paste-URL
+    // fallback if the browser really didn't make it back in time.
+    // (Previous 5s timeout was too short — the fallback prompt raced
+    // with late-arriving callbacks and confused the token exchange.)
     let first = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
         rx.recv(),
     ).await;
 
