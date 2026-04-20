@@ -173,3 +173,43 @@ jobs:
         run: cd npm && npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  r2-mirror:
+    name: Mirror to Cloudflare R2
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Upload binaries + install script to R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          npm i -g wrangler
+          VERSION="${GITHUB_REF_NAME}"
+          BUCKET="atem-releases"
+
+          # Upload each platform tarball
+          for f in dist/atem-*.tar.gz; do
+            KEY="atem/releases/${VERSION}/$(basename $f)"
+            echo "Uploading $KEY"
+            wrangler r2 object put "$BUCKET/$KEY" --file="$f"
+          done
+
+          # Update the 'latest' version marker (plain text, no 'v' prefix)
+          echo -n "${VERSION#v}" | wrangler r2 object put "$BUCKET/atem/releases/latest" \
+            --pipe --content-type text/plain
+
+          # Upload the install script
+          wrangler r2 object put "$BUCKET/atem/install.sh" \
+            --file=scripts/install.sh --content-type text/plain
