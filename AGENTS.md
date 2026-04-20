@@ -6,7 +6,15 @@ This file provides guidance to AI coding agents working with this repository.
 
 Atem is a terminal that connects people, Agora platform, and AI agents. It provides a CLI and TUI for managing Agora projects and tokens, routing tasks between Astation and AI coding agents, generating and hosting visual diagrams, voice-driven coding, and more.
 
-Distributed via npm: `npm install -g @agora-build/atem`
+Install:
+
+```bash
+# Quick install (works in regions where GitHub is not available)
+curl -fsSL https://dl.agora.build/atem/install.sh | bash
+
+# Or via npm
+npm install -g @agora-build/atem
+```
 
 ## Development Commands
 
@@ -54,7 +62,8 @@ src/
 ├── rtc_test_server.rs   # Browser-based RTC test page server
 ├── convo_config.rs      # ConvoAI TOML parsing + Agora REST /join body builder
 ├── convo_test_server.rs # atem serv convo — ConvoAI test server + --background mode
-├── web_server/          # Shared HTTPS scaffolding (cert, request, /api/token)
+├── convo_wizard.rs      # atem config convo — interactive config wizard + validation
+├── web_server/          # Shared HTTPS scaffolding (cert, request, /api/token, net, html)
 ├── command.rs           # Task queue and stream buffer for voice commands
 ├── dispatch.rs          # Work item dispatcher for mark tasks
 └── tui/
@@ -282,3 +291,11 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   `scripts/update-convoai-toolkit.sh`, stale bundles blocked at release time).
   `--background` runs headless for scenarios where an external device joins the
   channel on its own and atem's only job is to keep the agent alive.
+  Features: live transcription (RTM), preset checkboxes, avatar video
+  (Akool/LiveAvatar/Anam), RTC Stats, API History, camera toggle.
+- **ConvoAI Config Wizard (`atem config convo`)**: Interactive terminal wizard
+  that generates `~/.config/atem/convo.toml`. Supports preset-based or custom
+  configuration with provider selection for ASR (10 vendors), LLM (9), TTS (12),
+  MLLM (3), and Avatar (3). `--validate` performs read-only config validation
+  (checks required fields, large-integer precision issues, vendor completeness).
+  Always loads existing config as defaults — re-runs change only what's needed.

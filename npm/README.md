@@ -86,7 +86,7 @@ atem serv killall                       # Kill all background servers
 
 **`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
 
-### AI Agents
+### AI Agents (WIP)
 
 ```bash
 atem agent list                         # Scan and list detected AI agents

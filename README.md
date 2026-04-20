@@ -60,7 +60,7 @@ atem project use <N>                    # Set active project by index (1-based)
 atem project show                       # Show current active project
 ```
 
-### AI Agents
+### AI Agents (WIP)
 
 ```bash
 atem agent list                         # Scan and list detected AI agents
