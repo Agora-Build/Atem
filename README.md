@@ -74,37 +74,28 @@ atem agent visualize "topic" --url ws://localhost:8765  # Explicit agent URL
 atem agent visualize "topic" --no-browser               # Skip opening browser
 ```
 
-### ConvoAI (Conversational AI)
-
-```bash
-atem config convo                       # Interactive wizard to configure ConvoAI agent
-atem config convo --validate            # Validate config without modifying
-atem serv convo                         # Launch ConvoAI test page (HTTPS)
-atem serv convo --config ~/convo.toml   # Use custom config file
-atem serv convo --background            # Headless mode (no browser)
-```
-
-The ConvoAI page provides live voice conversation with an Agora ConvoAI agent, real-time transcription, preset selection, avatar support (Akool, LiveAvatar, Anam), RTC Stats, and API History for debugging.
-
-The `atem config convo` wizard supports:
-- **Segmented pipeline**: pick ASR + LLM + TTS providers individually (10 ASR, 9 LLM, 12 TTS vendors)
-- **Multimodal LLM**: OpenAI Realtime, Google Gemini Live (replaces ASR+LLM+TTS)
-- **Presets**: use Agora-managed preset bundles, optionally override providers
-- **Avatar**: Akool, LiveAvatar, Anam
-
 ### Dev Servers
 
 ```bash
-atem serv rtc                           # Launch browser-based RTC test page (HTTPS)
+atem serv convo                         # Launch ConvoAI test page (HTTPS)
+atem serv convo --config ~/convo.toml   # Use custom config file
+atem serv convo --background            # Headless mode (no browser)
+atem serv rtc                           # Launch RTC test page (HTTPS)
 atem serv rtc --channel test --port 8443
 atem serv rtc --background              # Run as background daemon
 atem serv diagrams                      # Host diagrams from SQLite (HTTP)
-atem serv diagrams --port 9000          # Custom port (default: 8787)
-atem serv diagrams --background         # Run as background daemon
+atem serv diagrams --port 9000
+atem serv diagrams --background
 atem serv list                          # List running background servers
 atem serv kill <ID>                     # Kill a background server
 atem serv killall                       # Kill all background servers
 ```
+
+**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle.
+
+**`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging.
+
+**`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
 
 ### Configuration
 
@@ -113,9 +104,16 @@ atem config show                        # Show resolved config
 atem config set astation_ws <URL>       # Set Astation WebSocket URL
 atem config set astation_relay_url <URL> # Set Astation relay URL
 atem config clear                       # Clear active project selection
-atem config convo                       # ConvoAI config wizard (see above)
-atem config convo --validate            # Validate ConvoAI config
+atem config convo                       # Interactive wizard to configure ConvoAI agent
+atem config convo --validate            # Validate ConvoAI config without modifying
+atem config convo --config <PATH>       # Use a specific config file
 ```
+
+The `atem config convo` wizard supports:
+- **Segmented pipeline**: pick ASR + LLM + TTS providers individually (10 ASR, 9 LLM, 12 TTS vendors)
+- **Multimodal LLM**: OpenAI Realtime, Google Gemini Live (replaces ASR+LLM+TTS)
+- **Presets**: use Agora-managed preset bundles, optionally override providers
+- **Avatar**: Akool, LiveAvatar, Anam
 
 ## How It Works
 

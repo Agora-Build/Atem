@@ -63,43 +63,28 @@ atem config convo --validate            # Validate existing config without modif
 atem config convo --config <PATH>       # Use a specific config file
 ```
 
-### ConvoAI (Conversational AI)
-
-```bash
-atem serv convo                         # Launch ConvoAI test page (HTTPS)
-atem serv convo --channel my-channel    # Pin a specific channel
-atem serv convo --config ~/convo.toml   # Use custom config
-atem serv convo --background            # Headless mode (no browser)
-atem serv convo --no-browser            # Don't auto-open browser
-```
-
-The ConvoAI page provides:
-- **Live voice conversation** with an Agora ConvoAI agent
-- **Real-time transcription** (user + agent, via RTM)
-- **Preset selection** via checkboxes (comma-joined)
-- **Avatar support** (Akool, LiveAvatar, Anam) with remote video
-- **RTC Stats** panel + **API History** panel for debugging
-- **Camera toggle** for local video
-
-Configure with `atem config convo` (interactive wizard) or edit `~/.config/atem/convo.toml` directly. The wizard supports:
-- **Segmented pipeline**: pick ASR + LLM + TTS providers individually
-- **Multimodal LLM (MLLM)**: OpenAI Realtime, Google Gemini Live
-- **Presets**: use Agora-managed preset bundles, optionally override individual providers
-- **10 ASR**, **9 LLM**, **12 TTS**, **3 MLLM**, **3 Avatar** providers with vendor-specific params
-
 ### Dev Servers
 
 ```bash
-atem serv rtc                           # Launch browser-based RTC test page (HTTPS)
+atem serv convo                         # Launch ConvoAI test page (HTTPS)
+atem serv convo --config ~/convo.toml   # Use custom config
+atem serv convo --background            # Headless mode (no browser)
+atem serv rtc                           # Launch RTC test page (HTTPS)
 atem serv rtc --channel test --port 8443
 atem serv rtc --background              # Run as background daemon
 atem serv diagrams                      # Host diagrams from SQLite (HTTP)
-atem serv diagrams --port 9000          # Custom port (default: 8787)
-atem serv diagrams --background         # Run as background daemon
+atem serv diagrams --port 9000
+atem serv diagrams --background
 atem serv list                          # List running background servers
 atem serv kill <ID>                     # Kill a background server
 atem serv killall                       # Kill all background servers
 ```
+
+**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle.
+
+**`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging.
+
+**`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
 
 ### AI Agents
 
