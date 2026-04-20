@@ -8,23 +8,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// Generate a channel name for `atem serv rtc` when the user didn't
-/// provide `--channel`. Format: `atem-rtc-<app_id[..12]>-<ts>-<rand4>`.
-/// Mirrors the convo session-name convention.
-pub fn gen_rtc_channel(app_id: &str) -> String {
-    use rand::RngCore;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let rand = rand::thread_rng().next_u32();
-    let prefix: String = app_id.chars().take(12).collect();
-    format!("atem-rtc-{prefix}-{ts}-{:04x}", rand & 0xffff)
-}
-
 /// Configuration for the RTC test server.
 pub struct RtcTestConfig {
-    /// None → auto-generate via gen_rtc_channel().
+    /// None → auto-generate via gen_channel().
     pub channel: Option<String>,
     pub port: u16,
     pub expire_secs: u32,
@@ -192,7 +178,7 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
     // `atem-rtc-<app_id[..12]>-<ts>-<rand4>` so each run gets a unique
     // channel and you can't accidentally step on another session.
     let channel: String = config.channel.take()
-        .unwrap_or_else(|| gen_rtc_channel(&app_id));
+        .unwrap_or_else(|| crate::web_server::net::gen_channel(&app_id, "rtc"));
     // From this point `channel` is the authoritative value; the rest
     // of the code reads it from a local shadow instead of config.channel.
     config.channel = Some(channel.clone());

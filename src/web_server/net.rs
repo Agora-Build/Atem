@@ -31,6 +31,20 @@ pub fn sslip_host(ip: &IpAddr) -> String {
     format!("{}.sslip.io", ip.to_string().replace('.', "-"))
 }
 
+/// Generate a channel name when the user didn't provide `--channel`.
+/// Format: `atem-<scenario>-<app_id[..12]>-<ts>-<rand4>`.
+/// `scenario` distinguishes the server type (e.g. "rtc", "convo").
+pub fn gen_channel(app_id: &str, scenario: &str) -> String {
+    use rand::RngCore;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rand = rand::thread_rng().next_u32();
+    let prefix: String = app_id.chars().take(12).collect();
+    format!("atem-{scenario}-{prefix}-{ts}-{:04x}", rand & 0xffff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

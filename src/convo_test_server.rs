@@ -178,11 +178,9 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     let app_cert = crate::config::ProjectCache::resolve_app_certificate(None)?;
 
     // Auto-generate channel when neither CLI nor TOML provides one.
-    // Uses the same naming rule as `atem serv rtc`'s auto-channel:
-    // `atem-rtc-<app_id[..12]>-<ts>-<rand4>`.
     let cli_channel = cfg.channel.clone()
         .or_else(|| convo.channel.clone())
-        .unwrap_or_else(|| crate::rtc_test_server::gen_rtc_channel(&app_id));
+        .unwrap_or_else(|| crate::web_server::net::gen_channel(&app_id, "convo"));
 
     let resolved = convo.resolve(&CliOverrides {
         channel:       Some(cli_channel),
