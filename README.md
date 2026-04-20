@@ -117,10 +117,6 @@ The `atem config convo` wizard supports:
 
 ## How It Works
 
-### Diagram Generation
-
-`atem agent visualize "topic"` sends a prompt to a running AI agent (via ACP), which generates a self-contained HTML diagram and saves it to `~/.agent/diagrams/`. Atem detects the new file, hosts it via `atem serv diagrams`, and opens it in the browser. Use `--url ws://host:port` to target a specific agent.
-
 ### TUI Modes
 
 | Mode | Description |
@@ -129,6 +125,10 @@ The `atem config convo` wizard supports:
 | **Projects** | Browse and select Agora projects |
 | **Claude Chat** | Claude Code integration via PTY |
 | **Codex Chat** | Codex terminal integration via PTY |
+
+### Diagram Generation
+
+`atem agent visualize "topic"` sends a prompt to a running AI agent (via ACP), which generates a self-contained HTML diagram and saves it to `~/.agent/diagrams/`. Atem detects the new file, hosts it via `atem serv diagrams`, and opens it in the browser. Use `--url ws://host:port` to target a specific agent.
 
 ### Astation Integration (WIP)
 

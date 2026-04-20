@@ -146,12 +146,19 @@ pub struct DiagramServerConfig {
 /// Run the diagram hosting HTTP server.
 pub async fn run_server(config: DiagramServerConfig) -> Result<()> {
     let lan_ip = get_lan_ip();
+    let extra_hostnames = crate::config::AtemConfig::load()
+        .map(|c| c.extra_hostnames())
+        .unwrap_or_default();
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = TcpListener::bind(bind_addr).await?;
     let port = listener.local_addr()?.port();
 
     let local_url = format!("http://localhost:{}", port);
     let network_url = format!("http://{}:{}", lan_ip, port);
+    let custom_urls: Vec<String> = extra_hostnames
+        .iter()
+        .map(|h| format!("http://{}:{}", h.trim(), port))
+        .collect();
 
     // ── Background mode: re-exec as daemon ─────────────────────────
     if config.background && !config._daemon {
@@ -176,6 +183,9 @@ pub async fn run_server(config: DiagramServerConfig) -> Result<()> {
     println!("Diagram server running:");
     println!("  Local:   {}", local_url);
     println!("  Network: {}", network_url);
+    for u in &custom_urls {
+        println!("  Custom:  {}", u);
+    }
     println!();
     println!("Press Ctrl+C to stop.");
     println!();
