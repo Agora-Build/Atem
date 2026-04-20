@@ -5,14 +5,14 @@ A terminal that connects people, Agora platform, and AI agents. Manage Agora pro
 ## Install
 
 ```bash
-# Quick install (works in regions where GitHub is not available)
 curl -fsSL https://dl.agora.build/atem/install.sh | bash
+```
 
-# Or via npm
+```bash
 npm install -g @agora-build/atem
 ```
 
-This downloads a prebuilt binary for your platform (linux-x64, linux-arm64, darwin-x64, darwin-arm64).
+Both download a prebuilt binary for your platform (linux-x64, linux-arm64, darwin-x64, darwin-arm64).
 
 ## Commands
 

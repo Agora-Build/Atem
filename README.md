@@ -5,6 +5,10 @@ A terminal that connects people, Agora platform, and AI agents. Manage Agora pro
 ## Install
 
 ```bash
+curl -fsSL https://dl.agora.build/atem/install.sh | bash
+```
+
+```bash
 npm install -g @agora-build/atem
 ```
 
@@ -31,17 +35,7 @@ atem repl                               # Interactive REPL with AI command inter
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
 atem logout                             # Log out from SSO
-atem pair                               # Pair with Astation
-atem pair --save                        # Pair and save credentials for offline use
-atem unpair                             # Unpair from Astation
 ```
-
-Two ways to authenticate:
-
-- **`atem login`** — your own Agora Console login. Auto-refreshes.
-- **`atem pair`** — receive credentials from a connected Astation. Pass `--save` to keep them after disconnect (otherwise atem asks interactively).
-
-When connected to Astation, paired credentials take priority; otherwise own login is the fallback.
 
 ### Tokens
 
@@ -78,6 +72,24 @@ atem agent visualize "topic" --url ws://localhost:8765  # Explicit agent URL
 atem agent visualize "topic" --no-browser               # Skip opening browser
 ```
 
+### ConvoAI (Conversational AI)
+
+```bash
+atem config convo                       # Interactive wizard to configure ConvoAI agent
+atem config convo --validate            # Validate config without modifying
+atem serv convo                         # Launch ConvoAI test page (HTTPS)
+atem serv convo --config ~/convo.toml   # Use custom config file
+atem serv convo --background            # Headless mode (no browser)
+```
+
+The ConvoAI page provides live voice conversation with an Agora ConvoAI agent, real-time transcription, preset selection, avatar support (Akool, LiveAvatar, Anam), RTC Stats, and API History for debugging.
+
+The `atem config convo` wizard supports:
+- **Segmented pipeline**: pick ASR + LLM + TTS providers individually (10 ASR, 9 LLM, 12 TTS vendors)
+- **Multimodal LLM**: OpenAI Realtime, Google Gemini Live (replaces ASR+LLM+TTS)
+- **Presets**: use Agora-managed preset bundles, optionally override providers
+- **Avatar**: Akool, LiveAvatar, Anam
+
 ### Dev Servers
 
 ```bash
@@ -99,6 +111,8 @@ atem config show                        # Show resolved config
 atem config set astation_ws <URL>       # Set Astation WebSocket URL
 atem config set astation_relay_url <URL> # Set Astation relay URL
 atem config clear                       # Clear active project selection
+atem config convo                       # ConvoAI config wizard (see above)
+atem config convo --validate            # Validate ConvoAI config
 ```
 
 ## How It Works
@@ -144,10 +158,10 @@ Files in `~/.config/atem/`:
 
 | File | Contents | Encryption |
 |------|----------|------------|
-| `config.toml` | Non-sensitive settings (only created if you override a default) | None |
-| `credentials.enc` | SSO + paired tokens (multi-entry) | AES-256-GCM (machine-bound) |
+| `config.toml` | Non-sensitive settings (extra_hostnames, SSO/BFF overrides) | None |
+| `convo.toml` | ConvoAI agent config (API keys, provider params) | None (chmod 0600) |
+| `credentials.enc` | SSO tokens | AES-256-GCM (machine-bound) |
 | `project_cache.enc` | Project list + active project selection | AES-256-GCM (machine-bound) |
-| `session.json` | Astation auth session (for reconnect) | None |
 
 Encrypted files are bound to the machine they were created on — copying them to another machine won't decrypt.
 
@@ -156,13 +170,13 @@ Encrypted files are bound to the machine they were created on — copying them t
 `~/.config/atem/config.toml`:
 
 ```toml
-astation_ws = "ws://127.0.0.1:8080/ws"
-astation_relay_url = "https://station.agora.build"
-rtm_channel = "atem_channel"
-
-# Optional overrides
+# astation_ws = "ws://127.0.0.1:8080/ws"
+# astation_relay_url = "https://station.agora.build"
 # bff_url = "https://agora-cli.agora.io"
 # sso_url = "https://sso2.agora.io"
+
+# Extra hostnames baked into the self-signed cert + shown as "Custom:" URLs
+# extra_hostnames = ["genie.netbird.cloud", "dev.mytailnet.ts.net"]
 ```
 
 ### Environment variable overrides
