@@ -139,6 +139,15 @@ pub enum ConfigCommands {
     },
     /// Clear the active project
     Clear,
+    /// Interactive wizard to configure ConvoAI agent
+    Convo {
+        /// Config file path (default: ~/.config/atem/convo.toml)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Validate config without modifying it
+        #[arg(long)]
+        validate: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -480,6 +489,15 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 crate::config::ProjectCache::clear_active()?;
                 println!("Active project cleared.");
                 Ok(())
+            }
+            ConfigCommands::Convo { config, validate } => {
+                let path = config.unwrap_or_else(||
+                    crate::config::AtemConfig::config_dir().join("convo.toml"));
+                if validate {
+                    crate::convo_wizard::run_validate(&path)
+                } else {
+                    crate::convo_wizard::run_wizard(&path)
+                }
             }
         },
         Commands::Project { project_command } => match project_command {
