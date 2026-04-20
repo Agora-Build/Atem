@@ -117,30 +117,26 @@ The `atem config convo` wizard supports:
 
 ## How It Works
 
+### Diagram Generation
+
+`atem agent visualize "topic"` sends a prompt to a running AI agent (via ACP), which generates a self-contained HTML diagram and saves it to `~/.agent/diagrams/`. Atem detects the new file, hosts it via `atem serv diagrams`, and opens it in the browser. Use `--url ws://host:port` to target a specific agent.
+
 ### TUI Modes
 
 | Mode | Description |
 |------|-------------|
-| **Claude Chat** | Claude Code integration via PTY |
-| **Codex Chat** | Codex terminal integration via PTY |
 | **Token Gen** | Generate Agora RTC/RTM tokens locally |
 | **Projects** | Browse and select Agora projects |
+| **Claude Chat** | Claude Code integration via PTY |
+| **Codex Chat** | Codex terminal integration via PTY |
 
-### Astation Integration
+### Astation Integration (WIP)
 
-[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates between [Chisel](https://github.com/Agora-Build/chisel), Atem, and AI agents. It receives annotation tasks from the browser, routes them to the right Atem instance, and tracks task status — so you can talk to your coding agent from anywhere. Once paired, Atem can:
+[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates between [Chisel](https://github.com/Agora-Build/chisel), Atem, and AI agents. It receives annotation tasks from the browser, routes them to the right Atem instance, and tracks task status.
 
-- Receive task assignments from Chisel annotations and route them to AI agents
-- Relay voice-coding sessions (speech-to-code and code-to-speech)
-- Request diagram generation from AI agents
+### Voice-Driven Coding (WIP)
 
-### Diagram Generation
-
-`atem agent visualize "topic"` sends a prompt to a running AI agent, which generates a self-contained HTML diagram and saves it to `~/.agent/diagrams/`. Atem detects the new file and opens it in the browser. See `designs/agent-visualize.md`.
-
-### Voice-Driven Coding
-
-Speak to code: Astation captures audio, a ConvoAI agent transcribes it, and Atem routes the text to Claude Code for implementation. Responses flow back as speech. See `designs/data-flow-between-atem-and-astation.md`.
+Speak to code: Astation captures audio, a ConvoAI agent transcribes it, and Atem routes the text to Claude Code for implementation. Responses flow back as speech.
 
 ## Configuration
 
