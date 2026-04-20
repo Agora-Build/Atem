@@ -5,10 +5,15 @@
 Interactive TUI wizard that walks the user through configuring a ConvoAI agent, generates `~/.config/atem/convo.toml`, and validates it. After running the wizard, `atem serv convo` launches with the generated config.
 
 ```bash
-atem config convo              # wizard — loads existing config as defaults, saves changes
-atem config convo --validate   # read-only — validates config, reports errors, never writes
-atem serv convo                # launch with the config
+atem config convo                        # wizard — loads/saves ~/.config/atem/convo.toml
+atem config convo --config /path/to.toml # wizard — loads/saves a specific file
+atem config convo --validate             # read-only validation of default config
+atem config convo --validate --config /path/to.toml  # validate specific file
+atem serv convo                          # launch with default config
+atem serv convo --config /path/to.toml   # launch with specific config
 ```
+
+`--config` works the same as `atem serv convo --config` — overrides the default path `~/.config/atem/convo.toml`. Both wizard and validate respect it.
 
 ---
 
