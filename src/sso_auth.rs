@@ -181,14 +181,15 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
     let _ = crate::web_server::browser::open_browser(&auth_url);
     println!("Waiting for browser callback...");
 
-    // Channel: loopback callback OR stdin paste both send (code, state, login_id) here
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(String, String, String)>>(2);
+    // Channel: loopback callback OR stdin paste both send here.
+    // The 4th field is the source tag ("loopback" or "stdin") for debugging.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(String, String, String, String)>>(2);
 
     // Spawn loopback listener task
     let tx_loopback = tx.clone();
     let state_for_loopback = state.clone();
     tokio::spawn(async move {
-        let result: Result<(String, String, String)> = async {
+        let result: Result<(String, String, String, String)> = async {
             let (mut stream, _) = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
                 listener.accept(),
@@ -303,7 +304,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             if code.is_empty() {
                 anyhow::bail!("No authorization code received from OAuth server.");
             }
-            Ok((code, ret_state, login_id))
+            Ok((code, ret_state, login_id, "loopback".to_string()))
         }.await;
         let _ = tx_loopback.send(result).await;
     });
@@ -316,7 +317,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
         rx.recv(),
     ).await;
 
-    let (code, _, login_id) = match first {
+    let (code, _, login_id, _source) = match first {
         Ok(Some(result)) => {
             // Callback arrived within 5s
             print!("Validating...");
@@ -366,7 +367,7 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
                                 eprintln!("Stale URL from a previous login attempt — paste the URL from the CURRENT browser tab.");
                                 continue;
                             }
-                            let _ = tx_stdin.send(Ok((code, ret_state, login_id))).await;
+                            let _ = tx_stdin.send(Ok((code, ret_state, login_id, "stdin".to_string()))).await;
                             break;
                         }
                         _ => {
@@ -416,6 +417,9 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         eprintln!(" failed.");
+        eprintln!("  source:       {}", _source);
+        eprintln!("  redirect_uri: {}", redirect_uri);
+        eprintln!("  code prefix:  {}...", &code[..code.len().min(12)]);
         anyhow::bail!("Token exchange failed ({status}): {body}");
     }
     eprintln!(" ok.");
