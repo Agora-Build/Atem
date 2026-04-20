@@ -5,6 +5,10 @@ A terminal that connects people, Agora platform, and AI agents. Manage Agora pro
 ## Install
 
 ```bash
+# Quick install (works in regions where GitHub is not available)
+curl -fsSL https://dl.agora.build/atem/install.sh | bash
+
+# Or via npm
 npm install -g @agora-build/atem
 ```
 
@@ -22,15 +26,7 @@ atem repl                               # Interactive REPL with AI command inter
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
 atem logout                             # Log out from SSO
-atem pair                               # Pair with Astation
-atem pair --save                        # Pair and save credentials for offline use
-atem unpair                             # Unpair from Astation
 ```
-
-Two ways to authenticate:
-
-- **`atem login`** — your own Agora Console login. Auto-refreshes.
-- **`atem pair`** — receive credentials from a connected Astation. Paired tokens take priority when connected; own login is the fallback.
 
 ### Tokens
 
@@ -60,21 +56,34 @@ atem config show                        # Show resolved config
 atem config set astation_ws <URL>       # Set Astation WebSocket URL
 atem config set astation_relay_url <URL> # Set Astation relay URL
 atem config clear                       # Clear active project selection
+atem config convo                       # Interactive wizard to configure ConvoAI agent
+atem config convo --validate            # Validate existing config without modifying
+atem config convo --config <PATH>       # Use a specific config file
 ```
 
-### AI Agents
+### ConvoAI (Conversational AI)
 
 ```bash
-atem agent list                         # Scan and list detected AI agents
-atem agent launch                       # Launch Claude Code as PTY agent
-atem agent launch codex                 # Launch Codex as PTY agent
-atem agent connect <WS_URL>             # Connect to ACP agent and show info
-atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent
-atem agent probe <WS_URL>               # Probe URL for ACP support
-atem agent visualize "topic"            # Generate visual HTML diagram via ACP agent
-atem agent visualize "topic" --url ws://localhost:8765  # Explicit agent URL
-atem agent visualize "topic" --no-browser               # Skip opening browser
+atem serv convo                         # Launch ConvoAI test page (HTTPS)
+atem serv convo --channel my-channel    # Pin a specific channel
+atem serv convo --config ~/convo.toml   # Use custom config
+atem serv convo --background            # Headless mode (no browser)
+atem serv convo --no-browser            # Don't auto-open browser
 ```
+
+The ConvoAI page provides:
+- **Live voice conversation** with an Agora ConvoAI agent
+- **Real-time transcription** (user + agent, via RTM)
+- **Preset selection** via checkboxes (comma-joined)
+- **Avatar support** (Akool, LiveAvatar, Anam) with remote video
+- **RTC Stats** panel + **API History** panel for debugging
+- **Camera toggle** for local video
+
+Configure with `atem config convo` (interactive wizard) or edit `~/.config/atem/convo.toml` directly. The wizard supports:
+- **Segmented pipeline**: pick ASR + LLM + TTS providers individually
+- **Multimodal LLM (MLLM)**: OpenAI Realtime, Google Gemini Live
+- **Presets**: use Agora-managed preset bundles, optionally override individual providers
+- **10 ASR**, **9 LLM**, **12 TTS**, **3 MLLM**, **3 Avatar** providers with vendor-specific params
 
 ### Dev Servers
 
@@ -88,6 +97,18 @@ atem serv diagrams --background         # Run as background daemon
 atem serv list                          # List running background servers
 atem serv kill <ID>                     # Kill a background server
 atem serv killall                       # Kill all background servers
+```
+
+### AI Agents
+
+```bash
+atem agent list                         # Scan and list detected AI agents
+atem agent launch                       # Launch Claude Code as PTY agent
+atem agent launch codex                 # Launch Codex as PTY agent
+atem agent connect <WS_URL>             # Connect to ACP agent and show info
+atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent
+atem agent probe <WS_URL>              # Probe URL for ACP support
+atem agent visualize "topic"            # Generate visual HTML diagram via ACP agent
 ```
 
 ## TUI Modes
