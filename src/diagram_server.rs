@@ -162,7 +162,7 @@ pub async fn run_server(config: DiagramServerConfig) -> Result<()> {
 
     // ── Background mode: re-exec as daemon ─────────────────────────
     if config.background && !config._daemon {
-        return spawn_background_daemon(port, &local_url, &network_url);
+        return spawn_background_daemon(port, &local_url, &network_url, &custom_urls);
     }
 
     // ── Daemon mode: register self and set up cleanup ──────────────
@@ -533,7 +533,7 @@ fn unregister_server(id: &str) -> Result<()> {
 }
 
 /// Spawn `atem serv diagrams --serv-daemon` as a detached background process.
-fn spawn_background_daemon(port: u16, local_url: &str, network_url: &str) -> Result<()> {
+fn spawn_background_daemon(port: u16, local_url: &str, network_url: &str, custom_urls: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_dir = servers_dir();
     std::fs::create_dir_all(&log_dir)?;
@@ -574,6 +574,9 @@ fn spawn_background_daemon(port: u16, local_url: &str, network_url: &str) -> Res
     println!("  PID:     {}", child.id());
     println!("  Local:   {}", local_url);
     println!("  Network: {}", network_url);
+    for u in custom_urls {
+        println!("  Custom:  {}", u);
+    }
     println!("  Log:     {}", log_path.display());
     println!();
     println!("Use `atem serv list` to see running servers.");
@@ -616,7 +619,7 @@ pub fn ensure_running() -> Result<String> {
     let local_url = format!("http://localhost:{}", port);
     let network_url = format!("http://{}:{}", lan_ip, port);
 
-    spawn_background_daemon(port, &local_url, &network_url)?;
+    spawn_background_daemon(port, &local_url, &network_url, &[])?;
 
     // Wait briefly for the server to start accepting connections
     std::thread::sleep(std::time::Duration::from_millis(500));
