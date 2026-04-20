@@ -777,6 +777,52 @@ pub fn run_validate(config_path: &Path) -> Result<()> {
     let rtm = cfg.advanced_features.as_ref().and_then(|m| m.get("enable_rtm")).and_then(|v| v.as_bool()).unwrap_or(false);
     if !rtm { warnings.push("advanced_features.enable_rtm is not true — transcription won't work".into()); }
 
+    // Check for large integers in param maps that would lose precision
+    // when serialized to JSON (> 2^53 = 9007199254740992). These should
+    // be quoted strings in TOML, not bare integers.
+    fn check_large_ints(section: &str, map: &BTreeMap<String, toml::Value>, warnings: &mut Vec<String>) {
+        const JS_SAFE_MAX: i64 = 9007199254740992;
+        for (k, v) in map {
+            if let toml::Value::Integer(n) = v {
+                if n.abs() > JS_SAFE_MAX {
+                    warnings.push(format!(
+                        "{}.{} = {} is a bare integer > 2^53 — will lose precision in JSON. \
+                         Quote it as a string: {} = {:?}",
+                        section, k, n, k, n.to_string()
+                    ));
+                }
+            }
+            if let toml::Value::Table(sub) = v {
+                let sub_map: BTreeMap<String, toml::Value> = sub.iter().map(|(k2, v2)| (k2.clone(), v2.clone())).collect();
+                check_large_ints(&format!("{}.{}", section, k), &sub_map, warnings);
+            }
+        }
+    }
+    if let Some(agent) = &cfg.agent {
+        if let Some(asr) = &agent.asr { check_large_ints("[agent.asr.params]", &asr.params, &mut warnings); }
+        if let Some(llm) = &agent.llm { check_large_ints("[agent.llm.params]", &llm.params, &mut warnings); }
+        if let Some(tts) = &agent.tts { check_large_ints("[agent.tts.params]", &tts.params, &mut warnings); }
+        if let Some(av) = &agent.avatar { check_large_ints("[agent.avatar.params]", &av.params, &mut warnings); }
+    }
+
+    // Check data_channel = "rtm" (common misconfiguration)
+    let data_ch = cfg.parameters.as_ref().and_then(|m| m.get("data_channel")).and_then(|v| v.as_str()).unwrap_or("");
+    if !data_ch.is_empty() && data_ch != "rtm" {
+        warnings.push(format!("parameters.data_channel = {:?} — transcripts usually need \"rtm\"", data_ch));
+    }
+
+    // Check ASR vendor is set when ASR block exists
+    if has_asr {
+        let asr = cfg.agent.as_ref().unwrap().asr.as_ref().unwrap();
+        if asr.vendor.is_none() { warnings.push("[agent.asr] has no vendor".into()); }
+    }
+
+    // Check TTS vendor is set when TTS block exists
+    if has_tts {
+        let tts = cfg.agent.as_ref().unwrap().tts.as_ref().unwrap();
+        if tts.vendor.is_none() { warnings.push("[agent.tts] has no vendor".into()); }
+    }
+
     for e in &errors { println!("  ERROR:   {}", e); }
     for w in &warnings { println!("  WARNING: {}", w); }
     if errors.is_empty() && warnings.is_empty() {
