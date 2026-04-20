@@ -10,6 +10,7 @@
 
 # Tooling state
 .claude/
+.wrangler/
 
 # Editor settings
 .vscode/
