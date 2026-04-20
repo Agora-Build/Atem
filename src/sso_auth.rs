@@ -336,10 +336,11 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
             std::io::stdout().flush().ok();
 
             // Spawn stdin reader — loops until it gets a non-empty line
-            // with a valid authorization code. Empty lines (accidental
-            // Enter) are silently ignored so the user can retry, and
-            // the loopback callback can still win the race at any time.
+            // with a valid authorization code + matching state. Empty
+            // lines (accidental Enter) and stale URLs from previous
+            // login attempts (state mismatch) are rejected with a hint.
             let tx_stdin = tx.clone();
+            let expected_state = state.clone();
             tokio::spawn(async move {
                 loop {
                     let line = tokio::task::spawn_blocking(|| {
@@ -350,19 +351,22 @@ pub async fn run_login_flow(sso_url: &str) -> Result<SsoSession> {
                         Ok(Ok(s)) => {
                             let pasted = s.trim();
                             if pasted.is_empty() {
-                                // Blank Enter — silently loop for another line.
                                 continue;
                             }
                             let query = pasted
                                 .split_once('?')
                                 .map(|(_, q)| q.split('#').next().unwrap_or(q))
                                 .unwrap_or("");
-                            let (code, state, login_id) = parse_callback_query(query);
+                            let (code, ret_state, login_id) = parse_callback_query(query);
                             if code.is_empty() {
                                 eprintln!("No authorization code found — paste the full callback URL.");
                                 continue;
                             }
-                            let _ = tx_stdin.send(Ok((code, state, login_id))).await;
+                            if ret_state != expected_state {
+                                eprintln!("Stale URL from a previous login attempt — paste the URL from the CURRENT browser tab.");
+                                continue;
+                            }
+                            let _ = tx_stdin.send(Ok((code, ret_state, login_id))).await;
                             break;
                         }
                         _ => {
