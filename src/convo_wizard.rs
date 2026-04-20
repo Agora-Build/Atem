@@ -237,6 +237,26 @@ const AVATAR_PROVIDERS: &[Provider] = &[
     ]},
 ];
 
+// ── MLLM providers (per docs.agora.io/en/conversational-ai/models/mllm/overview)
+
+const MLLM_PROVIDERS: &[Provider] = &[
+    Provider { name: "OpenAI Realtime API", vendor_id: "openai_realtime", beta: false, style: "", params: &[
+        Param { key: "api_key", label: "API Key", secret: true, default_value: "", hint: "" },
+        Param { key: "model", label: "Model", secret: false, default_value: "gpt-4o-realtime-preview", hint: "" },
+        Param { key: "voice", label: "Voice", secret: false, default_value: "alloy", hint: "alloy, echo, fable, onyx, nova, shimmer" },
+    ]},
+    Provider { name: "Google Gemini Live", vendor_id: "gemini_live", beta: false, style: "", params: &[
+        Param { key: "api_key", label: "API Key", secret: true, default_value: "", hint: "" },
+        Param { key: "model", label: "Model", secret: false, default_value: "gemini-2.0-flash-live-001", hint: "" },
+    ]},
+    Provider { name: "Google Gemini Live (Vertex AI)", vendor_id: "gemini_live_vertex", beta: false, style: "", params: &[
+        Param { key: "project_id", label: "GCP Project ID", secret: false, default_value: "", hint: "" },
+        Param { key: "location", label: "Location", secret: false, default_value: "us-central1", hint: "" },
+        Param { key: "adc_credentials_string", label: "Service Account JSON", secret: true, default_value: "", hint: "Full JSON string" },
+        Param { key: "model", label: "Model", secret: false, default_value: "gemini-2.0-flash-live-001", hint: "" },
+    ]},
+];
+
 // ── Wizard answers ──────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -267,6 +287,10 @@ struct WizardAnswers {
     // TTS
     tts_vendor: String,
     tts_params: BTreeMap<String, String>,
+
+    // MLLM (optional — replaces ASR+LLM+TTS when set)
+    mllm_vendor: String,
+    mllm_params: BTreeMap<String, String>,
 
     // Avatar
     avatar_vendor: String,
@@ -388,72 +412,107 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
     let t_default = existing.idle_timeout_secs.unwrap_or(120).to_string();
     a.idle_timeout_secs = prompt_input("Idle timeout (seconds)", &t_default, false)?.parse().unwrap_or(120);
 
-    // Step 3: Presets or custom providers
+    // Step 3: Presets
     if a.use_preset {
         println!("\n── Presets ──");
         let current = existing.preset_list().join(", ");
         let input = prompt_input("Preset name(s), comma-separated", &current, false)?;
         a.presets = input.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    } else {
-        // ASR
-        println!("\n── ASR (Speech-to-Text) ──");
-        let cur_vendor = existing.agent.as_ref().and_then(|ag| ag.asr.as_ref()).and_then(|s| s.vendor.as_deref()).unwrap_or("");
-        let idx = select_provider("ASR", ASR_PROVIDERS, cur_vendor)?;
-        let prov = &ASR_PROVIDERS[idx];
-        a.asr_vendor = prov.vendor_id.to_string();
-        let existing_p = existing.agent.as_ref().and_then(|ag| ag.asr.as_ref()).map(service_params_flat).unwrap_or_default();
-        a.asr_params = collect_provider_params(prov, &existing_p)?;
-        let cur_lang = existing.agent.as_ref().and_then(|ag| ag.asr.as_ref()).and_then(|s| s.language.as_deref()).unwrap_or("en-US");
-        a.asr_language = prompt_input("Language", cur_lang, false)?;
-
-        // LLM
-        println!("\n── LLM (Language Model) ──");
-        let cur_llm_vendor = existing.agent.as_ref().and_then(|ag| ag.llm.as_ref()).and_then(|l| {
-            l.url.as_deref().and_then(|u| {
-                if u.contains("groq.com") { Some("groq") }
-                else if u.contains("anthropic") { Some("anthropic") }
-                else if u.contains("openai.com") { Some("openai") }
-                else if u.contains("generativelanguage.googleapis.com") { Some("gemini") }
-                else if u.contains("aiplatform.googleapis.com") { Some("vertex") }
-                else if u.contains("bedrock") { Some("bedrock") }
-                else { None }
-            })
-        }).unwrap_or("");
-        let idx = select_provider("LLM", LLM_PROVIDERS, cur_llm_vendor)?;
-        let prov = &LLM_PROVIDERS[idx];
-        a.llm_style = prov.style.to_string();
-        if prov.vendor_id == "azure" { a.llm_vendor = "azure".to_string(); }
-
-        let mut existing_p = BTreeMap::new();
-        if let Some(l) = existing.agent.as_ref().and_then(|ag| ag.llm.as_ref()) {
-            if let Some(u) = &l.url { existing_p.insert("url".to_string(), u.clone()); }
-            if let Some(k) = &l.api_key { existing_p.insert("api_key".to_string(), k.clone()); }
-            for (k, v) in &l.params {
-                if let Some(s) = v.as_str() { existing_p.insert(k.clone(), s.to_string()); }
-            }
-        }
-        a.llm_params = collect_provider_params(prov, &existing_p)?;
-        a.llm_url = a.llm_params.remove("url").unwrap_or_default();
-        a.llm_api_key = a.llm_params.remove("api_key").unwrap_or_default();
-
-        let existing_llm = existing.agent.as_ref().and_then(|ag| ag.llm.as_ref());
-        a.llm_greeting = prompt_input("Greeting message", existing_llm.and_then(|l| l.greeting_message.as_deref()).unwrap_or("Hi, how can I help?"), false)?;
-        a.llm_failure = prompt_input("Failure message", existing_llm.and_then(|l| l.failure_message.as_deref()).unwrap_or("Error, please hold on."), false)?;
-        let cur_prompt = existing_llm.and_then(|l| l.system_messages.first()).map(|m| m.content.as_str()).unwrap_or("You are a helpful conversational AI agent.");
-        println!("System prompt (single line; for multiline edit TOML directly):");
-        a.llm_system_prompt = prompt_input("  Prompt", cur_prompt, false)?;
-
-        // TTS
-        println!("\n── TTS (Text-to-Speech) ──");
-        let cur_vendor = existing.agent.as_ref().and_then(|ag| ag.tts.as_ref()).and_then(|s| s.vendor.as_deref()).unwrap_or("");
-        let idx = select_provider("TTS", TTS_PROVIDERS, cur_vendor)?;
-        let prov = &TTS_PROVIDERS[idx];
-        a.tts_vendor = prov.vendor_id.to_string();
-        let existing_p = existing.agent.as_ref().and_then(|ag| ag.tts.as_ref()).map(service_params_flat).unwrap_or_default();
-        a.tts_params = collect_provider_params(prov, &existing_p)?;
     }
 
-    // Avatar (optional, both modes)
+    // Step 4: Pipeline type — segmented (ASR+LLM+TTS) vs multimodal (MLLM)
+    // Both are configurable even in preset mode (as overrides).
+    let configure_providers = if a.use_preset {
+        Confirm::new()
+            .with_prompt("Override provider settings?")
+            .default(existing.agent.as_ref().map(|ag| ag.asr.is_some() || ag.llm.is_some() || ag.tts.is_some()).unwrap_or(false))
+            .interact()?
+    } else {
+        true
+    };
+
+    if configure_providers {
+        let pipeline_items = &[
+            "Segmented pipeline (ASR + LLM + TTS)",
+            "Multimodal LLM (single model handles voice in/out)",
+        ];
+        let pipeline = Select::new()
+            .with_prompt("Pipeline type")
+            .items(pipeline_items)
+            .default(0)
+            .interact()?;
+
+        if pipeline == 1 {
+            // MLLM — single multimodal model
+            println!("\n── MLLM (Multimodal LLM) ──");
+            let idx = select_provider("MLLM", MLLM_PROVIDERS, "")?;
+            let prov = &MLLM_PROVIDERS[idx];
+            a.mllm_vendor = prov.vendor_id.to_string();
+            a.mllm_params = collect_provider_params(prov, &BTreeMap::new())?;
+        } else {
+            // Segmented — ASR + LLM + TTS
+            let suffix = if a.use_preset { " — override" } else { "" };
+
+            // ASR
+            println!("\n── ASR (Speech-to-Text){} ──", suffix);
+            let cur_vendor = existing.agent.as_ref().and_then(|ag| ag.asr.as_ref()).and_then(|s| s.vendor.as_deref()).unwrap_or("");
+            let idx = select_provider("ASR", ASR_PROVIDERS, cur_vendor)?;
+            let prov = &ASR_PROVIDERS[idx];
+            a.asr_vendor = prov.vendor_id.to_string();
+            let existing_p = existing.agent.as_ref().and_then(|ag| ag.asr.as_ref()).map(service_params_flat).unwrap_or_default();
+            a.asr_params = collect_provider_params(prov, &existing_p)?;
+            let cur_lang = existing.agent.as_ref().and_then(|ag| ag.asr.as_ref()).and_then(|s| s.language.as_deref()).unwrap_or("en-US");
+            a.asr_language = prompt_input("Language", cur_lang, false)?;
+
+            // LLM
+            println!("\n── LLM (Language Model){} ──", suffix);
+            let cur_llm_vendor = existing.agent.as_ref().and_then(|ag| ag.llm.as_ref()).and_then(|l| {
+                l.url.as_deref().and_then(|u| {
+                    if u.contains("groq.com") { Some("groq") }
+                    else if u.contains("anthropic") { Some("anthropic") }
+                    else if u.contains("openai.com") { Some("openai") }
+                    else if u.contains("generativelanguage.googleapis.com") { Some("gemini") }
+                    else if u.contains("aiplatform.googleapis.com") { Some("vertex") }
+                    else if u.contains("bedrock") { Some("bedrock") }
+                    else { None }
+                })
+            }).unwrap_or("");
+            let idx = select_provider("LLM", LLM_PROVIDERS, cur_llm_vendor)?;
+            let prov = &LLM_PROVIDERS[idx];
+            a.llm_style = prov.style.to_string();
+            if prov.vendor_id == "azure" { a.llm_vendor = "azure".to_string(); }
+
+            let mut existing_p = BTreeMap::new();
+            if let Some(l) = existing.agent.as_ref().and_then(|ag| ag.llm.as_ref()) {
+                if let Some(u) = &l.url { existing_p.insert("url".to_string(), u.clone()); }
+                if let Some(k) = &l.api_key { existing_p.insert("api_key".to_string(), k.clone()); }
+                for (k, v) in &l.params {
+                    if let Some(s) = v.as_str() { existing_p.insert(k.clone(), s.to_string()); }
+                }
+            }
+            a.llm_params = collect_provider_params(prov, &existing_p)?;
+            a.llm_url = a.llm_params.remove("url").unwrap_or_default();
+            a.llm_api_key = a.llm_params.remove("api_key").unwrap_or_default();
+
+            let existing_llm = existing.agent.as_ref().and_then(|ag| ag.llm.as_ref());
+            a.llm_greeting = prompt_input("Greeting message", existing_llm.and_then(|l| l.greeting_message.as_deref()).unwrap_or("Hi, how can I help?"), false)?;
+            a.llm_failure = prompt_input("Failure message", existing_llm.and_then(|l| l.failure_message.as_deref()).unwrap_or("Error, please hold on."), false)?;
+            let cur_prompt = existing_llm.and_then(|l| l.system_messages.first()).map(|m| m.content.as_str()).unwrap_or("You are a helpful conversational AI agent.");
+            println!("System prompt (single line; for multiline edit TOML directly):");
+            a.llm_system_prompt = prompt_input("  Prompt", cur_prompt, false)?;
+
+            // TTS
+            println!("\n── TTS (Text-to-Speech){} ──", suffix);
+            let cur_vendor = existing.agent.as_ref().and_then(|ag| ag.tts.as_ref()).and_then(|s| s.vendor.as_deref()).unwrap_or("");
+            let idx = select_provider("TTS", TTS_PROVIDERS, cur_vendor)?;
+            let prov = &TTS_PROVIDERS[idx];
+            a.tts_vendor = prov.vendor_id.to_string();
+            let existing_p = existing.agent.as_ref().and_then(|ag| ag.tts.as_ref()).map(service_params_flat).unwrap_or_default();
+            a.tts_params = collect_provider_params(prov, &existing_p)?;
+        }
+    }
+
+    // Step 5: Avatar (optional, both modes)
     println!("\n── Avatar (optional) ──");
     let mut avatar_items = vec!["Skip".to_string()];
     avatar_items.extend(AVATAR_PROVIDERS.iter().map(|p| p.display()));
@@ -584,8 +643,22 @@ fn build_toml(a: &WizardAnswers) -> String {
         }
     }
 
-    // ASR + LLM + TTS (custom mode only)
-    if !a.use_preset {
+    // MLLM (if chosen instead of segmented pipeline)
+    if !a.mllm_vendor.is_empty() {
+        let _ = writeln!(t, "\n# Multimodal LLM — replaces the ASR + LLM + TTS pipeline");
+        let _ = writeln!(t, "[agent.mllm]");
+        let _ = writeln!(t, "vendor = {:?}", a.mllm_vendor);
+        if !a.mllm_params.is_empty() {
+            let _ = writeln!(t, "\n[agent.mllm.params]");
+            let (flat, nested): (Vec<_>, Vec<_>) = a.mllm_params.iter().partition(|(k, _)| !k.contains('.'));
+            for (k, v) in &flat { write_param(&mut t, "agent.mllm.params", k, v); }
+            for (k, v) in &nested { write_param(&mut t, "agent.mllm.params", k, v); }
+        }
+    }
+
+    // ASR + LLM + TTS (segmented pipeline — written when any has data,
+    // regardless of preset mode since presets can have overrides)
+    if !a.asr_vendor.is_empty() || !a.llm_url.is_empty() || !a.llm_api_key.is_empty() || !a.tts_vendor.is_empty() {
         // LLM
         let _ = writeln!(t, "\n[agent.llm]");
         if !a.llm_url.is_empty() { let _ = writeln!(t, "url              = {:?}", a.llm_url); }
