@@ -318,13 +318,22 @@ fn find_provider_index(providers: &[Provider], vendor_id: &str) -> Option<usize>
 
 fn prompt_input(label: &str, default: &str, secret: bool) -> Result<String> {
     if secret && !default.is_empty() {
+        // Secret with existing value: show masked hint, DON'T pass
+        // the raw value to .default() — dialoguer would print it in
+        // plaintext on the terminal. Empty input = keep existing.
         let masked = mask_secret(default);
         let input: String = Input::new()
-            .with_prompt(format!("{} [{}]", label, masked))
-            .default(default.to_string())
+            .with_prompt(format!("{} [{}] (Enter to keep)", label, masked))
             .allow_empty(true)
             .interact_text()?;
-        Ok(if input.is_empty() { default.to_string() } else { input })
+        Ok(if input.trim().is_empty() { default.to_string() } else { input })
+    } else if secret {
+        // Secret, no existing value: plain prompt, no default shown
+        let input: String = Input::new()
+            .with_prompt(label)
+            .allow_empty(true)
+            .interact_text()?;
+        Ok(input)
     } else {
         let mut builder = Input::<String>::new().with_prompt(label);
         if !default.is_empty() {
