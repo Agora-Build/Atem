@@ -3,7 +3,7 @@
 # Install atem — Agora's CLI for real-time communication.
 #
 # Quick install (works in regions where GitHub is not available):
-#   curl -fsSL https://agora.build/atem/install.sh | bash
+#   curl -fsSL https://dl.agora.build/atem/install.sh | bash
 #
 # Options (via env vars):
 #   ATEM_VERSION=0.4.91   Pin a specific version (default: latest)
@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-BASE_URL="${ATEM_BASE_URL:-https://agora.build/atem/releases}"
+BASE_URL="${ATEM_BASE_URL:-https://dl.agora.build/atem/releases}"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
