@@ -566,27 +566,49 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
 
 // ── TOML builder ────────────────────────────────────────────────────
 
-/// Write a dotted key (e.g. "voice_setting.voice_id") as nested TOML.
-/// Returns (section_prefix, leaf_key, value).
+/// Write a param to TOML. Dotted keys (e.g. "voice_setting.voice_id")
+/// become nested tables. Values are ALWAYS quoted as strings — never
+/// written as bare integers — because:
+///   1. Large numeric-looking strings (e.g. group_id "1967483817044222128")
+///      overflow JS safe-integer if serialized as numbers, causing
+///      precision loss and Agora 400 errors.
+///   2. The ConvoConfig parser uses BTreeMap<String, toml::Value> which
+///      preserves TOML types, and toml_value_to_json faithfully converts
+///      String→String. Writing them as TOML strings is always safe.
+/// Booleans are the one exception (true/false without quotes).
+/// Keys that should be written as bare integers in TOML (not quoted).
+/// Everything else stays as a quoted string to avoid precision loss
+/// on large numeric-looking values like group_id.
+const NUMERIC_KEYS: &[&str] = &[
+    "sample_rate", "sample_rate_hertz", "max_tokens",
+    "media_sample_rate_hz", "speed", "volume", "rate", "pitch",
+    "loudness", "pace", "stability", "similarity_boost",
+    "trailing_silence",
+];
+
 fn write_param(t: &mut String, section: &str, key: &str, value: &str) {
+    let write_value = |t: &mut String, leaf: &str, val: &str| {
+        if val == "true" || val == "false" {
+            let _ = writeln!(t, "{} = {}", leaf, val);
+        } else if NUMERIC_KEYS.contains(&leaf) {
+            if let Ok(n) = val.parse::<i64>() {
+                let _ = writeln!(t, "{} = {}", leaf, n);
+            } else if let Ok(f) = val.parse::<f64>() {
+                let _ = writeln!(t, "{} = {}", leaf, f);
+            } else {
+                let _ = writeln!(t, "{} = {:?}", leaf, val);
+            }
+        } else {
+            let _ = writeln!(t, "{} = {:?}", leaf, val);
+        }
+    };
     if let Some(dot) = key.rfind('.') {
         let sub = &key[..dot];
         let leaf = &key[dot+1..];
         let _ = writeln!(t, "\n[{}.{}]", section, sub);
-        // Try parsing as integer, bool, or string
-        if let Ok(n) = value.parse::<i64>() {
-            let _ = writeln!(t, "{} = {}", leaf, n);
-        } else if value == "true" || value == "false" {
-            let _ = writeln!(t, "{} = {}", value, value);
-        } else {
-            let _ = writeln!(t, "{} = {:?}", leaf, value);
-        }
-    } else if let Ok(n) = value.parse::<i64>() {
-        let _ = writeln!(t, "{} = {}", key, n);
-    } else if value == "true" || value == "false" {
-        let _ = writeln!(t, "{} = {}", key, value);
+        write_value(t, leaf, value);
     } else {
-        let _ = writeln!(t, "{} = {:?}", key, value);
+        write_value(t, key, value);
     }
 }
 
