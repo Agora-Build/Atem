@@ -43,10 +43,12 @@ atem logout                             # Log out from SSO
 
 ```bash
 atem token rtc create                   # Generate RTC token (interactive)
-atem token rtc create --channel test --uid 0 --expire 3600
+atem token rtc create --channel test --rtc-user-id 0 --expire 3600
+atem token rtc create --channel test --rtc-user-id alice --with-rtm   # RTC + RTM in one token (reuses rtc-user-id)
+atem token rtc create --channel test --rtc-user-id 42 --with-rtm --rtm-user-id bob  # Separate RTM account
 atem token rtc decode <token>           # Decode existing RTC token
 atem token rtm create                   # Generate Signaling (RTM) token
-atem token rtm create --user-id bob --expire 3600
+atem token rtm create --rtm-user-id bob --expire 3600
 atem token rtm decode <token>           # Decode existing Signaling (RTM) token
 ```
 
