@@ -62,6 +62,7 @@ resolve_version() {
 
 pick_install_dir() {
   if [ -n "${ATEM_INSTALL_DIR:-}" ]; then
+    mkdir -p "$ATEM_INSTALL_DIR"
     echo "$ATEM_INSTALL_DIR"
     return
   fi
@@ -94,8 +95,7 @@ main() {
   info "To:       ${install_dir}/atem"
 
   # Download + extract to temp dir
-  local tmpdir
-  tmpdir="$(mktemp -d)"
+  tmpdir="$(mktemp -d)"  # global so EXIT trap can see it
   trap 'rm -rf "$tmpdir"' EXIT
 
   curl -fSL --progress-bar "$url" -o "${tmpdir}/${archive}" \
