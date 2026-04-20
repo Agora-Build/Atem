@@ -203,13 +203,13 @@ jobs:
           for f in dist/atem-*.tar.gz; do
             KEY="atem/releases/${VERSION}/$(basename $f)"
             echo "Uploading $KEY"
-            wrangler r2 object put "$BUCKET/$KEY" --file="$f"
+            wrangler r2 object put "$BUCKET/$KEY" --file="$f" --remote
           done
 
           # Update the 'latest' version marker (plain text, no 'v' prefix)
           echo -n "${VERSION#v}" | wrangler r2 object put "$BUCKET/atem/releases/latest" \
-            --pipe --content-type text/plain
+            --pipe --content-type text/plain --remote
 
           # Upload the install script
           wrangler r2 object put "$BUCKET/atem/install.sh" \
-            --file=scripts/install.sh --content-type text/plain
+            --file=scripts/install.sh --content-type text/plain --remote
