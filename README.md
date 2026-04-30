@@ -93,9 +93,9 @@ atem serv kill <ID>                     # Kill a background server
 atem serv killall                       # Kill all background servers
 ```
 
-**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle.
+**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle, RTC encryption (key + salt forwarded to the agent).
 
-**`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging.
+**`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging, RTC encryption (8 modes; gcm2 modes auto-generate a copyable salt).
 
 **`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
 

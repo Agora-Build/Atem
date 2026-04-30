@@ -173,6 +173,15 @@ pub struct JoinArgs<'a> {
     /// the config-level `preset` / `presets[0]`. Usually comes from the
     /// browser dropdown selection via /api/convo/start's body.
     pub preset:         Option<&'a str>,
+    /// RTC encryption mode (1..=8). See Agora ConvoAI docs for the integer
+    /// table. When `encryption_key` is set and `encryption_mode` is `None`,
+    /// the agent uses Agora's default (AES_128_GCM).
+    pub encryption_mode: Option<u8>,
+    /// RTC encryption key. Empty / `None` → no encryption.
+    pub encryption_key:  Option<&'a str>,
+    /// Base64-encoded 32-byte salt. Required by gcm2 modes (7, 8). Ignored
+    /// for other modes by the Agora server.
+    pub encryption_salt: Option<&'a str>,
 }
 
 impl ConvoConfig {
@@ -290,6 +299,22 @@ impl ConvoConfig {
         }
         if let Some(m) = &self.parameters {
             props.insert("parameters".into(), map_to_json(m));
+        }
+
+        // RTC encryption (https://docs.agora.io/en/conversational-ai/rest-api/agent/join).
+        // Emit `properties.rtc` only when an encryption_key is supplied;
+        // omitting the block keeps the call unencrypted, which is the
+        // ConvoAI default.
+        if let Some(key) = args.encryption_key.filter(|s| !s.is_empty()) {
+            let mut rtc = Map::new();
+            rtc.insert("encryption_key".into(), json!(key));
+            if let Some(mode) = args.encryption_mode {
+                rtc.insert("encryption_mode".into(), json!(mode));
+            }
+            if let Some(salt) = args.encryption_salt.filter(|s| !s.is_empty()) {
+                rtc.insert("encryption_salt".into(), json!(salt));
+            }
+            props.insert("rtc".into(), Value::Object(rtc));
         }
 
         // Top-level request envelope:
@@ -521,6 +546,9 @@ mod tests {
             avatar_channel: None,
             avatar_token:   None,
             preset:        None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
 
         // Top-level
@@ -575,6 +603,9 @@ mod tests {
             avatar_channel: None,
             avatar_token:   None,
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         assert!(body["properties"].get("avatar").is_none());
     }
@@ -608,6 +639,46 @@ mod tests {
     }
 
     #[test]
+    fn join_payload_emits_rtc_encryption_when_key_set() {
+        let cfg: ConvoConfig = toml::from_str("").unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
+            preset: None,
+            encryption_mode: Some(8),
+            encryption_key:  Some("hunter2"),
+            encryption_salt: Some("c2FsdC1iYXNlNjQ="),
+        });
+        let rtc = &body["properties"]["rtc"];
+        assert_eq!(rtc["encryption_mode"], 8);
+        assert_eq!(rtc["encryption_key"], "hunter2");
+        assert_eq!(rtc["encryption_salt"], "c2FsdC1iYXNlNjQ=");
+    }
+
+    #[test]
+    fn join_payload_omits_rtc_encryption_when_key_empty() {
+        let cfg: ConvoConfig = toml::from_str("").unwrap();
+        // Empty key behaves like None — no `properties.rtc` block.
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
+            preset: None,
+            encryption_mode: Some(8),
+            encryption_key:  Some(""),
+            encryption_salt: Some("c2FsdC1iYXNlNjQ="),
+        });
+        assert!(body["properties"].get("rtc").is_none());
+    }
+
+    #[test]
     fn join_payload_runtime_preset_overrides_config() {
         let toml_str = r#"preset = "from_config""#;
         let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
@@ -619,6 +690,9 @@ mod tests {
             avatar_channel: None,
             avatar_token:   None,
             preset: Some("from_runtime"),
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         assert_eq!(body["preset"], "from_runtime");
     }
@@ -641,6 +715,9 @@ mod tests {
             avatar_channel: None,
             avatar_token:   None,
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"], true);
@@ -671,6 +748,9 @@ api_key = "secret"
             avatar_channel: None,
             avatar_token:   None,
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"],                 true);
@@ -699,6 +779,9 @@ avatar_id = "abc"
             avatar_channel: None,
             avatar_token:   None,
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         assert!(body["properties"].get("avatar").is_none());
     }
@@ -719,6 +802,9 @@ avatar_id = "abc"
             avatar_channel: Some("convoai-ch"),
             avatar_token:   Some("007tk"),
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"], true);
@@ -750,6 +836,9 @@ agora_app_cert = "<SECRET>"
             avatar_channel: Some("convoai-fake-uuid"),
             avatar_token:   Some("007fake"),
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         let ap = &body["properties"]["avatar"]["params"];
         assert_eq!(ap["agora_appid"],   "54faa34804aa4411a5a1c5f81a2a95b3");
@@ -819,6 +908,9 @@ agora_token = "007user"
             avatar_channel: Some("convoai-caller"),
             avatar_token:   Some("007caller"),
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         assert_eq!(body["properties"]["avatar"]["params"]["agora_token"], "007user");
     }
@@ -844,6 +936,9 @@ agora_uid = "explicit_from_toml"
             avatar_channel: None,
             avatar_token:   None,
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         assert_eq!(body["properties"]["avatar"]["params"]["agora_uid"],
                    "explicit_from_toml");
@@ -885,6 +980,9 @@ validate_asr_result_timestamp = false
             avatar_channel: None,
             avatar_token:   None,
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         let props = &body["properties"];
         assert_eq!(props["advanced_features"]["enable_rtm"],  true);
@@ -909,6 +1007,9 @@ validate_asr_result_timestamp = false
             avatar_channel: None,
             avatar_token:   None,
             preset: None,
+            encryption_mode: None,
+            encryption_key: None,
+            encryption_salt: None,
         });
         assert_eq!(body["preset"], "first");
     }

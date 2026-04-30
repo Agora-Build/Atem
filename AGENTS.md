@@ -292,7 +292,12 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   `--background` runs headless for scenarios where an external device joins the
   channel on its own and atem's only job is to keep the agent alive.
   Features: live transcription (RTM), preset checkboxes, avatar video
-  (Akool/LiveAvatar/Anam), RTC Stats, API History, camera toggle.
+  (Akool/LiveAvatar/Anam), RTC Stats, API History, camera toggle,
+  RTC encryption (key + base64 salt sent to ConvoAI as `properties.rtc.{encryption_key, encryption_salt, encryption_mode}`;
+  same params applied to local Web SDK so both peers decrypt). gcm2
+  modes (7, 8) require a 32-byte salt; the page auto-generates one and
+  exposes it as a copyable, editable field. Project must have Media
+  Stream Encryption enabled in the Agora console for the appid.
 - **ConvoAI Config Wizard (`atem config convo`)**: Interactive terminal wizard
   that generates `~/.config/atem/convo.toml`. Supports preset-based or custom
   configuration with provider selection for ASR (10 vendors), LLM (9), TTS (12),

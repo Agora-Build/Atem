@@ -736,6 +736,27 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <button id="fetchBtn" class="btn btn-mute" onclick="fetchToken()" disabled>Fetch</button>
     <button class="copy-btn" onclick="copyText(document.getElementById('tokenInput').value)">Copy</button>
   </div>
+  <div class="controls">
+    <label>Encryption</label>
+    <select id="encModeSelect" style="width:200px">
+      <option value="0">None</option>
+      <option value="8" selected>AES_256_GCM2</option>
+      <option value="7">AES_128_GCM2</option>
+      <option value="6">AES_256_GCM</option>
+      <option value="5">AES_128_GCM</option>
+      <option value="3">AES_256_XTS</option>
+      <option value="1">AES_128_XTS</option>
+      <option value="2">AES_128_ECB</option>
+      <option value="4">SM4_128_ECB</option>
+    </select>
+    <input id="encKeyInput" type="text" placeholder="Encryption key (empty = unencrypted)" style="flex:1">
+  </div>
+  <div class="token-row" id="encSaltRow">
+    <label>Salt</label>
+    <textarea id="encSaltInput" rows="1" placeholder="Base64 32-byte salt (auto-generated; shared across tabs/agent)"></textarea>
+    <button class="btn btn-mute" onclick="regenSalt()">Regen</button>
+    <button class="copy-btn" onclick="copyText(document.getElementById('encSaltInput').value)">Copy</button>
+  </div>
 </section>
 
 <!-- ── RTC ─────────────────────────────────────────────────────── -->
@@ -768,6 +789,56 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 {rtm_sdk_script}
 <script>
 const APP_ID = "{app_id}";
+
+// ── Encryption helpers ───────────────────────────────────────────
+// Mode IDs match the Agora ConvoAI REST API integer table; the strings
+// are what AgoraRTC.setEncryptionConfig expects. gcm2 modes (7, 8)
+// require a 32-byte salt; both peers must use the SAME key AND salt
+// or audio comes back as noise / silence.
+const ENC_MODE_NAMES = {{
+  1: 'aes-128-xts', 2: 'aes-128-ecb', 3: 'aes-256-xts', 4: 'sm4-128-ecb',
+  5: 'aes-128-gcm', 6: 'aes-256-gcm', 7: 'aes-128-gcm2', 8: 'aes-256-gcm2',
+}};
+function randSalt32() {{
+  const a = new Uint8Array(32);
+  crypto.getRandomValues(a);
+  return a;
+}}
+function saltBase64(arr) {{
+  let s = '';
+  for (const b of arr) s += String.fromCharCode(b);
+  return btoa(s);
+}}
+function saltFromBase64(b64) {{
+  const bin = atob(b64);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a;
+}}
+function regenSalt() {{
+  document.getElementById('encSaltInput').value = saltBase64(randSalt32());
+}}
+// Salt only matters for gcm2 modes (7, 8). Hide the row + clear the
+// value for any other mode so the UI shows only what's actually used.
+function syncSaltRow() {{
+  const id = parseInt(document.getElementById('encModeSelect').value, 10);
+  const isGcm2 = id === 7 || id === 8;
+  const row = document.getElementById('encSaltRow');
+  const input = document.getElementById('encSaltInput');
+  if (!row || !input) return;
+  if (isGcm2) {{
+    row.style.display = '';
+    if (!input.value) input.value = saltBase64(randSalt32());
+  }} else {{
+    row.style.display = 'none';
+    input.value = '';
+  }}
+}}
+window.addEventListener('DOMContentLoaded', () => {{
+  document.getElementById('encModeSelect').addEventListener('change', syncSaltRow);
+  syncSaltRow();
+}});
+
 function copyText(text) {{
   if (!text) return;
   navigator.clipboard.writeText(text).then(() => {{
@@ -1009,6 +1080,31 @@ async function doJoin() {{
         setStatus('disconnected', 'Disconnected');
       }}
     }});
+
+    // Encryption (must be configured BEFORE client.join). Empty key →
+    // no encryption. gcm2 modes pass the 32-byte salt from the input;
+    // other modes accept just the key.
+    const encModeId = parseInt(document.getElementById('encModeSelect').value, 10);
+    const encKey    = document.getElementById('encKeyInput').value;
+    if (encModeId !== 0 && encKey) {{
+      const modeStr = ENC_MODE_NAMES[encModeId];
+      const isGcm2  = encModeId === 7 || encModeId === 8;
+      if (isGcm2) {{
+        const saltB64 = document.getElementById('encSaltInput').value.trim();
+        let salt;
+        try {{ salt = saltFromBase64(saltB64); }}
+        catch (e) {{ log('Salt is not valid base64', 'error'); return; }}
+        if (salt.length !== 32) {{
+          log('Salt must decode to 32 bytes (got ' + salt.length + ')', 'error');
+          return;
+        }}
+        client.setEncryptionConfig(modeStr, encKey, salt);
+        log('Encryption: ' + modeStr + ' (salt: ' + saltB64.slice(0, 12) + '…)');
+      }} else {{
+        client.setEncryptionConfig(modeStr, encKey);
+        log('Encryption: ' + modeStr);
+      }}
+    }}
 
     // Join
     const joinedUid = await client.join(APP_ID, channel, token, joinUid);

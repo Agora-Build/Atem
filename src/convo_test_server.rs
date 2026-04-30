@@ -23,10 +23,10 @@ fn convoai_base_url() -> String {
 
 /// Generate a unique agent name for this session.
 /// Build the session name sent as `name` in /join.
-/// Format: `atem-convo-<app_id[..12]>-<unix_ts>-<rand4>`
-/// Embedding a short app_id prefix makes session names unambiguously
-/// bound to the project they belong to — useful in logs and when
-/// multiple projects share infrastructure.
+/// Format: `atem-agent-<app_id[..12]>-<unix_ts>-<rand4>`
+/// The `agent` prefix keeps this visually distinct from the auto-
+/// generated channel (`atem-convo-...`); they would otherwise share
+/// the same shape and be hard to tell apart in logs.
 fn gen_agent_name(app_id: &str) -> String {
     use rand::RngCore;
     let ts = std::time::SystemTime::now()
@@ -35,7 +35,7 @@ fn gen_agent_name(app_id: &str) -> String {
         .unwrap_or(0);
     let rand = rand::thread_rng().next_u32();
     let prefix: String = app_id.chars().take(12).collect();
-    format!("atem-convo-{prefix}-{ts}-{:04x}", rand & 0xffff)
+    format!("atem-agent-{prefix}-{ts}-{:04x}", rand & 0xffff)
 }
 
 /// Generate a random RTC uid (as a short decimal string) for the
@@ -342,6 +342,11 @@ async fn run_background(
         avatar_token:   avatar_token.as_deref(),
         // Background mode: no UI, use config-level preset as-is.
         preset: None,
+        // Encryption is opt-in via the browser UI; not surfaced in
+        // background mode (where there is no UI to type a key into).
+        encryption_mode: None,
+        encryption_key: None,
+        encryption_salt: None,
     });
 
     let url = format!(
@@ -462,6 +467,20 @@ async fn handle_connection(
                 .as_str()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
+            // Optional RTC encryption from the page. Browser sends mode (1..=8),
+            // key, and salt (base64 32 bytes for gcm2 modes). Empty key →
+            // unencrypted (no `properties.rtc` block emitted).
+            let enc_key: Option<String> = req["encryption_key"]
+                .as_str()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            let enc_mode: Option<u8> = req["encryption_mode"]
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok());
+            let enc_salt: Option<String> = req["encryption_salt"]
+                .as_str()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
 
             // Only one agent at a time per process.
             {
@@ -509,6 +528,9 @@ async fn handle_connection(
                 avatar_channel: avatar_channel.as_deref(),
                 avatar_token:   avatar_token.as_deref(),
                 preset: preset_override.as_deref(),
+                encryption_mode: enc_mode,
+                encryption_key:  enc_key.as_deref(),
+                encryption_salt: enc_salt.as_deref(),
             });
 
             let url = format!(
@@ -821,6 +843,27 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <button id="fetchBtn" class="btn btn-mute" onclick="fetchToken()">Fetch</button>
     <button class="copy-btn" onclick="copyText(document.getElementById('tokenInput').value)">Copy</button>
   </div>
+  <div class="controls">
+    <label>Encryption</label>
+    <select id="encModeSelect" style="width:200px">
+      <option value="0">None</option>
+      <option value="8" selected>AES_256_GCM2</option>
+      <option value="7">AES_128_GCM2</option>
+      <option value="6">AES_256_GCM</option>
+      <option value="5">AES_128_GCM</option>
+      <option value="3">AES_256_XTS</option>
+      <option value="1">AES_128_XTS</option>
+      <option value="2">AES_128_ECB</option>
+      <option value="4">SM4_128_ECB</option>
+    </select>
+    <input id="encKeyInput" type="text" placeholder="Encryption key (empty = unencrypted; same key used for local SDK + agent)" style="flex:1">
+  </div>
+  <div class="token-row" id="encSaltRow">
+    <label>Salt</label>
+    <textarea id="encSaltInput" rows="1" placeholder="Base64 32-byte salt (auto-generated; same value sent to agent)"></textarea>
+    <button class="btn btn-mute" onclick="regenSalt()">Regen</button>
+    <button class="copy-btn" onclick="copyText(document.getElementById('encSaltInput').value)">Copy</button>
+  </div>
 </section>
 
 <!-- ── RTC ─────────────────────────────────────────────────────── -->
@@ -894,6 +937,55 @@ const PRESET      = "{preset}";
 const PRESETS     = {presets_js};    // e.g. ["expertise_ai_poc", ...] or []
 const AVATAR_OK   = {avatar_ok};     // [agent.avatar] block present in TOML
 const AVATAR_INFO = {avatar_info_js};  // {{vendor, avatar_id}} or null
+
+// ── Encryption helpers ───────────────────────────────────────────
+// Mode IDs match the Agora ConvoAI REST API integer table; the strings
+// are what AgoraRTC.setEncryptionConfig expects. The same key+salt is
+// sent to /api/convo/start so the agent joins encrypted with matching
+// params; otherwise audio comes back as noise / silence.
+const ENC_MODE_NAMES = {{
+  1: 'aes-128-xts', 2: 'aes-128-ecb', 3: 'aes-256-xts', 4: 'sm4-128-ecb',
+  5: 'aes-128-gcm', 6: 'aes-256-gcm', 7: 'aes-128-gcm2', 8: 'aes-256-gcm2',
+}};
+function randSalt32() {{
+  const a = new Uint8Array(32);
+  crypto.getRandomValues(a);
+  return a;
+}}
+function saltBase64(arr) {{
+  let s = '';
+  for (const b of arr) s += String.fromCharCode(b);
+  return btoa(s);
+}}
+function saltFromBase64(b64) {{
+  const bin = atob(b64);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a;
+}}
+function regenSalt() {{
+  document.getElementById('encSaltInput').value = saltBase64(randSalt32());
+}}
+// Salt only matters for gcm2 modes (7, 8). Hide the row + clear the
+// value for any other mode so the UI shows only what's actually used.
+function syncSaltRow() {{
+  const id = parseInt(document.getElementById('encModeSelect').value, 10);
+  const isGcm2 = id === 7 || id === 8;
+  const row = document.getElementById('encSaltRow');
+  const input = document.getElementById('encSaltInput');
+  if (!row || !input) return;
+  if (isGcm2) {{
+    row.style.display = '';
+    if (!input.value) input.value = saltBase64(randSalt32());
+  }} else {{
+    row.style.display = 'none';
+    input.value = '';
+  }}
+}}
+window.addEventListener('DOMContentLoaded', () => {{
+  document.getElementById('encModeSelect').addEventListener('change', syncSaltRow);
+  syncSaltRow();
+}});
 
 function copyText(text) {{
   if (!text) return;
@@ -1086,6 +1178,31 @@ async function doJoin() {{
       else if (cur === 'RECONNECTING') setRtcDot('connecting', 'Reconnecting...');
       else if (cur === 'DISCONNECTED') setRtcDot('disconnected', 'Disconnected');
     }});
+
+    // Encryption (must be configured BEFORE rtcClient.join). Empty key →
+    // no encryption. The same key+salt is sent to /api/convo/start so
+    // the agent joins encrypted with matching params.
+    const encModeId = parseInt(document.getElementById('encModeSelect').value, 10);
+    const encKey    = document.getElementById('encKeyInput').value;
+    if (encModeId !== 0 && encKey) {{
+      const modeStr = ENC_MODE_NAMES[encModeId];
+      const isGcm2  = encModeId === 7 || encModeId === 8;
+      if (isGcm2) {{
+        const saltB64 = document.getElementById('encSaltInput').value.trim();
+        let salt;
+        try {{ salt = saltFromBase64(saltB64); }}
+        catch (e) {{ logEvent('Salt is not valid base64', 'error'); return; }}
+        if (salt.length !== 32) {{
+          logEvent('Salt must decode to 32 bytes (got ' + salt.length + ')', 'error');
+          return;
+        }}
+        rtcClient.setEncryptionConfig(modeStr, encKey, salt);
+        logEvent('Encryption: ' + modeStr + ' (salt: ' + saltB64.slice(0, 12) + '…)');
+      }} else {{
+        rtcClient.setEncryptionConfig(modeStr, encKey);
+        logEvent('Encryption: ' + modeStr);
+      }}
+    }}
 
     const joinedUid = await rtcClient.join(APP_ID, channel, token, joinUid);
     logEvent('Joined as uid ' + joinedUid, 'success');
@@ -1503,6 +1620,19 @@ async function startAgent() {{
   try {{
     const startBody = {{ avatar: includeAvatar }};
     if (presetName) startBody.preset = presetName;
+    // Forward encryption to the agent so it joins with matching params.
+    // Empty key → no encryption fields sent → unencrypted call. Salt
+    // comes from the page's editable Salt field, NOT a per-tab random
+    // value, so the agent's salt matches whatever the local SDK used.
+    const startEncModeId = parseInt(document.getElementById('encModeSelect').value, 10);
+    const startEncKey    = document.getElementById('encKeyInput').value;
+    if (startEncModeId !== 0 && startEncKey) {{
+      startBody.encryption_mode = startEncModeId;
+      startBody.encryption_key  = startEncKey;
+      if (startEncModeId === 7 || startEncModeId === 8) {{
+        startBody.encryption_salt = document.getElementById('encSaltInput').value.trim();
+      }}
+    }}
     const resp = await fetch('/api/convo/start', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
@@ -1514,7 +1644,12 @@ async function startAgent() {{
       setAgentDot('idle', 'idle');
       return;
     }}
-    logEvent('Agent started: ' + (data.agent_id || '?') + ' (' + (data.name || '?') + ')', 'success');
+    const startedChannel = document.getElementById('channelInput').value.trim() || CHANNEL;
+    logEvent(
+      'Agent started: ' + (data.agent_id || '?')
+        + ' (name: ' + (data.name || '?') + ', channel: ' + startedChannel + ')',
+      'success'
+    );
 
     agentRunning = true;
     setAgentDot('connected', 'connected');
@@ -1710,7 +1845,12 @@ window.addEventListener('load', async () => {{
       document.getElementById('startAgentBtn').style.display = 'none';
       document.getElementById('stopAgentBtn').style.display  = '';
       document.getElementById('stopAgentBtn').disabled       = false;
-      logEvent('Existing agent detected: ' + (st.agent_id || '?') + ' (' + (st.name || '?') + ')', 'info');
+      const existingChannel = document.getElementById('channelInput').value.trim() || CHANNEL;
+      logEvent(
+        'Existing agent detected: ' + (st.agent_id || '?')
+          + ' (name: ' + (st.name || '?') + ', channel: ' + existingChannel + ')',
+        'info'
+      );
     }}
   }} catch (_) {{ /* ignore */ }}
 }});
@@ -1811,7 +1951,7 @@ mod tests {
     #[test]
     fn gen_agent_name_has_expected_shape() {
         let n = gen_agent_name("7dcc42cab6404f7b9ea0a36b1500d1f1");
-        assert!(n.starts_with("atem-convo-7dcc42cab640-"), "got: {n}");
+        assert!(n.starts_with("atem-agent-7dcc42cab640-"), "got: {n}");
         // 4-hex suffix after the last dash
         let last = n.rsplit('-').next().unwrap();
         assert_eq!(last.len(), 4);
