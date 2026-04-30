@@ -4,7 +4,14 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "atem")]
 #[command(version)]
-#[command(about = "Agora.io CLI tool with AI integration")]
+#[command(about = "A terminal that connects builders, Agora platform, and AI agents.")]
+#[command(long_about = "A terminal that connects builders, Agora platform, and AI agents.
+
+Open source. Built on official Agora APIs — your credentials stay on your machine.
+
+Disclaimer: This is an unofficial community tool with no SLA or guarantees,
+and may be discontinued at any time. For official products and support,
+visit https://www.agora.io/")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
