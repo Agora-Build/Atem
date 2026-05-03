@@ -1415,6 +1415,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_entry_round_trip_with_status_field() {
+        // Regression: serializing/deserializing must preserve the new
+        // last_status / last_checked_at fields. Also: entries written
+        // before this field existed (no key in JSON) must still parse.
+        let e = ServerEntry {
+            id: "atem-convo-x".into(),
+            pid: 1234,
+            kind: "convo".into(),
+            port: 0,
+            channel: "atem-convo-x".into(),
+            local_url: String::new(),
+            network_url: String::new(),
+            started_at: 1700000000,
+            last_status: Some("RUNNING".into()),
+            last_checked_at: Some(1700000060),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_status.as_deref(), Some("RUNNING"));
+        assert_eq!(back.last_checked_at, Some(1700000060));
+
+        // Pre-status-field entries (no last_status / last_checked_at
+        // keys) — serde defaults them to None thanks to #[serde(default)].
+        let legacy = r#"{
+            "id": "rtc-x",
+            "pid": 1,
+            "kind": "rtc",
+            "port": 8443,
+            "channel": "x",
+            "local_url": "https://localhost:8443",
+            "network_url": "https://192-168-1-1.sslip.io:8443",
+            "started_at": 1700000000
+        }"#;
+        let parsed: ServerEntry = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.last_status.is_none());
+        assert!(parsed.last_checked_at.is_none());
+    }
+
+    #[test]
+    fn resolve_id_or_index_passes_through_literal_id() {
+        // Non-numeric strings are returned verbatim — no registry lookup.
+        let out = resolve_id_or_index("atem-convo-some-channel-0001").unwrap();
+        assert_eq!(out, "atem-convo-some-channel-0001");
+    }
+
+    #[test]
+    fn resolve_id_or_index_rejects_invalid_index() {
+        // 0 (out of 1-based range) and very large numbers should fail
+        // when no servers are running. Without writing real registry
+        // files we can at least confirm the error path triggers.
+        assert!(resolve_id_or_index("0").is_err());
+        assert!(resolve_id_or_index("999").is_err());
+    }
+
+    #[test]
     fn html_page_contains_app_id_and_channel() {
         let html = build_html_page(
             "abc123def456ghij", "my-test-channel", "0", false, "0",

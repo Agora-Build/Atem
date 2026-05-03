@@ -560,6 +560,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_level_hipaa_and_geofence() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            channel       = "c"
+            agent_user_id = "1001"
+            hipaa         = true
+            geofence      = "NORTH_AMERICA"
+        "#).unwrap();
+        assert_eq!(cfg.hipaa, Some(true));
+        assert_eq!(cfg.geofence.as_deref(), Some("NORTH_AMERICA"));
+    }
+
+    #[test]
+    fn parses_encryption_table() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            channel       = "c"
+            agent_user_id = "1001"
+            [encryption]
+            mode = 8
+            key  = "hunter2"
+            salt = "c2FsdC1iYXNlNjQ="
+        "#).unwrap();
+        let enc = cfg.encryption.unwrap();
+        assert_eq!(enc.mode, 8);
+        assert_eq!(enc.key, "hunter2");
+        assert_eq!(enc.salt, "c2FsdC1iYXNlNjQ=");
+    }
+
+    #[test]
+    fn resolve_propagates_hipaa_geofence_encryption_into_resolved() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            channel       = "c"
+            agent_user_id = "1001"
+            hipaa         = true
+            geofence      = "ASIA"
+            [encryption]
+            mode = 7
+            key  = "k"
+            salt = "s"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides {
+            channel: None, rtc_user_id: None, agent_user_id: None,
+        }).unwrap();
+        assert!(r.hipaa);
+        assert_eq!(r.geofence, "ASIA");
+        assert_eq!(r.encryption_mode, 7);
+        assert_eq!(r.encryption_key,  "k");
+        assert_eq!(r.encryption_salt, "s");
+    }
+
+    #[test]
+    fn resolve_defaults_hipaa_off_geofence_empty_encryption_zero() {
+        // Config without hipaa/geofence/encryption blocks — resolution
+        // should produce the off/empty/zero defaults (no surprises).
+        let cfg: ConvoConfig = toml::from_str(r#"
+            channel       = "c"
+            agent_user_id = "1001"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides {
+            channel: None, rtc_user_id: None, agent_user_id: None,
+        }).unwrap();
+        assert!(!r.hipaa);
+        assert_eq!(r.geofence, "");
+        assert_eq!(r.encryption_mode, 0);
+        assert_eq!(r.encryption_key, "");
+        assert_eq!(r.encryption_salt, "");
+    }
+
+    #[test]
     fn parses_full_fixture() {
         let cfg = ConvoConfig::from_file(&fixtures().join("convo_full.toml")).unwrap();
         assert_eq!(cfg.channel.as_deref(), Some("demo"));

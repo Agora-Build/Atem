@@ -2240,6 +2240,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn html_emits_toml_default_constants() {
+        // ResolvedConfig with HIPAA on + geofence + encryption set →
+        // page should bake the defaults into JS constants the form
+        // pre-fill code reads on DOMContentLoaded.
+        let resolved = ResolvedConfig {
+            channel:           "c".into(),
+            rtc_user_id:       "1".into(),
+            agent_user_id:     "2".into(),
+            idle_timeout_secs: None,
+            avatar_configured: false,
+            avatar_summary:    None,
+            preset:            None,
+            presets:           vec![],
+            hipaa:             true,
+            geofence:          "NORTH_AMERICA".into(),
+            encryption_mode:   8,
+            encryption_key:    "hunter2".into(),
+            encryption_salt:   "c2FsdC1iYXNlNjQ=".into(),
+        };
+        let html = build_html_page("app", &resolved, false);
+        assert!(html.contains("const DEFAULT_HIPAA    = true;"),
+            "DEFAULT_HIPAA should be true");
+        assert!(html.contains(r#"const DEFAULT_GEOFENCE = "NORTH_AMERICA";"#));
+        assert!(html.contains("const DEFAULT_ENC_MODE = 8;"));
+        assert!(html.contains(r#"const DEFAULT_ENC_KEY  = "hunter2";"#));
+        assert!(html.contains(r#"const DEFAULT_ENC_SALT = "c2FsdC1iYXNlNjQ=";"#));
+    }
+
+    #[test]
+    fn html_attach_mode_flag_propagates() {
+        let resolved = ResolvedConfig {
+            channel: "c".into(), rtc_user_id: "1".into(), agent_user_id: "2".into(),
+            idle_timeout_secs: None, avatar_configured: false, avatar_summary: None,
+            preset: None, presets: vec![],
+            hipaa: false, geofence: String::new(),
+            encryption_mode: 0, encryption_key: String::new(), encryption_salt: String::new(),
+        };
+        let off = build_html_page("a", &resolved, false);
+        let on  = build_html_page("a", &resolved, true);
+        assert!(off.contains("const ATTACH_MODE      = false;"));
+        assert!(on.contains("const ATTACH_MODE      = true;"));
+    }
+
+    #[test]
     fn mask_secrets_replaces_sensitive_keys_keeps_others() {
         let mut v = serde_json::json!({
             "channel": "test",
