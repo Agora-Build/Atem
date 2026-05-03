@@ -2,4 +2,4 @@ upstream: https://github.com/AgoraIO-Community/Conversational-AI-Demo.git
 ref:      main
 sha:      908e6f96b05f9e978873f991bdeb671d245676fe
 entry:    Web/Scenes/VoiceAgent/src/conversational-ai-api/index.ts
-built:    2026-04-30T19:00:18Z
+built:    2026-05-03T22:49:14Z
