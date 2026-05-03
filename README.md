@@ -81,23 +81,37 @@ atem agent visualize "topic" --no-browser               # Skip opening browser
 ```bash
 atem serv convo                         # Launch ConvoAI test page (HTTPS)
 atem serv convo --config ~/convo.toml   # Use custom config file
-atem serv convo --background            # Headless mode (no browser)
+atem serv convo --background            # Detached daemon — POSTs /join, registers, exits
+atem serv attach <ID>                   # Open UI bound to a running convo daemon (talk to live agent)
+atem serv attach 3                      # …or by index from `atem serv list`
 atem serv rtc                           # Launch RTC test page (HTTPS)
 atem serv rtc --channel test --port 8443
 atem serv rtc --background              # Run as background daemon
 atem serv diagrams                      # Host diagrams from SQLite (HTTP)
 atem serv diagrams --port 9000
 atem serv diagrams --background
-atem serv list                          # List running background servers
-atem serv kill <ID>                     # Kill a background server
+atem serv list                          # List running background servers (#, ID, PID, STATUS)
+atem serv kill <ID|#>                   # Kill a server (POSTs /leave for convo)
 atem serv killall                       # Kill all background servers
+
+# Fleet test loop — {appid} and {ts} are expanded by atem
+for i in $(seq -f '%04g' 1 10); do
+  atem serv convo --background --channel 'atem-convo-{appid}-{ts}-'$i
+  sleep 0.5
+done
 ```
 
-**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle, RTC encryption (key + salt forwarded to the agent).
+**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle, RTC encryption (key + salt forwarded to the agent), HIPAA mode (routes via `/hipaa/api/...`), audio dump.
+
+`--background` re-execs as a detached daemon: parent POSTs `/join`, registers the agent in `~/.config/atem/servers/<channel>.json`, and exits. The daemon polls Agora's `GET /agents/{id}` every 60s and writes the status (RUNNING/IDLE/STOPPED/…) back into the registry — `atem serv list` reads it without making any network calls. `kill`/`killall` SIGTERM the daemon, which catches the signal and POSTs `/leave` before exiting. The daemon's log file (`<channel>.log`) contains the `/join` URL and request body with secrets masked, useful for debugging encryption mismatches.
+
+**`serv attach <id>`** — opens a foreground HTTPS UI bound to a running convo daemon's channel. The page hides Start/Stop because the daemon owns the agent; you Join to talk to the live agent. Encryption / HIPAA / geofence are read from the same `convo.toml` so the local SDK matches what the daemon used.
 
 **`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging, RTC encryption (8 modes; gcm2 modes auto-generate a copyable salt).
 
 **`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
+
+**Channel placeholders** — `--channel` accepts `{appid}` (first 12 chars of the active app id) and `{ts}` (unix epoch seconds at startup). Useful in for-loops: `--channel 'atem-convo-{appid}-{ts}-001'` produces `atem-convo-2655d20a82fc-1777574763-001`.
 
 ### Configuration
 
@@ -116,6 +130,20 @@ The `atem config convo` wizard supports:
 - **Multimodal LLM**: OpenAI Realtime, Google Gemini Live (replaces ASR+LLM+TTS)
 - **Presets**: use Agora-managed preset bundles, optionally override providers
 - **Avatar**: Akool, LiveAvatar, Anam
+
+`convo.toml` also supports routing/security defaults that the web UI pre-fills and `--background` forwards to the agent:
+
+```toml
+hipaa    = false            # route via /hipaa/api/... (Agora support must enable for the project)
+geofence = "GLOBAL"         # GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
+
+[encryption]                # mode = 0 → off
+mode = 8                    # 1..=8 (Agora's table); 8 = AES_256_GCM2 (recommended)
+key  = "your-key-here"
+salt = "Q4mTLy5h…="          # base64 32 bytes; required for gcm2 modes (7, 8)
+```
+
+The same values flow into both code paths: `serv convo` (web UI form pre-fills, user can override) and `serv convo --background` (forwarded verbatim to ConvoAI's `/join` body). Both peers must use matching encryption/geofence or audio fails silently.
 
 ## How It Works
 

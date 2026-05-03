@@ -289,8 +289,6 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   `~/.config/atem/convo.toml` (override via `--config`). Page uses the vendored
   Conversational-AI-Demo toolkit at `assets/convo/` (refreshed by
   `scripts/update-convoai-toolkit.sh`, stale bundles blocked at release time).
-  `--background` runs headless for scenarios where an external device joins the
-  channel on its own and atem's only job is to keep the agent alive.
   Features: live transcription (RTM), preset checkboxes, avatar video
   (Akool/LiveAvatar/Anam), RTC Stats, API History, camera toggle,
   RTC encryption (key + base64 salt sent to ConvoAI as `properties.rtc.{encryption_key, encryption_salt, encryption_mode}`;
@@ -298,6 +296,48 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   modes (7, 8) require a 32-byte salt; the page auto-generates one and
   exposes it as a copyable, editable field. Project must have Media
   Stream Encryption enabled in the Agora console for the appid.
+
+  `--background` re-execs as a detached daemon (mirrors the rtc daemon
+  pattern): parent POSTs `/join`, registers `{id, pid, kind="convo",
+  channel}` in `~/.config/atem/servers/<channel>.json`, exits. The
+  daemon catches SIGINT + SIGTERM (so `atem serv kill` works) and
+  POSTs `/leave` before exiting. A 60s tokio task on the daemon polls
+  `GET /agents/{id}` and writes `last_status` + `last_checked_at`
+  into the registry JSON — `atem serv list` reads the cached value
+  with no network round-trip. The daemon log (`<channel>.log`) contains
+  the `/join` URL (HIPAA path when applicable) and the request body
+  with secrets masked (api keys, tokens, encryption_key, certs).
+
+  `--channel` supports `{appid}` (first 12 chars of active app id) and
+  `{ts}` (unix epoch seconds) placeholders, expanded by atem at startup.
+  Lets fleet for-loops produce channels matching the default auto-gen
+  shape without computing prefix/timestamp in the shell:
+  `atem serv convo --background --channel 'atem-convo-{appid}-{ts}-001'`.
+
+  `convo.toml` carries routing/security defaults:
+  - `hipaa = true/false` — switch ConvoAI URL prefix to `/hipaa/api/...`
+  - `geofence = "GLOBAL"|"NORTH_AMERICA"|"EUROPE"|"ASIA"|"JAPAN"|"INDIA"`
+  - `[encryption]` table: `mode` (0..=8), `key`, `salt` (base64-32-bytes)
+  These flow into both the web UI (form pre-fills via `DEFAULT_*` JS
+  constants emitted by `build_html_page`) and `--background` mode (sent
+  to ConvoAI's `/join` body via the resolved values on `JoinArgs`).
+
+- **`atem serv attach <id>` / `atem serv attach <#>`**: Opens a foreground
+  HTTPS UI bound to a running convo daemon's channel. Looks up the entry
+  in the servers registry, validates `kind == "convo"`, spawns the
+  convo HTTPS server with `attach: true`. The page receives `ATTACH_MODE
+  = true` which hides the Start/Stop buttons (the daemon owns the agent;
+  trying to /start would create a duplicate agent on the same channel).
+  User joins the channel with their RTC uid + matching encryption to
+  talk to the live daemon-owned agent.
+
+- **`atem serv list/kill/killall` registry conventions**: All servers
+  (rtc, convo, diagrams) write JSON entries to `~/.config/atem/servers/`.
+  Convo entries use the channel name itself as the id (no kind/port
+  suffix) since channels are unique per agent. `list` shows a 1-based
+  index (`#`), `ID`, `PID`, `PORT`, `STATUS` (cached from convo's 60s
+  poller, `—` until the first poll). `kill` and `attach` accept either
+  the literal id or the index from `list`.
 - **ConvoAI Config Wizard (`atem config convo`)**: Interactive terminal wizard
   that generates `~/.config/atem/convo.toml`. Supports preset-based or custom
   configuration with provider selection for ASR (10 vendors), LLM (9), TTS (12),

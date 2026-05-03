@@ -70,23 +70,37 @@ atem config convo --config <PATH>       # Use a specific config file
 ```bash
 atem serv convo                         # Launch ConvoAI test page (HTTPS)
 atem serv convo --config ~/convo.toml   # Use custom config
-atem serv convo --background            # Headless mode (no browser)
+atem serv convo --background            # Detached daemon — POSTs /join, registers, exits
+atem serv attach <ID>                   # Open UI bound to a running convo daemon (talk to live agent)
+atem serv attach 3                      # …or by index from `atem serv list`
 atem serv rtc                           # Launch RTC test page (HTTPS)
 atem serv rtc --channel test --port 8443
 atem serv rtc --background              # Run as background daemon
 atem serv diagrams                      # Host diagrams from SQLite (HTTP)
 atem serv diagrams --port 9000
 atem serv diagrams --background
-atem serv list                          # List running background servers
-atem serv kill <ID>                     # Kill a background server
+atem serv list                          # List running background servers (#, ID, PID, STATUS)
+atem serv kill <ID|#>                   # Kill a server (POSTs /leave for convo)
 atem serv killall                       # Kill all background servers
+
+# Fleet test loop — {appid} and {ts} are expanded by atem
+for i in $(seq -f '%04g' 1 10); do
+  atem serv convo --background --channel 'atem-convo-{appid}-{ts}-'$i
+  sleep 0.5
+done
 ```
 
-**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle, RTC encryption (key + salt forwarded to the agent).
+**`serv convo`** — ConvoAI voice agent: live transcription (RTM), preset selection, avatar (Akool, LiveAvatar, Anam), RTC Stats, API History, camera toggle, RTC encryption (key + salt forwarded to the agent), HIPAA mode (routes via `/hipaa/api/...`), audio dump.
+
+`--background` re-execs as a detached daemon: parent POSTs `/join`, registers in `~/.config/atem/servers/<channel>.json`, exits. The daemon polls Agora's `GET /agents/{id}` every 60s and writes the status (RUNNING/IDLE/STOPPED/…) back into the registry — `atem serv list` reads it without making any network calls. `kill`/`killall` SIGTERM the daemon, which catches the signal and POSTs `/leave` before exiting. Daemon log file (`<channel>.log`) contains the `/join` URL and request body with secrets masked.
+
+**`serv attach <id>`** — opens a foreground HTTPS UI bound to a running convo daemon's channel. The page hides Start/Stop because the daemon owns the agent; you Join to talk to the live agent. Encryption / HIPAA / geofence read from the same `convo.toml` so the local SDK matches what the daemon used.
 
 **`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging, RTC encryption (8 modes; gcm2 modes auto-generate a copyable salt).
 
 **`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
+
+**Channel placeholders** — `--channel` accepts `{appid}` (first 12 chars of the active app id) and `{ts}` (unix epoch seconds at startup). Useful in for-loops to match the auto-gen channel format.
 
 ### AI Agents (WIP)
 
