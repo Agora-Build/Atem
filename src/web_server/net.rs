@@ -45,6 +45,25 @@ pub fn gen_channel(app_id: &str, scenario: &str) -> String {
     format!("atem-{scenario}-{prefix}-{ts}-{:04x}", rand & 0xffff)
 }
 
+/// Expand placeholders in a user-provided `--channel` template:
+///   `{appid}` → first 12 chars of `app_id`
+///   `{ts}`    → unix epoch seconds at expansion time
+/// Other characters pass through verbatim. Idempotent on strings with
+/// no placeholders, so callers can always run it through the expander.
+pub fn expand_channel_template(template: &str, app_id: &str) -> String {
+    if !template.contains("{appid}") && !template.contains("{ts}") {
+        return template.to_string();
+    }
+    let appid12: String = app_id.chars().take(12).collect();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    template
+        .replace("{appid}", &appid12)
+        .replace("{ts}", &ts.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +78,36 @@ mod tests {
     fn sslip_host_formats_correctly() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42));
         assert_eq!(sslip_host(&ip), "192-168-1-42.sslip.io");
+    }
+
+    #[test]
+    fn expand_channel_template_passes_through_when_no_placeholders() {
+        // No `{appid}` / `{ts}` → string returned verbatim.
+        assert_eq!(
+            expand_channel_template("test-001", "abcdef0123456789abcd"),
+            "test-001"
+        );
+    }
+
+    #[test]
+    fn expand_channel_template_substitutes_appid() {
+        let out = expand_channel_template(
+            "atem-convo-{appid}-fixed-0001",
+            "2655d20a82fc47cebcff82d5bd5d53ef",
+        );
+        assert_eq!(out, "atem-convo-2655d20a82fc-fixed-0001");
+    }
+
+    #[test]
+    fn expand_channel_template_substitutes_ts_with_digits() {
+        let out = expand_channel_template(
+            "atem-convo-{appid}-{ts}-0001",
+            "2655d20a82fc47cebcff82d5bd5d53ef",
+        );
+        // Format: atem-convo-<12chars>-<unix_secs>-0001 — verify the
+        // ts segment is all digits and reasonable (≥ 1700000000 = 2023).
+        let parts: Vec<&str> = out.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[3].parse::<u64>().unwrap_or(0) > 1_700_000_000, true);
     }
 }

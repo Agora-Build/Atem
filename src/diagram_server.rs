@@ -512,6 +512,8 @@ fn build_server_entry(sid: &str, port: u16, local_url: &str, network_url: &str) 
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        last_status: None,
+        last_checked_at: None,
     }
 }
 
@@ -566,6 +568,8 @@ fn spawn_background_daemon(port: u16, local_url: &str, network_url: &str, custom
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        last_status: None,
+        last_checked_at: None,
     };
     register_server(&entry)?;
 

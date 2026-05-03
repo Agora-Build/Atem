@@ -7,11 +7,11 @@ use clap::{Parser, Subcommand};
 #[command(about = "A terminal that connects builders, Agora platform, and AI agents.")]
 #[command(long_about = "A terminal that connects builders, Agora platform, and AI agents.
 
-Open source. Built on official Agora APIs — your credentials stay on your machine.
+Open source. Some functions built on official Agora APIs — your credentials stay on your machine.
 
-Disclaimer: This is an unofficial community tool with no SLA or guarantees,
-and may be discontinued at any time. For official products and support,
-visit https://www.agora.io/")]
+Disclaimer: This is an unofficial community tool that contains some experimental
+functions, provided AS-IS, with no SLA or guarantees. Contributions welcome.
+For official products and support, visit https://www.agora.io/")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -240,7 +240,8 @@ pub enum ServCommands {
     /// Launch a browser-based RTC audio/video test page (HTTPS)
     Rtc {
         /// Channel name. If omitted, atem auto-generates one in the shape
-        /// `atem-rtc-<app_id[..12]>-<unix_ts>-<rand4>`.
+        /// `atem-rtc-<app_id[..12]>-<unix_ts>-<rand4>`. Supports `{appid}`
+        /// and `{ts}` placeholders, e.g. `--channel atem-rtc-{appid}-{ts}-001`.
         #[arg(long)]
         channel: Option<String>,
         /// HTTPS port (0 = auto-assign)
@@ -272,8 +273,28 @@ pub enum ServCommands {
         _serv_daemon: bool,
     },
     /// Launch a browser-based Conversational AI agent test page (HTTPS).
+    #[command(after_help = "EXAMPLES:
+  # Launch a single agent with the test page
+  atem serv convo
+
+  # Run as a background daemon (headless, survives terminal close)
+  atem serv convo --background
+
+  # Launch 40 background agents. {appid} and {ts} are expanded by atem,
+  # so the channels look like atem-convo-2655d20a82fc-1777574763-0001..0040.
+  # `sleep 0.5` between spawns avoids hitting Agora's /join rate limit;
+  # without it, ~5-10% of the agents fail to start in a tight burst.
+  for i in $(seq -f '%04g' 1 40); do \\
+    atem serv convo --background --channel 'atem-convo-{appid}-{ts}-'$i; \\
+    sleep 0.5; \\
+  done
+  atem serv list                # inspect them
+  atem serv killall             # stop all of them
+")]
     Convo {
-        /// Channel to join
+        /// Channel to join. Supports `{appid}` (first 12 chars of the
+        /// active app id) and `{ts}` (unix timestamp) placeholders, e.g.
+        /// `--channel atem-convo-{appid}-{ts}-001`.
         #[arg(long)]
         channel: Option<String>,
         /// Human's RTC uid. Defaults to "0" (server-assigned).
@@ -291,7 +312,11 @@ pub enum ServCommands {
         /// Don't auto-open the browser
         #[arg(long)]
         no_browser: bool,
-        /// Daemon mode: no HTTPS server, agent started immediately.
+        /// Daemon mode: re-execs as a detached daemon process. Parent
+        /// exits immediately after the agent is created and registered.
+        /// Use `atem serv list` / `kill` / `killall` to manage running
+        /// agents — `kill` sends SIGTERM to the daemon which POSTs
+        /// `/leave` before exiting.
         #[arg(long)]
         background: bool,
         /// Internal: daemon marker (hidden)
@@ -319,6 +344,19 @@ pub enum ServCommands {
     },
     /// Kill all background servers
     Killall,
+    /// Open a UI to talk to a running convo agent (kind=convo). Spawns
+    /// a foreground HTTPS page bound to the daemon's channel/uids; the
+    /// page hides "Start Agent" since the agent is already alive.
+    Attach {
+        /// Server ID from `atem serv list` (kind=convo only)
+        id: String,
+        /// HTTPS port (0 = auto-assign)
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Don't auto-open the browser
+        #[arg(long)]
+        no_browser: bool,
+    },
 }
 
 pub async fn handle_cli_command(command: Commands) -> Result<()> {
@@ -918,6 +956,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     config_path: config,
                     port, no_browser, background,
                     _daemon: _serv_daemon,
+                    attach: false,
                 }).await
             }
             ServCommands::Diagrams {
@@ -935,6 +974,36 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             ServCommands::List => crate::rtc_test_server::cmd_list_servers(),
             ServCommands::Kill { id } => crate::rtc_test_server::cmd_kill_server(&id),
             ServCommands::Killall => crate::rtc_test_server::cmd_kill_all_servers(),
+            ServCommands::Attach { id, port, no_browser } => {
+                // Look up the running daemon by id (or 1-based index from
+                // `atem serv list`), validate it's a convo agent, then
+                // spawn a foreground UI bound to its channel.
+                let id = crate::rtc_test_server::resolve_id_or_index(&id)?;
+                let entry_path = crate::rtc_test_server::servers_dir()
+                    .join(format!("{}.json", id));
+                if !entry_path.exists() {
+                    anyhow::bail!("No server with id '{}'. Run `atem serv list`.", id);
+                }
+                let data = std::fs::read_to_string(&entry_path)?;
+                let entry: crate::rtc_test_server::ServerEntry = serde_json::from_str(&data)?;
+                if entry.kind != "convo" {
+                    anyhow::bail!(
+                        "Server '{}' is kind='{}'; attach only works for kind='convo'.",
+                        id, entry.kind
+                    );
+                }
+                crate::convo_test_server::run_server(crate::convo_test_server::ServeConvoConfig {
+                    channel: Some(entry.channel.clone()),
+                    rtc_user_id: None,    // resolves from convo.toml
+                    agent_user_id: None,  // resolves from convo.toml
+                    config_path: None,
+                    port,
+                    no_browser,
+                    background: false,
+                    _daemon: false,
+                    attach: true,
+                }).await
+            }
         },
     }
 }

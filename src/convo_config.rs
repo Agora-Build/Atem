@@ -57,6 +57,36 @@ pub struct ConvoConfig {
     /// arbitrary nested tables like `[parameters.transcript]` and
     /// `[parameters.turn_detector]`.
     pub parameters: Option<BTreeMap<String, toml::Value>>,
+
+    // ── Routing / security defaults (testing convenience) ────────────
+    //
+    // Same values reused across all channels — for fleet test loops we
+    // don't want to mint a fresh salt or pick a region per launch. The
+    // browser UI form fields are pre-filled from these but remain
+    // editable; --background mode forwards them to the agent's /join.
+
+    /// Route through Agora's HIPAA-compliant `/hipaa/api/...` endpoint.
+    /// Default false (regular path).
+    pub hipaa: Option<bool>,
+
+    /// Geofence area: GLOBAL (default) | NORTH_AMERICA | EUROPE | ASIA |
+    /// JAPAN | INDIA. None / "GLOBAL" → no geofence sent.
+    pub geofence: Option<String>,
+
+    /// `[encryption]` block. When `mode > 0`, encryption is active.
+    pub encryption: Option<EncryptionConfig>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct EncryptionConfig {
+    /// 0 = off; 1..=8 per Agora's encryption_mode integer table.
+    pub mode: u8,
+    /// Encryption key. Required when `mode > 0`.
+    pub key: String,
+    /// Base64-encoded 32-byte salt. Required for gcm2 modes (7, 8);
+    /// ignored otherwise.
+    pub salt: String,
 }
 
 impl ConvoConfig {
@@ -182,6 +212,14 @@ pub struct JoinArgs<'a> {
     /// Base64-encoded 32-byte salt. Required by gcm2 modes (7, 8). Ignored
     /// for other modes by the Agora server.
     pub encryption_salt: Option<&'a str>,
+    /// Agora geofence area. Valid values: GLOBAL, NORTH_AMERICA, EUROPE,
+    /// ASIA, JAPAN, INDIA. `None` or "GLOBAL" → no `properties.geofence`
+    /// emitted (default global behaviour).
+    pub geofence_area: Option<&'a str>,
+    /// Inject `properties.parameters.enable_dump = true`. Asks Agora
+    /// to capture audio frames on the agent side for debugging — the
+    /// dump itself is server-side and retrieved via Agora support.
+    pub enable_dump: bool,
 }
 
 impl ConvoConfig {
@@ -299,6 +337,25 @@ impl ConvoConfig {
         }
         if let Some(m) = &self.parameters {
             props.insert("parameters".into(), map_to_json(m));
+        }
+        // Inject runtime UI knobs into `properties.parameters`. We may
+        // need to create the table if convo.toml didn't declare one.
+        if args.enable_dump {
+            let entry = props.entry("parameters".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(map) = entry {
+                map.insert("enable_dump".into(), json!(true));
+            }
+        }
+
+        // Geofence — restrict the agent's media routing to a specific
+        // Agora region. Skip emission when None or GLOBAL (Agora's default).
+        if let Some(area) = args.geofence_area
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("GLOBAL"))
+        {
+            let mut g = Map::new();
+            g.insert("area".into(), json!(area));
+            props.insert("geofence".into(), Value::Object(g));
         }
 
         // RTC encryption (https://docs.agora.io/en/conversational-ai/rest-api/agent/join).
@@ -425,6 +482,17 @@ pub struct ResolvedConfig {
     /// `presets` in TOML, falling back to `preset` as a one-element
     /// list. Empty means no checkboxes rendered.
     pub presets:           Vec<String>,
+    /// HIPAA mode (TOML default). UI checkbox + background mode both
+    /// honour this; user can still toggle in the browser form.
+    pub hipaa:             bool,
+    /// Geofence area (TOML default). Empty / "GLOBAL" → no geofence.
+    pub geofence:          String,
+    /// Encryption mode 0..=8 (TOML default). 0 = off.
+    pub encryption_mode:   u8,
+    /// Encryption key (TOML default). Empty when mode = 0.
+    pub encryption_key:    String,
+    /// Encryption salt base64 (TOML default). Required for gcm2 modes.
+    pub encryption_salt:   String,
 }
 
 /// Public display fields from `[agent.avatar]`. Excludes `params`,
@@ -463,6 +531,7 @@ impl ConvoConfig {
             vendor:    av.vendor.clone(),
             avatar_id: av.avatar_id.clone(),
         });
+        let enc = self.encryption.clone().unwrap_or_default();
         Ok(ResolvedConfig {
             channel,
             rtc_user_id,
@@ -472,6 +541,11 @@ impl ConvoConfig {
             avatar_summary,
             preset: self.preset.clone(),
             presets: self.preset_list(),
+            hipaa: self.hipaa.unwrap_or(false),
+            geofence: self.geofence.clone().unwrap_or_default(),
+            encryption_mode: enc.mode,
+            encryption_key:  enc.key,
+            encryption_salt: enc.salt,
         })
     }
 }
@@ -549,6 +623,8 @@ mod tests {
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
 
         // Top-level
@@ -606,6 +682,8 @@ mod tests {
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         assert!(body["properties"].get("avatar").is_none());
     }
@@ -652,6 +730,8 @@ mod tests {
             encryption_mode: Some(8),
             encryption_key:  Some("hunter2"),
             encryption_salt: Some("c2FsdC1iYXNlNjQ="),
+            geofence_area: None,
+            enable_dump: false,
         });
         let rtc = &body["properties"]["rtc"];
         assert_eq!(rtc["encryption_mode"], 8);
@@ -674,8 +754,99 @@ mod tests {
             encryption_mode: Some(8),
             encryption_key:  Some(""),
             encryption_salt: Some("c2FsdC1iYXNlNjQ="),
+            geofence_area: None,
+            enable_dump: false,
         });
         assert!(body["properties"].get("rtc").is_none());
+    }
+
+    #[test]
+    fn join_payload_injects_enable_dump_into_parameters() {
+        // No `[parameters]` in TOML → parameters object is created
+        // just to hold enable_dump.
+        let cfg: ConvoConfig = toml::from_str("").unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None,
+            enable_dump: true,
+        });
+        assert_eq!(body["properties"]["parameters"]["enable_dump"], true);
+    }
+
+    #[test]
+    fn join_payload_merges_enable_dump_with_existing_parameters() {
+        // Existing [parameters] from TOML must be preserved when
+        // enable_dump is injected.
+        let toml_str = r#"
+            channel = "c"
+            agent_user_id = "a"
+            [parameters]
+            audio_scenario = "default"
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None,
+            enable_dump: true,
+        });
+        let p = &body["properties"]["parameters"];
+        assert_eq!(p["audio_scenario"], "default");
+        assert_eq!(p["enable_dump"], true);
+    }
+
+    #[test]
+    fn join_payload_emits_geofence_when_area_set() {
+        let cfg: ConvoConfig = toml::from_str("").unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None,
+            avatar_token:   None,
+            preset: None,
+            encryption_mode: None,
+            encryption_key:  None,
+            encryption_salt: None,
+            geofence_area:   Some("ASIA"),
+            enable_dump: false,
+        });
+        assert_eq!(body["properties"]["geofence"]["area"], "ASIA");
+    }
+
+    #[test]
+    fn join_payload_omits_geofence_for_global_or_none() {
+        let cfg: ConvoConfig = toml::from_str("").unwrap();
+        for area in [None, Some("GLOBAL"), Some("global"), Some("")] {
+            let body = cfg.build_join_payload(JoinArgs {
+                name: "x", channel: "c", token: "t",
+                agent_rtc_uid: "1", remote_uids: &[],
+                include_avatar: false,
+                avatar_user_id: "999",
+                avatar_channel: None,
+                avatar_token:   None,
+                preset: None,
+                encryption_mode: None,
+                encryption_key:  None,
+                encryption_salt: None,
+                geofence_area:   area,
+                enable_dump: false,
+            });
+            assert!(body["properties"].get("geofence").is_none(),
+                "geofence should be absent for area={:?}", area);
+        }
     }
 
     #[test]
@@ -693,6 +864,8 @@ mod tests {
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         assert_eq!(body["preset"], "from_runtime");
     }
@@ -718,6 +891,8 @@ mod tests {
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"], true);
@@ -751,6 +926,8 @@ api_key = "secret"
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"],                 true);
@@ -782,6 +959,8 @@ avatar_id = "abc"
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         assert!(body["properties"].get("avatar").is_none());
     }
@@ -805,6 +984,8 @@ avatar_id = "abc"
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"], true);
@@ -839,6 +1020,8 @@ agora_app_cert = "<SECRET>"
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         let ap = &body["properties"]["avatar"]["params"];
         assert_eq!(ap["agora_appid"],   "54faa34804aa4411a5a1c5f81a2a95b3");
@@ -911,6 +1094,8 @@ agora_token = "007user"
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         assert_eq!(body["properties"]["avatar"]["params"]["agora_token"], "007user");
     }
@@ -939,6 +1124,8 @@ agora_uid = "explicit_from_toml"
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         assert_eq!(body["properties"]["avatar"]["params"]["agora_uid"],
                    "explicit_from_toml");
@@ -983,6 +1170,8 @@ validate_asr_result_timestamp = false
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         let props = &body["properties"];
         assert_eq!(props["advanced_features"]["enable_rtm"],  true);
@@ -1010,6 +1199,8 @@ validate_asr_result_timestamp = false
             encryption_mode: None,
             encryption_key: None,
             encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
         });
         assert_eq!(body["preset"], "first");
     }

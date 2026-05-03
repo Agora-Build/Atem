@@ -38,6 +38,14 @@ pub struct ServerEntry {
     pub local_url: String,
     pub network_url: String,
     pub started_at: u64,
+    /// Last status returned by Agora's GET /agents/{id} (convo only).
+    /// Polled by the daemon every 60s. None on initial registration
+    /// before the first poll completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    /// Unix seconds when last_status was last updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<u64>,
 }
 
 // ── Server registry ─────────────────────────────────────────────────────
@@ -56,7 +64,7 @@ pub fn server_id(kind: &str, channel: &str, port: u16) -> String {
 }
 
 /// Write a server entry JSON file.
-fn register_server(entry: &ServerEntry) -> Result<()> {
+pub fn register_server(entry: &ServerEntry) -> Result<()> {
     let dir = servers_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", entry.id));
@@ -66,7 +74,7 @@ fn register_server(entry: &ServerEntry) -> Result<()> {
 }
 
 /// Remove a server entry JSON file.
-fn unregister_server(id: &str) -> Result<()> {
+pub fn unregister_server(id: &str) -> Result<()> {
     let path = servers_dir().join(format!("{}.json", id));
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -138,20 +146,51 @@ fn kill_all_servers() -> Result<()> {
 
 // ── CLI command handlers ────────────────────────────────────────────────
 
+/// Accept either a literal id (e.g. `atem-convo-...`) or a 1-based
+/// index from `atem serv list` (e.g. `3`). Returns the resolved id.
+pub fn resolve_id_or_index(input: &str) -> Result<String> {
+    if let Ok(idx) = input.parse::<usize>() {
+        let servers = list_servers();
+        if idx < 1 || idx > servers.len() {
+            anyhow::bail!(
+                "Index {} out of range. `atem serv list` has {} entries.",
+                idx, servers.len()
+            );
+        }
+        return Ok(servers[idx - 1].id.clone());
+    }
+    Ok(input.to_string())
+}
+
 pub fn cmd_list_servers() -> Result<()> {
     let servers = list_servers();
     if servers.is_empty() {
         println!("No running servers.");
         return Ok(());
     }
-    println!("{:<24} {:>6} {:>8}  {}", "ID", "PID", "PORT", "URL");
-    for s in &servers {
-        println!("{:<24} {:>6} {:>8}  {}", s.id, s.pid, s.port, s.network_url);
+    // Determine ID column width — wide enough for the longest id but
+    // not narrower than 24 chars (legacy rtc-* ids fit in that).
+    let id_width = servers.iter().map(|s| s.id.len()).max().unwrap_or(24).max(24);
+    println!(
+        "{:>3}  {:<width$} {:>6} {:>8}  {}",
+        "#", "ID", "PID", "PORT", "STATUS", width = id_width
+    );
+    for (i, s) in servers.iter().enumerate() {
+        // STATUS column: the last_status from the daemon's 60s poll, or
+        // "—" before the first poll completes.
+        let status = s.last_status.as_deref().unwrap_or("—");
+        println!(
+            "{:>3}  {:<width$} {:>6} {:>8}  {}",
+            i + 1, s.id, s.pid, s.port, status,
+            width = id_width
+        );
     }
     Ok(())
 }
 
 pub fn cmd_kill_server(id: &str) -> Result<()> {
+    let id = resolve_id_or_index(id)?;
+    let id = id.as_str();
     kill_server(id)?;
     println!("Killed server '{}'", id);
     Ok(())
@@ -177,7 +216,10 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
     // Resolve channel: explicit --channel wins, else auto-generate
     // `atem-rtc-<app_id[..12]>-<ts>-<rand4>` so each run gets a unique
     // channel and you can't accidentally step on another session.
+    // User-provided strings may use `{appid}`/`{ts}` placeholders for
+    // for-loop fleet launches.
     let channel: String = config.channel.take()
+        .map(|s| crate::web_server::net::expand_channel_template(&s, &app_id))
         .unwrap_or_else(|| crate::web_server::net::gen_channel(&app_id, "rtc"));
     // From this point `channel` is the authoritative value; the rest
     // of the code reads it from a local shadow instead of config.channel.
@@ -264,6 +306,8 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            last_status: None,
+            last_checked_at: None,
         };
         register_server(&entry)?;
 
@@ -297,6 +341,8 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            last_status: None,
+            last_checked_at: None,
         };
         register_server(&entry)?;
 
@@ -757,6 +803,17 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <button class="btn btn-mute" onclick="regenSalt()">Regen</button>
     <button class="copy-btn" onclick="copyText(document.getElementById('encSaltInput').value)">Copy</button>
   </div>
+  <div class="controls">
+    <label>Geofence</label>
+    <select id="geoAreaSelect" style="width:200px">
+      <option value="GLOBAL" selected>Global (no fence)</option>
+      <option value="NORTH_AMERICA">North America</option>
+      <option value="EUROPE">Europe</option>
+      <option value="ASIA">Asia</option>
+      <option value="JAPAN">Japan</option>
+      <option value="INDIA">India</option>
+    </select>
+  </div>
 </section>
 
 <!-- ── RTC ─────────────────────────────────────────────────────── -->
@@ -1036,6 +1093,14 @@ async function doJoin() {{
     console.log('App ID:', APP_ID);
     console.log('Channel:', channel);
     console.log('Token:', token);
+
+    // Geofence — restrict media routing to a region. Must be set
+    // BEFORE createClient. "GLOBAL" leaves the SDK at its default.
+    const geoArea = document.getElementById('geoAreaSelect').value;
+    if (geoArea && geoArea !== 'GLOBAL') {{
+      AgoraRTC.setArea({{ areaCode: geoArea }});
+      log('Geofence: ' + geoArea);
+    }}
 
     // Create client
     client = AgoraRTC.createClient({{ mode: 'rtc', codec: 'vp8' }});

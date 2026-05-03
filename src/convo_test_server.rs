@@ -21,6 +21,14 @@ fn convoai_base_url() -> String {
         .unwrap_or_else(|_| "https://api.agora.io".to_string())
 }
 
+/// Build a ConvoAI REST URL. `hipaa` switches the path prefix from
+/// `/api/conversational-ai-agent/...` to `/hipaa/api/conversational-ai-agent/...`.
+/// `suffix` is everything after the prefix (e.g. `v2/projects/<app_id>/join`).
+fn convoai_url(hipaa: bool, suffix: &str) -> String {
+    let prefix = if hipaa { "hipaa/api" } else { "api" };
+    format!("{}/{}/conversational-ai-agent/{}", convoai_base_url(), prefix, suffix)
+}
+
 /// Generate a unique agent name for this session.
 /// Build the session name sent as `name` in /join.
 /// Format: `atem-agent-<app_id[..12]>-<unix_ts>-<rand4>`
@@ -112,6 +120,10 @@ pub struct ServeConvoConfig {
     pub no_browser:    bool,
     pub background:    bool,
     pub _daemon:       bool,
+    /// Attach mode — page hides "Start Agent". Used by
+    /// `atem serv attach <id>` so the user can join a channel that
+    /// already has a daemon-owned agent in it.
+    pub attach:        bool,
 }
 
 /// Process-local state. One agent at a time.
@@ -121,6 +133,9 @@ pub struct AgentState {
     pub agent_id:   Option<String>,
     pub name:       Option<String>,
     pub started_at: Option<u64>,
+    /// Whether the active agent was started in HIPAA mode. Controls
+    /// which URL `/leave` and `/stop` use — must match `/start`'s URL.
+    pub hipaa:      bool,
 }
 
 /// One entry in the ConvoAI REST history log. Captures exactly what
@@ -178,8 +193,12 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     let app_cert = crate::config::ProjectCache::resolve_app_certificate(None)?;
 
     // Auto-generate channel when neither CLI nor TOML provides one.
+    // User-provided channels may use `{appid}`/`{ts}` placeholders so the
+    // same template can be reused across many for-loop invocations
+    // without needing to compute prefix/timestamp in the shell.
     let cli_channel = cfg.channel.clone()
         .or_else(|| convo.channel.clone())
+        .map(|s| crate::web_server::net::expand_channel_template(&s, &app_id))
         .unwrap_or_else(|| crate::web_server::net::gen_channel(&app_id, "convo"));
 
     let resolved = convo.resolve(&CliOverrides {
@@ -188,8 +207,82 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         agent_user_id: cfg.agent_user_id.clone(),
     })?;
 
-    if cfg.background {
+    // ── Background mode: re-exec as detached daemon ─────────────────────
+    // Parent prints info, spawns a child with --_serv-daemon, registers
+    // the child's PID, exits. Child runs run_background which holds the
+    // agent and posts /leave on SIGTERM.
+    if cfg.background && !cfg._daemon {
+        let exe = std::env::current_exe()?;
+        let log_dir = crate::rtc_test_server::servers_dir();
+        std::fs::create_dir_all(&log_dir)?;
+        // For convo, the channel name is unique per agent (auto-gen has
+        // ts+rand4, user-provided is deliberate). Use it as the registry
+        // id directly — `kind="convo"` already distinguishes it from rtc
+        // entries that share the prefixed-with-port `server_id` shape.
+        let sid = resolved.channel.clone();
+        let log_path = log_dir.join(format!("{}.log", sid));
+        let log_file = std::fs::File::create(&log_path)?;
+
+        let mut daemon_args: Vec<String> = vec![
+            "serv".into(), "convo".into(),
+            "--channel".into(), resolved.channel.clone(),
+            "--rtc-user-id".into(), resolved.rtc_user_id.clone(),
+            "--agent-user-id".into(), resolved.agent_user_id.clone(),
+        ];
+        if let Some(p) = &cfg.config_path {
+            daemon_args.push("--config".into());
+            daemon_args.push(p.display().to_string());
+        }
+        daemon_args.push("--background".into());
+        daemon_args.push("--no-browser".into());
+        // Hidden flag — tells the spawned process it's the daemon.
+        daemon_args.push("--serv-daemon".into());
+
+        let child = std::process::Command::new(exe)
+            .args(&daemon_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file)
+            .spawn()?;
+
+        let entry = crate::rtc_test_server::ServerEntry {
+            id: sid.clone(),
+            pid: child.id(),
+            kind: "convo".to_string(),
+            port: 0,
+            channel: resolved.channel.clone(),
+            local_url: String::new(),
+            network_url: String::new(),
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            last_status: None,
+            last_checked_at: None,
+        };
+        crate::rtc_test_server::register_server(&entry)?;
+
         println!("atem serv convo");
+        println!("  config:    {}", toml_path.display());
+        println!("  channel:   {}", resolved.channel);
+        println!("  rtc uid:   {}", resolved.rtc_user_id);
+        println!("  agent uid: {}", resolved.agent_user_id);
+        println!(
+            "  avatar:    {}",
+            if resolved.avatar_configured { "configured" } else { "not configured" }
+        );
+        println!("  ID:        {}", sid);
+        println!("  PID:       {}", child.id());
+        println!("  Log:       {}", log_path.display());
+        println!();
+        println!("Use `atem serv list` to see running agents.");
+        println!("Use `atem serv kill {}` (or `killall`) to /leave + stop.", sid);
+        return Ok(());
+    }
+
+    // ── Daemon mode: this IS the spawned child ──────────────────────────
+    if cfg._daemon {
+        println!("atem serv convo (daemon)");
         println!("  config:    {}", toml_path.display());
         println!("  channel:   {}", resolved.channel);
         println!("  rtc uid:   {}", resolved.rtc_user_id);
@@ -268,6 +361,7 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     let resolved  = Arc::new(resolved);
     let convo_cfg = Arc::new(convo);
 
+    let attach_mode = cfg.attach;
     loop {
         let (stream, _) = listener.accept().await?;
         let acceptor  = acceptor.clone();
@@ -282,7 +376,7 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let _ = handle_connection(tls, &app_id, &app_cert, &resolved, &convo_cfg, state, history).await;
+            let _ = handle_connection(tls, &app_id, &app_cert, &resolved, &convo_cfg, state, history, attach_mode).await;
         });
     }
 }
@@ -296,6 +390,95 @@ fn default_config_path() -> PathBuf {
 /// for SIGINT/SIGTERM to POST /leave. Useful when an external device
 /// (phone, ConvoAI-capable hardware) joins the channel on its own and
 /// atem's only role is to keep the agent alive on the other side.
+/// Walk a JSON value recursively and mask any field whose key suggests
+/// it carries a secret (contains "key", "token", "secret", "cert",
+/// "password", or "credential"). The value is replaced with a short
+/// "***<N chars>" string so the operator can still tell whether a
+/// field was set without exposing its contents in the log file.
+fn mask_secrets(v: &mut serde_json::Value) {
+    fn looks_secret(name: &str) -> bool {
+        let n = name.to_ascii_lowercase();
+        n.contains("key")
+            || n.contains("token")
+            || n.contains("secret")
+            || n.contains("cert")
+            || n.contains("password")
+            || n.contains("credential")
+    }
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, val) in m.iter_mut() {
+                if looks_secret(k) {
+                    let len = match val {
+                        serde_json::Value::String(s) => s.len(),
+                        _ => 0,
+                    };
+                    *val = serde_json::Value::String(format!("***<{} chars>", len));
+                } else {
+                    mask_secrets(val);
+                }
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for x in a.iter_mut() { mask_secrets(x); }
+        }
+        _ => {}
+    }
+}
+
+/// Spawn a tokio task that polls Agora's GET /agents/{id} every 60s
+/// and writes the result back into the daemon's registry entry. Each
+/// successful poll updates `last_status` + `last_checked_at` so
+/// `atem serv list` can show STATUS without making any network calls.
+/// On error, status becomes "ERR" so the operator notices.
+fn spawn_status_poller(
+    channel: String,
+    app_id: String,
+    agent_id: String,
+    agent_token: String,
+    hipaa: bool,
+) {
+    tokio::spawn(async move {
+        let url = convoai_url(hipaa, &format!("v2/projects/{}/agents/{}", app_id, agent_id));
+        let client = reqwest::Client::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let status = match client
+                .get(&url)
+                .header("Authorization", format!("agora token={}", agent_token))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    r.json::<serde_json::Value>().await
+                        .ok()
+                        .and_then(|v| v["status"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| "?".into())
+                }
+                Ok(r) => format!("HTTP_{}", r.status().as_u16()),
+                Err(_) => "ERR".into(),
+            };
+            // Read-modify-write the registry JSON. We're the only writer
+            // for this id so there's no contention.
+            let path = crate::rtc_test_server::servers_dir().join(format!("{}.json", channel));
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(mut entry) = serde_json::from_str::<crate::rtc_test_server::ServerEntry>(&data) {
+                    entry.last_status = Some(status);
+                    entry.last_checked_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    );
+                    if let Ok(json) = serde_json::to_string_pretty(&entry) {
+                        let _ = std::fs::write(&path, json);
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn run_background(
     app_id:   &str,
     app_cert: &str,
@@ -342,18 +525,30 @@ async fn run_background(
         avatar_token:   avatar_token.as_deref(),
         // Background mode: no UI, use config-level preset as-is.
         preset: None,
-        // Encryption is opt-in via the browser UI; not surfaced in
-        // background mode (where there is no UI to type a key into).
-        encryption_mode: None,
-        encryption_key: None,
-        encryption_salt: None,
+        // Encryption / geofence: read from convo.toml. mode=0 → no
+        // encryption block emitted. geofence empty/"GLOBAL" → no fence.
+        encryption_mode: if resolved.encryption_mode > 0 { Some(resolved.encryption_mode) } else { None },
+        encryption_key:  if resolved.encryption_mode > 0 { Some(resolved.encryption_key.as_str()) } else { None },
+        encryption_salt: if !resolved.encryption_salt.is_empty() { Some(resolved.encryption_salt.as_str()) } else { None },
+        geofence_area:   if !resolved.geofence.is_empty() { Some(resolved.geofence.as_str()) } else { None },
+        enable_dump: false,
     });
 
-    let url = format!(
-        "{}/api/conversational-ai-agent/v2/projects/{}/join",
-        convoai_base_url(),
-        app_id
-    );
+    // Use HIPAA endpoint when convo.toml says so. Both /join and /leave
+    // must use the same prefix or the agent gets stranded on the wrong
+    // SD-RTN.
+    let url = convoai_url(resolved.hipaa, &format!("v2/projects/{}/join", app_id));
+    println!("  /join URL: {}", url);
+    // Log the request body with secrets masked. Useful for diagnosing
+    // mismatches (encryption_key present? geofence area? avatar shape?).
+    {
+        let mut masked = payload.clone();
+        mask_secrets(&mut masked);
+        match serde_json::to_string_pretty(&masked) {
+            Ok(s)  => println!("  /join body (masked):\n{}", s),
+            Err(_) => println!("  /join body: <serialization failed>"),
+        }
+    }
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -373,10 +568,30 @@ async fn run_background(
     let agent_id = body["agent_id"].as_str().unwrap_or("").to_string();
     println!("  agent_id:  {}", agent_id);
     println!("  name:      {}", name);
-    println!("\nAgent running. Ctrl+C to stop.");
+    println!("\nAgent running. SIGTERM (atem serv kill) or Ctrl+C to stop.");
 
-    // Block until SIGINT/SIGTERM, then POST /leave.
-    tokio::signal::ctrl_c().await?;
+    // Spawn a 60s status poller that updates the registry JSON. Lets
+    // `atem serv list` show whether each agent is RUNNING/IDLE/STOPPED
+    // without each list call having to make a network round-trip.
+    spawn_status_poller(
+        resolved.channel.clone(),
+        app_id.to_string(),
+        agent_id.clone(),
+        agent_token.clone(),
+        resolved.hipaa,
+    );
+
+    // Block until SIGINT or SIGTERM. The daemon process is reaped via
+    // SIGTERM by `atem serv kill`/`killall`; tokio::signal::ctrl_c only
+    // catches SIGINT on Unix, so listen for both.
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
     println!("\nStopping agent...");
 
     // Mint a fresh short-lived token for the /leave call.
@@ -390,17 +605,22 @@ async fn run_background(
         3600,
         Some(resolved.agent_user_id.as_str()),
     )?;
-    let leave_url = format!(
-        "{}/api/conversational-ai-agent/v2/projects/{}/agents/{}/leave",
-        convoai_base_url(),
-        app_id,
-        agent_id
+    let leave_url = convoai_url(
+        resolved.hipaa,
+        &format!("v2/projects/{}/agents/{}/leave", app_id, agent_id),
     );
+    println!("/leave URL: {}", leave_url);
     let _ = client
         .post(&leave_url)
         .header("Authorization", format!("agora token={}", leave_token))
         .send()
         .await;
+
+    // Best-effort cleanup of the registry entry so `atem serv list`
+    // doesn't show a dead daemon. Id matches what the parent registered
+    // (the channel name itself).
+    let _ = crate::rtc_test_server::unregister_server(&resolved.channel);
+
     println!("Stopped.");
     Ok(())
 }
@@ -413,6 +633,7 @@ async fn handle_connection(
     convo_cfg:  &Arc<ConvoConfig>,
     state:      Arc<Mutex<AgentState>>,
     history:    Arc<Mutex<std::collections::VecDeque<HistoryEntry>>>,
+    attach_mode: bool,
 ) -> Result<()> {
     use crate::web_server::request::{read_full_http_request, send_response};
     let buf = match read_full_http_request(&mut stream).await {
@@ -429,7 +650,7 @@ async fn handle_connection(
     let (method, path) = (parts[0], parts[1]);
     match (method, path) {
         ("GET", "/") => {
-            let html = build_html_page(app_id, resolved);
+            let html = build_html_page(app_id, resolved, attach_mode);
             send_response(&mut stream, 200, "text/html; charset=utf-8", html.as_bytes()).await?;
         }
         ("GET", "/favicon.ico") => {
@@ -481,6 +702,20 @@ async fn handle_connection(
                 .as_str()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
+            // Geofence — restrict media routing region. "GLOBAL" / empty
+            // → no `properties.geofence` emitted (Agora's default).
+            let geo_area: Option<String> = req["geofence_area"]
+                .as_str()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("GLOBAL"));
+            // HIPAA mode — routes the call through Agora's US-HIPAA
+            // endpoint. Browser also enforces NORTH_AMERICA + AES_256_GCM2
+            // before sending; we trust those flags arrived correctly.
+            let hipaa = req["hipaa"].as_bool().unwrap_or(false);
+            // Audio dump — opt-in debug knob, surfaces as
+            // properties.parameters.enable_dump=true. Server-side capture;
+            // retrieve via Agora support.
+            let enable_dump = req["enable_dump"].as_bool().unwrap_or(false);
 
             // Only one agent at a time per process.
             {
@@ -531,12 +766,11 @@ async fn handle_connection(
                 encryption_mode: enc_mode,
                 encryption_key:  enc_key.as_deref(),
                 encryption_salt: enc_salt.as_deref(),
+                geofence_area:   geo_area.as_deref(),
+                enable_dump,
             });
 
-            let url = format!(
-                "{}/api/conversational-ai-agent/v2/projects/{}/join",
-                convoai_base_url(), app_id
-            );
+            let url = convoai_url(hipaa, &format!("v2/projects/{}/join", app_id));
             history_push(&history, HistoryEntry {
                 ts_ms: unix_ms(), kind: "request".into(),
                 method: Some("POST".into()), url: url.clone(), status: None,
@@ -574,6 +808,7 @@ async fn handle_connection(
                         st.agent_id   = Some(agent_id.clone());
                         st.name       = Some(name.clone());
                         st.started_at = Some(started);
+                        st.hipaa      = hipaa;
                     }
                     let out = serde_json::json!({
                         "agent_id":   agent_id,
@@ -609,9 +844,10 @@ async fn handle_connection(
         }
 
         ("POST", "/api/convo/stop") => {
-            let agent_id = {
+            // Both fields read under one lock — keep them consistent.
+            let (agent_id, hipaa) = {
                 let st = state.lock().await;
-                st.agent_id.clone()
+                (st.agent_id.clone(), st.hipaa)
             };
             let agent_id = match agent_id {
                 Some(id) => id,
@@ -634,10 +870,9 @@ async fn handle_connection(
                 3600,
                 Some(resolved.agent_user_id.as_str()),
             )?;
-            let url = format!(
-                "{}/api/conversational-ai-agent/v2/projects/{}/agents/{}/leave",
-                convoai_base_url(), app_id, agent_id
-            );
+            // Re-use hipaa from /start so the URL matches the agent's
+            // origin endpoint.
+            let url = convoai_url(hipaa, &format!("v2/projects/{}/agents/{}/leave", app_id, agent_id));
             history_push(&history, HistoryEntry {
                 ts_ms: unix_ms(), kind: "request".into(),
                 method: Some("POST".into()), url: url.clone(), status: None,
@@ -709,7 +944,7 @@ async fn handle_connection(
 /// live in Task 14. This function only produces the static structure,
 /// inline CSS, and the JS constants + input-seeding the page needs to
 /// display correctly.
-fn build_html_page(app_id: &str, resolved: &ResolvedConfig) -> String {
+fn build_html_page(app_id: &str, resolved: &ResolvedConfig, attach_mode: bool) -> String {
     let app_id_display = if app_id.len() > 12 {
         format!("{}...{}", &app_id[..6], &app_id[app_id.len() - 4..])
     } else {
@@ -864,6 +1099,17 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <button class="btn btn-mute" onclick="regenSalt()">Regen</button>
     <button class="copy-btn" onclick="copyText(document.getElementById('encSaltInput').value)">Copy</button>
   </div>
+  <div class="controls">
+    <label>Geofence</label>
+    <select id="geoAreaSelect" style="width:200px">
+      <option value="GLOBAL" selected>Global (no fence)</option>
+      <option value="NORTH_AMERICA">North America</option>
+      <option value="EUROPE">Europe</option>
+      <option value="ASIA">Asia</option>
+      <option value="JAPAN">Japan</option>
+      <option value="INDIA">India</option>
+    </select>
+  </div>
 </section>
 
 <!-- ── RTC ─────────────────────────────────────────────────────── -->
@@ -910,6 +1156,22 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <label for="avatarCheckbox">Enable Avatar</label>
     <input type="checkbox" id="avatarCheckbox">
   </div>
+  <div class="controls avatar-row">
+    <label for="hipaaCheckbox">HIPAA Mode</label>
+    <input type="checkbox" id="hipaaCheckbox">
+    <span id="hipaaHint" style="font-size:12px;color:#7d8590">
+      Routes via /hipaa endpoint, forces NORTH_AMERICA + AES_256_GCM2 with a generated key.
+      Contact Agora Support to enable this function for your project first.
+    </span>
+  </div>
+  <div class="controls avatar-row">
+    <label for="audioDumpCheckbox">Audio Dump</label>
+    <input type="checkbox" id="audioDumpCheckbox">
+    <span style="font-size:12px;color:#7d8590">
+      Sends `parameters.enable_dump=true` so Agora captures agent-side audio for debugging.
+      Retrieve via Agora Support.
+    </span>
+  </div>
   <div class="controls" id="avatarInfo"
        style="flex-direction:column;align-items:flex-start;gap:4px;padding-left:16px;color:#7d8590;font-family:monospace;font-size:12px">
     <!-- Filled by JS from AVATAR_INFO. Shows non-secret fields from
@@ -937,6 +1199,15 @@ const PRESET      = "{preset}";
 const PRESETS     = {presets_js};    // e.g. ["expertise_ai_poc", ...] or []
 const AVATAR_OK   = {avatar_ok};     // [agent.avatar] block present in TOML
 const AVATAR_INFO = {avatar_info_js};  // {{vendor, avatar_id}} or null
+
+// Defaults from convo.toml. Pre-fill the form fields on load; user
+// can still override via the browser controls.
+const DEFAULT_HIPAA    = {default_hipaa};
+const DEFAULT_GEOFENCE = "{default_geofence}";
+const DEFAULT_ENC_MODE = {default_enc_mode};
+const DEFAULT_ENC_KEY  = "{default_enc_key}";
+const DEFAULT_ENC_SALT = "{default_enc_salt}";
+const ATTACH_MODE      = {attach_mode};   // True → daemon owns the agent; UI hides Start/Stop.
 
 // ── Encryption helpers ───────────────────────────────────────────
 // Mode IDs match the Agora ConvoAI REST API integer table; the strings
@@ -982,10 +1253,76 @@ function syncSaltRow() {{
     input.value = '';
   }}
 }}
+// Pre-fill HIPAA / geofence / encryption controls from convo.toml
+// defaults emitted by the server. User can still override.
+function applyTomlDefaults() {{
+  if (DEFAULT_HIPAA) document.getElementById('hipaaCheckbox').checked = true;
+  if (DEFAULT_GEOFENCE) document.getElementById('geoAreaSelect').value = DEFAULT_GEOFENCE;
+  if (DEFAULT_ENC_MODE > 0) {{
+    document.getElementById('encModeSelect').value = String(DEFAULT_ENC_MODE);
+    document.getElementById('encKeyInput').value   = DEFAULT_ENC_KEY;
+    document.getElementById('encSaltInput').value  = DEFAULT_ENC_SALT;
+  }} else {{
+    // No encryption configured in TOML — leave the page-default mode 8
+    // selected but clear any auto-generated salt so the row stays empty
+    // until the user picks a key.
+    if (!DEFAULT_ENC_KEY) document.getElementById('encKeyInput').value = '';
+  }}
+}}
+
+// Attach mode: a background daemon already owns the agent on this
+// channel. Hide Start/Stop because /api/convo/start would create a
+// SECOND agent on the same channel, which Agora rejects.
+function applyAttachMode() {{
+  if (!ATTACH_MODE) return;
+  const startBtn = document.getElementById('startAgentBtn');
+  const stopBtn  = document.getElementById('stopAgentBtn');
+  if (startBtn) startBtn.style.display = 'none';
+  if (stopBtn)  stopBtn.style.display  = 'none';
+  setAgentDot('connected', 'attached (daemon owns agent)');
+  logEvent('Attach mode: agent is owned by a background daemon. Use `atem serv kill` to /leave.', 'info');
+}}
 window.addEventListener('DOMContentLoaded', () => {{
+  applyTomlDefaults();
+  applyAttachMode();
   document.getElementById('encModeSelect').addEventListener('change', syncSaltRow);
   syncSaltRow();
+  document.getElementById('hipaaCheckbox').addEventListener('change', syncHipaa);
+  syncHipaa();
 }});
+
+// Generate a short random encryption key (8 decimal digits) for
+// HIPAA mode. Easy to read/share for testing; not cryptographically
+// strong — for production use, replace with a 32-byte key.
+function genHipaaKey() {{
+  const a = new Uint32Array(1);
+  crypto.getRandomValues(a);
+  return String(a[0] % 100000000).padStart(8, '0');
+}}
+
+// Force the related controls when HIPAA mode is on:
+//   geofence = NORTH_AMERICA, encryption = AES_256_GCM2 (mode 8)
+// Generated key + fresh salt are populated. All four fields are
+// locked while HIPAA is checked so the values that get sent to the
+// server can't drift from what the UI claims is in effect.
+function syncHipaa() {{
+  const on = document.getElementById('hipaaCheckbox').checked;
+  const geo = document.getElementById('geoAreaSelect');
+  const mode = document.getElementById('encModeSelect');
+  const key = document.getElementById('encKeyInput');
+  const salt = document.getElementById('encSaltInput');
+  if (on) {{
+    geo.value  = 'NORTH_AMERICA';
+    mode.value = '8';
+    if (!key.value) key.value = genHipaaKey();
+    syncSaltRow();
+    if (!salt.value) salt.value = saltBase64(randSalt32());
+    geo.disabled = mode.disabled = key.readOnly = salt.readOnly = true;
+  }} else {{
+    geo.disabled = mode.disabled = false;
+    key.readOnly = salt.readOnly = false;
+  }}
+}}
 
 function copyText(text) {{
   if (!text) return;
@@ -1124,6 +1461,15 @@ async function doJoin() {{
       }}
     }} catch (e) {{
       logEvent('setParameter ENABLE_AUDIO_PTS_METADATA failed: ' + e.message, 'warning');
+    }}
+
+    // Geofence — restrict local SDK media routing. Must be set BEFORE
+    // createClient. The same area is forwarded to /api/convo/start so
+    // the agent stays in the same region.
+    const geoArea = document.getElementById('geoAreaSelect').value;
+    if (geoArea && geoArea !== 'GLOBAL') {{
+      AgoraRTC.setArea({{ areaCode: geoArea }});
+      logEvent('Geofence: ' + geoArea);
     }}
 
     rtcClient = AgoraRTC.createClient({{ mode: 'rtc', codec: 'vp8' }});
@@ -1633,6 +1979,19 @@ async function startAgent() {{
         startBody.encryption_salt = document.getElementById('encSaltInput').value.trim();
       }}
     }}
+    // Forward geofence area. GLOBAL = default = no field sent.
+    const startGeoArea = document.getElementById('geoAreaSelect').value;
+    if (startGeoArea && startGeoArea !== 'GLOBAL') {{
+      startBody.geofence_area = startGeoArea;
+    }}
+    // HIPAA mode flag — server uses it to pick /hipaa/api/... URL.
+    if (document.getElementById('hipaaCheckbox').checked) {{
+      startBody.hipaa = true;
+    }}
+    // Audio dump flag — debug knob; server adds parameters.enable_dump.
+    if (document.getElementById('audioDumpCheckbox').checked) {{
+      startBody.enable_dump = true;
+    }}
     const resp = await fetch('/api/convo/start', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
@@ -1867,12 +2226,54 @@ window.addEventListener('load', async () => {{
         presets_js     = presets_js,
         avatar_ok      = avatar_ok,
         avatar_info_js = avatar_info_js,
+        default_hipaa    = if resolved.hipaa { "true" } else { "false" },
+        default_geofence = resolved.geofence,
+        default_enc_mode = resolved.encryption_mode,
+        default_enc_key  = resolved.encryption_key,
+        default_enc_salt = resolved.encryption_salt,
+        attach_mode      = if attach_mode { "true" } else { "false" },
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_secrets_replaces_sensitive_keys_keeps_others() {
+        let mut v = serde_json::json!({
+            "channel": "test",
+            "token":   "super_secret_token_value",
+            "agent_user_id": "1001",
+            "rtc": {
+                "encryption_key":  "shhhh",
+                "encryption_salt": "saltydata=",   // not masked
+                "encryption_mode": 8,
+            },
+            "agent": {
+                "llm": {
+                    "url":     "https://api.example.com",
+                    "api_key": "sk-xxxxx",
+                },
+                "avatar": {
+                    "params": {
+                        "agora_app_cert": "private",
+                    },
+                },
+            },
+        });
+        mask_secrets(&mut v);
+        assert!(v["token"].as_str().unwrap().starts_with("***"));
+        assert!(v["rtc"]["encryption_key"].as_str().unwrap().starts_with("***"));
+        assert!(v["agent"]["llm"]["api_key"].as_str().unwrap().starts_with("***"));
+        assert!(v["agent"]["avatar"]["params"]["agora_app_cert"].as_str().unwrap().starts_with("***"));
+        // Non-sensitive fields are untouched.
+        assert_eq!(v["channel"], "test");
+        assert_eq!(v["agent_user_id"], "1001");
+        assert_eq!(v["rtc"]["encryption_salt"], "saltydata=");
+        assert_eq!(v["rtc"]["encryption_mode"], 8);
+        assert_eq!(v["agent"]["llm"]["url"], "https://api.example.com");
+    }
 
     #[test]
     fn default_config_path_ends_with_convo_toml() {
@@ -1904,6 +2305,20 @@ mod tests {
     }
 
     #[test]
+    fn convoai_url_default_uses_api_prefix() {
+        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
+        let u = convoai_url(false, "v2/projects/abc/join");
+        assert_eq!(u, "https://api.agora.io/api/conversational-ai-agent/v2/projects/abc/join");
+    }
+
+    #[test]
+    fn convoai_url_hipaa_uses_hipaa_prefix() {
+        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
+        let u = convoai_url(true, "v2/projects/abc/join");
+        assert_eq!(u, "https://api.agora.io/hipaa/api/conversational-ai-agent/v2/projects/abc/join");
+    }
+
+    #[test]
     fn html_has_expected_ids_and_scripts() {
         let resolved = ResolvedConfig {
             channel:           "chan".into(),
@@ -1916,8 +2331,13 @@ mod tests {
             }),
             preset:            None,
             presets:           vec![],
+            hipaa:             false,
+            geofence:          String::new(),
+            encryption_mode:   0,
+            encryption_key:    String::new(),
+            encryption_salt:   String::new(),
         };
-        let html = build_html_page("app-xx", &resolved);
+        let html = build_html_page("app-xx", &resolved, false);
         assert!(html.contains("/vendor/conversational-ai-api.js"));
         assert!(html.contains("id=\"agentUidDisplay\""));
         assert!(html.contains("id=\"avatarCheckbox\""));
@@ -1940,8 +2360,13 @@ mod tests {
             avatar_summary:    None,
             preset:            None,
             presets:           vec!["expertise_ai_poc".into(), "_akool_test_expertise".into()],
+            hipaa:             false,
+            geofence:          String::new(),
+            encryption_mode:   0,
+            encryption_key:    String::new(),
+            encryption_salt:   String::new(),
         };
-        let html = build_html_page("app", &resolved);
+        let html = build_html_page("app", &resolved, false);
         // JSON-encoded array literal must appear in the page.
         assert!(html.contains(r#"["expertise_ai_poc","_akool_test_expertise"]"#),
             "preset list not embedded — got: {}",
