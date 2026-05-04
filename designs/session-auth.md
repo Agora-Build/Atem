@@ -239,7 +239,7 @@ Activity on Machine B doesn't affect Machine C.
 ### Atem
 - ✅ `src/auth.rs` - Session model + 8 new tests
 - ✅ `src/app.rs` - Session refresh on connection/messages
-- ✅ `config.example.toml` - VPN + relay examples
+- ✅ `configs/config.example.toml` - VPN + relay examples
 - ✅ `designs/connection-priority.md` - Architecture docs
 
 ### Astation

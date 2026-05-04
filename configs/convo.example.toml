@@ -1,17 +1,54 @@
 # atem serv convo — ConvoAI agent configuration
 # Copy to ~/.config/atem/convo.toml (chmod 0600 — contains API keys)
 #
-# Override any field via CLI: --channel, --rtc-user-id, --agent-user-id, --config
+# Override per-command via CLI: --channel, --rtc-user-id, --agent-user-id, --config
 
 # ── Channel & UIDs ───────────────────────────────────────────────────
-# channel is auto-generated when omitted:
-#   "atem-rtc-<app_id[..12]>-<ts>-<rand4>"
+# Channel is auto-generated when omitted:
+#   "atem-convo-<app_id[..12]>-<ts>-<rand4>"
 # Uncomment to pin a fixed channel:
 # channel         = "demo"
 
 rtc_user_id       = "0"      # human's RTC uid ("0" = server-assigned)
 agent_user_id     = "1001"   # agent's RTC uid (voice)
 idle_timeout_secs = 120      # server-side safety timeout (seconds)
+
+# ── Routing / security ────────────────────────────────────────────────
+# All optional. Empty / unset → off (regular endpoint, no fence,
+# no encryption, no avatar). The web UI form pre-fills from these
+# values and `--background` mode forwards them verbatim to ConvoAI's
+# /join body so both flows behave consistently.
+
+# Route through Agora's /hipaa/api/conversational-ai-agent/... endpoint
+# instead of /api/.... Requires Agora Support to enable HIPAA on the
+# project first.
+hipaa = false
+
+# Geofence — restrict media routing region.
+# Valid: GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
+# GLOBAL (or omitting the field) → no geofence sent.
+geofence = "GLOBAL"
+
+# Avatar opt-in. Defaults to false even when [agent.avatar] is
+# configured below — fleet `--background` launches won't burn avatar
+# minutes by accident.  Note: avatar + encryption is currently
+# incompatible (the avatar vendor joins the channel unencrypted).
+enable_avatar = false
+
+# RTC encryption.  mode = 0 → off; the [encryption] block is ignored
+# entirely.  When mode > 0, both the local browser SDK and the agent
+# join with these settings — they MUST match exactly or audio fails
+# silently.
+[encryption]
+mode = 0
+# key  = "your-key-here"                                # required when mode > 0
+# salt = "Q4mTLy5h9qtD46vrdMgotPH9WrZxDsLxThPD9vtlf+o="  # base64-32-bytes; required for gcm2 modes (7, 8)
+# Agora encryption_mode integer reference:
+#   1 AES_128_XTS         5 AES_128_GCM
+#   2 AES_128_ECB         6 AES_256_GCM
+#   3 AES_256_XTS         7 AES_128_GCM2  (needs salt)
+#   4 SM4_128_ECB         8 AES_256_GCM2  (needs salt; recommended)
+# Generate a fresh salt with:  openssl rand -base64 32
 
 # ── Presets ──────────────────────────────────────────────────────────
 # Shown as checkboxes on the page (all checked by default). Checked
@@ -38,7 +75,7 @@ sal_mode = "locking"
 [parameters]
 audio_scenario = "default"
 data_channel   = "rtm"       # transcripts via RTM (not RTC data stream)
-# enable_dump  = true        # Agora server-side debug dump — enable only
+# enable_dump  = true        # Agora server-side audio dump — enable only
                              # when troubleshooting with Agora support
 
 [parameters.transcript]
@@ -48,24 +85,25 @@ enable_words = true
 validate_asr_result_timestamp = false
 
 # ── Avatar (optional) ────────────────────────────────────────────────
-# Declaring [agent.avatar] enables the avatar block in /join when the
-# user ticks "Enable Avatar" on the page. atem auto-generates
-# agora_channel (= voice channel), agora_uid (random 5-digit), and
-# agora_token (minted from active project's appid + cert).
+# Declaring [agent.avatar] makes the avatar block AVAILABLE; whether it
+# actually goes into the /join body is gated by `enable_avatar = true`
+# above (or the "Enable Avatar" checkbox on the web page).
 #
-# vendor + avatar_id are required by Agora — sending without them
-# causes a 400 or a silent agent failure. Your downstream preset /
-# proxy backend can back-fill them if you leave them commented.
+# atem auto-generates agora_channel (= voice channel), agora_uid
+# (random 5-digit), and agora_token (minted from active project's
+# appid + cert) when not provided in [agent.avatar.params].
+#
+# vendor + avatar_id are required by Agora.
 #
 # [agent.avatar]
 # vendor    = "akool"
 # avatar_id = "dvp_Sean_agora"
 #
 # [agent.avatar.params]
-# api_key        = "<vendor api key>"
-# host           = "ws://..."                # vendor-specific endpoint
-# agora_appid    = "..."                     # override project for minting
-# agora_token    = "..."                     # pre-minted; atem uses verbatim
+# api_key     = "<vendor api key>"
+# host        = "ws://..."                # vendor-specific endpoint
+# agora_appid = "..."                     # override project for minting
+# agora_token = "..."                     # pre-minted; atem uses verbatim
 
 # ── LLM ──────────────────────────────────────────────────────────────
 [agent.llm]

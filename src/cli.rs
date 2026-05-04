@@ -335,6 +335,28 @@ pub enum ServCommands {
         #[arg(long, hide = true)]
         _serv_daemon: bool,
     },
+    /// Receive Agora webhooks locally; tunnels via ngrok by default.
+    /// Prints each event to stdout and serves a live console at /.
+    Webhooks {
+        /// webhooks.toml path. Default: ~/.config/atem/webhooks.toml
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Local HTTP port (0 = use TOML or 9090 default)
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Skip ngrok tunnel — POSTs must reach the local port directly.
+        #[arg(long)]
+        no_tunnel: bool,
+        /// Don't auto-open the local console in a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Daemon mode: re-execs as a detached daemon process.
+        #[arg(long)]
+        background: bool,
+        /// Internal: daemon marker (hidden)
+        #[arg(long, hide = true)]
+        _serv_daemon: bool,
+    },
     /// List running background servers
     List,
     /// Kill a background server by ID
@@ -957,6 +979,15 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     port, no_browser, background,
                     _daemon: _serv_daemon,
                     attach: false,
+                }).await
+            }
+            ServCommands::Webhooks {
+                config, port, no_tunnel, no_browser, background, _serv_daemon,
+            } => {
+                crate::webhook_server::run_server(crate::webhook_server::ServeWebhooksConfig {
+                    config_path: config,
+                    port, no_tunnel, no_browser, background,
+                    _daemon: _serv_daemon,
                 }).await
             }
             ServCommands::Diagrams {

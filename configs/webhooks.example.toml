@@ -1,0 +1,58 @@
+# atem serv webhooks — local Agora webhook receiver configuration
+# Copy to ~/.config/atem/webhooks.toml
+#
+# Override per-command via CLI: --port, --no-tunnel, --no-browser, --background
+#
+# ── Quick start ──────────────────────────────────────────────────────
+#   1. atem serv webhooks
+#   2. Atem prints a Public URL (via ngrok by default).
+#   3. Paste the Public URL into Agora Console → NCS / ConvoAI webhook
+#      settings, copy the secret it shows you, paste it into `secret`
+#      below, restart atem.
+#   4. The web console at http://127.0.0.1:9090/ shows incoming events
+#      live; each event also prints a one-line summary to stdout.
+#
+# ── Local port ────────────────────────────────────────────────────────
+# Atem binds 0.0.0.0:<port> so the page is reachable from other devices
+# on the same network if needed. Default 9090.
+port = 9090
+
+# ── HMAC secret ──────────────────────────────────────────────────────
+# Used to validate the `Agora-Signature-V2` header (HMAC-SHA256 of the
+# raw body, hex-encoded). Agora Console shows the secret when you
+# create the webhook subscription.
+#
+# Empty / unset → atem accepts unsigned events with a banner warning.
+# Fine for `curl` testing; set this in real use so a stranger can't
+# POST garbage to your public URL.
+secret = ""
+
+# ── Tunnel (scenario A: atem manages it) ─────────────────────────────
+# When `tunnel = true`, atem spawns a tunnel subprocess at startup,
+# reads the public URL it prints, and shows it on the launch banner.
+# When the atem process exits, the tunnel dies with it.
+#
+# For scenarios B (your own ngrok / cloudflared running separately)
+# and C (cloudflared named tunnel on your domain), launch atem with
+# `--no-tunnel` instead — the local listener stays the same; only
+# the auto-spawn step is skipped.
+tunnel = true
+
+# ── Tunnel provider ──────────────────────────────────────────────────
+# "ngrok"
+#   - Requires `ngrok config add-authtoken <token>` (one-time).
+#   - Free tier: 1 random URL, changes every restart.
+#   - Atem detects collisions on port 4040 (ngrok's agent API) and
+#     prints a clear error if another ngrok is already running.
+#
+# "cloudflared"  (alias: "cf")
+#   - No account / authtoken needed for "quick tunnels".
+#   - Random URL `https://<words>.trycloudflare.com`, changes every restart.
+#   - Install: https://github.com/cloudflare/cloudflared/releases
+tunnel_provider = "ngrok"
+
+# ── ngrok reserved domain (optional, paid feature) ───────────────────
+# Pin a stable URL across restarts. Requires an ngrok plan that
+# includes reserved domains. Ignored when tunnel_provider != "ngrok".
+#
+# ngrok_domain = "atem-webhooks.ngrok-free.app"

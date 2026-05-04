@@ -79,6 +79,9 @@ atem serv rtc --background              # Run as background daemon
 atem serv diagrams                      # Host diagrams from SQLite (HTTP)
 atem serv diagrams --port 9000
 atem serv diagrams --background
+atem serv webhooks                      # Receive Agora webhooks locally (auto-tunneled via ngrok)
+atem serv webhooks --no-tunnel          # Local listener only — bring your own tunnel
+atem serv webhooks --background         # Run as background daemon
 atem serv list                          # List running background servers (#, ID, PID, STATUS)
 atem serv kill <ID|#>                   # Kill a server (POSTs /leave for convo)
 atem serv killall                       # Kill all background servers
@@ -99,6 +102,8 @@ done
 **`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging, RTC encryption (8 modes; gcm2 modes auto-generate a copyable salt).
 
 **`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
+
+**`serv webhooks`** — local receiver for Agora webhook events (ConvoAI: `agent_joined`, `agent_left`, `agent_history`, `agent_error`, `agent_metrics`, …; RTC NCS events). Validates `Agora-Signature-V2` (HMAC-SHA256) when a `secret` is configured in `webhooks.toml`; accepts unsigned events otherwise with a warning. Live web console at `http://127.0.0.1:9090/` shows incoming events; each event also prints a one-line summary to stdout. Default tunnel provider is **ngrok**; set `tunnel_provider = "cloudflared"` for zero-auth quick tunnels. Use `--no-tunnel` if you're running cloudflared / ngrok separately for stable URLs across atem restarts.
 
 **Channel placeholders** — `--channel` accepts `{appid}` (first 12 chars of the active app id) and `{ts}` (unix epoch seconds at startup). Useful in for-loops to match the auto-gen channel format.
 

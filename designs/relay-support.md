@@ -126,7 +126,7 @@ With the new configuration, Atem tries connections in this order:
 **Atem:**
 - `src/config.rs`: Added `astation_relay_code` field + env var support
 - `src/app.rs`: Updated relay connection to use astation_id as code
-- `config.example.toml`: Documented new config option
+- `configs/config.example.toml`: Documented new config option
 - `designs/relay-support.md`: This file
 
 **Astation:**

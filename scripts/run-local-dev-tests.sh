@@ -459,6 +459,58 @@ else
 fi
 echo
 
+# ── Webhooks server (no tunnel — local end-to-end) ──────────────────
+echo "$(yellow "Webhooks server")"
+WEBHOOK_PORT=19191
+WEBHOOK_LOG="$(mktemp -t atem-webhooks.XXXXXX.log)"
+"$ATEM" serv webhooks --port "$WEBHOOK_PORT" --no-tunnel --no-browser >"$WEBHOOK_LOG" 2>&1 &
+WEBHOOK_PID=$!
+# Wait up to 5s for HTTP listener
+for _ in $(seq 1 10); do
+    curl -s --max-time 1 "http://127.0.0.1:$WEBHOOK_PORT/" -o /dev/null 2>/dev/null && break
+    sleep 0.5
+done
+
+run_contains "atem serv webhooks — GET /" "atem serv webhooks" \
+    -- curl -s "http://127.0.0.1:$WEBHOOK_PORT/"
+
+run_contains "atem serv webhooks — POST /webhook (unsigned, 200)" '{"ok":true}' \
+    -- bash -c "curl -s -X POST http://127.0.0.1:$WEBHOOK_PORT/webhook \
+        -H 'Content-Type: application/json' \
+        -d '{\"noticeId\":\"smoke-1\",\"productId\":1,\"eventType\":101,\"notifyMs\":1,\"payload\":{\"agent_id\":\"x\"}}'"
+
+# Unknown route should 404
+printf "  %s ... " "$(dim "atem serv webhooks — GET /no-such returns 404")"
+status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEBHOOK_PORT/no-such")
+if [[ "$status" == "404" ]]; then
+    green "PASS"; echo
+    PASS=$((PASS + 1))
+else
+    red "FAIL"; echo " (got $status)"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES+=("atem serv webhooks — 404 path")
+fi
+
+# Each POST should print a one-line summary in the daemon's stdout (we
+# captured it via WEBHOOK_LOG). Eyeballing the log catches regressions
+# in the broadcast / println path.
+printf "  %s ... " "$(dim "atem serv webhooks — POST printed event summary to log")"
+sleep 0.2  # let the broadcast task drain
+if grep -q '101 agent_joined' "$WEBHOOK_LOG"; then
+    green "PASS"; echo
+    PASS=$((PASS + 1))
+else
+    red "FAIL"; echo
+    sed 's/^/      /' "$WEBHOOK_LOG"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES+=("atem serv webhooks — log line")
+fi
+
+kill "$WEBHOOK_PID" 2>/dev/null || true
+wait "$WEBHOOK_PID" 2>/dev/null || true
+rm -f "$WEBHOOK_LOG"
+echo
+
 # ── Interactive / external commands (intentionally skipped) ─────────
 echo "$(yellow "Interactive / external (skipped)")"
 skip "atem login"    "opens browser — interactive"

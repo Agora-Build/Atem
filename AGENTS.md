@@ -59,6 +59,8 @@ src/
 ├── agent_registry.rs    # Registry of all known agents (PTY + ACP)
 ├── agent_visualize.rs   # Diagram generation: prompt builder, fs snapshot/diff, upload
 ├── diagram_server.rs    # Diagram hosting: SQLite blob store + HTTP server
+├── webhook_server.rs    # atem serv webhooks — Agora webhook receiver +
+                          # ngrok/cloudflared tunnel integration + SSE console
 ├── rtc_test_server.rs   # Browser-based RTC test page server
 ├── convo_config.rs      # ConvoAI TOML parsing + Agora REST /join body builder
 ├── convo_test_server.rs # atem serv convo — ConvoAI test server + --background mode
@@ -137,6 +139,8 @@ Key methods:
 **Agent Visualize** (`agent_visualize.rs`): Generates visual HTML diagrams via ACP agents. Snapshots `~/.agent/diagrams/` before sending a prompt, detects new HTML files via ToolCall events or filesystem diff, uploads to diagram server, and opens results in the browser.
 
 **Diagram Server** (`diagram_server.rs`): SQLite-backed HTTP server for hosting diagrams. Stores HTML as blobs, serves at `/d/{id}`. Auto-starts as background daemon when needed. Integrates with server registry (`atem serv list/kill`).
+
+**Webhook Server** (`webhook_server.rs`): Receives Agora webhook POSTs (ConvoAI events 101–111, 201–202; RTC NCS events) on a local HTTP port. Optionally spawns `ngrok http <port>` or `cloudflared tunnel --url <port>` to expose the listener publicly. Validates `Agora-Signature-V2` (HMAC-SHA256) against `secret` from `webhooks.toml` when configured, skips validation with a banner warning otherwise. Broadcasts each accepted event to a live web console (SSE) at `GET /` and prints a one-line summary to stdout. `--background` mode: standard daemon shape — registers in `~/.config/atem/servers/webhooks-<port>.json`, redirects stdout/stderr to `webhooks-<port>.log`, manageable via `atem serv list / kill / killall`. ngrok collision detection (refuses to start when a foreign ngrok already owns `:4040` and prints actionable next steps including the paid-plan link). cloudflared failure path captures stderr tail and surfaces it.
 
 ### Configuration & Storage (`config.rs`)
 

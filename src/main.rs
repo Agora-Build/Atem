@@ -31,6 +31,8 @@ mod web_server;
 mod rtc_test_server;
 // Diagram hosting server
 mod diagram_server;
+// Local Agora webhook receiver + ngrok tunnel
+mod webhook_server;
 
 use anyhow::Result;
 use clap::Parser;
