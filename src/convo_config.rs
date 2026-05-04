@@ -75,6 +75,13 @@ pub struct ConvoConfig {
 
     /// `[encryption]` block. When `mode > 0`, encryption is active.
     pub encryption: Option<EncryptionConfig>,
+
+    /// Default state of the "Enable Avatar" checkbox in the web UI,
+    /// AND the value used by `--background` mode (which has no UI).
+    /// Defaults to `false` even when `[agent.avatar]` is configured —
+    /// avatar is opt-in, not opt-out, so fleet launches don't burn
+    /// avatar minutes by accident.
+    pub enable_avatar: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -493,6 +500,11 @@ pub struct ResolvedConfig {
     pub encryption_key:    String,
     /// Encryption salt base64 (TOML default). Required for gcm2 modes.
     pub encryption_salt:   String,
+    /// Whether to enable avatar by default. False unless convo.toml
+    /// sets `enable_avatar = true`. Web UI form pre-fills from this;
+    /// `--background` uses it directly to gate the avatar block in
+    /// the /join body.
+    pub enable_avatar:     bool,
 }
 
 /// Public display fields from `[agent.avatar]`. Excludes `params`,
@@ -546,6 +558,7 @@ impl ConvoConfig {
             encryption_mode: enc.mode,
             encryption_key:  enc.key,
             encryption_salt: enc.salt,
+            enable_avatar:   self.enable_avatar.unwrap_or(false),
         })
     }
 }

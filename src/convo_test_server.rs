@@ -519,7 +519,12 @@ async fn run_background(
         token: &agent_token,
         agent_rtc_uid: &resolved.agent_user_id,
         remote_uids: &[resolved.rtc_user_id.clone()],
-        include_avatar: resolved.avatar_configured,
+        // Avatar is opt-in via convo.toml's `enable_avatar = true`.
+        // Configuration alone (i.e. presence of [agent.avatar]) is not
+        // enough — fleet daemons would otherwise burn avatar minutes
+        // unintentionally. `avatar_configured` is the secondary gate
+        // so we don't emit a half-formed avatar block.
+        include_avatar: resolved.enable_avatar && resolved.avatar_configured,
         avatar_user_id: &avatar_user_id,
         avatar_channel: avatar_channel.as_deref(),
         avatar_token:   avatar_token.as_deref(),
@@ -1208,6 +1213,7 @@ const DEFAULT_ENC_MODE = {default_enc_mode};
 const DEFAULT_ENC_KEY  = "{default_enc_key}";
 const DEFAULT_ENC_SALT = "{default_enc_salt}";
 const ATTACH_MODE      = {attach_mode};   // True → daemon owns the agent; UI hides Start/Stop.
+const DEFAULT_ENABLE_AVATAR = {default_enable_avatar};  // From convo.toml's `enable_avatar`.
 
 // ── Encryption helpers ───────────────────────────────────────────
 // Mode IDs match the Agora ConvoAI REST API integer table; the strings
@@ -1256,6 +1262,7 @@ function syncSaltRow() {{
 // Pre-fill HIPAA / geofence / encryption controls from convo.toml
 // defaults emitted by the server. User can still override.
 function applyTomlDefaults() {{
+  if (DEFAULT_ENABLE_AVATAR) document.getElementById('avatarCheckbox').checked = true;
   if (DEFAULT_HIPAA) document.getElementById('hipaaCheckbox').checked = true;
   if (DEFAULT_GEOFENCE) document.getElementById('geoAreaSelect').value = DEFAULT_GEOFENCE;
   if (DEFAULT_ENC_MODE > 0) {{
@@ -1272,15 +1279,36 @@ function applyTomlDefaults() {{
 
 // Attach mode: a background daemon already owns the agent on this
 // channel. Hide Start/Stop because /api/convo/start would create a
-// SECOND agent on the same channel, which Agora rejects.
+// SECOND agent on the same channel, which Agora rejects. Also lock
+// every agent-creation knob — these are baked into the live agent at
+// /join time and cannot be changed mid-flight; leaving them editable
+// would just mislead the operator.
 function applyAttachMode() {{
   if (!ATTACH_MODE) return;
   const startBtn = document.getElementById('startAgentBtn');
   const stopBtn  = document.getElementById('stopAgentBtn');
   if (startBtn) startBtn.style.display = 'none';
   if (stopBtn)  stopBtn.style.display  = 'none';
+  // These are settable only at /join time — the daemon already used
+  // whatever convo.toml had when it spawned. Disable so the operator
+  // doesn't think toggling them affects the live agent.
+  const lockIds = [
+    'avatarCheckbox', 'audioDumpCheckbox', 'hipaaCheckbox',
+    'geoAreaSelect',  'encModeSelect',
+    'encKeyInput',    'encSaltInput',
+  ];
+  for (const id of lockIds) {{
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (el.tagName === 'INPUT' && el.type === 'text') el.readOnly = true;
+    else el.disabled = true;
+  }}
+  // Preset checkboxes are populated dynamically; lock them too.
+  document.querySelectorAll('#presetCheckboxes input[type=checkbox]')
+    .forEach((cb) => {{ cb.disabled = true; }});
   setAgentDot('connected', 'attached (daemon owns agent)');
   logEvent('Attach mode: agent is owned by a background daemon. Use `atem serv kill` to /leave.', 'info');
+  logEvent('Agent-creation controls (avatar, encryption, presets, geofence, HIPAA, dump) are locked — they were set when the daemon spawned.', 'info');
 }}
 window.addEventListener('DOMContentLoaded', () => {{
   applyTomlDefaults();
@@ -2232,6 +2260,7 @@ window.addEventListener('load', async () => {{
         default_enc_key  = resolved.encryption_key,
         default_enc_salt = resolved.encryption_salt,
         attach_mode      = if attach_mode { "true" } else { "false" },
+        default_enable_avatar = if resolved.enable_avatar { "true" } else { "false" },
     )
 }
 
@@ -2258,6 +2287,7 @@ mod tests {
             encryption_mode:   8,
             encryption_key:    "hunter2".into(),
             encryption_salt:   "c2FsdC1iYXNlNjQ=".into(),
+            enable_avatar:     true,
         };
         let html = build_html_page("app", &resolved, false);
         assert!(html.contains("const DEFAULT_HIPAA    = true;"),
@@ -2276,6 +2306,7 @@ mod tests {
             preset: None, presets: vec![],
             hipaa: false, geofence: String::new(),
             encryption_mode: 0, encryption_key: String::new(), encryption_salt: String::new(),
+            enable_avatar: false,
         };
         let off = build_html_page("a", &resolved, false);
         let on  = build_html_page("a", &resolved, true);
@@ -2380,6 +2411,7 @@ mod tests {
             encryption_mode:   0,
             encryption_key:    String::new(),
             encryption_salt:   String::new(),
+            enable_avatar:     false,
         };
         let html = build_html_page("app-xx", &resolved, false);
         assert!(html.contains("/vendor/conversational-ai-api.js"));
@@ -2409,6 +2441,7 @@ mod tests {
             encryption_mode:   0,
             encryption_key:    String::new(),
             encryption_salt:   String::new(),
+            enable_avatar:     false,
         };
         let html = build_html_page("app", &resolved, false);
         // JSON-encoded array literal must appear in the page.
