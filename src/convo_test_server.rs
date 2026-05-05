@@ -184,7 +184,9 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         ConvoConfig::from_file(&toml_path)?
     } else {
         anyhow::bail!(
-            "No config at {}. Pass --config or create one (wizard coming soon).",
+            "No config at {}.\n\
+             Create one with: atem config convo   (interactive wizard)\n\
+             Or copy & edit:  configs/convo.example.toml from the atem repo.",
             toml_path.display()
         )
     };

@@ -418,6 +418,43 @@ echo "$(yellow "Convo test server")"
 run "assets/convo/conversational-ai-api.js exists" -- test -s assets/convo/conversational-ai-api.js
 run "assets/convo/VERSION has sha"                 -- bash -c "grep -q '^sha:' assets/convo/VERSION"
 
+# Missing config — the error message should point users at the wizard
+# command, not the obsolete "wizard coming soon" line.
+printf "  %s ... " "$(dim "atem serv convo missing-config error mentions \`atem config convo\`")"
+MISSING_OUT="$("$ATEM" serv convo --config /tmp/atem-does-not-exist-$$.toml --no-browser 2>&1 || true)"
+if echo "$MISSING_OUT" | grep -q "atem config convo"; then
+    green "PASS"; echo
+    PASS=$((PASS + 1))
+else
+    red "FAIL"; echo
+    echo "$MISSING_OUT" | sed 's/^/      /'
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES+=("atem serv convo missing-config message")
+fi
+
+# Typo in [atem] section — deny_unknown_fields should reject it.
+TYPO_TOML="$(mktemp -t atem-typo.XXXXXX.toml)"
+cat > "$TYPO_TOML" <<'EOF'
+[atem]
+hippa = true
+[agent]
+user_id = "1001"
+[advanced_features]
+enable_rtm = true
+EOF
+printf "  %s ... " "$(dim "atem config convo --validate rejects typo'd field")"
+VAL_OUT="$("$ATEM" config convo --validate --config "$TYPO_TOML" 2>&1 || true)"
+if echo "$VAL_OUT" | grep -q "unknown field" && echo "$VAL_OUT" | grep -q "hippa"; then
+    green "PASS"; echo
+    PASS=$((PASS + 1))
+else
+    red "FAIL"; echo
+    echo "$VAL_OUT" | sed 's/^/      /'
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES+=("atem config convo --validate typo")
+fi
+rm -f "$TYPO_TOML"
+
 if [[ -f tests/fixtures/convo_full.toml ]] && {
     [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] \
     || [[ -f "$HOME/.config/atem/project_cache.enc" ]]

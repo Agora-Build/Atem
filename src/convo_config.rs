@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConvoConfig {
     pub agent: Option<AgentConfig>,
 
@@ -63,7 +63,7 @@ pub struct ConvoConfig {
 /// e.g. `hipaa = true` switches the `/join` URL prefix; `[atem.encryption]`
 /// gates whether `properties.rtc.encryption_*` is emitted at all.
 #[derive(Debug, Deserialize, Default, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AtemSection {
     /// RTC channel name. Auto-generated when omitted as
     /// `atem-convo-<app_id[..12]>-<ts>-<rand4>`. Overridable via
@@ -95,7 +95,7 @@ pub struct AtemSection {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EncryptionConfig {
     /// 0 = off; 1..=8 per Agora's encryption_mode integer table.
     pub mode: u8,
@@ -150,7 +150,7 @@ impl ConvoConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     /// Agent's RTC uid (the AI agent that joins the channel).
     /// Required (CLI `--agent-user-id` overrides). Forwarded to
@@ -603,11 +603,12 @@ mod tests {
     #[test]
     fn parses_atem_section_hipaa_and_geofence() {
         let cfg: ConvoConfig = toml::from_str(r#"
-            channel       = "c"
-            agent_user_id = "1001"
             [atem]
+            channel  = "c"
             hipaa    = true
             geofence = "NORTH_AMERICA"
+            [agent]
+            user_id = "1001"
         "#).unwrap();
         let a = cfg.atem.unwrap();
         assert_eq!(a.hipaa, Some(true));
@@ -617,12 +618,14 @@ mod tests {
     #[test]
     fn parses_atem_encryption_subtable() {
         let cfg: ConvoConfig = toml::from_str(r#"
-            channel       = "c"
-            agent_user_id = "1001"
+            [atem]
+            channel = "c"
             [atem.encryption]
             mode = 8
             key  = "hunter2"
             salt = "c2FsdC1iYXNlNjQ="
+            [agent]
+            user_id = "1001"
         "#).unwrap();
         let enc = cfg.atem.unwrap().encryption.unwrap();
         assert_eq!(enc.mode, 8);
@@ -907,8 +910,10 @@ mod tests {
         // Existing [parameters] from TOML must be preserved when
         // enable_dump is injected.
         let toml_str = r#"
+            [atem]
             channel = "c"
-            agent_user_id = "a"
+            [agent]
+            user_id = "a"
             [parameters]
             audio_scenario = "default"
         "#;
@@ -974,7 +979,10 @@ mod tests {
 
     #[test]
     fn join_payload_runtime_preset_overrides_config() {
-        let toml_str = r#"preset = "from_config""#;
+        let toml_str = r#"
+            [agent]
+            preset = "from_config"
+        "#;
         let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
         let body = cfg.build_join_payload(JoinArgs {
             name: "x", channel: "c", token: "t",
@@ -1095,7 +1103,10 @@ avatar_id = "abc"
         // emit the avatar skeleton (enable + agora_uid). Downstream
         // preset/proxy is expected to provide vendor + avatar_id +
         // credentials.
-        let toml_str = r#"preset = "x""#;
+        let toml_str = r#"
+            [agent]
+            preset = "x"
+        "#;
         let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
         let body = cfg.build_join_payload(JoinArgs {
             name: "x", channel: "c", token: "t",
