@@ -333,18 +333,14 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         println!("  Custom:  {}", u);
     }
     println!();
-    println!(
-        "  App ID:  {}...{}",
-        &app_id[..4.min(app_id.len())],
-        if app_id.len() > 8 { &app_id[app_id.len() - 4..] } else { "" }
-    );
+    println!("  App ID:   {}", app_id);
     if let Some(ref name) = project_name {
-        println!("  Project: {}", name);
+        println!("  Project:  {}", name);
     }
-    println!("  Channel: {}", resolved.channel);
-    println!("  Config:  {}", toml_path.display());
-    println!("  RTC UID: {}", resolved.rtc_user_id);
-    println!("  Agent:   {} (avatar {})",
+    println!("  Channel:  {}", resolved.channel);
+    println!("  Config:   {}", toml_path.display());
+    println!("  RTC User: {}", resolved.rtc_user_id);
+    println!("  Agent:    {} (avatar {})",
              resolved.agent_user_id,
              if resolved.avatar_configured { "configured" } else { "off" });
     println!();
@@ -952,11 +948,10 @@ async fn handle_connection(
 /// inline CSS, and the JS constants + input-seeding the page needs to
 /// display correctly.
 fn build_html_page(app_id: &str, resolved: &ResolvedConfig, attach_mode: bool) -> String {
-    let app_id_display = if app_id.len() > 12 {
-        format!("{}...{}", &app_id[..6], &app_id[app_id.len() - 4..])
-    } else {
-        app_id.to_string()
-    };
+    // Show the full App ID — operators frequently need to copy it
+    // into Agora Console / SDK params, and the truncated `abc...wxyz`
+    // form caused enough "is that the right project?" confusion.
+    let app_id_display = app_id.to_string();
     // "App ID" or "App ID (Project Name)" — project name comes from the
     // project cache when the active app_id matches a known project. The
     // parenthetical is omitted when app_id came from --app-id / env var.
@@ -1125,7 +1120,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 <section class="block">
   <h2 class="block-title"><span class="status-dot disconnected" id="rtcDot"></span>RTC — <span id="rtcState" style="font-weight:400;color:#7d8590">Disconnected</span></h2>
   <div class="controls">
-    <label>UID</label>
+    <label>RTC User</label>
     <input id="uidInput" type="text" placeholder="auto" value="{rtc_uid}" style="width:100px">
     <button id="joinBtn"    class="btn btn-join"  onclick="doJoin()">Join</button>
     <button id="leaveBtn"   class="btn btn-leave" onclick="doLeave()" style="display:none">Leave</button>
@@ -1153,7 +1148,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 <section class="block">
   <h2 class="block-title"><span class="status-dot idle" id="agentDot"></span>ConvoAI — <span id="agentState" style="font-weight:400;color:#7d8590">idle</span></h2>
   <div class="controls">
-    <label>Agent UID</label>
+    <label>Agent User</label>
     <span id="agentUidDisplay" class="read-only-value">—</span>
   </div>
   <div class="controls">
