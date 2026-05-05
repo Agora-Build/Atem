@@ -1,6 +1,6 @@
 [package]
 name = "atem"
-version = "0.4.104"
+version = "0.5.10"
 edition = "2024"
 
 [dependencies]
