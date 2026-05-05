@@ -100,7 +100,6 @@ atem serv killall                       # Kill all background servers
 # Fleet test loop — {appid} and {ts} are expanded by atem
 for i in $(seq -f '%04g' 1 10); do
   atem serv convo --background --channel 'atem-convo-{appid}-{ts}-'$i
-  sleep 0.5
 done
 ```
 
@@ -136,19 +135,38 @@ The `atem config convo` wizard supports:
 - **Presets**: use Agora-managed preset bundles, optionally override providers
 - **Avatar**: Akool, LiveAvatar, Anam
 
-`convo.toml` also supports routing/security defaults that the web UI pre-fills and `--background` forwards to the agent:
+`convo.toml` is structured into two atem-managed top-level sections plus the Agora pass-through tables. The web UI pre-fills form fields from `[atem]`; `--background` reads them directly.
 
 ```toml
-hipaa    = false            # route via /hipaa/api/... (Agora support must enable for the project)
-geofence = "GLOBAL"         # GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
+[atem]                       # atem's runtime control surface
+channel       = "..."        # auto-generated when omitted
+rtc_user_id   = "0"          # human's RTC uid
+hipaa         = false        # route via /hipaa/api/... (Agora support must enable)
+geofence      = "GLOBAL"     # GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
+enable_avatar = false        # opt in to use [agent.avatar] this session
 
-[encryption]                # mode = 0 → off
-mode = 8                    # 1..=8 (Agora's table); 8 = AES_256_GCM2 (recommended)
+[atem.encryption]            # mode = 0 → off
+mode = 8                     # 1..=8 (Agora's table); 8 = AES_256_GCM2 (recommended)
 key  = "your-key-here"
-salt = "Q4mTLy5h…="          # base64 32 bytes; required for gcm2 modes (7, 8)
+salt = "Q4mTLy5h…="           # base64 32 bytes; required for gcm2 modes (7, 8)
+
+[agent]                      # the AI agent
+user_id           = "1001"
+idle_timeout_secs = 120
+preset            = "preset_a, preset_b"   # comma-separated; UI splits into checkboxes
+
+[agent.llm]                  # provider configs (forwarded under properties.<svc>)
+[agent.asr]
+[agent.tts]
+[agent.avatar]
+
+[advanced_features]          # pass-through (forwarded verbatim to Agora)
+[vad]
+[sal]
+[parameters]
 ```
 
-The same values flow into both code paths: `serv convo` (web UI form pre-fills, user can override) and `serv convo --background` (forwarded verbatim to ConvoAI's `/join` body). Both peers must use matching encryption/geofence or audio fails silently.
+Both peers must use matching encryption/geofence or audio fails silently. `enable_avatar` is opt-in even when `[agent.avatar]` is configured — fleet `--background` launches won't burn avatar minutes by accident. `atem config convo --validate` reports any issue (unknown geofence, gcm2 mode without salt, missing `[agent].user_id`, etc.).
 
 ## How It Works
 

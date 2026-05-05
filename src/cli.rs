@@ -282,11 +282,8 @@ pub enum ServCommands {
 
   # Launch 40 background agents. {appid} and {ts} are expanded by atem,
   # so the channels look like atem-convo-2655d20a82fc-1777574763-0001..0040.
-  # `sleep 0.5` between spawns avoids hitting Agora's /join rate limit;
-  # without it, ~5-10% of the agents fail to start in a tight burst.
   for i in $(seq -f '%04g' 1 40); do \\
     atem serv convo --background --channel 'atem-convo-{appid}-{ts}-'$i; \\
-    sleep 0.5; \\
   done
   atem serv list                # inspect them
   atem serv killall             # stop all of them

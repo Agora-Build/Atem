@@ -12,17 +12,6 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct ConvoConfig {
-    pub channel: Option<String>,
-    pub rtc_user_id: Option<String>,
-    pub agent_user_id: Option<String>,
-    pub idle_timeout_secs: Option<u32>,
-    /// Single preset name — backward compat. Ignored if `presets` is non-empty.
-    pub preset: Option<String>,
-    /// Named preset bundles the page can switch between via dropdown.
-    /// The selected name is forwarded verbatim as `properties.preset`
-    /// in the Agora ConvoAI `/join` body, so entries here must be valid
-    /// preset identifiers on the Agora side.
-    pub presets: Option<Vec<String>>,
     pub agent: Option<AgentConfig>,
 
     // ── Pass-through top-level properties ────────────────────────────
@@ -58,12 +47,33 @@ pub struct ConvoConfig {
     /// `[parameters.turn_detector]`.
     pub parameters: Option<BTreeMap<String, toml::Value>>,
 
-    // ── Routing / security defaults (testing convenience) ────────────
+    // ── atem-local controls ─────────────────────────────────────────
     //
-    // Same values reused across all channels — for fleet test loops we
-    // don't want to mint a fresh salt or pick a region per launch. The
-    // browser UI form fields are pre-filled from these but remain
-    // editable; --background mode forwards them to the agent's /join.
+    // Settings that atem reads and acts on locally, never forwarded
+    // verbatim to ConvoAI's /join body. Grouped under [atem] so they
+    // can't collide with future Agora pass-through keys.
+
+    /// `[atem]` block — atem-local control surface (HIPAA routing,
+    /// geofence, avatar opt-in, encryption). See `AtemSection`.
+    pub atem: Option<AtemSection>,
+}
+
+/// atem-local control fields that DO NOT pass through to Agora's
+/// /join body. atem reads each and decides what to dispatch / build:
+/// e.g. `hipaa = true` switches the `/join` URL prefix; `[atem.encryption]`
+/// gates whether `properties.rtc.encryption_*` is emitted at all.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct AtemSection {
+    /// RTC channel name. Auto-generated when omitted as
+    /// `atem-convo-<app_id[..12]>-<ts>-<rand4>`. Overridable via
+    /// `--channel`. Forwarded to ConvoAI's /join as `properties.channel`.
+    pub channel: Option<String>,
+
+    /// Human's RTC uid. "0" or omitted → server-assigned. Overridable
+    /// via `--rtc-user-id`. Forwarded to ConvoAI's /join as
+    /// `properties.remote_rtc_uids[0]`.
+    pub rtc_user_id: Option<String>,
 
     /// Route through Agora's HIPAA-compliant `/hipaa/api/...` endpoint.
     /// Default false (regular path).
@@ -73,7 +83,7 @@ pub struct ConvoConfig {
     /// JAPAN | INDIA. None / "GLOBAL" → no geofence sent.
     pub geofence: Option<String>,
 
-    /// `[encryption]` block. When `mode > 0`, encryption is active.
+    /// `[atem.encryption]` block. When `mode > 0`, encryption is active.
     pub encryption: Option<EncryptionConfig>,
 
     /// Default state of the "Enable Avatar" checkbox in the web UI,
@@ -123,22 +133,41 @@ impl ConvoConfig {
             .unwrap_or(false)
     }
 
-    /// The effective list of selectable preset names: prefer `presets`
-    /// when set + non-empty, otherwise fall back to the single `preset`
-    /// field (as a one-element list), otherwise empty.
+    /// Split `[agent].preset` on `,` and trim each entry. Empty
+    /// strings are filtered out so a trailing or doubled comma
+    /// doesn't produce blank checkboxes.
     pub fn preset_list(&self) -> Vec<String> {
-        if let Some(list) = &self.presets {
-            if !list.is_empty() {
-                return list.clone();
-            }
-        }
-        self.preset.clone().map(|p| vec![p]).unwrap_or_default()
+        self.agent
+            .as_ref()
+            .and_then(|a| a.preset.as_deref())
+            .map(|s| s
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect())
+            .unwrap_or_default()
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct AgentConfig {
+    /// Agent's RTC uid (the AI agent that joins the channel).
+    /// Required (CLI `--agent-user-id` overrides). Forwarded to
+    /// ConvoAI's /join as `properties.agent_rtc_uid`.
+    pub user_id: Option<String>,
+
+    /// Server-side safety timeout in seconds. Forwarded as
+    /// `properties.idle_timeout`. Default left to Agora when omitted.
+    pub idle_timeout_secs: Option<u32>,
+
+    /// Comma-separated preset names. atem splits on `,` to render
+    /// checkboxes (all checked by default) on the web page; selected
+    /// names are joined back with `,` and forwarded as
+    /// `properties.preset` in the /join body. Empty / omitted →
+    /// no presets sent (agent runs from `[agent.llm/asr/tts]`).
+    pub preset: Option<String>,
+
     pub llm: Option<LlmConfig>,
     pub asr: Option<ServiceConfig>,
     pub tts: Option<ServiceConfig>,
@@ -243,15 +272,14 @@ impl ConvoConfig {
         props.insert("token".into(),           json!(args.token));
         props.insert("agent_rtc_uid".into(),   json!(args.agent_rtc_uid));
         props.insert("remote_rtc_uids".into(), json!(args.remote_uids));
-        if let Some(t) = self.idle_timeout_secs {
+        if let Some(t) = self.agent.as_ref().and_then(|a| a.idle_timeout_secs) {
             props.insert("idle_timeout".into(), json!(t));
         }
         // Preset moves to top-level `info.preset` per the current
         // Agora /join contract. Resolution order: runtime (browser
-        // dropdown) > self.preset > first entry of presets.
+        // dropdown) > [agent].preset (comma-separated string).
         let effective_preset: Option<&str> = args.preset
-            .or(self.preset.as_deref())
-            .or_else(|| self.presets.as_ref().and_then(|v| v.first().map(|s| s.as_str())));
+            .or_else(|| self.agent.as_ref().and_then(|a| a.preset.as_deref()));
         if let Some(agent) = &self.agent {
             if let Some(llm) = &agent.llm {
                 props.insert("llm".into(), llm_to_json(llm));
@@ -482,12 +510,10 @@ pub struct ResolvedConfig {
     /// the page (vendor + avatar_id). `None` when no avatar block is
     /// configured. Never includes `params` — those may carry secrets.
     pub avatar_summary:    Option<AvatarSummary>,
-    /// Legacy single-preset field (kept for page display fallback when
-    /// the full `presets` list is empty).
-    pub preset:            Option<String>,
-    /// Selectable preset names for the page checkboxes. Derived from
-    /// `presets` in TOML, falling back to `preset` as a one-element
-    /// list. Empty means no checkboxes rendered.
+    /// Selectable preset names for the page checkboxes — derived by
+    /// splitting `[agent].preset` on `,`. Empty means no checkboxes.
+    /// The page sends back a comma-joined subset as
+    /// `properties.preset` in the /join body.
     pub presets:           Vec<String>,
     /// HIPAA mode (TOML default). UI checkbox + background mode both
     /// honour this; user can still toggle in the browser form.
@@ -524,41 +550,43 @@ impl ConvoConfig {
     /// - `agent_user_id`: required (CLI or TOML); errors if missing.
     /// - `avatar_configured`: true iff `[agent.avatar]` is present in TOML.
     pub fn resolve(&self, cli: &CliOverrides) -> Result<ResolvedConfig> {
+        let atem = self.atem.clone().unwrap_or_default();
+        let agent = self.agent.as_ref();
+
         let channel = cli.channel.clone()
-            .or_else(|| self.channel.clone())
+            .or(atem.channel.clone())
             .ok_or_else(|| anyhow::anyhow!(
-                "channel required (pass --channel or set 'channel' in convo.toml)"
+                "channel required (pass --channel or set [atem].channel in convo.toml)"
             ))?;
         let rtc_user_id = cli.rtc_user_id.clone()
-            .or_else(|| self.rtc_user_id.clone())
+            .or(atem.rtc_user_id.clone())
             .unwrap_or_else(|| "0".to_string());
         let agent_user_id = cli.agent_user_id.clone()
-            .or_else(|| self.agent_user_id.clone())
+            .or_else(|| agent.and_then(|a| a.user_id.clone()))
             .ok_or_else(|| anyhow::anyhow!(
-                "agent_user_id required (pass --agent-user-id or set 'agent_user_id' in convo.toml)"
+                "agent.user_id required (pass --agent-user-id or set [agent].user_id in convo.toml)"
             ))?;
-        let avatar_block = self.agent.as_ref().and_then(|a| a.avatar.as_ref());
+        let avatar_block = agent.and_then(|a| a.avatar.as_ref());
         let avatar_configured = avatar_block.is_some();
         let avatar_summary = avatar_block.map(|av| AvatarSummary {
             vendor:    av.vendor.clone(),
             avatar_id: av.avatar_id.clone(),
         });
-        let enc = self.encryption.clone().unwrap_or_default();
+        let enc = atem.encryption.unwrap_or_default();
         Ok(ResolvedConfig {
             channel,
             rtc_user_id,
             agent_user_id,
-            idle_timeout_secs: self.idle_timeout_secs,
+            idle_timeout_secs: agent.and_then(|a| a.idle_timeout_secs),
             avatar_configured,
             avatar_summary,
-            preset: self.preset.clone(),
             presets: self.preset_list(),
-            hipaa: self.hipaa.unwrap_or(false),
-            geofence: self.geofence.clone().unwrap_or_default(),
+            hipaa: atem.hipaa.unwrap_or(false),
+            geofence: atem.geofence.unwrap_or_default(),
             encryption_mode: enc.mode,
             encryption_key:  enc.key,
             encryption_salt: enc.salt,
-            enable_avatar:   self.enable_avatar.unwrap_or(false),
+            enable_avatar:   atem.enable_avatar.unwrap_or(false),
         })
     }
 }
@@ -573,67 +601,76 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_hipaa_and_geofence() {
+    fn parses_atem_section_hipaa_and_geofence() {
         let cfg: ConvoConfig = toml::from_str(r#"
             channel       = "c"
             agent_user_id = "1001"
-            hipaa         = true
-            geofence      = "NORTH_AMERICA"
+            [atem]
+            hipaa    = true
+            geofence = "NORTH_AMERICA"
         "#).unwrap();
-        assert_eq!(cfg.hipaa, Some(true));
-        assert_eq!(cfg.geofence.as_deref(), Some("NORTH_AMERICA"));
+        let a = cfg.atem.unwrap();
+        assert_eq!(a.hipaa, Some(true));
+        assert_eq!(a.geofence.as_deref(), Some("NORTH_AMERICA"));
     }
 
     #[test]
-    fn parses_encryption_table() {
+    fn parses_atem_encryption_subtable() {
         let cfg: ConvoConfig = toml::from_str(r#"
             channel       = "c"
             agent_user_id = "1001"
-            [encryption]
+            [atem.encryption]
             mode = 8
             key  = "hunter2"
             salt = "c2FsdC1iYXNlNjQ="
         "#).unwrap();
-        let enc = cfg.encryption.unwrap();
+        let enc = cfg.atem.unwrap().encryption.unwrap();
         assert_eq!(enc.mode, 8);
         assert_eq!(enc.key, "hunter2");
         assert_eq!(enc.salt, "c2FsdC1iYXNlNjQ=");
     }
 
     #[test]
-    fn resolve_propagates_hipaa_geofence_encryption_into_resolved() {
+    fn resolve_propagates_atem_section_into_resolved() {
         let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
             channel       = "c"
-            agent_user_id = "1001"
             hipaa         = true
             geofence      = "ASIA"
-            [encryption]
+            enable_avatar = true
+            [atem.encryption]
             mode = 7
             key  = "k"
             salt = "s"
+            [agent]
+            user_id = "1001"
         "#).unwrap();
         let r = cfg.resolve(&CliOverrides {
             channel: None, rtc_user_id: None, agent_user_id: None,
         }).unwrap();
         assert!(r.hipaa);
         assert_eq!(r.geofence, "ASIA");
+        assert!(r.enable_avatar);
         assert_eq!(r.encryption_mode, 7);
         assert_eq!(r.encryption_key,  "k");
         assert_eq!(r.encryption_salt, "s");
     }
 
     #[test]
-    fn resolve_defaults_hipaa_off_geofence_empty_encryption_zero() {
-        // Config without hipaa/geofence/encryption blocks — resolution
-        // should produce the off/empty/zero defaults (no surprises).
+    fn resolve_defaults_when_atem_section_missing() {
+        // Config without an [atem] block — resolution should produce
+        // the off/empty/zero defaults (no surprises).
         let cfg: ConvoConfig = toml::from_str(r#"
-            channel       = "c"
-            agent_user_id = "1001"
+            [atem]
+            channel = "c"
+            [agent]
+            user_id = "1001"
         "#).unwrap();
         let r = cfg.resolve(&CliOverrides {
             channel: None, rtc_user_id: None, agent_user_id: None,
         }).unwrap();
         assert!(!r.hipaa);
+        assert!(!r.enable_avatar);
         assert_eq!(r.geofence, "");
         assert_eq!(r.encryption_mode, 0);
         assert_eq!(r.encryption_key, "");
@@ -643,17 +680,18 @@ mod tests {
     #[test]
     fn parses_full_fixture() {
         let cfg = ConvoConfig::from_file(&fixtures().join("convo_full.toml")).unwrap();
-        assert_eq!(cfg.channel.as_deref(), Some("demo"));
-        assert_eq!(cfg.rtc_user_id.as_deref(), Some("42"));
-        assert_eq!(cfg.agent_user_id.as_deref(), Some("1001"));
-        assert_eq!(cfg.idle_timeout_secs, Some(120));
+        let atem  = cfg.atem.as_ref().unwrap();
+        let agent = cfg.agent.as_ref().unwrap();
+        assert_eq!(atem.channel.as_deref(), Some("demo"));
+        assert_eq!(atem.rtc_user_id.as_deref(), Some("42"));
+        assert_eq!(agent.user_id.as_deref(), Some("1001"));
+        assert_eq!(agent.idle_timeout_secs, Some(120));
         assert_eq!(
-            cfg.preset.as_deref(),
+            agent.preset.as_deref(),
             Some("deepgram_nova_3,openai_gpt_5_mini,minimax_speech_2_6_turbo")
         );
 
-        let agent = cfg.agent.unwrap();
-        let llm = agent.llm.unwrap();
+        let llm = agent.llm.as_ref().unwrap();
         assert_eq!(llm.greeting_message.as_deref(), Some("Hi"));
         assert_eq!(llm.system_messages.len(), 1);
         assert_eq!(llm.system_messages[0].role, "system");
@@ -670,7 +708,7 @@ mod tests {
     #[test]
     fn empty_config_parses_to_all_none() {
         let cfg: ConvoConfig = toml::from_str("").unwrap();
-        assert!(cfg.channel.is_none());
+        assert!(cfg.atem.is_none());
         assert!(cfg.agent.is_none());
     }
 
@@ -770,22 +808,26 @@ mod tests {
     }
 
     #[test]
-    fn preset_list_from_presets_array() {
+    fn preset_list_splits_comma_separated_string() {
         let toml_str = r#"
-            channel = "c"
-            agent_user_id = "a"
-            presets = ["first", "second"]
+            [agent]
+            user_id = "a"
+            preset  = "first, second , third"
         "#;
         let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.preset_list(), vec!["first".to_string(), "second".to_string()]);
+        // Trims whitespace around each entry.
+        assert_eq!(
+            cfg.preset_list(),
+            vec!["first".to_string(), "second".to_string(), "third".to_string()],
+        );
     }
 
     #[test]
-    fn preset_list_falls_back_to_single_preset() {
+    fn preset_list_returns_single_when_no_comma() {
         let toml_str = r#"
-            channel = "c"
-            agent_user_id = "a"
-            preset = "only_one"
+            [agent]
+            user_id = "a"
+            preset  = "only_one"
         "#;
         let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.preset_list(), vec!["only_one".to_string()]);
@@ -988,6 +1030,7 @@ mod tests {
         // enable:true + vendor + params.avatar_id + params.api_key +
         // auto-injected params.agora_uid.
         let toml_str = r#"
+[agent]
 preset = "some_preset"
 [agent.avatar]
 vendor = "akool"
@@ -1266,8 +1309,14 @@ validate_asr_result_timestamp = false
     }
 
     #[test]
-    fn join_payload_uses_first_preset_from_list_when_no_runtime() {
-        let toml_str = r#"presets = ["first", "second"]"#;
+    fn join_payload_emits_preset_from_agent_section_when_no_runtime() {
+        // [agent].preset is the comma-separated string atem forwards
+        // verbatim as `properties.preset` when the page hasn't selected
+        // a runtime override.
+        let toml_str = r#"
+            [agent]
+            preset = "first,second"
+        "#;
         let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
         let body = cfg.build_join_payload(JoinArgs {
             name: "x", channel: "c", token: "t",
@@ -1283,7 +1332,7 @@ validate_asr_result_timestamp = false
             geofence_area: None,
             enable_dump: false,
         });
-        assert_eq!(body["preset"], "first");
+        assert_eq!(body["preset"], "first,second");
     }
 
     #[test]
@@ -1303,8 +1352,10 @@ validate_asr_result_timestamp = false
     #[test]
     fn resolve_errors_when_channel_missing() {
         let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
             rtc_user_id = "1"
-            agent_user_id = "9"
+            [agent]
+            user_id = "9"
         "#).unwrap();
         let err = cfg.resolve(&CliOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("channel"), "got: {err}");
@@ -1313,18 +1364,21 @@ validate_asr_result_timestamp = false
     #[test]
     fn resolve_errors_when_agent_user_id_missing() {
         let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
             channel = "c"
             rtc_user_id = "1"
         "#).unwrap();
         let err = cfg.resolve(&CliOverrides::default()).unwrap_err().to_string();
-        assert!(err.contains("agent_user_id"), "got: {err}");
+        assert!(err.contains("user_id"), "got: {err}");
     }
 
     #[test]
     fn resolve_defaults_rtc_user_id_to_0() {
         let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
             channel = "c"
-            agent_user_id = "9"
+            [agent]
+            user_id = "9"
         "#).unwrap();
         let r = cfg.resolve(&CliOverrides::default()).unwrap();
         assert_eq!(r.rtc_user_id, "0");
@@ -1333,8 +1387,10 @@ validate_asr_result_timestamp = false
     #[test]
     fn resolve_avatar_configured_false_when_section_absent() {
         let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
             channel = "c"
-            agent_user_id = "9"
+            [agent]
+            user_id = "9"
         "#).unwrap();
         let r = cfg.resolve(&CliOverrides::default()).unwrap();
         assert!(!r.avatar_configured);

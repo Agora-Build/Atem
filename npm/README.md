@@ -89,7 +89,6 @@ atem serv killall                       # Kill all background servers
 # Fleet test loop — {appid} and {ts} are expanded by atem
 for i in $(seq -f '%04g' 1 10); do
   atem serv convo --background --channel 'atem-convo-{appid}-{ts}-'$i
-  sleep 0.5
 done
 ```
 

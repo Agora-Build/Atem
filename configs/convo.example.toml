@@ -2,22 +2,23 @@
 # Copy to ~/.config/atem/convo.toml (chmod 0600 — contains API keys)
 #
 # Override per-command via CLI: --channel, --rtc-user-id, --agent-user-id, --config
+#
+# The schema has two top-level sections atem cares about:
+#   [atem]   — atem's runtime control surface (channel, RTC uid, HIPAA,
+#              geofence, encryption, avatar opt-in)
+#   [agent]  — everything about the AI agent (its uid, idle timeout,
+#              presets, and the LLM / ASR / TTS / avatar provider blocks)
+# plus pass-through tables atem forwards verbatim to ConvoAI's /join body:
+#   [advanced_features], [vad], [sal], [parameters]
 
-# ── Channel & UIDs ───────────────────────────────────────────────────
+# ── [atem] — runtime control surface ────────────────────────────────
+[atem]
 # Channel is auto-generated when omitted:
 #   "atem-convo-<app_id[..12]>-<ts>-<rand4>"
-# Uncomment to pin a fixed channel:
-# channel         = "demo"
+# Pin a fixed channel only when you need a stable name across runs.
+# channel = "demo"
 
-rtc_user_id       = "0"      # human's RTC uid ("0" = server-assigned)
-agent_user_id     = "1001"   # agent's RTC uid (voice)
-idle_timeout_secs = 120      # server-side safety timeout (seconds)
-
-# ── Routing / security ────────────────────────────────────────────────
-# All optional. Empty / unset → off (regular endpoint, no fence,
-# no encryption, no avatar). The web UI form pre-fills from these
-# values and `--background` mode forwards them verbatim to ConvoAI's
-# /join body so both flows behave consistently.
+rtc_user_id = "0"           # human's RTC uid ("0" = server-assigned)
 
 # Route through Agora's /hipaa/api/conversational-ai-agent/... endpoint
 # instead of /api/.... Requires Agora Support to enable HIPAA on the
@@ -31,18 +32,18 @@ geofence = "GLOBAL"
 
 # Avatar opt-in. Defaults to false even when [agent.avatar] is
 # configured below — fleet `--background` launches won't burn avatar
-# minutes by accident.  Note: avatar + encryption is currently
+# minutes by accident. Note: avatar + encryption is currently
 # incompatible (the avatar vendor joins the channel unencrypted).
 enable_avatar = false
 
-# RTC encryption.  mode = 0 → off; the [encryption] block is ignored
-# entirely.  When mode > 0, both the local browser SDK and the agent
-# join with these settings — they MUST match exactly or audio fails
-# silently.
-[encryption]
+# RTC encryption. mode = 0 → off; the [atem.encryption] block is
+# ignored entirely. When mode > 0, both the local browser SDK and the
+# agent join with these settings — they MUST match exactly or audio
+# fails silently.
+[atem.encryption]
 mode = 0
-# key  = "your-key-here"                                # required when mode > 0
-# salt = "Q4mTLy5h9qtD46vrdMgotPH9WrZxDsLxThPD9vtlf+o="  # base64-32-bytes; required for gcm2 modes (7, 8)
+# key  = "your-key-here"                                  # required when mode > 0
+# salt = "Q4mTLy5h9qtD46vrdMgotPH9WrZxDsLxThPD9vtlf+o="    # base64-32-bytes; required for gcm2 modes (7, 8)
 # Agora encryption_mode integer reference:
 #   1 AES_128_XTS         5 AES_128_GCM
 #   2 AES_128_ECB         6 AES_256_GCM
@@ -50,44 +51,22 @@ mode = 0
 #   4 SM4_128_ECB         8 AES_256_GCM2  (needs salt; recommended)
 # Generate a fresh salt with:  openssl rand -base64 32
 
-# ── Presets ──────────────────────────────────────────────────────────
-# Shown as checkboxes on the page (all checked by default). Checked
-# values are comma-joined into properties.preset in the /join body.
-# Single preset also supported: preset = "my_preset"
-#
-# presets = ["my_preset_1", "my_preset_2"]
+# ── [agent] — everything about the AI agent ─────────────────────────
+[agent]
+user_id           = "1001"   # the agent's RTC uid (voice)
+idle_timeout_secs = 120      # server-side safety timeout (seconds)
 
-# ── Transcript wiring ────────────────────────────────────────────────
-# Required for live transcription. Without these, the agent runs but
-# never emits subtitle data.
-
-[advanced_features]
-enable_rtm   = true
-enable_sal   = true
-enable_aivad = false
-
-[vad]
-silence_duration_ms = 800
-
-[sal]
-sal_mode = "locking"
-
-[parameters]
-audio_scenario = "default"
-data_channel   = "rtm"       # transcripts via RTM (not RTC data stream)
-# enable_dump  = true        # Agora server-side audio dump — enable only
-                             # when troubleshooting with Agora support
-
-[parameters.transcript]
-enable_words = true
-
-[parameters.turn_detector]
-validate_asr_result_timestamp = false
+# Presets — comma-separated. atem splits on `,` to render checkboxes
+# on the web page (all checked by default); selected names are joined
+# back with `,` and forwarded as `properties.preset` in the /join body.
+# Empty / omitted → no presets sent (agent runs from the explicit
+# [agent.llm] / [agent.asr] / [agent.tts] blocks below).
+preset = "expertise_ai_poc, _akool_test_expertise"
 
 # ── Avatar (optional) ────────────────────────────────────────────────
-# Declaring [agent.avatar] makes the avatar block AVAILABLE; whether it
-# actually goes into the /join body is gated by `enable_avatar = true`
-# above (or the "Enable Avatar" checkbox on the web page).
+# Declaring [agent.avatar] makes the avatar block AVAILABLE; whether
+# it actually goes into the /join body is gated by `enable_avatar`
+# under [atem] (or the "Enable Avatar" checkbox on the web page).
 #
 # atem auto-generates agora_channel (= voice channel), agora_uid
 # (random 5-digit), and agora_token (minted from active project's
@@ -149,3 +128,31 @@ emotion  = "happy"
 
 [agent.tts.params.audio_setting]
 sample_rate = 16000
+
+# ── Pass-through tables (forwarded verbatim to Agora /join) ─────────
+# Required for live transcription. Without `enable_rtm = true`,
+# `data_channel = "rtm"`, and `transcript.enable_words = true`, the
+# agent runs but never streams transcripts.
+
+[advanced_features]
+enable_rtm   = true
+enable_sal   = true
+enable_aivad = false
+
+[vad]
+silence_duration_ms = 800
+
+[sal]
+sal_mode = "locking"
+
+[parameters]
+audio_scenario = "default"
+data_channel   = "rtm"       # transcripts via RTM (not RTC data stream)
+# enable_dump  = true        # Agora server-side audio dump — enable only
+                             # when troubleshooting with Agora support
+
+[parameters.transcript]
+enable_words = true
+
+[parameters.turn_detector]
+validate_asr_result_timestamp = false

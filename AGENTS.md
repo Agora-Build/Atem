@@ -318,13 +318,34 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   shape without computing prefix/timestamp in the shell:
   `atem serv convo --background --channel 'atem-convo-{appid}-{ts}-001'`.
 
-  `convo.toml` carries routing/security defaults:
-  - `hipaa = true/false` — switch ConvoAI URL prefix to `/hipaa/api/...`
-  - `geofence = "GLOBAL"|"NORTH_AMERICA"|"EUROPE"|"ASIA"|"JAPAN"|"INDIA"`
-  - `[encryption]` table: `mode` (0..=8), `key`, `salt` (base64-32-bytes)
-  These flow into both the web UI (form pre-fills via `DEFAULT_*` JS
-  constants emitted by `build_html_page`) and `--background` mode (sent
-  to ConvoAI's `/join` body via the resolved values on `JoinArgs`).
+  `convo.toml` schema:
+  - `[atem]` — atem's runtime control surface. atem reads each field
+    and decides how to dispatch (URL prefix, build the avatar block,
+    pre-fill the web form, etc.). Fields:
+    - `channel` (RTC channel name; auto-generated when omitted)
+    - `rtc_user_id` (human's RTC uid; "0" = server-assigned)
+    - `hipaa` — switches ConvoAI URL prefix to `/hipaa/api/...`
+    - `geofence` — GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
+    - `enable_avatar` — opt in to `[agent.avatar]` this session
+    - `[atem.encryption]` — `mode` (0..=8), `key`, `salt` (base64-32-bytes)
+  - `[agent]` — about the AI agent itself:
+    - `user_id` (the agent's RTC uid; required)
+    - `idle_timeout_secs` (server-side reaper)
+    - `preset` (comma-separated string; UI splits to checkboxes,
+      joins selections back as `properties.preset`)
+    - `[agent.llm]` / `[agent.asr]` / `[agent.tts]` / `[agent.avatar]`
+      — provider blocks, forwarded under `properties.<svc>`
+  - Pass-through tables — `[advanced_features]`, `[vad]`, `[sal]`,
+    `[parameters]` — atem forwards verbatim as `properties.<key>`.
+
+  Implemented as `ConvoConfig { atem: Option<AtemSection>, agent:
+  Option<AgentConfig>, …pass-through… }`. `[atem]` values flow into
+  both the web UI (form pre-fills via `DEFAULT_*` JS constants
+  emitted by `build_html_page`) and `--background` mode (sent to
+  ConvoAI's `/join` body via the resolved values on `JoinArgs`).
+  `atem config convo --validate` checks the schema (geofence value,
+  encryption mode/key/salt consistency, etc.) — see
+  `convo_wizard::run_validate`.
 
 - **`atem serv attach <id>` / `atem serv attach <#>`**: Opens a foreground
   HTTPS UI bound to a running convo daemon's channel. Looks up the entry

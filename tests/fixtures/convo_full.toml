@@ -1,6 +1,9 @@
+[atem]
 channel = "demo"
 rtc_user_id = "42"
-agent_user_id = "1001"
+
+[agent]
+user_id = "1001"
 idle_timeout_secs = 120
 preset = "deepgram_nova_3,openai_gpt_5_mini,minimax_speech_2_6_turbo"
 

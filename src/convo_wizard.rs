@@ -406,7 +406,11 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
 
     // Step 1: Mode
     let mode_items = &["Preset-based (use Agora presets)", "Custom (pick ASR + LLM + TTS)"];
-    let current_mode = if existing.preset.is_some() || existing.presets.is_some() { 0 } else { 1 };
+    let existing_atem  = existing.atem.as_ref();
+    let existing_agent = existing.agent.as_ref();
+    let preset_set = existing_agent.and_then(|a| a.preset.as_deref())
+        .map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let current_mode = if preset_set { 0 } else { 1 };
     a.use_preset = Select::new()
         .with_prompt("Configuration mode")
         .items(mode_items)
@@ -415,10 +419,25 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
 
     // Step 2: Channel & UIDs
     println!("\n── Channel & UIDs ──");
-    a.channel = prompt_input("Channel (empty = auto-generate)", existing.channel.as_deref().unwrap_or(""), false)?;
-    a.rtc_user_id = prompt_input("RTC User ID", existing.rtc_user_id.as_deref().unwrap_or("0"), false)?;
-    a.agent_user_id = prompt_input("Agent User ID", existing.agent_user_id.as_deref().unwrap_or("1001"), false)?;
-    let t_default = existing.idle_timeout_secs.unwrap_or(120).to_string();
+    a.channel = prompt_input(
+        "Channel (empty = auto-generate)",
+        existing_atem.and_then(|x| x.channel.as_deref()).unwrap_or(""),
+        false,
+    )?;
+    a.rtc_user_id = prompt_input(
+        "RTC User ID",
+        existing_atem.and_then(|x| x.rtc_user_id.as_deref()).unwrap_or("0"),
+        false,
+    )?;
+    a.agent_user_id = prompt_input(
+        "Agent User ID",
+        existing_agent.and_then(|x| x.user_id.as_deref()).unwrap_or("1001"),
+        false,
+    )?;
+    let t_default = existing_agent
+        .and_then(|x| x.idle_timeout_secs)
+        .unwrap_or(120)
+        .to_string();
     a.idle_timeout_secs = prompt_input("Idle timeout (seconds)", &t_default, false)?.parse().unwrap_or(120);
 
     // Step 3: Presets
@@ -757,9 +776,86 @@ pub fn run_validate(config_path: &Path) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    if cfg.agent_user_id.is_none() { errors.push("agent_user_id is required".into()); }
+    if cfg.agent.as_ref().and_then(|a| a.user_id.as_ref()).is_none() {
+        errors.push("[agent].user_id is required".into());
+    }
 
-    let has_preset = cfg.preset.is_some() || cfg.presets.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+    // [atem] sub-field value validation
+    if let Some(atem) = &cfg.atem {
+        const VALID_GEOFENCES: &[&str] = &[
+            "GLOBAL", "NORTH_AMERICA", "EUROPE", "ASIA", "JAPAN", "INDIA",
+        ];
+        if let Some(g) = atem.geofence.as_deref() {
+            if !g.is_empty() && !VALID_GEOFENCES.iter().any(|v| v.eq_ignore_ascii_case(g)) {
+                errors.push(format!(
+                    "[atem].geofence = {:?} is not one of {:?}",
+                    g, VALID_GEOFENCES
+                ));
+            }
+        }
+        if let Some(enc) = &atem.encryption {
+            // mode 0 = off; 1..=8 valid per Agora's table.
+            if enc.mode > 8 {
+                errors.push(format!(
+                    "[atem.encryption].mode = {} is out of range (valid: 0..=8; 0 = off)",
+                    enc.mode
+                ));
+            }
+            // mode > 0 → key must be set.
+            if enc.mode > 0 && enc.key.is_empty() {
+                errors.push(format!(
+                    "[atem.encryption].mode = {} requires a non-empty `key`",
+                    enc.mode
+                ));
+            }
+            // gcm2 modes (7, 8) need a 32-byte salt.
+            if enc.mode == 7 || enc.mode == 8 {
+                if enc.salt.is_empty() {
+                    errors.push(format!(
+                        "[atem.encryption].mode = {} (gcm2) requires `salt` (base64 of 32 bytes). \
+                         Generate one with: openssl rand -base64 32",
+                        enc.mode
+                    ));
+                } else {
+                    use base64::Engine;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(enc.salt.as_bytes())
+                        .ok()
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    if decoded != 32 {
+                        errors.push(format!(
+                            "[atem.encryption].salt decodes to {} bytes; gcm2 requires exactly 32. \
+                             Re-generate with: openssl rand -base64 32",
+                            decoded
+                        ));
+                    }
+                }
+            }
+        }
+        // Avatar + encryption interaction warning.
+        if atem.enable_avatar.unwrap_or(false) {
+            let enc_on = atem.encryption.as_ref().map(|e| e.mode > 0).unwrap_or(false);
+            if enc_on {
+                warnings.push(
+                    "[atem].enable_avatar = true with [atem.encryption].mode > 0 — \
+                     avatar vendors don't currently support encrypted channels, \
+                     audio will be silent. Pick one or the other.".into()
+                );
+            }
+            if cfg.agent.as_ref().and_then(|a| a.avatar.as_ref()).is_none() {
+                warnings.push(
+                    "[atem].enable_avatar = true but no [agent.avatar] block — \
+                     no avatar will be sent in /join.".into()
+                );
+            }
+        }
+    }
+
+    let has_preset = cfg.agent.as_ref()
+        .and_then(|a| a.preset.as_deref())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     let has_asr = cfg.agent.as_ref().and_then(|a| a.asr.as_ref()).is_some();
     let has_llm = cfg.agent.as_ref().and_then(|a| a.llm.as_ref()).is_some();
     let has_tts = cfg.agent.as_ref().and_then(|a| a.tts.as_ref()).is_some();
@@ -832,4 +928,95 @@ pub fn run_validate(config_path: &Path) -> Result<()> {
     }
     if !errors.is_empty() { anyhow::bail!("{} error(s) found", errors.len()); }
     Ok(())
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp(contents: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("atem-validate-{}.toml", ts));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        p
+    }
+
+    #[test]
+    fn validate_rejects_unknown_geofence() {
+        let p = write_temp(r#"
+            [atem]
+            geofence = "MOON"
+            [agent]
+            user_id = "1001"
+            preset  = "x"
+            [advanced_features]
+            enable_rtm = true
+        "#);
+        let err = run_validate(&p).unwrap_err().to_string();
+        assert!(err.contains("error"), "expected error: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_rejects_gcm2_mode_without_salt() {
+        let p = write_temp(r#"
+            [atem.encryption]
+            mode = 8
+            key  = "k"
+            # salt missing
+            [agent]
+            user_id = "1001"
+            preset  = "x"
+            [advanced_features]
+            enable_rtm = true
+        "#);
+        let err = run_validate(&p).unwrap_err().to_string();
+        assert!(err.contains("error"), "expected error: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_rejects_encryption_mode_without_key() {
+        let p = write_temp(r#"
+            [atem.encryption]
+            mode = 6
+            # key missing
+            [agent]
+            user_id = "1001"
+            preset  = "x"
+            [advanced_features]
+            enable_rtm = true
+        "#);
+        let err = run_validate(&p).unwrap_err().to_string();
+        assert!(err.contains("error"), "expected error: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_config() {
+        // Minimal valid config — should pass without error.
+        let p = write_temp(r#"
+            [atem]
+            hipaa    = false
+            geofence = "GLOBAL"
+            [atem.encryption]
+            mode = 0
+            [agent]
+            user_id = "1001"
+            preset  = "demo_preset"
+            [advanced_features]
+            enable_rtm = true
+            [parameters]
+            data_channel = "rtm"
+        "#);
+        let res = run_validate(&p);
+        assert!(res.is_ok(), "expected Ok, got: {:?}", res);
+        let _ = std::fs::remove_file(&p);
+    }
 }

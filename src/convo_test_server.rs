@@ -197,7 +197,7 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     // same template can be reused across many for-loop invocations
     // without needing to compute prefix/timestamp in the shell.
     let cli_channel = cfg.channel.clone()
-        .or_else(|| convo.channel.clone())
+        .or_else(|| convo.atem.as_ref().and_then(|a| a.channel.clone()))
         .map(|s| crate::web_server::net::expand_channel_template(&s, &app_id))
         .unwrap_or_else(|| crate::web_server::net::gen_channel(&app_id, "convo"));
 
@@ -966,7 +966,9 @@ fn build_html_page(app_id: &str, resolved: &ResolvedConfig, attach_mode: bool) -
     let channel   = resolved.channel.as_str();
     let rtc_uid   = resolved.rtc_user_id.as_str();
     let agent_uid = resolved.agent_user_id.as_str();
-    let preset    = resolved.preset.clone().unwrap_or_default();
+    // First entry of the comma-split list — used as a fallback display
+    // value (e.g. when the page renders a label without checkboxes).
+    let preset    = resolved.presets.first().cloned().unwrap_or_default();
     let avatar_ok = if resolved.avatar_configured { "true" } else { "false" };
     // JSON-encode the preset list so it embeds safely as a JS array
     // literal regardless of quotes / odd chars in preset names.
@@ -2280,7 +2282,6 @@ mod tests {
             idle_timeout_secs: None,
             avatar_configured: false,
             avatar_summary:    None,
-            preset:            None,
             presets:           vec![],
             hipaa:             true,
             geofence:          "NORTH_AMERICA".into(),
@@ -2303,7 +2304,7 @@ mod tests {
         let resolved = ResolvedConfig {
             channel: "c".into(), rtc_user_id: "1".into(), agent_user_id: "2".into(),
             idle_timeout_secs: None, avatar_configured: false, avatar_summary: None,
-            preset: None, presets: vec![],
+            presets: vec![],
             hipaa: false, geofence: String::new(),
             encryption_mode: 0, encryption_key: String::new(), encryption_salt: String::new(),
             enable_avatar: false,
@@ -2404,7 +2405,6 @@ mod tests {
             avatar_summary:    Some(crate::convo_config::AvatarSummary {
                 vendor: Some("heygen".into()), avatar_id: Some("abc".into()),
             }),
-            preset:            None,
             presets:           vec![],
             hipaa:             false,
             geofence:          String::new(),
@@ -2434,7 +2434,6 @@ mod tests {
             idle_timeout_secs: None,
             avatar_configured: false,
             avatar_summary:    None,
-            preset:            None,
             presets:           vec!["expertise_ai_poc".into(), "_akool_test_expertise".into()],
             hipaa:             false,
             geofence:          String::new(),
