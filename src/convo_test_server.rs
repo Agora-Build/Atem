@@ -264,8 +264,13 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         };
         crate::rtc_test_server::register_server(&entry)?;
 
+        let project_name = crate::config::ProjectCache::name_for_app_id(&app_id);
         println!("atem serv convo");
         println!("  config:    {}", toml_path.display());
+        println!("  app id:    {}", app_id);
+        if let Some(ref name) = project_name {
+            println!("  project:   {}", name);
+        }
         println!("  channel:   {}", resolved.channel);
         println!("  rtc uid:   {}", resolved.rtc_user_id);
         println!("  agent uid: {}", resolved.agent_user_id);
@@ -284,8 +289,13 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
 
     // ── Daemon mode: this IS the spawned child ──────────────────────────
     if cfg._daemon {
+        let project_name = crate::config::ProjectCache::name_for_app_id(&app_id);
         println!("atem serv convo (daemon)");
         println!("  config:    {}", toml_path.display());
+        println!("  app id:    {}", app_id);
+        if let Some(ref name) = project_name {
+            println!("  project:   {}", name);
+        }
         println!("  channel:   {}", resolved.channel);
         println!("  rtc uid:   {}", resolved.rtc_user_id);
         println!("  agent uid: {}", resolved.agent_user_id);
