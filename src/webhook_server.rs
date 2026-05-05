@@ -665,6 +665,19 @@ async fn handle_connection(
         }
         ("GET", "/events") => sse_stream(stream, tx).await,
         ("POST", "/webhook") => {
+            // Diagnostic: when ATEM_WEBHOOK_VERBOSE=1, dump all
+            // incoming headers to stdout so the operator can confirm
+            // what tunnels (ngrok / cloudflared / nginx) actually
+            // forward. Useful for diagnosing "why is `from` showing
+            // localhost instead of the public IP".
+            if std::env::var("ATEM_WEBHOOK_VERBOSE").ok().as_deref() == Some("1") {
+                println!("--- POST /webhook from {} (raw headers) ---", peer);
+                for line in header_str.lines() {
+                    if line.is_empty() || line.starts_with("POST ") { continue; }
+                    println!("    {}", line);
+                }
+                println!("--- /raw headers ---");
+            }
             let sig_v2 = header_value(header_str, "agora-signature-v2");
             let signature_ok = if secret.is_empty() {
                 true   // skipped, not validated — log/stream still happen
@@ -681,7 +694,9 @@ async fn handle_connection(
                 event_type,
                 label,
                 body,
-                remote: peer,
+                // Prefer the original client IP from forwarding headers
+                // — tunnels make `peer` always look like 127.0.0.1.
+                remote: forwarded_remote(header_str, &peer),
             };
             let _ = tx.send(ev);
             send_response(stream, 200, "application/json", b"{\"ok\":true}").await
@@ -700,6 +715,30 @@ fn header_value(header_str: &str, name_lower: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the original sender IP from the request headers. Tunnels
+/// (ngrok, cloudflared, nginx, etc.) make atem see traffic from
+/// `127.0.0.1:<random>` — the public IP travels in forwarding headers.
+/// Returns the local TCP peer when no forwarding header is present
+/// (e.g., when called directly without a tunnel).
+fn forwarded_remote(header_str: &str, local_peer: &str) -> String {
+    // Cloudflare-specific (cloudflared sets this); cleanest source.
+    if let Some(ip) = header_value(header_str, "cf-connecting-ip") {
+        return ip;
+    }
+    // ngrok / nginx / most proxies. May be a comma-list:
+    // "client, proxy1, proxy2" — first is the original client.
+    if let Some(xff) = header_value(header_str, "x-forwarded-for") {
+        if let Some(first) = xff.split(',').next() {
+            let trimmed = first.trim();
+            if !trimmed.is_empty() { return trimmed.to_string(); }
+        }
+    }
+    if let Some(ip) = header_value(header_str, "x-real-ip") {
+        return ip;
+    }
+    local_peer.to_string()
 }
 
 async fn send_response(
@@ -1064,6 +1103,35 @@ mod tests {
         assert_eq!(resp404.status().as_u16(), 404);
 
         server.abort();
+    }
+
+    #[test]
+    fn forwarded_remote_prefers_cf_connecting_ip() {
+        // cloudflared sets Cf-Connecting-Ip with the original client IP.
+        let h = "POST /webhook HTTP/1.1\r\n\
+            Cf-Connecting-Ip: 203.0.113.42\r\n\
+            X-Forwarded-For: 198.51.100.1, 172.18.0.1\r\n\
+            \r\n";
+        assert_eq!(forwarded_remote(h, "127.0.0.1:54321"), "203.0.113.42");
+    }
+
+    #[test]
+    fn forwarded_remote_falls_back_to_xff_first_address() {
+        // ngrok and most generic proxies set only X-Forwarded-For.
+        let h = "POST /webhook HTTP/1.1\r\n\
+            X-Forwarded-For: 198.51.100.1, 172.18.0.1\r\n\
+            \r\n";
+        assert_eq!(forwarded_remote(h, "127.0.0.1:54321"), "198.51.100.1");
+    }
+
+    #[test]
+    fn forwarded_remote_falls_back_to_x_real_ip_then_peer() {
+        let h_xri = "POST /webhook HTTP/1.1\r\nX-Real-Ip: 192.0.2.7\r\n\r\n";
+        assert_eq!(forwarded_remote(h_xri, "127.0.0.1:1"), "192.0.2.7");
+
+        let h_none = "POST /webhook HTTP/1.1\r\nHost: foo\r\n\r\n";
+        // No forwarding headers → fall back to the TCP peer atem saw.
+        assert_eq!(forwarded_remote(h_none, "127.0.0.1:1"), "127.0.0.1:1");
     }
 
     #[test]
