@@ -239,21 +239,28 @@ const AVATAR_PROVIDERS: &[Provider] = &[
 
 // ── MLLM providers (per docs.agora.io/en/conversational-ai/models/mllm/overview)
 
+// vendor_id values match Agora's `/join` body contract — server
+// rejects anything outside the set {"openai","gemini","vertexai","xai"}.
 const MLLM_PROVIDERS: &[Provider] = &[
-    Provider { name: "OpenAI Realtime API", vendor_id: "openai_realtime", beta: false, style: "", params: &[
+    Provider { name: "OpenAI Realtime API", vendor_id: "openai", beta: false, style: "", params: &[
         Param { key: "api_key", label: "API Key", secret: true, default_value: "", hint: "" },
-        Param { key: "model", label: "Model", secret: false, default_value: "gpt-4o-realtime-preview", hint: "" },
+        Param { key: "model", label: "Model", secret: false, default_value: "gpt-realtime", hint: "" },
         Param { key: "voice", label: "Voice", secret: false, default_value: "alloy", hint: "alloy, echo, fable, onyx, nova, shimmer" },
+        Param { key: "instructions", label: "Instructions", secret: false, default_value: "You are a Conversational AI Agent, developed by Agora.", hint: "System prompt sent to the model" },
     ]},
-    Provider { name: "Google Gemini Live", vendor_id: "gemini_live", beta: false, style: "", params: &[
+    Provider { name: "Google Gemini Live", vendor_id: "gemini", beta: false, style: "", params: &[
         Param { key: "api_key", label: "API Key", secret: true, default_value: "", hint: "" },
         Param { key: "model", label: "Model", secret: false, default_value: "gemini-2.0-flash-live-001", hint: "" },
     ]},
-    Provider { name: "Google Gemini Live (Vertex AI)", vendor_id: "gemini_live_vertex", beta: false, style: "", params: &[
+    Provider { name: "Google Gemini Live (Vertex AI)", vendor_id: "vertexai", beta: false, style: "", params: &[
         Param { key: "project_id", label: "GCP Project ID", secret: false, default_value: "", hint: "" },
         Param { key: "location", label: "Location", secret: false, default_value: "us-central1", hint: "" },
         Param { key: "adc_credentials_string", label: "Service Account JSON", secret: true, default_value: "", hint: "Full JSON string" },
         Param { key: "model", label: "Model", secret: false, default_value: "gemini-2.0-flash-live-001", hint: "" },
+    ]},
+    Provider { name: "xAI Grok Realtime", vendor_id: "xai", beta: true, style: "", params: &[
+        Param { key: "api_key", label: "API Key", secret: true, default_value: "", hint: "" },
+        Param { key: "model", label: "Model", secret: false, default_value: "grok-4", hint: "" },
     ]},
 ];
 
@@ -290,6 +297,9 @@ struct WizardAnswers {
 
     // MLLM (optional — replaces ASR+LLM+TTS when set)
     mllm_vendor: String,
+    mllm_url: String,
+    mllm_api_key: String,
+    mllm_greeting_message: String,
     mllm_params: BTreeMap<String, String>,
 
     // Avatar
@@ -403,34 +413,26 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
     let existing = existing.unwrap_or_default();
 
     let mut a = WizardAnswers::default();
-
-    // Step 1: Mode
-    let mode_items = &["Preset-based (use Agora presets)", "Custom (pick ASR + LLM + TTS)"];
     let existing_atem  = existing.atem.as_ref();
     let existing_agent = existing.agent.as_ref();
-    let preset_set = existing_agent.and_then(|a| a.preset.as_deref())
-        .map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let current_mode = if preset_set { 0 } else { 1 };
-    a.use_preset = Select::new()
-        .with_prompt("Configuration mode")
-        .items(mode_items)
-        .default(current_mode)
-        .interact()? == 0;
 
-    // Step 2: Channel & UIDs
-    println!("\n── Channel & UIDs ──");
+    // Step 1: Channel & User (writes under [atem] in convo.toml)
+    println!("\n── Channel & User ──");
     a.channel = prompt_input(
         "Channel (empty = auto-generate)",
         existing_atem.and_then(|x| x.channel.as_deref()).unwrap_or(""),
         false,
     )?;
     a.rtc_user_id = prompt_input(
-        "RTC User ID",
+        "RTC User",
         existing_atem.and_then(|x| x.rtc_user_id.as_deref()).unwrap_or("0"),
         false,
     )?;
+
+    // Step 2: Agent (writes under [agent] in convo.toml)
+    println!("\n── Agent ──");
     a.agent_user_id = prompt_input(
-        "Agent User ID",
+        "Agent User",
         existing_agent.and_then(|x| x.user_id.as_deref()).unwrap_or("1001"),
         false,
     )?;
@@ -440,45 +442,101 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
         .to_string();
     a.idle_timeout_secs = prompt_input("Idle timeout (seconds)", &t_default, false)?.parse().unwrap_or(120);
 
-    // Step 3: Presets
-    if a.use_preset {
-        println!("\n── Presets ──");
-        let current = existing.preset_list().join(", ");
-        let input = prompt_input("Preset name(s), comma-separated", &current, false)?;
-        a.presets = input.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    }
+    // Step 3: Preset (empty to skip). Independent of Custom — preset
+    // sets defaults; explicit cascaded/MLLM blocks override per-field.
+    let cur_preset = existing_agent.and_then(|x| x.preset.as_deref()).unwrap_or("");
+    let preset_input = prompt_input("Preset name(s), comma-separated (empty = skip)", cur_preset, false)?;
+    a.presets = preset_input
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    a.use_preset = !a.presets.is_empty();
 
-    // Step 4: Pipeline type — segmented (ASR+LLM+TTS) vs multimodal (MLLM)
-    // Both are configurable even in preset mode (as overrides).
-    let configure_providers = if a.use_preset {
-        Confirm::new()
-            .with_prompt("Override provider settings?")
-            .default(existing.agent.as_ref().map(|ag| ag.asr.is_some() || ag.llm.is_some() || ag.tts.is_some()).unwrap_or(false))
-            .interact()?
-    } else {
-        true
-    };
+    // Step 4: Custom override (optional). User picks zero, one, or
+    // both pipelines via multi-select. [atem].pipeline still selects
+    // which one is sent in /join; the other parks in convo.toml.
+    let has_cascaded = existing_agent.map(|ag|
+        ag.asr.is_some() || ag.llm.is_some() || ag.tts.is_some()).unwrap_or(false);
+    let has_mllm = existing_agent.and_then(|ag| ag.mllm.as_ref()).is_some();
+    let any_custom = has_cascaded || has_mllm;
+    let prompt_label = if a.use_preset { "Add Custom override?" } else { "Configure Custom?" };
+    let configure_providers = Confirm::new()
+        .with_prompt(prompt_label)
+        .default(if a.use_preset { any_custom } else { true })
+        .interact()?;
 
+    let mut do_cascaded = false;
+    let mut do_mllm = false;
     if configure_providers {
         let pipeline_items = &[
-            "Segmented pipeline (ASR + LLM + TTS)",
-            "Multimodal LLM (single model handles voice in/out)",
+            "Cascaded (ASR + LLM + TTS)",
+            "Multimodal LLM",
         ];
-        let pipeline = Select::new()
-            .with_prompt("Pipeline type")
+        let prior_pipeline = existing_atem.and_then(|x| x.pipeline.as_deref());
+        let default_idx = match prior_pipeline {
+            Some("mllm") => 1,
+            _            => if has_mllm && !has_cascaded { 1 } else { 0 },
+        };
+        let chosen = Select::new()
+            .with_prompt("Pipeline")
             .items(pipeline_items)
-            .default(0)
+            .default(default_idx)
             .interact()?;
+        do_cascaded = chosen == 0;
+        do_mllm     = chosen == 1;
 
-        if pipeline == 1 {
-            // MLLM — single multimodal model
+        if do_mllm {
+            // MLLM — single multimodal model. Pre-fill from any
+            // existing [agent.mllm] block: vendor for the provider
+            // dropdown's default + params for each prompt's default.
             println!("\n── MLLM (Multimodal LLM) ──");
-            let idx = select_provider("MLLM", MLLM_PROVIDERS, "")?;
+            let cur_vendor = existing.agent.as_ref()
+                .and_then(|ag| ag.mllm.as_ref())
+                .and_then(|m| m.vendor.as_deref())
+                .unwrap_or("");
+            let idx = select_provider("MLLM", MLLM_PROVIDERS, cur_vendor)?;
             let prov = &MLLM_PROVIDERS[idx];
             a.mllm_vendor = prov.vendor_id.to_string();
-            a.mllm_params = collect_provider_params(prov, &BTreeMap::new())?;
-        } else {
-            // Segmented — ASR + LLM + TTS
+            let url_default = match prov.vendor_id {
+                "openai" => "wss://api.openai.com/v1/realtime",
+                _        => "",
+            };
+            let cur_url = existing.agent.as_ref()
+                .and_then(|ag| ag.mllm.as_ref())
+                .and_then(|m| m.url.as_deref())
+                .unwrap_or(url_default);
+            a.mllm_url = prompt_input("Endpoint URL", cur_url, false)?;
+
+            // collect_provider_params returns api_key inside the
+            // params map for prompt-flow consistency. Agora's MLLM
+            // schema expects api_key at the top of the `mllm` block,
+            // so hoist it after collection.
+            let mut existing_p = existing.agent.as_ref()
+                .and_then(|ag| ag.mllm.as_ref())
+                .map(service_params_flat)
+                .unwrap_or_default();
+            if let Some(k) = existing.agent.as_ref()
+                .and_then(|ag| ag.mllm.as_ref())
+                .and_then(|m| m.api_key.as_deref())
+            {
+                existing_p.entry("api_key".into()).or_insert(k.to_string());
+            }
+            a.mllm_params = collect_provider_params(prov, &existing_p)?;
+            if let Some(k) = a.mllm_params.remove("api_key") {
+                a.mllm_api_key = k;
+            }
+
+            // greeting_message is top-level on the mllm block.
+            let cur_greet = existing.agent.as_ref()
+                .and_then(|ag| ag.mllm.as_ref())
+                .and_then(|m| m.greeting_message.as_deref())
+                .unwrap_or("");
+            a.mllm_greeting_message = prompt_input("Greeting message (empty = skip)", cur_greet, false)?;
+        }
+
+        if do_cascaded {
+            // Cascaded — ASR + LLM + TTS
             let suffix = if a.use_preset { " — override" } else { "" };
 
             // ASR
@@ -550,10 +608,25 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
     if av_idx > 0 {
         let prov = &AVATAR_PROVIDERS[av_idx - 1];
         a.avatar_vendor = prov.vendor_id.to_string();
-        let existing_p = existing.agent.as_ref().and_then(|ag| ag.avatar.as_ref()).map(service_params_flat).unwrap_or_default();
+        // `service_params_flat` only flattens [agent.avatar.params], but
+        // `avatar_id` lives at the top of [agent.avatar] (sibling to
+        // `params`). Inject it into the params map under the key the
+        // provider definition expects, so the "Avatar ID" prompt
+        // pre-fills with the existing value instead of empty.
+        let mut existing_p = existing.agent.as_ref()
+            .and_then(|ag| ag.avatar.as_ref())
+            .map(service_params_flat)
+            .unwrap_or_default();
+        if let Some(cur_id) = existing.agent.as_ref()
+            .and_then(|ag| ag.avatar.as_ref())
+            .and_then(|s| s.avatar_id.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            existing_p.entry("avatar_id".to_string())
+                .or_insert_with(|| cur_id.to_string());
+        }
         a.avatar_params = collect_provider_params(prov, &existing_p)?;
-        let cur_id = existing.agent.as_ref().and_then(|ag| ag.avatar.as_ref()).and_then(|s| s.avatar_id.as_deref()).unwrap_or("");
-        a.avatar_id_value = a.avatar_params.remove("avatar_id").unwrap_or_else(|| cur_id.to_string());
+        a.avatar_id_value = a.avatar_params.remove("avatar_id").unwrap_or_default();
     }
 
     // Advanced
@@ -564,12 +637,29 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
     a.enable_words = Confirm::new().with_prompt("Enable word-level transcription").default(true).interact()?;
     a.vad_silence_ms = prompt_input("VAD silence duration (ms)", "800", false)?.parse().unwrap_or(800);
 
-    // Generate + preview + save
-    let toml = build_toml(&a);
+    // Generate + preview + save. Round-trip via toml_edit so the
+    // user's existing comments, key ordering, and any sections the
+    // wizard didn't ask about (e.g., parked MLLM/ASR-LLM-TTS blocks
+    // when toggling pipelines) are preserved.
+    let existing = if config_path.exists() {
+        std::fs::read_to_string(config_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| format!("Failed to parse existing {}", config_path.display()))?;
+    apply_to_doc(&mut doc, &a);
+    let toml = doc.to_string();
     println!("\n── Preview ──\n{}", toml);
 
     if Confirm::new().with_prompt(format!("Save to {}?", config_path.display())).default(true).interact()? {
         if let Some(dir) = config_path.parent() { std::fs::create_dir_all(dir)?; }
+        // Rotate backups (max 5: .bak, .bak.1, ..., .bak.4) before
+        // overwriting. Lets the operator recover from a wizard run
+        // that nuked something they wanted to keep.
+        rotate_backups(config_path, 5)
+            .with_context(|| format!("Failed to back up {}", config_path.display()))?;
         std::fs::write(config_path, &toml).with_context(|| format!("Failed to write {}", config_path.display()))?;
         #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
@@ -581,6 +671,276 @@ pub fn run_wizard(config_path: &Path) -> Result<()> {
         println!("Cancelled.");
     }
     Ok(())
+}
+
+/// Rotate `path` to a numbered `.bak` series, keeping at most `max`
+/// generations. Strategy:
+///   * `<file>.bak`     — most recent backup
+///   * `<file>.bak.1`   — one save ago
+///   * `<file>.bak.2`   ... up to `<file>.bak.<max-1>` (oldest kept)
+///
+/// On each save: drop the oldest, shift each existing `.bak.N` to
+/// `.bak.N+1`, then copy current → `.bak`.
+pub(crate) fn rotate_backups(path: &Path, max: usize) -> Result<()> {
+    if !path.exists() || max == 0 {
+        return Ok(());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name   = path.file_name()
+        .ok_or_else(|| anyhow::anyhow!("no filename in {}", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let bak = |i: usize| -> std::path::PathBuf {
+        if i == 0 { parent.join(format!("{}.bak",     name)) }
+        else      { parent.join(format!("{}.bak.{}",  name, i)) }
+    };
+    // Drop the oldest if it would otherwise push past `max`.
+    let oldest = bak(max - 1);
+    if oldest.exists() {
+        let _ = std::fs::remove_file(&oldest);
+    }
+    // Shift down: bak.(max-2) → bak.(max-1), ..., bak.1 → bak.2, bak → bak.1
+    for i in (0..max - 1).rev() {
+        let from = bak(i);
+        let to   = bak(i + 1);
+        if from.exists() {
+            std::fs::rename(&from, &to)?;
+        }
+    }
+    // Current file → .bak
+    std::fs::copy(path, bak(0))?;
+    Ok(())
+}
+
+/// Apply wizard answers to a `toml_edit::DocumentMut`, preserving any
+/// content (comments, ordering, unrelated keys, parked provider
+/// blocks) the wizard didn't explicitly touch.
+///
+/// Sections the wizard ALWAYS owns and replaces: `[atem]`,
+/// `[agent]` scalars (user_id/idle_timeout_secs/preset),
+/// `[advanced_features]`, `[vad]`, `[sal]`, `[parameters]` (+ its
+/// `transcript` / `turn_detector` sub-tables).
+///
+/// Sections written ONLY when the wizard collected fresh data:
+/// `[agent.avatar]`, `[agent.mllm]`, `[agent.llm]` / `[agent.asr]` /
+/// `[agent.tts]`. If the user picks MLLM mode this run, the
+/// cascaded blocks stay parked in the file as-is.
+fn apply_to_doc(doc: &mut toml_edit::DocumentMut, a: &WizardAnswers) {
+    use toml_edit::{value, Item, Table};
+
+    // ── [atem] ────────────────────────────────────────────────
+    if doc.get("atem").is_none() {
+        doc["atem"] = Item::Table(Table::new());
+    }
+    let atem = doc["atem"].as_table_mut().expect("atem is table");
+    if !a.channel.is_empty() {
+        atem["channel"] = value(a.channel.as_str());
+    } else {
+        atem.remove("channel");
+    }
+    atem["rtc_user_id"] = value(a.rtc_user_id.as_str());
+    // Pipeline: explicit so re-parses survive even when both blocks
+    // are parked. If the user configured exactly one this run, that
+    // wins; otherwise preserve the prior choice (default cascaded).
+    let prior_pipeline = atem.get("pipeline")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let configured_mllm     = !a.mllm_vendor.is_empty();
+    let configured_cascaded = !a.asr_vendor.is_empty();
+    let pipeline_value: String = match (configured_mllm, configured_cascaded) {
+        (true,  false) => "mllm".into(),
+        (false, true)  => "cascaded".into(),
+        _              => prior_pipeline.unwrap_or_else(|| "cascaded".into()),
+    };
+    atem["pipeline"] = value(pipeline_value.as_str());
+
+    // ── [agent] ───────────────────────────────────────────────
+    if doc.get("agent").is_none() {
+        doc["agent"] = Item::Table(Table::new());
+    }
+    let agent = doc["agent"].as_table_mut().expect("agent is table");
+    agent["user_id"] = value(a.agent_user_id.as_str());
+    agent["idle_timeout_secs"] = value(a.idle_timeout_secs as i64);
+    if a.use_preset && !a.presets.is_empty() {
+        agent["preset"] = value(a.presets.join(","));
+    } else {
+        agent.remove("preset");
+    }
+
+    // ── Pass-through tables (always wizard-managed) ───────────
+    let af = ensure_table(doc, "advanced_features");
+    af["enable_rtm"]   = value(a.enable_rtm);
+    af["enable_sal"]   = value(a.enable_sal);
+    af["enable_aivad"] = value(false);
+
+    let vad = ensure_table(doc, "vad");
+    vad["silence_duration_ms"] = value(a.vad_silence_ms as i64);
+
+    let sal = ensure_table(doc, "sal");
+    sal["sal_mode"] = value("locking");
+
+    let parameters = ensure_table(doc, "parameters");
+    parameters["audio_scenario"] = value("default");
+    parameters["data_channel"]   = value(a.data_channel.as_str());
+    let transcript = ensure_subtable(parameters, "transcript");
+    transcript["enable_words"] = value(a.enable_words);
+    let turn_detector = ensure_subtable(parameters, "turn_detector");
+    turn_detector["validate_asr_result_timestamp"] = value(false);
+
+    // ── [agent.avatar] (only when user picked an avatar) ─────
+    if !a.avatar_vendor.is_empty() {
+        let agent = doc["agent"].as_table_mut().unwrap();
+        let av = ensure_subtable(agent, "avatar");
+        av["vendor"] = value(a.avatar_vendor.as_str());
+        if !a.avatar_id_value.is_empty() {
+            av["avatar_id"] = value(a.avatar_id_value.as_str());
+        } else {
+            av.remove("avatar_id");
+        }
+        if !a.avatar_params.is_empty() {
+            // Replace the params table in full so removed keys go away.
+            av.remove("params");
+            let params = ensure_subtable(av, "params");
+            apply_flat_params(params, &a.avatar_params);
+        }
+    }
+
+    // ── [agent.mllm] (only when user picked MLLM mode) ───────
+    if !a.mllm_vendor.is_empty() {
+        let agent = doc["agent"].as_table_mut().unwrap();
+        let m = ensure_subtable(agent, "mllm");
+        m["vendor"] = value(a.mllm_vendor.as_str());
+        if !a.mllm_url.is_empty() {
+            m["url"] = value(a.mllm_url.as_str());
+        } else {
+            m.remove("url");
+        }
+        if !a.mllm_api_key.is_empty() {
+            m["api_key"] = value(a.mllm_api_key.as_str());
+        } else {
+            m.remove("api_key");
+        }
+        if !a.mllm_greeting_message.is_empty() {
+            m["greeting_message"] = value(a.mllm_greeting_message.as_str());
+        } else {
+            m.remove("greeting_message");
+        }
+        if !a.mllm_params.is_empty() {
+            m.remove("params");
+            let p = ensure_subtable(m, "params");
+            apply_flat_params(p, &a.mllm_params);
+        }
+    }
+
+    // ── [agent.llm/asr/tts] (only when user picked cascaded) ─
+    let cascaded_filled = !a.asr_vendor.is_empty()
+        || !a.llm_url.is_empty()
+        || !a.llm_api_key.is_empty()
+        || !a.tts_vendor.is_empty();
+    if cascaded_filled {
+        let agent = doc["agent"].as_table_mut().unwrap();
+
+        // LLM
+        let llm = ensure_subtable(agent, "llm");
+        if !a.llm_url.is_empty()      { llm["url"]              = value(a.llm_url.as_str()); }
+        if !a.llm_api_key.is_empty()  { llm["api_key"]          = value(a.llm_api_key.as_str()); }
+        if !a.llm_vendor.is_empty()   { llm["vendor"]           = value(a.llm_vendor.as_str()); }
+        if !a.llm_style.is_empty()    { llm["style"]            = value(a.llm_style.as_str()); }
+        if !a.llm_greeting.is_empty() { llm["greeting_message"] = value(a.llm_greeting.as_str()); }
+        if !a.llm_failure.is_empty()  { llm["failure_message"]  = value(a.llm_failure.as_str()); }
+
+        // system_messages — replace as a single-element array of tables.
+        if !a.llm_system_prompt.is_empty() {
+            let mut arr = toml_edit::ArrayOfTables::new();
+            let mut row = Table::new();
+            row["role"]    = value("system");
+            row["content"] = value(a.llm_system_prompt.as_str());
+            arr.push(row);
+            llm.insert("system_messages", Item::ArrayOfTables(arr));
+        }
+
+        // params — replace in full.
+        llm.remove("params");
+        if !a.llm_params.is_empty() {
+            let p = ensure_subtable(llm, "params");
+            apply_flat_params(p, &a.llm_params);
+        }
+
+        // Anthropic needs a versioned header.
+        if a.llm_style == "anthropic" {
+            llm.remove("headers");
+            let h = ensure_subtable(llm, "headers");
+            h["anthropic-version"] = value("2023-06-01");
+        }
+
+        // ASR
+        let asr = ensure_subtable(agent, "asr");
+        asr["vendor"] = value(a.asr_vendor.as_str());
+        if !a.asr_language.is_empty() { asr["language"] = value(a.asr_language.as_str()); }
+        asr.remove("params");
+        if !a.asr_params.is_empty() {
+            let p = ensure_subtable(asr, "params");
+            apply_flat_params(p, &a.asr_params);
+        }
+
+        // TTS
+        let tts = ensure_subtable(agent, "tts");
+        tts["vendor"] = value(a.tts_vendor.as_str());
+        tts.remove("params");
+        if !a.tts_params.is_empty() {
+            let p = ensure_subtable(tts, "params");
+            apply_flat_params(p, &a.tts_params);
+        }
+    }
+}
+
+fn ensure_table<'a>(doc: &'a mut toml_edit::DocumentMut, name: &str) -> &'a mut toml_edit::Table {
+    if doc.get(name).is_none() {
+        doc[name] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc[name].as_table_mut().expect("table")
+}
+
+fn ensure_subtable<'a>(parent: &'a mut toml_edit::Table, name: &str) -> &'a mut toml_edit::Table {
+    if !parent.contains_key(name) {
+        parent.insert(name, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    parent.get_mut(name).and_then(|i| i.as_table_mut()).expect("subtable")
+}
+
+/// Apply a flat `BTreeMap<String, String>` (where keys may contain
+/// dots indicating nested sub-tables) to a toml_edit Table. Values
+/// are coerced into the appropriate TOML type heuristically.
+fn apply_flat_params(table: &mut toml_edit::Table, params: &std::collections::BTreeMap<String, String>) {
+    for (k, v) in params {
+        if let Some((head, tail)) = k.split_once('.') {
+            let sub = ensure_subtable(table, head);
+            // Recurse for deeper nesting via a small helper map.
+            let mut one = std::collections::BTreeMap::new();
+            one.insert(tail.to_string(), v.clone());
+            apply_flat_params(sub, &one);
+        } else {
+            table[k] = coerce_value(v);
+        }
+    }
+}
+
+/// Heuristic value coercion: booleans stay booleans, integers stay
+/// integers IF they fit JS-safe range (≤ 2^53), everything else
+/// stays a quoted string. The JS-safe cap protects values like
+/// minimax's `group_id = 1967483817044222128` which would lose
+/// precision when serialized to JSON downstream.
+fn coerce_value(s: &str) -> toml_edit::Item {
+    use toml_edit::value;
+    const JS_SAFE_MAX: i64 = 9_007_199_254_740_992;
+    if s == "true"  { return value(true);  }
+    if s == "false" { return value(false); }
+    if let Ok(n) = s.parse::<i64>() {
+        if n.abs() <= JS_SAFE_MAX {
+            return value(n);
+        }
+    }
+    value(s)
 }
 
 // ── TOML builder ────────────────────────────────────────────────────
@@ -636,23 +996,23 @@ fn build_toml(a: &WizardAnswers) -> String {
     let _ = writeln!(t, "# ConvoAI Agent Configuration");
     let _ = writeln!(t, "# Generated by `atem config convo`\n");
 
+    // [atem] — atem-managed runtime control surface
+    let _ = writeln!(t, "[atem]");
     if !a.channel.is_empty() {
-        let _ = writeln!(t, "channel           = {:?}", a.channel);
+        let _ = writeln!(t, "channel     = {:?}", a.channel);
     } else {
         let _ = writeln!(t, "# channel auto-generated when omitted");
     }
-    let _ = writeln!(t, "rtc_user_id       = {:?}", a.rtc_user_id);
-    let _ = writeln!(t, "agent_user_id     = {:?}", a.agent_user_id);
-    let _ = writeln!(t, "idle_timeout_secs = {}", a.idle_timeout_secs);
+    let _ = writeln!(t, "rtc_user_id = {:?}", a.rtc_user_id);
 
+    // [agent] — about the AI agent itself
+    let _ = writeln!(t, "\n[agent]");
+    let _ = writeln!(t, "user_id           = {:?}", a.agent_user_id);
+    let _ = writeln!(t, "idle_timeout_secs = {}", a.idle_timeout_secs);
     if a.use_preset && !a.presets.is_empty() {
-        let _ = writeln!(t);
-        if a.presets.len() == 1 {
-            let _ = writeln!(t, "preset = {:?}", a.presets[0]);
-        } else {
-            let items: Vec<String> = a.presets.iter().map(|p| format!("{:?}", p)).collect();
-            let _ = writeln!(t, "presets = [{}]", items.join(", "));
-        }
+        // Single comma-separated string — atem splits for the UI
+        // checkboxes and joins selections back as properties.preset.
+        let _ = writeln!(t, "preset            = {:?}", a.presets.join(","));
     }
 
     // Advanced features
@@ -693,11 +1053,20 @@ fn build_toml(a: &WizardAnswers) -> String {
         }
     }
 
-    // MLLM (if chosen instead of segmented pipeline)
+    // MLLM (if chosen instead of the cascaded pipeline)
     if !a.mllm_vendor.is_empty() {
         let _ = writeln!(t, "\n# Multimodal LLM — replaces the ASR + LLM + TTS pipeline");
         let _ = writeln!(t, "[agent.mllm]");
         let _ = writeln!(t, "vendor = {:?}", a.mllm_vendor);
+        if !a.mllm_url.is_empty() {
+            let _ = writeln!(t, "url    = {:?}", a.mllm_url);
+        }
+        if !a.mllm_api_key.is_empty() {
+            let _ = writeln!(t, "api_key = {:?}", a.mllm_api_key);
+        }
+        if !a.mllm_greeting_message.is_empty() {
+            let _ = writeln!(t, "greeting_message = {:?}", a.mllm_greeting_message);
+        }
         if !a.mllm_params.is_empty() {
             let _ = writeln!(t, "\n[agent.mllm.params]");
             let (flat, nested): (Vec<_>, Vec<_>) = a.mllm_params.iter().partition(|(k, _)| !k.contains('.'));
@@ -706,7 +1075,7 @@ fn build_toml(a: &WizardAnswers) -> String {
         }
     }
 
-    // ASR + LLM + TTS (segmented pipeline — written when any has data,
+    // ASR + LLM + TTS (cascaded pipeline — written when any has data,
     // regardless of preset mode since presets can have overrides)
     if !a.asr_vendor.is_empty() || !a.llm_url.is_empty() || !a.llm_api_key.is_empty() || !a.tts_vendor.is_empty() {
         // LLM
@@ -856,11 +1225,52 @@ pub fn run_validate(config_path: &Path) -> Result<()> {
         .and_then(|a| a.preset.as_deref())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    let has_asr = cfg.agent.as_ref().and_then(|a| a.asr.as_ref()).is_some();
-    let has_llm = cfg.agent.as_ref().and_then(|a| a.llm.as_ref()).is_some();
-    let has_tts = cfg.agent.as_ref().and_then(|a| a.tts.as_ref()).is_some();
-    if !has_preset && !(has_asr && has_llm && has_tts) {
-        errors.push("Need either a preset or all three: [agent.asr], [agent.llm], [agent.tts]".into());
+    let has_asr  = cfg.agent.as_ref().and_then(|a| a.asr.as_ref()).is_some();
+    let has_llm  = cfg.agent.as_ref().and_then(|a| a.llm.as_ref()).is_some();
+    let has_tts  = cfg.agent.as_ref().and_then(|a| a.tts.as_ref()).is_some();
+    let has_mllm = cfg.agent.as_ref().and_then(|a| a.mllm.as_ref()).is_some();
+    let has_seg  = has_asr || has_llm || has_tts;
+    // Pipeline detection (mirrors `resolve()`'s logic but doesn't
+    // require a channel — validation runs against any draft).
+    enum P { Cascaded, Mllm, Ambiguous, BadValue(String) }
+    let detected = match cfg.atem.as_ref()
+        .and_then(|a| a.pipeline.as_deref())
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        Some(s) if matches!(s.as_str(), "cascaded" | "cascade" | "chained" | "segmented") => P::Cascaded,
+        Some(s) if s == "mllm" => P::Mllm,
+        Some(other) => P::BadValue(other),
+        None => match (has_seg, has_mllm) {
+            (false, true) => P::Mllm,
+            (true,  false) | (false, false) => P::Cascaded,
+            (true,  true) => P::Ambiguous,
+        },
+    };
+    match detected {
+        P::Cascaded => {
+            if !has_preset && !(has_asr && has_llm && has_tts) {
+                errors.push(
+                    "Active pipeline is cascaded — need a preset, OR \
+                     all three of [agent.asr] / [agent.llm] / [agent.tts]".into()
+                );
+            }
+        }
+        P::Mllm => {
+            if !has_mllm {
+                errors.push("Active pipeline is mllm — need [agent.mllm] block".into());
+            }
+        }
+        P::Ambiguous => {
+            errors.push(
+                "Both [agent.mllm] and [agent.asr/llm/tts] are configured; \
+                 set [atem].pipeline = \"cascaded\" or \"mllm\" to pick one".into()
+            );
+        }
+        P::BadValue(v) => {
+            errors.push(format!(
+                "[atem].pipeline = {:?} is not one of \"cascaded\", \"mllm\"", v
+            ));
+        }
     }
 
     if has_llm {
@@ -996,6 +1406,176 @@ mod validate_tests {
         let err = run_validate(&p).unwrap_err().to_string();
         assert!(err.contains("error"), "expected error: {}", err);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_accepts_mllm_alone() {
+        // [agent.mllm] is a valid third path alongside preset and the
+        // segmented (asr+llm+tts) trio. With it set, no preset and no
+        // asr/llm/tts blocks are needed.
+        let p = write_temp(r#"
+            [atem]
+            channel = "c"
+            [agent]
+            user_id = "1001"
+            [agent.mllm]
+            vendor = "openai"
+            [agent.mllm.params]
+            api_key = "sk-x"
+            [advanced_features]
+            enable_rtm = true
+        "#);
+        let res = run_validate(&p);
+        assert!(res.is_ok(), "expected Ok, got: {:?}", res);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_requires_explicit_pipeline_when_both_present() {
+        // Both [agent.mllm] and [agent.asr/llm/tts] in one file —
+        // ambiguous, so resolve() refuses to auto-pick. User must
+        // set [atem].pipeline.
+        let p = write_temp(r#"
+            [atem]
+            channel = "c"
+            [agent]
+            user_id = "1001"
+            [agent.mllm]
+            vendor = "openai"
+            [agent.mllm.params]
+            api_key = "x"
+            [agent.asr]
+            vendor = "soniox"
+            [agent.llm]
+            api_key = "x"
+            [agent.tts]
+            vendor = "minimax"
+            [advanced_features]
+            enable_rtm = true
+        "#);
+        let err = run_validate(&p).unwrap_err().to_string();
+        assert!(err.contains("error"), "expected error: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_picks_pipeline_when_explicit() {
+        // Both blocks present + explicit `pipeline = "mllm"` → ok,
+        // resolves to mllm and `validate_*` only checks for mllm.
+        let p = write_temp(r#"
+            [atem]
+            channel  = "c"
+            pipeline = "mllm"
+            [agent]
+            user_id = "1001"
+            [agent.mllm]
+            vendor = "openai"
+            [agent.mllm.params]
+            api_key = "x"
+            [agent.asr]
+            vendor = "soniox"
+            [advanced_features]
+            enable_rtm = true
+        "#);
+        let res = run_validate(&p);
+        assert!(res.is_ok(), "expected Ok, got: {:?}", res);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn backup_rotation_keeps_at_most_max_generations() {
+        use std::io::Write;
+        let mut p = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        p.push(format!("atem-bak-test-{}.toml", unique));
+        // Seed with six sequential "saves".
+        for n in 0..6 {
+            let mut f = std::fs::File::create(&p).unwrap();
+            writeln!(f, "n = {}", n).unwrap();
+            super::rotate_backups(&p, 5).unwrap();
+        }
+        // After 6 saves at max=5, expect: original + .bak + .bak.1..=.bak.4
+        let bak  = p.with_file_name(format!("{}.bak",   p.file_name().unwrap().to_string_lossy()));
+        let bak1 = p.with_file_name(format!("{}.bak.1", p.file_name().unwrap().to_string_lossy()));
+        let bak2 = p.with_file_name(format!("{}.bak.2", p.file_name().unwrap().to_string_lossy()));
+        let bak3 = p.with_file_name(format!("{}.bak.3", p.file_name().unwrap().to_string_lossy()));
+        let bak4 = p.with_file_name(format!("{}.bak.4", p.file_name().unwrap().to_string_lossy()));
+        let bak5 = p.with_file_name(format!("{}.bak.5", p.file_name().unwrap().to_string_lossy()));
+        assert!(bak.exists()  && bak1.exists() && bak2.exists() && bak3.exists() && bak4.exists());
+        assert!(!bak5.exists(), "5th-old should have been dropped");
+
+        // Cleanup
+        for path in [&p, &bak, &bak1, &bak2, &bak3, &bak4, &bak5] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn apply_to_doc_preserves_unrelated_sections_and_comments() {
+        // Drop a file with a [agent.mllm] block + a top-level comment.
+        // Run wizard answers that pick CASCADED mode (so the wizard
+        // doesn't touch [agent.mllm]) and verify the parked block is
+        // still in the output.
+        let starting = r#"# my custom comment
+[atem]
+channel = "old-channel"
+
+[agent]
+user_id = "1001"
+
+# parked MLLM — kept across switches to cascaded
+[agent.mllm]
+vendor = "openai"
+[agent.mllm.params]
+api_key = "sk-keep-me"
+"#;
+        let mut doc: toml_edit::DocumentMut = starting.parse().unwrap();
+        let answers = super::WizardAnswers {
+            use_preset: false,
+            channel: "new-channel".into(),
+            rtc_user_id: "0".into(),
+            agent_user_id: "1001".into(),
+            idle_timeout_secs: 120,
+            presets: vec![],
+            asr_vendor: "soniox".into(),
+            asr_language: "en-US".into(),
+            asr_params: Default::default(),
+            llm_vendor: String::new(),
+            llm_url: "https://api.example.com".into(),
+            llm_api_key: "k".into(),
+            llm_style: String::new(),
+            llm_greeting: String::new(),
+            llm_failure: String::new(),
+            llm_system_prompt: String::new(),
+            llm_params: Default::default(),
+            tts_vendor: "minimax".into(),
+            tts_params: Default::default(),
+            mllm_vendor: String::new(),  // ← didn't pick MLLM this run
+            mllm_url: String::new(),
+            mllm_api_key: String::new(),
+            mllm_greeting_message: String::new(),
+            mllm_params: Default::default(),
+            avatar_vendor: String::new(),
+            avatar_params: Default::default(),
+            avatar_id_value: String::new(),
+            enable_rtm: true,
+            enable_sal: true,
+            data_channel: "rtm".into(),
+            enable_words: true,
+            vad_silence_ms: 800,
+        };
+        super::apply_to_doc(&mut doc, &answers);
+        let out = doc.to_string();
+        // Top-level comment preserved.
+        assert!(out.contains("# my custom comment"), "comment lost:\n{}", out);
+        // Channel updated.
+        assert!(out.contains("new-channel"), "channel not updated:\n{}", out);
+        // Parked MLLM block intact.
+        assert!(out.contains("[agent.mllm]"), "MLLM block dropped:\n{}", out);
+        assert!(out.contains("sk-keep-me"), "MLLM api_key dropped:\n{}", out);
+        // Pipeline now explicitly set.
+        assert!(out.contains(r#"pipeline = "cascaded""#), "pipeline not written:\n{}", out);
     }
 
     #[test]

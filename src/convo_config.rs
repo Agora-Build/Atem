@@ -5,9 +5,34 @@
 //! `serde_json::Value` later) so atem does not need to know every vendor's shape.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// Deserialize a user-id field that's either a TOML string or a TOML
+/// integer. Both land as `Option<String>` because the same field
+/// holds either int-uid (`42`) or string-account (`"alice"`) values
+/// — atem's `RtcAccount::parse` classifies at use time.
+///
+/// Lets users write `rtc_user_id = 42` (no quotes) for the common
+/// numeric case, while still accepting `"alice"` and the `"s/1232"`
+/// escape-hatch for forced-string mode.
+fn de_user_id<'de, D>(d: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrString {
+        Int(i64),
+        Str(String),
+    }
+    let v = Option::<IntOrString>::deserialize(d)?;
+    Ok(v.map(|x| match x {
+        IntOrString::Int(n) => n.to_string(),
+        IntOrString::Str(s) => s,
+    }))
+}
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -72,7 +97,10 @@ pub struct AtemSection {
 
     /// Human's RTC uid. "0" or omitted → server-assigned. Overridable
     /// via `--rtc-user-id`. Forwarded to ConvoAI's /join as
-    /// `properties.remote_rtc_uids[0]`.
+    /// `properties.remote_rtc_uids[0]`. TOML accepts either a string
+    /// (`"alice"`) or a bare int (`42`); both land as `String` so a
+    /// single field can hold either int-uid or string-account values.
+    #[serde(deserialize_with = "de_user_id", default)]
     pub rtc_user_id: Option<String>,
 
     /// Route through Agora's HIPAA-compliant `/hipaa/api/...` endpoint.
@@ -92,6 +120,16 @@ pub struct AtemSection {
     /// avatar is opt-in, not opt-out, so fleet launches don't burn
     /// avatar minutes by accident.
     pub enable_avatar: Option<bool>,
+
+    /// Which agent pipeline is active in this file:
+    ///   "cascaded" — use `[agent.asr]` + `[agent.llm]` + `[agent.tts]`
+    ///   "mllm"     — use `[agent.mllm]` (replaces the cascaded trio)
+    /// Lets both pipelines live in the same file as parked configs;
+    /// `pipeline` selects which atem actually forwards to ConvoAI.
+    /// When omitted, atem auto-detects from which blocks are present;
+    /// if both are configured, an explicit value is required.
+    /// Term matches Agora's API docs / industry usage.
+    pub pipeline: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -154,7 +192,9 @@ impl ConvoConfig {
 pub struct AgentConfig {
     /// Agent's RTC uid (the AI agent that joins the channel).
     /// Required (CLI `--agent-user-id` overrides). Forwarded to
-    /// ConvoAI's /join as `properties.agent_rtc_uid`.
+    /// ConvoAI's /join as `properties.agent_rtc_uid`. Accepts bare
+    /// int or string in TOML — same parsing as `[atem].rtc_user_id`.
+    #[serde(deserialize_with = "de_user_id", default)]
     pub user_id: Option<String>,
 
     /// Server-side safety timeout in seconds. Forwarded as
@@ -171,6 +211,10 @@ pub struct AgentConfig {
     pub llm: Option<LlmConfig>,
     pub asr: Option<ServiceConfig>,
     pub tts: Option<ServiceConfig>,
+    /// `[agent.mllm]` — multimodal LLM (OpenAI Realtime, Gemini Live,
+    /// etc.). When configured, replaces the ASR + LLM + TTS pipeline:
+    /// the model takes audio in and emits audio out end-to-end.
+    pub mllm: Option<ServiceConfig>,
     pub avatar: Option<ServiceConfig>,
 }
 
@@ -196,6 +240,9 @@ pub struct SystemMessage {
 #[serde(default)]
 pub struct ServiceConfig {
     pub vendor: Option<String>,
+    pub url: Option<String>,
+    pub api_key: Option<String>,
+    pub greeting_message: Option<String>,
     pub language: Option<String>,
     pub avatar_id: Option<String>,
     pub params: BTreeMap<String, toml::Value>,
@@ -239,6 +286,11 @@ pub struct JoinArgs<'a> {
     /// the config-level `preset` / `presets[0]`. Usually comes from the
     /// browser dropdown selection via /api/convo/start's body.
     pub preset:         Option<&'a str>,
+    /// Active pipeline. atem only forwards the matching provider
+    /// blocks to ConvoAI's /join: segmented sends `[agent.asr/llm/tts]`,
+    /// mllm sends `[agent.mllm]`. The other set stays parked in the
+    /// file but is omitted from the request.
+    pub pipeline:       Pipeline,
     /// RTC encryption mode (1..=8). See Agora ConvoAI docs for the integer
     /// table. When `encryption_key` is set and `encryption_mode` is `None`,
     /// the agent uses Agora's default (AES_128_GCM).
@@ -280,15 +332,28 @@ impl ConvoConfig {
         // dropdown) > [agent].preset (comma-separated string).
         let effective_preset: Option<&str> = args.preset
             .or_else(|| self.agent.as_ref().and_then(|a| a.preset.as_deref()));
+        // Emit only the blocks belonging to the active pipeline. The
+        // parked pipeline stays in convo.toml but doesn't go to Agora.
         if let Some(agent) = &self.agent {
-            if let Some(llm) = &agent.llm {
-                props.insert("llm".into(), llm_to_json(llm));
-            }
-            if let Some(asr) = &agent.asr {
-                props.insert("asr".into(), service_to_json(asr));
-            }
-            if let Some(tts) = &agent.tts {
-                props.insert("tts".into(), service_to_json(tts));
+            match args.pipeline {
+                Pipeline::Cascaded => {
+                    if let Some(llm) = &agent.llm { props.insert("llm".into(), llm_to_json(llm)); }
+                    if let Some(asr) = &agent.asr { props.insert("asr".into(), service_to_json(asr)); }
+                    if let Some(tts) = &agent.tts { props.insert("tts".into(), service_to_json(tts)); }
+                }
+                Pipeline::Mllm => {
+                    if let Some(mllm) = &agent.mllm {
+                        let mut v = service_to_json(mllm);
+                        if let Value::Object(map) = &mut v {
+                            map.entry("enable").or_insert(json!(true));
+                            map.entry("input_modalities")
+                                .or_insert(json!(["audio"]));
+                            map.entry("output_modalities")
+                                .or_insert(json!(["text", "audio"]));
+                        }
+                        props.insert("mllm".into(), v);
+                    }
+                }
             }
         }
 
@@ -446,9 +511,12 @@ fn llm_to_json(c: &LlmConfig) -> Value {
 
 fn service_to_json(c: &ServiceConfig) -> Value {
     let mut m = Map::new();
-    if let Some(v) = &c.vendor    { m.insert("vendor".into(), json!(v)); }
-    if let Some(v) = &c.language  { m.insert("language".into(), json!(v)); }
-    if let Some(v) = &c.avatar_id { m.insert("avatar_id".into(), json!(v)); }
+    if let Some(v) = &c.vendor           { m.insert("vendor".into(), json!(v)); }
+    if let Some(v) = &c.url              { m.insert("url".into(), json!(v)); }
+    if let Some(v) = &c.api_key          { m.insert("api_key".into(), json!(v)); }
+    if let Some(v) = &c.greeting_message { m.insert("greeting_message".into(), json!(v)); }
+    if let Some(v) = &c.language         { m.insert("language".into(), json!(v)); }
+    if let Some(v) = &c.avatar_id        { m.insert("avatar_id".into(), json!(v)); }
     if !c.params.is_empty() {
         m.insert("params".into(), toml_map_to_json(&c.params));
     }
@@ -531,6 +599,26 @@ pub struct ResolvedConfig {
     /// `--background` uses it directly to gate the avatar block in
     /// the /join body.
     pub enable_avatar:     bool,
+    /// Resolved active pipeline: `"cascaded"` (uses `[agent.asr/llm/tts]`)
+    /// or `"mllm"` (uses `[agent.mllm]`). Driven by `[atem].pipeline`
+    /// when set, otherwise auto-detected from which provider blocks
+    /// are present.
+    pub pipeline:          Pipeline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pipeline {
+    /// `[agent.asr]` + `[agent.llm]` + `[agent.tts]` (or a preset).
+    /// Matches Agora's API-docs term ("cascaded pipeline").
+    Cascaded,
+    /// `[agent.mllm]` — multimodal end-to-end model.
+    Mllm,
+}
+
+impl Pipeline {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Cascaded => "cascaded", Self::Mllm => "mllm" }
+    }
 }
 
 /// Public display fields from `[agent.avatar]`. Excludes `params`,
@@ -572,7 +660,35 @@ impl ConvoConfig {
             vendor:    av.vendor.clone(),
             avatar_id: av.avatar_id.clone(),
         });
-        let enc = atem.encryption.unwrap_or_default();
+        let enc = atem.encryption.clone().unwrap_or_default();
+        // Pipeline resolution:
+        //   * explicit [atem].pipeline wins
+        //   * otherwise auto-detect by which blocks are configured
+        //   * if both segmented and mllm are present without an
+        //     explicit pipeline, refuse to guess — error
+        let has_seg  = agent.map(|a| a.asr.is_some() || a.llm.is_some() || a.tts.is_some()).unwrap_or(false);
+        let has_mllm = agent.and_then(|a| a.mllm.as_ref()).is_some();
+        let pipeline = match atem.pipeline.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            // Accept both "cascaded" (preferred, matches Agora's API
+            // docs) and "cascade" / "chained" / "segmented" (synonyms
+            // people coming from different docs may type).
+            Some(s) if s == "cascaded" || s == "cascade"
+                    || s == "chained"  || s == "segmented" => Pipeline::Cascaded,
+            Some(s) if s == "mllm" => Pipeline::Mllm,
+            Some(other) => anyhow::bail!(
+                "[atem].pipeline = {:?} is not one of \"cascaded\", \"mllm\"",
+                other,
+            ),
+            None => match (has_seg, has_mllm) {
+                (false, true) => Pipeline::Mllm,
+                (true,  false) | (false, false) => Pipeline::Cascaded,
+                (true,  true) => anyhow::bail!(
+                    "Both [agent.mllm] and [agent.asr/llm/tts] are configured; \
+                     set `[atem].pipeline = \"cascaded\"` or `\"mllm\"` to pick \
+                     which one is active",
+                ),
+            },
+        };
         Ok(ResolvedConfig {
             channel,
             rtc_user_id,
@@ -587,6 +703,7 @@ impl ConvoConfig {
             encryption_key:  enc.key,
             encryption_salt: enc.salt,
             enable_avatar:   atem.enable_avatar.unwrap_or(false),
+            pipeline,
         })
     }
 }
@@ -598,6 +715,36 @@ mod tests {
 
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    #[test]
+    fn user_id_fields_accept_bare_int_in_toml() {
+        // `rtc_user_id = 42` (no quotes) and `user_id = 1001` should
+        // both parse — atem coerces ints to their string form so the
+        // same field can also hold non-numeric account names later.
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel     = "c"
+            rtc_user_id = 42
+            [agent]
+            user_id = 1001
+        "#).unwrap();
+        assert_eq!(cfg.atem.as_ref().unwrap().rtc_user_id.as_deref(), Some("42"));
+        assert_eq!(cfg.agent.as_ref().unwrap().user_id.as_deref(), Some("1001"));
+    }
+
+    #[test]
+    fn user_id_fields_accept_quoted_string_in_toml() {
+        // The string form still works, including non-numeric accounts.
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel     = "c"
+            rtc_user_id = "alice2"
+            [agent]
+            user_id = "s/1232"
+        "#).unwrap();
+        assert_eq!(cfg.atem.as_ref().unwrap().rtc_user_id.as_deref(), Some("alice2"));
+        assert_eq!(cfg.agent.as_ref().unwrap().user_id.as_deref(), Some("s/1232"));
     }
 
     #[test]
@@ -747,6 +894,7 @@ mod tests {
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
 
         // Top-level
@@ -806,6 +954,7 @@ mod tests {
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert!(body["properties"].get("avatar").is_none());
     }
@@ -858,6 +1007,7 @@ mod tests {
             encryption_salt: Some("c2FsdC1iYXNlNjQ="),
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         let rtc = &body["properties"]["rtc"];
         assert_eq!(rtc["encryption_mode"], 8);
@@ -882,6 +1032,7 @@ mod tests {
             encryption_salt: Some("c2FsdC1iYXNlNjQ="),
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert!(body["properties"].get("rtc").is_none());
     }
@@ -901,6 +1052,7 @@ mod tests {
             encryption_mode: None, encryption_key: None, encryption_salt: None,
             geofence_area: None,
             enable_dump: true,
+            pipeline: Pipeline::Cascaded,
         });
         assert_eq!(body["properties"]["parameters"]["enable_dump"], true);
     }
@@ -928,10 +1080,78 @@ mod tests {
             encryption_mode: None, encryption_key: None, encryption_salt: None,
             geofence_area: None,
             enable_dump: true,
+            pipeline: Pipeline::Cascaded,
         });
         let p = &body["properties"]["parameters"];
         assert_eq!(p["audio_scenario"], "default");
         assert_eq!(p["enable_dump"], true);
+    }
+
+    #[test]
+    fn mllm_pipeline_emits_only_mllm_block() {
+        let toml_str = r#"
+            [agent]
+            user_id = "1001"
+
+            [agent.mllm]
+            vendor = "openai"
+
+            [agent.mllm.params]
+            api_key = "sk-x"
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
+            pipeline: Pipeline::Mllm,
+        });
+        let props = &body["properties"];
+        assert_eq!(props["mllm"]["vendor"], "openai");
+        assert_eq!(props["mllm"]["enable"], true,
+            "mllm block must include `enable: true` so Agora routes to the MLLM validator: {}", body);
+        assert_eq!(props["mllm"]["input_modalities"], json!(["audio"]),
+            "mllm input_modalities default must include audio so user voice flows in: {}", body);
+        assert_eq!(props["mllm"]["output_modalities"], json!(["text", "audio"]),
+            "mllm output_modalities default must include audio or the agent goes silent: {}", body);
+        assert!(props.get("llm").is_none(), "mllm path should not emit llm: {}", body);
+        assert!(props.get("asr").is_none(), "mllm path should not emit asr: {}", body);
+        assert!(props.get("tts").is_none(), "mllm path should not emit tts: {}", body);
+    }
+
+    #[test]
+    fn cascaded_pipeline_does_not_emit_mllm_block() {
+        // Counterpart: ensure cascaded mode never accidentally emits
+        // the mllm-mode workaround stub (or a real mllm block).
+        let toml_str = r#"
+            [agent]
+            user_id = "1001"
+            preset  = "test"
+
+            [agent.mllm]
+            vendor = "openai"
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
+            pipeline: Pipeline::Cascaded,  // ← parked mllm should be ignored
+        });
+        let props = &body["properties"];
+        assert!(props.get("mllm").is_none(), "cascaded path should not emit mllm: {}", body);
     }
 
     #[test]
@@ -950,6 +1170,7 @@ mod tests {
             encryption_salt: None,
             geofence_area:   Some("ASIA"),
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert_eq!(body["properties"]["geofence"]["area"], "ASIA");
     }
@@ -971,6 +1192,7 @@ mod tests {
                 encryption_salt: None,
                 geofence_area:   area,
                 enable_dump: false,
+                pipeline: Pipeline::Cascaded,
             });
             assert!(body["properties"].get("geofence").is_none(),
                 "geofence should be absent for area={:?}", area);
@@ -997,6 +1219,7 @@ mod tests {
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert_eq!(body["preset"], "from_runtime");
     }
@@ -1024,6 +1247,7 @@ mod tests {
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"], true);
@@ -1060,6 +1284,7 @@ api_key = "secret"
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"],                 true);
@@ -1093,6 +1318,7 @@ avatar_id = "abc"
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert!(body["properties"].get("avatar").is_none());
     }
@@ -1121,6 +1347,7 @@ avatar_id = "abc"
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         let av = &body["properties"]["avatar"];
         assert_eq!(av["enable"], true);
@@ -1157,6 +1384,7 @@ agora_app_cert = "<SECRET>"
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         let ap = &body["properties"]["avatar"]["params"];
         assert_eq!(ap["agora_appid"],   "54faa34804aa4411a5a1c5f81a2a95b3");
@@ -1231,6 +1459,7 @@ agora_token = "007user"
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert_eq!(body["properties"]["avatar"]["params"]["agora_token"], "007user");
     }
@@ -1261,6 +1490,7 @@ agora_uid = "explicit_from_toml"
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert_eq!(body["properties"]["avatar"]["params"]["agora_uid"],
                    "explicit_from_toml");
@@ -1307,6 +1537,7 @@ validate_asr_result_timestamp = false
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         let props = &body["properties"];
         assert_eq!(props["advanced_features"]["enable_rtm"],  true);
@@ -1342,6 +1573,7 @@ validate_asr_result_timestamp = false
             encryption_salt: None,
             geofence_area: None,
             enable_dump: false,
+            pipeline: Pipeline::Cascaded,
         });
         assert_eq!(body["preset"], "first,second");
     }

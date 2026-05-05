@@ -528,6 +528,7 @@ async fn run_background(
         avatar_token:   avatar_token.as_deref(),
         // Background mode: no UI, use config-level preset as-is.
         preset: None,
+        pipeline: resolved.pipeline,
         // Encryption / geofence: read from convo.toml. mode=0 → no
         // encryption block emitted. geofence empty/"GLOBAL" → no fence.
         encryption_mode: if resolved.encryption_mode > 0 { Some(resolved.encryption_mode) } else { None },
@@ -766,6 +767,7 @@ async fn handle_connection(
                 avatar_channel: avatar_channel.as_deref(),
                 avatar_token:   avatar_token.as_deref(),
                 preset: preset_override.as_deref(),
+                pipeline: resolved.pipeline,
                 encryption_mode: enc_mode,
                 encryption_key:  enc_key.as_deref(),
                 encryption_salt: enc_salt.as_deref(),
@@ -987,7 +989,7 @@ fn build_html_page(app_id: &str, resolved: &ResolvedConfig, attach_mode: bool) -
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>atem serv convo</title>
+<title>Hello, Agora Convo AI</title>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; }}
@@ -2286,6 +2288,7 @@ mod tests {
             encryption_key:    "hunter2".into(),
             encryption_salt:   "c2FsdC1iYXNlNjQ=".into(),
             enable_avatar:     true,
+            pipeline:          crate::convo_config::Pipeline::Cascaded,
         };
         let html = build_html_page("app", &resolved, false);
         assert!(html.contains("const DEFAULT_HIPAA    = true;"),
@@ -2305,6 +2308,7 @@ mod tests {
             hipaa: false, geofence: String::new(),
             encryption_mode: 0, encryption_key: String::new(), encryption_salt: String::new(),
             enable_avatar: false,
+            pipeline: crate::convo_config::Pipeline::Cascaded,
         };
         let off = build_html_page("a", &resolved, false);
         let on  = build_html_page("a", &resolved, true);
@@ -2409,6 +2413,7 @@ mod tests {
             encryption_key:    String::new(),
             encryption_salt:   String::new(),
             enable_avatar:     false,
+            pipeline:          crate::convo_config::Pipeline::Cascaded,
         };
         let html = build_html_page("app-xx", &resolved, false);
         assert!(html.contains("/vendor/conversational-ai-api.js"));
@@ -2438,6 +2443,7 @@ mod tests {
             encryption_key:    String::new(),
             encryption_salt:   String::new(),
             enable_avatar:     false,
+            pipeline:          crate::convo_config::Pipeline::Cascaded,
         };
         let html = build_html_page("app", &resolved, false);
         // JSON-encoded array literal must appear in the page.
