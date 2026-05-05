@@ -324,6 +324,10 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
     pre-fill the web form, etc.). Fields:
     - `channel` (RTC channel name; auto-generated when omitted)
     - `rtc_user_id` (human's RTC uid; "0" = server-assigned)
+    - `pipeline` — `"cascaded"` | `"mllm"`. Picks which provider
+      block goes into `/join` when both are parked in the file.
+      Auto-detected from which block is present when omitted; required
+      when both `[agent.asr/llm/tts]` and `[agent.mllm]` exist.
     - `hipaa` — switches ConvoAI URL prefix to `/hipaa/api/...`
     - `geofence` — GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
     - `enable_avatar` — opt in to `[agent.avatar]` this session
@@ -334,7 +338,14 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
     - `preset` (comma-separated string; UI splits to checkboxes,
       joins selections back as `properties.preset`)
     - `[agent.llm]` / `[agent.asr]` / `[agent.tts]` / `[agent.avatar]`
-      — provider blocks, forwarded under `properties.<svc>`
+      — cascaded provider blocks, forwarded under `properties.<svc>`
+    - `[agent.mllm]` — single multimodal model that replaces
+      asr+llm+tts. Per Agora's MLLM schema: `vendor`, `url`,
+      `api_key`, `greeting_message` at the top of the block; vendor
+      knobs (`model`, `voice`, `instructions`, …) under `[…params]`.
+      atem auto-injects `enable: true`, `input_modalities: ["audio"]`,
+      and `output_modalities: ["text", "audio"]` so the agent emits
+      audio.
   - Pass-through tables — `[advanced_features]`, `[vad]`, `[sal]`,
     `[parameters]` — atem forwards verbatim as `properties.<key>`.
 
@@ -364,8 +375,15 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   poller, `—` until the first poll). `kill` and `attach` accept either
   the literal id or the index from `list`.
 - **ConvoAI Config Wizard (`atem config convo`)**: Interactive terminal wizard
-  that generates `~/.config/atem/convo.toml`. Supports preset-based or custom
-  configuration with provider selection for ASR (10 vendors), LLM (9), TTS (12),
-  MLLM (3), and Avatar (3). `--validate` performs read-only config validation
-  (checks required fields, large-integer precision issues, vendor completeness).
-  Always loads existing config as defaults — re-runs change only what's needed.
+  that generates `~/.config/atem/convo.toml`. Flow: Channel & User → Agent →
+  Preset (empty = skip) → Add Custom override? → Pipeline (Cascaded | MLLM)
+  → Avatar. Preset and Custom stack — preset sets defaults, explicit blocks
+  override per-field. Pipeline pick is single-select; the parked one stays in
+  the file (`[atem].pipeline` switches between them at runtime). Provider
+  selection: ASR (10 vendors), LLM (9), TTS (12), MLLM (4 — OpenAI Realtime
+  default `gpt-realtime`, Gemini Live, Vertex AI Gemini Live, xAI Grok),
+  Avatar (3). MLLM `api_key`/`url`/`greeting_message` written at the top of
+  `[agent.mllm]`; `instructions`/`model`/`voice` go in `[agent.mllm.params]`.
+  Pre-fills from existing TOML on re-run; `.bak` rotation keeps last 5
+  generations. `--validate` performs read-only schema checks (required
+  fields, large-integer precision issues, vendor completeness).

@@ -129,10 +129,9 @@ atem config convo --validate            # Validate ConvoAI config without modify
 atem config convo --config <PATH>       # Use a specific config file
 ```
 
-The `atem config convo` wizard supports:
-- **Segmented pipeline**: pick ASR + LLM + TTS providers individually (10 ASR, 9 LLM, 12 TTS vendors)
-- **Multimodal LLM**: OpenAI Realtime, Google Gemini Live (replaces ASR+LLM+TTS)
-- **Presets**: use Agora-managed preset bundles, optionally override providers
+The `atem config convo` wizard walks you through Channel & User → Agent → Preset (empty = skip) → Add Custom override? → Pipeline → Avatar. Preset and Custom stack: preset sets defaults, explicit blocks override per-field. Pipeline selects one of:
+- **Cascaded** (ASR + LLM + TTS): 10 ASR, 9 LLM, 12 TTS vendors
+- **Multimodal LLM**: OpenAI Realtime (`gpt-realtime`), Google Gemini Live, xAI Grok Realtime — single model handles voice in/out
 - **Avatar**: Akool, LiveAvatar, Anam
 
 `convo.toml` is structured into two atem-managed top-level sections plus the Agora pass-through tables. The web UI pre-fills form fields from `[atem]`; `--background` reads them directly.
@@ -141,6 +140,7 @@ The `atem config convo` wizard supports:
 [atem]                       # atem's runtime control surface
 channel       = "..."        # auto-generated when omitted
 rtc_user_id   = "0"          # human's RTC uid
+pipeline      = "cascaded"   # "cascaded" | "mllm" — picks which block goes to /join
 hipaa         = false        # route via /hipaa/api/... (Agora support must enable)
 geofence      = "GLOBAL"     # GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
 enable_avatar = false        # opt in to use [agent.avatar] this session
@@ -155,9 +155,10 @@ user_id           = "1001"
 idle_timeout_secs = 120
 preset            = "preset_a, preset_b"   # comma-separated; UI splits into checkboxes
 
-[agent.llm]                  # provider configs (forwarded under properties.<svc>)
+[agent.llm]                  # cascaded providers (forwarded under properties.<svc>)
 [agent.asr]
 [agent.tts]
+[agent.mllm]                 # OR a single multimodal model — replaces asr+llm+tts
 [agent.avatar]
 
 [advanced_features]          # pass-through (forwarded verbatim to Agora)

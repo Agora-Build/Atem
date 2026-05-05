@@ -20,6 +20,12 @@
 
 rtc_user_id = "0"           # human's RTC uid ("0" = server-assigned)
 
+# Active pipeline. Either pipeline can be parked in this file; this
+# field decides which one /join receives. Auto-detected when omitted
+# (cascaded if [agent.asr/llm/tts] present, mllm if [agent.mllm]
+# present); set explicitly when both are parked.
+pipeline = "cascaded"        # "cascaded" | "mllm"
+
 # Route through Agora's /hipaa/api/conversational-ai-agent/... endpoint
 # instead of /api/.... Requires Agora Support to enable HIPAA on the
 # project first.
@@ -128,6 +134,28 @@ emotion  = "happy"
 
 [agent.tts.params.audio_setting]
 sample_rate = 16000
+
+# ── MLLM (alternative to ASR + LLM + TTS) ───────────────────────────
+# A single multimodal model that takes audio in and produces audio
+# out. Activate by setting [atem].pipeline = "mllm" above. atem
+# auto-injects `enable = true`, `input_modalities = ["audio"]`, and
+# `output_modalities = ["text", "audio"]` so the agent actually
+# emits audio.
+#
+# api_key, url, and greeting_message live at the TOP of [agent.mllm]
+# per Agora's MLLM schema. Vendor-specific knobs (model, voice,
+# instructions, …) go under [agent.mllm.params].
+#
+# [agent.mllm]
+# vendor           = "openai"
+# url              = "wss://api.openai.com/v1/realtime"
+# api_key          = "<openai api key>"
+# greeting_message = "Hello, I am ready to help."
+#
+# [agent.mllm.params]
+# model        = "gpt-realtime"
+# voice        = "alloy"          # alloy | echo | fable | onyx | nova | shimmer
+# instructions = "You are a Conversational AI Agent, developed by Agora."
 
 # ── Pass-through tables (forwarded verbatim to Agora /join) ─────────
 # Required for live transcription. Without `enable_rtm = true`,
