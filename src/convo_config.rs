@@ -130,6 +130,13 @@ pub struct AtemSection {
     /// if both are configured, an explicit value is required.
     /// Term matches Agora's API docs / industry usage.
     pub pipeline: Option<String>,
+
+    /// Background-mode status poll cadence, in seconds. The daemon
+    /// hits Agora's `GET /agents/{id}` every N seconds and writes the
+    /// result back to its registry JSON so `atem serv list` can show
+    /// STATUS without a network call. Default 60. Lower for faster
+    /// fleet visibility (40 daemons at 20s ≈ 2 calls/sec).
+    pub poll_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -604,6 +611,10 @@ pub struct ResolvedConfig {
     /// when set, otherwise auto-detected from which provider blocks
     /// are present.
     pub pipeline:          Pipeline,
+    /// Background-mode status poll cadence in seconds. Default 60,
+    /// floored to 5 to avoid hammering the API. Foreground mode
+    /// ignores this — there's no poller in that path.
+    pub poll_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,6 +715,9 @@ impl ConvoConfig {
             encryption_salt: enc.salt,
             enable_avatar:   atem.enable_avatar.unwrap_or(false),
             pipeline,
+            poll_interval_secs: atem.poll_interval_secs
+                .unwrap_or(60)
+                .max(5),
         })
     }
 }
@@ -825,6 +839,33 @@ mod tests {
         assert_eq!(r.encryption_mode, 0);
         assert_eq!(r.encryption_key, "");
         assert_eq!(r.encryption_salt, "");
+        assert_eq!(r.poll_interval_secs, 60, "default poll cadence is 60s");
+    }
+
+    #[test]
+    fn resolve_honors_poll_interval_secs_with_floor() {
+        // User-set value passes through verbatim above the floor.
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel = "c"
+            poll_interval_secs = 20
+            [agent]
+            user_id = "1001"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
+        assert_eq!(r.poll_interval_secs, 20);
+
+        // Below the floor (5) gets clamped up — no daemon should
+        // hammer the API every 1s even if the operator typos that.
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel = "c"
+            poll_interval_secs = 1
+            [agent]
+            user_id = "1001"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
+        assert_eq!(r.poll_interval_secs, 5, "values below 5 are floored");
     }
 
     #[test]

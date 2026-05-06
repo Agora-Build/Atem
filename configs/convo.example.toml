@@ -26,6 +26,14 @@ rtc_user_id = "0"           # human's RTC uid ("0" = server-assigned)
 # present); set explicitly when both are parked.
 pipeline = "cascaded"        # "cascaded" | "mllm"
 
+# Background-mode status poll cadence (seconds). Each `--background`
+# daemon hits Agora's GET /agents/{id} every N seconds and writes
+# the result to its registry JSON so `atem serv list` shows STATUS
+# without a network call. Default 60. Lower for faster fleet
+# visibility (40 daemons at 20s ≈ 2 calls/sec sustained, well within
+# rate limits). Floored to 5. Foreground mode ignores this field.
+# poll_interval_secs = 60
+
 # Route through Agora's /hipaa/api/conversational-ai-agent/... endpoint
 # instead of /api/.... Requires Agora Support to enable HIPAA on the
 # project first.

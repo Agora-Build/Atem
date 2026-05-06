@@ -305,10 +305,11 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   pattern): parent POSTs `/join`, registers `{id, pid, kind="convo",
   channel}` in `~/.config/atem/servers/<channel>.json`, exits. The
   daemon catches SIGINT + SIGTERM (so `atem serv kill` works) and
-  POSTs `/leave` before exiting. A 60s tokio task on the daemon polls
-  `GET /agents/{id}` and writes `last_status` + `last_checked_at`
-  into the registry JSON — `atem serv list` reads the cached value
-  with no network round-trip. The daemon log (`<channel>.log`) contains
+  POSTs `/leave` before exiting. A tokio task on the daemon polls
+  `GET /agents/{id}` every `[atem].poll_interval_secs` (default 60,
+  floored to 5) and writes `last_status` + `last_checked_at` into
+  the registry JSON — `atem serv list` reads the cached value with
+  no network round-trip. The daemon log (`<channel>.log`) contains
   the `/join` URL (HIPAA path when applicable) and the request body
   with secrets masked (api keys, tokens, encryption_key, certs).
 

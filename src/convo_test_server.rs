@@ -445,12 +445,14 @@ fn spawn_status_poller(
     agent_id: String,
     agent_token: String,
     hipaa: bool,
+    interval_secs: u64,
 ) {
     tokio::spawn(async move {
         let url = convoai_url(hipaa, &format!("v2/projects/{}/agents/{}", app_id, agent_id));
         let client = reqwest::Client::new();
+        let interval = std::time::Duration::from_secs(interval_secs);
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(interval).await;
             let status = match client
                 .get(&url)
                 .header("Authorization", format!("agora token={}", agent_token))
@@ -584,15 +586,17 @@ async fn run_background(
     println!("  name:      {}", name);
     println!("\nAgent running. SIGTERM (atem serv kill) or Ctrl+C to stop.");
 
-    // Spawn a 60s status poller that updates the registry JSON. Lets
+    // Spawn a status poller that updates the registry JSON. Lets
     // `atem serv list` show whether each agent is RUNNING/IDLE/STOPPED
     // without each list call having to make a network round-trip.
+    // Cadence comes from [atem].poll_interval_secs (default 60).
     spawn_status_poller(
         resolved.channel.clone(),
         app_id.to_string(),
         agent_id.clone(),
         agent_token.clone(),
         resolved.hipaa,
+        resolved.poll_interval_secs,
     );
 
     // Block until SIGINT or SIGTERM. The daemon process is reaped via
@@ -2299,6 +2303,7 @@ mod tests {
             encryption_salt:   "c2FsdC1iYXNlNjQ=".into(),
             enable_avatar:     true,
             pipeline:          crate::convo_config::Pipeline::Cascaded,
+            poll_interval_secs: 60,
         };
         let html = build_html_page("app", &resolved, false);
         assert!(html.contains("const DEFAULT_HIPAA    = true;"),
@@ -2319,6 +2324,7 @@ mod tests {
             encryption_mode: 0, encryption_key: String::new(), encryption_salt: String::new(),
             enable_avatar: false,
             pipeline: crate::convo_config::Pipeline::Cascaded,
+            poll_interval_secs: 60,
         };
         let off = build_html_page("a", &resolved, false);
         let on  = build_html_page("a", &resolved, true);
@@ -2424,6 +2430,7 @@ mod tests {
             encryption_salt:   String::new(),
             enable_avatar:     false,
             pipeline:          crate::convo_config::Pipeline::Cascaded,
+            poll_interval_secs: 60,
         };
         let html = build_html_page("app-xx", &resolved, false);
         assert!(html.contains("/vendor/conversational-ai-api.js"));
@@ -2454,6 +2461,7 @@ mod tests {
             encryption_salt:   String::new(),
             enable_avatar:     false,
             pipeline:          crate::convo_config::Pipeline::Cascaded,
+            poll_interval_secs: 60,
         };
         let html = build_html_page("app", &resolved, false);
         // JSON-encoded array literal must appear in the page.
