@@ -29,6 +29,8 @@ mod agent_visualize;
 mod web_server;
 // RTC test server
 mod rtc_test_server;
+// Static-file HTTPS server (atem serv files)
+mod files_server;
 // Diagram hosting server
 mod diagram_server;
 // Local Agora webhook receiver + ngrok tunnel

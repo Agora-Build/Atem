@@ -42,6 +42,7 @@ ctrlc = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 agora_token = { git = "https://github.com/AgoraIO/Tools.git", subdirectory = "DynamicKey/AgoraDynamicKey/rust" }
 urlencoding = "2"
+pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
 
 [features]
 real_rtm = []

@@ -332,6 +332,39 @@ pub enum ServCommands {
         #[arg(long, hide = true)]
         _serv_daemon: bool,
     },
+    /// Serve a directory (or single file) over HTTPS. Markdown is
+    /// rendered to HTML by default; append `?raw=1` to any URL for
+    /// raw bytes. Useful for browsing AI-generated docs on a remote
+    /// machine.
+    #[command(after_help = "EXAMPLES:
+  # Foreground — print Local/Network/Custom URLs, open browser
+  atem serv files /home/me/docs
+
+  # Single file — serves the parent dir, URL points at the file
+  atem serv files /home/me/docs/spec.md
+
+  # Background daemon (port auto-picked when not given)
+  atem serv files /home/me/docs --background
+  atem serv list
+  atem serv kill files-<port>
+")]
+    Files {
+        /// Directory or single file to serve. A file path serves the
+        /// parent directory with the URL pointing at the file.
+        dir: std::path::PathBuf,
+        /// HTTPS port (0 = auto-pick — works for both foreground and --background).
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Don't auto-open the browser
+        #[arg(long)]
+        no_browser: bool,
+        /// Run as a background daemon
+        #[arg(long)]
+        background: bool,
+        /// Internal: marks this process as the detached daemon (hidden)
+        #[arg(long, hide = true)]
+        _serv_daemon: bool,
+    },
     /// Receive Agora webhooks locally; tunnels via ngrok by default.
     /// Prints each event to stdout and serves a live console at /.
     Webhooks {
@@ -998,6 +1031,22 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     _daemon: _serv_daemon,
                 };
                 crate::diagram_server::run_server(config).await
+            }
+            ServCommands::Files {
+                dir,
+                port,
+                no_browser,
+                background,
+                _serv_daemon,
+            } => {
+                let config = crate::files_server::ServeFilesConfig {
+                    dir,
+                    port,
+                    no_browser,
+                    background,
+                    _daemon: _serv_daemon,
+                };
+                crate::files_server::run_server(config).await
             }
             ServCommands::List => crate::rtc_test_server::cmd_list_servers(),
             ServCommands::Kill { id } => crate::rtc_test_server::cmd_kill_server(&id),
