@@ -197,7 +197,10 @@ jobs:
         run: |
           npm i -g wrangler
           VERSION="${GITHUB_REF_NAME}"
-          BUCKET="atem-releases"
+          # Shared releases bucket for all Agora-Build CLIs. dl.agora.build
+          # is the custom domain attached to it; per-project key prefix
+          # (`atem/…`, `stream-to-agora/…`) keeps them separate.
+          BUCKET="agora-build-releases"
 
           # Upload each platform tarball
           for f in dist/atem-*.tar.gz; do
