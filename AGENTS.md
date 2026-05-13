@@ -339,7 +339,13 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
     - `preset` (comma-separated string; UI splits to checkboxes,
       joins selections back as `properties.preset`)
     - `[agent.llm]` / `[agent.asr]` / `[agent.tts]` / `[agent.avatar]`
-      — cascaded provider blocks, forwarded under `properties.<svc>`
+      — cascaded provider blocks, forwarded under `properties.<svc>`.
+      `[agent.llm]` also accepts `[[agent.llm.mcp_servers]]` entries
+      ({`name`, `endpoint`, `transport`, `headers`, `allowed_tools`,
+      `timeout_ms`}) → `properties.llm.mcp_servers[]`. When any MCP
+      server is present atem auto-sets `advanced_features.enable_tools
+      = true` unless that field is pinned in `[advanced_features]`.
+      MCP is LLM-pipeline only — ignored in MLLM mode.
     - `[agent.mllm]` — single multimodal model that replaces
       asr+llm+tts. Per Agora's MLLM schema: `vendor`, `url`,
       `api_key`, `greeting_message` at the top of the block; vendor

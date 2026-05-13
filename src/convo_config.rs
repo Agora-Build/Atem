@@ -234,6 +234,12 @@ pub struct LlmConfig {
     pub failure_message: Option<String>,
     pub max_history: Option<u32>,
     pub system_messages: Vec<SystemMessage>,
+    /// MCP (Model Context Protocol) servers the agent may call tools
+    /// from. Forwarded as `properties.llm.mcp_servers`. When any are
+    /// configured, atem also sets `advanced_features.enable_tools =
+    /// true` unless that field is explicitly set in `[advanced_features]`.
+    /// MCP is an LLM-pipeline feature only — MLLM mode ignores this.
+    pub mcp_servers: Vec<McpServer>,
     pub params: BTreeMap<String, toml::Value>,
 }
 
@@ -241,6 +247,25 @@ pub struct LlmConfig {
 pub struct SystemMessage {
     pub role: String,
     pub content: String,
+}
+
+/// One MCP server entry under `[[agent.llm.mcp_servers]]`. Mirrors
+/// Agora's `properties.llm.mcp_servers[]` shape.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServer {
+    /// Unique id, ≤48 chars, English letters + digits only (Agora's rule).
+    pub name: String,
+    /// MCP server endpoint URL the agent talks to.
+    pub endpoint: String,
+    /// Transport protocol. Agora currently accepts `streamable_http`.
+    pub transport: Option<String>,
+    /// HTTP headers sent on every request to the MCP server (auth, etc.).
+    pub headers: BTreeMap<String, String>,
+    /// Tool allow-list. Empty → all tools; supports exact names + `*` wildcards.
+    pub allowed_tools: Vec<String>,
+    /// Per-request timeout (ms) for MCP calls.
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -433,8 +458,32 @@ impl ConvoConfig {
 
         // Pass-through top-level properties from convo.toml. Any sub-table
         // (e.g. [parameters.transcript]) is preserved as nested JSON.
-        if let Some(m) = &self.advanced_features {
-            props.insert("advanced_features".into(), map_to_json(m));
+        //
+        // MCP convenience: when the active LLM declares `mcp_servers`,
+        // the agent needs `advanced_features.enable_tools = true` or
+        // it won't actually call any tools. Auto-set it unless the
+        // user pinned the field themselves in [advanced_features].
+        let llm_has_mcp = matches!(args.pipeline, Pipeline::Cascaded)
+            && self.agent.as_ref()
+                .and_then(|a| a.llm.as_ref())
+                .map(|l| !l.mcp_servers.is_empty())
+                .unwrap_or(false);
+        match (&self.advanced_features, llm_has_mcp) {
+            (Some(m), true) => {
+                let mut j = match map_to_json(m) {
+                    Value::Object(o) => o,
+                    _ => Map::new(),
+                };
+                j.entry("enable_tools").or_insert(json!(true));
+                props.insert("advanced_features".into(), Value::Object(j));
+            }
+            (Some(m), false) => {
+                props.insert("advanced_features".into(), map_to_json(m));
+            }
+            (None, true) => {
+                props.insert("advanced_features".into(), json!({ "enable_tools": true }));
+            }
+            (None, false) => {}
         }
         if let Some(m) = &self.vad {
             props.insert("vad".into(), map_to_json(m));
@@ -510,9 +559,31 @@ fn llm_to_json(c: &LlmConfig) -> Value {
             .collect();
         m.insert("system_messages".into(), Value::Array(arr));
     }
+    if !c.mcp_servers.is_empty() {
+        let arr: Vec<Value> = c.mcp_servers.iter().map(mcp_server_to_json).collect();
+        m.insert("mcp_servers".into(), Value::Array(arr));
+    }
     if !c.params.is_empty() {
         m.insert("params".into(), toml_map_to_json(&c.params));
     }
+    Value::Object(m)
+}
+
+fn mcp_server_to_json(s: &McpServer) -> Value {
+    let mut m = Map::new();
+    m.insert("name".into(),     json!(s.name));
+    m.insert("endpoint".into(), json!(s.endpoint));
+    if let Some(t) = &s.transport { m.insert("transport".into(), json!(t)); }
+    if !s.headers.is_empty() {
+        let h: Map<String, Value> = s.headers.iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        m.insert("headers".into(), Value::Object(h));
+    }
+    if !s.allowed_tools.is_empty() {
+        m.insert("allowed_tools".into(), json!(s.allowed_tools));
+    }
+    if let Some(t) = s.timeout_ms { m.insert("timeout_ms".into(), json!(t)); }
     Value::Object(m)
 }
 
@@ -1589,6 +1660,115 @@ validate_asr_result_timestamp = false
         assert_eq!(props["parameters"]["data_channel"], "rtm");
         assert_eq!(props["parameters"]["transcript"]["enable_words"], true);
         assert_eq!(props["parameters"]["turn_detector"]["validate_asr_result_timestamp"], false);
+    }
+
+    #[test]
+    fn join_payload_emits_mcp_servers_under_llm_and_auto_enables_tools() {
+        let toml_str = r#"
+            [agent]
+            user_id = "1001"
+
+            [agent.llm]
+            url     = "https://api.openai.com/v1/chat/completions"
+            api_key = "sk-x"
+
+            [[agent.llm.mcp_servers]]
+            name          = "agora"
+            endpoint      = "https://mcp.agora.io"
+            transport     = "streamable_http"
+            allowed_tools = ["get_*", "list_projects"]
+            timeout_ms    = 30000
+
+            [agent.llm.mcp_servers.headers]
+            Authorization = "Bearer tkn-123"
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false,
+            avatar_user_id: "999",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None,
+            enable_dump: false,
+            pipeline: Pipeline::Cascaded,
+        });
+        let mcp = &body["properties"]["llm"]["mcp_servers"][0];
+        assert_eq!(mcp["name"], "agora");
+        assert_eq!(mcp["endpoint"], "https://mcp.agora.io");
+        assert_eq!(mcp["transport"], "streamable_http");
+        assert_eq!(mcp["allowed_tools"], json!(["get_*", "list_projects"]));
+        assert_eq!(mcp["timeout_ms"], 30000);
+        assert_eq!(mcp["headers"]["Authorization"], "Bearer tkn-123");
+        // enable_tools auto-set since no [advanced_features] in the file
+        assert_eq!(body["properties"]["advanced_features"]["enable_tools"], true);
+    }
+
+    #[test]
+    fn mcp_auto_enable_tools_does_not_clobber_explicit_value() {
+        let toml_str = r#"
+            [agent]
+            user_id = "1001"
+            [agent.llm]
+            url     = "https://x/v1/chat/completions"
+            api_key = "k"
+            [[agent.llm.mcp_servers]]
+            name     = "agora"
+            endpoint = "https://mcp.agora.io"
+            [advanced_features]
+            enable_tools = false
+            enable_rtm   = true
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false, avatar_user_id: "9",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None, enable_dump: false,
+            pipeline: Pipeline::Cascaded,
+        });
+        // Explicit false wins; rtm passthrough preserved.
+        assert_eq!(body["properties"]["advanced_features"]["enable_tools"], false);
+        assert_eq!(body["properties"]["advanced_features"]["enable_rtm"], true);
+    }
+
+    #[test]
+    fn mcp_servers_not_emitted_in_mllm_mode() {
+        // mcp_servers parked under [agent.llm] don't leak into an
+        // MLLM-mode body (no properties.llm there at all).
+        let toml_str = r#"
+            [atem]
+            pipeline = "mllm"
+            [agent]
+            user_id = "1001"
+            [agent.llm]
+            url     = "https://x/v1/chat/completions"
+            api_key = "k"
+            [[agent.llm.mcp_servers]]
+            name     = "agora"
+            endpoint = "https://mcp.agora.io"
+            [agent.mllm]
+            vendor = "openai"
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false, avatar_user_id: "9",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None, enable_dump: false,
+            pipeline: Pipeline::Mllm,
+        });
+        assert!(body["properties"].get("llm").is_none());
+        assert!(body["properties"].get("advanced_features").is_none(),
+            "no auto enable_tools in mllm mode: {}", body);
     }
 
     #[test]

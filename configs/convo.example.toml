@@ -112,6 +112,23 @@ content = "You are a helpful conversational AI agent."
 [agent.llm.params]
 model = "openai/gpt-oss-120b"
 
+# MCP (Model Context Protocol) servers — tools the agent can call.
+# Forwarded as properties.llm.mcp_servers[]. atem auto-sets
+# advanced_features.enable_tools = true when any MCP server is
+# configured (unless you pin that field in [advanced_features]).
+# MCP is an LLM-pipeline feature only — MLLM mode ignores it.
+# Repeat the [[…]] block for multiple servers.
+#
+# [[agent.llm.mcp_servers]]
+# name          = "agora"                  # ≤48 chars, letters + digits only
+# endpoint      = "https://mcp.agora.io"
+# transport     = "streamable_http"        # only value Agora accepts today
+# allowed_tools = []                       # [] = all tools; supports "name", "prefix_*"
+# timeout_ms    = 30000
+#
+# [agent.llm.mcp_servers.headers]          # sent on every MCP request (auth, etc.)
+# Authorization = "Bearer <token>"
+
 # ── ASR ──────────────────────────────────────────────────────────────
 [agent.asr]
 vendor   = "soniox"
