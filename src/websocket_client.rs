@@ -218,22 +218,11 @@ pub enum AstationMessage {
         file_path: Option<String>,
     },
 
-    /// Astation → Atem: Agora REST API credentials for use without env vars.
-    /// Priority: synced (this) > env vars > config file.
+    /// Astation → Atem: SSO tokens to use for BFF calls + paired session
+    /// resolution. Repurposed in 2026-05; previously carried customer_id/
+    /// customer_secret. Identical payload to the now-removed SsoTokenSync.
     #[serde(rename = "credentialSync")]
     CredentialSync {
-        #[serde(rename = "customer_id")]
-        customer_id: String,
-        #[serde(rename = "customer_secret")]
-        customer_secret: String,
-        /// Astation's persistent identity ID — store as astation_relay_code for future TUI auto-connect.
-        #[serde(rename = "astation_id", default)]
-        astation_id: Option<String>,
-    },
-
-    /// Astation → Atem: SSO tokens pushed after successful pairing or on Astation's own refresh.
-    #[serde(rename = "ssoTokenSync")]
-    SsoTokenSync {
         access_token: String,
         refresh_token: String,
         expires_at: u64,
@@ -1710,45 +1699,56 @@ mod tests {
     #[test]
     fn credential_sync_roundtrip() {
         let msg = AstationMessage::CredentialSync {
-            customer_id: "cid_abc123".into(),
-            customer_secret: "csec_xyz789".into(),
-            astation_id: Some("astation-test-uuid".into()),
+            access_token: "AT".to_string(),
+            refresh_token: "RT".to_string(),
+            expires_at: 1_700_000_000,
+            login_id: Some("u@a.io".to_string()),
+            astation_id: "ast-1".to_string(),
+            save_credentials: true,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"credentialSync""#));
-        assert!(json.contains("customer_id"));
-        assert!(json.contains("customer_secret"));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::CredentialSync {
-            customer_id,
-            customer_secret,
-            astation_id,
-        } = parsed
-        {
-            assert_eq!(customer_id, "cid_abc123");
-            assert_eq!(customer_secret, "csec_xyz789");
-            assert_eq!(astation_id, Some("astation-test-uuid".into()));
-        } else {
-            panic!("expected CredentialSync");
-        }
+        assert!(json.contains(r#""access_token":"AT""#));
+        assert!(json.contains(r#""refresh_token":"RT""#));
+        assert!(json.contains(r#""expires_at":1700000000"#));
+        assert!(json.contains(r#""login_id":"u@a.io""#));
+        assert!(json.contains(r#""astation_id":"ast-1""#));
+        assert!(json.contains(r#""save_credentials":true"#));
     }
 
     #[test]
     fn credential_sync_deserialize_from_json() {
-        // Old messages without astation_id should still parse (astation_id defaults to None)
-        let json = r#"{"type":"credentialSync","data":{"customer_id":"my_id","customer_secret":"my_secret"}}"#;
+        let json = r#"{"type":"credentialSync","data":{
+            "access_token":"AT","refresh_token":"RT","expires_at":1700000000,
+            "login_id":"u","astation_id":"ast-1","save_credentials":false
+        }}"#;
         let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::CredentialSync {
-            customer_id,
-            customer_secret,
-            astation_id,
-        } = msg
-        {
-            assert_eq!(customer_id, "my_id");
-            assert_eq!(customer_secret, "my_secret");
-            assert_eq!(astation_id, None);
-        } else {
-            panic!("expected CredentialSync");
+        match msg {
+            AstationMessage::CredentialSync {
+                access_token, refresh_token, expires_at, login_id,
+                astation_id, save_credentials,
+            } => {
+                assert_eq!(access_token, "AT");
+                assert_eq!(refresh_token, "RT");
+                assert_eq!(expires_at, 1_700_000_000);
+                assert_eq!(login_id.as_deref(), Some("u"));
+                assert_eq!(astation_id, "ast-1");
+                assert!(!save_credentials);
+            }
+            _ => panic!("expected CredentialSync"),
+        }
+    }
+
+    #[test]
+    fn credential_sync_without_login_id() {
+        let json = r#"{"type":"credentialSync","data":{
+            "access_token":"AT","refresh_token":"RT","expires_at":1,
+            "astation_id":"ast-1","save_credentials":true
+        }}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            AstationMessage::CredentialSync { login_id, .. } => assert!(login_id.is_none()),
+            _ => panic!("expected CredentialSync"),
         }
     }
 
@@ -2073,85 +2073,7 @@ mod tests {
         }
     }
 
-    // ── SsoTokenSync / PairSavePreference ────────────────────────────────
-
-    #[test]
-    fn sso_token_sync_roundtrip() {
-        let msg = AstationMessage::SsoTokenSync {
-            access_token: "acc_tok_123".into(),
-            refresh_token: "ref_tok_456".into(),
-            expires_at: 1776081626,
-            login_id: Some("52a4f560".into()),
-            astation_id: "astation-uuid-1".into(),
-            save_credentials: true,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"ssoTokenSync""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        match parsed {
-            AstationMessage::SsoTokenSync {
-                access_token,
-                refresh_token,
-                expires_at,
-                login_id,
-                astation_id,
-                save_credentials,
-            } => {
-                assert_eq!(access_token, "acc_tok_123");
-                assert_eq!(refresh_token, "ref_tok_456");
-                assert_eq!(expires_at, 1776081626);
-                assert_eq!(login_id.as_deref(), Some("52a4f560"));
-                assert_eq!(astation_id, "astation-uuid-1");
-                assert!(save_credentials);
-            }
-            _ => panic!("expected SsoTokenSync"),
-        }
-    }
-
-    #[test]
-    fn sso_token_sync_deserialize_from_json() {
-        let json = r#"{
-            "type": "ssoTokenSync",
-            "data": {
-                "access_token": "a",
-                "refresh_token": "r",
-                "expires_at": 100,
-                "login_id": "uid",
-                "astation_id": "ast-1",
-                "save_credentials": false
-            }
-        }"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            AstationMessage::SsoTokenSync { save_credentials, astation_id, .. } => {
-                assert!(!save_credentials);
-                assert_eq!(astation_id, "ast-1");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn sso_token_sync_without_login_id() {
-        // login_id is Option — should default to None when missing from payload.
-        let json = r#"{
-            "type": "ssoTokenSync",
-            "data": {
-                "access_token": "a",
-                "refresh_token": "r",
-                "expires_at": 100,
-                "astation_id": "ast-1",
-                "save_credentials": false
-            }
-        }"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            AstationMessage::SsoTokenSync { login_id, .. } => {
-                assert!(login_id.is_none());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
+    // ── PairSavePreference ────────────────────────────────
 
     #[test]
     fn pair_save_preference_roundtrip_true() {
