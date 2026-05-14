@@ -1103,7 +1103,7 @@ fn prompt_save_credentials() -> bool {
     )
 }
 
-/// `atem pair [--save]` — connect to Astation, send PairSavePreference, wait for SsoTokenSync.
+/// `atem pair [--save]` — connect to Astation, send PairSavePreference, wait for CredentialSync.
 async fn run_pair(save: bool) -> Result<()> {
     use tokio::time::{Duration, timeout};
     let config = crate::config::AtemConfig::load()?;
@@ -1128,7 +1128,7 @@ async fn run_pair(save: bool) -> Result<()> {
     };
 
     // Send save preference. Astation uses this to decide what to put in
-    // the subsequent SsoTokenSync message.
+    // the subsequent CredentialSync message.
     client
         .send_message(crate::websocket_client::AstationMessage::PairSavePreference {
             save_credentials,
@@ -1137,11 +1137,11 @@ async fn run_pair(save: bool) -> Result<()> {
 
     println!("Waiting for Astation to send SSO credentials...");
 
-    // Wait up to 60s for SsoTokenSync.
+    // Wait up to 60s for CredentialSync.
     let received = timeout(Duration::from_secs(60), async {
         loop {
             match client.recv_message_async().await {
-                Some(crate::websocket_client::AstationMessage::SsoTokenSync {
+                Some(crate::websocket_client::AstationMessage::CredentialSync {
                     access_token,
                     refresh_token,
                     expires_at,

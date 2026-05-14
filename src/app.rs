@@ -143,9 +143,6 @@ pub struct App {
     pub active_agent_id: Option<String>,
     /// Cursor position in the AgentPanel list.
     pub agent_panel_selected: usize,
-    /// Credentials synced from Astation via WebSocket. Highest priority over env/config.
-    pub synced_customer_id: Option<String>,
-    pub synced_customer_secret: Option<String>,
     /// Pending credentials waiting for user to decide whether to save to disk.
     /// (customer_id, customer_secret)
     pub pending_credential_save: Option<(String, String)>,
@@ -264,8 +261,6 @@ impl App {
             acp_clients: HashMap::new(),
             active_agent_id: None,
             agent_panel_selected: 0,
-            synced_customer_id: None,
-            synced_customer_secret: None,
             pending_credential_save: None,
             astation_connect_rx: None,
             astation_reconnect_at: None,
@@ -1996,25 +1991,6 @@ impl App {
                 self.handle_visualize_request(session_id, topic, relay_url).await;
             }
             AstationMessage::CredentialSync {
-                customer_id,
-                customer_secret,
-                astation_id,
-            } => {
-                let id_preview = customer_id[..4.min(customer_id.len())].to_string();
-
-                // Store in memory for this session (available immediately)
-                self.synced_customer_id = Some(customer_id.clone());
-                self.synced_customer_secret = Some(customer_secret.clone());
-                if let Some(aid) = astation_id {
-                    self.connected_astation_id = Some(aid);
-                }
-
-                self.status_message = Some(format!(
-                    "\u{1f511} Credentials synced from Astation ({}...)",
-                    id_preview
-                ));
-            }
-            AstationMessage::SsoTokenSync {
                 access_token,
                 refresh_token,
                 expires_at,
