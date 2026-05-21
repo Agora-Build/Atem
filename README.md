@@ -268,6 +268,10 @@ Use `./scripts/release.sh` rather than `git tag` directly — the script keeps
 | `real_rtm` | Link against Agora RTM SDK (default: stub) |
 | `openssl-vendored` | Build OpenSSL from source (for cross-compilation) |
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for upcoming features and where to help. Items labelled [`help wanted`](https://github.com/Agora-Build/Atem/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) are open for contributors.
+
 ## Related Projects
 
 - [Astation](https://github.com/Agora-Build/Astation) -- macOS menubar hub that coordinates Chisel, Atem, and AI agents — talk to your coding agent from anywhere
