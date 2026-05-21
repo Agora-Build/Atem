@@ -20,6 +20,22 @@ Telephony is provider-agnostic: atem takes generic SIP trunk parameters, so numb
 
 → **[#4](https://github.com/Agora-Build/Atem/issues/4)** — large epic; will split into per-phase sub-issues after the Phase 0 API research.
 
+## In progress
+
+Built and usable today, but not yet at their best — actively being improved.
+
+### AI Agents
+
+`atem agent` connects to local AI coding agents (Claude Code, Codex) over ACP/PTY — detect running agents, launch them, send prompts, generate diagrams. The commands work today (see the README), but the current implementation is early; reliability, the ACP integration, and the UX are all being refined.
+
+### Astation Integration
+
+[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates [Chisel](https://github.com/Agora-Build/chisel), atem, and AI agents — it receives annotation tasks from the browser, routes them to the right atem instance, and tracks task status. The integration is partially wired and maturing alongside Astation.
+
+### Voice-Driven Coding
+
+Speak to code: Astation captures audio, a ConvoAI agent transcribes it, atem routes the text to Claude Code for implementation, and responses flow back as speech. End-to-end plumbing exists; it's being hardened into a smooth workflow.
+
 ## Under discussion
 
 Not committed yet — being shaped before they become roadmap items. Opinions welcome.
