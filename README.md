@@ -184,13 +184,7 @@ Both peers must use matching encryption/geofence or audio fails silently. `enabl
 
 `atem agent visualize "topic"` sends a prompt to a running AI agent (via ACP), which generates a self-contained HTML diagram and saves it to `~/.agent/diagrams/`. Atem detects the new file, hosts it via `atem serv diagrams`, and opens it in the browser. Use `--url ws://host:port` to target a specific agent.
 
-### Astation Integration (WIP)
-
-[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates between [Chisel](https://github.com/Agora-Build/chisel), Atem, and AI agents. It receives annotation tasks from the browser, routes them to the right Atem instance, and tracks task status.
-
-### Voice-Driven Coding (WIP)
-
-Speak to code: Astation captures audio, a ConvoAI agent transcribes it, and Atem routes the text to Claude Code for implementation. Responses flow back as speech.
+Astation integration and voice-driven coding are in progress — see [ROADMAP.md](ROADMAP.md).
 
 ## Configuration
 
@@ -267,6 +261,10 @@ Use `./scripts/release.sh` rather than `git tag` directly — the script keeps
 |------|-------------|
 | `real_rtm` | Link against Agora RTM SDK (default: stub) |
 | `openssl-vendored` | Build OpenSSL from source (for cross-compilation) |
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for upcoming features and where to help. Items labelled [`help wanted`](https://github.com/Agora-Build/Atem/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) are open for contributors.
 
 ## Related Projects
 
