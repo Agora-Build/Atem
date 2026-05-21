@@ -1,4 +1,4 @@
-# atem Roadmap
+# Atem Roadmap
 
 Where atem is headed. This is a direction, not a contract — items shift as we learn.
 
