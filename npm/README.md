@@ -46,8 +46,8 @@ atem token rtm decode <token>           # Decode existing Signaling (RTM) token
 ### Projects
 
 ```bash
-atem list project                       # List Agora projects
-atem list project --show-certificates   # List with app certificates visible
+atem project list                       # List Agora projects
+atem project list --show-certificates   # List with app certificates visible
 atem project use <N>                    # Set active project by index (1-based)
 atem project use <APP_ID>               # Set active project by App ID
 atem project show                       # Show current active project

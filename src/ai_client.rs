@@ -45,7 +45,7 @@ struct ContentBlock {
 const SYSTEM_PROMPT: &str = r#"You are an assistant that translates natural language into Atem CLI commands.
 
 Available commands:
-- atem list project [--show-certificates]  — List all Agora projects
+- atem project list [--show-certificates]  — List all Agora projects
 - atem project use <APP_ID>                — Set the active project by App ID
 - atem project show                        — Show the current active project
 - atem config show                         — Show resolved configuration
@@ -158,9 +158,9 @@ mod tests {
 
     #[test]
     fn parse_valid_intent() {
-        let json = r#"{"command": "atem list project", "explanation": "Lists all projects"}"#;
+        let json = r#"{"command": "atem project list", "explanation": "Lists all projects"}"#;
         let intent = parse_command_intent(json).unwrap();
-        assert_eq!(intent.command, "atem list project");
+        assert_eq!(intent.command, "atem project list");
         assert_eq!(intent.explanation, "Lists all projects");
     }
 

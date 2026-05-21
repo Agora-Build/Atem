@@ -34,11 +34,6 @@ pub enum Commands {
         #[command(subcommand)]
         project_command: ProjectCommands,
     },
-    /// List Agora resources
-    List {
-        #[command(subcommand)]
-        list_command: ListCommands,
-    },
     /// Interactive REPL with AI-powered command interpretation
     Repl,
     /// Log in with Agora Console (opens browser)
@@ -159,9 +154,15 @@ pub enum ConfigCommands {
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
-    /// Set active project by App ID or index from `atem list project`
+    /// List all Agora projects in your account
+    List {
+        /// Show app certificates in output
+        #[arg(long)]
+        show_certificates: bool,
+    },
+    /// Set active project by App ID or index from `atem project list`
     Use {
-        /// App ID or 1-based index from `atem list project`
+        /// App ID or 1-based index from `atem project list`
         app_id_or_index: String,
     },
     /// Show current active project
@@ -169,16 +170,6 @@ pub enum ProjectCommands {
         /// Show full app certificate (unmasked)
         #[arg(long)]
         with_certificate: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum ListCommands {
-    /// List all Agora projects in your account
-    Project {
-        /// Show app certificates in output
-        #[arg(long)]
-        show_certificates: bool,
     },
 }
 
@@ -598,6 +589,17 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
         },
         Commands::Project { project_command } => match project_command {
+            ProjectCommands::List { show_certificates } => {
+                let config = crate::config::AtemConfig::load()?;
+                let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
+                if let Err(e) = crate::config::ProjectCache::save(&projects) {
+                    eprintln!("Warning: could not cache projects: {}", e);
+                }
+                print!("{}", crate::agora_api::format_projects(&projects, show_certificates));
+                Ok(())
+            }
             ProjectCommands::Use { app_id_or_index } => {
                 // Index path reads from local ProjectCache — no network call needed.
                 // App ID path fetches from the BFF API to resolve name + certificate.
@@ -605,10 +607,10 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     let project = crate::config::ProjectCache::get(idx).ok_or_else(|| {
                         let hint = match crate::config::ProjectCache::load() {
                             Some(projects) => format!(
-                                "Valid range: 1-{}. Run `atem list project` to refresh.",
+                                "Valid range: 1-{}. Run `atem project list` to refresh.",
                                 projects.len()
                             ),
-                            None => "No cached projects. Run `atem list project` first.".to_string(),
+                            None => "No cached projects. Run `atem project list` first.".to_string(),
                         };
                         anyhow::anyhow!("Invalid project index {}. {}", idx, hint)
                     })?;
@@ -659,19 +661,6 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         println!("No active project set. Run `atem project use <APP_ID>`");
                     }
                 }
-                Ok(())
-            }
-        },
-        Commands::List { list_command } => match list_command {
-            ListCommands::Project { show_certificates } => {
-                let config = crate::config::AtemConfig::load()?;
-                let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let projects = crate::agora_api::fetch_projects(&token, config.effective_bff_url()).await?;
-                if let Err(e) = crate::config::ProjectCache::save(&projects) {
-                    eprintln!("Warning: could not cache projects: {}", e);
-                }
-                print!("{}", crate::agora_api::format_projects(&projects, show_certificates));
                 Ok(())
             }
         },
@@ -1210,29 +1199,29 @@ mod tests {
     }
 
     #[test]
-    fn cli_list_project_parses() {
-        let cli = Cli::try_parse_from(["atem", "list", "project"]).unwrap();
+    fn cli_project_list_parses() {
+        let cli = Cli::try_parse_from(["atem", "project", "list"]).unwrap();
         match cli.command {
-            Some(Commands::List {
-                list_command: ListCommands::Project { show_certificates },
+            Some(Commands::Project {
+                project_command: ProjectCommands::List { show_certificates },
             }) => {
                 assert!(!show_certificates);
             }
-            _ => panic!("Expected List Project command"),
+            _ => panic!("Expected Project List command"),
         }
     }
 
     #[test]
-    fn cli_list_project_with_show_certificates() {
+    fn cli_project_list_with_show_certificates() {
         let cli =
-            Cli::try_parse_from(["atem", "list", "project", "--show-certificates"]).unwrap();
+            Cli::try_parse_from(["atem", "project", "list", "--show-certificates"]).unwrap();
         match cli.command {
-            Some(Commands::List {
-                list_command: ListCommands::Project { show_certificates },
+            Some(Commands::Project {
+                project_command: ProjectCommands::List { show_certificates },
             }) => {
                 assert!(show_certificates);
             }
-            _ => panic!("Expected List Project command with show_certificates"),
+            _ => panic!("Expected Project List command with show_certificates"),
         }
     }
 
