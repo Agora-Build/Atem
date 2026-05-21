@@ -9,8 +9,8 @@ const HISTORY_FILE: &str = ".atem_history";
 
 /// Known commands for exact matching (without the "atem" prefix).
 const KNOWN_COMMANDS: &[&str] = &[
-    "list project",
-    "list project --show-certificates",
+    "project list",
+    "project list --show-certificates",
     "project show",
     "config show",
     "token rtc create",
@@ -128,7 +128,7 @@ fn print_help() {
     println!("Atem REPL - Interactive command shell with AI assistance");
     println!();
     println!("Available commands:");
-    println!("  list project [--show-certificates]  List all Agora projects");
+    println!("  project list [--show-certificates]  List all Agora projects");
     println!("  project use <APP_ID>                Set active project");
     println!("  project show                        Show active project");
     println!("  config show                         Show configuration");
@@ -291,34 +291,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_match_list_project() {
+    fn exact_match_project_list() {
         assert_eq!(
-            try_exact_match("list project"),
-            Some("atem list project".to_string())
+            try_exact_match("project list"),
+            Some("atem project list".to_string())
         );
     }
 
     #[test]
     fn exact_match_with_atem_prefix() {
         assert_eq!(
-            try_exact_match("atem list project"),
-            Some("atem list project".to_string())
+            try_exact_match("atem project list"),
+            Some("atem project list".to_string())
         );
     }
 
     #[test]
     fn exact_match_case_insensitive() {
         assert_eq!(
-            try_exact_match("List Project"),
-            Some("atem list project".to_string())
+            try_exact_match("Project List"),
+            Some("atem project list".to_string())
         );
     }
 
     #[test]
     fn exact_match_with_flags() {
         assert_eq!(
-            try_exact_match("list project --show-certificates"),
-            Some("atem list project --show-certificates".to_string())
+            try_exact_match("project list --show-certificates"),
+            Some("atem project list --show-certificates".to_string())
         );
     }
 
@@ -354,8 +354,8 @@ mod tests {
     #[test]
     fn shell_split_simple() {
         assert_eq!(
-            shell_split("list project --show-certificates"),
-            vec!["list", "project", "--show-certificates"]
+            shell_split("project list --show-certificates"),
+            vec!["project", "list", "--show-certificates"]
         );
     }
 
@@ -370,8 +370,8 @@ mod tests {
     #[test]
     fn command_to_args_strips_prefix() {
         assert_eq!(
-            command_to_args("atem list project"),
-            vec!["list", "project"]
+            command_to_args("atem project list"),
+            vec!["project", "list"]
         );
     }
 

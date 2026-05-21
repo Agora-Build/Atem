@@ -189,7 +189,7 @@ Paired:   astation-<uuid>  (SSO: 52a4f560...)  [save: yes]
 1. CLI flag (`--app-id`)
 2. Env var (`AGORA_APP_ID`, `AGORA_APP_CERTIFICATE`)
 3. Active project file
-4. Error: `"No active project. Run 'atem list project', then 'atem project use <index>'"`
+4. Error: `"No active project. Run 'atem project list', then 'atem project use <index>'"`
 
 Note: RTC/RTM token generation needs only `app_id` + `app_certificate` (from active project). It does NOT need SSO credentials.
 

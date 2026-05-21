@@ -244,7 +244,7 @@ impl AtemConfig {
             None => {
                 lines.push(String::new());
                 lines.push("Active project: (none)".to_string());
-                lines.push("  → run `atem list project` to see available projects".to_string());
+                lines.push("  → run `atem project list` to see available projects".to_string());
                 lines.push("  → run `atem project use <N>` to set one".to_string());
             }
         }
@@ -452,7 +452,7 @@ impl ProjectCache {
             if let Some(p) = project {
                 cache.projects.push(p);
             } else {
-                anyhow::bail!("Project {app_id} not in cache. Run `atem list project` first.");
+                anyhow::bail!("Project {app_id} not in cache. Run `atem project list` first.");
             }
         }
         cache.active_app_id = Some(app_id.to_string());
@@ -498,7 +498,7 @@ impl ProjectCache {
             return Ok(proj.app_id);
         }
         anyhow::bail!(
-            "No active project. Run `atem list project`, then `atem project use <index>`"
+            "No active project. Run `atem project list`, then `atem project use <index>`"
         )
     }
 
@@ -516,7 +516,7 @@ impl ProjectCache {
             return Ok(proj.sign_key.unwrap_or_default());
         }
         anyhow::bail!(
-            "No active project. Run `atem list project`, then `atem project use <index>`"
+            "No active project. Run `atem project list`, then `atem project use <index>`"
         )
     }
 }
@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn save_clears_active_if_project_removed() {
-        // When the user runs `atem list project` and the previously-active project
+        // When the user runs `atem project list` and the previously-active project
         // no longer exists in the new list, active_app_id should be cleared.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.enc");
