@@ -115,21 +115,30 @@ etc. There is **no** text-to-agent-stdin or key-event message, and **no
 `agent_id`** addressing. (Note: atem has `agentPrompt`/`agentEvent` for ACP
 agents, but Astation does not emit them — don't conflate.)
 
-v1 adds one new message, `agentInput`, for text + keys, with `(atem_id,
-agent_id)` addressing:
+v1 adds one new message, `agentInput`, for text + keys.
+
+**Addressing is two-level and `atem_id` is the *envelope*, not the payload.**
+The relay (and Astation's `sendHandler`) already wrap Astation→atem traffic as
+`{"atem_id": "<host>", "payload": <message>}` and route by `atem_id`. So the
+`agentInput` payload must **not** repeat `atem_id`; it carries only the agent
+selector + the input:
 
 ```
-Astation → atem  (control lane)
-  agentInput {
-    atem_id:  "<host>",        // relay routing (already supported by relay)
-    agent_id: "<agent>",       // which local agent (atem routes locally) — NEW
-    input: {
-      kind: "text" | "key",
-      text?: "refactor the auth module",   // kind=text → stdin + Enter
-      key?:  "enter" | "esc" | "ctrl-c" | "up" | "down" | "y" | "n",  // kind=key → raw PTY byte(s)
-    }
-  }
+relay envelope (added automatically by Astation/relay):
+  { "atem_id": "<host>", "payload": <agentInput> }
+
+agentInput payload (AstationMessage, tagged type/data):
+  { "type": "agentInput",
+    "data": {
+      "agentId": "<agent on that atem; optional in v1 — omit/null = focused/only agent>",
+      "kind": "text" | "key",
+      "text": "refactor the auth module",        // kind=text → stdin + Enter
+      "key":  "enter|esc|ctrl-c|up|down|y|n"      // kind=key → raw PTY byte(s)
+  } }
 ```
+
+(Authoritative wire contract — kept in sync with the Astation-side spec
+`Astation/docs/specs/2026-05-28-remote-agent-control-design.md`.)
 
 Voice stays on the **existing** `voiceRequest` / `voiceCommand` path (ConvoAI
 ASR → accumulated text → atem) — it already delivers text to the agent, so v1
