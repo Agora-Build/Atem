@@ -129,8 +129,8 @@ fn print_help() {
     println!();
     println!("Available commands:");
     println!("  project list [--show-certificates]  List all Agora projects");
-    println!("  project use <APP_ID>                Set active project");
-    println!("  project show                        Show active project");
+    println!("  project use <APP_ID>                Set current project");
+    println!("  project show                        Show current project");
     println!("  config show                         Show configuration");
     println!("  token rtc create [options]           Generate RTC token");
     println!("    --channel <NAME>  --uid <ID>  --role publisher|subscriber  --expire <SECS>");

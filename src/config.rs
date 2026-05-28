@@ -228,12 +228,12 @@ impl AtemConfig {
             }
         }
 
-        // Show active project info
-        match ProjectCache::get_active() {
+        // Show current project info
+        match ProjectCache::get_current() {
             Some(proj) => {
                 lines.push(String::new());
                 lines.push(format!(
-                    "Active project: {} ({})",
+                    "Current project: {} ({})",
                     proj.name, proj.app_id
                 ));
                 lines.push(format!(
@@ -243,7 +243,7 @@ impl AtemConfig {
             }
             None => {
                 lines.push(String::new());
-                lines.push("Active project: (none)".to_string());
+                lines.push("Current project: (none)".to_string());
                 lines.push("  → run `atem project list` to see available projects".to_string());
                 lines.push("  → run `atem project use <N>` to set one".to_string());
             }
@@ -355,13 +355,14 @@ impl From<&CachedProject> for crate::agora_api::BffProject {
 }
 
 /// Encrypted project cache stored at `~/.config/atem/project_cache.enc`.
-/// Single source of truth for both the list of known projects and the active selection.
+/// Single source of truth for both the list of known projects and the current selection.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ProjectCache {
     #[serde(default)]
     pub projects: Vec<CachedProject>,
+    /// The user-selected ("current") project's app_id.
     #[serde(default)]
-    pub active_app_id: Option<String>,
+    pub current_app_id: Option<String>,
 }
 
 impl ProjectCache {
@@ -412,14 +413,14 @@ impl ProjectCache {
         Ok(())
     }
 
-    /// Replace the project list (preserves `active_app_id` if the active project still exists).
+    /// Replace the project list (preserves `current_app_id` if the current project still exists).
     pub fn save(projects: &[crate::agora_api::BffProject]) -> Result<()> {
         let mut cache = Self::load_full();
         cache.projects = projects.iter().map(CachedProject::from).collect();
-        // If the previously active project no longer exists in the new list, clear it.
-        if let Some(active) = &cache.active_app_id {
-            if !cache.projects.iter().any(|p| &p.app_id == active) {
-                cache.active_app_id = None;
+        // If the previously current project no longer exists in the new list, clear it.
+        if let Some(current) = &cache.current_app_id {
+            if !cache.projects.iter().any(|p| &p.app_id == current) {
+                cache.current_app_id = None;
             }
         }
         cache.save_full()
@@ -443,9 +444,9 @@ impl ProjectCache {
         Some((&cache.projects[index - 1]).into())
     }
 
-    /// Set the active project by app_id. Adds the project to the cache if missing.
+    /// Set the current project by app_id. Adds the project to the cache if missing.
     /// Returns an error if the app_id is not in the cache and `project` is None.
-    pub fn set_active(app_id: &str, project: Option<CachedProject>) -> Result<()> {
+    pub fn set_current(app_id: &str, project: Option<CachedProject>) -> Result<()> {
         let mut cache = Self::load_full();
         // If the project isn't yet in the cache, add it.
         if !cache.projects.iter().any(|p| p.app_id == app_id) {
@@ -455,21 +456,21 @@ impl ProjectCache {
                 anyhow::bail!("Project {app_id} not in cache. Run `atem project list` first.");
             }
         }
-        cache.active_app_id = Some(app_id.to_string());
+        cache.current_app_id = Some(app_id.to_string());
         cache.save_full()
     }
 
-    /// Return the currently active project, if any.
-    pub fn get_active() -> Option<CachedProject> {
+    /// Return the current project, if any.
+    pub fn get_current() -> Option<CachedProject> {
         let cache = Self::load_full();
-        let app_id = cache.active_app_id.as_ref()?;
+        let app_id = cache.current_app_id.as_ref()?;
         cache.projects.iter().find(|p| &p.app_id == app_id).cloned()
     }
 
-    /// Clear the active project selection (does not remove projects from the cache).
-    pub fn clear_active() -> Result<()> {
+    /// Clear the current project selection (does not remove projects from the cache).
+    pub fn clear_current() -> Result<()> {
         let mut cache = Self::load_full();
-        cache.active_app_id = None;
+        cache.current_app_id = None;
         cache.save_full()
     }
 
@@ -484,7 +485,7 @@ impl ProjectCache {
             .map(|p| p.name)
     }
 
-    /// Resolve app_id: CLI flag > env var > active project > error
+    /// Resolve app_id: CLI flag > env var > current project > error
     pub fn resolve_app_id(cli_app_id: Option<&str>) -> Result<String> {
         if let Some(id) = cli_app_id {
             return Ok(id.to_string());
@@ -494,15 +495,15 @@ impl ProjectCache {
                 return Ok(id);
             }
         }
-        if let Some(proj) = Self::get_active() {
+        if let Some(proj) = Self::get_current() {
             return Ok(proj.app_id);
         }
         anyhow::bail!(
-            "No active project. Run `atem project list`, then `atem project use <index>`"
+            "No current project. Run `atem project list`, then `atem project use <index>`"
         )
     }
 
-    /// Resolve app_certificate: CLI flag > env var > active project > error
+    /// Resolve app_certificate: CLI flag > env var > current project > error
     pub fn resolve_app_certificate(cli_cert: Option<&str>) -> Result<String> {
         if let Some(cert) = cli_cert {
             return Ok(cert.to_string());
@@ -512,11 +513,11 @@ impl ProjectCache {
                 return Ok(cert);
             }
         }
-        if let Some(proj) = Self::get_active() {
+        if let Some(proj) = Self::get_current() {
             return Ok(proj.sign_key.unwrap_or_default());
         }
         anyhow::bail!(
-            "No active project. Run `atem project list`, then `atem project use <index>`"
+            "No current project. Run `atem project list`, then `atem project use <index>`"
         )
     }
 }
@@ -779,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn set_active_and_get_active_round_trip() {
+    fn set_current_and_get_current_round_trip() {
         let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         let backup_path = ProjectCache::path();
         let backup = backup_path.with_extension("enc.bak");
@@ -789,10 +790,10 @@ mod tests {
         }
 
         ProjectCache::save(&sample_projects()).unwrap();
-        ProjectCache::set_active("appid1", None).unwrap();
-        let active = ProjectCache::get_active().unwrap();
-        assert_eq!(active.app_id, "appid1");
-        assert_eq!(active.name, "Project One");
+        ProjectCache::set_current("appid1", None).unwrap();
+        let current = ProjectCache::get_current().unwrap();
+        assert_eq!(current.app_id, "appid1");
+        assert_eq!(current.name, "Project One");
 
         // Restore
         let _ = fs::remove_file(&backup_path);
@@ -802,36 +803,36 @@ mod tests {
     }
 
     #[test]
-    fn save_preserves_active_if_still_present() {
+    fn save_preserves_current_if_still_present() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.enc");
 
         let mut cache = ProjectCache::default();
         cache.projects = sample_projects().iter().map(CachedProject::from).collect();
-        cache.active_app_id = Some("appid1".to_string());
+        cache.current_app_id = Some("appid1".to_string());
         cache.save_to(&path).unwrap();
 
-        // Reload, verify active survives a round-trip
+        // Reload, verify current survives a round-trip
         let cache = ProjectCache::load_from(&path);
-        assert_eq!(cache.active_app_id.as_deref(), Some("appid1"));
+        assert_eq!(cache.current_app_id.as_deref(), Some("appid1"));
     }
 
     #[test]
-    fn save_clears_active_if_project_removed() {
-        // When the user runs `atem project list` and the previously-active project
-        // no longer exists in the new list, active_app_id should be cleared.
+    fn save_clears_current_if_project_removed() {
+        // When the user runs `atem project list` and the previously-current project
+        // no longer exists in the new list, current_app_id should be cleared.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.enc");
 
         let mut cache = ProjectCache::default();
         cache.projects = sample_projects().iter().map(CachedProject::from).collect();
-        cache.active_app_id = Some("appid_gone".to_string()); // not in projects
+        cache.current_app_id = Some("appid_gone".to_string()); // not in projects
         cache.save_to(&path).unwrap();
 
-        // Reload and simulate a save with fresh projects — active_app_id should still
+        // Reload and simulate a save with fresh projects — current_app_id should still
         // be there (since reload preserves state).
         let cache = ProjectCache::load_from(&path);
-        assert_eq!(cache.active_app_id.as_deref(), Some("appid_gone"));
+        assert_eq!(cache.current_app_id.as_deref(), Some("appid_gone"));
     }
 
     #[test]
@@ -853,7 +854,7 @@ mod tests {
         let path = dir.path().join("does_not_exist.enc");
         let cache = ProjectCache::load_from(&path);
         assert!(cache.projects.is_empty());
-        assert!(cache.active_app_id.is_none());
+        assert!(cache.current_app_id.is_none());
     }
 
     #[test]

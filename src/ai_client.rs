@@ -46,8 +46,8 @@ const SYSTEM_PROMPT: &str = r#"You are an assistant that translates natural lang
 
 Available commands:
 - atem project list [--show-certificates]  — List all Agora projects
-- atem project use <APP_ID>                — Set the active project by App ID
-- atem project show                        — Show the current active project
+- atem project use <APP_ID>                — Set the current project by App ID
+- atem project show                        — Show the current project
 - atem config show                         — Show resolved configuration
 - atem token rtc create [--channel <NAME>] [--uid <ID>] [--role publisher|subscriber] [--expire <SECS>]
                                            — Generate an RTC token

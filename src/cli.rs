@@ -29,7 +29,7 @@ pub enum Commands {
         #[command(subcommand)]
         config_command: ConfigCommands,
     },
-    /// Manage active project
+    /// Manage current project
     Project {
         #[command(subcommand)]
         project_command: ProjectCommands,
@@ -139,7 +139,7 @@ pub enum ConfigCommands {
         /// Config value
         value: String,
     },
-    /// Clear the active project
+    /// Clear the current project
     Clear,
     /// Interactive wizard to configure ConvoAI agent
     Convo {
@@ -160,12 +160,12 @@ pub enum ProjectCommands {
         #[arg(long)]
         show_certificates: bool,
     },
-    /// Set active project by App ID or index from `atem project list`
+    /// Set current project by App ID or index from `atem project list`
     Use {
         /// App ID or 1-based index from `atem project list`
         app_id_or_index: String,
     },
-    /// Show current active project
+    /// Show current project
     Show {
         /// Show full app certificate (unmasked)
         #[arg(long)]
@@ -574,8 +574,8 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Clear => {
-                crate::config::ProjectCache::clear_active()?;
-                println!("Active project cleared.");
+                crate::config::ProjectCache::clear_current()?;
+                println!("Current project cleared.");
                 Ok(())
             }
             ConfigCommands::Convo { config, validate } => {
@@ -614,8 +614,8 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         };
                         anyhow::anyhow!("Invalid project index {}. {}", idx, hint)
                     })?;
-                    crate::config::ProjectCache::set_active(&project.app_id, None)?;
-                    println!("Active project set: {} ({})", project.name, project.app_id);
+                    crate::config::ProjectCache::set_current(&project.app_id, None)?;
+                    println!("Current project set: {} ({})", project.name, project.app_id);
                 } else {
                     let config = crate::config::AtemConfig::load()?;
                     let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await
@@ -630,15 +630,15 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         .ok_or_else(|| {
                             anyhow::anyhow!("Project with App ID '{}' not found", app_id_or_index)
                         })?;
-                    crate::config::ProjectCache::set_active(&project.app_id, None)?;
-                    println!("Active project set: {} ({})", project.name, project.app_id);
+                    crate::config::ProjectCache::set_current(&project.app_id, None)?;
+                    println!("Current project set: {} ({})", project.name, project.app_id);
                 }
                 Ok(())
             }
             ProjectCommands::Show { with_certificate } => {
-                match crate::config::ProjectCache::get_active() {
+                match crate::config::ProjectCache::get_current() {
                     Some(proj) => {
-                        println!("Active project: {}", proj.name);
+                        println!("Current project: {}", proj.name);
                         println!("App ID: {}", proj.app_id);
                         let vid_suffix = proj.vid.map(|v| format!("  |  vid: {}", v)).unwrap_or_default();
                         println!("Project ID: {}{}", proj.project_id, vid_suffix);
@@ -658,7 +658,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                         }
                     }
                     None => {
-                        println!("No active project set. Run `atem project use <APP_ID>`");
+                        println!("No current project set. Run `atem project use <APP_ID>`");
                     }
                 }
                 Ok(())
