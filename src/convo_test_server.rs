@@ -69,7 +69,7 @@ fn gen_avatar_uid() -> String {
 ///      token + whatever `agora_channel` they set verbatim.
 ///   2. [agent.avatar.params] has agora_appid + agora_app_cert → mint
 ///      with those (avatar lives in a different Agora project).
-///   3. Fall back to the active project's appid + cert (avatar shares
+///   3. Fall back to the current project's appid + cert (avatar shares
 ///      the voice channel in the main project — the typical case).
 ///
 /// Returns (Some(channel), Some(token)) where `channel` is the voice
@@ -190,7 +190,7 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
             toml_path.display()
         )
     };
-    // Get app_id + app_certificate from active project.
+    // Get app_id + app_certificate from current project.
     let app_id   = crate::config::ProjectCache::resolve_app_id(None)?;
     let app_cert = crate::config::ProjectCache::resolve_app_certificate(None)?;
 
@@ -520,7 +520,7 @@ async fn run_background(
     // Avatar video runs in the vendor's OWN Agora project (akool etc.).
     // Mint a fresh channel + token for the avatar. Uses [agent.avatar
     // .params].agora_appid/agora_app_cert if set, otherwise falls back
-    // to the active project's appid+cert.
+    // to the current project's appid+cert.
     let (avatar_channel, avatar_token) =
         mint_avatar_channel_and_token(convo, &resolved.channel, app_id, app_cert, &avatar_user_id);
     let payload = convo.build_join_payload(crate::convo_config::JoinArgs {

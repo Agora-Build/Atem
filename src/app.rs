@@ -833,7 +833,7 @@ impl App {
                     self.last_activity_ping = Some(Instant::now());
                 }
                 Err(_err) => {
-                    // Silently ignore activity ping errors (RTM not configured/no active project)
+                    // Silently ignore activity ping errors (RTM not configured/no current project)
                     // This is expected in normal TUI usage without voice coding features
                 }
             }
