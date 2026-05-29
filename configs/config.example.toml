@@ -15,6 +15,14 @@
 # bff_url = "https://agora-cli.agora.io"
 # sso_url = "https://sso2.agora.io"
 
+# ── Identity (auto-generated — do not edit) ──────────────────────────
+# Written automatically on first relay connect. instance_id is a stable
+# per-install UUID (the canonical atem identity); atem_id is the derived
+# relay id "<host:12>-<instance suffix:8>". See designs/atem-identity.md.
+#
+# instance_id = "550e8400-e29b-41d4-a716-446655440000"
+# atem_id     = "MacBook-Prol-550e8400"
+
 # ── Extra hostnames ──────────────────────────────────────────────────
 # Additional hostnames the machine is reachable on (netbird, tailscale,
 # ngrok, cloudflared, etc.). Each one is baked into the self-signed

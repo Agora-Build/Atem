@@ -825,17 +825,21 @@ impl AstationClient {
             relay_url.replace("http://", "ws://")
         };
 
-        // Use hostname as atem_id so the relay can distinguish multiple Atems in the same room.
-        // Sanitize to URL-safe chars (relay does the same server-side).
+        // atem_id lets the relay distinguish multiple Atems in the same room.
+        // Generated once from hostname + instance id and frozen in config.toml,
+        // so it's stable across restarts (and hostname changes) and unique so two
+        // machines that share a hostname don't collide. See build_atem_id.
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
-        let atem_id: String = hostname.chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-            .collect();
-        let atem_id = if atem_id.is_empty() { "unknown".to_string() } else { atem_id };
+        let atem_id = crate::config::AtemConfig::stored_atem_id().unwrap_or_else(|| {
+            let instance_id = crate::config::AtemConfig::ensure_instance_id();
+            let id = build_atem_id(&hostname, &instance_id);
+            crate::config::AtemConfig::store_atem_id(&id);
+            id
+        });
 
-        let ws_url = format!("{}/ws?role=atem&code={}&atem_id={}", ws_scheme, identity_code, atem_id);
+        let ws_url = relay_ws_url(&ws_scheme, identity_code, &atem_id);
         self.connect_raw(&ws_url).await?;
 
         // Send hello to announce ourselves and trigger Astation to send credentials
@@ -885,6 +889,81 @@ impl AstationClient {
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
     }
 
+}
+
+/// Length of the host segment of an `atem_id` (truncated or padded to this).
+const ATEM_ID_HOST_LEN: usize = 12;
+/// Length of the instance-id suffix of an `atem_id`.
+const ATEM_ID_SUFFIX_LEN: usize = 8;
+
+/// Build the relay `atem_id`: `<host:12>-<instance suffix:8>` (21 chars).
+///
+/// Lengths are counted in **characters**, not bytes (CJK chars are multibyte).
+/// Host charset: non-ASCII chars (CJK etc.) are kept as-is; ASCII is restricted
+/// to `[A-Za-z0-9-]` (dots, underscores, and other punctuation are dropped). The
+/// host is normalized to [`ATEM_ID_HOST_LEN`] chars — truncated if longer, padded
+/// if shorter. Padding and suffix are drawn from the instance-id hex (the suffix
+/// is the first UUID block), so the id is unique per install and *stable* across
+/// restarts, never fresh-random.
+///
+/// Because non-ASCII is allowed, the value must be percent-encoded before it
+/// goes into the relay URL (see `connect_relay_identity`).
+fn build_atem_id(hostname: &str, instance_id: &str) -> String {
+    // Pool of stable chars from the instance id (UUID → 32 hex chars).
+    let pool: Vec<char> = instance_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+
+    // Host segment: keep non-ASCII as-is; for ASCII keep only [A-Za-z0-9-].
+    let mut host: Vec<char> = hostname
+        .chars()
+        .filter(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || *c == '-')
+        .take(ATEM_ID_HOST_LEN)
+        .collect();
+
+    // Without an instance id there's nothing unique to add; fall back to the
+    // bare (truncated) hostname.
+    if pool.is_empty() {
+        return if host.is_empty() {
+            "atem".to_string()
+        } else {
+            host.into_iter().collect()
+        };
+    }
+
+    let suffix: String = pool.iter().take(ATEM_ID_SUFFIX_LEN).collect();
+
+    // Pad the host segment to a uniform width using letters from the instance-id
+    // pool, drawn after the suffix chars so padding and suffix differ.
+    let pad: Vec<char> = pool.iter().skip(ATEM_ID_SUFFIX_LEN).copied().collect();
+    let mut i = 0;
+    while host.len() < ATEM_ID_HOST_LEN {
+        let c = if pad.is_empty() {
+            pool[i % pool.len()]
+        } else {
+            pad[i % pad.len()]
+        };
+        host.push(c);
+        i += 1;
+    }
+
+    let host: String = host.into_iter().collect();
+    format!("{host}-{suffix}")
+}
+
+/// Build the relay WebSocket URL. `atem_id` may contain non-ASCII (CJK etc.), so
+/// it is percent-encoded into the query value — the resulting URL is pure ASCII
+/// and valid URI syntax. The relay percent-decodes the query param back to the
+/// canonical `atem_id`. `relay_base` is the ws/wss scheme + host (e.g.
+/// `wss://relay.example`); `identity_code` is already ASCII.
+fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String {
+    format!(
+        "{}/ws?role=atem&code={}&atem_id={}",
+        relay_base,
+        identity_code,
+        urlencoding::encode(atem_id)
+    )
 }
 
 #[cfg(test)]
@@ -2095,5 +2174,157 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // --- atem_id shape + charset + uniqueness ---
+
+    /// Every ASCII char of an atem_id must be in `[A-Za-z0-9-]`; non-ASCII (CJK
+    /// etc.) is allowed through.
+    fn assert_atem_id_charset(id: &str) {
+        assert!(
+            id.chars().all(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '-'),
+            "atem_id has disallowed ASCII chars: {id}"
+        );
+    }
+
+    #[test]
+    fn atem_id_drops_dots_keeps_digits_and_truncates_to_12() {
+        // Dot dropped; "host01" digits kept: "host-01.lan" → "host-01lan" → padded.
+        let id = build_atem_id("host-01.lan", "550e8400-e29b-41d4-a716-446655440000");
+        let (host, suffix) = id.rsplit_once('-').unwrap();
+        assert!(host.starts_with("host-01lan"));
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        assert_eq!(suffix, "550e8400"); // first UUID block
+        assert_atem_id_charset(&id);
+    }
+
+    #[test]
+    fn atem_id_truncates_long_ascii_to_12() {
+        let id = build_atem_id("MacBookPro2024Dev", "550e8400-e29b-41d4-a716-446655440000");
+        let (host, _suffix) = id.rsplit_once('-').unwrap();
+        assert_eq!(host, "MacBookPro20");
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+    }
+
+    #[test]
+    fn atem_id_pads_short_hostname_to_12() {
+        let id = build_atem_id("mbp", "550e8400-e29b-41d4-a716-446655440000");
+        let (host, _suffix) = id.rsplit_once('-').unwrap();
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        assert!(host.starts_with("mbp"));
+        assert_atem_id_charset(&id);
+    }
+
+    #[test]
+    fn atem_id_keeps_chinese_hostname() {
+        let id = build_atem_id("我的电脑", "abcdef12-3456-7890-abcd-ef1234567890");
+        let (host, suffix) = id.rsplit_once('-').unwrap();
+        assert!(host.starts_with("我的电脑"));
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        assert_eq!(suffix, "abcdef12");
+        assert_atem_id_charset(&id);
+    }
+
+    #[test]
+    fn atem_id_keeps_japanese_hostname() {
+        // Mixed kanji + hiragana + katakana.
+        let id = build_atem_id("私のパソコン端末", "550e8400-e29b-41d4-a716-446655440000");
+        let (host, suffix) = id.rsplit_once('-').unwrap();
+        assert!(host.starts_with("私のパソコン端末"));
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        assert_eq!(suffix, "550e8400");
+        assert_atem_id_charset(&id);
+    }
+
+    #[test]
+    fn atem_id_keeps_korean_hostname() {
+        let id = build_atem_id("내컴퓨터", "550e8400-e29b-41d4-a716-446655440000");
+        let (host, suffix) = id.rsplit_once('-').unwrap();
+        assert!(host.starts_with("내컴퓨터"));
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        assert_eq!(suffix, "550e8400");
+        assert_atem_id_charset(&id);
+    }
+
+    #[test]
+    fn atem_id_truncates_long_non_ascii_hostname_by_chars() {
+        // 14 CJK chars → truncated to 12 chars (not bytes).
+        let id = build_atem_id("一二三四五六七八九十甲乙丙丁", "550e8400-e29b-41d4-a716-446655440000");
+        let (host, _suffix) = id.rsplit_once('-').unwrap();
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        assert_eq!(host, "一二三四五六七八九十甲乙");
+    }
+
+    #[test]
+    fn atem_id_keeps_mixed_korean_and_ascii_hostname() {
+        // Korean + ASCII letters/digits kept; dot dropped.
+        let id = build_atem_id("서버01.dev", "550e8400-e29b-41d4-a716-446655440000");
+        let (host, _suffix) = id.rsplit_once('-').unwrap();
+        assert!(host.starts_with("서버01dev"));
+        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        assert_atem_id_charset(&id);
+    }
+
+    #[test]
+    fn atem_id_is_stable_for_same_inputs() {
+        let a = build_atem_id("mbp", "11111111-aaaa-bbbb-cccc-dddddddddddd");
+        let b = build_atem_id("mbp", "11111111-aaaa-bbbb-cccc-dddddddddddd");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn atem_id_unique_for_same_hostname_different_instance() {
+        let a = build_atem_id("mbp", "11111111-aaaa-bbbb-cccc-dddddddddddd");
+        let b = build_atem_id("mbp", "22222222-aaaa-bbbb-cccc-dddddddddddd");
+        assert_ne!(a, b);
+        assert!(a.starts_with("mbp"));
+        assert!(b.starts_with("mbp"));
+    }
+
+    #[test]
+    fn atem_id_is_hostname_only_when_instance_id_empty() {
+        let id = build_atem_id("host", "");
+        assert_eq!(id, "host");
+    }
+
+    // --- relay URL encoding ---
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    #[test]
+    fn relay_url_is_ascii_and_parses_for_non_ascii_atem_id() {
+        let atem_id = build_atem_id("私のパソコン", "550e8400-e29b-41d4-a716-446655440000");
+        let url = relay_ws_url("wss://relay.example", "astation-abc", &atem_id);
+
+        // The built URL must be pure ASCII (percent-encoded UTF-8).
+        assert!(url.is_ascii(), "relay URL not ASCII: {url}");
+
+        // It must parse with the exact path the WS client uses (connect_async).
+        assert!(
+            url.as_str().into_client_request().is_ok(),
+            "encoded relay URL rejected by WS client: {url}"
+        );
+    }
+
+    #[test]
+    fn relay_url_query_round_trips_to_canonical_atem_id() {
+        let atem_id = build_atem_id("我的电脑", "550e8400-e29b-41d4-a716-446655440000");
+        let url = relay_ws_url("wss://relay.example", "code", &atem_id);
+
+        // Pull the atem_id query value back out and percent-decode it.
+        let encoded = url.split("atem_id=").nth(1).unwrap();
+        let decoded = urlencoding::decode(encoded).unwrap();
+        assert_eq!(decoded, atem_id);
+    }
+
+    #[test]
+    fn raw_non_ascii_atem_id_would_break_the_url() {
+        // Demonstrates why encoding is required: a raw CJK value yields a URL the
+        // WS client refuses to parse.
+        let raw = "wss://relay.example/ws?role=atem&code=c&atem_id=我的电脑";
+        assert!(
+            raw.into_client_request().is_err(),
+            "expected raw non-ASCII URL to be rejected"
+        );
     }
 }
