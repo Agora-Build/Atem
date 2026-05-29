@@ -18,6 +18,7 @@ mod rtm_client;
 mod time_sync;
 mod token;
 mod tui;
+mod vault_client;
 mod websocket_client;
 // Agent hub — ACP/PTY protocol abstraction
 mod acp_client;
