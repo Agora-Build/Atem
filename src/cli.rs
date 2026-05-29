@@ -58,6 +58,11 @@ pub enum Commands {
         #[command(subcommand)]
         serv_command: ServCommands,
     },
+    /// Shared cross-agent context store (see designs/vault.md)
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -399,6 +404,54 @@ pub enum ServCommands {
         /// Don't auto-open the browser
         #[arg(long)]
         no_browser: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum VaultCommands {
+    /// Create a new vault in the current work session
+    New {
+        /// Human/agent description of the vault
+        #[arg(long)]
+        summary: String,
+    },
+    /// List vaults you can read
+    List,
+    /// Read a vault's current contents (or history)
+    Read {
+        /// Vault id (from 'vault new' / 'vault list')
+        #[arg(long = "vault-id")]
+        vault_id: String,
+        /// Only entries newer than this seq cursor
+        #[arg(long)]
+        since: Option<u64>,
+        /// Show every version, not just the current view
+        #[arg(long)]
+        history: bool,
+        /// Output format: human (default) or plain
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+    /// Append an entry, or override one with --entry-id
+    Write {
+        /// Vault id to write to
+        #[arg(long = "vault-id")]
+        vault_id: String,
+        /// Override this entry id instead of appending
+        #[arg(long = "entry-id")]
+        entry_id: Option<u32>,
+        /// Entry text
+        #[arg(long)]
+        text: String,
+    },
+    /// Update the mutable summary
+    SetSummary {
+        /// Vault id whose summary to update
+        #[arg(long = "vault-id")]
+        vault_id: String,
+        /// New summary text
+        #[arg(long)]
+        text: String,
     },
 }
 
@@ -1071,7 +1124,68 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 }).await
             }
         },
+        Commands::Vault { command } => handle_vault_command(command).await,
     }
+}
+
+async fn handle_vault_command(command: VaultCommands) -> Result<()> {
+    use crate::vault_client::{self, VaultClient};
+
+    // Resolve relay base, client id, and session.
+    let config = crate::config::AtemConfig::load()?;
+    let base = config.astation_relay_url().to_string();
+    let astation_id = config
+        .astation_relay_code
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!(
+            "No relay configured. Set astation_relay_code in config.toml or the ASTATION_RELAY_CODE env var."
+        ))?;
+    let client_id = crate::config::AtemConfig::ensure_instance_id();
+    // astation_relay_code is the Astation identity, which is also the SessionManager
+    // key (relay room name == session key). See designs/vault.md open-questions #1/#6.
+    let session_id = crate::auth::SessionManager::load()?
+        .get(&astation_id)
+        .map(|s| s.session_id.clone())
+        .ok_or_else(|| anyhow::anyhow!(
+            "No Astation session found for {}. Connect to your Astation first to establish a session.",
+            astation_id
+        ))?;
+
+    let client = VaultClient::new(base, client_id, session_id);
+
+    match command {
+        VaultCommands::New { summary } => {
+            let v = client.create(&summary).await?;
+            println!("Created vault {}", v.vault_id);
+        }
+        VaultCommands::List => {
+            for item in client.list().await? {
+                println!("{}  {}", item.vault_id, item.summary);
+            }
+        }
+        VaultCommands::Read { vault_id, since, history, format } => {
+            let entries = client.read(&vault_id, since, history).await?;
+            let fmt = vault_client::parse_format(&format);
+            let out = if history {
+                vault_client::render_history(&entries, fmt)
+            } else {
+                // Summary lives on the vaults row, not in the entries list; v1
+                // renders an empty summary header here. A follow-up can have the
+                // read endpoint return {summary, entries} and thread it through.
+                vault_client::render_current("", &entries, fmt)
+            };
+            print!("{}", out);
+        }
+        VaultCommands::Write { vault_id, entry_id, text } => {
+            let r = client.write(&vault_id, &text, entry_id).await?;
+            println!("Wrote e{} v{} (seq {})", r.entry_no, r.version, r.seq);
+        }
+        VaultCommands::SetSummary { vault_id, text } => {
+            client.set_summary(&vault_id, &text).await?;
+            println!("Summary updated.");
+        }
+    }
+    Ok(())
 }
 
 /// Prompt "Save credentials? ... [y/N]" on stdin. Defaults to false on empty / non-tty.
@@ -1955,5 +2069,74 @@ mod tests {
         assert!(matches!(cli.command, Some(Commands::Login)));
         let cli = Cli::try_parse_from(["atem", "logout"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Logout)));
+    }
+
+    // ── vault command ────────────────────────────────────────────────────
+
+    #[test]
+    fn cli_vault_new_parses() {
+        let cli = Cli::try_parse_from(["atem", "vault", "new", "--summary", "ctx"]).unwrap();
+        match cli.command {
+            Some(Commands::Vault { command: VaultCommands::New { summary } }) => {
+                assert_eq!(summary, "ctx");
+            }
+            _ => panic!("expected vault new"),
+        }
+    }
+
+    #[test]
+    fn cli_vault_write_with_entry_id_parses() {
+        let cli = Cli::try_parse_from([
+            "atem", "vault", "write", "--vault-id", "v-1", "--entry-id", "3", "--text", "edit",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Vault {
+                command: VaultCommands::Write { vault_id, entry_id, text },
+            }) => {
+                assert_eq!(vault_id, "v-1");
+                assert_eq!(entry_id, Some(3));
+                assert_eq!(text, "edit");
+            }
+            _ => panic!("expected vault write"),
+        }
+    }
+
+    #[test]
+    fn cli_vault_read_history_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "atem", "vault", "read", "--vault-id", "v-1", "--history",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Vault { command: VaultCommands::Read { vault_id, history, .. } }) => {
+                assert_eq!(vault_id, "v-1");
+                assert!(history);
+            }
+            _ => panic!("expected vault read"),
+        }
+    }
+
+    #[test]
+    fn cli_vault_read_since_and_format_parse() {
+        let cli = Cli::try_parse_from([
+            "atem", "vault", "read", "--vault-id", "v-1", "--since", "5", "--format", "plain",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Vault { command: VaultCommands::Read { since, format, .. } }) => {
+                assert_eq!(since, Some(5));
+                assert_eq!(format, "plain");
+            }
+            _ => panic!("expected vault read"),
+        }
+        // Default format when omitted.
+        let cli = Cli::try_parse_from(["atem", "vault", "read", "--vault-id", "v-1"]).unwrap();
+        match cli.command {
+            Some(Commands::Vault { command: VaultCommands::Read { format, .. } }) => {
+                assert_eq!(format, "human");
+            }
+            _ => panic!("expected vault read"),
+        }
     }
 }

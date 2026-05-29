@@ -15,6 +15,17 @@ pub struct AtemConfig {
     pub bff_url: Option<String>,
     pub sso_url: Option<String>,
 
+    /// Stable per-install identifier (UUID v4), generated once by
+    /// `ensure_instance_id()` and persisted here. The canonical unique identity;
+    /// the relay `atem_id` is derived from it and it serves as the vault client id.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+
+    /// The relay `atem_id`, generated once from hostname + `instance_id` and
+    /// frozen here so it survives hostname changes. Charset is `[A-Za-z-]` only.
+    #[serde(default)]
+    pub atem_id: Option<String>,
+
     /// Extra hostnames the machine is reachable on, beyond loopback + LAN IP.
     /// Each entry is baked into the self-signed cert's SAN list so browsers
     /// that hit any of these names get a valid TLS handshake, and the URL
@@ -92,6 +103,62 @@ impl AtemConfig {
         self.extra_hostnames.clone().unwrap_or_default()
     }
 
+    /// Read a top-level string key straight from `config.toml`, without applying
+    /// env overrides. Empty values are treated as absent.
+    fn read_config_string(key: &str) -> Option<String> {
+        let content = fs::read_to_string(Self::config_path()).ok()?;
+        let val = toml::from_str::<toml::Value>(&content).ok()?;
+        val.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Merge a single top-level string key into `config.toml`, preserving other
+    /// keys. Best-effort: silently no-ops on IO/parse failure.
+    fn write_config_string(key: &str, value: &str) {
+        let path = Self::config_path();
+        let mut existing = fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        if let Some(table) = existing.as_table_mut() {
+            table.insert(key.into(), toml::Value::String(value.to_string()));
+            if let Some(dir) = path.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            if let Ok(content) = toml::to_string_pretty(&existing) {
+                let _ = fs::write(&path, content);
+            }
+        }
+    }
+
+    /// Stable per-install identifier (UUID v4), generated once and persisted to
+    /// `config.toml`. The canonical unique identity; also the source the relay
+    /// `atem_id` is derived from and the vault client id.
+    ///
+    /// Best-effort: if the file can't be written, a fresh id is still returned so
+    /// connecting isn't blocked (it just won't be stable until a write succeeds).
+    pub fn ensure_instance_id() -> String {
+        if let Some(id) = Self::read_config_string("instance_id") {
+            return id;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        Self::write_config_string("instance_id", &id);
+        id
+    }
+
+    /// The relay `atem_id` if one has already been generated and stored.
+    pub fn stored_atem_id() -> Option<String> {
+        Self::read_config_string("atem_id")
+    }
+
+    /// Persist the relay `atem_id` so it keeps across restarts and hostname
+    /// changes (generated once, then frozen).
+    pub fn store_atem_id(id: &str) {
+        Self::write_config_string("atem_id", id);
+    }
+
     /// Persist the config to disk.
     ///
     /// Non-sensitive settings → `~/.config/atem/config.toml` (plaintext)
@@ -135,6 +202,12 @@ impl AtemConfig {
         }
         if let Some(sso) = &self.sso_url {
             table.insert("sso_url".into(), toml::Value::String(sso.clone()));
+        }
+        if let Some(id) = &self.instance_id {
+            table.insert("instance_id".into(), toml::Value::String(id.clone()));
+        }
+        if let Some(id) = &self.atem_id {
+            table.insert("atem_id".into(), toml::Value::String(id.clone()));
         }
         if self.bff_url.is_none() {
             table.remove("bff_url");
@@ -199,6 +272,14 @@ impl AtemConfig {
         lines.push(format!(
             "diagram_server_url: {}",
             self.diagram_server_url.as_deref().unwrap_or("(not set)")
+        ));
+        lines.push(format!(
+            "instance_id: {}",
+            self.instance_id.as_deref().unwrap_or("(not set)")
+        ));
+        lines.push(format!(
+            "atem_id: {}",
+            self.atem_id.as_deref().unwrap_or("(not set)")
         ));
 
         // SSO + paired credentials
