@@ -191,6 +191,20 @@ pub enum AstationMessage {
         relay_url: String,
     },
 
+    /// Astation → Atem (remote agent control v1): text or a control key to write
+    /// to the focused agent's PTY. `agent_id` is optional (v1 = focused/only
+    /// agent). Wire shape: `{type:"agentInput", data:{agentId?, kind, text?, key?}}`.
+    #[serde(rename = "agentInput")]
+    AgentInput {
+        #[serde(rename = "agentId", default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+
     /// Atem → Astation: voice coding response confirmation.
     #[serde(rename = "voiceResponse")]
     VoiceResponse {
@@ -2161,6 +2175,57 @@ mod tests {
         assert!(json.contains(r#""type":"pairSavePreference""#));
         let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
         matches!(parsed, AstationMessage::PairSavePreference { save_credentials: true });
+    }
+
+    // --- AgentInput (remote agent control) ---
+
+    #[test]
+    fn agent_input_text_deserializes_from_astation_wire() {
+        // Exact shape sent by Astation's sendAgentText (key omitted).
+        let json = r#"{"type":"agentInput","data":{"agentId":"a1","kind":"text","text":"refactor auth"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            AstationMessage::AgentInput { agent_id, kind, text, key } => {
+                assert_eq!(agent_id.as_deref(), Some("a1"));
+                assert_eq!(kind, "text");
+                assert_eq!(text.as_deref(), Some("refactor auth"));
+                assert_eq!(key, None);
+            }
+            _ => panic!("expected AgentInput"),
+        }
+    }
+
+    #[test]
+    fn agent_input_key_deserializes_without_agent_id() {
+        // sendAgentKey with agentId omitted (v1 focused-agent default).
+        let json = r#"{"type":"agentInput","data":{"kind":"key","key":"ctrl-c"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            AstationMessage::AgentInput { agent_id, kind, text, key } => {
+                assert_eq!(agent_id, None);
+                assert_eq!(kind, "key");
+                assert_eq!(text, None);
+                assert_eq!(key.as_deref(), Some("ctrl-c"));
+            }
+            _ => panic!("expected AgentInput"),
+        }
+    }
+
+    #[test]
+    fn agent_input_roundtrips() {
+        let msg = AstationMessage::AgentInput {
+            agent_id: None,
+            kind: "text".into(),
+            text: Some("hi".into()),
+            key: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"agentInput""#));
+        // nil fields are omitted on the wire
+        assert!(!json.contains("agentId"));
+        assert!(!json.contains("\"key\""));
+        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
+        matches!(parsed, AstationMessage::AgentInput { .. });
     }
 
     #[test]
