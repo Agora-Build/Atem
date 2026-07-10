@@ -182,6 +182,23 @@ pub struct PendingVisualize {
     pub last_output_at: Instant,
 }
 
+/// Map an `agentInput` control-key name (from Astation) to the raw byte
+/// sequence written to the agent PTY. Returns None for an unknown key.
+pub fn agent_key_to_bytes(key: &str) -> Option<&'static str> {
+    match key {
+        "enter" => Some("\r"),
+        "esc" => Some("\x1b"),
+        "ctrl-c" => Some("\x03"),
+        "up" => Some("\x1b[A"),
+        "down" => Some("\x1b[B"),
+        "left" => Some("\x1b[D"),
+        "right" => Some("\x1b[C"),
+        "y" => Some("y"),
+        "n" => Some("n"),
+        _ => None,
+    }
+}
+
 /// Tracks a voice coding request waiting for Claude to finish.
 #[derive(Debug, Clone)]
 pub struct PendingVoiceRequest {
@@ -1983,6 +2000,14 @@ impl App {
             } => {
                 self.handle_voice_request(session_id, accumulated_text, relay_url).await;
             }
+            AstationMessage::AgentInput {
+                agent_id,
+                kind,
+                text,
+                key,
+            } => {
+                self.handle_agent_input(agent_id, kind, text, key);
+            }
             AstationMessage::VisualizeRequest {
                 session_id,
                 topic,
@@ -2226,6 +2251,54 @@ impl App {
     }
 
     /// Handle a voice coding request from Astation: send to Claude and track for completion.
+    /// Remote agent control (Astation → Atem): write text or a control key to
+    /// the focused agent's PTY. `agent_id` is ignored in v1 (the focused/only
+    /// agent = the current chat mode). `kind:"text"` types the line and submits
+    /// it with Enter; `kind:"key"` writes the raw control bytes (see
+    /// [`agent_key_to_bytes`]). Unknown kinds/keys are dropped with a status note.
+    pub fn handle_agent_input(
+        &mut self,
+        _agent_id: Option<String>,
+        kind: String,
+        text: Option<String>,
+        key: Option<String>,
+    ) {
+        // `kind` selects the input; the non-matching field is ignored (Astation
+        // only ever populates one).
+        let data: Option<String> = match kind.as_str() {
+            // Type the line and submit it. Trims + skips empty like
+            // send_claude_prompt, and matches its submit sequence (text, then
+            // "\n", then "\r") which the Claude/Codex TUIs need to accept a line.
+            "text" => text
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("{t}\n\r")),
+            "key" => key
+                .as_deref()
+                .and_then(agent_key_to_bytes)
+                .map(|s| s.to_string()),
+            _ => None,
+        };
+
+        let Some(data) = data else {
+            self.status_message = Some(format!(
+                "Ignored agentInput (kind={}, key={:?})",
+                kind, key
+            ));
+            return;
+        };
+
+        // Route to the focused agent's PTY. Codex when it's the active chat;
+        // Claude otherwise (matches the voice path's default target). The
+        // send_* helpers no-op if that agent has no live session.
+        if matches!(self.mode, AppMode::CodexChat) && self.codex_sender.is_some() {
+            self.send_codex_data(&data);
+        } else {
+            self.send_claude_data(&data);
+        }
+        self.status_message = Some(format!("\u{2328} agentInput: {}", kind));
+    }
+
     pub async fn handle_voice_request(
         &mut self,
         session_id: String,
@@ -2561,6 +2634,77 @@ pub fn current_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_key_maps_control_keys_to_pty_bytes() {
+        assert_eq!(agent_key_to_bytes("enter"), Some("\r"));
+        assert_eq!(agent_key_to_bytes("esc"), Some("\x1b"));
+        assert_eq!(agent_key_to_bytes("ctrl-c"), Some("\x03"));
+        assert_eq!(agent_key_to_bytes("up"), Some("\x1b[A"));
+        assert_eq!(agent_key_to_bytes("down"), Some("\x1b[B"));
+        assert_eq!(agent_key_to_bytes("y"), Some("y"));
+        assert_eq!(agent_key_to_bytes("n"), Some("n"));
+    }
+
+    #[test]
+    fn agent_key_unknown_returns_none() {
+        assert_eq!(agent_key_to_bytes("f13"), None);
+        assert_eq!(agent_key_to_bytes(""), None);
+        assert_eq!(agent_key_to_bytes("Enter"), None); // case-sensitive by design
+    }
+
+    #[test]
+    fn handle_agent_input_text_types_line_and_submits_to_claude() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        app.claude_sender = Some(tx);
+        app.mode = AppMode::ClaudeChat;
+        app.handle_agent_input(None, "text".into(), Some("hello".into()), None);
+        let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got, "hello\n\r");
+    }
+
+    #[test]
+    fn handle_agent_input_key_writes_raw_control_bytes() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        app.claude_sender = Some(tx);
+        app.mode = AppMode::ClaudeChat;
+        app.handle_agent_input(None, "key".into(), None, Some("ctrl-c".into()));
+        let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got, "\x03");
+    }
+
+    #[test]
+    fn handle_agent_input_empty_text_sends_nothing() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        app.claude_sender = Some(tx);
+        app.mode = AppMode::ClaudeChat;
+        app.handle_agent_input(None, "text".into(), Some("   ".into()), None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_agent_input_unknown_key_sends_nothing() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        app.claude_sender = Some(tx);
+        app.mode = AppMode::ClaudeChat;
+        app.handle_agent_input(None, "key".into(), None, Some("f13".into()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_agent_input_routes_to_codex_when_focused() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        app.codex_sender = Some(tx);
+        app.mode = AppMode::CodexChat;
+        app.handle_agent_input(None, "key".into(), None, Some("esc".into()));
+        let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got, "\x1b");
+    }
 
     #[test]
     fn test_active_cli_default_is_claude() {

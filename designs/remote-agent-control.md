@@ -153,8 +153,11 @@ atem → Astation acks/feedback ride the existing `commandResponse` /
 ### Injection semantics (atem side)
 
 - atem owns the agent PTY (`claude_client.rs` / `codex_client.rs`). `kind:text`
-  → write `text` + `\n` to the PTY master. `kind:key` → write the raw byte(s)
-  (`\r`, `\x1b`, `\x03`, arrow CSI, `y`/`n`) to the PTY master.
+  → trim, skip-if-empty, then write `text` + the submit sequence `\n\r` to the
+  PTY master (matches `send_claude_prompt`, which the Claude/Codex TUIs need to
+  reliably accept a line). `kind:key` → write the raw byte(s) (`\r`, `\x1b`,
+  `\x03`, arrow CSI, `y`/`n`) to the PTY master. Implemented as
+  `handle_agent_input` + `agent_key_to_bytes` in `app.rs`.
 - **Busy handling**: input is written to the live TUI's stdin. If the agent is
   mid-task, a typed line queues at its prompt (same as a human typing early);
   `Ctrl-C` is how you interrupt. atem does not try to gate on agent state in v1.
