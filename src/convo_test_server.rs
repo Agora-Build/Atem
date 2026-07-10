@@ -1101,8 +1101,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
   <div class="controls">
     <label>Encryption</label>
     <select id="encModeSelect" style="width:200px">
-      <option value="0">None</option>
-      <option value="8" selected>AES_256_GCM2</option>
+      <option value="0" selected>None</option>
+      <option value="8">AES_256_GCM2</option>
       <option value="7">AES_128_GCM2</option>
       <option value="6">AES_256_GCM</option>
       <option value="5">AES_128_GCM</option>
@@ -1330,8 +1330,10 @@ window.addEventListener('DOMContentLoaded', () => {{
   applyAttachMode();
   document.getElementById('encModeSelect').addEventListener('change', syncSaltRow);
   syncSaltRow();
-  document.getElementById('hipaaCheckbox').addEventListener('change', syncHipaa);
-  syncHipaa();
+  // On an explicit toggle, clear encryption when turning HIPAA off; on
+  // initial load, keep whatever convo.toml pre-filled (clearWhenOff=false).
+  document.getElementById('hipaaCheckbox').addEventListener('change', () => syncHipaa(true));
+  syncHipaa(false);
 }});
 
 // Generate a short random encryption key (8 decimal digits) for
@@ -1343,12 +1345,19 @@ function genHipaaKey() {{
   return String(a[0] % 100000000).padStart(8, '0');
 }}
 
-// Force the related controls when HIPAA mode is on:
-//   geofence = NORTH_AMERICA, encryption = AES_256_GCM2 (mode 8)
-// Generated key + fresh salt are populated. All four fields are
-// locked while HIPAA is checked so the values that get sent to the
-// server can't drift from what the UI claims is in effect.
-function syncHipaa() {{
+// HIPAA mode is off by default.
+//
+// ON  → force + lock the HIPAA-required settings: geofence =
+//       NORTH_AMERICA, encryption = AES_256_GCM2 (mode 8) with a
+//       generated key + fresh salt. All four fields are locked so the
+//       values sent to the server can't drift from what the UI shows.
+//
+// OFF → geofence is choose-able and the encryption controls unlock. When
+//       the user explicitly unticks (clearWhenOff), reset to no
+//       encryption: mode = None, key + salt cleared. On initial page load
+//       (clearWhenOff = false) we keep whatever convo.toml pre-filled, so
+//       a configured non-HIPAA encryption setup survives.
+function syncHipaa(clearWhenOff) {{
   const on = document.getElementById('hipaaCheckbox').checked;
   const geo = document.getElementById('geoAreaSelect');
   const mode = document.getElementById('encModeSelect');
@@ -1364,6 +1373,12 @@ function syncHipaa() {{
   }} else {{
     geo.disabled = mode.disabled = false;
     key.readOnly = salt.readOnly = false;
+    if (clearWhenOff) {{
+      mode.value = '0';   // encryption none
+      key.value = '';     // remove key
+      salt.value = '';    // clean salt
+    }}
+    syncSaltRow();
   }}
 }}
 
