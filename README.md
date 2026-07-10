@@ -57,9 +57,9 @@ atem token rtm decode <token>           # Decode existing Signaling (RTM) token
 ```bash
 atem project list                       # List Agora projects
 atem project list --show-certificates   # List with app certificates visible
-atem project use <APP_ID>               # Set active project by App ID
-atem project use <N>                    # Set active project by index (1-based)
-atem project show                       # Show current active project
+atem project use <APP_ID>               # Set current project by App ID
+atem project use <N>                    # Set current project by index (1-based)
+atem project show                       # Show current project
 ```
 
 ### AI Agents (WIP)
@@ -75,6 +75,23 @@ atem agent visualize "topic"            # Generate visual HTML diagram via agent
 atem agent visualize "topic" --url ws://localhost:8765  # Explicit agent URL
 atem agent visualize "topic" --no-browser               # Skip opening browser
 ```
+
+### Vault (shared cross-agent context)
+
+```bash
+atem vault new --summary "auth refactor context"   # Create a vault, prints its id
+atem vault list                                     # List vaults you can read
+atem vault read --vault-id <id>                     # Current contents
+atem vault read --vault-id <id> --history           # Every version (shown eN vM)
+atem vault read --vault-id <id> --format plain      # Bare text (pipe into a prompt)
+atem vault write --vault-id <id> --text "decided: JWT in cookie"   # Append an entry
+atem vault write --vault-id <id> --entry-id 3 --text "..."         # Override entry e3
+atem vault set-summary --vault-id <id> --text "..."  # Update the summary
+```
+
+Lets multiple atems (each driving an agent) share a versioned, append-only
+context store via the relay. Requires a relay-hosted vault server (`/api/vault`);
+see `designs/vault.md`.
 
 ### Dev Servers
 
