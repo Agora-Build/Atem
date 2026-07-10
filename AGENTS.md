@@ -68,6 +68,7 @@ src/
 ├── web_server/          # Shared HTTPS scaffolding (cert, request, /api/token, net, html)
 ├── command.rs           # Task queue and stream buffer for voice commands
 ├── dispatch.rs          # Work item dispatcher for mark tasks
+├── vault_client.rs      # atem vault CLI client (relay /api/vault: request builders, renderers, executor)
 └── tui/
     ├── mod.rs           # Main event loop, rendering dispatch
     └── voice_fx.rs      # Voice activity visual effects
@@ -95,7 +96,11 @@ designs/
 ├── validation-week0.md  # ConvoAI validation testing
 ├── test-cases.md        # Manual release test cases
 ├── data-flow-between-atem-and-astation.md  # Voice coding architecture
-└── codex-launcher-design.md  # Codex launcher design
+├── codex-launcher-design.md  # Codex launcher design
+├── remote-agent-control.md   # Astation → atem → agent (text/voice/control keys)
+├── atem-identity.md          # instance_id + unique relay atem_id
+├── vault.md                  # Shared cross-agent context store (relay + Postgres)
+└── vault-implementation-plan.md  # Vault atem-side implementation plan
 ```
 
 ### Core Components
@@ -126,7 +131,12 @@ Key methods:
 - `VoiceRequest { session_id, accumulated_text, relay_url }` - voice coding from Astation
 - `VisualizeRequest { session_id, topic, relay_url? }` - diagram generation from Astation
 - `VisualizeResult { session_id, success, message, file_path? }` - sent back to Astation
+- `AgentInput { agent_id?, kind, text?, key? }` - remote agent control: text or a control key from Astation → focused agent PTY (`handle_agent_input`)
 - Also: project lists, token requests, voice/video toggle, heartbeat, auth flow
+
+**Remote Agent Control** (`app.rs`, `websocket_client.rs`): Receives `AgentInput` from Astation and writes it to the focused agent's PTY — `kind:"text"` types a line and submits it (`\n\r`, matching `send_claude_prompt`); `kind:"key"` writes raw control bytes via `agent_key_to_bytes` (enter/esc/ctrl-c/arrows/y/n). Routes to the codex PTY when it's the active chat, else claude; no-ops if no agent session is live (v1 drives an already-running agent). Voice reuses the existing `VoiceRequest` path. See `designs/remote-agent-control.md`.
+
+**Vault** (`vault_client.rs`): Client for the relay-hosted shared cross-agent context store. `atem vault new/list/read/write/set-summary` — a versioned, append-only store that multiple atems read/write to hand off context between their agents. Pure request builders + human/plain renderers + a thin reqwest executor (auth: `Authorization: session <id>` + `?id=<instance_id>`). The `/api/vault` endpoints + Postgres live in the relay-server (Astation repo). See `designs/vault.md`.
 
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
@@ -148,10 +158,14 @@ Key methods:
 
 | File | Contents | Encryption |
 |------|----------|------------|
-| `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) | None |
+| `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) + auto-generated identity (`instance_id`, `atem_id`) | None |
 | `credentials.enc` | SSO + paired tokens (multi-entry `Vec<CredentialEntry>`) | AES-256-GCM (machine-bound) |
-| `project_cache.enc` | All projects + `active_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
+| `project_cache.enc` | All projects + `current_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
 | `session.json` | Astation auth session ID + expiry | None |
+
+**Identity** (`config.rs`, `websocket_client.rs`):
+- `instance_id` — persistent UUID v4, the canonical atem identity (and the vault `client_id`). Generated once by `ensure_instance_id()`, stored in `config.toml`.
+- `atem_id` — the relay-room id `<host:12>-<suffix:8>`, generated once (`build_atem_id`) and frozen in `config.toml` so it survives restarts and hostname changes. Keeps non-ASCII hostnames (Chinese/Japanese/Korean), restricts ASCII to `[A-Za-z0-9-]`, percent-encoded into the relay URL. See `designs/atem-identity.md`.
 
 **Credentials** (`credentials.rs`):
 - `CredentialStore` wraps `Vec<CredentialEntry>`, AES-256-GCM encryption with HMAC-SHA256(machine-id) key derivation — file cannot be decrypted on another machine
