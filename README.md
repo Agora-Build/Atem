@@ -188,6 +188,32 @@ Both peers must use matching encryption/geofence or audio fails silently. `enabl
 
 ## How It Works
 
+### Astation connections
+
+Atem tries a configured direct endpoint first and then the identity relay after
+it has learned the target Astation identity. Direct and relay connections use
+the same device session, so one Atem can move between networks without pairing
+again. Successful authentication stores `astation_relay_code` automatically;
+manual configuration is only needed for an override or headless provisioning.
+
+| Atem location | Endpoint | First connection | Internet required |
+|---------------|----------|------------------|-------------------|
+| Same Mac | `ws://127.0.0.1:8080/ws` | Transparent same-user proof | No |
+| Another LAN machine | `ws://<astation-ip>:8080/ws` | Approve pairing in Astation | No |
+| Remote network | Public WSS identity relay | Approve pairing in Astation | Yes |
+
+All paths use device authentication v2. Astation sends a fresh challenge; Atem
+proves possession of the local bootstrap token or its saved device-session token
+with HMAC-SHA256. A session ID by itself is not accepted. Same-Mac operation
+continues when Wi-Fi is disabled, and LAN operation needs no relay once the IP is
+configured.
+
+Direct LAN currently uses plaintext `ws://`. Authentication prevents a stolen
+session ID from being sufficient, but it does not stop traffic inspection or an
+active LAN attacker during initial pairing. Treat direct LAN as pre-production
+until WSS certificate pinning is implemented. The wire contract and test matrix
+are documented in [`designs/session-auth.md`](designs/session-auth.md).
+
 ### TUI Modes
 
 | Mode | Description |
@@ -223,6 +249,7 @@ Files in `~/.config/atem/`:
 | `convo.toml` | ConvoAI agent config (API keys, provider params) | None (chmod 0600) |
 | `credentials.enc` | SSO tokens | AES-256-GCM (machine-bound) |
 | `project_cache.enc` | Project list + active project selection | AES-256-GCM (machine-bound) |
+| `sessions.json` | Per-Astation device session IDs and tokens | Plaintext (chmod 0600) |
 
 Encrypted files are bound to the machine they were created on — copying them to another machine won't decrypt.
 
@@ -233,6 +260,7 @@ Encrypted files are bound to the machine they were created on — copying them t
 ```toml
 # astation_ws = "ws://127.0.0.1:8080/ws"
 # astation_relay_url = "https://station.agora.build"
+# astation_relay_code = "astation-..." # learned automatically after authentication
 # bff_url = "https://agora-cli.agora.io"
 # sso_url = "https://sso2.agora.io"
 
@@ -245,6 +273,9 @@ Encrypted files are bound to the machine they were created on — copying them t
 ```bash
 ATEM_BFF_URL=...   # Override BFF API base URL
 ATEM_SSO_URL=...   # Override SSO base URL
+ASTATION_WS=...            # Direct loopback, LAN, or VPN WebSocket endpoint
+ASTATION_RELAY_URL=...     # Relay HTTP(S) base URL
+ASTATION_RELAY_CODE=...    # Target Astation identity room
 AGORA_APP_ID=...           # Override active project App ID
 AGORA_APP_CERTIFICATE=...  # Override active project certificate
 ```

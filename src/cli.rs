@@ -1270,6 +1270,7 @@ async fn run_pair(save: bool) -> Result<()> {
 
     match received {
         Ok(Ok((access_token, refresh_token, expires_at, login_id, astation_id, save_credentials))) => {
+            crate::config::AtemConfig::store_astation_relay_code(&astation_id);
             let mut store = crate::credentials::CredentialStore::load();
             let now = crate::credentials::CredentialEntry::now_secs();
             store.upsert(crate::credentials::CredentialEntry::new_paired(

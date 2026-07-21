@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::time::Duration;
 
 const DEFAULT_SERVER_URL: &str = "https://station.agora.build";
@@ -88,15 +89,15 @@ impl SessionManager {
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("Failed to create config directory: {}", e))?;
+            set_private_directory_permissions(parent)?;
         }
 
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow!("Failed to serialize sessions: {}", e))?;
 
-        std::fs::write(&path, json)
-            .map_err(|e| anyhow!("Failed to write sessions file: {}", e))?;
+        write_private_file(&path, json.as_bytes())?;
 
         Ok(())
     }
@@ -141,6 +142,48 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("Could not determine config directory"))?;
         Ok(config_dir.join("atem").join("sessions.json"))
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn set_private_directory_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| anyhow!("Failed to secure config directory: {}", e))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_private_directory_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow!("Failed to secure sessions file: {}", e))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| anyhow!("Failed to open private file: {}", e))?;
+    file.write_all(contents)
+        .map_err(|e| anyhow!("Failed to write private file: {}", e))?;
+    set_private_file_permissions(path)
 }
 
 /// Generate a random 8-digit OTP code.
@@ -335,6 +378,20 @@ pub async fn run_login_flow(server_url: Option<&str>, astation_id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_write_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        write_private_file(&path, br#"{"token":"secret"}"#).unwrap();
+
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), br#"{"token":"secret"}"#);
+    }
 
     #[test]
     fn otp_is_8_digits() {

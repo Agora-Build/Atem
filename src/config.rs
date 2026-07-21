@@ -10,6 +10,8 @@ pub struct AtemConfig {
     pub rtm_account: Option<String>,
     pub astation_ws: Option<String>,
     pub astation_relay_url: Option<String>,
+    /// Most recently authenticated Astation identity. Learned automatically and
+    /// used to select its persistent relay room on remote reconnect.
     pub astation_relay_code: Option<String>,
     pub diagram_server_url: Option<String>,
     pub bff_url: Option<String>,
@@ -159,6 +161,11 @@ impl AtemConfig {
         Self::write_config_string("atem_id", id);
     }
 
+    /// Remember the authenticated Astation as the default identity-relay target.
+    pub fn store_astation_relay_code(astation_id: &str) {
+        Self::write_config_string("astation_relay_code", astation_id);
+    }
+
     /// Persist the config to disk.
     ///
     /// Non-sensitive settings → `~/.config/atem/config.toml` (plaintext)
@@ -268,6 +275,10 @@ impl AtemConfig {
         lines.push(format!(
             "astation_relay_url: {}",
             self.astation_relay_url.as_deref().unwrap_or("(not set)")
+        ));
+        lines.push(format!(
+            "astation_relay_code: {}",
+            self.astation_relay_code.as_deref().unwrap_or("(not learned)")
         ));
         lines.push(format!(
             "diagram_server_url: {}",
@@ -665,8 +676,9 @@ impl crate::auth::AuthSession {
         let path = Self::session_path();
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir)?;
+        crate::auth::set_private_directory_permissions(dir)?;
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json)?;
+        crate::auth::write_private_file(&path, json.as_bytes())?;
         Ok(())
     }
 

@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -380,14 +383,57 @@ impl AstationClient {
         .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
         .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
 
-        // Extract astation_id from auth_required message
-        let astation_id = if let AstationMessage::StatusUpdate { data, .. } = &auth_required {
-            data.get("astation_id")
-                .ok_or_else(|| anyhow!("auth_required missing astation_id"))?
-                .clone()
-        } else {
-            return Err(anyhow!("Invalid auth_required message"));
-        };
+        // Extract the server identity and challenge from auth_required.
+        let (astation_id, challenge, transport, protocol) =
+            if let AstationMessage::StatusUpdate { data, .. } = &auth_required {
+                let astation_id = data
+                    .get("astation_id")
+                    .ok_or_else(|| anyhow!("auth_required missing astation_id"))?
+                    .clone();
+                (
+                    astation_id,
+                    data.get("challenge").cloned(),
+                    data.get("transport").cloned(),
+                    data.get("protocol").cloned(),
+                )
+            } else {
+                return Err(anyhow!("Invalid auth_required message"));
+            };
+
+        let hostname = crate::auth::get_hostname();
+        let atem_id = resolved_atem_id(&hostname);
+
+        if transport.as_deref() == Some("loopback") && protocol.as_deref() == Some("2") {
+            let challenge = challenge
+                .as_deref()
+                .ok_or_else(|| anyhow!("Local auth challenge missing"))?;
+            let token = read_local_bootstrap_token()
+                .ok_or_else(|| anyhow!("Astation local bootstrap token is unavailable"))?;
+            let mut auth_data = std::collections::HashMap::new();
+            auth_data.insert("method".to_string(), "local_proof".to_string());
+            auth_data.insert("atem_id".to_string(), atem_id.clone());
+            auth_data.insert("hostname".to_string(), hostname.clone());
+            auth_data.insert(
+                "proof".to_string(),
+                device_auth_proof(&token, challenge, &astation_id, &atem_id, "local")?,
+            );
+            self.send_message(AstationMessage::StatusUpdate {
+                status: "auth".to_string(),
+                data: auth_data,
+            })
+            .await?;
+
+            return match self.wait_for_auth_response(&astation_id).await? {
+                Some(AuthResponse::Authenticated) => Ok(()),
+                Some(AuthResponse::Denied(message)) => {
+                    Err(anyhow!("Local authentication denied: {}", message))
+                }
+                Some(AuthResponse::SessionExpired) => {
+                    Err(anyhow!("Unexpected local session expiry"))
+                }
+                None => Err(anyhow!("Connection closed during local authentication")),
+            };
+        }
 
         // Load session manager
         let mut session_mgr = crate::auth::SessionManager::load()
@@ -395,9 +441,24 @@ impl AstationClient {
 
         // Try session-based auth first if we have a saved session for this Astation
         if let Some(session) = session_mgr.get(&astation_id) {
-            // Send session auth
             let mut auth_data = std::collections::HashMap::new();
             auth_data.insert("session_id".to_string(), session.session_id.clone());
+            auth_data.insert("atem_id".to_string(), atem_id.clone());
+            if protocol.as_deref() == Some("2") {
+                let challenge = challenge
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Session auth challenge missing"))?;
+                auth_data.insert(
+                    "proof".to_string(),
+                    device_auth_proof(
+                        &session.token,
+                        challenge,
+                        &astation_id,
+                        &atem_id,
+                        &session.session_id,
+                    )?,
+                );
+            }
 
             let auth_msg = AstationMessage::StatusUpdate {
                 status: "auth".to_string(),
@@ -427,11 +488,11 @@ impl AstationClient {
         }
 
         // Session auth failed or no session - use pairing
-        self.authenticate_with_pairing(&astation_id).await
+        self.authenticate_with_pairing(&astation_id, &atem_id).await
     }
 
     /// Authenticate using pairing code (fallback when session invalid/missing)
-    async fn authenticate_with_pairing(&mut self, astation_id: &str) -> Result<()> {
+    async fn authenticate_with_pairing(&mut self, astation_id: &str, atem_id: &str) -> Result<()> {
         // Generate pairing code
         let pairing_code = crate::auth::generate_otp();
         let hostname = crate::auth::get_hostname();
@@ -444,6 +505,7 @@ impl AstationClient {
         let mut auth_data = std::collections::HashMap::new();
         auth_data.insert("pairing_code".to_string(), pairing_code.clone());
         auth_data.insert("hostname".to_string(), hostname.clone());
+        auth_data.insert("atem_id".to_string(), atem_id.to_string());
 
         let auth_msg = AstationMessage::StatusUpdate {
             status: "auth".to_string(),
@@ -503,6 +565,7 @@ impl AstationClient {
                                         .unwrap_or_default();
                                     let _ = session_mgr.save_session(session);
                                 }
+                                AtemConfig::store_astation_relay_code(astation_id);
                                 return Ok(Some(AuthResponse::Authenticated));
                             }
                             "denied" => {
@@ -517,11 +580,13 @@ impl AstationClient {
                 }
                 AstationMessage::StatusUpdate { status, data: _ } if status == "authenticated" => {
                     // Alternative authenticated message format
+                    AtemConfig::store_astation_relay_code(astation_id);
                     return Ok(Some(AuthResponse::Authenticated));
                 }
                 AstationMessage::StatusUpdate { status, data } if status == "error" => {
                     if let Some(msg) = data.get("message") {
-                        if msg.contains("expired") || msg.contains("Session expired") {
+                        let lower = msg.to_ascii_lowercase();
+                        if lower.contains("expired") || lower.contains("pairing required") {
                             return Ok(Some(AuthResponse::SessionExpired));
                         }
                         return Ok(Some(AuthResponse::Denied(msg.clone())));
@@ -831,8 +896,12 @@ impl AstationClient {
     /// After `atem pair`, Atem stores the identity as `astation_relay_code` in config.
     /// The TUI calls this to auto-connect without a new `atem pair`.
     ///
-    /// Flow: connect_raw → send "hello" → Astation calls addClient → sends credentialSync.
-    pub async fn connect_relay_identity(&mut self, relay_url: &str, identity_code: &str) -> Result<()> {
+    /// Flow: connect_raw → hello → challenge/response authentication.
+    pub async fn connect_relay_identity(
+        &mut self,
+        relay_url: &str,
+        identity_code: &str,
+    ) -> Result<()> {
         let ws_scheme = if relay_url.starts_with("https://") {
             relay_url.replace("https://", "wss://")
         } else {
@@ -863,9 +932,10 @@ impl AstationClient {
         self.send_message(AstationMessage::StatusUpdate {
             status: "hello".to_string(),
             data: hello_data,
-        }).await?;
+        })
+        .await?;
 
-        Ok(())
+        self.authenticate(Duration::from_secs(300)).await
     }
 
     /// Register with the relay service and get a pairing code.
@@ -902,7 +972,64 @@ impl AstationClient {
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
     }
+}
 
+type HmacSha256 = Hmac<Sha256>;
+
+fn resolved_atem_id(hostname: &str) -> String {
+    if let Some(existing) = AtemConfig::stored_atem_id() {
+        return existing;
+    }
+    let atem_id = build_atem_id(hostname, &AtemConfig::ensure_instance_id());
+    AtemConfig::store_atem_id(&atem_id);
+    atem_id
+}
+
+fn device_auth_proof(
+    token: &str,
+    challenge: &str,
+    astation_id: &str,
+    atem_id: &str,
+    session_id: &str,
+) -> Result<String> {
+    let canonical = format!(
+        "astation-auth-v2\n{}\n{}\n{}\n{}",
+        challenge, astation_id, atem_id, session_id
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
+        .map_err(|_| anyhow!("Invalid device authentication key"))?;
+    mac.update(canonical.as_bytes());
+    Ok(mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect())
+}
+
+fn read_local_bootstrap_token() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let path = dirs::data_dir()?
+        .join("Astation")
+        .join("local-bootstrap-token");
+
+    #[cfg(not(target_os = "macos"))]
+    return None;
+
+    #[cfg(target_os = "macos")]
+    read_local_bootstrap_token_from(&path)
+}
+
+#[cfg(unix)]
+fn read_local_bootstrap_token_from(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return None;
+    }
+    let token = fs::read_to_string(path).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
 /// Length of the host segment of an `atem_id` (truncated or padded to this).
@@ -983,6 +1110,42 @@ fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_auth_proof_matches_protocol_vector() {
+        let proof = device_auth_proof(
+            "token-abc",
+            "challenge-123",
+            "astation-home",
+            "atem-office",
+            "session-456",
+        )
+        .unwrap();
+
+        assert_eq!(
+            proof,
+            "9fde5ba861c1a159d377b89e6fb3f92d245795998af958f5db3ad343d589d0ba"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_bootstrap_token_requires_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local-bootstrap-token");
+        fs::write(&path, "bootstrap-secret\n").unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_local_bootstrap_token_from(&path).as_deref(),
+            Some("bootstrap-secret")
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_local_bootstrap_token_from(&path), None);
+    }
 
     // --- Serialization round-trip tests ---
 

@@ -7,6 +7,10 @@
 # ── Astation ─────────────────────────────────────────────────────────
 # astation_ws         = "ws://127.0.0.1:8080/ws"
 # astation_relay_url  = "https://station.agora.build"
+# astation_relay_code = "astation-..." # learned automatically after authentication
+#
+# For an offline LAN connection, point astation_ws at the Mac running Astation:
+# astation_ws = "ws://192.168.1.20:8080/ws"
 
 # ── Diagram hosting server ───────────────────────────────────────────
 # diagram_server_url = "http://localhost:8787"
