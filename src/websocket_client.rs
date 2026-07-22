@@ -569,7 +569,11 @@ impl AstationClient {
                         // Session auth successful - refresh and save
                         if let Some(session) = session_mgr.get_mut(&astation_id) {
                             session.refresh();
-                            self.save_session_manager(&session_mgr)?;
+                            if let Err(error) = self.save_session_manager(&session_mgr) {
+                                eprintln!(
+                                    "Warning: could not refresh saved Astation session: {error}"
+                                );
+                            }
                         }
                         return Ok(());
                     }
@@ -1466,6 +1470,94 @@ mod tests {
             .await
             .expect_err("pairing unexpectedly ignored session persistence failure");
         assert!(error.to_string().contains("Failed to open private file"));
+        assert_eq!(
+            fs::read_to_string(target_path).unwrap(),
+            "must remain unchanged"
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn practical_websocket_reconnect_survives_session_refresh_failure() {
+        use std::os::unix::fs::symlink;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("sessions.json");
+        let target_path = directory.path().join("protected-target");
+        let astation_id = "astation-refresh-failure".to_string();
+
+        let mut sessions = crate::auth::SessionManager::default();
+        sessions.insert_session(crate::auth::AuthSession::new(
+            "session-existing".to_string(),
+            "token-existing".to_string(),
+            astation_id.clone(),
+            "test-machine".to_string(),
+        ));
+        sessions.save_to(&session_path).unwrap();
+
+        let server_session_path = session_path.clone();
+        let server_target_path = target_path.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), astation_id),
+                    ("challenge".to_string(), "f".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let request = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("timed out waiting for session proof")
+                .expect("Atem closed before session proof")
+                .expect("failed to read session proof");
+            assert!(matches!(request, Message::Text(_)));
+
+            fs::remove_file(&server_session_path).unwrap();
+            fs::write(&server_target_path, "must remain unchanged").unwrap();
+            symlink(&server_target_path, &server_session_path).unwrap();
+            let authenticated = AstationMessage::StatusUpdate {
+                status: "authenticated".to_string(),
+                data: std::collections::HashMap::from([(
+                    "method".to_string(),
+                    "session_proof".to_string(),
+                )]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&authenticated).unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut client =
+            AstationClient::new_with_test_state("atem-test-refresh-failure", session_path);
+        client
+            .connect_without_pairing(&format!("ws://{address}"))
+            .await
+            .expect("session metadata failure aborted an authenticated reconnect");
+        assert!(client.sender.is_some());
         assert_eq!(
             fs::read_to_string(target_path).unwrap(),
             "must remain unchanged"
