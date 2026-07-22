@@ -289,6 +289,8 @@ pub struct AstationClient {
     transport_tasks: Vec<tokio::task::JoinHandle<()>>,
     atem_id_override: Option<String>,
     session_path_override: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    relay_code_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
 }
@@ -301,6 +303,8 @@ impl AstationClient {
             transport_tasks: Vec::new(),
             atem_id_override: None,
             session_path_override: None,
+            #[cfg(test)]
+            relay_code_path_override: None,
             ws_closed: false,
         }
     }
@@ -309,6 +313,7 @@ impl AstationClient {
     fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
         let mut client = Self::new();
         client.atem_id_override = Some(atem_id.to_string());
+        client.relay_code_path_override = Some(session_path.with_file_name("relay-code"));
         client.session_path_override = Some(session_path);
         client
     }
@@ -337,6 +342,16 @@ impl AstationClient {
         let mut manager = self.load_session_manager()?;
         manager.insert_session(session);
         self.save_session_manager(&manager)
+    }
+
+    fn remember_astation_relay_code(&self, astation_id: &str) {
+        #[cfg(test)]
+        if let Some(path) = self.relay_code_path_override.as_deref() {
+            let _ = fs::write(path, astation_id);
+            return;
+        }
+
+        AtemConfig::store_astation_relay_code(astation_id);
     }
 
     fn abort_transport(&mut self) {
@@ -525,7 +540,7 @@ impl AstationClient {
             })
             .await?;
 
-            return match self.wait_for_auth_response(&astation_id).await? {
+            return match self.wait_for_auth_response(&astation_id, false).await? {
                 Some(AuthResponse::Authenticated) => Ok(()),
                 Some(AuthResponse::Denied(message)) => {
                     Err(anyhow!("Local authentication denied: {}", message))
@@ -563,7 +578,10 @@ impl AstationClient {
             self.send_message(auth_msg).await?;
 
             // Wait for response
-            if let Some(response) = self.wait_for_auth_response(&astation_id).await? {
+            if let Some(response) = self
+                .wait_for_auth_response(&astation_id, transport == "relay")
+                .await?
+            {
                 match response {
                     AuthResponse::Authenticated => {
                         // Session auth successful - refresh and save
@@ -592,11 +610,17 @@ impl AstationClient {
         }
 
         // Session auth failed or no session - use explicit pairing.
-        self.authenticate_with_pairing(&astation_id, &atem_id).await
+        self.authenticate_with_pairing(&astation_id, &atem_id, transport == "relay")
+            .await
     }
 
     /// Authenticate using pairing code (fallback when session invalid/missing)
-    async fn authenticate_with_pairing(&mut self, astation_id: &str, atem_id: &str) -> Result<()> {
+    async fn authenticate_with_pairing(
+        &mut self,
+        astation_id: &str,
+        atem_id: &str,
+        remember_relay: bool,
+    ) -> Result<()> {
         // Generate pairing code
         let pairing_code = crate::auth::generate_otp();
         let hostname = crate::auth::get_hostname();
@@ -620,7 +644,7 @@ impl AstationClient {
         // Wait for pairing response (longer timeout for user to approve)
         let response = tokio::time::timeout(
             Duration::from_secs(300), // 5 minutes for user to approve
-            self.wait_for_auth_response(astation_id)
+            self.wait_for_auth_response(astation_id, remember_relay)
         )
         .await
         .map_err(|_| anyhow!("Pairing timed out after 5 minutes"))??;
@@ -644,7 +668,11 @@ impl AstationClient {
     }
 
     /// Wait for auth response message and extract session if granted
-    async fn wait_for_auth_response(&mut self, astation_id: &str) -> Result<Option<AuthResponse>> {
+    async fn wait_for_auth_response(
+        &mut self,
+        astation_id: &str,
+        remember_relay: bool,
+    ) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
             match msg {
                 AstationMessage::StatusUpdate { status, data } if status == "auth" => {
@@ -667,7 +695,9 @@ impl AstationClient {
                                 );
 
                                 self.persist_session(session)?;
-                                AtemConfig::store_astation_relay_code(astation_id);
+                                if remember_relay {
+                                    self.remember_astation_relay_code(astation_id);
+                                }
                                 return Ok(Some(AuthResponse::Authenticated));
                             }
                             "denied" => {
@@ -682,7 +712,9 @@ impl AstationClient {
                 }
                 AstationMessage::StatusUpdate { status, data: _ } if status == "authenticated" => {
                     // Alternative authenticated message format
-                    AtemConfig::store_astation_relay_code(astation_id);
+                    if remember_relay {
+                        self.remember_astation_relay_code(astation_id);
+                    }
                     return Ok(Some(AuthResponse::Authenticated));
                 }
                 AstationMessage::StatusUpdate { status, data } if status == "error" => {
@@ -1474,6 +1506,7 @@ mod tests {
             fs::read_to_string(target_path).unwrap(),
             "must remain unchanged"
         );
+        assert!(!directory.path().join("relay-code").exists());
         server.await.unwrap();
     }
 
@@ -1562,6 +1595,7 @@ mod tests {
             fs::read_to_string(target_path).unwrap(),
             "must remain unchanged"
         );
+        assert!(!directory.path().join("relay-code").exists());
         server.await.unwrap();
     }
 
