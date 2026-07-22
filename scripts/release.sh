@@ -88,8 +88,9 @@ fi
 
 # ── Update Cargo.toml ───────────────────────────────────────────────
 echo "Updating $CARGO_TOML..."
-# macOS/Linux portable: use a backup suffix then delete it
-sed -i.bak -E "0,/^version[[:space:]]*=/{s/^(version[[:space:]]*=[[:space:]]*)\"[^\"]+\"/\1\"$TARGET\"/}" "$CARGO_TOML"
+# macOS/Linux portable: use a backup suffix then delete it. Cargo.toml has one
+# top-level package version, so an anchored substitution needs no GNU address.
+sed -i.bak -E "s/^(version[[:space:]]*=[[:space:]]*)\"[^\"]+\"/\1\"$TARGET\"/" "$CARGO_TOML"
 rm -f "$CARGO_TOML.bak"
 
 NEW_VER="$(grep -m1 '^version' "$CARGO_TOML" | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
