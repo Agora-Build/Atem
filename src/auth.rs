@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::time::Duration;
 
 const DEFAULT_SERVER_URL: &str = "https://station.agora.build";
@@ -68,15 +69,15 @@ impl SessionManager {
     /// Returns empty SessionManager if file doesn't exist.
     pub fn load() -> Result<Self> {
         let path = Self::sessions_path()?;
+        Self::load_from(&path)
+    }
 
-        if !path.exists() {
+    pub(crate) fn load_from(path: &std::path::Path) -> Result<Self> {
+        let Some(content) = read_private_file(path)? else {
             return Ok(Self::default());
-        }
+        };
 
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow!("Failed to read sessions file: {}", e))?;
-
-        let manager: SessionManager = serde_json::from_str(&content)
+        let manager: SessionManager = serde_json::from_slice(&content)
             .map_err(|e| anyhow!("Failed to parse sessions file: {}", e))?;
 
         Ok(manager)
@@ -85,18 +86,21 @@ impl SessionManager {
     /// Save all sessions to disk.
     pub fn save(&self) -> Result<()> {
         let path = Self::sessions_path()?;
+        self.save_to(&path)
+    }
 
+    pub(crate) fn save_to(&self, path: &std::path::Path) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("Failed to create config directory: {}", e))?;
+            set_private_directory_permissions(parent)?;
         }
 
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow!("Failed to serialize sessions: {}", e))?;
 
-        std::fs::write(&path, json)
-            .map_err(|e| anyhow!("Failed to write sessions file: {}", e))?;
+        write_private_file(path, json.as_bytes())?;
 
         Ok(())
     }
@@ -113,9 +117,13 @@ impl SessionManager {
 
     /// Save or update a session for a specific Astation.
     pub fn save_session(&mut self, session: AuthSession) -> Result<()> {
+        self.insert_session(session);
+        self.save()
+    }
+
+    pub(crate) fn insert_session(&mut self, session: AuthSession) {
         let astation_id = session.astation_id.clone();
         self.sessions.insert(astation_id, session);
-        self.save()
     }
 
     /// Remove a session for a specific Astation.
@@ -141,6 +149,104 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("Could not determine config directory"))?;
         Ok(config_dir.join("atem").join("sessions.json"))
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn set_private_directory_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| anyhow!("Failed to secure config directory: {}", e))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_private_directory_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_file(file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|e| anyhow!("Failed to inspect private file: {}", e))?;
+    let current_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != current_uid {
+        return Err(anyhow!("Private file must be a regular file owned by the current user"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_file(file: &fs::File) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .map_err(|e| anyhow!("Failed to inspect private file: {}", e))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("Private file must be a regular file"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow!("Failed to secure sessions file: {}", e))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_file: &fs::File) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn read_private_file(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(anyhow!("Failed to open private file: {}", error)),
+    };
+    validate_private_file(&file)?;
+    // Repair pre-v2 files before bearer tokens are read into memory.
+    set_private_file_permissions(&file)?;
+
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|e| anyhow!("Failed to read private file: {}", e))?;
+    Ok(Some(contents))
+}
+
+pub(crate) fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| anyhow!("Failed to open private file: {}", e))?;
+    validate_private_file(&file)?;
+    set_private_file_permissions(&file)?;
+    file.set_len(0)
+        .map_err(|e| anyhow!("Failed to truncate private file: {}", e))?;
+    file.write_all(contents)
+        .map_err(|e| anyhow!("Failed to write private file: {}", e))?;
+    file.sync_all()
+        .map_err(|e| anyhow!("Failed to sync private file: {}", e))
 }
 
 /// Generate a random 8-digit OTP code.
@@ -335,6 +441,54 @@ pub async fn run_login_flow(server_url: Option<&str>, astation_id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_write_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        write_private_file(&path, br#"{"token":"secret"}"#).unwrap();
+
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), br#"{"token":"secret"}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_read_repairs_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        fs::write(&path, br#"{"token":"secret"}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            read_private_file(&path).unwrap().unwrap(),
+            br#"{"token":"secret"}"#
+        );
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_io_refuses_symlinks_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.json");
+        let link = directory.path().join("sessions.json");
+        fs::write(&target, b"target contents").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(read_private_file(&link).is_err());
+        assert!(write_private_file(&link, b"replacement").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"target contents");
+    }
 
     #[test]
     fn otp_is_8_digits() {

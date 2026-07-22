@@ -1,214 +1,70 @@
-# ✅ Relay Server Support - COMPLETE
+# Astation Identity Relay
 
-## Summary
+Status: device authentication v2 is implemented for Atem identity-room clients.
+The relay still has production security blockers listed below.
 
-Full universal session support for relay connections is now **COMPLETE**!
+## Roles
 
-The solution uses the **astation_id as the room code**, enabling session-based auth through the relay with **zero relay server changes**.
+- Astation connects to `role=astation` using its stable identity as the room.
+- Atem connects to `role=atem` with the target `astation_relay_code` and its
+  stable, percent-encoded `atem_id`.
+- The relay routes per-Atem envelopes between the room owner and each client.
+- Astation remains the device-authentication authority.
 
----
+## Reconnect flow
 
-## How It Works
-
-### Architecture
-
-```
-Atem → Relay → Astation
-
-Both connect to relay using astation_id as the room code:
-- Astation: ?role=astation&code=<astation_id>
-- Atem: ?role=atem&code=<astation_id>
-
-Relay creates room and forwards all messages bidirectionally.
-Session auth happens via WebSocket messages (transparent to relay).
+```text
+Atem -> relay: connect to identity room, then hello
+Atem <- relay <- Astation: auth_required {challenge, astation_id, protocol=2}
+Atem -> relay -> Astation: auth {session_id, atem_id, proof}
+Atem <- relay <- Astation: authenticated
 ```
 
-### Flow
+The relay must not interpret `hello` or a session ID as authorization. It binds
+a pending session claim only after observing Astation's authenticated/granted
+response. Until that point Astation rejects application messages and does not
+send account credentials.
 
-**1. Astation connects to relay:**
-```
-wss://station.agora.build/ws?role=astation&code=astation-abc123...
-```
-- Uses its own identity as the room code
-- Relay creates/joins room "astation-abc123..."
-
-**2. Atem connects to relay:**
-```
-wss://station.agora.build/ws?role=atem&code=astation-abc123...
-```
-- Uses the target Astation's ID (from config) as room code
-- Relay pairs them in the same room
-- Messages forwarded bidirectionally
-
-**3. Session auth via messages:**
-```
-Atem → Relay → Astation: { status: "auth_required", astation_id: "..." }
-Atem ← Relay ← Astation: { status: "auth", session_id: "..." }
-Atem → Relay → Astation: Session validated → authenticated
-```
-- Auth happens end-to-end
-- Relay just forwards messages
-- Universal session system works transparently
-
----
+When Atem has no valid session, the same socket carries an eight-digit pairing
+code. Astation shows the device and code for approval, then returns a new token
+through the WSS connection.
 
 ## Configuration
 
-### Atem (`~/.config/atem/config.toml`)
-
 ```toml
-# Local/VPN connection
-astation_ws = "ws://127.0.0.1:8080/ws"
-
-# Relay connection
 astation_relay_url = "https://station.agora.build"
-astation_relay_code = "astation-abc123-def456..."  # The Astation's identity
+astation_relay_code = "astation-..."
 ```
 
-**Get the Astation ID:**
-- On macOS: `cat ~/Library/Application\ Support/Astation/identity.txt`
-- Or: Check Astation settings UI (shows identity)
+The identity code is learned and persisted after successful authentication. It
+is an Astation routing identifier, not an authentication secret; a saved v2
+session is still required for automatic reconnect.
 
-### Astation
+## Pairing rooms
 
-**No config changes needed!**
-- Astation already has its persistent identity
-- Just needs to connect to relay with its identity as code
-- (This would be implemented in Astation's relay client)
+The legacy `/api/pair` room remains available for discovering/connecting an
+Astation. Identity rooms are used for persistent reconnect after Atem knows the
+target `astation_id`. Device proof is required after either transport connects.
 
----
+## Production blockers
 
-## Connection Priority
+1. Authenticate `role=astation` before creating or replacing an identity-room
+   owner. A stable room code alone does not establish ownership.
+2. Require authenticated device context on Voice, LLM, Vault, and RTC owner
+   APIs rather than trusting a bare session ID.
+3. Make disconnect/replacement cleanup connection-generation aware so an old
+   socket cannot remove its replacement.
+4. Apply explicit WebSocket admission, message-size, and message-rate limits.
+5. Add device revocation and session rotation controls.
 
-With the new configuration, Atem tries connections in this order:
+These blockers mean the relay should not yet be described as a complete
+production authorization boundary, even though the Atem-to-Astation v2 proof is
+implemented.
 
-1. **Local WebSocket** (`astation_ws`)
-   - Try with session auth → auto-authenticated if session valid
-   - Try without auth → works for localhost
+## Verification
 
-2. **Relay with astation_id** (`astation_relay_code` configured)
-   - Connect to relay room using astation_id
-   - Session auth via messages → auto-authenticated if session valid
-   - Fallback to pairing if session expired → user approves → new session saved
-
-3. **Legacy relay pairing** (no `astation_relay_code`)
-   - Old flow: register for pairing code, show code to user
-   - Still works for backward compatibility
-
----
-
-## Benefits
-
-✅ **Universal sessions work through relay** - Same session for local and relay
-✅ **No re-pairing when switching** - Local fails → relay takes over seamlessly
-✅ **Zero relay changes** - Relay is a dumb pipe, just forwards messages
-✅ **Simple configuration** - Just add astation_relay_code to config
-✅ **Backward compatible** - Old pairing flow still works as fallback
-
----
-
-## Testing Checklist
-
-- [ ] Get Astation identity: `cat ~/Library/Application\ Support/Astation/identity.txt`
-- [ ] Add to Atem config: `astation_relay_code = "<identity>"`
-- [ ] Test local connection: Works ✅ (already tested)
-- [ ] Test relay connection: Atem connects via relay using astation_id as code
-- [ ] Test session through relay: Auto-authenticated (no pairing)
-- [ ] Test pairing through relay: User approves → new session saved
-- [ ] Test endpoint switching: Local → Relay without re-pairing
-
----
-
-## Implementation Details
-
-### Files Modified
-
-**Atem:**
-- `src/config.rs`: Added `astation_relay_code` field + env var support
-- `src/app.rs`: Updated relay connection to use astation_id as code
-- `configs/config.example.toml`: Documented new config option
-- `designs/relay-support.md`: This file
-
-**Astation:**
-- `AstationWebSocketServer.swift`: Handles session verification requests
-- `relay-server/src/session_verify.rs`: Caching infrastructure (for future use)
-- `relay-server/src/main.rs`: Added SessionVerifyCache to AppState
-
-**Relay Server:**
-- No changes needed! Uses existing room-based pairing with astation_id as code
-
-### Code Example (Atem)
-
-```rust
-// app.rs - Relay connection logic
-if let Some(astation_id) = config.astation_relay_code.as_ref() {
-    // Use astation_id as the room code
-    let relay_url = format!("{}/ws?role=atem&code={}", relay_ws_url, astation_id);
-    let mut client = AstationClient::new();
-    if let Ok(()) = client.connect(&relay_url).await {
-        // Session auth happens via WebSocket messages (authenticate() called in connect())
-        return Ok(client);
-    }
-}
-```
-
-### Code Example (Astation - Future)
-
-```swift
-// Connect to relay using own identity as room code
-let relayUrl = "wss://station.agora.build/ws?role=astation&code=\(AstationIdentity.shared.id)"
-// Then just forward messages as usual
-```
-
----
-
-## Remaining Work
-
-### Astation Relay Connection
-
-**TODO:** Implement Astation → Relay connection using astation_id as code.
-
-Currently Astation only runs a local WebSocket server. To support relay, it needs to:
-1. Connect to relay: `wss://station.agora.build/ws?role=astation&code=<astation_id>`
-2. Forward messages from relay to local clients (and vice versa)
-3. Handle both local and relay connections simultaneously
-
-**Estimated time:** 2-4 hours
-
-**Files to modify:**
-- Create `AstationRelayClient.swift` (similar to local WebSocket client)
-- Update `AstationHubManager.swift` to manage both local and relay connections
-- Add relay toggle in Settings UI
-
-**Not blocking Atem:** Atem side is complete and ready to use relay with astation_id!
-
----
-
-## Verification Infrastructure (Bonus)
-
-The session verification infrastructure (SessionVerifyCache, verification protocol) is implemented but not currently used since the relay acts as a pure proxy.
-
-**Future use cases:**
-- Relay-side session enforcement (rate limiting per session)
-- Session analytics (track relay usage per Astation)
-- Multi-hop relay chains (relay → relay → Astation)
-
----
-
-## Summary
-
-**Status:** ✅ **COMPLETE** (Atem side)
-
-Atem can now:
-- Connect to relay using astation_id as room code
-- Use universal sessions through relay
-- No re-pairing when switching local ↔ relay
-- Automatic fallback to pairing if session expired
-
-**Next step:** Implement Astation → Relay connection (separate task)
-
-**Ready to deploy:** Yes! Atem universal sessions work end-to-end:
-- Local ✅
-- LAN ✅
-- VPN ✅
-- Relay ✅ (pending Astation relay client)
+- Confirm `hello` only triggers an Astation challenge.
+- Confirm application messages before proof are rejected.
+- Confirm a valid LAN-created session authenticates through the identity relay.
+- Confirm an invalid proof falls back to pairing on the same socket.
+- Confirm two Atem IDs remain independently connected in one Astation room.

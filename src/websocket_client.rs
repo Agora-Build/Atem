@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -283,6 +286,11 @@ pub struct AtemInstance {
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<AstationMessage>>,
     receiver: Option<mpsc::UnboundedReceiver<AstationMessage>>,
+    transport_tasks: Vec<tokio::task::JoinHandle<()>>,
+    atem_id_override: Option<String>,
+    session_path_override: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    relay_code_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
 }
@@ -292,8 +300,67 @@ impl AstationClient {
         Self {
             sender: None,
             receiver: None,
+            transport_tasks: Vec::new(),
+            atem_id_override: None,
+            session_path_override: None,
+            #[cfg(test)]
+            relay_code_path_override: None,
             ws_closed: false,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
+        let mut client = Self::new();
+        client.atem_id_override = Some(atem_id.to_string());
+        client.relay_code_path_override = Some(session_path.with_file_name("relay-code"));
+        client.session_path_override = Some(session_path);
+        client
+    }
+
+    fn resolved_atem_id(&self, hostname: &str) -> String {
+        self.atem_id_override
+            .clone()
+            .unwrap_or_else(|| resolved_atem_id(hostname))
+    }
+
+    fn load_session_manager(&self) -> Result<crate::auth::SessionManager> {
+        match self.session_path_override.as_deref() {
+            Some(path) => crate::auth::SessionManager::load_from(path),
+            None => crate::auth::SessionManager::load(),
+        }
+    }
+
+    fn save_session_manager(&self, manager: &crate::auth::SessionManager) -> Result<()> {
+        match self.session_path_override.as_deref() {
+            Some(path) => manager.save_to(path),
+            None => manager.save(),
+        }
+    }
+
+    fn persist_session(&self, session: crate::auth::AuthSession) -> Result<()> {
+        let mut manager = self.load_session_manager()?;
+        manager.insert_session(session);
+        self.save_session_manager(&manager)
+    }
+
+    fn remember_astation_relay_code(&self, astation_id: &str) {
+        #[cfg(test)]
+        if let Some(path) = self.relay_code_path_override.as_deref() {
+            let _ = fs::write(path, astation_id);
+            return;
+        }
+
+        AtemConfig::store_astation_relay_code(astation_id);
+    }
+
+    fn abort_transport(&mut self) {
+        self.sender = None;
+        self.receiver = None;
+        for task in self.transport_tasks.drain(..) {
+            task.abort();
+        }
+        self.ws_closed = true;
     }
 
     /// Connect to Astation using a saved auth session.
@@ -302,19 +369,38 @@ impl AstationClient {
     pub async fn connect_with_session(&mut self, base_url: &str, _session_id: &str) -> Result<()> {
         // Session auth now happens inside connect() via authenticate()
         // The session_id parameter is ignored - session is loaded from disk
-        self.connect(base_url).await
+        self.connect_without_pairing(base_url).await
     }
 
     /// Connect WebSocket and authenticate (local Astation connections).
     pub async fn connect(&mut self, url: &str) -> Result<()> {
+        self.connect_with_auth_mode(url, true).await
+    }
+
+    /// Connect using an existing proof or same-user bootstrap without prompting.
+    pub async fn connect_without_pairing(&mut self, url: &str) -> Result<()> {
+        self.connect_with_auth_mode(url, false).await
+    }
+
+    async fn connect_with_auth_mode(&mut self, url: &str, allow_pairing: bool) -> Result<()> {
         self.connect_raw(url).await?;
-        self.authenticate(Duration::from_secs(5)).await?;
-        Ok(())
+        let result = self
+            .authenticate(
+                Duration::from_secs(5),
+                Duration::from_secs(300),
+                allow_pairing,
+            )
+            .await;
+        if result.is_err() {
+            self.abort_transport();
+        }
+        result
     }
 
     /// Connect WebSocket transport only, without authentication.
     /// Used by relay flow where auth happens separately after code exchange.
     pub async fn connect_raw(&mut self, url: &str) -> Result<()> {
+        self.abort_transport();
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
@@ -325,7 +411,7 @@ impl AstationClient {
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AstationMessage>();
 
         // Spawn task to handle outgoing messages
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             while let Some(message) = msg_rx.recv().await {
                 if let Ok(json) = serde_json::to_string(&message) {
                     if let Err(_) = write.send(Message::Text(json)).await {
@@ -336,7 +422,7 @@ impl AstationClient {
         });
 
         // Spawn task to handle incoming messages
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
@@ -359,6 +445,7 @@ impl AstationClient {
 
         self.sender = Some(msg_tx);
         self.receiver = Some(rx);
+        self.transport_tasks = vec![writer_task, reader_task];
         self.ws_closed = false;
 
         Ok(())
@@ -366,12 +453,18 @@ impl AstationClient {
 
     /// Authenticate with Astation after WebSocket connection.
     /// Waits for auth_required, then sends session ID or pairing code.
-    /// `auth_timeout` controls how long to wait for Astation to send auth_required
-    /// (5s for local, 5 minutes for relay where user enters code manually).
-    async fn authenticate(&mut self, auth_timeout: Duration) -> Result<()> {
+    /// `challenge_timeout` controls how long to wait for `auth_required`.
+    /// `completion_timeout` bounds everything after the challenge, including
+    /// session proof and interactive pairing.
+    async fn authenticate(
+        &mut self,
+        challenge_timeout: Duration,
+        completion_timeout: Duration,
+        allow_pairing: bool,
+    ) -> Result<()> {
         // Wait for auth_required message (with timeout)
         let auth_required = tokio::time::timeout(
-            auth_timeout,
+            challenge_timeout,
             self.wait_for_message(|msg| {
                 matches!(msg, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
             })
@@ -380,24 +473,103 @@ impl AstationClient {
         .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
         .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
 
-        // Extract astation_id from auth_required message
-        let astation_id = if let AstationMessage::StatusUpdate { data, .. } = &auth_required {
-            data.get("astation_id")
-                .ok_or_else(|| anyhow!("auth_required missing astation_id"))?
-                .clone()
-        } else {
-            return Err(anyhow!("Invalid auth_required message"));
-        };
+        tokio::time::timeout(
+            completion_timeout,
+            self.authenticate_after_challenge(auth_required, allow_pairing),
+        )
+        .await
+        .map_err(|_| anyhow!("Authentication timed out"))?
+    }
+
+    async fn authenticate_after_challenge(
+        &mut self,
+        auth_required: AstationMessage,
+        allow_pairing: bool,
+    ) -> Result<()> {
+        // Extract the server identity and challenge from auth_required.
+        let (astation_id, challenge, transport, protocol) =
+            if let AstationMessage::StatusUpdate { data, .. } = &auth_required {
+                let astation_id = data
+                    .get("astation_id")
+                    .ok_or_else(|| anyhow!("auth_required missing astation_id"))?
+                    .clone();
+                (
+                    astation_id,
+                    data.get("challenge").cloned(),
+                    data.get("transport").cloned(),
+                    data.get("protocol").cloned(),
+                )
+            } else {
+                return Err(anyhow!("Invalid auth_required message"));
+            };
+
+        if protocol.as_deref() != Some("2") {
+            return Err(anyhow!("Astation authentication protocol v2 is required"));
+        }
+        let challenge = challenge
+            .as_deref()
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| anyhow!("Invalid Astation authentication challenge"))?;
+        let transport = transport
+            .as_deref()
+            .filter(|value| matches!(*value, "loopback" | "lan" | "relay"))
+            .ok_or_else(|| anyhow!("Invalid Astation authentication transport"))?;
+
+        let hostname = crate::auth::get_hostname();
+        let atem_id = self.resolved_atem_id(&hostname);
+
+        if transport == "loopback" {
+            let token = read_local_bootstrap_token()
+                .ok_or_else(|| anyhow!("Astation local bootstrap token is unavailable"))?;
+            let mut auth_data = std::collections::HashMap::new();
+            auth_data.insert("method".to_string(), "local_proof".to_string());
+            auth_data.insert("atem_id".to_string(), atem_id.clone());
+            auth_data.insert("hostname".to_string(), hostname.clone());
+            auth_data.insert(
+                "proof".to_string(),
+                device_auth_proof(&token, challenge, &astation_id, &atem_id, "local")?,
+            );
+            self.send_message(AstationMessage::StatusUpdate {
+                status: "auth".to_string(),
+                data: auth_data,
+            })
+            .await?;
+
+            return match self.wait_for_auth_response(&astation_id).await? {
+                Some(AuthResponse::Authenticated) => Ok(()),
+                Some(AuthResponse::Denied(message)) => {
+                    Err(anyhow!("Local authentication denied: {}", message))
+                }
+                Some(AuthResponse::SessionExpired) => {
+                    Err(anyhow!("Unexpected local session expiry"))
+                }
+                None => Err(anyhow!("Connection closed during local authentication")),
+            };
+        }
 
         // Load session manager
-        let mut session_mgr = crate::auth::SessionManager::load()
-            .unwrap_or_default();
+        let mut session_mgr = self.load_session_manager()?;
 
         // Try session-based auth first if we have a saved session for this Astation
         if let Some(session) = session_mgr.get(&astation_id) {
-            // Send session auth
             let mut auth_data = std::collections::HashMap::new();
             auth_data.insert("session_id".to_string(), session.session_id.clone());
+            auth_data.insert("atem_id".to_string(), atem_id.clone());
+            auth_data.insert(
+                "proof".to_string(),
+                device_auth_proof(
+                    &session.token,
+                    challenge,
+                    &astation_id,
+                    &atem_id,
+                    &session.session_id,
+                )?,
+            );
 
             let auth_msg = AstationMessage::StatusUpdate {
                 status: "auth".to_string(),
@@ -412,7 +584,11 @@ impl AstationClient {
                         // Session auth successful - refresh and save
                         if let Some(session) = session_mgr.get_mut(&astation_id) {
                             session.refresh();
-                            let _ = session_mgr.save();
+                            if let Err(error) = self.save_session_manager(&session_mgr) {
+                                eprintln!(
+                                    "Warning: could not refresh saved Astation session: {error}"
+                                );
+                            }
                         }
                         return Ok(());
                     }
@@ -426,12 +602,16 @@ impl AstationClient {
             }
         }
 
-        // Session auth failed or no session - use pairing
-        self.authenticate_with_pairing(&astation_id).await
+        if !allow_pairing {
+            return Err(anyhow!("Pairing required; run 'atem pair'"));
+        }
+
+        // Session auth failed or no session - use explicit pairing.
+        self.authenticate_with_pairing(&astation_id, &atem_id).await
     }
 
     /// Authenticate using pairing code (fallback when session invalid/missing)
-    async fn authenticate_with_pairing(&mut self, astation_id: &str) -> Result<()> {
+    async fn authenticate_with_pairing(&mut self, astation_id: &str, atem_id: &str) -> Result<()> {
         // Generate pairing code
         let pairing_code = crate::auth::generate_otp();
         let hostname = crate::auth::get_hostname();
@@ -444,6 +624,7 @@ impl AstationClient {
         let mut auth_data = std::collections::HashMap::new();
         auth_data.insert("pairing_code".to_string(), pairing_code.clone());
         auth_data.insert("hostname".to_string(), hostname.clone());
+        auth_data.insert("atem_id".to_string(), atem_id.to_string());
 
         let auth_msg = AstationMessage::StatusUpdate {
             status: "auth".to_string(),
@@ -486,23 +667,22 @@ impl AstationClient {
                     if let Some(auth_status) = data.get("status") {
                         match auth_status.as_str() {
                             "granted" => {
-                                // Save new session if provided
-                                if let (Some(session_id), Some(token)) =
-                                    (data.get("session_id"), data.get("token"))
-                                {
-                                    let hostname = crate::auth::get_hostname();
-                                    let session = crate::auth::AuthSession::new(
-                                        session_id.clone(),
-                                        token.clone(),
-                                        astation_id.to_string(),
-                                        hostname,
-                                    );
+                                let session_id = data.get("session_id").ok_or_else(|| {
+                                    anyhow!("Pairing response missing session ID")
+                                })?;
+                                let token = data.get("token").ok_or_else(|| {
+                                    anyhow!("Pairing response missing session token")
+                                })?;
+                                let hostname = crate::auth::get_hostname();
+                                let session = crate::auth::AuthSession::new(
+                                    session_id.clone(),
+                                    token.clone(),
+                                    astation_id.to_string(),
+                                    hostname,
+                                );
 
-                                    // Save to session manager
-                                    let mut session_mgr = crate::auth::SessionManager::load()
-                                        .unwrap_or_default();
-                                    let _ = session_mgr.save_session(session);
-                                }
+                                self.persist_session(session)?;
+                                self.remember_astation_relay_code(astation_id);
                                 return Ok(Some(AuthResponse::Authenticated));
                             }
                             "denied" => {
@@ -517,11 +697,13 @@ impl AstationClient {
                 }
                 AstationMessage::StatusUpdate { status, data: _ } if status == "authenticated" => {
                     // Alternative authenticated message format
+                    self.remember_astation_relay_code(astation_id);
                     return Ok(Some(AuthResponse::Authenticated));
                 }
                 AstationMessage::StatusUpdate { status, data } if status == "error" => {
                     if let Some(msg) = data.get("message") {
-                        if msg.contains("expired") || msg.contains("Session expired") {
+                        let lower = msg.to_ascii_lowercase();
+                        if lower.contains("expired") || lower.contains("pairing required") {
                             return Ok(Some(AuthResponse::SessionExpired));
                         }
                         return Ok(Some(AuthResponse::Denied(msg.clone())));
@@ -831,8 +1013,32 @@ impl AstationClient {
     /// After `atem pair`, Atem stores the identity as `astation_relay_code` in config.
     /// The TUI calls this to auto-connect without a new `atem pair`.
     ///
-    /// Flow: connect_raw → send "hello" → Astation calls addClient → sends credentialSync.
-    pub async fn connect_relay_identity(&mut self, relay_url: &str, identity_code: &str) -> Result<()> {
+    /// Flow: connect_raw → hello → challenge/response authentication.
+    pub async fn connect_relay_identity(
+        &mut self,
+        relay_url: &str,
+        identity_code: &str,
+    ) -> Result<()> {
+        self.connect_relay_identity_with_mode(relay_url, identity_code, true)
+            .await
+    }
+
+    /// Reconnect to an identity room using existing credentials only.
+    pub async fn connect_relay_identity_without_pairing(
+        &mut self,
+        relay_url: &str,
+        identity_code: &str,
+    ) -> Result<()> {
+        self.connect_relay_identity_with_mode(relay_url, identity_code, false)
+            .await
+    }
+
+    async fn connect_relay_identity_with_mode(
+        &mut self,
+        relay_url: &str,
+        identity_code: &str,
+        allow_pairing: bool,
+    ) -> Result<()> {
         let ws_scheme = if relay_url.starts_with("https://") {
             relay_url.replace("https://", "wss://")
         } else {
@@ -846,12 +1052,7 @@ impl AstationClient {
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
-        let atem_id = crate::config::AtemConfig::stored_atem_id().unwrap_or_else(|| {
-            let instance_id = crate::config::AtemConfig::ensure_instance_id();
-            let id = build_atem_id(&hostname, &instance_id);
-            crate::config::AtemConfig::store_atem_id(&id);
-            id
-        });
+        let atem_id = self.resolved_atem_id(&hostname);
 
         let ws_url = relay_ws_url(&ws_scheme, identity_code, &atem_id);
         self.connect_raw(&ws_url).await?;
@@ -860,12 +1061,25 @@ impl AstationClient {
         let mut hello_data = std::collections::HashMap::new();
         hello_data.insert("hostname".to_string(), hostname.clone());
 
-        self.send_message(AstationMessage::StatusUpdate {
-            status: "hello".to_string(),
-            data: hello_data,
-        }).await?;
+        let result = async {
+            self.send_message(AstationMessage::StatusUpdate {
+                status: "hello".to_string(),
+                data: hello_data,
+            })
+            .await?;
 
-        Ok(())
+            self.authenticate(
+                Duration::from_secs(10),
+                Duration::from_secs(300),
+                allow_pairing,
+            )
+            .await
+        }
+        .await;
+        if result.is_err() {
+            self.abort_transport();
+        }
+        result
     }
 
     /// Register with the relay service and get a pairing code.
@@ -902,7 +1116,81 @@ impl AstationClient {
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
     }
+}
 
+impl Drop for AstationClient {
+    fn drop(&mut self) {
+        self.abort_transport();
+    }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn resolved_atem_id(hostname: &str) -> String {
+    if let Some(existing) = AtemConfig::stored_atem_id() {
+        return existing;
+    }
+    let atem_id = build_atem_id(hostname, &AtemConfig::ensure_instance_id());
+    AtemConfig::store_atem_id(&atem_id);
+    atem_id
+}
+
+fn device_auth_proof(
+    token: &str,
+    challenge: &str,
+    astation_id: &str,
+    atem_id: &str,
+    session_id: &str,
+) -> Result<String> {
+    let canonical = format!(
+        "astation-auth-v2\n{}\n{}\n{}\n{}",
+        challenge, astation_id, atem_id, session_id
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
+        .map_err(|_| anyhow!("Invalid device authentication key"))?;
+    mac.update(canonical.as_bytes());
+    Ok(mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect())
+}
+
+fn read_local_bootstrap_token() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let path = dirs::data_dir()?
+        .join("Astation")
+        .join("local-bootstrap-token");
+
+    #[cfg(not(target_os = "macos"))]
+    return None;
+
+    #[cfg(target_os = "macos")]
+    read_local_bootstrap_token_from(&path)
+}
+
+#[cfg(unix)]
+fn read_local_bootstrap_token_from(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return None;
+    }
+    let mut token = String::new();
+    file.read_to_string(&mut token).ok()?;
+    let token = token.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
 /// Length of the host segment of an `atem_id` (truncated or padded to this).
@@ -983,6 +1271,477 @@ fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_client(atem_id: &str) -> (tempfile::TempDir, AstationClient) {
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("sessions.json");
+        let client = AstationClient::new_with_test_state(atem_id, session_path);
+        (directory, client)
+    }
+
+    #[test]
+    fn device_auth_proof_matches_protocol_vector() {
+        let proof = device_auth_proof(
+            "token-abc",
+            "challenge-123",
+            "astation-home",
+            "atem-office",
+            "session-456",
+        )
+        .unwrap();
+
+        assert_eq!(
+            proof,
+            "9fde5ba861c1a159d377b89e6fb3f92d245795998af958f5db3ad343d589d0ba"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_bootstrap_token_requires_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local-bootstrap-token");
+        fs::write(&path, "bootstrap-secret\n").unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_local_bootstrap_token_from(&path).as_deref(),
+            Some("bootstrap-secret")
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_local_bootstrap_token_from(&path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_bootstrap_token_refuses_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("bootstrap-target");
+        let link = directory.path().join("local-bootstrap-token");
+        fs::write(&target, "bootstrap-secret\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(read_local_bootstrap_token_from(&link), None);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "bootstrap-secret\n");
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_v2_pairing_sends_identity_and_handles_denial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let astation_id = format!("astation-integration-{}", uuid::Uuid::new_v4());
+        let expected_astation_id = astation_id.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), expected_astation_id),
+                    ("challenge".to_string(), "a".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("timed out waiting for pairing request")
+                .expect("Atem closed before pairing request")
+                .expect("failed to read pairing request");
+            let Message::Text(text) = frame else {
+                panic!("expected text pairing request");
+            };
+            let request: AstationMessage = serde_json::from_str(&text).unwrap();
+            let AstationMessage::StatusUpdate { status, data } = request else {
+                panic!("expected authentication status update");
+            };
+            assert_eq!(status, "auth");
+            assert!(!data["atem_id"].is_empty());
+            assert!(!data["hostname"].is_empty());
+            assert_eq!(data["pairing_code"].len(), 8);
+            assert!(
+                data["pairing_code"]
+                    .chars()
+                    .all(|value| value.is_ascii_digit())
+            );
+            assert!(!data.contains_key("session_id"));
+            assert!(!data.contains_key("proof"));
+
+            let denied = AstationMessage::StatusUpdate {
+                status: "auth".to_string(),
+                data: std::collections::HashMap::from([
+                    ("status".to_string(), "denied".to_string()),
+                    ("message".to_string(), "integration denial".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(serde_json::to_string(&denied).unwrap()))
+                .await
+                .unwrap();
+        });
+
+        let (_state, mut client) = isolated_client("atem-test-denial");
+        let error = client
+            .connect(&format!("ws://{address}"))
+            .await
+            .expect_err("denied pairing unexpectedly authenticated");
+        assert!(
+            error
+                .to_string()
+                .contains("Pairing denied: integration denial")
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn practical_websocket_pairing_fails_when_session_cannot_be_persisted() {
+        use std::os::unix::fs::symlink;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("sessions.json");
+        let target_path = directory.path().join("protected-target");
+        let server_session_path = session_path.clone();
+        let server_target_path = target_path.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    (
+                        "astation_id".to_string(),
+                        "astation-persist-failure".to_string(),
+                    ),
+                    ("challenge".to_string(), "e".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("timed out waiting for pairing request")
+                .expect("Atem closed before pairing request")
+                .expect("failed to read pairing request");
+
+            fs::write(&server_target_path, "must remain unchanged").unwrap();
+            symlink(&server_target_path, &server_session_path).unwrap();
+            let granted = AstationMessage::StatusUpdate {
+                status: "auth".to_string(),
+                data: std::collections::HashMap::from([
+                    ("status".to_string(), "granted".to_string()),
+                    ("session_id".to_string(), "session-new".to_string()),
+                    ("token".to_string(), "token-new".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(serde_json::to_string(&granted).unwrap()))
+                .await
+                .unwrap();
+        });
+
+        let mut client =
+            AstationClient::new_with_test_state("atem-test-persist-failure", session_path);
+        let error = client
+            .connect(&format!("ws://{address}"))
+            .await
+            .expect_err("pairing unexpectedly ignored session persistence failure");
+        assert!(error.to_string().contains("Failed to open private file"));
+        assert_eq!(
+            fs::read_to_string(target_path).unwrap(),
+            "must remain unchanged"
+        );
+        assert!(!directory.path().join("relay-code").exists());
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn practical_websocket_reconnect_survives_session_refresh_failure() {
+        use std::os::unix::fs::symlink;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("sessions.json");
+        let target_path = directory.path().join("protected-target");
+        let astation_id = "astation-refresh-failure".to_string();
+
+        let mut sessions = crate::auth::SessionManager::default();
+        sessions.insert_session(crate::auth::AuthSession::new(
+            "session-existing".to_string(),
+            "token-existing".to_string(),
+            astation_id.clone(),
+            "test-machine".to_string(),
+        ));
+        sessions.save_to(&session_path).unwrap();
+
+        let server_session_path = session_path.clone();
+        let server_target_path = target_path.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), astation_id),
+                    ("challenge".to_string(), "f".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let request = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("timed out waiting for session proof")
+                .expect("Atem closed before session proof")
+                .expect("failed to read session proof");
+            assert!(matches!(request, Message::Text(_)));
+
+            fs::remove_file(&server_session_path).unwrap();
+            fs::write(&server_target_path, "must remain unchanged").unwrap();
+            symlink(&server_target_path, &server_session_path).unwrap();
+            let authenticated = AstationMessage::StatusUpdate {
+                status: "authenticated".to_string(),
+                data: std::collections::HashMap::from([(
+                    "method".to_string(),
+                    "session_proof".to_string(),
+                )]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&authenticated).unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut client =
+            AstationClient::new_with_test_state("atem-test-refresh-failure", session_path);
+        client
+            .connect_without_pairing(&format!("ws://{address}"))
+            .await
+            .expect("session metadata failure aborted an authenticated reconnect");
+        assert!(client.sender.is_some());
+        assert_eq!(
+            fs::read_to_string(target_path).unwrap(),
+            "must remain unchanged"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("relay-code")).unwrap(),
+            "astation-refresh-failure"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_rejects_protocol_downgrade_without_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), "astation-downgrade".to_string()),
+                    ("challenge".to_string(), "b".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
+                Err(_) | Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => {}
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    panic!("Atem leaked an authentication message after downgrade: {text}")
+                }
+                Ok(Some(other)) => panic!("unexpected WebSocket frame: {other:?}"),
+            }
+        });
+
+        let (_state, mut client) = isolated_client("atem-test-downgrade");
+        client
+            .connect_raw(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let error = client
+            .authenticate(Duration::from_secs(1), Duration::from_secs(1), true)
+            .await
+            .expect_err("protocol downgrade unexpectedly authenticated");
+        assert!(error.to_string().contains("protocol v2 is required"));
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_background_connect_never_starts_pairing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let astation_id = format!("astation-proof-only-{}", uuid::Uuid::new_v4());
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), astation_id),
+                    ("challenge".to_string(), "d".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
+                Err(_) | Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => {}
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    panic!("background reconnect unexpectedly sent pairing data: {text}")
+                }
+                Ok(Some(other)) => panic!("unexpected WebSocket frame: {other:?}"),
+            }
+        });
+
+        let (_state, mut client) = isolated_client("atem-test-proof-only");
+        let error = client
+            .connect_without_pairing(&format!("ws://{address}"))
+            .await
+            .expect_err("proof-only connection unexpectedly started pairing");
+        assert_eq!(error.to_string(), "Pairing required; run 'atem pair'");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_bounds_authentication_after_challenge() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let astation_id = format!("astation-timeout-{}", uuid::Uuid::new_v4());
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), astation_id),
+                    ("challenge".to_string(), "c".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let request = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("timed out waiting for authentication request")
+                .expect("Atem closed before authentication request")
+                .expect("failed to read authentication request");
+            assert!(matches!(request, Message::Text(_)));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (_state, mut client) = isolated_client("atem-test-timeout");
+        client
+            .connect_raw(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let error = client
+            .authenticate(Duration::from_secs(1), Duration::from_millis(50), true)
+            .await
+            .expect_err("silent Astation unexpectedly authenticated");
+        assert_eq!(error.to_string(), "Authentication timed out");
+        drop(client);
+        server.await.unwrap();
+    }
 
     // --- Serialization round-trip tests ---
 

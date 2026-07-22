@@ -1,300 +1,137 @@
-# Session-Based Pairing Authentication Implementation
+# Device Authentication v2
 
-## Overview
+Status: implemented for direct and identity-relay connections. This document is
+the authoritative Atem-side contract. The matching Astation specification is
+`docs/specs/2026-07-21-device-authentication-v2.md` in the Astation repository.
 
-Implemented a comprehensive pairing + session system for secure Atem↔Astation connections:
-- **Pairing required** for all connections (local/LAN/VPN/relay)
-- **Session persistence** after pairing (7-day inactivity expiry)
-- **Activity refresh** on every connection/message
-- **Multi-device support** with independent sessions
+## Connection matrix
 
-## Implementation Status
+| Path | Endpoint | First connection | Internet required |
+|------|----------|------------------|-------------------|
+| Same Mac | `ws://127.0.0.1:8080/ws` | Same-user bootstrap proof | No |
+| LAN or VPN | `ws://<astation-ip>:8080/ws` | User-approved pairing | No |
+| Remote | Astation identity room on WSS relay | User-approved pairing | Yes |
 
-### ✅ COMPLETED: Atem (Rust)
+The direct endpoint is attempted before relay. All paths can coexist, and the
+same saved device session works for direct LAN and relay reconnects.
 
-#### 1. Session Storage (`src/auth.rs`)
-- Changed `authenticated_at` → `last_activity`
-- Changed expiry from 30 days → 7 days
-- Added `refresh()` method to update activity timestamp
-- Added `age_seconds()` to check session age
-- Added `new()` constructor
-- Added `now_timestamp()` helper
+## Trust boundaries
 
-**Tests Added (8 tests, all passing):**
-- `session_is_valid_when_fresh` ✅
-- `session_expires_after_7_days` ✅
-- `session_valid_just_before_expiry` ✅
-- `session_refresh_extends_validity` ✅
-- `session_refresh_prevents_expiry` ✅
-- `session_age_calculation` ✅
-- `session_save_and_load_preserves_activity` ✅
-- `multiple_sessions_independent` ✅
+- Astation determines loopback from the kernel socket peer address. Atem cannot
+  claim loopback through a header, hostname, or protocol field.
+- Loopback skips interactive pairing only when Atem can read Astation's local
+  bootstrap file and that file has no group or other permission bits.
+- LAN, VPN, and relay clients pair once and then prove possession of the saved
+  session token. A `session_id` alone never authenticates a device.
+- The identity relay transports authentication messages. Astation, not the
+  relay, verifies the proof and decides whether the Atem can send app messages.
 
-#### 2. Connection Logic (`src/app.rs`)
-- `poll_astation_connect()`: Refreshes session on successful connection
-- `process_astation_messages()`: Refreshes session when messages received
-- Session refresh saves to `~/.config/atem/session.json` automatically
+## Challenge and proof
 
-#### 3. HTTP→WebSocket Conversion (`src/app.rs`)
-- Converts `http://` → `ws://` and `https://` → `wss://` for relay URLs
-- Supports custom relay servers (e.g., `http://100.117.91.44:8080`)
+Astation starts a direct connection, or answers an identity-relay `hello`, with:
 
-### ✅ COMPLETED: Astation (Swift)
-
-#### 1. Session Storage (`SessionStore.swift` - NEW FILE)
-**Features:**
-- Thread-safe session storage (DispatchQueue with barrier)
-- Persists to disk (`~/Library/Application Support/Astation/sessions.json`)
-- 7-day inactivity expiry
-- Secure token generation (SecRandom)
-- Auto-cleanup of expired sessions
-
-**Methods:**
-- `validate(sessionId:) -> Bool` - Check if session valid
-- `refresh(sessionId:)` - Update last activity timestamp
-- `create(hostname:) -> SessionInfo` - Create session after pairing
-- `delete(sessionId:)` - Remove session
-- `get(sessionId:) -> SessionInfo?` - Get session info
-- `getAllActive() -> [SessionInfo]` - List active sessions
-- `cleanupExpired()` - Remove expired sessions
-
-**Testing Helpers (DEBUG only):**
-- `createTest()` - Create session with custom parameters
-- `count` - Get session count
-
-#### 2. WebSocket Server Auth (`AstationWebSocketServer.swift`)
-**Authentication Flow:**
-1. Client connects → Server sends `auth_required` message
-2. Client responds with auth message (session ID or pairing code)
-3. Server validates:
-   - **Session auth**: Check `sessionStore.validate()` → auto-approve if valid
-   - **Pairing auth**: Show dialog → user approves → create new session
-4. Authenticated clients added to `authenticatedClients` set
-5. Unauthenticated clients rejected (non-auth messages → close connection)
-
-**Session Refresh:**
-- On every message from authenticated client
-- Updates `last_activity` in SessionStore
-
-**Methods Added:**
-- `handleAuthMessage()` - Process auth credentials
-- `authenticateClient()` - Mark client as authenticated + refresh session
-- `showPairingDialog()` - Show macOS alert for pairing approval
-
-#### 3. Message Protocol (`AstationMessage.swift`)
-**Convenience Constructors:**
-```swift
-.auth(info: [String: String]) // Auth messages
-.error(message: String)        // Error messages
+```json
+{
+  "type": "statusUpdate",
+  "data": {
+    "status": "auth_required",
+    "data": {
+      "astation_id": "astation-...",
+      "challenge": "64 lowercase hex characters",
+      "transport": "loopback|lan|relay",
+      "protocol": "2"
+    }
+  }
+}
 ```
 
-Uses `.statusUpdate` internally for compatibility.
+The proof is lowercase hexadecimal HMAC-SHA256 over this exact UTF-8 string:
 
-### ✅ COMPLETED: Atem Client-Side Auth
+```text
+astation-auth-v2\n<challenge>\n<astation_id>\n<atem_id>\n<session_id>
+```
 
-**Implemented auth message flow in Atem:**
+For loopback, the HMAC key is `local-bootstrap-token` and the proof input uses
+the literal session ID `local`. For LAN and relay reconnects, the key is the
+saved session token and the real session UUID is used.
 
-1. **`authenticate()` method** (`src/websocket_client.rs`):
-   - ✅ Waits for `auth_required` message
-   - ✅ Tries session auth first (if saved session exists)
-   - ✅ Falls back to pairing if session invalid/expired
-   - ✅ Saves new session after successful pairing
+The cross-language test vector is:
 
-2. **Session auth flow**:
-   - ✅ Loads session from `~/.config/atem/session.json`
-   - ✅ Sends `{ status: "auth", session_id: "..." }`
-   - ✅ Refreshes session on success
-   - ✅ Falls back to pairing on expiry
+| Field | Value |
+|-------|-------|
+| token | `token-abc` |
+| challenge | `challenge-123` |
+| astation ID | `astation-home` |
+| Atem ID | `atem-office` |
+| session ID | `session-456` |
+| proof | `9fde5ba861c1a159d377b89e6fb3f92d245795998af958f5db3ad343d589d0ba` |
 
-3. **Pairing auth flow**:
-   - ✅ Generates 8-digit OTP code
-   - ✅ Displays to user: "🔐 Pairing... Code: 12345678"
-   - ✅ Sends `{ status: "auth", pairing_code: "...", hostname: "..." }`
-   - ✅ Waits up to 5 minutes for approval
-   - ✅ Saves session credentials on success
+## Pairing and reconnect
 
-**See `designs/session-auth.md` (this file) for full details.**
+Remote first-time pairing has two explicit stages. The short relay-room code lets
+Astation and Atem discover each other, then the identity-relay connection shows
+an 8-digit device code for approval. `atem pair` reports success only after the
+second stage creates and stores the reusable device session.
 
-### ⚠️ TODO: Relay Server
+Every v2 handshake is bounded both while waiting for `auth_required` and after
+the challenge is received. Atem rejects missing or malformed v2 challenges
+rather than falling back to bearer-session authentication.
 
-The relay server (`relay-server/src/relay.rs`) needs the same session logic:
-1. Add `SessionStore` (Rust version)
-2. Validate sessions on WebSocket upgrade
-3. Support both `?session=<id>` and `?role=X&code=Y` auth
-4. Refresh sessions on activity
+Background TUI reconnects are proof-only and never open an interactive pairing
+prompt. A missing, expired, or revoked session closes that attempt and requires
+an explicit `atem pair`. Explicit pairing succeeds only after the new session
+token has been written securely to disk.
 
-## Security Model
+1. Atem receives `auth_required` and looks up a session by `astation_id`.
+2. When a valid session exists, Atem sends `session_id`, `atem_id`, and `proof`.
+3. Astation verifies the proof, expiry, and device binding before registering
+   the client or sending credentials.
+4. If the session is absent, invalid, or expired, Atem sends an eight-digit
+   pairing code and waits up to five minutes for approval.
+5. Astation returns a new session ID and token after approval. Atem persists it
+   and uses a fresh proof on later connections.
 
-| Connection | Auth Required | Session Saved | Expiry |
-|------------|---------------|---------------|--------|
-| **Localhost** | ✅ Pairing (first time) | ✅ Yes | 7 days inactivity |
-| **LAN** | ✅ Pairing (first time) | ✅ Yes | 7 days inactivity |
-| **VPN** | ✅ Pairing (first time) | ✅ Yes | 7 days inactivity |
-| **Relay** | ✅ Pairing (first time) | ✅ Yes | 7 days inactivity |
+An invalid or expired saved proof falls back to pairing on the same open socket.
+Old clients that send only a session ID cannot authenticate against v2.
 
-**Unified security everywhere:**
-- All connections require explicit pairing approval (first time)
-- Sessions auto-refresh with activity (up to 7 days)
-- Expired sessions require re-pairing
-- Each device has independent session
+## Local state
 
-## Testing
+| Path | Mode | Contents |
+|------|------|----------|
+| `~/.config/atem/sessions.json` | `0600` | Sessions keyed by Astation ID |
+| `~/.config/atem/config.toml` | existing user config mode | Stable `instance_id`, `atem_id`, endpoints |
+| `~/Library/Application Support/Astation/local-bootstrap-token` | `0600` | Same-user loopback key, read on macOS only |
 
-### Atem Tests
+The `~/.config/atem` directory is set to `0700` when sessions are saved. Never
+print session tokens, proofs, or bootstrap contents. Existing session files are
+validated as current-user regular files, changed to `0600` before reading, and
+opened without following symbolic links. Private writes apply the same checks
+before truncating an existing file.
+
+## Practical verification
+
 ```bash
-cd /home/guohai/Dev/Agora.Build/Atem
-cargo test auth:: -- --nocapture
+cargo test websocket_client::tests::device_auth_proof_matches_protocol_vector
+cargo test websocket_client::tests::local_bootstrap_token_requires_private_permissions
+cargo test websocket_client::tests::practical_websocket_v2_pairing_sends_identity_and_handles_denial
+cargo test websocket_client::tests::practical_websocket_background_connect_never_starts_pairing
+cargo test websocket_client::tests::practical_websocket_pairing_fails_when_session_cannot_be_persisted
+cargo test auth::tests::private_file_write_uses_owner_only_permissions
+cargo test -- --test-threads=1
 ```
 
-**Result:** ✅ 19 tests passed (including 8 new session tests)
+The practical Atem test starts a real loopback WebSocket server, sends the v2
+LAN challenge through the production client, validates the stable Atem identity
+and pairing request, and confirms that a denial propagates to the caller.
 
-### Astation Tests
-**TODO:** Add Swift unit tests for:
-- `SessionStore` - create, validate, refresh, expire, cleanup
-- `AstationWebSocketServer` - auth flow, session validation, pairing dialog
+The coordinated Astation tests start the real NIO WebSocket server and cover an
+offline loopback client, a rejected forged proof, five concurrent Atem clients,
+and direct auth through a real non-loopback LAN interface.
 
-## Configuration
+## Known limitation
 
-### Atem Config (`~/.config/atem/config.toml`)
-```toml
-# Local/VPN connection URL
-astation_ws = "ws://127.0.0.1:8080/ws"        # Default (localhost)
-# astation_ws = "ws://192.168.1.5:8080/ws"     # LAN IP
-# astation_ws = "ws://100.64.0.2:8080/ws"      # Netbird VPN
-
-# Relay server URL (auto-converts http→ws)
-astation_relay_url = "http://100.117.91.44:8080"  # Custom relay
-# astation_relay_url = "https://station.agora.build"  # Production (default)
-```
-
-### Session Storage Locations
-- **Atem**: `~/.config/atem/session.json`
-- **Astation**: `~/Library/Application Support/Astation/sessions.json`
-
-## User Flow Examples
-
-### First Connection (Machine B)
-```
-1. User runs: atem
-2. Atem connects to Astation
-3. Astation shows dialog: "Allow 'machine-b'? Code: 12345678"
-4. User clicks "Allow"
-5. Astation creates session, sends to Atem
-6. Atem saves session to disk
-7. Connected! ✅
-```
-
-### Subsequent Connections (Machine B)
-```
-1. User runs: atem
-2. Atem sends session ID
-3. Astation validates (< 7 days) → auto-approves
-4. Connected! ✅ (no dialog)
-```
-
-### After 7 Days Idle (Machine B)
-```
-1. User runs: atem
-2. Atem sends old session ID
-3. Astation validates → expired!
-4. Astation shows dialog again (new pairing)
-5. User clicks "Allow"
-6. New session created
-7. Connected! ✅
-```
-
-### Multiple Devices
-```
-Machine B: Session sess-abc (created 2 days ago, active)
-Machine C: Session sess-def (created 5 days ago, active)
-Laptop:    Session sess-xyz (created 8 days ago, expired ❌)
-
-Each device has independent session.
-Activity on Machine B doesn't affect Machine C.
-```
-
-## Next Steps
-
-1. **Complete Atem client-side auth** (`src/websocket_client.rs`)
-   - Send auth message on connection
-   - Handle auth responses
-   - Fall back to pairing on session expiry
-
-2. **Add relay server session support** (`relay-server/src/relay.rs`)
-   - Port SessionStore to Rust
-   - Validate sessions on WebSocket upgrade
-   - Refresh on activity
-
-3. **Add tests**
-   - Swift unit tests for SessionStore
-   - Integration tests for full auth flow
-   - Test session expiry and refresh
-
-4. **Documentation**
-   - Update README with pairing instructions
-   - Document session management for users
-
-## Files Changed
-
-### Atem
-- ✅ `src/auth.rs` - Session model + 8 new tests
-- ✅ `src/app.rs` - Session refresh on connection/messages
-- ✅ `configs/config.example.toml` - VPN + relay examples
-- ✅ `designs/connection-priority.md` - Architecture docs
-
-### Astation
-- ✅ `Sources/Menubar/SessionStore.swift` - NEW FILE (session storage)
-- ✅ `Sources/Menubar/AstationWebSocketServer.swift` - Auth flow + pairing dialog
-- ✅ `Sources/Menubar/AstationMessage.swift` - Auth/error helpers
-- ✅ `Sources/Menubar/AstationApp.swift` - Listen on 0.0.0.0
-- ✅ `Sources/Menubar/SettingsWindowController.swift` - Show network IPs
-
-### Documentation
-- ✅ `designs/session-auth.md` - THIS FILE
-- ✅ `designs/connection-priority.md` - Updated with VPN support
-
-## Compilation Status
-
-**Atem:** ✅ Compiles successfully
-```bash
-cargo check
-# Finished `dev` profile in 0.92s
-```
-
-**Astation:** ⚠️ Not tested (macOS only, Linux build unavailable)
-
-## Security Considerations
-
-✅ **Explicit approval required** - User must click "Allow" for every new device
-✅ **Session tokens secure** - 64-char hex from SecRandom (256-bit entropy)
-✅ **Time-based expiry** - 7 days forces re-approval for inactive devices
-✅ **Activity tracking** - Sessions stay alive only with active use
-✅ **No localhost bypass** - Even 127.0.0.1 requires pairing (can be changed if needed)
-✅ **Multi-device isolation** - Each Atem has independent session
-✅ **Persistent storage** - Sessions survive restarts
-✅ **Auto-cleanup** - Expired sessions removed automatically
-
-## Performance
-
-- **Session validation**: O(1) hash lookup
-- **Session refresh**: O(1) update + disk write (async)
-- **Cleanup**: O(n) filter (runs on startup only)
-- **Disk I/O**: JSON files, pretty-printed for debugging
-- **Thread safety**: All SessionStore ops use concurrent queue with barriers
-
-## Known Issues
-
-1. **Atem auth not yet implemented** - Client doesn't send auth messages yet
-2. **Relay server missing session support** - Only Astation local server has it
-3. **No Swift tests** - SessionStore needs unit tests
-4. **Pairing dialog blocks main thread** - Should use async alert on macOS 12+
-5. **No session revocation UI** - User can't manually revoke sessions (only via expiry)
-
-## Conclusion
-
-The foundation is solid! Session storage, expiry, refresh, and multi-device support all work on both sides. Just need to connect the dots:
-- Atem client sending auth messages
-- Relay server validating sessions
-- Tests for confidence
-
-Security is strong with pairing required everywhere and 7-day expiry forcing periodic re-approval.
+Direct LAN currently uses plaintext `ws://`. HMAC verifies possession but does
+not encrypt pairing credentials or application traffic and does not prevent an
+active man-in-the-middle. Do not call direct LAN production-ready until WSS with
+persistent certificate pinning, or an equivalent authenticated encrypted
+transport, is implemented.
