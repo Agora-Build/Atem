@@ -1224,18 +1224,20 @@ async fn run_pair(save: bool) -> Result<()> {
     }
 
     // Resolve save preference: --save skips the prompt; otherwise ask interactively.
-    let save_credentials = if save {
+    let requested_save_credentials = if save {
         true
     } else {
         prompt_save_credentials()
     };
 
-    // Send save preference. Astation uses this to decide what to put in
-    // the subsequent CredentialSync message.
+    // Send the preference for peers that support it. Atem still treats the
+    // local choice as authoritative when it stores the received credentials.
     client
-        .send_message(crate::websocket_client::AstationMessage::PairSavePreference {
-            save_credentials,
-        })
+        .send_message(
+            crate::websocket_client::AstationMessage::PairSavePreference {
+                save_credentials: requested_save_credentials,
+            },
+        )
         .await?;
 
     println!("Waiting for Astation to send SSO credentials...");
@@ -1250,7 +1252,7 @@ async fn run_pair(save: bool) -> Result<()> {
                     expires_at,
                     login_id,
                     astation_id,
-                    save_credentials,
+                    save_credentials: server_save_credentials,
                 }) => {
                     return Ok::<_, anyhow::Error>((
                         access_token,
@@ -1258,7 +1260,7 @@ async fn run_pair(save: bool) -> Result<()> {
                         expires_at,
                         login_id,
                         astation_id,
-                        save_credentials,
+                        server_save_credentials,
                     ));
                 }
                 Some(_) => continue,
@@ -1275,7 +1277,7 @@ async fn run_pair(save: bool) -> Result<()> {
             expires_at,
             login_id,
             astation_id,
-            save_credentials,
+            _server_save_credentials,
         ))) => {
             if result != "local" {
                 println!("Establishing an authenticated relay session...");
@@ -1300,7 +1302,7 @@ async fn run_pair(save: bool) -> Result<()> {
                 expires_at,
                 login_id.clone(),
                 astation_id,
-                save_credentials,
+                requested_save_credentials,
                 now,
             ));
             store.save()?;
@@ -1308,7 +1310,7 @@ async fn run_pair(save: bool) -> Result<()> {
                 Some(id) => println!("Paired with Astation. (SSO: {})", id),
                 None => println!("Paired with Astation."),
             }
-            if save_credentials {
+            if requested_save_credentials {
                 println!("Credentials saved — will work offline.");
             } else {
                 println!("Credentials are session-only (5 min grace period after disconnect).");

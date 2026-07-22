@@ -77,6 +77,11 @@ Every v2 handshake is bounded both while waiting for `auth_required` and after
 the challenge is received. Atem rejects missing or malformed v2 challenges
 rather than falling back to bearer-session authentication.
 
+Background TUI reconnects are proof-only and never open an interactive pairing
+prompt. A missing, expired, or revoked session closes that attempt and requires
+an explicit `atem pair`. Explicit pairing succeeds only after the new session
+token has been written securely to disk.
+
 1. Atem receives `auth_required` and looks up a session by `astation_id`.
 2. When a valid session exists, Atem sends `session_id`, `atem_id`, and `proof`.
 3. Astation verifies the proof, expiry, and device binding before registering
@@ -109,6 +114,8 @@ before truncating an existing file.
 cargo test websocket_client::tests::device_auth_proof_matches_protocol_vector
 cargo test websocket_client::tests::local_bootstrap_token_requires_private_permissions
 cargo test websocket_client::tests::practical_websocket_v2_pairing_sends_identity_and_handles_denial
+cargo test websocket_client::tests::practical_websocket_background_connect_never_starts_pairing
+cargo test websocket_client::tests::practical_websocket_pairing_fails_when_session_cannot_be_persisted
 cargo test auth::tests::private_file_write_uses_owner_only_permissions
 cargo test -- --test-threads=1
 ```

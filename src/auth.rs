@@ -69,7 +69,11 @@ impl SessionManager {
     /// Returns empty SessionManager if file doesn't exist.
     pub fn load() -> Result<Self> {
         let path = Self::sessions_path()?;
-        let Some(content) = read_private_file(&path)? else {
+        Self::load_from(&path)
+    }
+
+    pub(crate) fn load_from(path: &std::path::Path) -> Result<Self> {
+        let Some(content) = read_private_file(path)? else {
             return Ok(Self::default());
         };
 
@@ -82,7 +86,10 @@ impl SessionManager {
     /// Save all sessions to disk.
     pub fn save(&self) -> Result<()> {
         let path = Self::sessions_path()?;
+        self.save_to(&path)
+    }
 
+    pub(crate) fn save_to(&self, path: &std::path::Path) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -93,7 +100,7 @@ impl SessionManager {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow!("Failed to serialize sessions: {}", e))?;
 
-        write_private_file(&path, json.as_bytes())?;
+        write_private_file(path, json.as_bytes())?;
 
         Ok(())
     }
@@ -110,9 +117,13 @@ impl SessionManager {
 
     /// Save or update a session for a specific Astation.
     pub fn save_session(&mut self, session: AuthSession) -> Result<()> {
+        self.insert_session(session);
+        self.save()
+    }
+
+    pub(crate) fn insert_session(&mut self, session: AuthSession) {
         let astation_id = session.astation_id.clone();
         self.sessions.insert(astation_id, session);
-        self.save()
     }
 
     /// Remove a session for a specific Astation.

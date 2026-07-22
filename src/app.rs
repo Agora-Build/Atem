@@ -1661,7 +1661,10 @@ impl App {
             // If we have a valid session, try local with session auth
             if let Some(ref sess) = session {
                 if sess.is_valid() {
-                    if let Ok(()) = client.connect_with_session(local_url, &sess.session_id).await {
+                    if let Ok(()) = client
+                        .connect_with_session(local_url, &sess.session_id)
+                        .await
+                    {
                         let _ = tx.send(Ok((client, None)));
                         return;
                     }
@@ -1671,7 +1674,7 @@ impl App {
             // No valid session - try local with fresh auth (5s timeout)
             let mut client = crate::websocket_client::AstationClient::new();
             let local_url = config.astation_ws().to_string();
-            match client.connect(&local_url).await {
+            match client.connect_without_pairing(&local_url).await {
                 Ok(()) => {
                     let _ = tx.send(Ok((client, Some("local".to_string()))));
                     return;
@@ -1683,7 +1686,10 @@ impl App {
             if let Some(relay_code) = config.astation_relay_code.clone() {
                 let relay_url = config.astation_relay_url().to_string();
                 let mut relay_client = crate::websocket_client::AstationClient::new();
-                match relay_client.connect_relay_identity(&relay_url, &relay_code).await {
+                match relay_client
+                    .connect_relay_identity_without_pairing(&relay_url, &relay_code)
+                    .await
+                {
                     Ok(()) => {
                         let _ = tx.send(Ok((relay_client, Some(relay_code))));
                         return;
