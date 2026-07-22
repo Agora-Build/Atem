@@ -540,7 +540,7 @@ impl AstationClient {
             })
             .await?;
 
-            return match self.wait_for_auth_response(&astation_id, false).await? {
+            return match self.wait_for_auth_response(&astation_id).await? {
                 Some(AuthResponse::Authenticated) => Ok(()),
                 Some(AuthResponse::Denied(message)) => {
                     Err(anyhow!("Local authentication denied: {}", message))
@@ -578,10 +578,7 @@ impl AstationClient {
             self.send_message(auth_msg).await?;
 
             // Wait for response
-            if let Some(response) = self
-                .wait_for_auth_response(&astation_id, transport == "relay")
-                .await?
-            {
+            if let Some(response) = self.wait_for_auth_response(&astation_id).await? {
                 match response {
                     AuthResponse::Authenticated => {
                         // Session auth successful - refresh and save
@@ -610,17 +607,11 @@ impl AstationClient {
         }
 
         // Session auth failed or no session - use explicit pairing.
-        self.authenticate_with_pairing(&astation_id, &atem_id, transport == "relay")
-            .await
+        self.authenticate_with_pairing(&astation_id, &atem_id).await
     }
 
     /// Authenticate using pairing code (fallback when session invalid/missing)
-    async fn authenticate_with_pairing(
-        &mut self,
-        astation_id: &str,
-        atem_id: &str,
-        remember_relay: bool,
-    ) -> Result<()> {
+    async fn authenticate_with_pairing(&mut self, astation_id: &str, atem_id: &str) -> Result<()> {
         // Generate pairing code
         let pairing_code = crate::auth::generate_otp();
         let hostname = crate::auth::get_hostname();
@@ -644,7 +635,7 @@ impl AstationClient {
         // Wait for pairing response (longer timeout for user to approve)
         let response = tokio::time::timeout(
             Duration::from_secs(300), // 5 minutes for user to approve
-            self.wait_for_auth_response(astation_id, remember_relay)
+            self.wait_for_auth_response(astation_id)
         )
         .await
         .map_err(|_| anyhow!("Pairing timed out after 5 minutes"))??;
@@ -668,11 +659,7 @@ impl AstationClient {
     }
 
     /// Wait for auth response message and extract session if granted
-    async fn wait_for_auth_response(
-        &mut self,
-        astation_id: &str,
-        remember_relay: bool,
-    ) -> Result<Option<AuthResponse>> {
+    async fn wait_for_auth_response(&mut self, astation_id: &str) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
             match msg {
                 AstationMessage::StatusUpdate { status, data } if status == "auth" => {
@@ -695,9 +682,7 @@ impl AstationClient {
                                 );
 
                                 self.persist_session(session)?;
-                                if remember_relay {
-                                    self.remember_astation_relay_code(astation_id);
-                                }
+                                self.remember_astation_relay_code(astation_id);
                                 return Ok(Some(AuthResponse::Authenticated));
                             }
                             "denied" => {
@@ -712,9 +697,7 @@ impl AstationClient {
                 }
                 AstationMessage::StatusUpdate { status, data: _ } if status == "authenticated" => {
                     // Alternative authenticated message format
-                    if remember_relay {
-                        self.remember_astation_relay_code(astation_id);
-                    }
+                    self.remember_astation_relay_code(astation_id);
                     return Ok(Some(AuthResponse::Authenticated));
                 }
                 AstationMessage::StatusUpdate { status, data } if status == "error" => {
@@ -1595,7 +1578,10 @@ mod tests {
             fs::read_to_string(target_path).unwrap(),
             "must remain unchanged"
         );
-        assert!(!directory.path().join("relay-code").exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("relay-code")).unwrap(),
+            "astation-refresh-failure"
+        );
         server.await.unwrap();
     }
 
