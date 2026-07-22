@@ -286,6 +286,8 @@ pub struct AtemInstance {
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<AstationMessage>>,
     receiver: Option<mpsc::UnboundedReceiver<AstationMessage>>,
+    transport_tasks: Vec<tokio::task::JoinHandle<()>>,
+    atem_id_override: Option<String>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
 }
@@ -295,8 +297,32 @@ impl AstationClient {
         Self {
             sender: None,
             receiver: None,
+            transport_tasks: Vec::new(),
+            atem_id_override: None,
             ws_closed: false,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_atem_id(atem_id: &str) -> Self {
+        let mut client = Self::new();
+        client.atem_id_override = Some(atem_id.to_string());
+        client
+    }
+
+    fn resolved_atem_id(&self, hostname: &str) -> String {
+        self.atem_id_override
+            .clone()
+            .unwrap_or_else(|| resolved_atem_id(hostname))
+    }
+
+    fn abort_transport(&mut self) {
+        self.sender = None;
+        self.receiver = None;
+        for task in self.transport_tasks.drain(..) {
+            task.abort();
+        }
+        self.ws_closed = true;
     }
 
     /// Connect to Astation using a saved auth session.
@@ -311,14 +337,19 @@ impl AstationClient {
     /// Connect WebSocket and authenticate (local Astation connections).
     pub async fn connect(&mut self, url: &str) -> Result<()> {
         self.connect_raw(url).await?;
-        self.authenticate(Duration::from_secs(5), Duration::from_secs(300))
-            .await?;
-        Ok(())
+        let result = self
+            .authenticate(Duration::from_secs(5), Duration::from_secs(300))
+            .await;
+        if result.is_err() {
+            self.abort_transport();
+        }
+        result
     }
 
     /// Connect WebSocket transport only, without authentication.
     /// Used by relay flow where auth happens separately after code exchange.
     pub async fn connect_raw(&mut self, url: &str) -> Result<()> {
+        self.abort_transport();
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
@@ -329,7 +360,7 @@ impl AstationClient {
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AstationMessage>();
 
         // Spawn task to handle outgoing messages
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             while let Some(message) = msg_rx.recv().await {
                 if let Ok(json) = serde_json::to_string(&message) {
                     if let Err(_) = write.send(Message::Text(json)).await {
@@ -340,7 +371,7 @@ impl AstationClient {
         });
 
         // Spawn task to handle incoming messages
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
@@ -363,6 +394,7 @@ impl AstationClient {
 
         self.sender = Some(msg_tx);
         self.receiver = Some(rx);
+        self.transport_tasks = vec![writer_task, reader_task];
         self.ws_closed = false;
 
         Ok(())
@@ -433,7 +465,7 @@ impl AstationClient {
             .ok_or_else(|| anyhow!("Invalid Astation authentication transport"))?;
 
         let hostname = crate::auth::get_hostname();
-        let atem_id = resolved_atem_id(&hostname);
+        let atem_id = self.resolved_atem_id(&hostname);
 
         if transport == "loopback" {
             let token = read_local_bootstrap_token()
@@ -938,12 +970,7 @@ impl AstationClient {
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
-        let atem_id = crate::config::AtemConfig::stored_atem_id().unwrap_or_else(|| {
-            let instance_id = crate::config::AtemConfig::ensure_instance_id();
-            let id = build_atem_id(&hostname, &instance_id);
-            crate::config::AtemConfig::store_atem_id(&id);
-            id
-        });
+        let atem_id = self.resolved_atem_id(&hostname);
 
         let ws_url = relay_ws_url(&ws_scheme, identity_code, &atem_id);
         self.connect_raw(&ws_url).await?;
@@ -952,14 +979,21 @@ impl AstationClient {
         let mut hello_data = std::collections::HashMap::new();
         hello_data.insert("hostname".to_string(), hostname.clone());
 
-        self.send_message(AstationMessage::StatusUpdate {
-            status: "hello".to_string(),
-            data: hello_data,
-        })
-        .await?;
+        let result = async {
+            self.send_message(AstationMessage::StatusUpdate {
+                status: "hello".to_string(),
+                data: hello_data,
+            })
+            .await?;
 
-        self.authenticate(Duration::from_secs(10), Duration::from_secs(300))
-            .await
+            self.authenticate(Duration::from_secs(10), Duration::from_secs(300))
+                .await
+        }
+        .await;
+        if result.is_err() {
+            self.abort_transport();
+        }
+        result
     }
 
     /// Register with the relay service and get a pairing code.
@@ -995,6 +1029,12 @@ impl AstationClient {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
+    }
+}
+
+impl Drop for AstationClient {
+    fn drop(&mut self) {
+        self.abort_transport();
     }
 }
 
@@ -1268,7 +1308,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mut client = AstationClient::new();
+        let mut client = AstationClient::new_with_atem_id("atem-test-denial");
         let error = client
             .connect(&format!("ws://{address}"))
             .await
@@ -1312,7 +1352,7 @@ mod tests {
                 .unwrap();
 
             match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
-                Err(_) | Ok(None) | Ok(Some(Ok(Message::Close(_)))) => {}
+                Err(_) | Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => {}
                 Ok(Some(Ok(Message::Text(text)))) => {
                     panic!("Atem leaked an authentication message after downgrade: {text}")
                 }
@@ -1320,7 +1360,7 @@ mod tests {
             }
         });
 
-        let mut client = AstationClient::new();
+        let mut client = AstationClient::new_with_atem_id("atem-test-downgrade");
         client
             .connect_raw(&format!("ws://{address}"))
             .await
@@ -1375,7 +1415,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
-        let mut client = AstationClient::new();
+        let mut client = AstationClient::new_with_atem_id("atem-test-timeout");
         client
             .connect_raw(&format!("ws://{address}"))
             .await
