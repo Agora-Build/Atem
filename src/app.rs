@@ -1640,7 +1640,10 @@ impl App {
         if self.astation_connected || self.astation_connect_rx.is_some() {
             return;
         }
-        let config = self.config.clone();
+        // Pairing can learn the relay identity while the TUI is already running.
+        // Refresh before every attempt so the next reconnect can use it immediately.
+        let config = AtemConfig::load().unwrap_or_else(|_| self.config.clone());
+        self.config = config.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.astation_connect_rx = Some(rx);
         tokio::spawn(async move {

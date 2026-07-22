@@ -1269,7 +1269,28 @@ async fn run_pair(save: bool) -> Result<()> {
     .await;
 
     match received {
-        Ok(Ok((access_token, refresh_token, expires_at, login_id, astation_id, save_credentials))) => {
+        Ok(Ok((
+            access_token,
+            refresh_token,
+            expires_at,
+            login_id,
+            astation_id,
+            save_credentials,
+        ))) => {
+            if result != "local" {
+                println!("Establishing an authenticated relay session...");
+                drop(client);
+                let mut identity_client = crate::websocket_client::AstationClient::new();
+                identity_client
+                    .connect_relay_identity(config.astation_relay_url(), &astation_id)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Relay room paired, but device authentication failed: {}",
+                            error
+                        )
+                    })?;
+            }
             crate::config::AtemConfig::store_astation_relay_code(&astation_id);
             let mut store = crate::credentials::CredentialStore::load();
             let now = crate::credentials::CredentialEntry::now_secs();

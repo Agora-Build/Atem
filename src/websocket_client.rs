@@ -311,7 +311,8 @@ impl AstationClient {
     /// Connect WebSocket and authenticate (local Astation connections).
     pub async fn connect(&mut self, url: &str) -> Result<()> {
         self.connect_raw(url).await?;
-        self.authenticate(Duration::from_secs(5)).await?;
+        self.authenticate(Duration::from_secs(5), Duration::from_secs(300))
+            .await?;
         Ok(())
     }
 
@@ -369,12 +370,17 @@ impl AstationClient {
 
     /// Authenticate with Astation after WebSocket connection.
     /// Waits for auth_required, then sends session ID or pairing code.
-    /// `auth_timeout` controls how long to wait for Astation to send auth_required
-    /// (5s for local, 5 minutes for relay where user enters code manually).
-    async fn authenticate(&mut self, auth_timeout: Duration) -> Result<()> {
+    /// `challenge_timeout` controls how long to wait for `auth_required`.
+    /// `completion_timeout` bounds everything after the challenge, including
+    /// session proof and interactive pairing.
+    async fn authenticate(
+        &mut self,
+        challenge_timeout: Duration,
+        completion_timeout: Duration,
+    ) -> Result<()> {
         // Wait for auth_required message (with timeout)
         let auth_required = tokio::time::timeout(
-            auth_timeout,
+            challenge_timeout,
             self.wait_for_message(|msg| {
                 matches!(msg, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
             })
@@ -383,6 +389,15 @@ impl AstationClient {
         .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
         .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
 
+        tokio::time::timeout(
+            completion_timeout,
+            self.authenticate_after_challenge(auth_required),
+        )
+        .await
+        .map_err(|_| anyhow!("Authentication timed out"))?
+    }
+
+    async fn authenticate_after_challenge(&mut self, auth_required: AstationMessage) -> Result<()> {
         // Extract the server identity and challenge from auth_required.
         let (astation_id, challenge, transport, protocol) =
             if let AstationMessage::StatusUpdate { data, .. } = &auth_required {
@@ -400,13 +415,27 @@ impl AstationClient {
                 return Err(anyhow!("Invalid auth_required message"));
             };
 
+        if protocol.as_deref() != Some("2") {
+            return Err(anyhow!("Astation authentication protocol v2 is required"));
+        }
+        let challenge = challenge
+            .as_deref()
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| anyhow!("Invalid Astation authentication challenge"))?;
+        let transport = transport
+            .as_deref()
+            .filter(|value| matches!(*value, "loopback" | "lan" | "relay"))
+            .ok_or_else(|| anyhow!("Invalid Astation authentication transport"))?;
+
         let hostname = crate::auth::get_hostname();
         let atem_id = resolved_atem_id(&hostname);
 
-        if transport.as_deref() == Some("loopback") && protocol.as_deref() == Some("2") {
-            let challenge = challenge
-                .as_deref()
-                .ok_or_else(|| anyhow!("Local auth challenge missing"))?;
+        if transport == "loopback" {
             let token = read_local_bootstrap_token()
                 .ok_or_else(|| anyhow!("Astation local bootstrap token is unavailable"))?;
             let mut auth_data = std::collections::HashMap::new();
@@ -436,29 +465,23 @@ impl AstationClient {
         }
 
         // Load session manager
-        let mut session_mgr = crate::auth::SessionManager::load()
-            .unwrap_or_default();
+        let mut session_mgr = crate::auth::SessionManager::load().unwrap_or_default();
 
         // Try session-based auth first if we have a saved session for this Astation
         if let Some(session) = session_mgr.get(&astation_id) {
             let mut auth_data = std::collections::HashMap::new();
             auth_data.insert("session_id".to_string(), session.session_id.clone());
             auth_data.insert("atem_id".to_string(), atem_id.clone());
-            if protocol.as_deref() == Some("2") {
-                let challenge = challenge
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("Session auth challenge missing"))?;
-                auth_data.insert(
-                    "proof".to_string(),
-                    device_auth_proof(
-                        &session.token,
-                        challenge,
-                        &astation_id,
-                        &atem_id,
-                        &session.session_id,
-                    )?,
-                );
-            }
+            auth_data.insert(
+                "proof".to_string(),
+                device_auth_proof(
+                    &session.token,
+                    challenge,
+                    &astation_id,
+                    &atem_id,
+                    &session.session_id,
+                )?,
+            );
 
             let auth_msg = AstationMessage::StatusUpdate {
                 status: "auth".to_string(),
@@ -935,7 +958,8 @@ impl AstationClient {
         })
         .await?;
 
-        self.authenticate(Duration::from_secs(300)).await
+        self.authenticate(Duration::from_secs(10), Duration::from_secs(300))
+            .await
     }
 
     /// Register with the relay service and get a pairing code.
@@ -1184,7 +1208,10 @@ mod tests {
         let expected_astation_id = astation_id.clone();
 
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("test Astation did not accept");
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
             let mut socket = tokio_tungstenite::accept_async(stream)
                 .await
                 .expect("WebSocket handshake failed");
@@ -1192,13 +1219,15 @@ mod tests {
                 status: "auth_required".to_string(),
                 data: std::collections::HashMap::from([
                     ("astation_id".to_string(), expected_astation_id),
-                    ("challenge".to_string(), "challenge-integration".to_string()),
+                    ("challenge".to_string(), "a".repeat(64)),
                     ("transport".to_string(), "lan".to_string()),
                     ("protocol".to_string(), "2".to_string()),
                 ]),
             };
             socket
-                .send(Message::Text(serde_json::to_string(&auth_required).unwrap()))
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
                 .await
                 .unwrap();
 
@@ -1218,7 +1247,11 @@ mod tests {
             assert!(!data["atem_id"].is_empty());
             assert!(!data["hostname"].is_empty());
             assert_eq!(data["pairing_code"].len(), 8);
-            assert!(data["pairing_code"].chars().all(|value| value.is_ascii_digit()));
+            assert!(
+                data["pairing_code"]
+                    .chars()
+                    .all(|value| value.is_ascii_digit())
+            );
             assert!(!data.contains_key("session_id"));
             assert!(!data.contains_key("proof"));
 
@@ -1240,7 +1273,119 @@ mod tests {
             .connect(&format!("ws://{address}"))
             .await
             .expect_err("denied pairing unexpectedly authenticated");
-        assert!(error.to_string().contains("Pairing denied: integration denial"));
+        assert!(
+            error
+                .to_string()
+                .contains("Pairing denied: integration denial")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_rejects_protocol_downgrade_without_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), "astation-downgrade".to_string()),
+                    ("challenge".to_string(), "b".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
+                Err(_) | Ok(None) | Ok(Some(Ok(Message::Close(_)))) => {}
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    panic!("Atem leaked an authentication message after downgrade: {text}")
+                }
+                Ok(Some(other)) => panic!("unexpected WebSocket frame: {other:?}"),
+            }
+        });
+
+        let mut client = AstationClient::new();
+        client
+            .connect_raw(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let error = client
+            .authenticate(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .expect_err("protocol downgrade unexpectedly authenticated");
+        assert!(error.to_string().contains("protocol v2 is required"));
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_bounds_authentication_after_challenge() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let astation_id = format!("astation-timeout-{}", uuid::Uuid::new_v4());
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), astation_id),
+                    ("challenge".to_string(), "c".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let request = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("timed out waiting for authentication request")
+                .expect("Atem closed before authentication request")
+                .expect("failed to read authentication request");
+            assert!(matches!(request, Message::Text(_)));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut client = AstationClient::new();
+        client
+            .connect_raw(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let error = client
+            .authenticate(Duration::from_secs(1), Duration::from_millis(50))
+            .await
+            .expect_err("silent Astation unexpectedly authenticated");
+        assert_eq!(error.to_string(), "Authentication timed out");
+        drop(client);
         server.await.unwrap();
     }
 

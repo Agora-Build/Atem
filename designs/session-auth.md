@@ -68,6 +68,15 @@ The cross-language test vector is:
 
 ## Pairing and reconnect
 
+Remote first-time pairing has two explicit stages. The short relay-room code lets
+Astation and Atem discover each other, then the identity-relay connection shows
+an 8-digit device code for approval. `atem pair` reports success only after the
+second stage creates and stores the reusable device session.
+
+Every v2 handshake is bounded both while waiting for `auth_required` and after
+the challenge is received. Atem rejects missing or malformed v2 challenges
+rather than falling back to bearer-session authentication.
+
 1. Atem receives `auth_required` and looks up a session by `astation_id`.
 2. When a valid session exists, Atem sends `session_id`, `atem_id`, and `proof`.
 3. Astation verifies the proof, expiry, and device binding before registering
