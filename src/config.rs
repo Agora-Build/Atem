@@ -664,11 +664,8 @@ impl crate::auth::AuthSession {
     /// Load saved session from disk. Returns None if not found.
     pub fn load_saved() -> Option<Self> {
         let path = Self::session_path();
-        if !path.exists() {
-            return None;
-        }
-        let content = fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
+        let content = crate::auth::read_private_file(&path).ok()??;
+        serde_json::from_slice(&content).ok()
     }
 
     /// Save session to disk.

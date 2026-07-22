@@ -89,16 +89,24 @@ Old clients that send only a session ID cannot authenticate against v2.
 | `~/Library/Application Support/Astation/local-bootstrap-token` | `0600` | Same-user loopback key, read on macOS only |
 
 The `~/.config/atem` directory is set to `0700` when sessions are saved. Never
-print session tokens, proofs, or bootstrap contents.
+print session tokens, proofs, or bootstrap contents. Existing session files are
+validated as current-user regular files, changed to `0600` before reading, and
+opened without following symbolic links. Private writes apply the same checks
+before truncating an existing file.
 
 ## Practical verification
 
 ```bash
 cargo test websocket_client::tests::device_auth_proof_matches_protocol_vector
 cargo test websocket_client::tests::local_bootstrap_token_requires_private_permissions
+cargo test websocket_client::tests::practical_websocket_v2_pairing_sends_identity_and_handles_denial
 cargo test auth::tests::private_file_write_uses_owner_only_permissions
 cargo test -- --test-threads=1
 ```
+
+The practical Atem test starts a real loopback WebSocket server, sends the v2
+LAN challenge through the production client, validates the stable Atem identity
+and pairing request, and confirms that a denial propagates to the caller.
 
 The coordinated Astation tests start the real NIO WebSocket server and cover an
 offline loopback client, a rejected forged proof, five concurrent Atem clients,

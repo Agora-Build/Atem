@@ -1022,13 +1022,24 @@ fn read_local_bootstrap_token() -> Option<String> {
 
 #[cfg(unix)]
 fn read_local_bootstrap_token_from(path: &std::path::Path) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         return None;
     }
-    let token = fs::read_to_string(path).ok()?.trim().to_string();
+    let mut token = String::new();
+    file.read_to_string(&mut token).ok()?;
+    let token = token.trim().to_string();
     (!token.is_empty()).then_some(token)
 }
 
@@ -1145,6 +1156,92 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(read_local_bootstrap_token_from(&path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_bootstrap_token_refuses_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("bootstrap-target");
+        let link = directory.path().join("local-bootstrap-token");
+        fs::write(&target, "bootstrap-secret\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(read_local_bootstrap_token_from(&link), None);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "bootstrap-secret\n");
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_v2_pairing_sends_identity_and_handles_denial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let astation_id = format!("astation-integration-{}", uuid::Uuid::new_v4());
+        let expected_astation_id = astation_id.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), expected_astation_id),
+                    ("challenge".to_string(), "challenge-integration".to_string()),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(serde_json::to_string(&auth_required).unwrap()))
+                .await
+                .unwrap();
+
+            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("timed out waiting for pairing request")
+                .expect("Atem closed before pairing request")
+                .expect("failed to read pairing request");
+            let Message::Text(text) = frame else {
+                panic!("expected text pairing request");
+            };
+            let request: AstationMessage = serde_json::from_str(&text).unwrap();
+            let AstationMessage::StatusUpdate { status, data } = request else {
+                panic!("expected authentication status update");
+            };
+            assert_eq!(status, "auth");
+            assert!(!data["atem_id"].is_empty());
+            assert!(!data["hostname"].is_empty());
+            assert_eq!(data["pairing_code"].len(), 8);
+            assert!(data["pairing_code"].chars().all(|value| value.is_ascii_digit()));
+            assert!(!data.contains_key("session_id"));
+            assert!(!data.contains_key("proof"));
+
+            let denied = AstationMessage::StatusUpdate {
+                status: "auth".to_string(),
+                data: std::collections::HashMap::from([
+                    ("status".to_string(), "denied".to_string()),
+                    ("message".to_string(), "integration denial".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(serde_json::to_string(&denied).unwrap()))
+                .await
+                .unwrap();
+        });
+
+        let mut client = AstationClient::new();
+        let error = client
+            .connect(&format!("ws://{address}"))
+            .await
+            .expect_err("denied pairing unexpectedly authenticated");
+        assert!(error.to_string().contains("Pairing denied: integration denial"));
+        server.await.unwrap();
     }
 
     // --- Serialization round-trip tests ---
