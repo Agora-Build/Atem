@@ -359,14 +359,15 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
       `timeout_ms`}) → `properties.llm.mcp_servers[]`. When any MCP
       server is present atem auto-sets `advanced_features.enable_tools
       = true` unless that field is pinned in `[advanced_features]`.
-      MCP is LLM-pipeline only — ignored in MLLM mode.
     - `[agent.mllm]` — single multimodal model that replaces
       asr+llm+tts. Per Agora's MLLM schema: `vendor`, `url`,
       `api_key`, `greeting_message` at the top of the block; vendor
       knobs (`model`, `voice`, `instructions`, …) under `[…params]`.
       atem auto-injects `enable: true`, `input_modalities: ["audio"]`,
       and `output_modalities: ["text", "audio"]` so the agent emits
-      audio.
+      audio. MCP works here too: `[[agent.mllm.mcp_servers]]` (same
+      shape as the LLM's) → `properties.mllm.mcp_servers[]`, and
+      `enable_tools` is auto-set the same way.
   - Pass-through tables — `[advanced_features]`, `[vad]`, `[sal]`,
     `[parameters]` — atem forwards verbatim as `properties.<key>`.
 

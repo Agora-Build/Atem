@@ -238,7 +238,8 @@ pub struct LlmConfig {
     /// from. Forwarded as `properties.llm.mcp_servers`. When any are
     /// configured, atem also sets `advanced_features.enable_tools =
     /// true` unless that field is explicitly set in `[advanced_features]`.
-    /// MCP is an LLM-pipeline feature only — MLLM mode ignores this.
+    /// For MLLM mode, the equivalent lives on `ServiceConfig.mcp_servers`
+    /// (`[[agent.mllm.mcp_servers]]`).
     pub mcp_servers: Vec<McpServer>,
     pub params: BTreeMap<String, toml::Value>,
 }
@@ -249,8 +250,9 @@ pub struct SystemMessage {
     pub content: String,
 }
 
-/// One MCP server entry under `[[agent.llm.mcp_servers]]`. Mirrors
-/// Agora's `properties.llm.mcp_servers[]` shape.
+/// One MCP server entry under `[[agent.llm.mcp_servers]]` (cascaded) or
+/// `[[agent.mllm.mcp_servers]]` (MLLM). Mirrors Agora's
+/// `properties.<llm|mllm>.mcp_servers[]` shape.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServer {
