@@ -1825,6 +1825,131 @@ validate_asr_result_timestamp = false
         assert_eq!(body["properties"]["advanced_features"]["enable_tools"], true);
     }
 
+    // Full real-world MLLM + MCP /join body, mirroring the shape Agora's
+    // API expects (auto-injected enable/modalities alongside mcp_servers +
+    // top-level advanced_features.enable_tools).
+    #[test]
+    fn mllm_mcp_full_join_body_matches_agora_shape() {
+        let toml_str = r#"
+            [atem]
+            pipeline = "mllm"
+            [agent]
+            user_id = "1001"
+            [agent.mllm]
+            vendor  = "openai"
+            url     = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
+            api_key = "sk-x"
+            [[agent.mllm.mcp_servers]]
+            name          = "kb"
+            endpoint      = "https://mcp-kb-test.example/mcp"
+            transport     = "streamable_http"
+            allowed_tools = ["search_knowledge_base"]
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false, avatar_user_id: "9",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None, enable_dump: false,
+            pipeline: Pipeline::Mllm,
+        });
+        let mllm = &body["properties"]["mllm"];
+        // Provider fields from TOML.
+        assert_eq!(mllm["vendor"], "openai");
+        assert_eq!(mllm["url"], "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1");
+        assert_eq!(mllm["api_key"], "sk-x");
+        // atem-injected MLLM defaults, sitting next to mcp_servers.
+        assert_eq!(mllm["enable"], true);
+        assert_eq!(mllm["input_modalities"], json!(["audio"]));
+        assert_eq!(mllm["output_modalities"], json!(["text", "audio"]));
+        // MCP is on the mllm block, NOT on a (nonexistent) llm block.
+        assert!(body["properties"].get("llm").is_none());
+        assert_eq!(mllm["mcp_servers"][0]["name"], "kb");
+        assert_eq!(body["properties"]["advanced_features"]["enable_tools"], true);
+    }
+
+    // Multiple MLLM MCP servers keep their order, and headers/timeout_ms
+    // pass through per server.
+    #[test]
+    fn mllm_multiple_mcp_servers_preserved_with_headers() {
+        let toml_str = r#"
+            [atem]
+            pipeline = "mllm"
+            [agent]
+            user_id = "1001"
+            [agent.mllm]
+            vendor = "openai"
+
+            [[agent.mllm.mcp_servers]]
+            name       = "kb"
+            endpoint   = "https://kb.example/mcp"
+            transport  = "streamable_http"
+            timeout_ms = 30000
+            [agent.mllm.mcp_servers.headers]
+            Authorization = "Bearer tok-1"
+
+            [[agent.mllm.mcp_servers]]
+            name     = "crm"
+            endpoint = "https://crm.example/mcp"
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false, avatar_user_id: "9",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None, enable_dump: false,
+            pipeline: Pipeline::Mllm,
+        });
+        let servers = body["properties"]["mllm"]["mcp_servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0]["name"], "kb");
+        assert_eq!(servers[0]["timeout_ms"], 30000);
+        assert_eq!(servers[0]["headers"]["Authorization"], "Bearer tok-1");
+        assert_eq!(servers[1]["name"], "crm");
+        assert_eq!(body["properties"]["advanced_features"]["enable_tools"], true);
+    }
+
+    // An explicit enable_tools in [advanced_features] wins over the MLLM
+    // MCP auto-set (parity with the cascaded-LLM behavior).
+    #[test]
+    fn mllm_mcp_explicit_enable_tools_false_is_respected() {
+        let toml_str = r#"
+            [atem]
+            pipeline = "mllm"
+            [agent]
+            user_id = "1001"
+            [agent.mllm]
+            vendor = "openai"
+            [[agent.mllm.mcp_servers]]
+            name     = "kb"
+            endpoint = "https://kb.example/mcp"
+            [advanced_features]
+            enable_tools = false
+            enable_rtm   = true
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false, avatar_user_id: "9",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None, enable_dump: false,
+            pipeline: Pipeline::Mllm,
+        });
+        assert_eq!(body["properties"]["advanced_features"]["enable_tools"], false);
+        assert_eq!(body["properties"]["advanced_features"]["enable_rtm"], true);
+        // servers still emitted regardless of the tools switch
+        assert_eq!(body["properties"]["mllm"]["mcp_servers"][0]["name"], "kb");
+    }
+
     #[test]
     fn join_payload_emits_preset_from_agent_section_when_no_runtime() {
         // [agent].preset is the comma-separated string atem forwards
