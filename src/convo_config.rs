@@ -277,6 +277,13 @@ pub struct ServiceConfig {
     pub greeting_message: Option<String>,
     pub language: Option<String>,
     pub avatar_id: Option<String>,
+    /// MCP servers under `[[agent.mllm.mcp_servers]]`. Forwarded as
+    /// `properties.mllm.mcp_servers[]` (newer Agora MLLM schema; MCP
+    /// moved onto the mllm block since it replaces the LLM). When any
+    /// are set in MLLM mode, atem also auto-sets
+    /// `advanced_features.enable_tools = true`. Ignored for asr/tts/
+    /// avatar blocks (they never carry MCP).
+    pub mcp_servers: Vec<McpServer>,
     pub params: BTreeMap<String, toml::Value>,
 }
 
@@ -459,16 +466,22 @@ impl ConvoConfig {
         // Pass-through top-level properties from convo.toml. Any sub-table
         // (e.g. [parameters.transcript]) is preserved as nested JSON.
         //
-        // MCP convenience: when the active LLM declares `mcp_servers`,
-        // the agent needs `advanced_features.enable_tools = true` or
-        // it won't actually call any tools. Auto-set it unless the
-        // user pinned the field themselves in [advanced_features].
-        let llm_has_mcp = matches!(args.pipeline, Pipeline::Cascaded)
-            && self.agent.as_ref()
+        // MCP convenience: when the ACTIVE pipeline's model declares
+        // `mcp_servers`, the agent needs `advanced_features.enable_tools
+        // = true` or it won't actually call any tools. Auto-set it unless
+        // the user pinned the field themselves in [advanced_features].
+        // Cascaded → [agent.llm].mcp_servers; MLLM → [agent.mllm].mcp_servers.
+        let has_mcp = match args.pipeline {
+            Pipeline::Cascaded => self.agent.as_ref()
                 .and_then(|a| a.llm.as_ref())
                 .map(|l| !l.mcp_servers.is_empty())
-                .unwrap_or(false);
-        match (&self.advanced_features, llm_has_mcp) {
+                .unwrap_or(false),
+            Pipeline::Mllm => self.agent.as_ref()
+                .and_then(|a| a.mllm.as_ref())
+                .map(|m| !m.mcp_servers.is_empty())
+                .unwrap_or(false),
+        };
+        match (&self.advanced_features, has_mcp) {
             (Some(m), true) => {
                 let mut j = match map_to_json(m) {
                     Value::Object(o) => o,
@@ -595,6 +608,10 @@ fn service_to_json(c: &ServiceConfig) -> Value {
     if let Some(v) = &c.greeting_message { m.insert("greeting_message".into(), json!(v)); }
     if let Some(v) = &c.language         { m.insert("language".into(), json!(v)); }
     if let Some(v) = &c.avatar_id        { m.insert("avatar_id".into(), json!(v)); }
+    if !c.mcp_servers.is_empty() {
+        let arr: Vec<Value> = c.mcp_servers.iter().map(mcp_server_to_json).collect();
+        m.insert("mcp_servers".into(), Value::Array(arr));
+    }
     if !c.params.is_empty() {
         m.insert("params".into(), toml_map_to_json(&c.params));
     }
@@ -1768,7 +1785,44 @@ validate_asr_result_timestamp = false
         });
         assert!(body["properties"].get("llm").is_none());
         assert!(body["properties"].get("advanced_features").is_none(),
-            "no auto enable_tools in mllm mode: {}", body);
+            "llm-parked mcp_servers must not auto-enable tools in mllm mode: {}", body);
+    }
+
+    #[test]
+    fn join_payload_emits_mcp_servers_under_mllm_and_auto_enables_tools() {
+        let toml_str = r#"
+            [atem]
+            pipeline = "mllm"
+            [agent]
+            user_id = "1001"
+            [agent.mllm]
+            vendor  = "openai"
+            url     = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
+            api_key = "sk-x"
+            [[agent.mllm.mcp_servers]]
+            name          = "kb"
+            endpoint      = "https://mcp-kb-test.example/mcp"
+            transport     = "streamable_http"
+            allowed_tools = ["search_knowledge_base"]
+        "#;
+        let cfg: ConvoConfig = toml::from_str(toml_str).unwrap();
+        let body = cfg.build_join_payload(JoinArgs {
+            name: "x", channel: "c", token: "t",
+            agent_rtc_uid: "1", remote_uids: &[],
+            include_avatar: false, avatar_user_id: "9",
+            avatar_channel: None, avatar_token: None,
+            preset: None,
+            encryption_mode: None, encryption_key: None, encryption_salt: None,
+            geofence_area: None, enable_dump: false,
+            pipeline: Pipeline::Mllm,
+        });
+        let mcp = &body["properties"]["mllm"]["mcp_servers"][0];
+        assert_eq!(mcp["name"], "kb");
+        assert_eq!(mcp["endpoint"], "https://mcp-kb-test.example/mcp");
+        assert_eq!(mcp["transport"], "streamable_http");
+        assert_eq!(mcp["allowed_tools"], json!(["search_knowledge_base"]));
+        // enable_tools auto-set since no [advanced_features] in the file
+        assert_eq!(body["properties"]["advanced_features"]["enable_tools"], true);
     }
 
     #[test]
