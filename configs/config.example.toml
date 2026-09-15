@@ -27,6 +27,12 @@
 # instance_id = "550e8400-e29b-41d4-a716-446655440000"
 # atem_id     = "MacBook-Prol-550e8400"
 
+# ── serv files state (auto-generated — do not edit) ──────────────────
+# The port `atem serv files` bound last time. Reused on the next run;
+# if it's taken, atem switches to an open port and records that instead.
+#
+# files_last_port = 8443
+
 # ── Extra hostnames ──────────────────────────────────────────────────
 # Additional hostnames the machine is reachable on (netbird, tailscale,
 # ngrok, cloudflared, etc.). Each one is baked into the self-signed

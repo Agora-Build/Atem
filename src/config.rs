@@ -116,16 +116,16 @@ impl AtemConfig {
             .filter(|s| !s.is_empty())
     }
 
-    /// Merge a single top-level string key into `config.toml`, preserving other
-    /// keys. Best-effort: silently no-ops on IO/parse failure.
-    fn write_config_string(key: &str, value: &str) {
+    /// Merge a single top-level key into `config.toml`, preserving other keys.
+    /// Best-effort: silently no-ops on IO/parse failure.
+    fn write_config_value(key: &str, value: toml::Value) {
         let path = Self::config_path();
         let mut existing = fs::read_to_string(&path)
             .ok()
             .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
             .unwrap_or_else(|| toml::Value::Table(Default::default()));
         if let Some(table) = existing.as_table_mut() {
-            table.insert(key.into(), toml::Value::String(value.to_string()));
+            table.insert(key.into(), value);
             if let Some(dir) = path.parent() {
                 let _ = fs::create_dir_all(dir);
             }
@@ -133,6 +133,11 @@ impl AtemConfig {
                 let _ = fs::write(&path, content);
             }
         }
+    }
+
+    /// Merge a single top-level string key into `config.toml`.
+    fn write_config_string(key: &str, value: &str) {
+        Self::write_config_value(key, toml::Value::String(value.to_string()));
     }
 
     /// Stable per-install identifier (UUID v4), generated once and persisted to
@@ -159,6 +164,21 @@ impl AtemConfig {
     /// changes (generated once, then frozen).
     pub fn store_atem_id(id: &str) {
         Self::write_config_string("atem_id", id);
+    }
+
+    /// The port `atem serv files` bound last time, if recorded. Reused as the
+    /// preferred port on the next run.
+    pub fn stored_files_port() -> Option<u16> {
+        let content = fs::read_to_string(Self::config_path()).ok()?;
+        let val = toml::from_str::<toml::Value>(&content).ok()?;
+        val.get("files_last_port")
+            .and_then(|v| v.as_integer())
+            .and_then(|n| u16::try_from(n).ok())
+    }
+
+    /// Remember the port `atem serv files` bound, so the next run reuses it.
+    pub fn store_files_port(port: u16) {
+        Self::write_config_value("files_last_port", toml::Value::Integer(port as i64));
     }
 
     /// Remember the authenticated Astation as the default identity-relay target.

@@ -26,6 +26,32 @@ pub struct ServeFilesConfig {
     pub _daemon: bool,
 }
 
+/// Resolve the port to attempt: an explicit `--port` (non-zero) wins; otherwise
+/// reuse the port from the last run; otherwise 0 (let the OS assign a free one).
+fn resolve_files_port(explicit: u16, last_used: Option<u16>) -> u16 {
+    if explicit != 0 {
+        explicit
+    } else {
+        last_used.unwrap_or(0)
+    }
+}
+
+/// Bind the files server, falling back to an OS-assigned port if `desired` is
+/// taken. `desired == 0` already means "any free port", so it never falls back.
+async fn bind_files_listener(desired: u16) -> Result<TcpListener> {
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], desired));
+    match TcpListener::bind(addr).await {
+        Ok(l) => Ok(l),
+        Err(e) if desired != 0 => {
+            println!("Port {} is unavailable ({}); switching to an open port.", desired, e);
+            TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+                .await
+                .context("failed to bind a fallback port")
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("failed to bind files server")),
+    }
+}
+
 pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
     // Accept either a directory or a single file. For a file, the
     // parent directory becomes the served root and the URL points at
@@ -49,18 +75,26 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
 
     // ── Background fork: parent re-execs the daemon, registers, exits ──
     if cfg.background && !cfg._daemon {
-        // Auto-pick a port if not given. Parent briefly binds 0 to
-        // discover an OS-assigned port, drops the listener, then
-        // hands the port to the daemon. The race window between
-        // drop and child re-bind is sub-millisecond locally; if you
-        // care about it, pass --port explicitly.
-        let port = if cfg.port == 0 {
-            let probe = std::net::TcpListener::bind(("0.0.0.0", 0))
-                .context("failed to probe a free port")?;
+        // Resolve the port: explicit --port > last-used > OS-assigned. The
+        // parent briefly binds it to confirm it's free (falling back to an
+        // open port if taken), drops the listener, then hands the port to the
+        // daemon. The race window between drop and child re-bind is sub-ms
+        // locally; if you care about it, pass --port explicitly.
+        let desired = resolve_files_port(cfg.port, crate::config::AtemConfig::stored_files_port());
+        let port = {
+            let probe = match std::net::TcpListener::bind(("0.0.0.0", desired)) {
+                Ok(p) => p,
+                Err(e) if desired != 0 => {
+                    println!("Port {} is unavailable ({}); switching to an open port.", desired, e);
+                    std::net::TcpListener::bind(("0.0.0.0", 0))
+                        .context("failed to probe a free port")?
+                }
+                Err(e) => return Err(anyhow::Error::new(e).context("failed to probe a free port")),
+            };
             probe.local_addr()?.port()
-        } else {
-            cfg.port
         };
+        // Remember it for next time (the daemon child binds this exact port).
+        crate::config::AtemConfig::store_files_port(port);
 
         let exe = std::env::current_exe()?;
         let log_dir = crate::rtc_test_server::servers_dir();
@@ -142,10 +176,21 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
         .with_single_cert(certs, key)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
-    let listener  = TcpListener::bind(bind_addr).await
-        .with_context(|| format!("Failed to bind {}", bind_addr))?;
+    // Resolve the port: explicit --port > last-used > OS-assigned, then bind
+    // with fallback to an open port if it's taken. The daemon child already
+    // received the parent-resolved port, so it binds cfg.port directly.
+    let desired = if cfg._daemon {
+        cfg.port
+    } else {
+        resolve_files_port(cfg.port, crate::config::AtemConfig::stored_files_port())
+    };
+    let listener   = bind_files_listener(desired).await?;
     let bound_port = listener.local_addr()?.port();
+    // Remember the port so the next run reuses it (parent persisted in the
+    // background path; only foreground non-daemon runs persist here).
+    if !cfg._daemon {
+        crate::config::AtemConfig::store_files_port(bound_port);
+    }
 
     let local_url   = format!("https://localhost:{}{}", bound_port, target_path);
     let network_url = format!("https://{}:{}{}", sslip, bound_port, target_path);
@@ -458,6 +503,25 @@ mod tests {
         assert!(resolve_path(&root, "/../etc/passwd").is_err());
         assert!(resolve_path(&root, "/foo/../../etc").is_err());
         assert!(resolve_path(&root, "/./hidden").is_err());
+    }
+
+    #[test]
+    fn resolve_port_prefers_explicit() {
+        // Explicit --port always wins, even over a remembered port.
+        assert_eq!(resolve_files_port(8443, Some(9000)), 8443);
+        assert_eq!(resolve_files_port(8443, None), 8443);
+    }
+
+    #[test]
+    fn resolve_port_falls_back_to_last_used() {
+        // No --port → reuse the last-used port.
+        assert_eq!(resolve_files_port(0, Some(9000)), 9000);
+    }
+
+    #[test]
+    fn resolve_port_defaults_to_zero_when_no_history() {
+        // No --port and nothing remembered → 0 (OS assigns a free port).
+        assert_eq!(resolve_files_port(0, None), 0);
     }
 
     #[test]
