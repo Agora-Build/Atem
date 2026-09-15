@@ -158,7 +158,7 @@ Key methods:
 
 | File | Contents | Encryption |
 |------|----------|------------|
-| `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) + auto-generated identity (`instance_id`, `atem_id`) | None |
+| `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) + auto-generated identity (`instance_id`, `atem_id`) + `files_last_port` (last port `atem serv files` bound, reused next run) | None |
 | `credentials.enc` | SSO + paired tokens (multi-entry `Vec<CredentialEntry>`) | AES-256-GCM (machine-bound) |
 | `project_cache.enc` | All projects + `current_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
 | `session.json` | Astation auth session ID + expiry | None |
