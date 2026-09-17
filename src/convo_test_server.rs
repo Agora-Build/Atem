@@ -1183,6 +1183,20 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 <!-- ── ConvoAI ─────────────────────────────────────────────────── -->
 <section class="block">
   <h2 class="block-title"><span class="status-dot idle" id="agentDot"></span>ConvoAI — <span id="agentState" style="font-weight:400;color:#7d8590">idle</span></h2>
+  <div class="controls avatar-row">
+    <label>Environment</label>
+    <span id="envRadios"></span>
+  </div>
+  <div class="controls avatar-row">
+    <label>Endpoint</label>
+    <span id="envUrlPreview" style="font-family:monospace;font-size:12px;color:#7d8590;word-break:break-all"></span>
+  </div>
+  <div style="font-size:12px;color:#7d8590;padding-left:16px">
+    The environment sets the ConvoAI REST endpoint used for the agent's /join, /leave, and
+    status calls. Pick one — GA (general availability), EAP (Early Access Preview, for
+    live/MLLM models), or HIPAA — and the URL above updates to what atem will call.
+  </div>
+  <div id="envHint" style="font-size:12px;color:#7d8590;padding-left:16px"></div>
   <div class="controls">
     <label>Agent User</label>
     <span id="agentUidDisplay" class="read-only-value">—</span>
@@ -1196,15 +1210,6 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <label for="avatarCheckbox">Enable Avatar</label>
     <input type="checkbox" id="avatarCheckbox">
   </div>
-  <div class="controls avatar-row">
-    <label>Environment</label>
-    <span id="envRadios"></span>
-  </div>
-  <div class="controls avatar-row">
-    <label>Endpoint</label>
-    <span id="envUrlPreview" style="font-family:monospace;font-size:12px;color:#7d8590;word-break:break-all"></span>
-  </div>
-  <div id="envHint" style="font-size:12px;color:#7d8590;padding-left:16px"></div>
   <div class="controls avatar-row">
     <label for="audioDumpCheckbox">Audio Dump</label>
     <input type="checkbox" id="audioDumpCheckbox">
