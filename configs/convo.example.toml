@@ -34,10 +34,38 @@ pipeline = "cascaded"        # "cascaded" | "mllm"
 # rate limits). Floored to 5. Foreground mode ignores this field.
 # poll_interval_secs = 60
 
-# Route through Agora's /hipaa/api/conversational-ai-agent/... endpoint
-# instead of /api/.... Requires Agora Support to enable HIPAA on the
-# project first.
-hipaa = false
+# ConvoAI REST environment — which endpoint the /join, /leave, and status
+# calls use. Built-in choices (a single one is active at a time; the web UI
+# shows them as radio buttons):
+#   ga    → https://api.agora.io/api/...              (default, general availability)
+#   eap   → https://partner.ai.agora.io/preview/api/...  (Early Access Preview;
+#           live/MLLM models. atem sends the `agora-feature: live-models`
+#           header. Requires Agora to allowlist your project.)
+#   hipaa → https://api.agora.io/hipaa/api/...         (forces NORTH_AMERICA +
+#           AES_256_GCM2; requires Agora Support to enable HIPAA.)
+env = "ga"
+
+# Optional allowlist — show only these environments in the web UI (in this
+# order). Omit to show all available. e.g. envs = ["ga", "eap"] hides HIPAA.
+# Hosts/prefixes still come from the built-in defaults unless overridden below.
+# envs = ["ga", "eap"]
+
+# The legacy `hipaa = true` still works — it's an alias for `env = "hipaa"`.
+# hipaa = false
+
+# Add or override environments here — no code change needed. Each entry
+# becomes a selectable radio in the web UI. Merged over the built-ins by
+# `name` (matching name overrides, new name adds). ATEM_CONVOAI_API_URL, if
+# set, overrides the host of the built-in ga/hipaa.
+#
+# [[atem.environments]]
+# name    = "eap"
+# host    = "https://partner.ai.agora.io"
+# prefix  = "preview/api"
+# label   = "EAP"                        # UI label (defaults to NAME uppercased)
+# headers = { agora-feature = "live-models" }   # sent on every request
+# # force_geofence        = "NORTH_AMERICA"      # optional: pin + lock geofence
+# # force_encryption_mode = 8                    # optional: pin + lock encryption
 
 # Geofence — restrict media routing region.
 # Valid: GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA

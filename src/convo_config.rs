@@ -83,9 +83,66 @@ pub struct ConvoConfig {
     pub atem: Option<AtemSection>,
 }
 
+/// One ConvoAI REST environment. The `/join` (etc.) URL is built as
+/// `{host}/{prefix}/conversational-ai-agent/v2/projects/<app_id>/...`, with
+/// `headers` added to every request. `force_*` let an environment pin UI
+/// controls (HIPAA uses them). Defined by built-ins + `[[atem.environments]]`,
+/// so new environments need no code change.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvDef {
+    /// Selector id, e.g. "ga" | "eap" | "hipaa" | custom. Matches `[atem].env`.
+    pub name: String,
+    /// Scheme + host, e.g. "https://api.agora.io" (no trailing slash).
+    pub host: String,
+    /// Path segment before `/conversational-ai-agent/...`, e.g. "api",
+    /// "preview/api", "hipaa/api".
+    pub prefix: String,
+    /// Extra request headers sent on every ConvoAI call (e.g. EAP's
+    /// `agora-feature = "live-models"`).
+    pub headers: BTreeMap<String, String>,
+    /// UI label; defaults to `name.to_uppercase()` when empty.
+    pub label: Option<String>,
+    /// When set, selecting this env forces + locks the geofence to this area
+    /// (e.g. "NORTH_AMERICA"). HIPAA uses this.
+    pub force_geofence: Option<String>,
+    /// When set, selecting this env forces + locks the encryption mode
+    /// (1..=8; e.g. 8 = AES_256_GCM2). HIPAA uses this.
+    pub force_encryption_mode: Option<u8>,
+}
+
+impl EnvDef {
+    fn new(name: &str, host: &str, prefix: &str) -> Self {
+        EnvDef { name: name.into(), host: host.into(), prefix: prefix.into(), ..Default::default() }
+    }
+    /// Base URL up to `projects/<app_id>`, no `/join` or `/leave` — used for
+    /// building request URLs and the UI endpoint preview.
+    pub fn projects_base(&self, app_id: &str) -> String {
+        format!("{}/{}/conversational-ai-agent/v2/projects/{}",
+            self.host.trim_end_matches('/'), self.prefix.trim_matches('/'), app_id)
+    }
+}
+
+/// Built-in environment defaults. `[[atem.environments]]` overrides by name.
+pub fn default_environments() -> Vec<EnvDef> {
+    let mut ga = EnvDef::new("ga", "https://api.agora.io", "api");
+    ga.label = Some("GA".into());
+
+    let mut eap = EnvDef::new("eap", "https://partner.ai.agora.io", "preview/api");
+    eap.label = Some("EAP".into());
+    eap.headers.insert("agora-feature".into(), "live-models".into());
+
+    let mut hipaa = EnvDef::new("hipaa", "https://api.agora.io", "hipaa/api");
+    hipaa.label = Some("HIPAA".into());
+    hipaa.force_geofence = Some("NORTH_AMERICA".into());
+    hipaa.force_encryption_mode = Some(8); // AES_256_GCM2
+
+    vec![ga, eap, hipaa]
+}
+
 /// atem-local control fields that DO NOT pass through to Agora's
 /// /join body. atem reads each and decides what to dispatch / build:
-/// e.g. `hipaa = true` switches the `/join` URL prefix; `[atem.encryption]`
+/// e.g. `env`/`hipaa` switch the `/join` URL; `[atem.encryption]`
 /// gates whether `properties.rtc.encryption_*` is emitted at all.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(default, deny_unknown_fields)]
@@ -103,8 +160,26 @@ pub struct AtemSection {
     #[serde(deserialize_with = "de_user_id", default)]
     pub rtc_user_id: Option<String>,
 
-    /// Route through Agora's HIPAA-compliant `/hipaa/api/...` endpoint.
-    /// Default false (regular path).
+    /// Which ConvoAI REST environment to use — must match an entry `name`
+    /// (built-in `ga`/`eap`/`hipaa`, or a custom `[[atem.environments]]`).
+    /// Default "ga". When unset, `hipaa = true` (below) still selects "hipaa".
+    pub env: Option<String>,
+
+    /// Allowlist of environment names to show in the UI, in this order.
+    /// Empty / omitted → show all available. e.g. `envs = ["ga", "eap"]`
+    /// shows only those two (hosts/prefixes still come from the built-in
+    /// defaults unless overridden via `[[atem.environments]]`).
+    pub envs: Vec<String>,
+
+    /// Extra / overriding REST environments. Merged over the built-in
+    /// defaults (`ga`, `eap`, `hipaa`) by `name`: a matching name overrides
+    /// that built-in, a new name adds a selectable environment — no code
+    /// change needed. Each entry becomes a radio option in the web UI
+    /// (subject to `envs` above).
+    pub environments: Vec<EnvDef>,
+
+    /// Deprecated alias for `env = "hipaa"`. Route through Agora's
+    /// HIPAA-compliant `/hipaa/api/...` endpoint. Default false.
     pub hipaa: Option<bool>,
 
     /// Geofence area: GLOBAL (default) | NORTH_AMERICA | EUROPE | ASIA |
@@ -191,6 +266,69 @@ impl ConvoConfig {
                 .filter(|p| !p.is_empty())
                 .collect())
             .unwrap_or_default()
+    }
+
+    /// The available REST environments: built-in defaults merged with
+    /// `[[atem.environments]]` (config wins by `name`; a new name is added).
+    /// The legacy `ATEM_CONVOAI_API_URL` env var, if set, overrides the host
+    /// of the `ga` and `hipaa` built-ins (the ones on api.agora.io).
+    pub fn environments(&self) -> Vec<EnvDef> {
+        let api_override = std::env::var("ATEM_CONVOAI_API_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.environments_with(api_override.as_deref())
+    }
+
+    /// Same as [`environments`], but the `ATEM_CONVOAI_API_URL` override is
+    /// passed in explicitly (keeps this pure + testable without touching the
+    /// process environment).
+    fn environments_with(&self, api_override: Option<&str>) -> Vec<EnvDef> {
+        let mut envs = default_environments();
+        if let Some(base) = api_override {
+            for e in envs.iter_mut() {
+                if e.name == "ga" || e.name == "hipaa" {
+                    e.host = base.to_string();
+                }
+            }
+        }
+        if let Some(atem) = &self.atem {
+            for cfg in &atem.environments {
+                if cfg.name.is_empty() {
+                    continue;
+                }
+                match envs.iter_mut().find(|e| e.name == cfg.name) {
+                    Some(existing) => *existing = cfg.clone(),
+                    None => envs.push(cfg.clone()),
+                }
+            }
+        }
+        // Allowlist: when [atem].envs is non-empty, keep only those, in that
+        // order. Names that don't resolve to any environment are skipped.
+        if let Some(allow) = self.atem.as_ref().map(|a| &a.envs).filter(|a| !a.is_empty()) {
+            let filtered: Vec<EnvDef> = allow.iter()
+                .filter_map(|name| envs.iter().find(|e| &e.name == name).cloned())
+                .collect();
+            if !filtered.is_empty() {
+                return filtered;
+            }
+        }
+        envs
+    }
+
+    /// The selected environment name: `[atem].env`, else legacy
+    /// `[atem].hipaa = true` → "hipaa", else "ga".
+    pub fn env_name(&self) -> String {
+        let atem = self.atem.as_ref();
+        atem.and_then(|a| a.env.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if atem.and_then(|a| a.hipaa).unwrap_or(false) {
+                    "hipaa".into()
+                } else {
+                    "ga".into()
+                }
+            })
     }
 }
 
@@ -680,9 +818,14 @@ pub struct ResolvedConfig {
     /// The page sends back a comma-joined subset as
     /// `properties.preset` in the /join body.
     pub presets:           Vec<String>,
-    /// HIPAA mode (TOML default). UI checkbox + background mode both
-    /// honour this; user can still toggle in the browser form.
-    pub hipaa:             bool,
+    /// ConvoAI environment (TOML default): "ga" | "eap" | "hipaa". The UI
+    /// radio + background mode both honour this; the browser form can still
+    /// switch it. Resolved from `[atem].env`, falling back to the legacy
+    /// `[atem].hipaa = true` → "hipaa".
+    pub env:               String,
+    /// All available environments (built-ins merged with
+    /// `[[atem.environments]]`). The web UI renders one radio per entry.
+    pub environments:      Vec<EnvDef>,
     /// Geofence area (TOML default). Empty / "GLOBAL" → no geofence.
     pub geofence:          String,
     /// Encryption mode 0..=8 (TOML default). 0 = off.
@@ -705,6 +848,19 @@ pub struct ResolvedConfig {
     /// floored to 5 to avoid hammering the API. Foreground mode
     /// ignores this — there's no poller in that path.
     pub poll_interval_secs: u64,
+}
+
+impl ResolvedConfig {
+    /// The selected environment (by `env` name). Falls back to the first
+    /// available, then to a GA default, if the name matches nothing.
+    pub fn active_env(&self) -> EnvDef {
+        self.environments
+            .iter()
+            .find(|e| e.name == self.env)
+            .cloned()
+            .or_else(|| self.environments.first().cloned())
+            .unwrap_or_else(|| EnvDef::new("ga", "https://api.agora.io", "api"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -798,7 +954,18 @@ impl ConvoConfig {
             avatar_configured,
             avatar_summary,
             presets: self.preset_list(),
-            hipaa: atem.hipaa.unwrap_or(false),
+            env: {
+                // Clamp the selected env to one that's actually shown (an
+                // allowlist may exclude the configured/alias default).
+                let environments = self.environments();
+                let name = self.env_name();
+                if environments.iter().any(|e| e.name == name) {
+                    name
+                } else {
+                    environments.first().map(|e| e.name.clone()).unwrap_or_else(|| "ga".into())
+                }
+            },
+            environments: self.environments(),
             geofence: atem.geofence.unwrap_or_default(),
             encryption_mode: enc.mode,
             encryption_key:  enc.key,
@@ -902,7 +1069,7 @@ mod tests {
         let r = cfg.resolve(&CliOverrides {
             channel: None, rtc_user_id: None, agent_user_id: None,
         }).unwrap();
-        assert!(r.hipaa);
+        assert_eq!(r.env, "hipaa"); // legacy hipaa = true → env "hipaa"
         assert_eq!(r.geofence, "ASIA");
         assert!(r.enable_avatar);
         assert_eq!(r.encryption_mode, 7);
@@ -923,13 +1090,120 @@ mod tests {
         let r = cfg.resolve(&CliOverrides {
             channel: None, rtc_user_id: None, agent_user_id: None,
         }).unwrap();
-        assert!(!r.hipaa);
+        assert_eq!(r.env, "ga"); // no env / no hipaa → default "ga"
         assert!(!r.enable_avatar);
         assert_eq!(r.geofence, "");
         assert_eq!(r.encryption_mode, 0);
         assert_eq!(r.encryption_key, "");
         assert_eq!(r.encryption_salt, "");
         assert_eq!(r.poll_interval_secs, 60, "default poll cadence is 60s");
+    }
+
+    #[test]
+    fn env_selects_named_environment() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            env = "eap"
+            [agent]
+            user_id = "1"
+        "#).unwrap();
+        assert_eq!(cfg.env_name(), "eap");
+        let eap = cfg.environments().into_iter().find(|e| e.name == "eap").unwrap();
+        assert_eq!(eap.host, "https://partner.ai.agora.io");
+        assert_eq!(eap.prefix, "preview/api");
+        assert_eq!(eap.headers.get("agora-feature").map(String::as_str), Some("live-models"));
+    }
+
+    #[test]
+    fn env_falls_back_to_ga_then_hipaa_alias() {
+        // Neither env nor hipaa → "ga".
+        let none: ConvoConfig = toml::from_str("[agent]\nuser_id=\"1\"").unwrap();
+        assert_eq!(none.env_name(), "ga");
+        // Legacy hipaa = true (no env) → "hipaa".
+        let legacy: ConvoConfig = toml::from_str("[atem]\nhipaa = true\n[agent]\nuser_id=\"1\"").unwrap();
+        assert_eq!(legacy.env_name(), "hipaa");
+    }
+
+    #[test]
+    fn environments_merge_overrides_and_adds() {
+        // Override "ga" host + add a brand-new "staging" env — no code change.
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            [[atem.environments]]
+            name   = "ga"
+            host   = "https://api-test.agora.io"
+            prefix = "api"
+            [[atem.environments]]
+            name   = "staging"
+            host   = "https://stg.example"
+            prefix = "api"
+            [agent]
+            user_id = "1"
+        "#).unwrap();
+        let envs = cfg.environments();
+        let ga = envs.iter().find(|e| e.name == "ga").unwrap();
+        assert_eq!(ga.host, "https://api-test.agora.io"); // overridden
+        assert!(envs.iter().any(|e| e.name == "staging"));  // added
+        assert!(envs.iter().any(|e| e.name == "eap"));      // built-in preserved
+        // A custom env is selectable.
+        let cfg2: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel = "c"
+            env = "staging"
+            [[atem.environments]]
+            name = "staging"
+            host = "https://stg.example"
+            prefix = "api"
+            [agent]
+            user_id = "1"
+        "#).unwrap();
+        let r = cfg2.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
+        assert_eq!(r.active_env().host, "https://stg.example");
+    }
+
+    #[test]
+    fn api_url_override_applies_to_ga_and_hipaa_only() {
+        // Pure — no process-env mutation (avoids parallel-test pollution).
+        let cfg: ConvoConfig = toml::from_str("[agent]\nuser_id=\"1\"").unwrap();
+        let envs = cfg.environments_with(Some("http://127.0.0.1:9999"));
+        assert_eq!(envs.iter().find(|e| e.name == "ga").unwrap().host, "http://127.0.0.1:9999");
+        assert_eq!(envs.iter().find(|e| e.name == "hipaa").unwrap().host, "http://127.0.0.1:9999");
+        // EAP keeps its own host.
+        assert_eq!(envs.iter().find(|e| e.name == "eap").unwrap().host, "https://partner.ai.agora.io");
+        // No override → built-in defaults.
+        let plain = cfg.environments_with(None);
+        assert_eq!(plain.iter().find(|e| e.name == "ga").unwrap().host, "https://api.agora.io");
+    }
+
+    #[test]
+    fn envs_allowlist_filters_and_orders() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            envs = ["eap", "ga"]
+            [agent]
+            user_id = "1"
+        "#).unwrap();
+        let envs = cfg.environments();
+        let names: Vec<&str> = envs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["eap", "ga"]);              // only these, in order
+        assert!(!envs.iter().any(|e| e.name == "hipaa")); // hidden
+    }
+
+    #[test]
+    fn env_clamped_to_shown_when_allowlist_excludes_it() {
+        // Legacy hipaa=true would select "hipaa", but the allowlist hides it →
+        // clamp the default to the first shown env.
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel = "c"
+            hipaa = true
+            envs = ["ga", "eap"]
+            [agent]
+            user_id = "1"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
+        assert_eq!(r.env, "ga");
+        assert_eq!(r.environments.len(), 2);
     }
 
     #[test]
