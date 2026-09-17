@@ -212,6 +212,22 @@ sample_rate = 16000
 # voice        = "alloy"          # alloy | echo | fable | onyx | nova | shimmer
 # instructions = "You are a Conversational AI Agent, developed by Agora."
 #
+# GPT-live (OpenAI, Early Access Preview) — runs on the EAP endpoint, so
+# set [atem].env = "eap" above (partner.ai.agora.io/preview/api +
+# agora-feature: live-models header). Requires Agora to allowlist your
+# project. See https://docs.agora.io/en/ai/models/mllm/openai-gpt-live.md
+#
+# [agent.mllm]
+# vendor           = "openai_gpt_live"
+# url              = "wss://api.openai.com/v1/live/sessions"
+# api_key          = "<openai_api_key>"
+# greeting_message = "Hello! I'm GPT-live. How can I help you today?"
+#
+# [agent.mllm.params]
+# model  = "gpt-live-1"
+# voice  = "marin"
+# prompt = "<system_prompt>"
+#
 # MCP tools in MLLM mode — same shape as [[agent.llm.mcp_servers]], but
 # under the mllm block. Emitted as properties.mllm.mcp_servers[]. atem
 # auto-sets advanced_features.enable_tools = true when any are present.
