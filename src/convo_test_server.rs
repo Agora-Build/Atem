@@ -1016,6 +1016,15 @@ fn build_html_page(app_id: &str, resolved: &ResolvedConfig, attach_mode: bool) -
             "force_encryption_mode": e.force_encryption_mode,
         })).collect::<Vec<_>>()
     ).unwrap_or_else(|_| "[]".to_string());
+    // Active-pipeline model summary (role/vendor/model/voice) for the UI.
+    let models_js = serde_json::to_string(
+        &resolved.models.iter().map(|m| serde_json::json!({
+            "role":   m.role,
+            "vendor": m.vendor,
+            "model":  m.model,
+            "voice":  m.voice,
+        })).collect::<Vec<_>>()
+    ).unwrap_or_else(|_| "[]".to_string());
 
     format!(
         r##"<!DOCTYPE html>
@@ -1197,6 +1206,10 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     live/MLLM models), or HIPAA — and the URL above updates to what atem will call.
   </div>
   <div id="envHint" style="font-size:12px;color:#7d8590;padding-left:16px"></div>
+  <div class="controls avatar-row" style="align-items:flex-start">
+    <label>Models</label>
+    <div id="modelInfo" style="display:inline-flex;flex-direction:column;gap:2px;font-family:monospace;font-size:12px;color:#7d8590"></div>
+  </div>
   <div class="controls">
     <label>Agent User</label>
     <span id="agentUidDisplay" class="read-only-value">—</span>
@@ -1249,6 +1262,7 @@ const AVATAR_INFO = {avatar_info_js};  // {{vendor, avatar_id}} or null
 // Defaults from convo.toml. Pre-fill the form fields on load; user
 // can still override via the browser controls.
 const ENVIRONMENTS     = {environments_js};  // [{{name,label,host,prefix,force_geofence,force_encryption_mode}}]
+const MODELS           = {models_js};        // [{{role,vendor,model,voice}}] for the active pipeline
 const DEFAULT_ENV      = "{default_env}";     // selected env name
 const DEFAULT_GEOFENCE = "{default_geofence}";
 const DEFAULT_ENC_MODE = {default_enc_mode};
@@ -1355,6 +1369,7 @@ function applyAttachMode() {{
 }}
 window.addEventListener('DOMContentLoaded', () => {{
   renderEnvRadios();
+  renderModels();
   applyTomlDefaults();
   applyAttachMode();
   document.getElementById('encModeSelect').addEventListener('change', () => {{ syncSaltRow(); updateEnvPreview(); }});
@@ -1376,6 +1391,27 @@ function genHipaaKey() {{
 // Render one radio per environment (built-in ga/eap/hipaa + any
 // [[atem.environments]]). Selecting one drives the endpoint preview and
 // forcing (syncEnv). Single-select — one environment at a time.
+// Show the active pipeline's model(s): one line per service, each
+// "ROLE: vendor · model · voice <id>". Cascaded → LLM/ASR/TTS; MLLM → one.
+function renderModels() {{
+  const box = document.getElementById('modelInfo');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!MODELS || MODELS.length === 0) {{
+    box.textContent = '(no model configured)';
+    return;
+  }}
+  for (const m of MODELS) {{
+    const bits = [];
+    if (m.vendor) bits.push(m.vendor);
+    if (m.model)  bits.push(m.model);
+    if (m.voice)  bits.push('voice ' + m.voice);
+    const line = document.createElement('div');
+    line.textContent = m.role + ': ' + (bits.length ? bits.join(' · ') : '(unset)');
+    box.appendChild(line);
+  }}
+}}
+
 function renderEnvRadios() {{
   const box = document.getElementById('envRadios');
   box.innerHTML = '';
@@ -2359,6 +2395,7 @@ window.addEventListener('load', async () => {{
         avatar_ok      = avatar_ok,
         avatar_info_js = avatar_info_js,
         environments_js  = environments_js,
+        models_js        = models_js,
         default_env      = resolved.env,
         default_geofence = resolved.geofence,
         default_enc_mode = resolved.encryption_mode,
@@ -2385,6 +2422,7 @@ mod tests {
             idle_timeout_secs: None,
             avatar_configured: false,
             avatar_summary:    None,
+            models:            vec![],
             presets:           vec![],
             env:               "hipaa".into(),
             environments:      crate::convo_config::default_environments(),
@@ -2412,6 +2450,7 @@ mod tests {
         let resolved = ResolvedConfig {
             channel: "c".into(), rtc_user_id: "1".into(), agent_user_id: "2".into(),
             idle_timeout_secs: None, avatar_configured: false, avatar_summary: None,
+            models: vec![],
             presets: vec![],
             env: "ga".into(), environments: crate::convo_config::default_environments(),
             geofence: String::new(),
@@ -2514,6 +2553,7 @@ mod tests {
             avatar_summary:    Some(crate::convo_config::AvatarSummary {
                 vendor: Some("heygen".into()), avatar_id: Some("abc".into()),
             }),
+            models:            vec![],
             presets:           vec![],
             env:               "ga".into(),
             environments:      crate::convo_config::default_environments(),
@@ -2546,6 +2586,7 @@ mod tests {
             idle_timeout_secs: None,
             avatar_configured: false,
             avatar_summary:    None,
+            models:            vec![],
             presets:           vec!["expertise_ai_poc".into(), "_akool_test_expertise".into()],
             env:               "ga".into(),
             environments:      crate::convo_config::default_environments(),

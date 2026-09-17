@@ -813,6 +813,9 @@ pub struct ResolvedConfig {
     /// the page (vendor + avatar_id). `None` when no avatar block is
     /// configured. Never includes `params` — those may carry secrets.
     pub avatar_summary:    Option<AvatarSummary>,
+    /// Non-secret model summary for the active pipeline: LLM/ASR/TTS for
+    /// cascaded, or the single MLLM. Shown (vendor/model/voice) in the UI.
+    pub models:            Vec<ServiceSummary>,
     /// Selectable preset names for the page checkboxes — derived by
     /// splitting `[agent].preset` on `,`. Empty means no checkboxes.
     /// The page sends back a comma-joined subset as
@@ -886,6 +889,48 @@ pub struct AvatarSummary {
     pub avatar_id: Option<String>,
 }
 
+/// Non-secret summary of one active model service, for the web UI. For a
+/// cascaded pipeline there's one per LLM/ASR/TTS; for MLLM there's one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSummary {
+    /// "LLM" | "ASR" | "TTS" | "MLLM".
+    pub role:   String,
+    pub vendor: Option<String>,
+    pub model:  Option<String>,
+    pub voice:  Option<String>,
+}
+
+/// Read a top-level string from a params table (e.g. `params.model`).
+fn param_string(params: &BTreeMap<String, toml::Value>, key: &str) -> Option<String> {
+    params.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// Read a string from a nested params sub-table (e.g.
+/// `params.voice_setting.voice_id`).
+fn nested_param_string(params: &BTreeMap<String, toml::Value>, table: &str, key: &str) -> Option<String> {
+    params.get(table)
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Best-effort voice id across common vendor shapes.
+fn extract_voice(params: &BTreeMap<String, toml::Value>) -> Option<String> {
+    param_string(params, "voice")
+        .or_else(|| param_string(params, "voice_id"))
+        .or_else(|| nested_param_string(params, "voice_setting", "voice_id"))
+}
+
+fn summarize_service(role: &str, vendor: Option<String>, params: &BTreeMap<String, toml::Value>) -> ServiceSummary {
+    ServiceSummary {
+        role:   role.to_string(),
+        vendor,
+        model:  param_string(params, "model"),
+        voice:  extract_voice(params),
+    }
+}
+
 impl ConvoConfig {
     /// Resolve runtime values from CLI overrides + TOML + defaults.
     /// Precedence: CLI > TOML > default/error.
@@ -946,6 +991,22 @@ impl ConvoConfig {
                 ),
             },
         };
+        // Model summary for the UI — the active pipeline's services.
+        let models: Vec<ServiceSummary> = match pipeline {
+            Pipeline::Cascaded => {
+                let mut v = Vec::new();
+                if let Some(a) = agent {
+                    if let Some(llm) = &a.llm { v.push(summarize_service("LLM", None, &llm.params)); }
+                    if let Some(asr) = &a.asr { v.push(summarize_service("ASR", asr.vendor.clone(), &asr.params)); }
+                    if let Some(tts) = &a.tts { v.push(summarize_service("TTS", tts.vendor.clone(), &tts.params)); }
+                }
+                v
+            }
+            Pipeline::Mllm => agent
+                .and_then(|a| a.mllm.as_ref())
+                .map(|m| vec![summarize_service("MLLM", m.vendor.clone(), &m.params)])
+                .unwrap_or_default(),
+        };
         Ok(ResolvedConfig {
             channel,
             rtc_user_id,
@@ -953,6 +1014,7 @@ impl ConvoConfig {
             idle_timeout_secs: agent.and_then(|a| a.idle_timeout_secs),
             avatar_configured,
             avatar_summary,
+            models,
             presets: self.preset_list(),
             env: {
                 // Clamp the selected env to one that's actually shown (an
@@ -1204,6 +1266,62 @@ mod tests {
         let r = cfg.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
         assert_eq!(r.env, "ga");
         assert_eq!(r.environments.len(), 2);
+    }
+
+    #[test]
+    fn resolve_summarizes_cascaded_models() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel = "c"
+            pipeline = "cascaded"
+            [agent]
+            user_id = "1"
+            [agent.llm]
+            url = "https://x/v1/chat/completions"
+            [agent.llm.params]
+            model = "gpt-4o"
+            [agent.asr]
+            vendor = "soniox"
+            [agent.asr.params]
+            model = "stt-rt-v3"
+            [agent.tts]
+            vendor = "minimax"
+            [agent.tts.params]
+            model = "speech-02-turbo"
+            [agent.tts.params.voice_setting]
+            voice_id = "pamela"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
+        let roles: Vec<&str> = r.models.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["LLM", "ASR", "TTS"]);
+        assert_eq!(r.models[0].model.as_deref(), Some("gpt-4o"));
+        assert_eq!(r.models[0].vendor, None);              // LLM has no vendor field
+        assert_eq!(r.models[1].vendor.as_deref(), Some("soniox"));
+        assert_eq!(r.models[2].vendor.as_deref(), Some("minimax"));
+        assert_eq!(r.models[2].model.as_deref(), Some("speech-02-turbo"));
+        assert_eq!(r.models[2].voice.as_deref(), Some("pamela")); // nested voice_setting.voice_id
+    }
+
+    #[test]
+    fn resolve_summarizes_mllm_model() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel = "c"
+            pipeline = "mllm"
+            [agent]
+            user_id = "1"
+            [agent.mllm]
+            vendor = "openai_gpt_live"
+            [agent.mllm.params]
+            model = "gpt-live-1"
+            voice = "marin"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
+        assert_eq!(r.models.len(), 1);
+        assert_eq!(r.models[0].role, "MLLM");
+        assert_eq!(r.models[0].vendor.as_deref(), Some("openai_gpt_live"));
+        assert_eq!(r.models[0].model.as_deref(), Some("gpt-live-1"));
+        assert_eq!(r.models[0].voice.as_deref(), Some("marin"));
     }
 
     #[test]
