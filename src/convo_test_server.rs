@@ -12,21 +12,33 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
-use crate::convo_config::{CliOverrides, ConvoConfig, ResolvedConfig};
+use crate::convo_config::{CliOverrides, ConvoConfig, EnvDef, ResolvedConfig};
 
-/// Agora Conversational AI v2 REST base URL. Overridable via `ATEM_CONVOAI_API_URL`
-/// for integration tests that point at a local mock.
-fn convoai_base_url() -> String {
-    std::env::var("ATEM_CONVOAI_API_URL")
-        .unwrap_or_else(|_| "https://api.agora.io".to_string())
+/// Build a ConvoAI REST URL for the given environment. `suffix` is everything
+/// after the `.../conversational-ai-agent/` segment (e.g.
+/// `v2/projects/<app_id>/join`). The host + path prefix come from the
+/// environment definition (built-in `ga`/`eap`/`hipaa` or a custom one).
+fn convoai_url(env: &EnvDef, suffix: &str) -> String {
+    format!("{}/{}/conversational-ai-agent/{}",
+        env.host.trim_end_matches('/'), env.prefix.trim_matches('/'), suffix)
 }
 
-/// Build a ConvoAI REST URL. `hipaa` switches the path prefix from
-/// `/api/conversational-ai-agent/...` to `/hipaa/api/conversational-ai-agent/...`.
-/// `suffix` is everything after the prefix (e.g. `v2/projects/<app_id>/join`).
-fn convoai_url(hipaa: bool, suffix: &str) -> String {
-    let prefix = if hipaa { "hipaa/api" } else { "api" };
-    format!("{}/{}/conversational-ai-agent/{}", convoai_base_url(), prefix, suffix)
+/// Attach the standard ConvoAI auth header plus any environment-specific
+/// headers (e.g. EAP's `agora-feature: live-models`) to a request.
+fn convoai_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    env: &EnvDef,
+    token: &str,
+) -> reqwest::RequestBuilder {
+    let mut rb = client
+        .request(method, url)
+        .header("Authorization", format!("agora token={}", token));
+    for (k, v) in &env.headers {
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    rb
 }
 
 /// Generate a unique agent name for this session.
@@ -133,9 +145,9 @@ pub struct AgentState {
     pub agent_id:   Option<String>,
     pub name:       Option<String>,
     pub started_at: Option<u64>,
-    /// Whether the active agent was started in HIPAA mode. Controls
-    /// which URL `/leave` and `/stop` use — must match `/start`'s URL.
-    pub hipaa:      bool,
+    /// The environment the active agent was started in. `/leave` and `/stop`
+    /// must reuse it so their URL + headers match `/start`'s.
+    pub env:        EnvDef,
 }
 
 /// One entry in the ConvoAI REST history log. Captures exactly what
@@ -444,18 +456,16 @@ fn spawn_status_poller(
     app_id: String,
     agent_id: String,
     agent_token: String,
-    hipaa: bool,
+    env: EnvDef,
     interval_secs: u64,
 ) {
     tokio::spawn(async move {
-        let url = convoai_url(hipaa, &format!("v2/projects/{}/agents/{}", app_id, agent_id));
+        let url = convoai_url(&env, &format!("v2/projects/{}/agents/{}", app_id, agent_id));
         let client = reqwest::Client::new();
         let interval = std::time::Duration::from_secs(interval_secs);
         loop {
             tokio::time::sleep(interval).await;
-            let status = match client
-                .get(&url)
-                .header("Authorization", format!("agora token={}", agent_token))
+            let status = match convoai_request(&client, reqwest::Method::GET, &url, &env, &agent_token)
                 .send()
                 .await
             {
@@ -550,10 +560,12 @@ async fn run_background(
         enable_dump: false,
     });
 
-    // Use HIPAA endpoint when convo.toml says so. Both /join and /leave
-    // must use the same prefix or the agent gets stranded on the wrong
-    // SD-RTN.
-    let url = convoai_url(resolved.hipaa, &format!("v2/projects/{}/join", app_id));
+    // Select the ConvoAI environment from convo.toml ([atem].env). Both /join
+    // and /leave must use the same host/prefix or the agent gets stranded on
+    // the wrong SD-RTN.
+    let env = resolved.active_env();
+    let url = convoai_url(&env, &format!("v2/projects/{}/join", app_id));
+    println!("  env:       {}", env.name);
     println!("  /join URL: {}", url);
     // Log the request body with secrets masked. Useful for diagnosing
     // mismatches (encryption_key present? geofence area? avatar shape?).
@@ -566,9 +578,7 @@ async fn run_background(
         }
     }
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("agora token={}", agent_token))
+    let resp = convoai_request(&client, reqwest::Method::POST, &url, &env, &agent_token)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -595,7 +605,7 @@ async fn run_background(
         app_id.to_string(),
         agent_id.clone(),
         agent_token.clone(),
-        resolved.hipaa,
+        env.clone(),
         resolved.poll_interval_secs,
     );
 
@@ -624,13 +634,11 @@ async fn run_background(
         Some(resolved.agent_user_id.as_str()),
     )?;
     let leave_url = convoai_url(
-        resolved.hipaa,
+        &env,
         &format!("v2/projects/{}/agents/{}/leave", app_id, agent_id),
     );
     println!("/leave URL: {}", leave_url);
-    let _ = client
-        .post(&leave_url)
-        .header("Authorization", format!("agora token={}", leave_token))
+    let _ = convoai_request(&client, reqwest::Method::POST, &leave_url, &env, &leave_token)
         .send()
         .await;
 
@@ -726,10 +734,13 @@ async fn handle_connection(
                 .as_str()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("GLOBAL"));
-            // HIPAA mode — routes the call through Agora's US-HIPAA
-            // endpoint. Browser also enforces NORTH_AMERICA + AES_256_GCM2
-            // before sending; we trust those flags arrived correctly.
-            let hipaa = req["hipaa"].as_bool().unwrap_or(false);
+            // ConvoAI environment — the browser sends the selected env name
+            // ("ga" | "eap" | "hipaa" | custom); look it up in the resolved
+            // environment list (host/prefix/headers/forcing). Unknown → the
+            // configured default.
+            let env: EnvDef = req["env"].as_str()
+                .and_then(|name| resolved.environments.iter().find(|e| e.name == name).cloned())
+                .unwrap_or_else(|| resolved.active_env());
             // Audio dump — opt-in debug knob, surfaces as
             // properties.parameters.enable_dump=true. Server-side capture;
             // retrieve via Agora support.
@@ -789,7 +800,7 @@ async fn handle_connection(
                 enable_dump,
             });
 
-            let url = convoai_url(hipaa, &format!("v2/projects/{}/join", app_id));
+            let url = convoai_url(&env, &format!("v2/projects/{}/join", app_id));
             history_push(&history, HistoryEntry {
                 ts_ms: unix_ms(), kind: "request".into(),
                 method: Some("POST".into()), url: url.clone(), status: None,
@@ -797,9 +808,7 @@ async fn handle_connection(
                     .unwrap_or_else(|_| payload.to_string()),
             }).await;
             let client = reqwest::Client::new();
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("agora token={}", agent_token))
+            let resp = convoai_request(&client, reqwest::Method::POST, &url, &env, &agent_token)
                 .header("Content-Type", "application/json")
                 .json(&payload)
                 .send()
@@ -827,7 +836,7 @@ async fn handle_connection(
                         st.agent_id   = Some(agent_id.clone());
                         st.name       = Some(name.clone());
                         st.started_at = Some(started);
-                        st.hipaa      = hipaa;
+                        st.env        = env.clone();
                     }
                     let out = serde_json::json!({
                         "agent_id":   agent_id,
@@ -864,9 +873,9 @@ async fn handle_connection(
 
         ("POST", "/api/convo/stop") => {
             // Both fields read under one lock — keep them consistent.
-            let (agent_id, hipaa) = {
+            let (agent_id, env) = {
                 let st = state.lock().await;
-                (st.agent_id.clone(), st.hipaa)
+                (st.agent_id.clone(), st.env.clone())
             };
             let agent_id = match agent_id {
                 Some(id) => id,
@@ -889,18 +898,16 @@ async fn handle_connection(
                 3600,
                 Some(resolved.agent_user_id.as_str()),
             )?;
-            // Re-use hipaa from /start so the URL matches the agent's
-            // origin endpoint.
-            let url = convoai_url(hipaa, &format!("v2/projects/{}/agents/{}/leave", app_id, agent_id));
+            // Re-use the env from /start so the URL + headers match the
+            // agent's origin endpoint.
+            let url = convoai_url(&env, &format!("v2/projects/{}/agents/{}/leave", app_id, agent_id));
             history_push(&history, HistoryEntry {
                 ts_ms: unix_ms(), kind: "request".into(),
                 method: Some("POST".into()), url: url.clone(), status: None,
                 body: "".into(),
             }).await;
             let client = reqwest::Client::new();
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("agora token={}", token))
+            let resp = convoai_request(&client, reqwest::Method::POST, &url, &env, &token)
                 .send()
                 .await;
             if let Ok(r) = resp {
@@ -996,6 +1003,19 @@ fn build_html_page(app_id: &str, resolved: &ResolvedConfig, attach_mode: bool) -
         })).unwrap_or_else(|_| "null".to_string()),
         None => "null".to_string(),
     };
+    // Environments for the radio group + endpoint preview. Only the fields
+    // the page needs (host/prefix for the URL, force_* for locking); headers
+    // are applied server-side and not exposed here.
+    let environments_js = serde_json::to_string(
+        &resolved.environments.iter().map(|e| serde_json::json!({
+            "name":   e.name,
+            "label":  e.label.clone().unwrap_or_else(|| e.name.to_uppercase()),
+            "host":   e.host,
+            "prefix": e.prefix,
+            "force_geofence": e.force_geofence,
+            "force_encryption_mode": e.force_encryption_mode,
+        })).collect::<Vec<_>>()
+    ).unwrap_or_else(|_| "[]".to_string());
 
     format!(
         r##"<!DOCTYPE html>
@@ -1177,13 +1197,14 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <input type="checkbox" id="avatarCheckbox">
   </div>
   <div class="controls avatar-row">
-    <label for="hipaaCheckbox">HIPAA Mode</label>
-    <input type="checkbox" id="hipaaCheckbox">
-    <span id="hipaaHint" style="font-size:12px;color:#7d8590">
-      Routes via /hipaa endpoint, forces NORTH_AMERICA + AES_256_GCM2 with a generated key.
-      Contact Agora Support to enable this function for your project first.
-    </span>
+    <label>Environment</label>
+    <span id="envRadios"></span>
   </div>
+  <div class="controls avatar-row">
+    <label>Endpoint</label>
+    <span id="envUrlPreview" style="font-family:monospace;font-size:12px;color:#7d8590;word-break:break-all"></span>
+  </div>
+  <div id="envHint" style="font-size:12px;color:#7d8590;padding-left:16px"></div>
   <div class="controls avatar-row">
     <label for="audioDumpCheckbox">Audio Dump</label>
     <input type="checkbox" id="audioDumpCheckbox">
@@ -1222,7 +1243,8 @@ const AVATAR_INFO = {avatar_info_js};  // {{vendor, avatar_id}} or null
 
 // Defaults from convo.toml. Pre-fill the form fields on load; user
 // can still override via the browser controls.
-const DEFAULT_HIPAA    = {default_hipaa};
+const ENVIRONMENTS     = {environments_js};  // [{{name,label,host,prefix,force_geofence,force_encryption_mode}}]
+const DEFAULT_ENV      = "{default_env}";     // selected env name
 const DEFAULT_GEOFENCE = "{default_geofence}";
 const DEFAULT_ENC_MODE = {default_enc_mode};
 const DEFAULT_ENC_KEY  = "{default_enc_key}";
@@ -1274,11 +1296,11 @@ function syncSaltRow() {{
     input.value = '';
   }}
 }}
-// Pre-fill HIPAA / geofence / encryption controls from convo.toml
-// defaults emitted by the server. User can still override.
+// Pre-fill geofence / encryption controls from convo.toml defaults
+// emitted by the server. User can still override. (Env is handled by the
+// radio group — see renderEnvRadios/syncEnv.)
 function applyTomlDefaults() {{
   if (DEFAULT_ENABLE_AVATAR) document.getElementById('avatarCheckbox').checked = true;
-  if (DEFAULT_HIPAA) document.getElementById('hipaaCheckbox').checked = true;
   if (DEFAULT_GEOFENCE) document.getElementById('geoAreaSelect').value = DEFAULT_GEOFENCE;
   if (DEFAULT_ENC_MODE > 0) {{
     document.getElementById('encModeSelect').value = String(DEFAULT_ENC_MODE);
@@ -1308,7 +1330,7 @@ function applyAttachMode() {{
   // whatever convo.toml had when it spawned. Disable so the operator
   // doesn't think toggling them affects the live agent.
   const lockIds = [
-    'avatarCheckbox', 'audioDumpCheckbox', 'hipaaCheckbox',
+    'avatarCheckbox', 'audioDumpCheckbox',
     'geoAreaSelect',  'encModeSelect',
     'encKeyInput',    'encSaltInput',
   ];
@@ -1318,22 +1340,23 @@ function applyAttachMode() {{
     if (el.tagName === 'INPUT' && el.type === 'text') el.readOnly = true;
     else el.disabled = true;
   }}
-  // Preset checkboxes are populated dynamically; lock them too.
+  // Env radios + preset checkboxes are populated dynamically; lock them too.
+  document.querySelectorAll('input[name=convoEnv]').forEach((r) => {{ r.disabled = true; }});
   document.querySelectorAll('#presetCheckboxes input[type=checkbox]')
     .forEach((cb) => {{ cb.disabled = true; }});
   setAgentDot('connected', 'attached (daemon owns agent)');
   logEvent('Attach mode: agent is owned by a background daemon. Use `atem serv kill` to /leave.', 'info');
-  logEvent('Agent-creation controls (avatar, encryption, presets, geofence, HIPAA, dump) are locked — they were set when the daemon spawned.', 'info');
+  logEvent('Agent-creation controls (environment, avatar, encryption, presets, geofence, dump) are locked — they were set when the daemon spawned.', 'info');
 }}
 window.addEventListener('DOMContentLoaded', () => {{
+  renderEnvRadios();
   applyTomlDefaults();
   applyAttachMode();
-  document.getElementById('encModeSelect').addEventListener('change', syncSaltRow);
+  document.getElementById('encModeSelect').addEventListener('change', () => {{ syncSaltRow(); updateEnvPreview(); }});
   syncSaltRow();
-  // On an explicit toggle, clear encryption when turning HIPAA off; on
-  // initial load, keep whatever convo.toml pre-filled (clearWhenOff=false).
-  document.getElementById('hipaaCheckbox').addEventListener('change', () => syncHipaa(true));
-  syncHipaa(false);
+  // Apply the selected env's forcing on load without clearing any
+  // convo.toml-configured encryption (clearOnUnforce=false).
+  syncEnv(false);
 }});
 
 // Generate a short random encryption key (8 decimal digits) for
@@ -1345,41 +1368,89 @@ function genHipaaKey() {{
   return String(a[0] % 100000000).padStart(8, '0');
 }}
 
-// HIPAA mode is off by default.
-//
-// ON  → force + lock the HIPAA-required settings: geofence =
-//       NORTH_AMERICA, encryption = AES_256_GCM2 (mode 8) with a
-//       generated key + fresh salt. All four fields are locked so the
-//       values sent to the server can't drift from what the UI shows.
-//
-// OFF → geofence is choose-able and the encryption controls unlock. When
-//       the user explicitly unticks (clearWhenOff), reset to no
-//       encryption: mode = None, key + salt cleared. On initial page load
-//       (clearWhenOff = false) we keep whatever convo.toml pre-filled, so
-//       a configured non-HIPAA encryption setup survives.
-function syncHipaa(clearWhenOff) {{
-  const on = document.getElementById('hipaaCheckbox').checked;
+// Render one radio per environment (built-in ga/eap/hipaa + any
+// [[atem.environments]]). Selecting one drives the endpoint preview and
+// forcing (syncEnv). Single-select — one environment at a time.
+function renderEnvRadios() {{
+  const box = document.getElementById('envRadios');
+  box.innerHTML = '';
+  for (const e of ENVIRONMENTS) {{
+    const label = document.createElement('label');
+    label.style.marginRight = '14px';
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'convoEnv';
+    radio.value = e.name;
+    if (e.name === DEFAULT_ENV) radio.checked = true;
+    radio.addEventListener('change', () => syncEnv(true));
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(' ' + (e.label || e.name.toUpperCase())));
+    box.appendChild(label);
+  }}
+  if (!document.querySelector('input[name=convoEnv]:checked')) {{
+    const first = document.querySelector('input[name=convoEnv]');
+    if (first) first.checked = true;
+  }}
+}}
+
+function selectedEnvName() {{
+  const r = document.querySelector('input[name=convoEnv]:checked');
+  return r ? r.value : (ENVIRONMENTS[0] ? ENVIRONMENTS[0].name : 'ga');
+}}
+function selectedEnv() {{
+  const n = selectedEnvName();
+  return ENVIRONMENTS.find((e) => e.name === n) || ENVIRONMENTS[0] || {{ host: '', prefix: 'api' }};
+}}
+
+// Endpoint preview: host + prefix + .../projects/<APP_ID> (no /join, /leave).
+function updateEnvPreview() {{
+  const e = selectedEnv();
+  const host = (e.host || '').replace(/\/+$/, '');
+  const prefix = (e.prefix || '').replace(/^\/+|\/+$/g, '');
+  document.getElementById('envUrlPreview').textContent =
+    host + '/' + prefix + '/conversational-ai-agent/v2/projects/' + APP_ID;
+  const hint = document.getElementById('envHint');
+  if (e.force_geofence || e.force_encryption_mode) {{
+    hint.textContent = 'This environment forces + locks geofence/encryption below. Contact Agora Support to enable it for your project first.';
+  }} else if (e.name === 'eap') {{
+    hint.textContent = 'Early Access Preview endpoint — requires project allowlisting; atem sends the `agora-feature: live-models` header.';
+  }} else {{
+    hint.textContent = '';
+  }}
+}}
+
+// Apply the selected environment. An env with force_geofence /
+// force_encryption_mode (e.g. HIPAA) pins + locks those controls with a
+// generated key + fresh salt; others leave them choose-able. On an explicit
+// env change (clearOnUnforce = true), switching to a non-forcing env resets
+// encryption to None; on initial load (false) convo.toml encryption survives.
+function syncEnv(clearOnUnforce) {{
+  const e = selectedEnv();
   const geo = document.getElementById('geoAreaSelect');
   const mode = document.getElementById('encModeSelect');
   const key = document.getElementById('encKeyInput');
   const salt = document.getElementById('encSaltInput');
-  if (on) {{
-    geo.value  = 'NORTH_AMERICA';
-    mode.value = '8';
-    if (!key.value) key.value = genHipaaKey();
-    syncSaltRow();
-    if (!salt.value) salt.value = saltBase64(randSalt32());
+  const forces = !!(e.force_geofence || e.force_encryption_mode);
+  if (forces) {{
+    if (e.force_geofence) geo.value = e.force_geofence;
+    if (e.force_encryption_mode) {{
+      mode.value = String(e.force_encryption_mode);
+      if (!key.value) key.value = genHipaaKey();
+      syncSaltRow();
+      if (!salt.value) salt.value = saltBase64(randSalt32());
+    }}
     geo.disabled = mode.disabled = key.readOnly = salt.readOnly = true;
   }} else {{
     geo.disabled = mode.disabled = false;
     key.readOnly = salt.readOnly = false;
-    if (clearWhenOff) {{
+    if (clearOnUnforce) {{
       mode.value = '0';   // encryption none
       key.value = '';     // remove key
       salt.value = '';    // clean salt
     }}
     syncSaltRow();
   }}
+  updateEnvPreview();
 }}
 
 function copyText(text) {{
@@ -2042,10 +2113,8 @@ async function startAgent() {{
     if (startGeoArea && startGeoArea !== 'GLOBAL') {{
       startBody.geofence_area = startGeoArea;
     }}
-    // HIPAA mode flag — server uses it to pick /hipaa/api/... URL.
-    if (document.getElementById('hipaaCheckbox').checked) {{
-      startBody.hipaa = true;
-    }}
+    // Selected environment — server maps the name to host/prefix/headers.
+    startBody.env = selectedEnvName();
     // Audio dump flag — debug knob; server adds parameters.enable_dump.
     if (document.getElementById('audioDumpCheckbox').checked) {{
       startBody.enable_dump = true;
@@ -2284,7 +2353,8 @@ window.addEventListener('load', async () => {{
         presets_js     = presets_js,
         avatar_ok      = avatar_ok,
         avatar_info_js = avatar_info_js,
-        default_hipaa    = if resolved.hipaa { "true" } else { "false" },
+        environments_js  = environments_js,
+        default_env      = resolved.env,
         default_geofence = resolved.geofence,
         default_enc_mode = resolved.encryption_mode,
         default_enc_key  = resolved.encryption_key,
@@ -2311,7 +2381,8 @@ mod tests {
             avatar_configured: false,
             avatar_summary:    None,
             presets:           vec![],
-            hipaa:             true,
+            env:               "hipaa".into(),
+            environments:      crate::convo_config::default_environments(),
             geofence:          "NORTH_AMERICA".into(),
             encryption_mode:   8,
             encryption_key:    "hunter2".into(),
@@ -2321,8 +2392,10 @@ mod tests {
             poll_interval_secs: 60,
         };
         let html = build_html_page("app", &resolved, false);
-        assert!(html.contains("const DEFAULT_HIPAA    = true;"),
-            "DEFAULT_HIPAA should be true");
+        assert!(html.contains(r#"const DEFAULT_ENV      = "hipaa";"#),
+            "DEFAULT_ENV should be hipaa");
+        assert!(html.contains(r#""name":"eap""#) && html.contains(r#""prefix":"preview/api""#),
+            "ENVIRONMENTS should include the eap entry");
         assert!(html.contains(r#"const DEFAULT_GEOFENCE = "NORTH_AMERICA";"#));
         assert!(html.contains("const DEFAULT_ENC_MODE = 8;"));
         assert!(html.contains(r#"const DEFAULT_ENC_KEY  = "hunter2";"#));
@@ -2335,7 +2408,8 @@ mod tests {
             channel: "c".into(), rtc_user_id: "1".into(), agent_user_id: "2".into(),
             idle_timeout_secs: None, avatar_configured: false, avatar_summary: None,
             presets: vec![],
-            hipaa: false, geofence: String::new(),
+            env: "ga".into(), environments: crate::convo_config::default_environments(),
+            geofence: String::new(),
             encryption_mode: 0, encryption_key: String::new(), encryption_salt: String::new(),
             enable_avatar: false,
             pipeline: crate::convo_config::Pipeline::Cascaded,
@@ -2399,31 +2473,29 @@ mod tests {
     }
 
     #[test]
-    fn convoai_base_url_defaults_to_agora() {
-        // Unset to guarantee default.
-        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
-        assert_eq!(convoai_base_url(), "https://api.agora.io");
+    fn convoai_url_builds_per_environment() {
+        let envs = crate::convo_config::default_environments();
+        let ga    = envs.iter().find(|e| e.name == "ga").unwrap();
+        let eap   = envs.iter().find(|e| e.name == "eap").unwrap();
+        let hipaa = envs.iter().find(|e| e.name == "hipaa").unwrap();
+        assert_eq!(convoai_url(ga, "v2/projects/abc/join"),
+            "https://api.agora.io/api/conversational-ai-agent/v2/projects/abc/join");
+        assert_eq!(convoai_url(eap, "v2/projects/abc/join"),
+            "https://partner.ai.agora.io/preview/api/conversational-ai-agent/v2/projects/abc/join");
+        assert_eq!(convoai_url(hipaa, "v2/projects/abc/join"),
+            "https://api.agora.io/hipaa/api/conversational-ai-agent/v2/projects/abc/join");
     }
 
     #[test]
-    fn convoai_base_url_honours_env_override() {
-        unsafe { std::env::set_var("ATEM_CONVOAI_API_URL", "http://127.0.0.1:9999"); }
-        assert_eq!(convoai_base_url(), "http://127.0.0.1:9999");
-        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
-    }
-
-    #[test]
-    fn convoai_url_default_uses_api_prefix() {
-        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
-        let u = convoai_url(false, "v2/projects/abc/join");
-        assert_eq!(u, "https://api.agora.io/api/conversational-ai-agent/v2/projects/abc/join");
-    }
-
-    #[test]
-    fn convoai_url_hipaa_uses_hipaa_prefix() {
-        unsafe { std::env::remove_var("ATEM_CONVOAI_API_URL"); }
-        let u = convoai_url(true, "v2/projects/abc/join");
-        assert_eq!(u, "https://api.agora.io/hipaa/api/conversational-ai-agent/v2/projects/abc/join");
+    fn eap_env_has_live_models_header_no_forcing_hipaa_forces() {
+        let envs = crate::convo_config::default_environments();
+        let eap = envs.iter().find(|e| e.name == "eap").unwrap();
+        assert_eq!(eap.headers.get("agora-feature").map(String::as_str), Some("live-models"));
+        assert!(eap.force_geofence.is_none() && eap.force_encryption_mode.is_none());
+        let hipaa = envs.iter().find(|e| e.name == "hipaa").unwrap();
+        assert_eq!(hipaa.force_geofence.as_deref(), Some("NORTH_AMERICA"));
+        assert_eq!(hipaa.force_encryption_mode, Some(8));
+        assert!(hipaa.headers.is_empty());
     }
 
     #[test]
@@ -2438,7 +2510,8 @@ mod tests {
                 vendor: Some("heygen".into()), avatar_id: Some("abc".into()),
             }),
             presets:           vec![],
-            hipaa:             false,
+            env:               "ga".into(),
+            environments:      crate::convo_config::default_environments(),
             geofence:          String::new(),
             encryption_mode:   0,
             encryption_key:    String::new(),
@@ -2469,7 +2542,8 @@ mod tests {
             avatar_configured: false,
             avatar_summary:    None,
             presets:           vec!["expertise_ai_poc".into(), "_akool_test_expertise".into()],
-            hipaa:             false,
+            env:               "ga".into(),
+            environments:      crate::convo_config::default_environments(),
             geofence:          String::new(),
             encryption_mode:   0,
             encryption_key:    String::new(),

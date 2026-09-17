@@ -343,7 +343,17 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
       block goes into `/join` when both are parked in the file.
       Auto-detected from which block is present when omitted; required
       when both `[agent.asr/llm/tts]` and `[agent.mllm]` exist.
-    - `hipaa` — switches ConvoAI URL prefix to `/hipaa/api/...`
+    - `env` — ConvoAI REST environment: `ga` (default, api.agora.io/api) |
+      `eap` (partner.ai.agora.io/preview/api + `agora-feature: live-models`
+      header; Early Access Preview) | `hipaa` (api.agora.io/hipaa/api, forces
+      NORTH_AMERICA + AES_256_GCM2). `[atem].hipaa = true` is a legacy alias
+      for `env = "hipaa"`. The web UI shows the environments as single-select
+      radios with a live endpoint-URL preview.
+    - `[[atem.environments]]` — add/override environments (`name`, `host`,
+      `prefix`, `label`, `headers`, `force_geofence`, `force_encryption_mode`).
+      Merged over the built-in ga/eap/hipaa by `name`; a new name adds a
+      selectable environment — no code change. `ATEM_CONVOAI_API_URL` overrides
+      the ga/hipaa host.
     - `geofence` — GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
     - `enable_avatar` — opt in to `[agent.avatar]` this session
     - `[atem.encryption]` — `mode` (0..=8), `key`, `salt` (base64-32-bytes)
