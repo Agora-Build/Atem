@@ -165,10 +165,17 @@ pub struct AtemSection {
     /// Default "ga". When unset, `hipaa = true` (below) still selects "hipaa".
     pub env: Option<String>,
 
+    /// Allowlist of environment names to show in the UI, in this order.
+    /// Empty / omitted → show all available. e.g. `envs = ["ga", "eap"]`
+    /// shows only those two (hosts/prefixes still come from the built-in
+    /// defaults unless overridden via `[[atem.environments]]`).
+    pub envs: Vec<String>,
+
     /// Extra / overriding REST environments. Merged over the built-in
     /// defaults (`ga`, `eap`, `hipaa`) by `name`: a matching name overrides
     /// that built-in, a new name adds a selectable environment — no code
-    /// change needed. Each entry becomes a radio option in the web UI.
+    /// change needed. Each entry becomes a radio option in the web UI
+    /// (subject to `envs` above).
     pub environments: Vec<EnvDef>,
 
     /// Deprecated alias for `env = "hipaa"`. Route through Agora's
@@ -294,6 +301,16 @@ impl ConvoConfig {
                     Some(existing) => *existing = cfg.clone(),
                     None => envs.push(cfg.clone()),
                 }
+            }
+        }
+        // Allowlist: when [atem].envs is non-empty, keep only those, in that
+        // order. Names that don't resolve to any environment are skipped.
+        if let Some(allow) = self.atem.as_ref().map(|a| &a.envs).filter(|a| !a.is_empty()) {
+            let filtered: Vec<EnvDef> = allow.iter()
+                .filter_map(|name| envs.iter().find(|e| &e.name == name).cloned())
+                .collect();
+            if !filtered.is_empty() {
+                return filtered;
             }
         }
         envs
@@ -937,7 +954,17 @@ impl ConvoConfig {
             avatar_configured,
             avatar_summary,
             presets: self.preset_list(),
-            env: self.env_name(),
+            env: {
+                // Clamp the selected env to one that's actually shown (an
+                // allowlist may exclude the configured/alias default).
+                let environments = self.environments();
+                let name = self.env_name();
+                if environments.iter().any(|e| e.name == name) {
+                    name
+                } else {
+                    environments.first().map(|e| e.name.clone()).unwrap_or_else(|| "ga".into())
+                }
+            },
             environments: self.environments(),
             geofence: atem.geofence.unwrap_or_default(),
             encryption_mode: enc.mode,
@@ -1146,6 +1173,37 @@ mod tests {
         // No override → built-in defaults.
         let plain = cfg.environments_with(None);
         assert_eq!(plain.iter().find(|e| e.name == "ga").unwrap().host, "https://api.agora.io");
+    }
+
+    #[test]
+    fn envs_allowlist_filters_and_orders() {
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            envs = ["eap", "ga"]
+            [agent]
+            user_id = "1"
+        "#).unwrap();
+        let envs = cfg.environments();
+        let names: Vec<&str> = envs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["eap", "ga"]);              // only these, in order
+        assert!(!envs.iter().any(|e| e.name == "hipaa")); // hidden
+    }
+
+    #[test]
+    fn env_clamped_to_shown_when_allowlist_excludes_it() {
+        // Legacy hipaa=true would select "hipaa", but the allowlist hides it →
+        // clamp the default to the first shown env.
+        let cfg: ConvoConfig = toml::from_str(r#"
+            [atem]
+            channel = "c"
+            hipaa = true
+            envs = ["ga", "eap"]
+            [agent]
+            user_id = "1"
+        "#).unwrap();
+        let r = cfg.resolve(&CliOverrides { channel: None, rtc_user_id: None, agent_user_id: None }).unwrap();
+        assert_eq!(r.env, "ga");
+        assert_eq!(r.environments.len(), 2);
     }
 
     #[test]

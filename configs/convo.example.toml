@@ -45,6 +45,11 @@ pipeline = "cascaded"        # "cascaded" | "mllm"
 #           AES_256_GCM2; requires Agora Support to enable HIPAA.)
 env = "ga"
 
+# Optional allowlist — show only these environments in the web UI (in this
+# order). Omit to show all available. e.g. envs = ["ga", "eap"] hides HIPAA.
+# Hosts/prefixes still come from the built-in defaults unless overridden below.
+# envs = ["ga", "eap"]
+
 # The legacy `hipaa = true` still works — it's an alias for `env = "hipaa"`.
 # hipaa = false
 

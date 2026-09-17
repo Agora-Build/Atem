@@ -354,6 +354,9 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
       Merged over the built-in ga/eap/hipaa by `name`; a new name adds a
       selectable environment — no code change. `ATEM_CONVOAI_API_URL` overrides
       the ga/hipaa host.
+    - `envs` — allowlist of environment names to show in the UI, in order
+      (e.g. `["ga", "eap"]` hides HIPAA). Empty/omitted → show all. The
+      selected `env`/`hipaa` default is clamped to a shown entry.
     - `geofence` — GLOBAL | NORTH_AMERICA | EUROPE | ASIA | JAPAN | INDIA
     - `enable_avatar` — opt in to `[agent.avatar]` this session
     - `[atem.encryption]` — `mode` (0..=8), `key`, `salt` (base64-32-bytes)
