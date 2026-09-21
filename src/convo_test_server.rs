@@ -226,6 +226,20 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     // the child's PID, exits. Child runs run_background which holds the
     // agent and posts /leave on SIGTERM.
     if cfg.background && !cfg._daemon {
+        // A forcing env (e.g. HIPAA) requires encryption, but --background
+        // can't generate a key headlessly (the web page does that in the
+        // browser). Refuse to launch unencrypted rather than silently violate
+        // the requirement — the key must be in [atem.encryption].
+        if let Some(mode) = resolved.active_env().force_encryption_mode {
+            if resolved.encryption_mode == 0 {
+                anyhow::bail!(
+                    "Environment '{}' requires encryption (mode {}), but no [atem.encryption] \
+                     is configured. --background can't generate a key — set [atem.encryption] \
+                     with `mode = {}`, `key`, and `salt` in convo.toml (or pick a non-forcing env).",
+                    resolved.env, mode, mode,
+                );
+            }
+        }
         let exe = std::env::current_exe()?;
         let log_dir = crate::rtc_test_server::servers_dir();
         std::fs::create_dir_all(&log_dir)?;
