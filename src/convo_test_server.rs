@@ -1337,13 +1337,10 @@ function syncSaltRow() {{
 function applyTomlDefaults() {{
   if (DEFAULT_ENABLE_AVATAR) document.getElementById('avatarCheckbox').checked = true;
   if (DEFAULT_GEOFENCE) document.getElementById('geoAreaSelect').value = DEFAULT_GEOFENCE;
-  // Only pre-fill encryption from convo.toml when the default environment
-  // FORCES it (e.g. HIPAA). For GA/EAP, encryption stays off on load — the
-  // user enables it manually. (syncEnv still forces + generates a key/salt
-  // for a forcing env when nothing was pre-filled.)
-  const defEnv = ENVIRONMENTS.find((e) => e.name === DEFAULT_ENV);
-  const envForcesEnc = !!(defEnv && defEnv.force_encryption_mode);
-  if (envForcesEnc && DEFAULT_ENC_MODE > 0) {{
+  // Respect a configured [atem.encryption] (mode>0) on load for ANY env — it's
+  // the persistent choice. HIPAA additionally forces + generates a key/salt
+  // via syncEnv when nothing is configured.
+  if (DEFAULT_ENC_MODE > 0) {{
     document.getElementById('encModeSelect').value = String(DEFAULT_ENC_MODE);
     document.getElementById('encKeyInput').value   = DEFAULT_ENC_KEY;
     document.getElementById('encSaltInput').value  = DEFAULT_ENC_SALT;
@@ -1502,9 +1499,15 @@ function syncEnv(clearOnUnforce) {{
     geo.disabled = mode.disabled = false;
     key.readOnly = salt.readOnly = false;
     if (clearOnUnforce) {{
-      mode.value = '0';   // encryption none
-      key.value = '';     // remove key
-      salt.value = '';    // clean salt
+      // Switching to a non-forcing env: fall back to the convo.toml
+      // encryption if configured (respect the persistent choice), else none.
+      if (DEFAULT_ENC_MODE > 0) {{
+        mode.value = String(DEFAULT_ENC_MODE);
+        key.value  = DEFAULT_ENC_KEY;
+        salt.value = DEFAULT_ENC_SALT;
+      }} else {{
+        mode.value = '0'; key.value = ''; salt.value = '';
+      }}
     }}
     syncSaltRow();
   }}
