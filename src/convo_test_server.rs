@@ -226,6 +226,20 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     // the child's PID, exits. Child runs run_background which holds the
     // agent and posts /leave on SIGTERM.
     if cfg.background && !cfg._daemon {
+        // A forcing env (e.g. HIPAA) requires encryption, but --background
+        // can't generate a key headlessly (the web page does that in the
+        // browser). Refuse to launch unencrypted rather than silently violate
+        // the requirement — the key must be in [atem.encryption].
+        if let Some(mode) = resolved.active_env().force_encryption_mode {
+            if resolved.encryption_mode == 0 {
+                anyhow::bail!(
+                    "Environment '{}' requires encryption (mode {}), but no [atem.encryption] \
+                     is configured. --background can't generate a key — set [atem.encryption] \
+                     with `mode = {}`, `key`, and `salt` in convo.toml (or pick a non-forcing env).",
+                    resolved.env, mode, mode,
+                );
+            }
+        }
         let exe = std::env::current_exe()?;
         let log_dir = crate::rtc_test_server::servers_dir();
         std::fs::create_dir_all(&log_dir)?;
@@ -551,8 +565,10 @@ async fn run_background(
         // Background mode: no UI, use config-level preset as-is.
         preset: None,
         pipeline: resolved.pipeline,
-        // Encryption / geofence: read from convo.toml. mode=0 → no
-        // encryption block emitted. geofence empty/"GLOBAL" → no fence.
+        // Encryption / geofence: read from convo.toml verbatim. Background
+        // has no UI, so [atem.encryption] is the explicit choice — respect it
+        // regardless of env. mode=0 → no encryption. geofence empty/"GLOBAL"
+        // → no fence.
         encryption_mode: if resolved.encryption_mode > 0 { Some(resolved.encryption_mode) } else { None },
         encryption_key:  if resolved.encryption_mode > 0 { Some(resolved.encryption_key.as_str()) } else { None },
         encryption_salt: if !resolved.encryption_salt.is_empty() { Some(resolved.encryption_salt.as_str()) } else { None },
@@ -1321,15 +1337,13 @@ function syncSaltRow() {{
 function applyTomlDefaults() {{
   if (DEFAULT_ENABLE_AVATAR) document.getElementById('avatarCheckbox').checked = true;
   if (DEFAULT_GEOFENCE) document.getElementById('geoAreaSelect').value = DEFAULT_GEOFENCE;
+  // Respect a configured [atem.encryption] (mode>0) on load for ANY env — it's
+  // the persistent choice. HIPAA additionally forces + generates a key/salt
+  // via syncEnv when nothing is configured.
   if (DEFAULT_ENC_MODE > 0) {{
     document.getElementById('encModeSelect').value = String(DEFAULT_ENC_MODE);
     document.getElementById('encKeyInput').value   = DEFAULT_ENC_KEY;
     document.getElementById('encSaltInput').value  = DEFAULT_ENC_SALT;
-  }} else {{
-    // No encryption configured in TOML — leave the page-default mode 8
-    // selected but clear any auto-generated salt so the row stays empty
-    // until the user picks a key.
-    if (!DEFAULT_ENC_KEY) document.getElementById('encKeyInput').value = '';
   }}
 }}
 
@@ -1485,9 +1499,15 @@ function syncEnv(clearOnUnforce) {{
     geo.disabled = mode.disabled = false;
     key.readOnly = salt.readOnly = false;
     if (clearOnUnforce) {{
-      mode.value = '0';   // encryption none
-      key.value = '';     // remove key
-      salt.value = '';    // clean salt
+      // Switching to a non-forcing env: fall back to the convo.toml
+      // encryption if configured (respect the persistent choice), else none.
+      if (DEFAULT_ENC_MODE > 0) {{
+        mode.value = String(DEFAULT_ENC_MODE);
+        key.value  = DEFAULT_ENC_KEY;
+        salt.value = DEFAULT_ENC_SALT;
+      }} else {{
+        mode.value = '0'; key.value = ''; salt.value = '';
+      }}
     }}
     syncSaltRow();
   }}
