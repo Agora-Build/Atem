@@ -533,10 +533,6 @@ async fn run_background(
     // to the current project's appid+cert.
     let (avatar_channel, avatar_token) =
         mint_avatar_channel_and_token(convo, &resolved.channel, app_id, app_cert, &avatar_user_id);
-    // Encryption is only applied when the active env forces it (e.g. HIPAA),
-    // mirroring the web page. GA/EAP get no encryption even if
-    // [atem.encryption] is configured in convo.toml.
-    let enc_on = resolved.active_env().force_encryption_mode.is_some();
     let payload = convo.build_join_payload(crate::convo_config::JoinArgs {
         name: &name,
         channel: &resolved.channel,
@@ -555,11 +551,13 @@ async fn run_background(
         // Background mode: no UI, use config-level preset as-is.
         preset: None,
         pipeline: resolved.pipeline,
-        // Encryption: only when the active env forces it (see enc_on above).
-        // geofence empty/"GLOBAL" → no fence.
-        encryption_mode: if enc_on && resolved.encryption_mode > 0 { Some(resolved.encryption_mode) } else { None },
-        encryption_key:  if enc_on && resolved.encryption_mode > 0 { Some(resolved.encryption_key.as_str()) } else { None },
-        encryption_salt: if enc_on && !resolved.encryption_salt.is_empty() { Some(resolved.encryption_salt.as_str()) } else { None },
+        // Encryption / geofence: read from convo.toml verbatim. Background
+        // has no UI, so [atem.encryption] is the explicit choice — respect it
+        // regardless of env. mode=0 → no encryption. geofence empty/"GLOBAL"
+        // → no fence.
+        encryption_mode: if resolved.encryption_mode > 0 { Some(resolved.encryption_mode) } else { None },
+        encryption_key:  if resolved.encryption_mode > 0 { Some(resolved.encryption_key.as_str()) } else { None },
+        encryption_salt: if !resolved.encryption_salt.is_empty() { Some(resolved.encryption_salt.as_str()) } else { None },
         geofence_area:   if !resolved.geofence.is_empty() { Some(resolved.geofence.as_str()) } else { None },
         enable_dump: false,
     });
