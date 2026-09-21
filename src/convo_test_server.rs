@@ -1321,15 +1321,16 @@ function syncSaltRow() {{
 function applyTomlDefaults() {{
   if (DEFAULT_ENABLE_AVATAR) document.getElementById('avatarCheckbox').checked = true;
   if (DEFAULT_GEOFENCE) document.getElementById('geoAreaSelect').value = DEFAULT_GEOFENCE;
-  if (DEFAULT_ENC_MODE > 0) {{
+  // Only pre-fill encryption from convo.toml when the default environment
+  // FORCES it (e.g. HIPAA). For GA/EAP, encryption stays off on load — the
+  // user enables it manually. (syncEnv still forces + generates a key/salt
+  // for a forcing env when nothing was pre-filled.)
+  const defEnv = ENVIRONMENTS.find((e) => e.name === DEFAULT_ENV);
+  const envForcesEnc = !!(defEnv && defEnv.force_encryption_mode);
+  if (envForcesEnc && DEFAULT_ENC_MODE > 0) {{
     document.getElementById('encModeSelect').value = String(DEFAULT_ENC_MODE);
     document.getElementById('encKeyInput').value   = DEFAULT_ENC_KEY;
     document.getElementById('encSaltInput').value  = DEFAULT_ENC_SALT;
-  }} else {{
-    // No encryption configured in TOML — leave the page-default mode 8
-    // selected but clear any auto-generated salt so the row stays empty
-    // until the user picks a key.
-    if (!DEFAULT_ENC_KEY) document.getElementById('encKeyInput').value = '';
   }}
 }}
 
