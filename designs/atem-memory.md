@@ -86,9 +86,15 @@ with, and approved by, your Astation.
 
 - The account is the paired Astation. Every machine paired with the same
   Astation shares memory and skills.
-- Pair once per machine with `atem pair`. Sessions renew on use and expire
-  after 7 days idle. An unpaired or expired machine can't read, write, or
-  sync.
+- Pair once per machine with `atem pair`. An unpaired machine can't read,
+  write, or sync.
+- The relay recognizes a pairing session only while it knows the session's
+  binding to your Astation. That binding lives in the relay's memory
+  (`SessionVerifyCache`) and is learned when atem connects to the Astation,
+  so after a relay restart or deploy `atem sync` gets 401 until atem
+  reconnects: open atem while your Astation is online, then sync again.
+  Changes stay queued meanwhile. A durable binding that survives relay
+  restarts is a planned follow-up.
 - Login-based accounts are a possible future follow-up.
 - atem sends `Authorization: session <session_id>` (the pairing session for
   the configured Astation, from `SessionManager::load()`) plus
