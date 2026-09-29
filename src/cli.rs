@@ -63,6 +63,25 @@ pub enum Commands {
         #[command(subcommand)]
         command: VaultCommands,
     },
+    /// Sync memory and skills across agents and machines (see designs/atem-memory.md)
+    Sync {
+        /// Don't harvest Claude's saved memories this run
+        #[arg(long)]
+        no_harvest: bool,
+        /// Allow writing into files tracked by git
+        #[arg(long)]
+        allow_tracked: bool,
+    },
+    /// Shared memory for coding agents (see designs/atem-memory.md)
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+    /// Shared skills for coding agents (see designs/atem-memory.md)
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -452,6 +471,90 @@ pub enum VaultCommands {
         /// New summary text
         #[arg(long)]
         text: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum MemoryCommands {
+    /// Add a memory (a short, durable fact)
+    Add {
+        /// The fact to remember
+        content: String,
+        /// global | project | machine (default: project inside a git repo, else global)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Project key (default: the current repo's normalized git remote)
+        #[arg(long)]
+        project: Option<String>,
+        /// high | medium | low
+        #[arg(long, default_value = "medium")]
+        confidence: String,
+        /// Which agent is saving this: cli (default) or codex
+        #[arg(long, default_value = "cli", value_parser = ["cli", "codex"])]
+        agent: String,
+        /// Store even though it looks like a credential (only if it is not one)
+        #[arg(long)]
+        force: bool,
+    },
+    /// List memories (global, this machine, and the current project unless --all)
+    List {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Search memories on this machine
+    Search {
+        text: String,
+    },
+    /// Remove a memory everywhere
+    Rm {
+        id: String,
+    },
+    /// Remove a memory that contained a credential, everywhere, and stop re-harvesting it
+    Purge {
+        id: String,
+    },
+    /// Rewrite the managed memory blocks and skills from the local store
+    Apply {
+        #[arg(long)]
+        allow_tracked: bool,
+    },
+    /// Account, machine, pending changes, held-back memories, credential findings
+    Status,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SkillCommands {
+    /// Add (or update) a skill from a directory containing SKILL.md
+    Add {
+        dir: String,
+        /// global (default) | project
+        #[arg(long)]
+        scope: Option<String>,
+        /// Skill name (default: the directory name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List skills
+    List,
+    /// Remove a skill everywhere
+    Rm {
+        name: String,
+        #[arg(long, default_value = "global")]
+        scope: String,
+    },
+    /// Erase skill versions that contained a credential
+    Purge {
+        name: String,
+        #[arg(long, default_value = "global")]
+        scope: String,
+        #[arg(long)]
+        version: Option<i64>,
+        #[arg(long)]
+        all_versions: bool,
     },
 }
 
@@ -1125,6 +1228,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
         },
         Commands::Vault { command } => handle_vault_command(command).await,
+        Commands::Sync { no_harvest, allow_tracked } => crate::memory::cmd::handle_sync(no_harvest, allow_tracked).await,
+        Commands::Memory { command } => crate::memory::cmd::handle_memory(command).await,
+        Commands::Skill { command } => crate::memory::cmd::handle_skill(command).await,
     }
 }
 
