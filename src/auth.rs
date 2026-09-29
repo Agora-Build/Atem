@@ -6,6 +6,92 @@ use std::time::Duration;
 
 const DEFAULT_SERVER_URL: &str = "https://station.agora.build";
 
+// ===== Capability tiers: shared pairing/login gates =====
+//
+// Tier 1 (`atem login`) unlocks a limited set of functions; tier 2 (paired
+// with Astation, the control plane) unlocks the full set. These helpers are
+// the single shared implementation — callers across the CLI (memory, vault,
+// project, …) gate through `require_pairing`/`require_login` rather than
+// re-deriving the session/credential checks themselves.
+
+/// Why a pairing session couldn't be resolved. A purely local determination
+/// — no network involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingProblem {
+    /// No `astation_relay_code` (or `ASTATION_RELAY_CODE`) is configured.
+    NotConfigured,
+    /// An Astation is configured, but there's no valid pairing session for it.
+    NotPaired,
+}
+
+/// A resolved pairing: the relay base URL, the configured Astation's id, and
+/// this machine's pairing session for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedSession {
+    pub relay_base: String,
+    pub astation_id: String,
+    pub session_id: String,
+}
+
+/// Pure: derive a `PairedSession` from already-resolved inputs. No network,
+/// no disk access — everything is fed in.
+pub fn pairing_from(
+    relay_base: &str,
+    astation_id: Option<&str>,
+    session_id: Option<String>,
+) -> std::result::Result<PairedSession, PairingProblem> {
+    let astation_id = astation_id.ok_or(PairingProblem::NotConfigured)?;
+    let session_id = session_id.ok_or(PairingProblem::NotPaired)?;
+    Ok(PairedSession {
+        relay_base: relay_base.to_string(),
+        astation_id: astation_id.to_string(),
+        session_id,
+    })
+}
+
+/// Loads `AtemConfig` and `SessionManager` the way `handle_vault_command`
+/// used to: a config load failure maps to `NotConfigured`, a missing or
+/// unresolvable session maps to `NotPaired`.
+pub fn pairing_session() -> std::result::Result<PairedSession, PairingProblem> {
+    let config = crate::config::AtemConfig::load().map_err(|_| PairingProblem::NotConfigured)?;
+    let astation_id = config.astation_relay_code.clone();
+    let session_id = astation_id.as_deref().and_then(|id| {
+        SessionManager::load()
+            .ok()
+            .and_then(|m| m.get(id).map(|s| s.session_id.clone()))
+    });
+    pairing_from(config.astation_relay_url(), astation_id.as_deref(), session_id)
+}
+
+/// The tier-2 gate message: `feature` refused because this machine isn't
+/// paired with an Astation.
+pub fn pairing_gate_message(feature: &str) -> String {
+    format!(
+        "{feature} works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry."
+    )
+}
+
+/// The tier-2 gate: a local check with no network. Fails with an actionable
+/// message when this machine isn't paired with an Astation.
+pub fn require_pairing(feature: &str) -> Result<PairedSession> {
+    pairing_session().map_err(|_| anyhow!(pairing_gate_message(feature)))
+}
+
+/// The tier-1 gate message: `feature` refused because there's no `atem
+/// login`.
+pub fn login_gate_message(feature: &str) -> String {
+    format!("{feature} requires `atem login` (your Agora account).")
+}
+
+/// The tier-1 gate: a local check with no network. Passes when
+/// `CredentialStore::load().entries` is non-empty.
+pub fn require_login(feature: &str) -> Result<()> {
+    if crate::credentials::CredentialStore::load().entries.is_empty() {
+        return Err(anyhow!(login_gate_message(feature)));
+    }
+    Ok(())
+}
+
 /// Stored session after successful pairing.
 /// Sessions expire after 7 days of inactivity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,6 +574,52 @@ mod tests {
         assert!(read_private_file(&link).is_err());
         assert!(write_private_file(&link, b"replacement").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"target contents");
+    }
+
+    // ===== Capability tier gates =====
+
+    #[test]
+    fn pairing_from_not_configured_without_astation_id() {
+        assert_eq!(
+            pairing_from("https://relay.example.com", None, Some("sess-1".to_string())),
+            Err(PairingProblem::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn pairing_from_not_paired_without_session() {
+        assert_eq!(
+            pairing_from("https://relay.example.com", Some("astation-1"), None),
+            Err(PairingProblem::NotPaired)
+        );
+    }
+
+    #[test]
+    fn pairing_from_ok_with_both() {
+        assert_eq!(
+            pairing_from("https://relay.example.com", Some("astation-1"), Some("sess-1".to_string())),
+            Ok(PairedSession {
+                relay_base: "https://relay.example.com".to_string(),
+                astation_id: "astation-1".to_string(),
+                session_id: "sess-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn pairing_gate_message_text_is_exact() {
+        assert_eq!(
+            pairing_gate_message("Atem Memory"),
+            "Atem Memory works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry."
+        );
+    }
+
+    #[test]
+    fn login_gate_message_text_is_exact() {
+        assert_eq!(
+            login_gate_message("atem project"),
+            "atem project requires `atem login` (your Agora account)."
+        );
     }
 
     #[test]

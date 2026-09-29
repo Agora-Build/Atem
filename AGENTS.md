@@ -225,6 +225,27 @@ Paired:   astation-<uuid>  (SSO: 52a4f560...)  [save: yes]
 
 Note: RTC/RTM token generation needs only `app_id` + `app_certificate` (from active project). It does NOT need SSO credentials.
 
+### Capability Tiers
+
+Product rule: `atem login` unlocks a limited set of functions (tier 1); pairing
+with Astation unlocks the full set (tier 2) — Astation is the control plane.
+
+| Tier | Needs | Commands |
+|---|---|---|
+| 0 | — | serv files, config, token with AGORA_APP_ID/CERT env |
+| 1 | `atem login` | project, token (active project), serv rtc/convo/webhooks |
+| 2 | paired with Astation | vault, sync, memory, skill, and Astation-driven remote agent control, voice coding, mark tasks, visualize |
+
+Gates are centralized in `src/auth.rs`: `require_login(feature)` is the tier-1
+gate (passes when `CredentialStore::load().entries` is non-empty);
+`require_pairing(feature)` is the tier-2 gate (resolves a `PairedSession` —
+relay base, Astation id, session id — from `AtemConfig` + `SessionManager`,
+purely local, no network). Both return an actionable `anyhow::Error` built
+from `login_gate_message`/`pairing_gate_message` when the check fails.
+
+New cross-machine or cross-agent features are tier 2 and must gate with
+`auth::require_pairing`.
+
 ### Native FFI Layer
 
 ```

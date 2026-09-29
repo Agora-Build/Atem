@@ -746,6 +746,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         },
         Commands::Project { project_command } => match project_command {
             ProjectCommands::List { show_certificates } => {
+                crate::auth::require_login("atem project")?;
                 let config = crate::config::AtemConfig::load()?;
                 let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -773,6 +774,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     crate::config::ProjectCache::set_current(&project.app_id, None)?;
                     println!("Current project set: {} ({})", project.name, project.app_id);
                 } else {
+                    crate::auth::require_login("atem project")?;
                     let config = crate::config::AtemConfig::load()?;
                     let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1237,27 +1239,11 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
 async fn handle_vault_command(command: VaultCommands) -> Result<()> {
     use crate::vault_client::{self, VaultClient};
 
-    // Resolve relay base, client id, and session.
-    let config = crate::config::AtemConfig::load()?;
-    let base = config.astation_relay_url().to_string();
-    let astation_id = config
-        .astation_relay_code
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!(
-            "No relay configured. Set astation_relay_code in config.toml or the ASTATION_RELAY_CODE env var."
-        ))?;
+    // Tier-2 gate: Astation is the control plane, so vault needs an active
+    // pairing session. Also resolves relay base + client id + session.
+    let paired = crate::auth::require_pairing("Atem Vault")?;
     let client_id = crate::config::AtemConfig::ensure_instance_id();
-    // astation_relay_code is the Astation identity, which is also the SessionManager
-    // key (relay room name == session key). See designs/vault.md open-questions #1/#6.
-    let session_id = crate::auth::SessionManager::load()?
-        .get(&astation_id)
-        .map(|s| s.session_id.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "No Astation session found for {}. Connect to your Astation first to establish a session.",
-            astation_id
-        ))?;
-
-    let client = VaultClient::new(base, client_id, session_id);
+    let client = VaultClient::new(paired.relay_base, client_id, paired.session_id);
 
     match command {
         VaultCommands::New { summary } => {

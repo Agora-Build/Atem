@@ -1,6 +1,7 @@
 //! CLI handlers for `atem sync`, `atem memory …`, `atem skill …`.
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
+use crate::auth::PairingProblem;
 use crate::cli::{MemoryCommands, SkillCommands};
 use crate::memory::adapters::{valid_skill_name, Agent, Ctx};
 use crate::memory::api::KnowledgeClient;
@@ -48,38 +49,6 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", s.chars().take(max - 1).collect::<String>())
 }
 
-/// Why a relay session couldn't be resolved. A purely local determination —
-/// no network involved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionProblem {
-    /// No `astation_relay_code` (or `ASTATION_RELAY_CODE`) is configured.
-    NotConfigured,
-    /// An Astation is configured, but there's no valid pairing session for it.
-    NotPaired,
-}
-
-const PAIRING_GATE_MSG: &str = "Atem Memory works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry.";
-
-/// Mirrors `handle_vault_command` in `src/cli.rs`: the relay base URL and
-/// this machine's pairing session for the configured Astation. Local only —
-/// no network calls.
-fn relay_session(config: &crate::config::AtemConfig) -> Result<(String, String), SessionProblem> {
-    let astation_id = config.astation_relay_code.clone().ok_or(SessionProblem::NotConfigured)?;
-    let session_id = crate::auth::SessionManager::load()
-        .ok()
-        .and_then(|m| m.get(&astation_id).map(|s| s.session_id.clone()))
-        .ok_or(SessionProblem::NotPaired)?;
-    Ok((config.astation_relay_url().to_string(), session_id))
-}
-
-/// Local check only — no network. Astation is the control plane: every
-/// memory/skill command, including purely local ones, refuses to run
-/// without an active pairing session for the configured Astation.
-fn require_pairing() -> Result<()> {
-    let config = crate::config::AtemConfig::load()?;
-    relay_session(&config).map(|_| ()).map_err(|_| anyhow!(PAIRING_GATE_MSG))
-}
-
 fn build_ctx(allow_tracked: bool) -> Result<Ctx> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot find the home directory"))?;
     let cwd = std::env::current_dir()?;
@@ -95,14 +64,13 @@ const NOT_CONFIGURED_MSG: &str = "No Astation configured — set astation_relay_
 const NOT_PAIRED_MSG: &str = "Not paired with your Astation — run `atem pair`; changes stay queued.";
 
 /// `Err` when no relay client can be built (no Astation configured, or no
-/// pairing session). `require_pairing()` should already have caught this
-/// before any of these callers run, but `client()` resolves the session
-/// itself so it never trusts a stale gate check. Relay reachability is
-/// found out later, when a request actually goes out.
-async fn client() -> Result<KnowledgeClient, SessionProblem> {
-    let config = crate::config::AtemConfig::load().map_err(|_| SessionProblem::NotConfigured)?;
-    let (base, session_id) = relay_session(&config)?;
-    Ok(KnowledgeClient::new(base, crate::config::AtemConfig::ensure_instance_id(), session_id))
+/// pairing session). `crate::auth::require_pairing` should already have
+/// caught this before any of these callers run, but `client()` resolves the
+/// session itself so it never trusts a stale gate check. Relay reachability
+/// is found out later, when a request actually goes out.
+async fn client() -> Result<KnowledgeClient, PairingProblem> {
+    let paired = crate::auth::pairing_session()?;
+    Ok(KnowledgeClient::new(paired.relay_base, crate::config::AtemConfig::ensure_instance_id(), paired.session_id))
 }
 
 /// `atem memory status`'s "Astation:" line. `status` only runs after
@@ -113,16 +81,16 @@ fn astation_status_line(astation_id: &str) -> String {
 }
 
 /// `problem`: why `client()` couldn't build a client, if it couldn't.
-fn sync_status_line(out: &SyncOutcome, problem: Option<&SessionProblem>) -> String {
+fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>) -> String {
     match problem {
-        Some(SessionProblem::NotConfigured) => NOT_CONFIGURED_MSG.to_string(),
-        Some(SessionProblem::NotPaired) => NOT_PAIRED_MSG.to_string(),
+        Some(PairingProblem::NotConfigured) => NOT_CONFIGURED_MSG.to_string(),
+        Some(PairingProblem::NotPaired) => NOT_PAIRED_MSG.to_string(),
         None if out.offline => "Relay unreachable — changes stay queued and sync next time.".to_string(),
         None => format!("Pushed {} change(s), pulled {} update(s).", out.pushed, out.pulled),
     }
 }
 
-fn print_outcome(out: &SyncOutcome, problem: Option<&SessionProblem>) {
+fn print_outcome(out: &SyncOutcome, problem: Option<&PairingProblem>) {
     if let Some(h) = &out.harvest {
         println!("Harvested from Claude: {} new, {} removed", h.added, h.removed);
         for hb in &h.held_back {
@@ -277,7 +245,7 @@ fn credential_findings(ctx: &Ctx) -> Vec<String> {
 }
 
 pub async fn handle_sync(no_harvest: bool, allow_tracked: bool) -> Result<()> {
-    require_pairing()?;
+    crate::auth::require_pairing("Atem Memory")?;
     let ctx = build_ctx(allow_tracked)?;
     let store = Store::open(&store_path())?;
     let c = client().await;
@@ -288,7 +256,7 @@ pub async fn handle_sync(no_harvest: bool, allow_tracked: bool) -> Result<()> {
 }
 
 pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
-    require_pairing()?;
+    crate::auth::require_pairing("Atem Memory")?;
     match command {
         MemoryCommands::Add { content, scope, project, confidence, agent, force } => {
             let ctx = build_ctx(false)?;
@@ -414,7 +382,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
 }
 
 pub async fn handle_skill(command: SkillCommands) -> Result<()> {
-    require_pairing()?;
+    crate::auth::require_pairing("Atem Memory")?;
     let ctx = build_ctx(false)?;
     let store = Store::open(&store_path())?;
     match command {
@@ -602,8 +570,8 @@ mod tests {
     #[test]
     fn sync_status_line_distinguishes_pairing_problems_from_offline() {
         let offline = SyncOutcome { offline: true, ..Default::default() };
-        assert_eq!(sync_status_line(&offline, Some(&SessionProblem::NotConfigured)), NOT_CONFIGURED_MSG);
-        assert_eq!(sync_status_line(&offline, Some(&SessionProblem::NotPaired)), NOT_PAIRED_MSG);
+        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotConfigured)), NOT_CONFIGURED_MSG);
+        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired)), NOT_PAIRED_MSG);
         assert!(NOT_CONFIGURED_MSG.contains("astation_relay_code") && NOT_CONFIGURED_MSG.contains("stay queued"));
         assert!(NOT_PAIRED_MSG.contains("atem pair") && NOT_PAIRED_MSG.contains("stay queued"));
         assert!(sync_status_line(&offline, None).starts_with("Relay unreachable"));
@@ -617,15 +585,13 @@ mod tests {
     }
 
     #[test]
-    fn pairing_gate_message_is_actionable() {
-        assert!(PAIRING_GATE_MSG.contains("atem pair"));
-        assert!(PAIRING_GATE_MSG.contains("Astation approves this machine"));
-    }
-
-    #[test]
-    fn relay_session_reports_not_configured_without_astation_id() {
-        let config = crate::config::AtemConfig::default();
-        assert_eq!(relay_session(&config), Err(SessionProblem::NotConfigured));
+    fn pairing_gate_message_is_byte_identical_to_before() {
+        // Locks the exact text memory commands have always shown; the shared
+        // gate now lives in `crate::auth`, but this text must not drift.
+        assert_eq!(
+            crate::auth::pairing_gate_message("Atem Memory"),
+            "Atem Memory works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry."
+        );
     }
 
     #[test]
