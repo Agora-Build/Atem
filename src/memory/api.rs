@@ -1,6 +1,7 @@
 //! Relay client for /api/memory and /api/skills. Request building is pure
-//! (unit-tested); `KnowledgeClient` only sends. Auth = the SSO token from
-//! `atem login`, so any logged-in machine on any network can sync.
+//! (unit-tested); `KnowledgeClient` only sends. Auth = the Astation pairing
+//! session: the paired Astation is the account, so any machine paired with
+//! it (and approved by it) can sync.
 use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::memory::model::{Memory, Skill};
@@ -112,19 +113,25 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// The `Authorization` header value for a pairing session. Pure so it can be
+/// unit-tested without a live `KnowledgeClient`.
+pub fn auth_header(session_id: &str) -> String {
+    format!("session {}", session_id)
+}
+
 pub struct KnowledgeClient {
     base: String,
     client_id: String,
-    token: String,
+    session_id: String,
     http: reqwest::Client,
 }
 
 impl KnowledgeClient {
-    pub fn new(base: String, client_id: String, token: String) -> Self {
+    pub fn new(base: String, client_id: String, session_id: String) -> Self {
         Self {
             base,
             client_id,
-            token,
+            session_id,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -137,7 +144,7 @@ impl KnowledgeClient {
             "POST" => self.http.post(&req.url),
             _ => self.http.get(&req.url),
         };
-        rb = rb.header("Authorization", format!("Bearer {}", self.token));
+        rb = rb.header("Authorization", auth_header(&self.session_id));
         if let Some(b) = req.body {
             rb = rb.json(&b);
         }
@@ -237,6 +244,11 @@ mod tests {
     fn op_result_defaults() {
         let r: OpResult = serde_json::from_value(json!({"ok": true})).unwrap();
         assert!(r.ok && r.canonical_id.is_none() && !r.superseded_concurrent);
+    }
+
+    #[test]
+    fn sends_session_authorization() {
+        assert_eq!(auth_header("sess_abc123"), "session sess_abc123");
     }
 
     #[test]

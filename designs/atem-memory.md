@@ -81,15 +81,18 @@ name is the last path segment, for example `atem`.
 
 ## Identity & auth
 
-Memory and skills belong to an **account**, meaning the Agora SSO identity
-from `atem login`.
+**Astation is the control plane.** Atem Memory works only on machines paired
+with, and approved by, your Astation.
 
-- atem sends `Authorization: Bearer <sso_access_token>` (from
-  `sso_auth::valid_token`, refreshed automatically) plus `?id=<instance_id>`.
-- The relay verifies the token with SSO, resolves `login_id → account_id`,
-  and caches the mapping until the token expires.
-- There's no dependency on `atem pair` or a live Astation work session. A
-  machine where you've run `atem login` can sync.
+- The account is the paired Astation. Every machine paired with the same
+  Astation shares memory and skills.
+- Pair once per machine with `atem pair`. Sessions renew on use and expire
+  after 7 days idle. An unpaired or expired machine can't read, write, or
+  sync.
+- Login-based accounts are a possible future follow-up.
+- atem sends `Authorization: session <session_id>` (the pairing session for
+  the configured Astation, from `SessionManager::load()`) plus
+  `?id=<instance_id>`. Wire JSON is otherwise unchanged.
 
 ## Capture: how agents learn from each other
 
@@ -428,7 +431,8 @@ atem memory status                  # account, machine, pending ops, last sync, 
   the next command.
 - `sync` and `apply` always handle global targets, and project targets when
   the current directory is in a repo.
-- Every command refuses to run without `atem login`, and says so plainly.
+- Every command refuses to run without an active Astation pairing, and says
+  so plainly.
 
 ## Sync algorithm
 

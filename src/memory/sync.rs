@@ -10,7 +10,8 @@ use crate::memory::model::{new_memory_id, now_secs, Memory, Scope, Skill};
 use crate::memory::secrets::find_secrets;
 use crate::memory::store::{HarvestEntry, HarvestStatus, PendingOp, Store, LAST_SYNC_AT, MEMORY_CURSOR, SKILL_CURSOR};
 
-const PUSH_CHUNK: usize = 50;
+const MEMORY_PUSH_CHUNK: usize = 50;
+const SKILL_PUSH_CHUNK: usize = 8;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct HarvestSummary {
@@ -231,8 +232,8 @@ pub struct SyncOutcome {
 async fn push_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome) -> Result<()> {
     let pending = store.pending()?;
     let (mem_ops, skill_ops): (Vec<_>, Vec<_>) = pending.into_iter().partition(|(_, op)| op.is_memory());
-    for (group, is_mem) in [(mem_ops, true), (skill_ops, false)] {
-        for chunk in group.chunks(PUSH_CHUNK) {
+    for (group, is_mem, chunk_size) in [(mem_ops, true, MEMORY_PUSH_CHUNK), (skill_ops, false, SKILL_PUSH_CHUNK)] {
+        for chunk in group.chunks(chunk_size) {
             if out.offline {
                 return Ok(());
             }
@@ -553,6 +554,15 @@ mod tests {
         assert!(notes[0].contains("0 results for 1"), "{}", notes[0]);
         assert_eq!(s.pending_count().unwrap(), 1);
         assert_eq!(s.live_memories().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn skill_pushes_chunk_smaller_than_memory_pushes() {
+        // Skill payloads (file contents) are much heavier per-op than memory
+        // rows, so they're batched in smaller groups.
+        assert_eq!(MEMORY_PUSH_CHUNK, 50);
+        assert_eq!(SKILL_PUSH_CHUNK, 8);
+        assert!(SKILL_PUSH_CHUNK < MEMORY_PUSH_CHUNK);
     }
 
     #[test]
