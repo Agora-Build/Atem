@@ -6,9 +6,23 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use crate::memory::model::{Memory, Scope, Skill};
 
+/// Legacy, unkeyed cursor names. Only the per-account keys below are read;
+/// a cursor stored under these bare names is ignored.
 pub const MEMORY_CURSOR: &str = "memory_cursor";
 pub const SKILL_CURSOR: &str = "skill_cursor";
 pub const LAST_SYNC_AT: &str = "last_sync_at";
+
+/// The memory pull cursor for `account` (the paired Astation id). Cursors are
+/// per account: a relay seq means nothing under another account, so switching
+/// Astations starts that account's pull from 0.
+pub fn memory_cursor_key(account: &str) -> String {
+    format!("{}:{}", MEMORY_CURSOR, account)
+}
+
+/// The skill pull cursor for `account`; see `memory_cursor_key`.
+pub fn skill_cursor_key(account: &str) -> String {
+    format!("{}:{}", SKILL_CURSOR, account)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -408,6 +422,17 @@ mod tests {
         assert!(p[0].1.is_memory() && p[1].1.is_memory() && !p[2].1.is_memory());
         s.ack(p[0].0).unwrap();
         assert_eq!(s.pending_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn cursor_keys_are_per_account() {
+        assert_eq!(memory_cursor_key("astation-a"), "memory_cursor:astation-a");
+        assert_eq!(skill_cursor_key("astation-a"), "skill_cursor:astation-a");
+        let s = Store::open_in_memory().unwrap();
+        s.set_state(&memory_cursor_key("astation-a"), 42).unwrap();
+        s.set_state(MEMORY_CURSOR, 99).unwrap(); // legacy, unkeyed
+        assert_eq!(s.get_state(&memory_cursor_key("astation-b")).unwrap(), 0);
+        assert_eq!(s.get_state(&memory_cursor_key("astation-a")).unwrap(), 42);
     }
 
     #[test]

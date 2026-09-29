@@ -123,20 +123,29 @@ pub struct KnowledgeClient {
     base: String,
     client_id: String,
     session_id: String,
+    /// The paired Astation id — the relay account this client syncs with.
+    astation_id: String,
     http: reqwest::Client,
 }
 
 impl KnowledgeClient {
-    pub fn new(base: String, client_id: String, session_id: String) -> Self {
+    pub fn new(base: String, client_id: String, session_id: String, astation_id: String) -> Self {
         Self {
             base,
             client_id,
             session_id,
+            astation_id,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
+    }
+
+    /// The account this client syncs with (the paired Astation id). Pull
+    /// cursors are kept per account.
+    pub fn account(&self) -> &str {
+        &self.astation_id
     }
 
     async fn send(&self, req: ApiRequest) -> Result<reqwest::Response, ApiError> {

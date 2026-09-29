@@ -210,7 +210,8 @@ there's no window where it's readable by others:
   only).
 - `pending_ops`: an outbound queue of `add`/`delete` memory and `push`/`delete`
   skill, applied locally first.
-- `sync_state`: the last pulled `seq`.
+- `sync_state`: the last pulled `seq`, per account (paired Astation id), and
+  the last clean sync time.
 - `harvest_map`: see above.
 - Drift is detected with the hash stored in each skill's `.atem-skill`
   marker.
@@ -437,11 +438,23 @@ atem memory status                  # account, machine, pending ops, last sync, 
 ## Sync algorithm
 
 1. **Harvest** Claude's memory for the current repo, unless disabled.
-2. **Push** `pending_ops` for memories, then skills. Apply `canonical_id`
-   rewrites and remove the ops the server confirmed. Network errors leave
-   the ops queued.
+2. **Push** `pending_ops` for memories, then skills (at most 50 memory ops
+   and 8 skill ops per request). Apply `canonical_id` rewrites and remove the
+   ops the server answered. A per-op refusal is permanent and is removed
+   (with a note); a failed request (network error, any HTTP error) leaves
+   the ops queued and stops that group, keeping queue order:
+   - 401: the relay didn't recognize the Astation session (see Identity &
+     auth) — reconnect atem to the Astation, then sync again.
+   - 503: the relay is temporarily unavailable (e.g. its database).
+   - 413 on a chunk: its ops are retried one at a time. A single op that is
+     still too large stays queued with a note and is never acked.
 3. **Pull** memories and skills since `cursor`, page by page. Upsert rows and
-   apply tombstones locally. Advance `cursor` after each page.
+   apply tombstones locally. Advance `cursor` after each page. Cursors are
+   kept per account (`memory_cursor:<astation_id>`,
+   `skill_cursor:<astation_id>`), so pairing with a different Astation
+   pulls that account from 0; the legacy unkeyed cursor is ignored.
+   "Last sync" is recorded only when push and pull both finish with no
+   network or HTTP error.
 4. **Apply** memory blocks and skills to every discovered agent, and print
    the report.
 

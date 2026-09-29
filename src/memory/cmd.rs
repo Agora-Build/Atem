@@ -70,7 +70,12 @@ const NOT_PAIRED_MSG: &str = "Not paired with your Astation — run `atem pair`;
 /// is found out later, when a request actually goes out.
 async fn client() -> Result<KnowledgeClient, PairingProblem> {
     let paired = crate::auth::pairing_session()?;
-    Ok(KnowledgeClient::new(paired.relay_base, crate::config::AtemConfig::ensure_instance_id(), paired.session_id))
+    Ok(KnowledgeClient::new(
+        paired.relay_base,
+        crate::config::AtemConfig::ensure_instance_id(),
+        paired.session_id,
+        paired.astation_id,
+    ))
 }
 
 /// `atem memory status`'s "Astation:" line. `status` only runs after
@@ -86,6 +91,10 @@ fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>) -> Stri
         Some(PairingProblem::NotConfigured) => NOT_CONFIGURED_MSG.to_string(),
         Some(PairingProblem::NotPaired) => NOT_PAIRED_MSG.to_string(),
         None if out.offline => "Relay unreachable — changes stay queued and sync next time.".to_string(),
+        None if out.relay_error => format!(
+            "Sync incomplete — pushed {} change(s), pulled {} update(s); the rest stay queued (see notes).",
+            out.pushed, out.pulled
+        ),
         None => format!("Pushed {} change(s), pulled {} update(s).", out.pushed, out.pulled),
     }
 }
@@ -577,6 +586,8 @@ mod tests {
         assert!(sync_status_line(&offline, None).starts_with("Relay unreachable"));
         let done = SyncOutcome { pushed: 2, pulled: 3, ..Default::default() };
         assert_eq!(sync_status_line(&done, None), "Pushed 2 change(s), pulled 3 update(s).");
+        let partial = SyncOutcome { pushed: 1, relay_error: true, ..Default::default() };
+        assert!(sync_status_line(&partial, None).starts_with("Sync incomplete — pushed 1 change(s)"));
     }
 
     #[test]
