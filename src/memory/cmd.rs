@@ -105,6 +105,13 @@ async fn client() -> Result<KnowledgeClient, SessionProblem> {
     Ok(KnowledgeClient::new(base, crate::config::AtemConfig::ensure_instance_id(), session_id))
 }
 
+/// `atem memory status`'s "Astation:" line. `status` only runs after
+/// `require_pairing()` succeeds, so the machine is paired with `astation_id`
+/// by construction — there's no unpaired case to render here.
+fn astation_status_line(astation_id: &str) -> String {
+    format!("{} (paired)", astation_id)
+}
+
 /// `problem`: why `client()` couldn't build a client, if it couldn't.
 fn sync_status_line(out: &SyncOutcome, problem: Option<&SessionProblem>) -> String {
     match problem {
@@ -378,12 +385,10 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
         MemoryCommands::Status => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
-            let creds = crate::credentials::CredentialStore::load();
-            let account = creds.find_sso().and_then(|e| e.login_id.clone())
-                .or_else(|| creds.entries.iter().find_map(|e| e.login_id.clone()))
-                .unwrap_or_else(|| "(logged in)".into());
+            let config = crate::config::AtemConfig::load()?;
+            let astation_id = config.astation_relay_code.clone().unwrap_or_default();
             let last = store.get_state(LAST_SYNC_AT)?;
-            println!("Account:    {}", account);
+            println!("Astation:   {}", astation_status_line(&astation_id));
             println!("Machine:    {}", ctx.atem_id);
             println!("Project:    {}", ctx.repo.as_ref().map(|r| r.key.as_str()).unwrap_or("(not in a git repo)"));
             println!("Memories:   {} live", store.live_memories()?.len());
@@ -604,6 +609,11 @@ mod tests {
         assert!(sync_status_line(&offline, None).starts_with("Relay unreachable"));
         let done = SyncOutcome { pushed: 2, pulled: 3, ..Default::default() };
         assert_eq!(sync_status_line(&done, None), "Pushed 2 change(s), pulled 3 update(s).");
+    }
+
+    #[test]
+    fn astation_status_line_shows_paired_id() {
+        assert_eq!(astation_status_line("astation-abc123"), "astation-abc123 (paired)");
     }
 
     #[test]
