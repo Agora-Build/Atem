@@ -1126,7 +1126,7 @@ impl Drop for AstationClient {
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn resolved_atem_id(hostname: &str) -> String {
+pub(crate) fn resolved_atem_id(hostname: &str) -> String {
     if let Some(existing) = AtemConfig::stored_atem_id() {
         return existing;
     }

@@ -69,6 +69,19 @@ src/
 ├── command.rs           # Task queue and stream buffer for voice commands
 ├── dispatch.rs          # Work item dispatcher for mark tasks
 ├── vault_client.rs      # atem vault CLI client (relay /api/vault: request builders, renderers, executor)
+├── memory/              # Atem Memory: shared memory + skills across agents and machines
+│   ├── model.rs         #   Memory/Skill types, hashing
+│   ├── secrets.rs       #   credential-value detector (fail-closed)
+│   ├── project.rs       #   project key = normalized git remote
+│   ├── block.rs         #   managed <!-- atem:memory --> block
+│   ├── gitguard.rs      #   never write tracked files; .git/info/exclude
+│   ├── harvest.rs       #   read Claude Code's auto-memory
+│   ├── skills_fs.rs     #   skill dirs, .atem-skill marker, drift
+│   ├── store.rs         #   local SQLite (~/.config/atem/knowledge.db) + queue
+│   ├── adapters.rs      #   Claude/Codex targets + apply report
+│   ├── api.rs           #   relay /api/memory, /api/skills client
+│   ├── sync.rs          #   harvest → push → pull → apply
+│   └── cmd.rs           #   CLI handlers
 └── tui/
     ├── mod.rs           # Main event loop, rendering dispatch
     └── voice_fx.rs      # Voice activity visual effects
@@ -100,7 +113,9 @@ designs/
 ├── remote-agent-control.md   # Astation → atem → agent (text/voice/control keys)
 ├── atem-identity.md          # instance_id + unique relay atem_id
 ├── vault.md                  # Shared cross-agent context store (relay + Postgres)
-└── vault-implementation-plan.md  # Vault atem-side implementation plan
+├── vault-implementation-plan.md  # Vault atem-side implementation plan
+├── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
+└── atem-memory-implementation-plan.md  # Atem Memory implementation plan
 ```
 
 ### Core Components
@@ -138,6 +153,8 @@ Key methods:
 
 **Vault** (`vault_client.rs`): Client for the relay-hosted shared cross-agent context store. `atem vault new/list/read/write/set-summary` — a versioned, append-only store that multiple atems read/write to hand off context between their agents. Pure request builders + human/plain renderers + a thin reqwest executor (auth: `Authorization: session <id>` + `?id=<instance_id>`). The `/api/vault` endpoints + Postgres live in the relay-server (Astation repo). See `designs/vault.md`.
 
+**Atem Memory** (`src/memory/`): `atem sync`, `atem memory …`, `atem skill …`. Agents learn from each other across agents and machines. Claude's saved memories are harvested, Codex saves facts with `atem memory add --agent codex`, and skills are versioned directories. Everything is synced through the relay (`/api/memory`, `/api/skills`, SSO bearer auth) with an offline SQLite store, then applied as a managed block in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `<repo>/CLAUDE.local.md`, and as skills in `.claude/skills` and `.agents/skills`. Credential values are never stored: names only, fetched via `atem vault get <name>`. Tracked files are never written. See `designs/atem-memory.md`.
+
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
 **RTM Signaling** (`rtm_client.rs`): FFI wrapper for native C RTM client with async Tokio channels. Default build uses a stub; enable `real_rtm` feature for Agora SDK.
@@ -158,10 +175,11 @@ Key methods:
 
 | File | Contents | Encryption |
 |------|----------|------------|
-| `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) + auto-generated identity (`instance_id`, `atem_id`) + `files_last_port` (last port `atem serv files` bound, reused next run) | None |
+| `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) + auto-generated identity (`instance_id`, `atem_id`) + `files_last_port` (last port `atem serv files` bound, reused next run) + `[memory] harvest_claude = false` (turns off harvesting Claude's native memory during `atem sync`) | None |
 | `credentials.enc` | SSO + paired tokens (multi-entry `Vec<CredentialEntry>`) | AES-256-GCM (machine-bound) |
 | `project_cache.enc` | All projects + `current_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
 | `session.json` | Astation auth session ID + expiry | None |
+| `knowledge.db` | Atem Memory local store: memories, skills, harvest map, and the pending-sync queue (SQLite, mode 0600; holds no secrets — credentials are refused before storing) | None |
 
 **Identity** (`config.rs`, `websocket_client.rs`):
 - `instance_id` — persistent UUID v4, the canonical atem identity (and the vault `client_id`). Generated once by `ensure_instance_id()`, stored in `config.toml`.
