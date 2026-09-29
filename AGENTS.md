@@ -232,8 +232,8 @@ with Astation unlocks the full set (tier 2) — Astation is the control plane.
 
 | Tier | Needs | Commands |
 |---|---|---|
-| 0 | — | serv files, config, token with AGORA_APP_ID/CERT env |
-| 1 | `atem login` | project, token (active project), serv rtc/convo/webhooks |
+| 0 | — | serv files, config, token with AGORA_APP_ID/CERT env, `project use <index>`, `project show` (local cache) |
+| 1 | `atem login` | `project list`, `project use <app-id>`, token (active project), serv rtc/convo/webhooks |
 | 2 | paired with Astation | vault, sync, memory, skill, and Astation-driven remote agent control, voice coding, mark tasks, visualize |
 
 Gates are centralized in `src/auth.rs`: `require_login(feature)` is the tier-1
