@@ -106,7 +106,7 @@ fn describe(op: &PendingOp) -> String {
     }
 }
 
-pub const RELAY_UNAUTHORIZED_NOTE: &str = "The relay didn't recognize this machine's Astation session — open atem while your Astation is running to reconnect, then sync again. Changes stay queued.";
+pub const RELAY_UNAUTHORIZED_NOTE: &str = "The relay doesn't recognize this machine's Astation session. Make sure your Astation (latest version) is running and connected to the relay, then sync again. Changes stay queued.";
 pub const RELAY_UNAVAILABLE_NOTE: &str = "The relay is temporarily unavailable; changes stay queued.";
 
 /// The note shown for a relay request that failed with `e`. Every failure
@@ -801,7 +801,7 @@ mod tests {
     fn relay_error_notes_are_actionable() {
         let n401 = relay_error_note(&ApiError::Http(401, "invalid or unbound session".into()));
         assert_eq!(n401, RELAY_UNAUTHORIZED_NOTE);
-        assert!(n401.contains("open atem while your Astation is running") && n401.contains("stay queued"));
+        assert!(n401.contains("Astation (latest version)") && n401.contains("stay queued"));
         assert_eq!(relay_error_note(&ApiError::Http(503, "x".into())), RELAY_UNAVAILABLE_NOTE);
         assert!(RELAY_UNAVAILABLE_NOTE.contains("temporarily unavailable") && RELAY_UNAVAILABLE_NOTE.contains("stay queued"));
         assert!(relay_error_note(&ApiError::Http(500, "boom".into())).contains("500"));

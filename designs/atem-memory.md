@@ -88,13 +88,15 @@ with, and approved by, your Astation.
   Astation shares memory and skills.
 - Pair once per machine with `atem pair`. An unpaired machine can't read,
   write, or sync.
-- The relay recognizes a pairing session only while it knows the session's
-  binding to your Astation. That binding lives in the relay's memory
-  (`SessionVerifyCache`) and is learned when atem connects to the Astation,
-  so after a relay restart or deploy `atem sync` gets 401 until atem
-  reconnects: open atem while your Astation is online, then sync again.
-  Changes stay queued meanwhile. A durable binding that survives relay
-  restarts is a planned follow-up.
+- Pairing bindings are durable and survive relay restarts — they're stored
+  in Postgres, not held in memory.
+- The verified Astation pushes bindings to the relay (`relaySessions` full
+  resync plus `relayBind`/`relayUnbind` as sessions come and go), including
+  local-only pairings; removing the session in Astation revokes the binding
+  immediately.
+- This requires an Astation version with relay identity (a P-256 key
+  verified to the relay). Older Astations keep relaying chat and remote
+  control but can't grant memory or vault access.
 - Login-based accounts are a possible future follow-up.
 - atem sends `Authorization: session <session_id>` (the pairing session for
   the configured Astation, from `SessionManager::load()`) plus
