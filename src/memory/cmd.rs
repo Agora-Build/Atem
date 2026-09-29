@@ -32,6 +32,28 @@ fn findings_message(findings: &[SecretFinding]) -> String {
     )
 }
 
+/// What `memory add` does with the text, given the secret check.
+#[derive(Debug, PartialEq)]
+enum AddPlan {
+    /// A possible credential and no `--force`: refuse.
+    Refuse,
+    /// `--force` over a finding: keep it on this machine only, never queued
+    /// for sync — a credential value never leaves the machine.
+    LocalOnly,
+    /// No finding: store and sync.
+    StoreAndSync,
+}
+
+fn add_plan(findings_empty: bool, forced: bool) -> AddPlan {
+    match (findings_empty, forced) {
+        (true, _) => AddPlan::StoreAndSync,
+        (false, true) => AddPlan::LocalOnly,
+        (false, false) => AddPlan::Refuse,
+    }
+}
+
+const LOCAL_ONLY_MSG: &str = "Stored locally only — it looks like a credential, so it is never synced.";
+
 fn harvest_enabled_in(config_toml: &str) -> bool {
     config_toml.parse::<toml::Value>().ok()
         .and_then(|v| v.get("memory")?.get("harvest_claude")?.as_bool())
@@ -273,7 +295,8 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 bail!("The text contains the reserved token `atem:memory:`.");
             }
             let findings = find_secrets(&content);
-            if !findings.is_empty() && !force {
+            let plan = add_plan(findings.is_empty(), force);
+            if plan == AddPlan::Refuse {
                 bail!(findings_message(&findings));
             }
             let scope = match scope {
@@ -294,8 +317,12 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 source_agent: agent, source_machine: ctx.atem_id.clone(), created_at: now_secs(), deleted: false, seq: 0,
             };
             store.upsert_memory(&m)?;
-            store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
             println!("Added {} ({})", m.id, where_label(&m));
+            if plan == AddPlan::LocalOnly {
+                println!("{}", LOCAL_ONLY_MSG);
+                return Ok(());
+            }
+            store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
             best_effort_sync(&store, &ctx).await;
         }
         MemoryCommands::List { scope, project, all } => {
@@ -496,6 +523,15 @@ mod tests {
         assert!(msg.contains("sk-…uvwx"));
         assert!(!msg.contains("abcdefghijklmnop"));
         assert!(msg.contains("vault credential"));
+    }
+
+    #[test]
+    fn forced_credential_is_stored_locally_but_never_synced() {
+        assert_eq!(add_plan(true, false), AddPlan::StoreAndSync);
+        assert_eq!(add_plan(true, true), AddPlan::StoreAndSync); // --force without a finding changes nothing
+        assert_eq!(add_plan(false, true), AddPlan::LocalOnly);
+        assert_eq!(add_plan(false, false), AddPlan::Refuse);
+        assert!(LOCAL_ONLY_MSG.contains("never synced"));
     }
 
     #[test]

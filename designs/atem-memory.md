@@ -471,7 +471,8 @@ atem memory status                  # account, machine, pending ops, last sync, 
     sync output.
   - If the check itself fails, the item is treated as a match and refused.
   - `--force` overrides the check for manual `add` only, never for
-    harvesting.
+    harvesting. A forced memory is stored locally only: it is never queued
+    for sync, so it never leaves the machine.
 - The relay runs the same check server-side.
 - `knowledge.db` is 0600 plaintext, like `config.toml`. It holds no secrets
   by construction.
