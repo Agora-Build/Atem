@@ -4,7 +4,7 @@
 //! it (and approved by it) can sync.
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::memory::model::{Memory, Skill};
+use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::store::PendingOp;
 
 pub const PULL_LIMIT: u32 = 200;
@@ -62,6 +62,52 @@ pub fn memory_pull_request(base: &str, client_id: &str, since: i64, limit: u32) 
 }
 pub fn skills_pull_request(base: &str, client_id: &str, since: i64, limit: u32) -> ApiRequest {
     pull(base, client_id, "skills", since, limit)
+}
+
+fn skill_key_query(scope: Scope, project: &str, name: &str) -> String {
+    format!("scope={}&project={}&name={}", scope.as_str(), enc(project), enc(name))
+}
+
+pub fn skill_versions_request(base: &str, client_id: &str, scope: Scope, project: &str, name: &str) -> ApiRequest {
+    ApiRequest {
+        method: "GET",
+        url: format!("{}/api/skills/versions?id={}&{}", base_trim(base), enc(client_id), skill_key_query(scope, project, name)),
+        body: None,
+    }
+}
+
+pub fn skill_version_request(base: &str, client_id: &str, scope: Scope, project: &str, name: &str, version: i64) -> ApiRequest {
+    ApiRequest {
+        method: "GET",
+        url: format!("{}/api/skills/version?id={}&{}&version={}", base_trim(base), enc(client_id), skill_key_query(scope, project, name), version),
+        body: None,
+    }
+}
+
+/// One entry of `GET /api/skills/versions` (no files).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SkillVersionInfo {
+    pub version: i64,
+    pub created_at: i64,
+    #[serde(default)]
+    pub source_agent: String,
+    #[serde(default)]
+    pub source_machine: String,
+    #[serde(default)]
+    pub file_count: i64,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub purged: bool,
+}
+
+#[derive(Deserialize)]
+struct VersionsPage {
+    versions: Vec<SkillVersionInfo>,
+}
+#[derive(Deserialize)]
+struct VersionPage {
+    skill: Skill,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -188,6 +234,20 @@ impl KnowledgeClient {
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(page.skills)
     }
+
+    /// A skill's history, newest first (no files).
+    pub async fn skill_versions(&self, scope: Scope, project: &str, name: &str) -> Result<Vec<SkillVersionInfo>, ApiError> {
+        let req = skill_versions_request(&self.base, &self.client_id, scope, project, name);
+        let page: VersionsPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        Ok(page.versions)
+    }
+
+    /// One version with its files. 404 unknown, 410 purged (as `ApiError::Http`).
+    pub async fn skill_version(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<Skill, ApiError> {
+        let req = skill_version_request(&self.base, &self.client_id, scope, project, name, version);
+        let page: VersionPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        Ok(page.skill)
+    }
 }
 
 #[cfg(test)]
@@ -277,5 +337,19 @@ mod tests {
     fn api_error_display() {
         assert!(ApiError::Offline("x".into()).to_string().contains("unreachable"));
         assert!(ApiError::Http(403, "no".into()).to_string().contains("403"));
+    }
+
+    #[test]
+    fn skill_history_request_urls() {
+        let r = skill_versions_request("https://relay.example/", "inst 1", Scope::Project, "github.com/a/b", "deploy check");
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.url, "https://relay.example/api/skills/versions?id=inst%201&scope=project&project=github.com%2Fa%2Fb&name=deploy%20check");
+        assert!(r.body.is_none());
+        assert_eq!(
+            skill_version_request("https://relay.example", "i", Scope::Global, "", "demo", 4).url,
+            "https://relay.example/api/skills/version?id=i&scope=global&project=&name=demo&version=4"
+        );
+        let info: SkillVersionInfo = serde_json::from_value(json!({"version": 2, "created_at": 5})).unwrap();
+        assert_eq!((info.file_count, info.deleted, info.purged, info.source_agent.as_str()), (0, false, false, ""));
     }
 }

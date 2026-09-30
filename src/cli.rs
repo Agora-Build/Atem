@@ -582,6 +582,20 @@ pub enum SkillCommands {
         #[arg(long, default_value = "global")]
         scope: String,
     },
+    /// Every version of a skill, newest first (asks the relay)
+    History {
+        name: String,
+        #[arg(long, default_value = "global")]
+        scope: String,
+    },
+    /// Re-push an old version's files as a new version (history is kept)
+    Restore {
+        name: String,
+        #[arg(long)]
+        version: i64,
+        #[arg(long, default_value = "global")]
+        scope: String,
+    },
     /// Erase skill versions that contained a credential
     Purge {
         name: String,

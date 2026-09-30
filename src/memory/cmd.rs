@@ -7,14 +7,40 @@ use crate::memory::adapters::{valid_skill_name, Agent, Ctx};
 use crate::memory::api::KnowledgeClient;
 use crate::memory::block::{contains_reserved, one_line};
 use crate::memory::harvest::claude_memory_dir;
-use crate::memory::model::{content_hash, format_date, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, Memory, Scope, Skill};
+use crate::memory::model::{content_hash, format_date, format_datetime, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, Memory, Scope, Skill};
 use crate::memory::project::{detect_repo, display_name};
-use crate::memory::secrets::{check_bytes, find_secrets, SecretFinding};
+use crate::memory::secrets::{find_secrets, SecretFinding};
 use crate::memory::skills_fs::{self, DirState, SkillMarker};
 use crate::memory::store::{HarvestStatus, PendingOp, SearchQuery, Store, LAST_SYNC_AT};
 use crate::memory::sync::{self, SyncOptions, SyncOutcome};
 
 const ROTATE_WARNING: &str = "⚠ Rotate the credential: it may already be on other machines' disks or backups, so treat it as exposed.";
+
+const NOT_PAIRED_HISTORY_MSG: &str = "Not paired with your Astation — run `atem pair`, then retry.";
+
+fn skill_scope(s: &str) -> Result<Scope> {
+    let scope = Scope::parse(s)?;
+    if scope == Scope::Machine {
+        bail!("Skills support --scope global or project.");
+    }
+    Ok(scope)
+}
+
+/// One line per version, newest first (times in UTC).
+fn render_skill_history(versions: &[crate::memory::api::SkillVersionInfo]) -> Vec<String> {
+    versions.iter().enumerate().map(|(i, v)| {
+        let label = if v.purged { "purged" } else if v.deleted { "deleted" } else if i == 0 { "latest" } else { "" };
+        let files = if v.deleted || v.purged {
+            String::new()
+        } else if v.file_count == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{} files", v.file_count)
+        };
+        format!("v{:<3} {:<7}  {}  {:<12} {:<7} {}", v.version, label, format_datetime(v.created_at), truncate(&v.source_machine, 12), v.source_agent, files)
+            .trim_end().to_string()
+    }).collect()
+}
 
 pub fn store_path() -> PathBuf {
     crate::config::AtemConfig::config_dir().join("knowledge.db")
@@ -570,12 +596,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
         SkillCommands::Add { dir, scope, name } => {
             let dir = PathBuf::from(dir);
             let files = skills_fs::read_skill_dir(&dir)?;
-            let mut problems = Vec::new();
-            for (path, bytes) in &files {
-                for f in check_bytes(bytes) {
-                    problems.push(format!("{}:{}  {} {}", path, f.line, f.kind, f.masked));
-                }
-            }
+            let problems = crate::memory::secrets::skill_file_problems(&files);
             if !problems.is_empty() {
                 bail!(
                     "Refusing to add the skill — possible credentials (or unreadable files) found:\n  {}\nKeep credentials in the vault and read them at run time, e.g. `atem vault get <name>`.",
@@ -623,6 +644,27 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             store.put_skill(&t)?;
             store.enqueue(&PendingOp::DeleteSkill { scope, project, name: name.clone() })?;
             println!("Removed skill {}", name);
+            best_effort_sync(&store, &ctx).await;
+        }
+        SkillCommands::History { name, scope } => {
+            let scope = skill_scope(&scope)?;
+            let project = project_for_scope(scope, &ctx, None)?;
+            let c = client().await.map_err(|_| anyhow!(NOT_PAIRED_HISTORY_MSG))?;
+            let versions = c.skill_versions(scope, &project, &name).await
+                .map_err(|e| sync::skill_history_error(e, &name, None))?;
+            if versions.is_empty() {
+                println!("No history for skill {} ({}).", name, scope.as_str());
+            }
+            for l in render_skill_history(&versions) {
+                println!("{}", l);
+            }
+        }
+        SkillCommands::Restore { name, version, scope } => {
+            let scope = skill_scope(&scope)?;
+            let project = project_for_scope(scope, &ctx, None)?;
+            let c = client().await.map_err(|_| anyhow!(NOT_PAIRED_HISTORY_MSG))?;
+            let restored = sync::restore_skill(&store, &c, &ctx.atem_id, scope, &project, &name, version).await?;
+            println!("Restored {} v{} as v{}.", name, version, restored.version);
             best_effort_sync(&store, &ctx).await;
         }
         SkillCommands::Purge { name, scope, version, all_versions } => {
@@ -864,5 +906,35 @@ mod tests {
     fn truncate_keeps_short_text() {
         assert_eq!(truncate("abc", 10), "abc");
         assert_eq!(truncate(&"x".repeat(20), 10), format!("{}…", "x".repeat(9)));
+    }
+
+    fn info(version: i64, machine: &str, agent: &str, files: i64, deleted: bool, purged: bool, at: i64) -> crate::memory::api::SkillVersionInfo {
+        crate::memory::api::SkillVersionInfo {
+            version, created_at: at, source_agent: agent.into(), source_machine: machine.into(), file_count: files, deleted, purged,
+        }
+    }
+
+    #[test]
+    fn skill_history_lines() {
+        let lines = render_skill_history(&[
+            info(5, "mac-mini", "claude", 4, false, false, 1_791_036_600),
+            info(4, "genie", "codex", 1, false, false, 1_791_036_540),
+            info(2, "mac-mini", "cli", 0, true, false, 1_790_000_000),
+            info(1, "genie", "claude", 0, true, true, 1_789_000_000),
+        ]);
+        assert!(lines[0].starts_with("v5   latest   2026-10-03 14:10") && lines[0].contains("mac-mini") && lines[0].ends_with("4 files"), "{}", lines[0]);
+        assert!(!lines[1].contains("latest") && lines[1].contains("2026-10-03 14:09") && lines[1].ends_with("1 file"), "{}", lines[1]);
+        assert!(lines[2].contains("deleted") && !lines[2].contains("file"), "{}", lines[2]);
+        assert!(lines[3].contains("purged") && !lines[3].contains("deleted"), "{}", lines[3]);
+    }
+
+    #[test]
+    fn skill_history_commands_parse() {
+        use clap::Parser;
+        let ok = |args: &[&str]| crate::cli::Cli::try_parse_from(args).is_ok();
+        assert!(ok(&["atem", "skill", "history", "demo"]));
+        assert!(ok(&["atem", "skill", "history", "demo", "--scope", "project"]));
+        assert!(ok(&["atem", "skill", "restore", "demo", "--version", "4"]));
+        assert!(!ok(&["atem", "skill", "restore", "demo"]));
     }
 }

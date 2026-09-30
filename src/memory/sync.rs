@@ -1,13 +1,13 @@
 //! The learning loop: harvest what Claude learned → push local changes →
 //! pull what other agents/machines learned → apply to every agent here.
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
 use crate::memory::api::{ApiError, KnowledgeClient, OpResult, PULL_LIMIT};
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
-use crate::memory::model::{content_hash, new_memory_id, now_secs, Memory, Scope, Skill};
-use crate::memory::secrets::find_secrets;
+use crate::memory::model::{content_hash, new_memory_id, now_secs, skill_hash, Memory, Scope, Skill};
+use crate::memory::secrets::{find_secrets, skill_file_problems};
 use crate::memory::store::{memory_cursor_key, skill_cursor_key, HarvestEntry, HarvestStatus, PendingOp, Store, LAST_SYNC_AT};
 #[cfg(test)]
 use crate::memory::store::{MEMORY_CURSOR, SKILL_CURSOR};
@@ -226,9 +226,10 @@ pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[O
                         store.put_skill(&s)?;
                     }
                     if r.superseded_concurrent {
+                        let scope_flag = if skill.scope == Scope::Project { " --scope project" } else { "" };
                         notes.push(format!(
-                            "skill {}: another machine pushed an edit at the same time; both versions are kept and v{} is now the latest",
-                            skill.name, r.version.unwrap_or(skill.version)
+                            "skill {}: another machine pushed an edit at the same time; both versions are kept and v{} is now the latest. See them with `atem skill history {}{}`.",
+                            skill.name, r.version.unwrap_or(skill.version), skill.name, scope_flag
                         ));
                     }
                 }
@@ -484,6 +485,52 @@ pub async fn run_sync(store: &Store, client: Option<&KnowledgeClient>, ctx: &Ctx
     }
     out.report = apply_all(store, ctx)?;
     Ok(out)
+}
+
+pub const SKILL_HISTORY_OFFLINE: &str = "Skill history lives on the relay, which is unreachable right now. Try again when you're online.";
+
+/// A skill-history request failed: say why, plainly.
+pub fn skill_history_error(e: ApiError, name: &str, version: Option<i64>) -> anyhow::Error {
+    match (e, version) {
+        (ApiError::Offline(_), _) => anyhow!(SKILL_HISTORY_OFFLINE),
+        (ApiError::Http(404, _), Some(v)) => anyhow!("Skill {} has no version {}. See `atem skill history {}`.", name, v, name),
+        (ApiError::Http(410, _), Some(v)) => anyhow!("v{} of skill {} was purged: its files were erased, so it can't be restored.", v, name),
+        (e, _) => anyhow!("{}", e),
+    }
+}
+
+/// Push the files of version `version` as a new version on top of the
+/// current latest (the relay's newest, or this machine's if it has an
+/// unpushed newer one). History is never rewritten. Refuses purged versions
+/// and delete markers, and re-runs the secret check like `skill add`. Queues
+/// the push; the caller syncs.
+pub async fn restore_skill(store: &Store, client: &KnowledgeClient, atem_id: &str, scope: Scope, project: &str, name: &str, version: i64) -> Result<Skill> {
+    let old = client.skill_version(scope, project, name, version).await
+        .map_err(|e| skill_history_error(e, name, Some(version)))?;
+    if old.deleted {
+        bail!("v{} of skill {} is a delete marker; it has no files to restore. See `atem skill history {}`.", version, name, name);
+    }
+    let problems = skill_file_problems(&old.files);
+    if !problems.is_empty() {
+        bail!(
+            "Refusing to restore v{} of skill {} — possible credentials (or unreadable files) found:\n  {}\nKeep credentials in the vault and read them at run time, e.g. `atem vault get <name>`.",
+            version, name, problems.join("\n  ")
+        );
+    }
+    let relay_latest = client.skill_versions(scope, project, name).await
+        .map_err(|e| skill_history_error(e, name, None))?
+        .iter().map(|v| v.version).max().unwrap_or(0);
+    let local_latest = store.get_skill(scope, project, name)?.map(|s| s.version).unwrap_or(0);
+    let base_version = relay_latest.max(local_latest);
+    let files = old.files;
+    let skill = Skill {
+        scope, project: project.to_string(), name: name.to_string(), version: base_version + 1,
+        content_hash: skill_hash(&files), files,
+        source_agent: "cli".into(), source_machine: atem_id.to_string(), created_at: now_secs(), deleted: false, seq: 0,
+    };
+    store.put_skill(&skill)?;
+    store.enqueue(&PendingOp::PushSkill { skill: skill.clone(), base_version })?;
+    Ok(skill)
 }
 
 #[cfg(test)]
@@ -1141,5 +1188,95 @@ mod tests {
         assert_eq!(s.get_state(&memory_cursor_key("ast-b")).unwrap(), 7);
         let skill_first = log.lock().unwrap().iter().find(|(_, p, _)| p.starts_with("/api/skills?")).unwrap().1.clone();
         assert!(skill_first.contains("since=0&"), "{}", skill_first);
+    }
+
+    fn remote_skill(version: i64, body: &str, deleted: bool) -> serde_json::Value {
+        let mut files = BTreeMap::new();
+        if !deleted {
+            files.insert("SKILL.md".to_string(), body.as_bytes().to_vec());
+        }
+        serde_json::to_value(Skill {
+            scope: Scope::Global, project: String::new(), name: "demo".into(), version,
+            content_hash: skill_hash(&files), files, source_agent: "codex".into(), source_machine: "m2".into(),
+            created_at: 1_790_000_000, deleted, seq: version * 10,
+        }).unwrap()
+    }
+
+    fn history_relay() -> Box<Handler> {
+        Box::new(|m, p, body| {
+            if m == "GET" && p.starts_with("/api/skills/versions?") {
+                return (200, serde_json::json!({"versions": [
+                    {"version": 5, "created_at": 1_791_036_600, "source_agent": "claude", "source_machine": "mac-mini", "file_count": 1, "deleted": false, "purged": false},
+                    {"version": 4, "created_at": 1_791_036_540, "source_agent": "codex", "source_machine": "genie", "file_count": 1, "deleted": false, "purged": false},
+                    {"version": 3, "created_at": 1_790_900_000, "source_agent": "cli", "source_machine": "genie", "file_count": 0, "deleted": true, "purged": false},
+                    {"version": 2, "created_at": 1_790_800_000, "source_agent": "cli", "source_machine": "genie", "file_count": 1, "deleted": false, "purged": false},
+                    {"version": 1, "created_at": 1_790_700_000, "source_agent": "claude", "source_machine": "genie", "file_count": 0, "deleted": true, "purged": true},
+                ]}));
+            }
+            if m == "GET" && p.starts_with("/api/skills/version?") {
+                let v = p.split('&').find_map(|kv| kv.strip_prefix("version=")).unwrap_or("");
+                return match v {
+                    "4" => (200, serde_json::json!({"skill": remote_skill(4, "# v4 body", false)})),
+                    "3" => (200, serde_json::json!({"skill": remote_skill(3, "", true)})),
+                    "2" => (200, serde_json::json!({"skill": remote_skill(2, "key AKIAIOSFODNN7EXAMPLE", false)})),
+                    "1" => (410, serde_json::json!({"error": "skill version purged"})),
+                    _ => (404, serde_json::json!({"error": "no such skill version"})),
+                };
+            }
+            if let Some(r) = empty_pulls(m, p) {
+                return r;
+            }
+            (200, ok_results(body))
+        })
+    }
+
+    #[tokio::test]
+    async fn restore_pushes_old_files_as_a_new_version() {
+        let s = Store::open_in_memory().unwrap();
+        let (base, _log) = stub_relay(history_relay()).await;
+        let sk = restore_skill(&s, &client(&base, "ast-a"), "m1", Scope::Global, "", "demo", 4).await.unwrap();
+        assert_eq!(sk.version, 6);
+        assert_eq!(sk.files.get("SKILL.md").unwrap(), b"# v4 body");
+        assert_eq!((sk.source_agent.as_str(), sk.source_machine.as_str(), sk.deleted), ("cli", "m1", false));
+        let p = s.pending().unwrap();
+        assert!(matches!(&p[0].1, PendingOp::PushSkill { skill, base_version: 5 } if skill.version == 6 && skill.content_hash == skill_hash(&skill.files)));
+        assert_eq!(s.get_skill(Scope::Global, "", "demo").unwrap().unwrap().version, 6);
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_purged_deleted_secret_and_unknown_versions() {
+        let s = Store::open_in_memory().unwrap();
+        let (base, _log) = stub_relay(history_relay()).await;
+        let c = client(&base, "ast-a");
+        for (v, want) in [(1, "was purged"), (3, "delete marker"), (2, "possible credentials"), (9, "has no version 9")] {
+            let err = restore_skill(&s, &c, "m1", Scope::Global, "", "demo", v).await.unwrap_err().to_string();
+            assert!(err.contains(want), "{v}: {err}");
+        }
+        assert_eq!(s.pending_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn restore_offline_says_so_plainly() {
+        let s = Store::open_in_memory().unwrap();
+        let err = restore_skill(&s, &client("http://127.0.0.1:1", "ast-a"), "m1", Scope::Global, "", "demo", 4).await.unwrap_err();
+        assert_eq!(err.to_string(), SKILL_HISTORY_OFFLINE);
+    }
+
+    #[test]
+    fn concurrent_push_note_points_to_history() {
+        let s = Store::open_in_memory().unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("SKILL.md".to_string(), b"# s".to_vec());
+        let mk = |scope: Scope, project: &str| Skill {
+            scope, project: project.into(), name: "demo".into(), version: 2, content_hash: skill_hash(&files),
+            files: files.clone(), source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1, deleted: false, seq: 0,
+        };
+        s.enqueue(&PendingOp::PushSkill { skill: mk(Scope::Global, ""), base_version: 1 }).unwrap();
+        s.enqueue(&PendingOp::PushSkill { skill: mk(Scope::Project, "github.com/a/b"), base_version: 1 }).unwrap();
+        let sent = s.pending().unwrap();
+        let r = OpResult { ok: true, version: Some(3), seq: Some(9), superseded_concurrent: true, ..Default::default() };
+        let notes = apply_push_results(&s, &sent, &[r.clone(), r]).unwrap();
+        assert_eq!(notes[0], "skill demo: another machine pushed an edit at the same time; both versions are kept and v3 is now the latest. See them with `atem skill history demo`.");
+        assert!(notes[1].ends_with("See them with `atem skill history demo --scope project`."), "{}", notes[1]);
     }
 }
