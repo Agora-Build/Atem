@@ -1,6 +1,8 @@
 # Atem Memory — shared memory and skills for AI coding agents
 
-Status: design (MVP). Spans two repos: **Atem** (CLI, local store, adapters,
+Status: MVP built. Atem side merged (#23, #24); relay side deployed
+(Astation #19). **Fact validity** and **Search** are designed, not built:
+anything marked *planned* below. Spans two repos: **Atem** (CLI, local store, adapters,
 sync client) and **Astation** (relay-server `/api/memory`, `/api/skills` +
 Postgres).
 
@@ -34,7 +36,8 @@ relay-server, and each keeps a local copy so it works offline.
 - `atemd` daemon, agent hooks, and an `atem mcp` server: Phase 2.
 - Distilling session transcripts with an LLM, and merging or synthesizing
   memories: Phase 3. The MVP only dedupes.
-- Editing a memory in place. To change a memory, remove it and add a new one.
+- Editing a memory in place. To change a memory, replace it: the new fact is
+  added and the old one is marked invalid (see "Fact validity").
 - Syncing settings, MCP config, or hooks: Phase 4.
 
 ## Relationship to vault
@@ -107,7 +110,7 @@ with, and approved by, your Astation.
 | Source | Mechanism |
 |---|---|
 | **Claude** | **Harvest.** Claude Code already saves facts on its own. On `atem sync`, atem reads them into the store |
-| **Codex** | **Instruction.** The managed block in Codex's `AGENTS.md` includes one line: *"To save a durable fact for future sessions, run `atem memory add --agent codex "<fact>"`."* |
+| **Codex** | **Instruction.** The managed block in Codex's `AGENTS.md` includes one line: *"To save a durable fact for future sessions, run `atem memory add --agent codex "<fact>"`."* *Planned:* a second line telling Codex to run `atem memory replace` when a saved fact is outdated (see "Fact validity"). |
 | **Any user** | `atem memory add`, `atem skill add` |
 
 Claude does the learning and Atem moves it around. No LLM is involved in the
@@ -134,6 +137,8 @@ MVP.
   deleted, atem removes its memory. A memory is only removed this way when
   Claude on this machine created it and no other harvested file links to
   it; otherwise the file is just unlinked.
+  *Planned:* an edited file becomes a `replace` and a deleted file an
+  `invalidate`, so the history is kept (see "Fact validity").
 - **Held back and excluded:** a file that fails the secret check is
   recorded as `held_back` and isn't synced. A memory the relay refuses is
   also recorded as `held_back`. A purged memory's file is recorded as
@@ -153,7 +158,8 @@ MVP.
 ### Server (Postgres, relay-server)
 
 Every insert or tombstone takes a fresh value from a global sequence, and
-that value is the sync cursor.
+that value is the sync cursor. This matches the deployed migration
+`relay-server/migrations/0002_knowledge.sql`. Times are unix seconds.
 
 ```sql
 CREATE SEQUENCE knowledge_seq;
@@ -169,25 +175,31 @@ CREATE TABLE memories (
     confidence     TEXT NOT NULL DEFAULT 'medium',  -- high | medium | low
     source_agent   TEXT NOT NULL,            -- claude | codex | cli
     source_machine TEXT NOT NULL,            -- atem_id
-    created_at     TIMESTAMPTZ NOT NULL,
-    deleted_at     TIMESTAMPTZ,              -- tombstone; syncs like any other change
-    seq            BIGINT NOT NULL DEFAULT nextval('knowledge_seq')
+    created_at     BIGINT NOT NULL,
+    deleted        BOOLEAN NOT NULL DEFAULT false,  -- tombstone; syncs like any other change
+    seq            BIGINT NOT NULL DEFAULT nextval('knowledge_seq'),
+    -- PLANNED, not built yet (see "Fact validity"):
+    deleted_at     BIGINT,                   -- when it was deleted; replaces `deleted`
+    valid_at       BIGINT,                   -- when the fact became true; NULL = created_at
+    invalid_at     BIGINT,                   -- when it stopped being true; NULL = still valid
+    superseded_by  TEXT                      -- id of the memory that replaced it
 );
 CREATE INDEX memories_account_seq ON memories (account_id, seq);
 CREATE UNIQUE INDEX memories_dedup ON memories
-    (account_id, scope, project, machine, content_hash) WHERE deleted_at IS NULL;
+    (account_id, scope, project, machine, content_hash) WHERE NOT deleted;
+    -- PLANNED: ... WHERE deleted_at IS NULL AND invalid_at IS NULL
 
 CREATE TABLE skill_versions (
     account_id     TEXT NOT NULL,
     scope          TEXT NOT NULL,            -- global | project
     project        TEXT NOT NULL DEFAULT '',
     name           TEXT NOT NULL,            -- directory name
-    version        INT  NOT NULL,            -- 1, 2, 3 …; the latest live version wins
+    version        BIGINT NOT NULL,          -- 1, 2, 3 …; the latest live version wins
     files          JSONB NOT NULL,           -- {"SKILL.md": "<b64>", "scripts/x.sh": "<b64>"}
     content_hash   TEXT NOT NULL,            -- over sorted (path, bytes)
     source_agent   TEXT NOT NULL,
     source_machine TEXT NOT NULL,
-    created_at     TIMESTAMPTZ NOT NULL,
+    created_at     BIGINT NOT NULL,
     deleted        BOOLEAN NOT NULL DEFAULT false,  -- a tombstone is a version too
     seq            BIGINT NOT NULL DEFAULT nextval('knowledge_seq'),
     PRIMARY KEY (account_id, scope, project, name, version)
@@ -197,9 +209,10 @@ CREATE INDEX skill_versions_account_seq ON skill_versions (account_id, seq);
 
 - `project` and `machine` store `''` instead of NULL so the dedup index
   compares them normally.
-- **Deleting a memory clears its text.** The tombstone sets `deleted_at`,
+- **Deleting a memory clears its text.** The tombstone sets `deleted = true` (*planned:* `deleted_at = <now>`),
   blanks `content` and `content_hash`, and takes a new `seq`, so the text
-  doesn't stay on the server. Memories keep no history.
+  doesn't stay on the server. Deleted memories keep no history; invalidated
+  ones do (see "Fact validity").
 - **Memory `content_hash`:** trim, collapse runs of whitespace, lowercase.
   The original `content` is stored unchanged.
 - **Skills** are edited, unlike memories. Each push adds a version, and older
@@ -215,9 +228,10 @@ file mode 0600. The file is created with mode 0600 before it's opened, so
 there's no window where it's readable by others:
 
 - `memories` and `skills`: mirrors of the server rows (latest skill version
-  only).
+  only). `memories` gets the same three planned validity columns, plus the
+  planned `memories_fts` search index (see "Search").
 - `pending_ops`: an outbound queue of `add`/`delete` memory and `push`/`delete`
-  skill, applied locally first.
+  skill, applied locally first. *Planned:* memory `invalidate`.
 - `sync_state`: the last pulled `seq`, per account (paired Astation id), and
   the last clean sync time.
 - `harvest_map`: see above.
@@ -228,8 +242,8 @@ there's no window where it's readable by others:
 
 | Method & path | Purpose |
 |---|---|
-| `POST /api/memory/batch` | Push memory ops (`add`, `delete`). Returns per-op results. |
-| `GET /api/memory?since=<seq>&limit=<n>` | Pull memory rows (tombstones included) with `seq > since`. |
+| `POST /api/memory/batch` | Push memory ops (`add`, `delete`; *planned:* `invalidate`). Returns per-op results. |
+| `GET /api/memory?since=<seq>&limit=<n>` | Pull memory rows (tombstones included; *planned:* invalidations too, with the validity fields) with `seq > since`. |
 | `POST /api/skills/batch` | Push skill ops (`push`, `delete`, `purge`). |
 | `GET /api/skills?since=<seq>&limit=<n>` | Pull skill versions with `seq > since`. |
 
@@ -290,7 +304,9 @@ credential named in memory is always fetched from the vault, never copied.
 - Applying the same set twice produces identical output, and the file isn't
   rewritten when nothing changed.
 - **Size cap:** at most 50 entries and 4 KB per block. Sort by confidence,
-  then newest first.
+  then newest first. *Planned:* only valid facts are written, and when
+  facts are left out the block says how many and points the agent to
+  `atem memory search` (see "Search").
 - For Codex, the block also includes the capture instruction line described
   earlier, placed just before the credential instruction.
 
@@ -420,6 +436,15 @@ atem memory add "<content>" [--scope global|project|machine] [--project <key>]
 atem memory list   [--scope …] [--project <key>] [--all]
 atem memory search "<text>"         # local substring search
 atem memory rm <id>
+
+# planned (see "Fact validity" and "Search"):
+atem memory replace <id> "<new>" [--valid-at <date>]   # add new, invalidate old
+atem memory invalidate <id> [--at <date>]
+atem memory add … --valid-at <date>
+atem memory list --history [<id>]   # include invalid facts, show replacement chains
+atem memory search "<query>" [--scope …] [--project <key>] [--history] [--limit <n>]
+                                    # FTS5 + BM25, trigram (works for CJK)
+
 atem memory apply                   # rewrite the managed blocks from the local store
 
 atem skill add <dir> [--scope global|project] [--name <n>]
@@ -462,9 +487,10 @@ atem memory status                  # account, machine, pending ops, last sync, 
    `skill_cursor:<astation_id>`), so pairing with a different Astation
    pulls that account from 0; the legacy unkeyed cursor is ignored.
    "Last sync" is recorded only when push and pull both finish with no
-   network or HTTP error.
+   network or HTTP error. *Planned:* pulled invalidations set `invalid_at`
+   and `superseded_by` locally; the search index follows through triggers.
 4. **Apply** memory blocks and skills to every discovered agent, and print
-   the report.
+   the report. *Planned:* invalid facts are skipped.
 
 ## Security
 
@@ -580,12 +606,224 @@ lives.
   3. B runs `atem sync` in the same project's checkout.
   4. The fact appears in B's `CLAUDE.local.md` and in B's Codex target.
   5. A skill pushed from B appears under A's `~/.claude/skills/`.
+- *Planned,* for Fact validity and Search:
+  - **Pure/local:** `replace` queues add then invalidate; invalidation is
+    final (a second invalidate changes nothing); invalid facts are left out
+    of the block but shown by `--history`; re-adding a previously invalid
+    fact creates a new memory; harvest turns an edit into `replace` and a
+    delete into `invalidate`; FTS5 BM25 ranking, CJK trigram matches,
+    the substring fallback under 3 characters, and the "N more facts"
+    line in the block.
+  - **Relay:** the `invalidate` op (unknown id ok, content unchanged, new
+    `seq`, account isolation) and the dedup index ignoring invalid rows.
+  - **E2E:** A replaces a fact, B syncs, and the old fact leaves B's
+    `CLAUDE.md` but is still in B's `memory list --history`.
+
+## Fact validity
+
+Status: design, not built yet. Borrowed from Graphiti's temporal model (see
+"Prior art"). It uses only the time fields, not the graph or the LLM.
+
+Facts go stale. "DialF listens on TCP 8765" was true until the port moved,
+and a stale fact misleads every agent it's injected into. Delete is the
+wrong tool for that: the fact *was* true, and the history is useful. So a
+memory can be **invalidated**: it stops being injected, but it's kept.
+
+| | Delete | Invalidate |
+|---|---|---|
+| Use for | Facts that were never true (mistakes), and leaked credentials (`purge`) | Facts that were true and changed |
+| Text on the server | Cleared | Kept |
+| Injected into agent files | No | No |
+| Shown by `memory list --history` | No | Yes |
+
+### Fields
+
+Added to `memories` on both the server and the local store:
+
+| Field | Meaning |
+|---|---|
+| `valid_at` | When the fact became true. Defaults to `created_at`. |
+| `invalid_at` | When it stopped being true. `NULL` means still valid. |
+| `superseded_by` | The id of the memory that replaced it, if any |
+
+`created_at` and `seq` already record when atem learned each thing, so
+these three fields give the useful half of a bi-temporal model without
+four timestamps per row.
+
+The same migration replaces the `deleted` boolean with a `deleted_at`
+timestamp. It says both *that* and *when* a memory was deleted, which
+matters because a deletion clears the text, so the time is all that's left.
+It also matches `invalid_at`, so both ways a fact ends are recorded the same
+way.
+
+```sql
+-- relay-server migration (next number after 0003)
+ALTER TABLE memories ADD COLUMN deleted_at    BIGINT;
+UPDATE memories SET deleted_at = extract(epoch FROM now())::bigint
+    WHERE deleted;                                              -- real time unknown
+ALTER TABLE memories ADD COLUMN valid_at      BIGINT;          -- NULL means created_at
+ALTER TABLE memories ADD COLUMN invalid_at    BIGINT;
+ALTER TABLE memories ADD COLUMN superseded_by TEXT;
+DROP INDEX memories_dedup;
+CREATE UNIQUE INDEX memories_dedup ON memories
+    (account_id, scope, project, machine, content_hash)
+    WHERE deleted_at IS NULL AND invalid_at IS NULL;
+ALTER TABLE memories DROP COLUMN deleted;
+```
+
+- The dedup index only covers valid facts, so a fact that becomes true
+  again (the port moves back) can be added again as a new memory.
+- Rows deleted before this migration get the migration time as
+  `deleted_at`; the real time was never stored.
+- The wire format keeps `deleted: true|false`, computed from `deleted_at`,
+  and adds `deleted_at`, so older atems keep working.
+- The local store makes the same change.
+- Skills keep their `deleted` boolean: a skill tombstone is its own version
+  row, so its `created_at` already is the deletion time.
+
+### Operations
+
+- `atem memory replace <id> "<new fact>"` adds the new fact and invalidates
+  the old one, with `superseded_by` pointing at the new id. Both ops go into
+  the queue together, add first, and are sent in the same batch.
+- `atem memory invalidate <id> [--at <date>]` invalidates without a
+  replacement.
+- `atem memory add … --valid-at <date>` and `replace … --valid-at <date>`
+  set `valid_at` when the fact became true before it was recorded.
+- `atem memory list --history [<id>]` includes invalid facts and shows each
+  replacement chain, oldest first.
+
+New wire op for `POST /api/memory/batch`:
+
+```json
+{"op": "invalidate", "id": "mem_…", "invalid_at": 1790000000, "superseded_by": "mem_…"}
+```
+
+Memory rows returned by `GET /api/memory` gain `valid_at`, `invalid_at` and
+`superseded_by`. An invalidation takes a new `seq`, so every machine pulls
+it.
+
+### Rules
+
+- **Invalidation is final.** Once `invalid_at` is set it never changes, and
+  a later invalidate of the same id returns ok without changing anything.
+  Two machines can't disagree about it, so sync needs no conflict handling.
+  To bring a fact back, add it again.
+- **Invalidating an unknown or deleted id returns ok,** the same as delete,
+  so a retry after a crash is harmless.
+- **Two replacements of the same fact** (two machines, both offline) leave
+  two valid successors. Both survive. `atem memory status` lists facts with
+  more than one valid successor, so an agent or the user can replace one of
+  them.
+- The server runs the same scope and account checks as for delete. An
+  invalidate never changes `content`.
+
+### Who decides a fact is outdated
+
+The agents, as they already decide what to remember. atem still runs no
+LLM.
+
+- **Claude:** harvest turns Claude's edits into replacements.
+  - An edited memory file → `replace` (it used to be delete plus add).
+  - A deleted memory file → `invalidate`. Claude usually deletes a memory
+    because it's outdated, and keeping the history is the safe default.
+- **Codex:** the capture line in `AGENTS.md` gains: *"If a saved fact is
+  outdated, run `atem memory replace <id> "<new fact>"`."* The managed block
+  shows each fact's short id so Codex can do this.
+- **You:** `replace` and `invalidate`.
+
+### Compatibility
+
+- Deploy the relay first. An older relay rejects the unknown `invalidate` op
+  with 400, so the whole batch stays queued and nothing is lost. It's sent
+  once the relay is updated.
+- An older atem ignores the new fields, so on that machine an invalid fact
+  still looks valid until it's updated. Nothing breaks, but the
+  release notes should say to update every machine.
+
+## Search
+
+Status: design, not built yet.
+
+Every paired machine already keeps a full copy of its account's memories in
+`knowledge.db`, so search runs **locally**. It works offline, costs nothing,
+and sends nothing to the relay.
+
+- **Index:** an SQLite FTS5 table over `content`, kept in step with
+  `memories` by triggers:
+
+  ```sql
+  CREATE VIRTUAL TABLE memories_fts USING fts5(
+      content, content='memories', content_rowid='rowid', tokenize='trigram');
+  ```
+
+  The bundled SQLite in `rusqlite` already includes FTS5, so this adds no
+  dependency.
+- **Ranking:** BM25, via FTS5's built-in `bm25()`.
+- **Why `trigram`:** Chinese, Japanese and Korean text has no spaces
+  between words, so word tokenizers can't split it. Trigram matching works
+  for any language. Postgres's built-in full-text search has the same
+  problem and would need `zhparser` or `pg_jieba`, another reason search
+  stays local.
+- **Short queries:** trigram needs at least 3 characters. Shorter queries,
+  such as a 2-character Chinese word, fall back to a substring match.
+- `atem memory search "<query>" [--scope …] [--project <key>] [--history]
+  [--limit <n>]`. Valid facts only unless `--history`.
+
+### Search and the injection cap
+
+Today each managed block holds at most 50 entries and 4 KB, and any extra
+facts are dropped silently. With search:
+
+- The block still holds the top facts, by confidence and then newest.
+- When facts are left out, the block ends with a line saying how many and
+  telling the agent to run `atem memory search "<query>"` for the rest.
+- Phase 2's `atem mcp` exposes the same search as a `memory_search` tool.
+
+## Future: semantic search and relationships
+
+Not planned. Build these only if an evaluation shows keyword search isn't
+enough.
+
+- **Where:** on the Astation side, in Astation or the relay server. atem
+  stays a client: it would call a search endpoint and would not run
+  embeddings or a graph itself.
+- **Semantic (vector) search:** for example `pgvector` on the relay's
+  Postgres, combined with keyword search and merged with reciprocal rank
+  fusion. Choose between a cloud embedding API (costs money and sends
+  memory content to a provider, so it must be opt-in per account) and a
+  local model.
+- **Relationships:** only if we need questions like "what depends on the
+  auth service?" Start with an edges table in Postgres, or the Apache AGE
+  extension, before considering a separate graph database such as Neo4j.
+  The relay's Postgres stays the source of truth either way; any index is
+  rebuilt from it.
+- **Graphiti as an optional backend:** the same rule applies. It would be
+  an index fed from Postgres, not a replacement.
+
+### Evaluation before building any of it
+
+Measure on real data before adding anything:
+
+1. Take the memories from real projects and write about 50 questions whose
+   answers are in them. Include questions about facts that changed.
+2. Compare:
+   - inject-all (the managed block);
+   - local FTS5 search;
+   - relay hybrid search (keyword plus `pgvector`);
+   - Graphiti, fed the same facts through `add_triplet`.
+3. Measure answer accuracy with the same agent and model, latency, cost per
+   write and per query, and what leaves the machine.
+
+Adopt a new backend only if it beats local FTS5 by a clear margin on this
+test.
 
 ## Phasing
 
 | Phase | Scope |
 |---|---|
-| **1 (MVP)** | Everything in this doc |
+| **1 (MVP)** | Everything in this doc not marked *planned*. Built |
+| **1.1** | Fact validity and local Search (the *planned* items) |
 | 2 | `atemd` plus session-start hooks (sync and apply automatically, which also fixes worktrees). An `atem mcp` server with `memory_add` and `memory_search` tools, so agents save and search memory directly; this matters most for Codex, whose hooks are weaker |
 | 3 | A guarded nightly clean-up pass: back up first, run the LLM, sanity-check the result, restore the backup on failure. It merges duplicates, promotes project facts that apply everywhere to global, and flags contradictions. Also harvest session transcripts into searchable history before Claude deletes them (30 days by default), and distill them into memory |
 | 4 | Settings, MCP definitions, and hooks, with portable and machine-local fields separated and credential values replaced by references to the credential feature. Gemini and OpenCode adapters |
@@ -606,6 +844,17 @@ design. It isn't a phase of this one.
 - **Memorix.** The closest design found: a Postgres relay, global and
   project scopes, personal records kept local, and turning memories into
   skills. Worth reviewing before Phase 3.
+- **Graphiti (Zep).** An open-source temporal knowledge graph (Apache-2.0)
+  on Neo4j, FalkorDB or Neptune. It uses an LLM to extract entities and
+  facts from raw text, keeps each fact's validity window, and combines BM25,
+  vector and graph search. In the Zep paper (arXiv 2501.13956), on
+  LongMemEval against a full 115k-token history, accuracy rose from 60.2%
+  to 71.2% (gpt-4o) and latency fell from 28.9 s to 2.58 s. Recall of what
+  the assistant itself said dropped from 94.6% to 80.4%. The comparison is
+  against pasting raw chat history, not against curated facts like ours.
+  Useful idea: invalidating facts instead of deleting them ("Fact
+  validity"). Avoided for now: LLM extraction on every write (our agents
+  already curate facts), and running a second database.
 - **Others surveyed:** rulesync, ruler, basic-memory, ai-memory,
   agentmemory, mem0/OpenMemory, the Anthropic memory MCP server, and
   Claude-only sync tools. None combines account-scoped relay sync, offline
