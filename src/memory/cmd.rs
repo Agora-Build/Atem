@@ -11,7 +11,7 @@ use crate::memory::model::{content_hash, format_date, new_memory_id, now_secs, p
 use crate::memory::project::{detect_repo, display_name};
 use crate::memory::secrets::{check_bytes, find_secrets, SecretFinding};
 use crate::memory::skills_fs::{self, DirState, SkillMarker};
-use crate::memory::store::{HarvestStatus, PendingOp, Store, LAST_SYNC_AT};
+use crate::memory::store::{HarvestStatus, PendingOp, SearchQuery, Store, LAST_SYNC_AT};
 use crate::memory::sync::{self, SyncOptions, SyncOutcome};
 
 const ROTATE_WARNING: &str = "⚠ Rotate the credential: it may already be on other machines' disks or backups, so treat it as exposed.";
@@ -443,11 +443,10 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 }
             }
         }
-        MemoryCommands::Search { text } => {
+        MemoryCommands::Search { text, scope, project, history, limit } => {
             let store = Store::open(&store_path())?;
-            let needle = text.to_lowercase();
-            let hits: Vec<Memory> = store.live_memories()?.into_iter()
-                .filter(|m| m.content.to_lowercase().contains(&needle)).collect();
+            let scope = scope.map(|s| Scope::parse(&s)).transpose()?;
+            let hits = store.search_memories(&SearchQuery { text, scope, project, history, limit })?;
             print_memories(&hits);
         }
         MemoryCommands::Rm { id } => {
@@ -720,6 +719,15 @@ mod tests {
         assert!(err.contains("can't end before it became valid"), "{err}");
         assert!(check_end_or_now(&m, None, 1_800_000_000).is_ok());
         assert!(check_end_or_now(&m, Some(1_800_000_001), 1_790_000_000).is_ok());
+    }
+
+    #[test]
+    fn search_command_parses() {
+        use clap::Parser;
+        let ok = |args: &[&str]| crate::cli::Cli::try_parse_from(args).is_ok();
+        assert!(ok(&["atem", "memory", "search", "tcp port"]));
+        assert!(ok(&["atem", "memory", "search", "端口", "--scope", "project", "--project", "github.com/a/b", "--history", "--limit", "5"]));
+        assert!(!ok(&["atem", "memory", "search", "x", "--limit", "many"]));
     }
 
     #[test]

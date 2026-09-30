@@ -73,6 +73,32 @@ pub struct HarvestEntry {
     pub status: HarvestStatus,
 }
 
+/// `atem memory search`. `scope`/`project` = `None` means any; valid facts
+/// only unless `history`.
+#[derive(Debug, Clone, Default)]
+pub struct SearchQuery {
+    pub text: String,
+    pub scope: Option<Scope>,
+    pub project: Option<String>,
+    pub history: bool,
+    pub limit: usize,
+}
+
+/// The whole query as one FTS5 phrase (internal `"` doubled), so FTS5
+/// syntax (`OR`, `NOT`, `*`, `:`…) in user text is matched literally.
+pub fn fts_phrase(text: &str) -> String {
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
+/// A LIKE substring pattern with `\` as the escape character.
+pub fn like_pattern(text: &str) -> String {
+    format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+fn prefixed_mem_cols(prefix: &str) -> String {
+    MEM_COLS.split(", ").map(|c| format!("{}{}", prefix, c)).collect::<Vec<_>>().join(", ")
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
@@ -336,6 +362,30 @@ impl Store {
     pub fn history_memories(&self) -> Result<Vec<Memory>> {
         let mut stmt = self.conn.prepare(&format!("SELECT {} FROM memories WHERE deleted_at IS NULL ORDER BY created_at, id", MEM_COLS))?;
         let rows = stmt.query_map([], row_to_memory)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Local search. Three or more characters: FTS5 trigram phrase match,
+    /// ranked by BM25 (works for CJK). Shorter (trigram can't index it):
+    /// case-insensitive substring match, newest first.
+    pub fn search_memories(&self, q: &SearchQuery) -> Result<Vec<Memory>> {
+        let text = q.text.trim();
+        if text.is_empty() || q.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let validity = if q.history { "" } else { " AND m.invalid_at IS NULL" };
+        let filters = format!("m.deleted_at IS NULL{} AND (?2 IS NULL OR m.scope = ?2) AND (?3 IS NULL OR m.project = ?3)", validity);
+        let cols = prefixed_mem_cols("m.");
+        let short = text.chars().count() < 3;
+        let (sql, arg) = if short {
+            (format!("SELECT {cols} FROM memories m WHERE m.content LIKE ?1 ESCAPE '\\' AND {filters} ORDER BY m.created_at DESC, m.id LIMIT ?4"),
+             like_pattern(text))
+        } else {
+            (format!("SELECT {cols} FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid WHERE memories_fts MATCH ?1 AND {filters} ORDER BY bm25(memories_fts), m.created_at DESC, m.id LIMIT ?4"),
+             fts_phrase(text))
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![arg, q.scope.map(|s| s.as_str()), q.project, q.limit as i64], row_to_memory)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1012,4 +1062,80 @@ mod tests {
         Store::open(&existing).unwrap();
         assert_eq!(std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o600);
     }
+
+    fn q(text: &str) -> SearchQuery {
+        SearchQuery { text: text.into(), limit: 20, ..Default::default() }
+    }
+
+    fn search_ids(s: &Store, query: &SearchQuery) -> Vec<String> {
+        s.search_memories(query).unwrap().into_iter().map(|m| m.id).collect()
+    }
+
+    #[test]
+    fn search_ranks_with_bm25_and_matches_cjk() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_once", "DialF listens on TCP 8765")).unwrap();
+        s.upsert_memory(&mem("mem_many", "tcp tcp tcp port notes")).unwrap();
+        s.upsert_memory(&mem("mem_cjk", "服务器端口是八七六五")).unwrap();
+        s.upsert_memory(&mem("mem_pnpm", "Use pnpm not npm")).unwrap();
+        assert_eq!(search_ids(&s, &q("tcp")), vec!["mem_many", "mem_once"]);
+        assert_eq!(search_ids(&s, &q("TCP 87")), vec!["mem_once"]);
+        assert_eq!(search_ids(&s, &q("端口是")), vec!["mem_cjk"]);
+        // Shorter than a trigram: substring fallback.
+        assert_eq!(search_ids(&s, &q("端口")), vec!["mem_cjk"]);
+        assert_eq!(search_ids(&s, &q("pn")), vec!["mem_pnpm"]);
+        // FTS5 syntax in the query is just text.
+        assert!(search_ids(&s, &q("a\"b OR c*")).is_empty());
+        // An FTS5 operator word is matched as text (case-insensitive), not parsed.
+        // ("notes" in mem_many also contains the trigram text "not".)
+        let mut not = search_ids(&s, &q("NOT"));
+        not.sort();
+        assert_eq!(not, vec!["mem_many", "mem_pnpm"]);
+        assert!(search_ids(&s, &q("  ")).is_empty());
+        let mut one = q("tcp");
+        one.limit = 1;
+        assert_eq!(search_ids(&s, &one), vec!["mem_many"]);
+    }
+
+    #[test]
+    fn search_filters_validity_scope_and_project() {
+        let s = Store::open_in_memory().unwrap();
+        let mut old = mem("mem_old", "port 8765");
+        old.invalid_at = Some(5);
+        s.upsert_memory(&old).unwrap();
+        let mut proj = mem("mem_proj", "port 9000");
+        proj.scope = Scope::Project;
+        proj.project = "github.com/acme/dialf".into();
+        s.upsert_memory(&proj).unwrap();
+        s.upsert_memory(&mem("mem_gone", "port 1234")).unwrap();
+        s.mark_memory_deleted("mem_gone").unwrap();
+        assert_eq!(search_ids(&s, &q("port")), vec!["mem_proj"]);
+        let mut hist = q("port");
+        hist.history = true;
+        let mut got = search_ids(&s, &hist);
+        got.sort();
+        assert_eq!(got, vec!["mem_old", "mem_proj"]);
+        let mut scoped = q("port");
+        scoped.scope = Some(Scope::Global);
+        assert!(search_ids(&s, &scoped).is_empty());
+        let mut other = q("port");
+        other.project = Some("github.com/acme/other".into());
+        assert!(search_ids(&s, &other).is_empty());
+        let mut mine = q("po");
+        mine.project = Some("github.com/acme/dialf".into());
+        assert_eq!(search_ids(&s, &mine), vec!["mem_proj"]);
+    }
+
+    #[test]
+    fn like_fallback_escapes_wildcards() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_pct", "5% off")).unwrap();
+        s.upsert_memory(&mem("mem_num", "50 users")).unwrap();
+        s.upsert_memory(&mem("mem_us", "a_b")).unwrap();
+        assert_eq!(search_ids(&s, &q("5%")), vec!["mem_pct"]);
+        assert_eq!(search_ids(&s, &q("_")), vec!["mem_us"]);
+        assert_eq!(like_pattern("a%b_c\\"), "%a\\%b\\_c\\\\%");
+        assert_eq!(fts_phrase("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
 }

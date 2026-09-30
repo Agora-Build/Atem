@@ -512,9 +512,20 @@ pub enum MemoryCommands {
         #[arg(long, value_name = "ID", num_args = 0..=1)]
         history: Option<Option<String>>,
     },
-    /// Search memories on this machine
+    /// Search memories on this machine (FTS5 + BM25; works for CJK; offline)
     Search {
         text: String,
+        /// global | project | machine (default: any)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Only this project key
+        #[arg(long)]
+        project: Option<String>,
+        /// Include outdated facts
+        #[arg(long)]
+        history: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Remove a memory everywhere
     Rm {
