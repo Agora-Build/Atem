@@ -259,6 +259,12 @@ fn check_end(m: &Memory, end: i64) -> Result<()> {
     Ok(())
 }
 
+/// Checks the end of `m`'s validity: an explicit `given` date, or `now` when
+/// none was given. A future-dated fact can't be ended "now" either.
+fn check_end_or_now(m: &Memory, given: Option<i64>, now: i64) -> Result<()> {
+    check_end(m, given.unwrap_or(now))
+}
+
 /// Replacement chains via `superseded_by`, each oldest first; chains ordered
 /// by their first memory's creation time. A successor not in `mems` ends
 /// the chain; a memory reached twice stays in the first chain.
@@ -474,9 +480,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                     old.id
                 );
             }
-            if let Some(end) = valid_at {
-                check_end(&old, end)?;
-            }
+            check_end_or_now(&old, valid_at, now_secs())?;
             let new_id = sync::replace_memory(&store, &old, &content, valid_at, "cli", &ctx.atem_id)?;
             println!("Replaced {} with {}", old.id, new_id);
             best_effort_sync(&store, &ctx).await;
@@ -487,10 +491,9 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             let at = given.unwrap_or_else(now_secs);
             let store = Store::open(&store_path())?;
             let id = store.resolve_memory_id(&id)?;
-            if let Some(end) = given
-                && let Some(m) = store.get_memory(&id)?
+            if let Some(m) = store.get_memory(&id)?
                 && m.invalid_at.is_none() {
-                check_end(&m, end)?;
+                check_end_or_now(&m, given, at)?;
             }
             if sync::invalidate_and_queue(&store, &id, at, None)? {
                 println!("Marked {} outdated as of {}. It's kept in `atem memory list --history`.", id, format_date(at));
@@ -707,6 +710,16 @@ mod tests {
         assert!(err.contains("can't end before it became valid (2026-09-21)"), "{err}");
         m.valid_at = Some(1_700_000_000);
         assert!(check_end(&m, 1_789_000_000).is_ok());
+    }
+
+    #[test]
+    fn ending_a_future_dated_fact_now_is_refused() {
+        let mut m = hist("mem_f", "port 8765", 1_790_000_000, None, None);
+        m.valid_at = Some(1_800_000_000);
+        let err = check_end_or_now(&m, None, 1_790_000_000).unwrap_err().to_string();
+        assert!(err.contains("can't end before it became valid"), "{err}");
+        assert!(check_end_or_now(&m, None, 1_800_000_000).is_ok());
+        assert!(check_end_or_now(&m, Some(1_800_000_001), 1_790_000_000).is_ok());
     }
 
     #[test]
