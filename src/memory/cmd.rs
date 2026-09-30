@@ -123,7 +123,7 @@ fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>) -> Stri
 
 fn print_outcome(out: &SyncOutcome, problem: Option<&PairingProblem>) {
     if let Some(h) = &out.harvest {
-        println!("Harvested from Claude: {} new, {} removed", h.added, h.removed);
+        println!("Harvested from Claude: {} new, {} outdated", h.added, h.invalidated);
         for hb in &h.held_back {
             println!("  held back (possible credential): {}", hb);
         }

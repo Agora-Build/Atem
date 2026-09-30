@@ -18,26 +18,22 @@ const SKILL_PUSH_CHUNK: usize = 8;
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct HarvestSummary {
     pub added: usize,
-    pub removed: usize,
+    /// Memories marked outdated because their file was edited (replaced)
+    /// or deleted.
+    pub invalidated: usize,
     pub held_back: Vec<String>,
 }
 
-/// `origin` no longer yields `id`. The memory itself is deleted only when
-/// this machine's Claude harvest created it and no other harvested file
-/// still points at it — a harvest can dedupe onto a CLI add, another
-/// machine's memory, or a relay canonical id, which must survive.
-/// Returns true if the memory was deleted.
-fn release_memory(store: &Store, origin: &str, id: &str, atem_id: &str) -> Result<bool> {
+/// Whether harvest may retire memory `id`, which is linked from `origin`:
+/// this machine's Claude harvest created it, and no other harvested file
+/// still points at it. A harvest can dedupe onto a CLI add, another
+/// machine's memory, or a relay canonical id, and those must survive.
+fn owns_memory(store: &Store, origin: &str, id: &str, atem_id: &str) -> Result<bool> {
     let ours = store.get_memory(id)?
         .map(|m| m.source_agent == "claude" && m.source_machine == atem_id)
         .unwrap_or(false);
     let shared = store.harvest_entries_for_memory(id)?.iter().any(|e| e.origin != origin);
-    if !ours || shared {
-        return Ok(false);
-    }
-    store.mark_memory_deleted(id)?;
-    store.enqueue(&PendingOp::DeleteMemory { id: id.to_string() })?;
-    Ok(true)
+    Ok(ours && !shared)
 }
 
 /// Invalidate `id` locally and queue the op; `successor` is recorded as its
@@ -94,20 +90,23 @@ pub fn replace_memory(store: &Store, old: &Memory, content: &str, valid_at: Opti
     })
 }
 
+/// An edited file replaces its memory (the new fact is added, the old one
+/// invalidated with `superseded_by`). A deleted file invalidates it. The
+/// history is kept either way.
 pub fn harvest_into_store(store: &Store, items: &[Harvested], prefix: &str, project_key: &str, atem_id: &str) -> Result<HarvestSummary> {
     let mut sum = HarvestSummary::default();
     let seen: HashSet<&str> = items.iter().map(|h| h.origin.as_str()).collect();
     for h in items {
         let prev = store.harvest_get(&h.origin)?;
-        if let Some(p) = &prev {
-            if p.content_hash == h.hash {
-                continue; // unchanged (synced, held back, or excluded)
-            }
-            if p.status == HarvestStatus::Synced && !p.memory_id.is_empty()
-                && release_memory(store, &h.origin, &p.memory_id, atem_id)? {
-                sum.removed += 1;
-            }
+        if prev.as_ref().is_some_and(|p| p.content_hash == h.hash) {
+            continue; // unchanged (synced, held back, or excluded)
         }
+        // The file changed: the memory it used to yield (if harvest owns it) is outdated.
+        let outdated = match &prev {
+            Some(p) if p.status == HarvestStatus::Synced && !p.memory_id.is_empty()
+                && owns_memory(store, &h.origin, &p.memory_id, atem_id)? => Some(p.memory_id.clone()),
+            _ => None,
+        };
         let findings = find_secrets(&h.content);
         if !findings.is_empty() || contains_reserved(&h.content) {
             let why = if findings.is_empty() {
@@ -115,6 +114,11 @@ pub fn harvest_into_store(store: &Store, items: &[Harvested], prefix: &str, proj
             } else {
                 findings.iter().map(|f| format!("{} {}", f.kind, f.masked)).collect::<Vec<_>>().join(", ")
             };
+            // Nothing can replace it (the new text never leaves the machine).
+            if let Some(old) = &outdated
+                && invalidate_and_queue(store, old, now_secs(), None)? {
+                sum.invalidated += 1;
+            }
             store.harvest_put(&HarvestEntry { origin: h.origin.clone(), memory_id: String::new(), content_hash: h.hash.clone(), status: HarvestStatus::HeldBack })?;
             sum.held_back.push(format!("{} — {}", h.origin, why));
             continue;
@@ -135,6 +139,12 @@ pub fn harvest_into_store(store: &Store, items: &[Harvested], prefix: &str, proj
                 m.id
             }
         };
+        // Queued after the add, so both go out in order.
+        if let Some(old) = &outdated
+            && *old != id
+            && invalidate_and_queue(store, old, now_secs(), Some(&id))? {
+            sum.invalidated += 1;
+        }
         store.harvest_put(&HarvestEntry { origin: h.origin.clone(), memory_id: id, content_hash: h.hash.clone(), status: HarvestStatus::Synced })?;
     }
     for e in store.harvest_with_prefix(prefix)? {
@@ -142,8 +152,9 @@ pub fn harvest_into_store(store: &Store, items: &[Harvested], prefix: &str, proj
             continue;
         }
         if e.status == HarvestStatus::Synced && !e.memory_id.is_empty()
-            && release_memory(store, &e.origin, &e.memory_id, atem_id)? {
-            sum.removed += 1;
+            && owns_memory(store, &e.origin, &e.memory_id, atem_id)?
+            && invalidate_and_queue(store, &e.memory_id, now_secs(), None)? {
+            sum.invalidated += 1;
         }
         store.harvest_remove(&e.origin)?;
     }
@@ -594,20 +605,8 @@ mod tests {
         let items = [h("a.md", Scope::Global, "Prefers ripgrep")];
         harvest(&s, &items);
         let sum = harvest(&s, &items);
-        assert_eq!((sum.added, sum.removed), (0, 0));
+        assert_eq!((sum.added, sum.invalidated), (0, 0));
         assert_eq!(s.pending_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn changed_file_replaces_its_memory() {
-        let s = Store::open_in_memory().unwrap();
-        harvest(&s, &[h("a.md", Scope::Global, "v1 fact")]);
-        let sum = harvest(&s, &[h("a.md", Scope::Global, "v2 fact")]);
-        assert_eq!((sum.added, sum.removed), (1, 1));
-        let live = s.live_memories().unwrap();
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].content, "v2 fact");
-        assert_eq!(s.pending_count().unwrap(), 3); // add, delete, add
     }
 
     #[test]
@@ -624,17 +623,6 @@ mod tests {
     }
 
     #[test]
-    fn deleted_file_removes_its_memory() {
-        let s = Store::open_in_memory().unwrap();
-        harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
-        let sum = harvest(&s, &[]);
-        assert_eq!(sum.removed, 1);
-        assert!(s.live_memories().unwrap().is_empty());
-        assert!(matches!(s.pending().unwrap().last().unwrap().1, PendingOp::DeleteMemory { .. }));
-        assert!(s.harvest_with_prefix(P).unwrap().is_empty());
-    }
-
-    #[test]
     fn duplicate_content_reuses_existing_memory() {
         let s = Store::open_in_memory().unwrap();
         let existing = Memory {
@@ -648,12 +636,56 @@ mod tests {
         assert_eq!(s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id, "mem_old");
     }
 
-    fn deletes_queued_for(s: &Store, id: &str) -> usize {
-        s.pending().unwrap().iter().filter(|(_, op)| matches!(op, PendingOp::DeleteMemory { id: d } if d == id)).count()
+    fn invalidations_queued_for(s: &Store, id: &str) -> usize {
+        s.pending().unwrap().iter().filter(|(_, op)| matches!(op, PendingOp::InvalidateMemory { id: d, .. } if d == id)).count()
     }
 
     #[test]
-    fn changed_file_does_not_delete_shared_memory() {
+    fn changed_file_replaces_its_memory() {
+        let s = Store::open_in_memory().unwrap();
+        harvest(&s, &[h("a.md", Scope::Global, "v1 fact")]);
+        let old = s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id;
+        let sum = harvest(&s, &[h("a.md", Scope::Global, "v2 fact")]);
+        assert_eq!((sum.added, sum.invalidated), (1, 1));
+        let live = s.live_memories().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].content, "v2 fact");
+        let o = s.get_memory(&old).unwrap().unwrap();
+        assert_eq!((o.content.as_str(), o.superseded_by.as_deref()), ("v1 fact", Some(live[0].id.as_str())));
+        assert!(o.invalid_at.is_some());
+        let kinds: Vec<&'static str> = s.pending().unwrap().iter().map(|(_, op)| match op {
+            PendingOp::AddMemory { .. } => "add", PendingOp::InvalidateMemory { .. } => "invalidate", _ => "other",
+        }).collect();
+        assert_eq!(kinds, vec!["add", "add", "invalidate"]); // v1, v2, then v1's invalidation
+        assert_eq!(s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id, live[0].id);
+    }
+
+    #[test]
+    fn deleted_file_invalidates_its_memory() {
+        let s = Store::open_in_memory().unwrap();
+        harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
+        let id = s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id;
+        let sum = harvest(&s, &[]);
+        assert_eq!(sum.invalidated, 1);
+        assert!(s.live_memories().unwrap().is_empty());
+        assert!(matches!(&s.pending().unwrap().last().unwrap().1, PendingOp::InvalidateMemory { id: d, superseded_by: None, .. } if *d == id));
+        assert_eq!(s.get_memory(&id).unwrap().unwrap().content, "Prefers ripgrep"); // kept as history
+        assert!(s.harvest_with_prefix(P).unwrap().is_empty());
+    }
+
+    #[test]
+    fn edit_to_a_credential_invalidates_the_old_fact_without_a_successor() {
+        let s = Store::open_in_memory().unwrap();
+        harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
+        let old = s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id;
+        let sum = harvest(&s, &[h("a.md", Scope::Global, "key sk-abcdefghijklmnopqrstuvwx")]);
+        assert_eq!((sum.added, sum.invalidated, sum.held_back.len()), (0, 1, 1));
+        let m = s.get_memory(&old).unwrap().unwrap();
+        assert!(m.invalid_at.is_some() && m.superseded_by.is_none());
+    }
+
+    #[test]
+    fn changed_file_does_not_invalidate_shared_memory() {
         let s = Store::open_in_memory().unwrap();
         let existing = Memory {
             id: "mem_cli".into(), scope: Scope::Global, project: String::new(), machine: String::new(),
@@ -664,13 +696,13 @@ mod tests {
         harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
         assert_eq!(s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id, "mem_cli");
         let sum = harvest(&s, &[h("a.md", Scope::Global, "Prefers fd")]);
-        assert_eq!((sum.added, sum.removed), (1, 0));
-        assert!(!s.get_memory("mem_cli").unwrap().unwrap().is_deleted());
-        assert_eq!(deletes_queued_for(&s, "mem_cli"), 0);
+        assert_eq!((sum.added, sum.invalidated), (1, 0));
+        assert!(s.get_memory("mem_cli").unwrap().unwrap().is_valid());
+        assert_eq!(invalidations_queued_for(&s, "mem_cli"), 0);
         // Deleting the file doesn't touch it either.
         harvest(&s, &[]);
-        assert!(!s.get_memory("mem_cli").unwrap().unwrap().is_deleted());
-        assert_eq!(deletes_queued_for(&s, "mem_cli"), 0);
+        assert!(s.get_memory("mem_cli").unwrap().unwrap().is_valid());
+        assert_eq!(invalidations_queued_for(&s, "mem_cli"), 0);
     }
 
     #[test]
@@ -680,14 +712,14 @@ mod tests {
         let id = s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id;
         assert_eq!(s.harvest_get(&format!("{}b.md", P)).unwrap().unwrap().memory_id, id);
         let sum = harvest(&s, &[h("b.md", Scope::Global, "prefers ripgrep")]);
-        assert_eq!(sum.removed, 0);
-        assert!(!s.get_memory(&id).unwrap().unwrap().is_deleted());
-        assert_eq!(deletes_queued_for(&s, &id), 0);
+        assert_eq!(sum.invalidated, 0);
+        assert!(s.get_memory(&id).unwrap().unwrap().is_valid());
+        assert_eq!(invalidations_queued_for(&s, &id), 0);
         assert!(s.harvest_get(&format!("{}a.md", P)).unwrap().is_none());
-        // The last reference going away does delete it.
-        assert_eq!(harvest(&s, &[]).removed, 1);
-        assert!(s.get_memory(&id).unwrap().unwrap().is_deleted());
-        assert_eq!(deletes_queued_for(&s, &id), 1);
+        // The last reference going away does invalidate it.
+        assert_eq!(harvest(&s, &[]).invalidated, 1);
+        assert!(!s.get_memory(&id).unwrap().unwrap().is_valid());
+        assert_eq!(invalidations_queued_for(&s, &id), 1);
     }
 
     #[test]
