@@ -81,15 +81,26 @@ name is the last path segment, for example `atem`.
 
 ## Identity & auth
 
-Memory and skills belong to an **account**, meaning the Agora SSO identity
-from `atem login`.
+**Astation is the control plane.** Atem Memory works only on machines paired
+with, and approved by, your Astation.
 
-- atem sends `Authorization: Bearer <sso_access_token>` (from
-  `sso_auth::valid_token`, refreshed automatically) plus `?id=<instance_id>`.
-- The relay verifies the token with SSO, resolves `login_id → account_id`,
-  and caches the mapping until the token expires.
-- There's no dependency on `atem pair` or a live Astation work session. A
-  machine where you've run `atem login` can sync.
+- The account is the paired Astation. Every machine paired with the same
+  Astation shares memory and skills.
+- Pair once per machine with `atem pair`. An unpaired machine can't read,
+  write, or sync.
+- Pairing bindings are durable and survive relay restarts — they're stored
+  in Postgres, not held in memory.
+- The verified Astation pushes bindings to the relay (`relaySessions` full
+  resync plus `relayBind`/`relayUnbind` as sessions come and go), including
+  local-only pairings; removing the session in Astation revokes the binding
+  immediately.
+- This requires an Astation version with relay identity (a P-256 key
+  verified to the relay). Older Astations keep relaying chat and remote
+  control but can't grant memory or vault access.
+- Login-based accounts are a possible future follow-up.
+- atem sends `Authorization: session <session_id>` (the pairing session for
+  the configured Astation, from `SessionManager::load()`) plus
+  `?id=<instance_id>`. Wire JSON is otherwise unchanged.
 
 ## Capture: how agents learn from each other
 
@@ -207,7 +218,8 @@ there's no window where it's readable by others:
   only).
 - `pending_ops`: an outbound queue of `add`/`delete` memory and `push`/`delete`
   skill, applied locally first.
-- `sync_state`: the last pulled `seq`.
+- `sync_state`: the last pulled `seq`, per account (paired Astation id), and
+  the last clean sync time.
 - `harvest_map`: see above.
 - Drift is detected with the hash stored in each skill's `.atem-skill`
   marker.
@@ -428,16 +440,29 @@ atem memory status                  # account, machine, pending ops, last sync, 
   the next command.
 - `sync` and `apply` always handle global targets, and project targets when
   the current directory is in a repo.
-- Every command refuses to run without `atem login`, and says so plainly.
+- Every command refuses to run without an active Astation pairing, and says
+  so plainly.
 
 ## Sync algorithm
 
 1. **Harvest** Claude's memory for the current repo, unless disabled.
-2. **Push** `pending_ops` for memories, then skills. Apply `canonical_id`
-   rewrites and remove the ops the server confirmed. Network errors leave
-   the ops queued.
+2. **Push** `pending_ops` for memories, then skills (at most 50 memory ops
+   and 8 skill ops per request). Apply `canonical_id` rewrites and remove the
+   ops the server answered. A per-op refusal is permanent and is removed
+   (with a note); a failed request (network error, any HTTP error) leaves
+   the ops queued and stops that group, keeping queue order:
+   - 401: the relay didn't recognize the Astation session (see Identity &
+     auth) — reconnect atem to the Astation, then sync again.
+   - 503: the relay is temporarily unavailable (e.g. its database).
+   - 413 on a chunk: its ops are retried one at a time. A single op that is
+     still too large stays queued with a note and is never acked.
 3. **Pull** memories and skills since `cursor`, page by page. Upsert rows and
-   apply tombstones locally. Advance `cursor` after each page.
+   apply tombstones locally. Advance `cursor` after each page. Cursors are
+   kept per account (`memory_cursor:<astation_id>`,
+   `skill_cursor:<astation_id>`), so pairing with a different Astation
+   pulls that account from 0; the legacy unkeyed cursor is ignored.
+   "Last sync" is recorded only when push and pull both finish with no
+   network or HTTP error.
 4. **Apply** memory blocks and skills to every discovered agent, and print
    the report.
 
@@ -454,7 +479,8 @@ atem memory status                  # account, machine, pending ops, last sync, 
     sync output.
   - If the check itself fails, the item is treated as a match and refused.
   - `--force` overrides the check for manual `add` only, never for
-    harvesting.
+    harvesting. A forced memory is stored locally only: it is never queued
+    for sync, so it never leaves the machine.
 - The relay runs the same check server-side.
 - `knowledge.db` is 0600 plaintext, like `config.toml`. It holds no secrets
   by construction.

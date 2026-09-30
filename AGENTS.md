@@ -153,7 +153,7 @@ Key methods:
 
 **Vault** (`vault_client.rs`): Client for the relay-hosted shared cross-agent context store. `atem vault new/list/read/write/set-summary` — a versioned, append-only store that multiple atems read/write to hand off context between their agents. Pure request builders + human/plain renderers + a thin reqwest executor (auth: `Authorization: session <id>` + `?id=<instance_id>`). The `/api/vault` endpoints + Postgres live in the relay-server (Astation repo). See `designs/vault.md`.
 
-**Atem Memory** (`src/memory/`): `atem sync`, `atem memory …`, `atem skill …`. Agents learn from each other across agents and machines. Claude's saved memories are harvested, Codex saves facts with `atem memory add --agent codex`, and skills are versioned directories. Everything is synced through the relay (`/api/memory`, `/api/skills`, SSO bearer auth) with an offline SQLite store, then applied as a managed block in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `<repo>/CLAUDE.local.md`, and as skills in `.claude/skills` and `.agents/skills`. Credential values are never stored: names only, fetched via `atem vault get <name>`. Tracked files are never written. See `designs/atem-memory.md`.
+**Atem Memory** (`src/memory/`): `atem sync`, `atem memory …`, `atem skill …`. Agents learn from each other across agents and machines. Claude's saved memories are harvested, Codex saves facts with `atem memory add --agent codex`, and skills are versioned directories. Everything is synced through the relay (`/api/memory`, `/api/skills`, Astation pairing-session auth) with an offline SQLite store, then applied as a managed block in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `<repo>/CLAUDE.local.md`, and as skills in `.claude/skills` and `.agents/skills`. Credential values are never stored: names only, fetched via `atem vault get <name>`. Tracked files are never written. See `designs/atem-memory.md`.
 
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
@@ -224,6 +224,27 @@ Paired:   astation-<uuid>  (SSO: 52a4f560...)  [save: yes]
 4. Error: `"No active project. Run 'atem project list', then 'atem project use <index>'"`
 
 Note: RTC/RTM token generation needs only `app_id` + `app_certificate` (from active project). It does NOT need SSO credentials.
+
+### Capability Tiers
+
+Product rule: `atem login` unlocks a limited set of functions (tier 1); pairing
+with Astation unlocks the full set (tier 2) — Astation is the control plane.
+
+| Tier | Needs | Commands |
+|---|---|---|
+| 0 | — | serv files, config, token with AGORA_APP_ID/CERT env, `project use <index>`, `project show` (local cache) |
+| 1 | `atem login` | `project list`, `project use <app-id>`, token (active project), serv rtc/convo/webhooks |
+| 2 | paired with Astation | vault, sync, memory, skill, and Astation-driven remote agent control, voice coding, mark tasks, visualize |
+
+Gates are centralized in `src/auth.rs`: `require_login(feature)` is the tier-1
+gate (passes when `CredentialStore::load().entries` is non-empty);
+`require_pairing(feature)` is the tier-2 gate (resolves a `PairedSession` —
+relay base, Astation id, session id — from `AtemConfig` + `SessionManager`,
+purely local, no network). Both return an actionable `anyhow::Error` built
+from `login_gate_message`/`pairing_gate_message` when the check fails.
+
+New cross-machine or cross-agent features are tier 2 and must gate with
+`auth::require_pairing`.
 
 ### Native FFI Layer
 

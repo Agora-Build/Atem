@@ -1,6 +1,7 @@
 //! CLI handlers for `atem sync`, `atem memory …`, `atem skill …`.
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
+use crate::auth::PairingProblem;
 use crate::cli::{MemoryCommands, SkillCommands};
 use crate::memory::adapters::{valid_skill_name, Agent, Ctx};
 use crate::memory::api::KnowledgeClient;
@@ -31,6 +32,28 @@ fn findings_message(findings: &[SecretFinding]) -> String {
     )
 }
 
+/// What `memory add` does with the text, given the secret check.
+#[derive(Debug, PartialEq)]
+enum AddPlan {
+    /// A possible credential and no `--force`: refuse.
+    Refuse,
+    /// `--force` over a finding: keep it on this machine only, never queued
+    /// for sync — a credential value never leaves the machine.
+    LocalOnly,
+    /// No finding: store and sync.
+    StoreAndSync,
+}
+
+fn add_plan(findings_empty: bool, forced: bool) -> AddPlan {
+    match (findings_empty, forced) {
+        (true, _) => AddPlan::StoreAndSync,
+        (false, true) => AddPlan::LocalOnly,
+        (false, false) => AddPlan::Refuse,
+    }
+}
+
+const LOCAL_ONLY_MSG: &str = "Stored locally only — it looks like a credential, so it is never synced.";
+
 fn harvest_enabled_in(config_toml: &str) -> bool {
     config_toml.parse::<toml::Value>().ok()
         .and_then(|v| v.get("memory")?.get("harvest_claude")?.as_bool())
@@ -48,14 +71,6 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", s.chars().take(max - 1).collect::<String>())
 }
 
-/// Offline check: a stored login is enough. Network only matters for sync.
-fn require_login() -> Result<()> {
-    if crate::credentials::CredentialStore::load().entries.is_empty() {
-        bail!("Not logged in. Run `atem login` first — memory and skills sync to your Agora account.");
-    }
-    Ok(())
-}
-
 fn build_ctx(allow_tracked: bool) -> Result<Ctx> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot find the home directory"))?;
     let cwd = std::env::current_dir()?;
@@ -67,39 +82,53 @@ fn build_ctx(allow_tracked: bool) -> Result<Ctx> {
     })
 }
 
-const NOT_LOGGED_IN: &str = "Not logged in or login expired — run `atem login`; changes stay queued.";
+const NOT_CONFIGURED_MSG: &str = "No Astation configured — set astation_relay_code (or ASTATION_RELAY_CODE); changes stay queued.";
+const NOT_PAIRED_MSG: &str = "Not paired with your Astation — run `atem pair`; changes stay queued.";
 
-/// None when no access token can be obtained (logged out, or the login
-/// expired and can't be refreshed). Relay reachability is found out later.
-async fn client() -> Option<KnowledgeClient> {
-    let config = crate::config::AtemConfig::load().ok()?;
-    let token = crate::sso_auth::valid_token(None, config.effective_sso_url()).await.ok()?;
-    Some(KnowledgeClient::new(
-        config.astation_relay_url().to_string(),
+/// `Err` when no relay client can be built (no Astation configured, or no
+/// pairing session). `crate::auth::require_pairing` should already have
+/// caught this before any of these callers run, but `client()` resolves the
+/// session itself so it never trusts a stale gate check. Relay reachability
+/// is found out later, when a request actually goes out.
+async fn client() -> Result<KnowledgeClient, PairingProblem> {
+    let paired = crate::auth::pairing_session()?;
+    Ok(KnowledgeClient::new(
+        paired.relay_base,
         crate::config::AtemConfig::ensure_instance_id(),
-        token,
+        paired.session_id,
+        paired.astation_id,
     ))
 }
 
-/// `no_token`: `client()` returned None, so the relay was never tried.
-fn sync_status_line(out: &SyncOutcome, no_token: bool) -> String {
-    if no_token {
-        NOT_LOGGED_IN.to_string()
-    } else if out.offline {
-        "Relay unreachable — changes stay queued and sync next time.".to_string()
-    } else {
-        format!("Pushed {} change(s), pulled {} update(s).", out.pushed, out.pulled)
+/// `atem memory status`'s "Astation:" line. `status` only runs after
+/// `require_pairing()` succeeds, so the machine is paired with `astation_id`
+/// by construction — there's no unpaired case to render here.
+fn astation_status_line(astation_id: &str) -> String {
+    format!("{} (paired)", astation_id)
+}
+
+/// `problem`: why `client()` couldn't build a client, if it couldn't.
+fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>) -> String {
+    match problem {
+        Some(PairingProblem::NotConfigured) => NOT_CONFIGURED_MSG.to_string(),
+        Some(PairingProblem::NotPaired) => NOT_PAIRED_MSG.to_string(),
+        None if out.offline => "Relay unreachable — changes stay queued and sync next time.".to_string(),
+        None if out.relay_error => format!(
+            "Sync incomplete — pushed {} change(s), pulled {} update(s); the rest stay queued (see notes).",
+            out.pushed, out.pulled
+        ),
+        None => format!("Pushed {} change(s), pulled {} update(s).", out.pushed, out.pulled),
     }
 }
 
-fn print_outcome(out: &SyncOutcome, no_token: bool) {
+fn print_outcome(out: &SyncOutcome, problem: Option<&PairingProblem>) {
     if let Some(h) = &out.harvest {
         println!("Harvested from Claude: {} new, {} removed", h.added, h.removed);
         for hb in &h.held_back {
             println!("  held back (possible credential): {}", hb);
         }
     }
-    println!("{}", sync_status_line(out, no_token));
+    println!("{}", sync_status_line(out, problem));
     for n in &out.notes {
         println!("note: {}", n);
     }
@@ -111,7 +140,7 @@ fn print_outcome(out: &SyncOutcome, no_token: bool) {
 /// After a local change: push/pull/apply without harvesting; quiet offline.
 async fn best_effort_sync(store: &Store, ctx: &Ctx) {
     let c = client().await;
-    match sync::run_sync(store, c.as_ref(), ctx, &SyncOptions { harvest: false }).await {
+    match sync::run_sync(store, c.as_ref().ok(), ctx, &SyncOptions { harvest: false }).await {
         Ok(out) => {
             for n in &out.notes {
                 eprintln!("note: {}", n);
@@ -247,18 +276,18 @@ fn credential_findings(ctx: &Ctx) -> Vec<String> {
 }
 
 pub async fn handle_sync(no_harvest: bool, allow_tracked: bool) -> Result<()> {
-    require_login()?;
+    crate::auth::require_pairing("Atem Memory")?;
     let ctx = build_ctx(allow_tracked)?;
     let store = Store::open(&store_path())?;
     let c = client().await;
     let opts = SyncOptions { harvest: !no_harvest && harvest_enabled() };
-    let out = sync::run_sync(&store, c.as_ref(), &ctx, &opts).await?;
-    print_outcome(&out, c.is_none());
+    let out = sync::run_sync(&store, c.as_ref().ok(), &ctx, &opts).await?;
+    print_outcome(&out, c.as_ref().err());
     Ok(())
 }
 
 pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
-    require_login()?;
+    crate::auth::require_pairing("Atem Memory")?;
     match command {
         MemoryCommands::Add { content, scope, project, confidence, agent, force } => {
             let ctx = build_ctx(false)?;
@@ -266,7 +295,8 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 bail!("The text contains the reserved token `atem:memory:`.");
             }
             let findings = find_secrets(&content);
-            if !findings.is_empty() && !force {
+            let plan = add_plan(findings.is_empty(), force);
+            if plan == AddPlan::Refuse {
                 bail!(findings_message(&findings));
             }
             let scope = match scope {
@@ -287,8 +317,12 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 source_agent: agent, source_machine: ctx.atem_id.clone(), created_at: now_secs(), deleted: false, seq: 0,
             };
             store.upsert_memory(&m)?;
-            store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
             println!("Added {} ({})", m.id, where_label(&m));
+            if plan == AddPlan::LocalOnly {
+                println!("{}", LOCAL_ONLY_MSG);
+                return Ok(());
+            }
+            store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
             best_effort_sync(&store, &ctx).await;
         }
         MemoryCommands::List { scope, project, all } => {
@@ -355,12 +389,10 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
         MemoryCommands::Status => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
-            let creds = crate::credentials::CredentialStore::load();
-            let account = creds.find_sso().and_then(|e| e.login_id.clone())
-                .or_else(|| creds.entries.iter().find_map(|e| e.login_id.clone()))
-                .unwrap_or_else(|| "(logged in)".into());
+            let config = crate::config::AtemConfig::load()?;
+            let astation_id = config.astation_relay_code.clone().unwrap_or_default();
             let last = store.get_state(LAST_SYNC_AT)?;
-            println!("Account:    {}", account);
+            println!("Astation:   {}", astation_status_line(&astation_id));
             println!("Machine:    {}", ctx.atem_id);
             println!("Project:    {}", ctx.repo.as_ref().map(|r| r.key.as_str()).unwrap_or("(not in a git repo)"));
             println!("Memories:   {} live", store.live_memories()?.len());
@@ -386,7 +418,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
 }
 
 pub async fn handle_skill(command: SkillCommands) -> Result<()> {
-    require_login()?;
+    crate::auth::require_pairing("Atem Memory")?;
     let ctx = build_ctx(false)?;
     let store = Store::open(&store_path())?;
     match command {
@@ -494,6 +526,15 @@ mod tests {
     }
 
     #[test]
+    fn forced_credential_is_stored_locally_but_never_synced() {
+        assert_eq!(add_plan(true, false), AddPlan::StoreAndSync);
+        assert_eq!(add_plan(true, true), AddPlan::StoreAndSync); // --force without a finding changes nothing
+        assert_eq!(add_plan(false, true), AddPlan::LocalOnly);
+        assert_eq!(add_plan(false, false), AddPlan::Refuse);
+        assert!(LOCAL_ONLY_MSG.contains("never synced"));
+    }
+
+    #[test]
     fn harvest_switch_defaults_on() {
         assert!(harvest_enabled_in(""));
         assert!(!harvest_enabled_in("[memory]\nharvest_claude = false\n"));
@@ -572,13 +613,32 @@ mod tests {
     }
 
     #[test]
-    fn sync_status_line_tells_token_failure_from_offline() {
+    fn sync_status_line_distinguishes_pairing_problems_from_offline() {
         let offline = SyncOutcome { offline: true, ..Default::default() };
-        assert_eq!(sync_status_line(&offline, true), NOT_LOGGED_IN);
-        assert!(NOT_LOGGED_IN.contains("atem login") && NOT_LOGGED_IN.contains("stay queued"));
-        assert!(sync_status_line(&offline, false).starts_with("Relay unreachable"));
+        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotConfigured)), NOT_CONFIGURED_MSG);
+        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired)), NOT_PAIRED_MSG);
+        assert!(NOT_CONFIGURED_MSG.contains("astation_relay_code") && NOT_CONFIGURED_MSG.contains("stay queued"));
+        assert!(NOT_PAIRED_MSG.contains("atem pair") && NOT_PAIRED_MSG.contains("stay queued"));
+        assert!(sync_status_line(&offline, None).starts_with("Relay unreachable"));
         let done = SyncOutcome { pushed: 2, pulled: 3, ..Default::default() };
-        assert_eq!(sync_status_line(&done, false), "Pushed 2 change(s), pulled 3 update(s).");
+        assert_eq!(sync_status_line(&done, None), "Pushed 2 change(s), pulled 3 update(s).");
+        let partial = SyncOutcome { pushed: 1, relay_error: true, ..Default::default() };
+        assert!(sync_status_line(&partial, None).starts_with("Sync incomplete — pushed 1 change(s)"));
+    }
+
+    #[test]
+    fn astation_status_line_shows_paired_id() {
+        assert_eq!(astation_status_line("astation-abc123"), "astation-abc123 (paired)");
+    }
+
+    #[test]
+    fn pairing_gate_message_is_byte_identical_to_before() {
+        // Locks the exact text memory commands have always shown; the shared
+        // gate now lives in `crate::auth`, but this text must not drift.
+        assert_eq!(
+            crate::auth::pairing_gate_message("Atem Memory"),
+            "Atem Memory works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry."
+        );
     }
 
     #[test]
