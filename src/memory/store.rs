@@ -1,7 +1,7 @@
 //! Each machine's local copy (offline-first) plus the outbound queue.
 //! `~/.config/atem/knowledge.db`, mode 0600. Holds no secrets by construction.
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use crate::memory::model::{Memory, Scope, Skill};
@@ -105,7 +105,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
   INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
 END;
-CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories BEGIN
   INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
   INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
@@ -117,17 +117,26 @@ fn memory_columns(conn: &Connection) -> Result<Vec<String>> {
     Ok(cols.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+fn memories_current(cols: &[String]) -> bool {
+    let has = |c: &str| cols.iter().any(|x| x == c);
+    !has("deleted") && ["deleted_at", "valid_at", "invalid_at", "superseded_by"].iter().all(|c| has(c))
+}
+
 /// Bring a pre-1.1 `memories` table to the current shape: `deleted` →
 /// `deleted_at` (deleted rows get "now"; the real time was never stored),
-/// plus the validity columns. Idempotent; one transaction.
+/// plus the validity columns. Idempotent; one IMMEDIATE transaction that
+/// re-reads the columns, so a second atem opening the same legacy DB waits
+/// for the first and then finds nothing to do.
 fn migrate_memories(conn: &Connection) -> Result<()> {
-    let cols = memory_columns(conn)?;
-    let has = |c: &str| cols.iter().any(|x| x == c);
-    let wanted = ["deleted_at", "valid_at", "invalid_at", "superseded_by"];
-    if !has("deleted") && wanted.iter().all(|c| has(c)) {
+    if memories_current(&memory_columns(conn)?) {
         return Ok(());
     }
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let cols = memory_columns(&tx)?;
+    if memories_current(&cols) {
+        return Ok(());
+    }
+    let has = |c: &str| cols.iter().any(|x| x == c);
     if !has("deleted_at") {
         tx.execute_batch("ALTER TABLE memories ADD COLUMN deleted_at INTEGER")?;
         if has("deleted") {
@@ -141,6 +150,37 @@ fn migrate_memories(conn: &Connection) -> Result<()> {
     }
     if has("deleted") {
         tx.execute_batch("ALTER TABLE memories DROP COLUMN deleted")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// (index exists, update trigger is the current content-only one)
+fn fts_state(conn: &Connection) -> Result<(bool, bool)> {
+    let had_fts: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'memories_fts')", [], |r| r.get(0))?;
+    let au: Option<String> = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_fts_au'", [], |r| r.get(0)).optional()?;
+    Ok((had_fts, au.is_some_and(|s| s.contains("UPDATE OF content"))))
+}
+
+/// Create the FTS index and triggers, indexing existing rows the first
+/// time. An update trigger from an earlier build (fired on every update) is
+/// replaced by the content-only one. Same IMMEDIATE pattern as
+/// `migrate_memories`.
+fn setup_fts(conn: &Connection) -> Result<()> {
+    if fts_state(conn)? == (true, true) {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let (had_fts, trigger_current) = fts_state(&tx)?;
+    if !trigger_current {
+        tx.execute_batch("DROP TRIGGER IF EXISTS memories_fts_au")?;
+    }
+    tx.execute_batch(FTS_SCHEMA)?;
+    if !had_fts {
+        // Index the rows that existed before the index did.
+        tx.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")?;
     }
     tx.commit()?;
     Ok(())
@@ -196,6 +236,8 @@ impl Store {
             }
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // Another atem (e.g. a background sync) may hold the write lock.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -212,15 +254,7 @@ impl Store {
     fn init(conn: Connection) -> Result<Store> {
         conn.execute_batch(SCHEMA)?;
         migrate_memories(&conn)?;
-        let tx = conn.unchecked_transaction()?;
-        let had_fts: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'memories_fts')", [], |r| r.get(0))?;
-        tx.execute_batch(FTS_SCHEMA)?;
-        if !had_fts {
-            // Index the rows that existed before the index did.
-            tx.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")?;
-        }
-        tx.commit()?;
+        setup_fts(&conn)?;
         Ok(Store { conn })
     }
 
@@ -630,6 +664,66 @@ mod tests {
         assert_eq!(s.get_memory("mem_gone").unwrap().unwrap().deleted_at, gone.deleted_at);
         assert_eq!(ids(s.live_memories().unwrap()), vec!["mem_live"]);
         assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]);
+    }
+
+    fn write_legacy_db(p: &Path) {
+        let c = Connection::open(p).unwrap();
+        c.execute_batch("CREATE TABLE memories (
+          id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
+          content TEXT NOT NULL, content_hash TEXT NOT NULL, confidence TEXT NOT NULL,
+          source_agent TEXT NOT NULL, source_machine TEXT NOT NULL, created_at INTEGER NOT NULL,
+          deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO memories VALUES ('mem_live','global','','','DialF uses TCP 8765','h1','medium','cli','m',1,0,4);").unwrap();
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_legacy_db_all_succeed() {
+        // Two atem processes opening a pre-1.1 DB at once: one migrates, the
+        // other waits for it and then sees the migrated table.
+        for round in 0..5 {
+            let td = tempfile::tempdir().unwrap();
+            let p = td.path().join("knowledge.db");
+            write_legacy_db(&p);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = (0..4).map(|_| {
+                let (p, b) = (p.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    Store::open(&p).map(|_| ()).map_err(|e| format!("{e:#}"))
+                })
+            }).collect();
+            for h in handles {
+                h.join().unwrap().unwrap_or_else(|e| panic!("round {round}: {e}"));
+            }
+            let s = Store::open(&p).unwrap();
+            assert!(!memory_columns(&s.conn).unwrap().iter().any(|x| x == "deleted"));
+            assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]);
+        }
+    }
+
+    #[test]
+    fn fts_update_trigger_is_content_only_and_replaced_on_old_dbs() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("knowledge.db");
+        {
+            let s = Store::open(&p).unwrap();
+            s.upsert_memory(&mem("mem_a", "DialF uses TCP 8765")).unwrap();
+            // Simulate a DB made by the first 1.1 build: a trigger on any update.
+            s.conn.execute_batch("DROP TRIGGER memories_fts_au;
+                CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN
+                  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+                END;").unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let sql: String = s.conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_fts_au'", [], |r| r.get(0)).unwrap();
+        assert!(sql.contains("UPDATE OF content"), "{sql}");
+        s.set_memory_seq("mem_a", 3).unwrap();
+        s.invalidate_memory("mem_a", 5, None).unwrap();
+        assert_eq!(fts_hits(&s, "\"8765\""), vec!["mem_a"]);
+        s.upsert_memory(&mem("mem_a", "DialF uses TCP 9000")).unwrap();
+        assert!(fts_hits(&s, "\"8765\"").is_empty());
+        assert_eq!(fts_hits(&s, "\"9000\""), vec!["mem_a"]);
     }
 
     #[test]
