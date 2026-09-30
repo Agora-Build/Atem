@@ -424,6 +424,31 @@ pub async fn handle_sync(no_harvest: bool, allow_tracked: bool) -> Result<()> {
     Ok(())
 }
 
+/// `memory rm`: delete a memory named by a full id or a unique prefix / short
+/// id, and queue the delete. Returns the full id.
+fn remove_memory(store: &Store, input: &str) -> Result<String> {
+    let id = store.resolve_memory_id(input)?;
+    store.mark_memory_deleted(&id)?;
+    store.enqueue(&PendingOp::DeleteMemory { id: id.clone() })?;
+    Ok(id)
+}
+
+/// `memory purge`: like rm, and harvest never brings the text back. A memory
+/// removed earlier still matches by its full id. Returns the full id.
+fn purge_memory(store: &Store, input: &str) -> Result<String> {
+    let id = match store.get_memory(input.trim())? {
+        Some(m) => m.id,
+        None => store.resolve_memory_id(input)?,
+    };
+    store.mark_memory_deleted(&id)?;
+    store.enqueue(&PendingOp::DeleteMemory { id: id.clone() })?;
+    for mut e in store.harvest_entries_for_memory(&id)? {
+        e.status = HarvestStatus::Excluded;
+        store.harvest_put(&e)?;
+    }
+    Ok(id)
+}
+
 pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
     crate::auth::require_pairing("Atem Memory")?;
     match command {
@@ -500,9 +525,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
         MemoryCommands::Rm { id } => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
-            store.get_memory(&id)?.filter(|m| !m.is_deleted()).ok_or_else(|| anyhow!("No memory {}", id))?;
-            store.mark_memory_deleted(&id)?;
-            store.enqueue(&PendingOp::DeleteMemory { id: id.clone() })?;
+            let id = remove_memory(&store, &id)?;
             println!("Removed {}", id);
             best_effort_sync(&store, &ctx).await;
         }
@@ -552,13 +575,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
         MemoryCommands::Purge { id } => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
-            store.get_memory(&id)?.ok_or_else(|| anyhow!("No memory {}", id))?;
-            store.mark_memory_deleted(&id)?;
-            store.enqueue(&PendingOp::DeleteMemory { id: id.clone() })?;
-            for mut e in store.harvest_entries_for_memory(&id)? {
-                e.status = HarvestStatus::Excluded;
-                store.harvest_put(&e)?;
-            }
+            let id = purge_memory(&store, &id)?;
             println!("Purged {}. Its text is removed from the relay and from other machines at their next sync.", id);
             println!("{}", ROTATE_WARNING);
             best_effort_sync(&store, &ctx).await;
@@ -788,6 +805,31 @@ mod tests {
         assert!(err.contains("can't end before it became valid"), "{err}");
         assert!(check_end_or_now(&m, None, 1_800_000_000).is_ok());
         assert!(check_end_or_now(&m, Some(1_800_000_001), 1_790_000_000).is_ok());
+    }
+
+    #[test]
+    fn rm_and_purge_accept_short_ids() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&hist("mem_1a2b3c4d5e", "A", 1, None, None)).unwrap();
+        s.upsert_memory(&hist("mem_1a2bffff", "B", 1, None, None)).unwrap();
+        s.upsert_memory(&hist("mem_9f8e7d", "C", 1, None, None)).unwrap();
+        assert!(remove_memory(&s, "1a2b").unwrap_err().to_string().contains("more than one"));
+        assert!(remove_memory(&s, "zz").unwrap_err().to_string().contains("No memory"));
+        assert_eq!(remove_memory(&s, "1a2b3c").unwrap(), "mem_1a2b3c4d5e");
+        assert!(s.get_memory("mem_1a2b3c4d5e").unwrap().unwrap().is_deleted());
+        assert!(matches!(&s.pending().unwrap()[0].1, PendingOp::DeleteMemory { id } if id == "mem_1a2b3c4d5e"));
+        assert!(remove_memory(&s, "mem_1a2b3c4d5e").unwrap_err().to_string().contains("No memory"));
+
+        assert_eq!(purge_memory(&s, "mem_1a2bf").unwrap(), "mem_1a2bffff");
+        assert_eq!(purge_memory(&s, "9f8e").unwrap(), "mem_9f8e7d");
+        // A memory removed earlier can still be purged by its full id.
+        assert_eq!(purge_memory(&s, "mem_1a2b3c4d5e").unwrap(), "mem_1a2b3c4d5e");
+        assert!(purge_memory(&s, "zz").unwrap_err().to_string().contains("No memory"));
+        let deletes: Vec<String> = s.pending().unwrap().into_iter().filter_map(|(_, op)| match op {
+            PendingOp::DeleteMemory { id } => Some(id),
+            _ => None,
+        }).collect();
+        assert_eq!(deletes, vec!["mem_1a2b3c4d5e", "mem_1a2bffff", "mem_9f8e7d", "mem_1a2b3c4d5e"]);
     }
 
     #[test]
