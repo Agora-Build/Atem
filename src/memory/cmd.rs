@@ -250,6 +250,15 @@ fn in_view(m: &Memory, scope: Option<Scope>, project: Option<&str>, all: bool, c
     }
 }
 
+/// A fact can't stop being true before it started: `end` must not be
+/// earlier than `m.valid_from()`.
+fn check_end(m: &Memory, end: i64) -> Result<()> {
+    if end < m.valid_from() {
+        bail!("{} can't end before it became valid ({}).", m.id, format_date(m.valid_from()));
+    }
+    Ok(())
+}
+
 /// Replacement chains via `superseded_by`, each oldest first; chains ordered
 /// by their first memory's creation time. A successor not in `mems` ends
 /// the chain; a memory reached twice stays in the first chain.
@@ -465,15 +474,24 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                     old.id
                 );
             }
+            if let Some(end) = valid_at {
+                check_end(&old, end)?;
+            }
             let new_id = sync::replace_memory(&store, &old, &content, valid_at, "cli", &ctx.atem_id)?;
             println!("Replaced {} with {}", old.id, new_id);
             best_effort_sync(&store, &ctx).await;
         }
         MemoryCommands::Invalidate { id, at } => {
             let ctx = build_ctx(false)?;
-            let at = at.as_deref().map(parse_date).transpose()?.unwrap_or_else(now_secs);
+            let given = at.as_deref().map(parse_date).transpose()?;
+            let at = given.unwrap_or_else(now_secs);
             let store = Store::open(&store_path())?;
             let id = store.resolve_memory_id(&id)?;
+            if let Some(end) = given
+                && let Some(m) = store.get_memory(&id)?
+                && m.invalid_at.is_none() {
+                check_end(&m, end)?;
+            }
             if sync::invalidate_and_queue(&store, &id, at, None)? {
                 println!("Marked {} outdated as of {}. It's kept in `atem memory list --history`.", id, format_date(at));
                 best_effort_sync(&store, &ctx).await;
@@ -678,6 +696,17 @@ mod tests {
         assert_eq!(history(&["atem", "memory", "list", "--history"]), Some(None));
         assert_eq!(history(&["atem", "memory", "list", "--history", "1a2b"]), Some(Some("1a2b".to_string())));
         assert_eq!(history(&["atem", "memory", "list", "--history", "--all"]), Some(None));
+    }
+
+    #[test]
+    fn a_fact_cannot_end_before_it_became_valid() {
+        let mut m = hist("mem_a", "port 8765", 1_790_000_000, None, None);
+        assert!(check_end(&m, 1_790_000_000).is_ok());
+        assert!(check_end(&m, 1_790_000_001).is_ok());
+        let err = check_end(&m, 1_789_000_000).unwrap_err().to_string();
+        assert!(err.contains("can't end before it became valid (2026-09-21)"), "{err}");
+        m.valid_at = Some(1_700_000_000);
+        assert!(check_end(&m, 1_789_000_000).is_ok());
     }
 
     #[test]

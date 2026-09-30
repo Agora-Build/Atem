@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, pay
 CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS harvest_map (
   origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS replacements (new_id TEXT PRIMARY KEY, old_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS replacements (new_id TEXT NOT NULL, old_id TEXT NOT NULL, PRIMARY KEY (new_id, old_id));
 ";
 
 /// Full-text index over `memories.content`: external content, and trigram
@@ -151,6 +151,35 @@ fn migrate_memories(conn: &Connection) -> Result<()> {
     if has("deleted") {
         tx.execute_batch("ALTER TABLE memories DROP COLUMN deleted")?;
     }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Whether `replacements` is keyed on (new_id, old_id). The first 1.1 build
+/// keyed it on new_id alone, which dropped a link when a successor was reused.
+fn replacements_current(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(replacements)")?;
+    let pk = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(pk.iter().any(|(c, k)| c == "old_id" && *k > 0))
+}
+
+/// Re-key an old `replacements` table on (new_id, old_id). Same IMMEDIATE
+/// pattern as `migrate_memories`.
+fn migrate_replacements(conn: &Connection) -> Result<()> {
+    if replacements_current(conn)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if replacements_current(&tx)? {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE replacements_new (new_id TEXT NOT NULL, old_id TEXT NOT NULL, PRIMARY KEY (new_id, old_id));
+         INSERT OR IGNORE INTO replacements_new (new_id, old_id) SELECT new_id, old_id FROM replacements;
+         DROP TABLE replacements;
+         ALTER TABLE replacements_new RENAME TO replacements;",
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -254,8 +283,18 @@ impl Store {
     fn init(conn: Connection) -> Result<Store> {
         conn.execute_batch(SCHEMA)?;
         migrate_memories(&conn)?;
+        migrate_replacements(&conn)?;
         setup_fts(&conn)?;
         Ok(Store { conn })
+    }
+
+    /// Run `f` in one IMMEDIATE transaction on this store: everything it
+    /// writes commits together, or (on an error) not at all. Not nestable.
+    pub fn in_transaction<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let out = f()?; // an error drops `tx`, which rolls back
+        tx.commit()?;
+        Ok(out)
     }
 
     // ── memories ────────────────────────────────────────────────────────
@@ -336,9 +375,10 @@ impl Store {
     /// Local-only note that `new_id` was written to replace `old_id`. The
     /// relay keeps only the first replacement of a fact (invalidation is
     /// final), so this is how a second, concurrent replacement is noticed.
+    /// One successor may replace several facts; every link is kept.
     pub fn record_replacement(&self, new_id: &str, old_id: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO replacements (new_id, old_id) VALUES (?1, ?2) ON CONFLICT(new_id) DO UPDATE SET old_id = excluded.old_id",
+            "INSERT OR IGNORE INTO replacements (new_id, old_id) VALUES (?1, ?2)",
             params![new_id, old_id],
         )?;
         Ok(())
@@ -411,8 +451,12 @@ impl Store {
         }
         self.conn.execute("UPDATE harvest_map SET memory_id = ?2 WHERE memory_id = ?1", params![old, new])?;
         self.conn.execute("UPDATE memories SET superseded_by = ?2 WHERE superseded_by = ?1", params![old, new])?;
-        self.conn.execute("UPDATE OR REPLACE replacements SET new_id = ?2 WHERE new_id = ?1", params![old, new])?;
-        self.conn.execute("UPDATE replacements SET old_id = ?2 WHERE old_id = ?1", params![old, new])?;
+        // A link that already exists under the new id is kept once; the
+        // leftover under the old id is dropped.
+        self.conn.execute("UPDATE OR IGNORE replacements SET new_id = ?2 WHERE new_id = ?1", params![old, new])?;
+        self.conn.execute("DELETE FROM replacements WHERE new_id = ?1", params![old])?;
+        self.conn.execute("UPDATE OR IGNORE replacements SET old_id = ?2 WHERE old_id = ?1", params![old, new])?;
+        self.conn.execute("DELETE FROM replacements WHERE old_id = ?1", params![old])?;
         // Queued ops that still name the old id (e.g. replace's invalidate,
         // when a chunk boundary fell after its add).
         for (n, op) in self.pending()? {
@@ -611,6 +655,48 @@ mod tests {
         assert_eq!(s.multi_successors().unwrap(), vec![("mem_x".to_string(), vec!["mem_a".to_string(), "mem_b".to_string()])]);
         s.invalidate_memory("mem_b", 6, None).unwrap();
         assert!(s.multi_successors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reused_successor_keeps_every_replacement_link() {
+        let s = Store::open_in_memory().unwrap();
+        for (id, c) in [("mem_x", "X"), ("mem_y", "Y"), ("mem_e", "E"), ("mem_f", "F")] {
+            s.upsert_memory(&mem(id, c)).unwrap();
+        }
+        s.record_replacement("mem_e", "mem_x").unwrap();
+        s.record_replacement("mem_e", "mem_y").unwrap();
+        s.record_replacement("mem_e", "mem_y").unwrap(); // a repeat is ignored
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM replacements WHERE new_id = 'mem_e'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+        // X was also replaced by F elsewhere: still a fork.
+        s.record_replacement("mem_f", "mem_x").unwrap();
+        assert_eq!(s.multi_successors().unwrap(), vec![("mem_x".to_string(), vec!["mem_e".to_string(), "mem_f".to_string()])]);
+        // The relay dedups F onto E: the links merge, and nothing is left under F.
+        s.rewrite_memory_id("mem_f", "mem_e").unwrap();
+        let mut st = s.conn.prepare("SELECT new_id, old_id FROM replacements ORDER BY old_id").unwrap();
+        let rows: Vec<(String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|x| x.unwrap()).collect();
+        assert_eq!(rows, vec![("mem_e".to_string(), "mem_x".to_string()), ("mem_e".to_string(), "mem_y".to_string())]);
+        assert!(s.multi_successors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replacements_table_keyed_on_new_id_is_migrated() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("knowledge.db");
+        {
+            let s = Store::open(&p).unwrap();
+            s.conn.execute_batch("DROP TABLE replacements;
+                CREATE TABLE replacements (new_id TEXT PRIMARY KEY, old_id TEXT NOT NULL);
+                INSERT INTO replacements VALUES ('mem_e', 'mem_x');").unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        s.record_replacement("mem_e", "mem_y").unwrap();
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM replacements", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+        drop(s);
+        let s = Store::open(&p).unwrap(); // idempotent
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM replacements", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]

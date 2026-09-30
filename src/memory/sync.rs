@@ -64,27 +64,34 @@ pub fn invalidate_and_queue(store: &Store, id: &str, invalid_at: i64, successor:
 /// batch unless a chunk boundary splits them). `old` stops being true when
 /// the new fact starts (`valid_at`, else now). The caller has already run
 /// the secret check on `content`. Returns the successor's id.
+///
+/// All-or-nothing: if `old` turns out to be outdated already (e.g. another
+/// atem got there first), nothing is added or queued and it's an error.
 pub fn replace_memory(store: &Store, old: &Memory, content: &str, valid_at: Option<i64>, source_agent: &str, source_machine: &str) -> Result<String> {
     let hash = content_hash(content);
     if hash == old.content_hash {
         bail!("That is the same fact as {}; nothing to replace.", old.id);
     }
-    let successor = match store.find_live_by_hash(old.scope, &old.project, &old.machine, &hash)? {
-        Some(existing) => existing.id,
-        None => {
-            let m = Memory {
-                id: new_memory_id(), scope: old.scope, project: old.project.clone(), machine: old.machine.clone(),
-                content: content.to_string(), content_hash: hash, confidence: old.confidence.clone(),
-                source_agent: source_agent.to_string(), source_machine: source_machine.to_string(),
-                created_at: now_secs(), valid_at, ..Default::default()
-            };
-            store.upsert_memory(&m)?;
-            store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
-            m.id
+    store.in_transaction(|| {
+        let successor = match store.find_live_by_hash(old.scope, &old.project, &old.machine, &hash)? {
+            Some(existing) => existing.id,
+            None => {
+                let m = Memory {
+                    id: new_memory_id(), scope: old.scope, project: old.project.clone(), machine: old.machine.clone(),
+                    content: content.to_string(), content_hash: hash.clone(), confidence: old.confidence.clone(),
+                    source_agent: source_agent.to_string(), source_machine: source_machine.to_string(),
+                    created_at: now_secs(), valid_at, ..Default::default()
+                };
+                store.upsert_memory(&m)?;
+                store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
+                m.id
+            }
+        };
+        if !invalidate_and_queue(store, &old.id, valid_at.unwrap_or_else(now_secs), Some(&successor))? {
+            bail!("{} is already outdated; nothing changed. See `atem memory list --history {}`.", old.id, old.id);
         }
-    };
-    invalidate_and_queue(store, &old.id, valid_at.unwrap_or_else(now_secs), Some(&successor))?;
-    Ok(successor)
+        Ok(successor)
+    })
 }
 
 pub fn harvest_into_store(store: &Store, items: &[Harvested], prefix: &str, project_key: &str, atem_id: &str) -> Result<HarvestSummary> {
@@ -500,6 +507,22 @@ mod tests {
         assert_eq!((o.invalid_at, o.superseded_by.as_deref(), o.content.as_str()), (Some(1_790_000_000), Some(new_id.as_str()), "DialF listens on TCP 8765"));
         let live: Vec<String> = s.live_memories().unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(live, vec![new_id]);
+    }
+
+    #[test]
+    fn replace_of_a_fact_invalidated_meanwhile_queues_nothing() {
+        let s = Store::open_in_memory().unwrap();
+        let old = valid("mem_old", "port 8765");
+        s.upsert_memory(&old).unwrap();
+        // Another process outdated it after we resolved `old`.
+        s.invalidate_memory("mem_old", 5, None).unwrap();
+        let err = replace_memory(&s, &old, "port 9000", None, "cli", "m1").unwrap_err().to_string();
+        assert!(err.contains("already outdated"), "{err}");
+        assert_eq!(s.pending_count().unwrap(), 0);
+        assert!(s.live_memories().unwrap().is_empty()); // the add was rolled back too
+        assert!(s.multi_successors().unwrap().is_empty());
+        let o = s.get_memory("mem_old").unwrap().unwrap();
+        assert_eq!((o.invalid_at, o.superseded_by), (Some(5), None));
     }
 
     #[test]
