@@ -363,6 +363,27 @@ async fn send_chunk(store: &Store, client: &KnowledgeClient, chunk: &[(i64, Pend
     }
 }
 
+/// The note for a memory batch carrying an invalidation that the relay
+/// rejected as a bad request: a relay from before outdating facts existed.
+pub fn invalidate_unsupported_note(queued: usize) -> String {
+    format!("This relay doesn't support outdating facts yet — update the relay (Astation). {} change(s) stay queued.", queued)
+}
+
+/// Record the request for `sent` failing with `e`; the group stops there.
+fn group_failed(store: &Store, e: ApiError, sent: &[(i64, PendingOp)], is_mem: bool, out: &mut SyncOutcome) -> Result<()> {
+    if is_mem
+        && matches!(e, ApiError::Http(400, _))
+        && sent.iter().any(|(_, op)| matches!(op, PendingOp::InvalidateMemory { .. })) {
+        let queued = store.pending()?.iter().filter(|(_, op)| op.is_memory()).count();
+        out.relay_error = true;
+        out.note(invalidate_unsupported_note(queued));
+        return Ok(());
+    }
+    let single = if sent.len() == 1 { Some(&sent[0].1) } else { None };
+    out.failed(e, single);
+    Ok(())
+}
+
 /// Push a group in chunks, in queue order. Any failure stops the group (its
 /// remaining ops stay queued, preserving order). A chunk the relay refuses
 /// as too large (413) is retried one op at a time; a single op that is still
@@ -394,18 +415,11 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                     match send_chunk(store, client, &one, is_mem, out).await? {
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
-                        Err(e) => {
-                            out.failed(e, Some(&one[0].1));
-                            return Ok(());
-                        }
+                        Err(e) => return group_failed(store, e, &one, is_mem, out),
                     }
                 }
             }
-            Err(e) => {
-                let single = if chunk.len() == 1 { Some(&chunk[0].1) } else { None };
-                out.failed(e, single);
-                return Ok(());
-            }
+            Err(e) => return group_failed(store, e, &chunk, is_mem, out),
         }
         after = last;
     }
@@ -1247,6 +1261,39 @@ mod tests {
         assert_eq!(posts[2][0]["op"], "invalidate");
         assert_eq!(posts[2][0]["superseded_by"], "mem_canon");
         assert_eq!(s.pending_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn old_relay_rejecting_invalidate_says_update() {
+        let s = Store::open_in_memory().unwrap();
+        let old = valid("mem_old", "port 8765");
+        s.upsert_memory(&old).unwrap();
+        replace_memory(&s, &old, "port 9000", None, "cli", "m1").unwrap();
+        queue_memories(&s, &["later"]);
+        let (base, _log) = stub_relay(Box::new(|m, p, body| {
+            if let Some(r) = empty_pulls(m, p) {
+                return r;
+            }
+            if body["ops"].as_array().unwrap().iter().any(|o| o["op"] == "invalidate") {
+                return (400, serde_json::json!({"error": "unknown op"}));
+            }
+            (200, ok_results(body))
+        })).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert_eq!(out.notes, vec!["This relay doesn't support outdating facts yet — update the relay (Astation). 3 change(s) stay queued.".to_string()]);
+        assert!(out.relay_error);
+        assert_eq!(s.pending_count().unwrap(), 3);
+
+        // Any other 400 keeps today's note.
+        let s2 = Store::open_in_memory().unwrap();
+        queue_memories(&s2, &["a"]);
+        let (base2, _log2) = stub_relay(Box::new(|m, p, _| {
+            empty_pulls(m, p).unwrap_or((400, serde_json::json!({"error": "bad op"})))
+        })).await;
+        let out2 = run_sync(&s2, Some(&client(&base2, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert_eq!(out2.notes.len(), 1);
+        assert!(out2.notes[0].contains("400") && !out2.notes[0].contains("outdating"), "{:?}", out2.notes);
     }
 
     #[tokio::test]
