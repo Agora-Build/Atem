@@ -3,7 +3,7 @@ use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 use crate::auth::PairingProblem;
 use crate::cli::{MemoryCommands, SkillCommands};
-use crate::memory::adapters::{valid_skill_name, Agent, Ctx};
+use crate::memory::adapters::{skill_targets, valid_skill_name, Agent, Ctx, ReportLine};
 use crate::memory::api::KnowledgeClient;
 use crate::memory::block::{contains_reserved, one_line};
 use crate::memory::harvest::claude_memory_dir;
@@ -17,6 +17,13 @@ use crate::memory::sync::{self, SyncOptions, SyncOutcome};
 const ROTATE_WARNING: &str = "⚠ Rotate the credential: it may already be on other machines' disks or backups, so treat it as exposed.";
 
 const NOT_PAIRED_HISTORY_MSG: &str = "Not paired with your Astation — run `atem pair`, then retry.";
+
+fn check_history_name(name: &str) -> Result<()> {
+    if !valid_skill_name(name) {
+        bail!("Invalid skill name {:?}: use letters, digits, '-', '_' or '.'", name);
+    }
+    Ok(())
+}
 
 fn skill_scope(s: &str) -> Result<Scope> {
     let scope = Scope::parse(s)?;
@@ -165,15 +172,30 @@ fn print_outcome(out: &SyncOutcome, problem: Option<&PairingProblem>) {
 
 /// After a local change: push/pull/apply without harvesting; quiet offline.
 async fn best_effort_sync(store: &Store, ctx: &Ctx) {
+    best_effort_sync_report(store, ctx).await;
+}
+
+/// `best_effort_sync`, returning the apply report (empty if sync failed).
+async fn best_effort_sync_report(store: &Store, ctx: &Ctx) -> Vec<ReportLine> {
     let c = client().await;
     match sync::run_sync(store, c.as_ref().ok(), ctx, &SyncOptions { harvest: false }).await {
         Ok(out) => {
             for n in &out.notes {
                 eprintln!("note: {}", n);
             }
+            out.report
         }
-        Err(e) => eprintln!("note: {}", e),
+        Err(e) => {
+            eprintln!("note: {}", e);
+            Vec::new()
+        }
     }
+}
+
+/// The apply-report lines about one skill (e.g. "skipped: edited locally").
+fn skill_report_lines(report: &[ReportLine], ctx: &Ctx, scope: Scope, name: &str) -> Vec<String> {
+    let targets = skill_targets(ctx, scope, name);
+    report.iter().filter(|l| targets.contains(&l.target)).map(|l| l.render()).collect()
 }
 
 fn project_for_scope(scope: Scope, ctx: &Ctx, explicit: Option<String>) -> Result<String> {
@@ -647,6 +669,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             best_effort_sync(&store, &ctx).await;
         }
         SkillCommands::History { name, scope } => {
+            check_history_name(&name)?;
             let scope = skill_scope(&scope)?;
             let project = project_for_scope(scope, &ctx, None)?;
             let c = client().await.map_err(|_| anyhow!(NOT_PAIRED_HISTORY_MSG))?;
@@ -660,12 +683,16 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             }
         }
         SkillCommands::Restore { name, version, scope } => {
+            check_history_name(&name)?;
             let scope = skill_scope(&scope)?;
             let project = project_for_scope(scope, &ctx, None)?;
             let c = client().await.map_err(|_| anyhow!(NOT_PAIRED_HISTORY_MSG))?;
             let restored = sync::restore_skill(&store, &c, &ctx.atem_id, scope, &project, &name, version).await?;
             println!("Restored {} v{} as v{}.", name, version, restored.version);
-            best_effort_sync(&store, &ctx).await;
+            let report = best_effort_sync_report(&store, &ctx).await;
+            for l in skill_report_lines(&report, &ctx, scope, &name) {
+                println!("{}", l);
+            }
         }
         SkillCommands::Purge { name, scope, version, all_versions } => {
             let scope = Scope::parse(&scope)?;
@@ -936,5 +963,32 @@ mod tests {
         assert!(ok(&["atem", "skill", "history", "demo", "--scope", "project"]));
         assert!(ok(&["atem", "skill", "restore", "demo", "--version", "4"]));
         assert!(!ok(&["atem", "skill", "restore", "demo"]));
+    }
+
+    #[test]
+    fn history_skill_name_is_checked_locally() {
+        assert!(check_history_name("deploy-check").is_ok());
+        for bad in ["", "..", "a/b", "deploy check"] {
+            let e = check_history_name(bad).unwrap_err().to_string();
+            assert!(e.starts_with("Invalid skill name") && e.contains("letters, digits"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn restore_report_keeps_only_that_skills_lines() {
+        use crate::memory::adapters::{Mark, ReportLine};
+        let td = tempfile::tempdir().unwrap();
+        let ctx = Ctx { home: td.path().to_path_buf(), repo: None, atem_id: "m1".into(), allow_tracked: false };
+        let l = |target: &str, detail: &str| ReportLine { mark: Mark::Clash, target: target.into(), detail: detail.into() };
+        let report = vec![
+            l("~/.claude/CLAUDE.md", "3 memories"),
+            l("~/.claude/skills/demo", "skipped: edited locally"),
+            l("~/.agents/skills/demo", "skipped: unmanaged skill with same name"),
+            l("~/.claude/skills/demo2", "v1"),
+        ];
+        let got = skill_report_lines(&report, &ctx, Scope::Global, "demo");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].contains("edited locally") && got[1].contains("unmanaged skill"));
+        assert!(skill_report_lines(&report, &ctx, Scope::Project, "demo").is_empty());
     }
 }

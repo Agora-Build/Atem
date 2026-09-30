@@ -489,11 +489,22 @@ pub async fn run_sync(store: &Store, client: Option<&KnowledgeClient>, ctx: &Ctx
 
 pub const SKILL_HISTORY_OFFLINE: &str = "Skill history lives on the relay, which is unreachable right now. Try again when you're online.";
 
-/// A skill-history request failed: say why, plainly.
+pub const SKILL_HISTORY_UNAUTHORIZED: &str = "The relay doesn't recognize this machine's Astation session. Make sure your Astation (latest version) is running and connected to the relay, then try again.";
+pub const SKILL_HISTORY_UNAVAILABLE: &str = "The relay is temporarily unavailable; try again shortly.";
+pub const SKILL_HISTORY_UNSUPPORTED: &str = "This relay doesn't support skill history yet — update the relay (Astation) and try again.";
+
+/// A skill-history request failed: say why, plainly. Only a 404 whose body
+/// is the relay's own "no such skill version" means the version is missing;
+/// any other 404 is a relay without the history routes.
 pub fn skill_history_error(e: ApiError, name: &str, version: Option<i64>) -> anyhow::Error {
     match (e, version) {
         (ApiError::Offline(_), _) => anyhow!(SKILL_HISTORY_OFFLINE),
-        (ApiError::Http(404, _), Some(v)) => anyhow!("Skill {} has no version {}. See `atem skill history {}`.", name, v, name),
+        (ApiError::Http(401, _), _) => anyhow!(SKILL_HISTORY_UNAUTHORIZED),
+        (ApiError::Http(503, _), _) => anyhow!(SKILL_HISTORY_UNAVAILABLE),
+        (ApiError::Http(404, body), Some(v)) if body.contains("no such skill version") => {
+            anyhow!("Skill {} has no version {}. See `atem skill history {}`.", name, v, name)
+        }
+        (ApiError::Http(404, _), _) => anyhow!(SKILL_HISTORY_UNSUPPORTED),
         (ApiError::Http(410, _), Some(v)) => anyhow!("v{} of skill {} was purged: its files were erased, so it can't be restored.", v, name),
         (e, _) => anyhow!("{}", e),
     }
@@ -1278,5 +1289,33 @@ mod tests {
         let notes = apply_push_results(&s, &sent, &[r.clone(), r]).unwrap();
         assert_eq!(notes[0], "skill demo: another machine pushed an edit at the same time; both versions are kept and v3 is now the latest. See them with `atem skill history demo`.");
         assert!(notes[1].ends_with("See them with `atem skill history demo --scope project`."), "{}", notes[1]);
+    }
+
+    #[test]
+    fn skill_history_errors_are_plain() {
+        let msg = |e: ApiError, v: Option<i64>| skill_history_error(e, "demo", v).to_string();
+        assert_eq!(msg(ApiError::Http(401, "{\"error\":\"invalid or unbound session\"}".into()), Some(4)), SKILL_HISTORY_UNAUTHORIZED);
+        assert_eq!(msg(ApiError::Http(401, "x".into()), None), SKILL_HISTORY_UNAUTHORIZED);
+        assert!(SKILL_HISTORY_UNAUTHORIZED.contains("Astation (latest version)") && !SKILL_HISTORY_UNAUTHORIZED.contains("queued"));
+        assert_eq!(msg(ApiError::Http(503, "x".into()), None), SKILL_HISTORY_UNAVAILABLE);
+        assert!(!SKILL_HISTORY_UNAVAILABLE.contains("queued"));
+        assert_eq!(msg(ApiError::Http(404, "{\"error\":\"no such skill version\"}".into()), Some(9)),
+            "Skill demo has no version 9. See `atem skill history demo`.");
+        // An older relay without the routes answers a bare 404.
+        assert_eq!(msg(ApiError::Http(404, "404 page not found".into()), Some(9)), SKILL_HISTORY_UNSUPPORTED);
+        assert_eq!(msg(ApiError::Http(404, "".into()), None), SKILL_HISTORY_UNSUPPORTED);
+        assert!(msg(ApiError::Http(500, "boom".into()), None).contains("500"));
+    }
+
+    #[tokio::test]
+    async fn restore_and_history_on_an_old_relay_say_update() {
+        let s = Store::open_in_memory().unwrap();
+        let (base, _log) = stub_relay(Box::new(|_, _, _| (404, serde_json::json!("404 page not found")))).await;
+        let c = client(&base, "ast-a");
+        let err = restore_skill(&s, &c, "m1", Scope::Global, "", "demo", 4).await.unwrap_err();
+        assert_eq!(err.to_string(), SKILL_HISTORY_UNSUPPORTED);
+        let err = c.skill_versions(Scope::Global, "", "demo").await.map_err(|e| skill_history_error(e, "demo", None)).unwrap_err();
+        assert_eq!(err.to_string(), SKILL_HISTORY_UNSUPPORTED);
+        assert_eq!(s.pending_count().unwrap(), 0);
     }
 }

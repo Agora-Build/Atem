@@ -124,6 +124,11 @@ pub fn valid_skill_name(n: &str) -> bool {
         && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// The report targets `apply_skills` uses for this skill (one per agent).
+pub fn skill_targets(ctx: &Ctx, scope: Scope, name: &str) -> Vec<String> {
+    Agent::all().iter().filter_map(|a| a.skills_root(ctx, scope)).map(|r| display_path(&r.join(name), ctx)).collect()
+}
+
 fn display_path(p: &Path, ctx: &Ctx) -> String {
     match p.strip_prefix(&ctx.home) {
         Ok(rel) => format!("~/{}", rel.display()),
