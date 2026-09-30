@@ -326,7 +326,8 @@ impl Store {
     // ── memories ────────────────────────────────────────────────────────
     /// Insert or overwrite (the relay is authoritative), except that a local
     /// invalidation the incoming row doesn't have yet is kept. Invalidation
-    /// is final, so it can only be "not yet pulled", never undone.
+    /// is final, so it can only be "not yet pulled", never undone. `valid_at`
+    /// is set once at add, so a row without it (an older relay) keeps ours.
     pub fn upsert_memory(&self, m: &Memory) -> Result<()> {
         self.conn.execute(
             "INSERT INTO memories (id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted_at, valid_at, invalid_at, superseded_by, seq)
@@ -334,7 +335,7 @@ impl Store {
              ON CONFLICT(id) DO UPDATE SET scope=excluded.scope, project=excluded.project, machine=excluded.machine,
                content=excluded.content, content_hash=excluded.content_hash, confidence=excluded.confidence,
                source_agent=excluded.source_agent, source_machine=excluded.source_machine,
-               created_at=excluded.created_at, deleted_at=excluded.deleted_at, valid_at=excluded.valid_at,
+               created_at=excluded.created_at, deleted_at=excluded.deleted_at, valid_at=COALESCE(excluded.valid_at, memories.valid_at),
                invalid_at=COALESCE(excluded.invalid_at, memories.invalid_at),
                superseded_by=CASE WHEN excluded.invalid_at IS NOT NULL THEN excluded.superseded_by ELSE memories.superseded_by END,
                seq=excluded.seq",
@@ -675,6 +676,20 @@ mod tests {
         assert!(s.resolve_memory_id("1a2b").unwrap_err().to_string().contains("more than one"));
         assert!(s.resolve_memory_id("9999").unwrap_err().to_string().contains("No memory"));
         assert!(s.resolve_memory_id("zz").is_err());
+    }
+
+    #[test]
+    fn pull_without_valid_at_keeps_the_local_one() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = mem("mem_a", "A");
+        m.valid_at = Some(1_700_000_000);
+        s.upsert_memory(&m).unwrap();
+        let mut pulled = m.clone();
+        pulled.valid_at = None; // a relay that dropped the field
+        pulled.seq = 7;
+        s.upsert_memory(&pulled).unwrap();
+        let got = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((got.valid_at, got.seq), (Some(1_700_000_000), 7));
     }
 
     #[test]
