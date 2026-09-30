@@ -73,7 +73,7 @@ pub fn harvest_into_store(store: &Store, items: &[Harvested], prefix: &str, proj
                     id: new_memory_id(), scope: h.scope, project, machine: String::new(),
                     content: h.content.clone(), content_hash: h.hash.clone(), confidence: "medium".into(),
                     source_agent: "claude".into(), source_machine: atem_id.to_string(),
-                    created_at: now_secs(), deleted: false, seq: 0,
+                    created_at: now_secs(), seq: 0, ..Default::default()
                 };
                 store.upsert_memory(&m)?;
                 store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
@@ -198,7 +198,7 @@ pub fn apply_pulled_memories(store: &Store, items: &[Memory]) -> Result<i64> {
     for m in items {
         max = max.max(m.seq);
         let mut row = m.clone();
-        if row.deleted {
+        if row.is_deleted() {
             row.content.clear();
             row.content_hash.clear();
         }
@@ -499,7 +499,7 @@ mod tests {
         let existing = Memory {
             id: "mem_old".into(), scope: Scope::Global, project: String::new(), machine: String::new(),
             content: "Prefers ripgrep".into(), content_hash: content_hash("Prefers ripgrep"), confidence: "high".into(),
-            source_agent: "cli".into(), source_machine: "m2".into(), created_at: 1, deleted: false, seq: 3,
+            source_agent: "cli".into(), source_machine: "m2".into(), created_at: 1, seq: 3, ..Default::default()
         };
         s.upsert_memory(&existing).unwrap();
         let sum = harvest(&s, &[h("a.md", Scope::Global, "prefers  RIPGREP")]);
@@ -517,18 +517,18 @@ mod tests {
         let existing = Memory {
             id: "mem_cli".into(), scope: Scope::Global, project: String::new(), machine: String::new(),
             content: "Prefers ripgrep".into(), content_hash: content_hash("Prefers ripgrep"), confidence: "high".into(),
-            source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1, deleted: false, seq: 3,
+            source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1, seq: 3, ..Default::default()
         };
         s.upsert_memory(&existing).unwrap();
         harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
         assert_eq!(s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap().memory_id, "mem_cli");
         let sum = harvest(&s, &[h("a.md", Scope::Global, "Prefers fd")]);
         assert_eq!((sum.added, sum.removed), (1, 0));
-        assert!(!s.get_memory("mem_cli").unwrap().unwrap().deleted);
+        assert!(!s.get_memory("mem_cli").unwrap().unwrap().is_deleted());
         assert_eq!(deletes_queued_for(&s, "mem_cli"), 0);
         // Deleting the file doesn't touch it either.
         harvest(&s, &[]);
-        assert!(!s.get_memory("mem_cli").unwrap().unwrap().deleted);
+        assert!(!s.get_memory("mem_cli").unwrap().unwrap().is_deleted());
         assert_eq!(deletes_queued_for(&s, "mem_cli"), 0);
     }
 
@@ -540,12 +540,12 @@ mod tests {
         assert_eq!(s.harvest_get(&format!("{}b.md", P)).unwrap().unwrap().memory_id, id);
         let sum = harvest(&s, &[h("b.md", Scope::Global, "prefers ripgrep")]);
         assert_eq!(sum.removed, 0);
-        assert!(!s.get_memory(&id).unwrap().unwrap().deleted);
+        assert!(!s.get_memory(&id).unwrap().unwrap().is_deleted());
         assert_eq!(deletes_queued_for(&s, &id), 0);
         assert!(s.harvest_get(&format!("{}a.md", P)).unwrap().is_none());
         // The last reference going away does delete it.
         assert_eq!(harvest(&s, &[]).removed, 1);
-        assert!(s.get_memory(&id).unwrap().unwrap().deleted);
+        assert!(s.get_memory(&id).unwrap().unwrap().is_deleted());
         assert_eq!(deletes_queued_for(&s, &id), 1);
     }
 
@@ -659,15 +659,15 @@ mod tests {
         let mut a = Memory {
             id: "mem_a".into(), scope: Scope::Global, project: String::new(), machine: String::new(),
             content: "A".into(), content_hash: content_hash("A"), confidence: "medium".into(),
-            source_agent: "codex".into(), source_machine: "hal".into(), created_at: 1, deleted: false, seq: 5,
+            source_agent: "codex".into(), source_machine: "hal".into(), created_at: 1, seq: 5, ..Default::default()
         };
         let mut b = a.clone();
         b.id = "mem_b".into();
         b.seq = 7;
-        b.deleted = true;
+        b.deleted_at = Some(7);
         assert_eq!(apply_pulled_memories(&s, &[a.clone(), b]).unwrap(), 7);
         let got_b = s.get_memory("mem_b").unwrap().unwrap();
-        assert!(got_b.deleted && got_b.content.is_empty());
+        assert!(got_b.is_deleted() && got_b.content.is_empty());
         a.seq = 8;
         apply_pulled_memories(&s, &[a]).unwrap();
         assert_eq!(s.live_memories().unwrap().len(), 1);
@@ -788,7 +788,7 @@ mod tests {
             let m = Memory {
                 id: format!("mem_{}", c), scope: Scope::Global, project: String::new(), machine: String::new(),
                 content: c.to_string(), content_hash: content_hash(c), confidence: "high".into(),
-                source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1, deleted: false, seq: 0,
+                source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1, seq: 0, ..Default::default()
             };
             s.upsert_memory(&m).unwrap();
             s.enqueue(&PendingOp::AddMemory { memory: m }).unwrap();
@@ -796,6 +796,35 @@ mod tests {
     }
 
     const NO_HARVEST: SyncOptions = SyncOptions { harvest: false };
+
+    #[tokio::test]
+    async fn pulled_replacement_leaves_the_block_but_stays_in_history() {
+        let s = Store::open_in_memory().unwrap();
+        let (base, _log) = stub_relay(Box::new(|m, p, _| {
+            if m == "GET" && p.starts_with("/api/memory?") && p.contains("since=0&") {
+                let row = |id: &str, content: &str, invalid_at: serde_json::Value, superseded_by: serde_json::Value, seq: i64| serde_json::json!({
+                    "id": id, "scope": "global", "project": "", "machine": "", "content": content,
+                    "content_hash": content_hash(content), "confidence": "high", "source_agent": "cli",
+                    "source_machine": "m2", "created_at": 1, "deleted": false, "deleted_at": null,
+                    "valid_at": null, "invalid_at": invalid_at, "superseded_by": superseded_by, "seq": seq,
+                });
+                return (200, serde_json::json!({"memories": [
+                    row("mem_new", "DialF listens on TCP 9000", serde_json::Value::Null, serde_json::Value::Null, 2),
+                    row("mem_old", "DialF listens on TCP 8765", serde_json::json!(1_790_000_000), serde_json::json!("mem_new"), 3),
+                ]}));
+            }
+            empty_pulls(m, p).unwrap()
+        })).await;
+        let (_td, ctx) = test_ctx();
+        std::fs::create_dir_all(ctx.home.join(".claude")).unwrap();
+        run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        let text = std::fs::read_to_string(ctx.home.join(".claude/CLAUDE.md")).unwrap();
+        assert!(text.contains("TCP 9000") && !text.contains("TCP 8765"), "{text}");
+        let old = s.get_memory("mem_old").unwrap().unwrap();
+        assert_eq!((old.invalid_at, old.superseded_by.as_deref()), (Some(1_790_000_000), Some("mem_new")));
+        assert_eq!(s.history_memories().unwrap().len(), 2);
+        assert_eq!(s.live_memories().unwrap().len(), 1);
+    }
 
     #[test]
     fn relay_error_notes_are_actionable() {
@@ -881,7 +910,7 @@ mod tests {
         // "a" was acked; "huge" is never acked and "c" (after it) wasn't sent.
         let left: Vec<String> = s.pending().unwrap().iter().map(|(_, op)| describe(op)).collect();
         assert_eq!(left, vec!["memory mem_huge".to_string(), "memory mem_c".to_string()]);
-        assert!(s.get_memory("mem_huge").unwrap().is_some_and(|m| !m.deleted));
+        assert!(s.get_memory("mem_huge").unwrap().is_some_and(|m| !m.is_deleted()));
         let posted: Vec<String> = log.lock().unwrap().iter().filter(|(m, _, _)| m == "POST")
             .map(|(_, _, b)| b["ops"].as_array().unwrap().iter().map(|o| o["op"].as_str().unwrap().to_string()).collect::<Vec<_>>().join(",")).collect();
         // Skills are a separate group and still go out.

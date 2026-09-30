@@ -314,7 +314,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             }
             let m = Memory {
                 id: new_memory_id(), scope, project, machine, content, content_hash: hash, confidence,
-                source_agent: agent, source_machine: ctx.atem_id.clone(), created_at: now_secs(), deleted: false, seq: 0,
+                source_agent: agent, source_machine: ctx.atem_id.clone(), created_at: now_secs(), seq: 0, ..Default::default()
             };
             store.upsert_memory(&m)?;
             println!("Added {} ({})", m.id, where_label(&m));
@@ -359,7 +359,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
         MemoryCommands::Rm { id } => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
-            store.get_memory(&id)?.filter(|m| !m.deleted).ok_or_else(|| anyhow!("No memory {}", id))?;
+            store.get_memory(&id)?.filter(|m| !m.is_deleted()).ok_or_else(|| anyhow!("No memory {}", id))?;
             store.mark_memory_deleted(&id)?;
             store.enqueue(&PendingOp::DeleteMemory { id: id.clone() })?;
             println!("Removed {}", id);

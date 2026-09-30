@@ -49,7 +49,7 @@ pub fn one_line(content: &str) -> String {
 /// markers or carries a credential is never written.
 pub fn select_entries(mems: &[Memory]) -> Vec<String> {
     let mut sorted: Vec<&Memory> = mems.iter()
-        .filter(|m| !m.deleted && !contains_reserved(&m.content) && find_secrets(&m.content).is_empty())
+        .filter(|m| m.is_valid() && !contains_reserved(&m.content) && find_secrets(&m.content).is_empty())
         .collect();
     sorted.sort_by(|a, b| {
         confidence_rank(&a.confidence).cmp(&confidence_rank(&b.confidence))
@@ -118,7 +118,7 @@ mod tests {
             project: String::new(), machine: String::new(),
             content: content.into(), content_hash: content_hash(content),
             confidence: conf.into(), source_agent: "cli".into(), source_machine: "m".into(),
-            created_at: created, deleted: false, seq: 0,
+            created_at: created, seq: 0, ..Default::default()
         }
     }
 
@@ -179,7 +179,7 @@ mod tests {
         let big = "x".repeat(MAX_BYTES);
         assert_eq!(select_entries(&[mem(&big, "high", 1), mem("small", "low", 2)]), vec!["small"]);
         let mut d = mem("gone", "high", 5);
-        d.deleted = true;
+        d.deleted_at = Some(5);
         assert!(select_entries(&[d]).is_empty());
     }
 

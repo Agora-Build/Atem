@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
   content TEXT NOT NULL, content_hash TEXT NOT NULL, confidence TEXT NOT NULL,
   source_agent TEXT NOT NULL, source_machine TEXT NOT NULL, created_at INTEGER NOT NULL,
-  deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+  deleted_at INTEGER, valid_at INTEGER, invalid_at INTEGER, superseded_by TEXT,
+  seq INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS skills (
   scope TEXT NOT NULL, project TEXT NOT NULL, name TEXT NOT NULL,
   version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL,
@@ -88,7 +89,62 @@ CREATE TABLE IF NOT EXISTS harvest_map (
   origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
 ";
 
-const MEM_COLS: &str = "id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted, seq";
+/// Full-text index over `memories.content`: external content, and trigram
+/// so it matches inside CJK text too. Kept in step by triggers. `memories` is
+/// a rowid table (TEXT PRIMARY KEY, not WITHOUT ROWID). Never VACUUM this
+/// database without `INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')`
+/// afterwards: VACUUM may renumber those rowids.
+const FTS_SCHEMA: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  content, content='memories', content_rowid='rowid', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+";
+
+fn memory_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(cols.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Bring a pre-1.1 `memories` table to the current shape: `deleted` →
+/// `deleted_at` (deleted rows get "now"; the real time was never stored),
+/// plus the validity columns. Idempotent; one transaction.
+fn migrate_memories(conn: &Connection) -> Result<()> {
+    let cols = memory_columns(conn)?;
+    let has = |c: &str| cols.iter().any(|x| x == c);
+    let wanted = ["deleted_at", "valid_at", "invalid_at", "superseded_by"];
+    if !has("deleted") && wanted.iter().all(|c| has(c)) {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    if !has("deleted_at") {
+        tx.execute_batch("ALTER TABLE memories ADD COLUMN deleted_at INTEGER")?;
+        if has("deleted") {
+            tx.execute("UPDATE memories SET deleted_at = ?1 WHERE deleted != 0", params![crate::memory::model::now_secs()])?;
+        }
+    }
+    for (c, ty) in [("valid_at", "INTEGER"), ("invalid_at", "INTEGER"), ("superseded_by", "TEXT")] {
+        if !has(c) {
+            tx.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {} {}", c, ty))?;
+        }
+    }
+    if has("deleted") {
+        tx.execute_batch("ALTER TABLE memories DROP COLUMN deleted")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+const MEM_COLS: &str = "id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted_at, valid_at, invalid_at, superseded_by, seq";
 
 fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
     let scope: String = r.get(1)?;
@@ -103,8 +159,11 @@ fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
         source_agent: r.get(7)?,
         source_machine: r.get(8)?,
         created_at: r.get(9)?,
-        deleted: r.get::<_, i64>(10)? != 0,
-        seq: r.get(11)?,
+        deleted_at: r.get(10)?,
+        valid_at: r.get(11)?,
+        invalid_at: r.get(12)?,
+        superseded_by: r.get(13)?,
+        seq: r.get(14)?,
     })
 }
 
@@ -150,20 +209,37 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Store> {
         conn.execute_batch(SCHEMA)?;
+        migrate_memories(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let had_fts: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'memories_fts')", [], |r| r.get(0))?;
+        tx.execute_batch(FTS_SCHEMA)?;
+        if !had_fts {
+            // Index the rows that existed before the index did.
+            tx.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")?;
+        }
+        tx.commit()?;
         Ok(Store { conn })
     }
 
     // ── memories ────────────────────────────────────────────────────────
+    /// Insert or overwrite (the relay is authoritative), except that a local
+    /// invalidation the incoming row doesn't have yet is kept. Invalidation
+    /// is final, so it can only be "not yet pulled", never undone.
     pub fn upsert_memory(&self, m: &Memory) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO memories (id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO memories (id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted_at, valid_at, invalid_at, superseded_by, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET scope=excluded.scope, project=excluded.project, machine=excluded.machine,
                content=excluded.content, content_hash=excluded.content_hash, confidence=excluded.confidence,
                source_agent=excluded.source_agent, source_machine=excluded.source_machine,
-               created_at=excluded.created_at, deleted=excluded.deleted, seq=excluded.seq",
+               created_at=excluded.created_at, deleted_at=excluded.deleted_at, valid_at=excluded.valid_at,
+               invalid_at=COALESCE(excluded.invalid_at, memories.invalid_at),
+               superseded_by=CASE WHEN excluded.invalid_at IS NOT NULL THEN excluded.superseded_by ELSE memories.superseded_by END,
+               seq=excluded.seq",
             params![m.id, m.scope.as_str(), m.project, m.machine, m.content, m.content_hash, m.confidence,
-                    m.source_agent, m.source_machine, m.created_at, m.deleted as i64, m.seq],
+                    m.source_agent, m.source_machine, m.created_at, m.deleted_at, m.valid_at, m.invalid_at,
+                    m.superseded_by, m.seq],
         )?;
         Ok(())
     }
@@ -174,25 +250,39 @@ impl Store {
             .optional()?)
     }
 
+    /// Valid facts: not deleted and not invalidated (what gets injected).
     pub fn live_memories(&self) -> Result<Vec<Memory>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM memories WHERE deleted = 0 ORDER BY created_at, id", MEM_COLS))?;
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM memories WHERE deleted_at IS NULL AND invalid_at IS NULL ORDER BY created_at, id", MEM_COLS))?;
         let rows = stmt.query_map([], row_to_memory)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Everything not deleted, including invalidated facts (the history).
+    pub fn history_memories(&self) -> Result<Vec<Memory>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM memories WHERE deleted_at IS NULL ORDER BY created_at, id", MEM_COLS))?;
+        let rows = stmt.query_map([], row_to_memory)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A valid fact with this dedup key. Invalid facts never match, so a fact
+    /// that becomes true again is added as a new memory.
     pub fn find_live_by_hash(&self, scope: Scope, project: &str, machine: &str, hash: &str) -> Result<Option<Memory>> {
         Ok(self.conn
             .query_row(
-                &format!("SELECT {} FROM memories WHERE deleted = 0 AND scope = ?1 AND project = ?2 AND machine = ?3 AND content_hash = ?4 LIMIT 1", MEM_COLS),
+                &format!("SELECT {} FROM memories WHERE deleted_at IS NULL AND invalid_at IS NULL AND scope = ?1 AND project = ?2 AND machine = ?3 AND content_hash = ?4 LIMIT 1", MEM_COLS),
                 params![scope.as_str(), project, machine, hash],
                 row_to_memory,
             )
             .optional()?)
     }
 
-    /// Tombstone: also clears the text so it doesn't linger locally.
+    /// Tombstone: also clears the text so it doesn't linger locally. The
+    /// first deletion time is kept.
     pub fn mark_memory_deleted(&self, id: &str) -> Result<()> {
-        self.conn.execute("UPDATE memories SET deleted = 1, content = '', content_hash = '' WHERE id = ?1", params![id])?;
+        self.conn.execute(
+            "UPDATE memories SET deleted_at = COALESCE(deleted_at, ?2), content = '', content_hash = '' WHERE id = ?1",
+            params![id, crate::memory::model::now_secs()],
+        )?;
         Ok(())
     }
 
@@ -345,11 +435,109 @@ mod tests {
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
 
+    fn ids(ms: Vec<Memory>) -> Vec<String> {
+        ms.into_iter().map(|m| m.id).collect()
+    }
+
+    fn fts_hits(s: &Store, q: &str) -> Vec<String> {
+        let mut st = s.conn.prepare(
+            "SELECT m.id FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid WHERE memories_fts MATCH ?1 ORDER BY m.id",
+        ).unwrap();
+        st.query_map(params![q], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+    }
+
+    #[test]
+    fn legacy_db_is_migrated_once() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("knowledge.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch("CREATE TABLE memories (
+              id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
+              content TEXT NOT NULL, content_hash TEXT NOT NULL, confidence TEXT NOT NULL,
+              source_agent TEXT NOT NULL, source_machine TEXT NOT NULL, created_at INTEGER NOT NULL,
+              deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO memories VALUES ('mem_live','global','','','DialF uses TCP 8765','h1','medium','cli','m',1,0,4);
+            INSERT INTO memories VALUES ('mem_gone','global','','','','','medium','cli','m',1,1,5);").unwrap();
+        }
+        let before = crate::memory::model::now_secs();
+        let s = Store::open(&p).unwrap();
+        let cols = memory_columns(&s.conn).unwrap();
+        for c in ["deleted_at", "valid_at", "invalid_at", "superseded_by"] {
+            assert!(cols.iter().any(|x| x == c), "{c}");
+        }
+        assert!(!cols.iter().any(|x| x == "deleted"));
+        let gone = s.get_memory("mem_gone").unwrap().unwrap();
+        assert!(gone.deleted_at.unwrap() >= before);
+        let live = s.get_memory("mem_live").unwrap().unwrap();
+        assert_eq!((live.deleted_at, live.valid_at, live.invalid_at, live.superseded_by.clone(), live.seq), (None, None, None, None, 4));
+        assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]); // rebuilt over existing rows
+        drop(s);
+        let s = Store::open(&p).unwrap(); // idempotent
+        assert_eq!(s.get_memory("mem_gone").unwrap().unwrap().deleted_at, gone.deleted_at);
+        assert_eq!(ids(s.live_memories().unwrap()), vec!["mem_live"]);
+        assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]);
+    }
+
+    #[test]
+    fn fts_index_follows_inserts_updates_and_deletes() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_a", "DialF uses TCP 8765")).unwrap();
+        assert_eq!(fts_hits(&s, "\"8765\""), vec!["mem_a"]);
+        s.upsert_memory(&mem("mem_a", "DialF uses TCP 9000")).unwrap();
+        assert!(fts_hits(&s, "\"8765\"").is_empty());
+        assert_eq!(fts_hits(&s, "\"9000\""), vec!["mem_a"]);
+        s.rewrite_memory_id("mem_a", "mem_b").unwrap();
+        assert_eq!(fts_hits(&s, "\"9000\""), vec!["mem_b"]);
+        s.mark_memory_deleted("mem_b").unwrap();
+        assert!(fts_hits(&s, "\"9000\"").is_empty());
+    }
+
+    #[test]
+    fn live_means_valid_and_history_keeps_invalid() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_a", "A")).unwrap();
+        let mut b = mem("mem_b", "B");
+        b.invalid_at = Some(10);
+        b.superseded_by = Some("mem_a".into());
+        s.upsert_memory(&b).unwrap();
+        s.upsert_memory(&mem("mem_c", "C")).unwrap();
+        s.mark_memory_deleted("mem_c").unwrap();
+        assert_eq!(ids(s.live_memories().unwrap()), vec!["mem_a"]);
+        assert_eq!(ids(s.history_memories().unwrap()), vec!["mem_a", "mem_b"]);
+        // An invalid fact is not a dedup target: re-adding it makes a new memory.
+        assert!(s.find_live_by_hash(Scope::Global, "", "", &content_hash("B")).unwrap().is_none());
+        let c = s.get_memory("mem_c").unwrap().unwrap();
+        assert!(c.is_deleted() && c.content.is_empty());
+    }
+
+    #[test]
+    fn pulled_row_without_invalidation_keeps_a_local_one() {
+        let s = Store::open_in_memory().unwrap();
+        let mut a = mem("mem_a", "A");
+        a.invalid_at = Some(10);
+        a.superseded_by = Some("mem_b".into());
+        s.upsert_memory(&a).unwrap();
+        // The relay hasn't seen the invalidation yet.
+        let mut stale = mem("mem_a", "A");
+        stale.seq = 9;
+        s.upsert_memory(&stale).unwrap();
+        let got = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((got.invalid_at, got.superseded_by.as_deref(), got.seq), (Some(10), Some("mem_b"), 9));
+        // The relay's invalidation wins when it has one.
+        let mut server = mem("mem_a", "A");
+        server.invalid_at = Some(7);
+        server.superseded_by = Some("mem_c".into());
+        s.upsert_memory(&server).unwrap();
+        let got = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((got.invalid_at, got.superseded_by.as_deref()), (Some(7), Some("mem_c")));
+    }
+
     fn mem(id: &str, content: &str) -> Memory {
         Memory {
             id: id.into(), scope: Scope::Global, project: String::new(), machine: String::new(),
             content: content.into(), content_hash: content_hash(content), confidence: "medium".into(),
-            source_agent: "cli".into(), source_machine: "m".into(), created_at: 1, deleted: false, seq: 0,
+            source_agent: "cli".into(), source_machine: "m".into(), created_at: 1, seq: 0, ..Default::default()
         }
     }
 
@@ -371,7 +559,7 @@ mod tests {
         assert_eq!(s.get_memory("mem_a").unwrap().unwrap().content, "A");
         s.mark_memory_deleted("mem_b").unwrap();
         let b = s.get_memory("mem_b").unwrap().unwrap();
-        assert!(b.deleted && b.content.is_empty() && b.content_hash.is_empty());
+        assert!(b.is_deleted() && b.content.is_empty() && b.content_hash.is_empty());
         assert_eq!(s.live_memories().unwrap().len(), 1);
     }
 

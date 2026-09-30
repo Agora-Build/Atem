@@ -32,14 +32,14 @@ impl Scope {
     }
 }
 
-/// One memory. Also the wire format (see the plan's "Wire contract").
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One memory. On the wire (and in queued ops) it round-trips through
+/// `MemoryWire`, which still carries `deleted: bool` for older atems/relays.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "MemoryWire", into = "MemoryWire")]
 pub struct Memory {
     pub id: String,
     pub scope: Scope,
-    #[serde(default)]
     pub project: String,
-    #[serde(default)]
     pub machine: String,
     pub content: String,
     pub content_hash: String,
@@ -47,10 +47,87 @@ pub struct Memory {
     pub source_agent: String,
     pub source_machine: String,
     pub created_at: i64,
-    #[serde(default)]
-    pub deleted: bool,
-    #[serde(default)]
+    /// When it was deleted (a deletion also clears the text). `None` = not deleted.
+    pub deleted_at: Option<i64>,
+    /// When the fact became true. `None` = `created_at`.
+    pub valid_at: Option<i64>,
+    /// When it stopped being true. `None` = still valid. Final once set.
+    pub invalid_at: Option<i64>,
+    /// The memory that replaced it, if any.
+    pub superseded_by: Option<String>,
     pub seq: i64,
+}
+
+impl Memory {
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+
+    /// Not deleted and not invalidated: the facts that get injected.
+    pub fn is_valid(&self) -> bool {
+        self.deleted_at.is_none() && self.invalid_at.is_none()
+    }
+
+    /// When the fact became true.
+    pub fn valid_from(&self) -> i64 {
+        self.valid_at.unwrap_or(self.created_at)
+    }
+}
+
+/// The wire/queue shape of `Memory`. Rows without the 1.1 fields (an older
+/// relay, or ops queued by an older atem) parse with them unset; a legacy
+/// `deleted: true` without `deleted_at` counts as deleted now.
+#[derive(Serialize, Deserialize)]
+struct MemoryWire {
+    id: String,
+    scope: Scope,
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    machine: String,
+    content: String,
+    content_hash: String,
+    confidence: String,
+    source_agent: String,
+    source_machine: String,
+    created_at: i64,
+    #[serde(default)]
+    deleted: bool,
+    #[serde(default)]
+    deleted_at: Option<i64>,
+    #[serde(default)]
+    valid_at: Option<i64>,
+    #[serde(default)]
+    invalid_at: Option<i64>,
+    #[serde(default)]
+    superseded_by: Option<String>,
+    #[serde(default)]
+    seq: i64,
+}
+
+impl From<MemoryWire> for Memory {
+    fn from(w: MemoryWire) -> Memory {
+        Memory {
+            deleted_at: w.deleted_at.or_else(|| w.deleted.then(now_secs)),
+            id: w.id, scope: w.scope, project: w.project, machine: w.machine,
+            content: w.content, content_hash: w.content_hash, confidence: w.confidence,
+            source_agent: w.source_agent, source_machine: w.source_machine, created_at: w.created_at,
+            valid_at: w.valid_at, invalid_at: w.invalid_at, superseded_by: w.superseded_by, seq: w.seq,
+        }
+    }
+}
+
+impl From<Memory> for MemoryWire {
+    fn from(m: Memory) -> MemoryWire {
+        MemoryWire {
+            deleted: m.deleted_at.is_some(),
+            id: m.id, scope: m.scope, project: m.project, machine: m.machine,
+            content: m.content, content_hash: m.content_hash, confidence: m.confidence,
+            source_agent: m.source_agent, source_machine: m.source_machine, created_at: m.created_at,
+            deleted_at: m.deleted_at, valid_at: m.valid_at, invalid_at: m.invalid_at,
+            superseded_by: m.superseded_by, seq: m.seq,
+        }
+    }
 }
 
 /// One skill version. `files` maps a relative path to raw bytes and is
@@ -146,6 +223,39 @@ pub mod b64map {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_wire_keeps_deleted_flag_and_new_fields() {
+        let m = Memory {
+            id: "mem_1".into(), content: "x".into(), created_at: 5, deleted_at: Some(9),
+            valid_at: Some(3), invalid_at: Some(8), superseded_by: Some("mem_2".into()), seq: 4,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["deleted"], true);
+        assert_eq!((v["deleted_at"].clone(), v["valid_at"].clone(), v["invalid_at"].clone()), (serde_json::json!(9), serde_json::json!(3), serde_json::json!(8)));
+        assert_eq!(v["superseded_by"], "mem_2");
+        assert_eq!(v["scope"], "global");
+        let back: Memory = serde_json::from_value(v).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn legacy_memory_json_still_parses() {
+        let row = |deleted: bool| serde_json::json!({
+            "id": "mem_1", "scope": "project", "project": "p", "content": "x", "content_hash": "h",
+            "confidence": "high", "source_agent": "cli", "source_machine": "m", "created_at": 5,
+            "deleted": deleted, "seq": 2,
+        });
+        let m: Memory = serde_json::from_value(row(false)).unwrap();
+        assert!(m.is_valid() && !m.is_deleted() && m.valid_at.is_none() && m.superseded_by.is_none());
+        assert_eq!(m.valid_from(), 5);
+        let gone: Memory = serde_json::from_value(row(true)).unwrap();
+        assert!(gone.is_deleted() && !gone.is_valid());
+        let mut invalid = m.clone();
+        invalid.invalid_at = Some(6);
+        assert!(!invalid.is_valid() && !invalid.is_deleted());
+    }
 
     #[test]
     fn normalize_collapses_whitespace_and_case() {

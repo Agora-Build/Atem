@@ -131,7 +131,7 @@ fn line(mark: Mark, target: String, detail: impl Into<String>) -> ReportLine {
 }
 
 pub fn apply_memory(agent: Agent, ctx: &Ctx, mems: &[Memory]) -> Vec<ReportLine> {
-    let visible: Vec<Memory> = mems.iter().filter(|m| !m.deleted && !agent.skips_echo(m, ctx)).cloned().collect();
+    let visible: Vec<Memory> = mems.iter().filter(|m| m.is_valid() && !agent.skips_echo(m, ctx)).cloned().collect();
     let global: Vec<Memory> = visible.iter()
         .filter(|m| m.scope == Scope::Global || (m.scope == Scope::Machine && m.machine == ctx.atem_id))
         .cloned().collect();
@@ -291,6 +291,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::process::Command;
 
+    #[test]
+    fn invalid_facts_are_not_applied() {
+        let (_td, ctx) = setup();
+        let mut old = m(Scope::Global, "", "", "DialF listens on TCP 8765", "cli", "x");
+        old.invalid_at = Some(5);
+        let new = m(Scope::Global, "", "", "DialF listens on TCP 9000", "cli", "x");
+        apply_memory(Agent::Claude, &ctx, &[old, new]);
+        let text = read(ctx.home.join(".claude/CLAUDE.md"));
+        assert!(text.contains("TCP 9000") && !text.contains("TCP 8765"));
+    }
+
     fn run_git(dir: &Path, args: &[&str]) {
         assert!(Command::new("git").arg("-C").arg(dir).args(args).output().unwrap().status.success());
     }
@@ -317,7 +328,7 @@ mod tests {
         Memory {
             id: format!("mem_{}", content_hash(content)), scope, project: project.into(), machine: machine.into(),
             content: content.into(), content_hash: content_hash(content), confidence: "medium".into(),
-            source_agent: agent.into(), source_machine: src.into(), created_at: 1, deleted: false, seq: 0,
+            source_agent: agent.into(), source_machine: src.into(), created_at: 1, seq: 0, ..Default::default()
         }
     }
 

@@ -201,7 +201,7 @@ mod tests {
             id: "mem_1".into(), scope: Scope::Project, project: "github.com/acme/dialf".into(), machine: String::new(),
             content: "DialF uses TCP 8765".into(), content_hash: content_hash("DialF uses TCP 8765"),
             confidence: "high".into(), source_agent: "claude".into(), source_machine: "nixps-0001".into(),
-            created_at: 1700000000, deleted: false, seq: 0,
+            created_at: 1700000000, seq: 0, ..Default::default()
         }
     }
 
