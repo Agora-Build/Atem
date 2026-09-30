@@ -495,8 +495,11 @@ pub enum MemoryCommands {
         /// Store even though it looks like a credential (only if it is not one)
         #[arg(long)]
         force: bool,
+        /// When the fact became true: YYYY-MM-DD (UTC) or unix seconds (default: now)
+        #[arg(long)]
+        valid_at: Option<String>,
     },
-    /// List memories (global, this machine, and the current project unless --all)
+    /// List valid memories (global, this machine, and the current project unless --all)
     List {
         #[arg(long)]
         scope: Option<String>,
@@ -504,6 +507,10 @@ pub enum MemoryCommands {
         project: Option<String>,
         #[arg(long)]
         all: bool,
+        /// Include outdated facts and show replacement chains, oldest first
+        /// (with an id: just the chain containing it)
+        #[arg(long, value_name = "ID", num_args = 0..=1)]
+        history: Option<Option<String>>,
     },
     /// Search memories on this machine
     Search {
@@ -512,6 +519,24 @@ pub enum MemoryCommands {
     /// Remove a memory everywhere
     Rm {
         id: String,
+    },
+    /// Replace an outdated fact: adds the new one and invalidates the old one
+    Replace {
+        /// Memory id (a unique prefix, or the short id shown in the Codex block)
+        id: String,
+        /// The fact as it is now
+        content: String,
+        /// When the new fact became true: YYYY-MM-DD (UTC) or unix seconds (default: now)
+        #[arg(long)]
+        valid_at: Option<String>,
+    },
+    /// Mark a fact outdated without a replacement (kept as history, no longer injected)
+    Invalidate {
+        /// Memory id (a unique prefix, or the short id shown in the Codex block)
+        id: String,
+        /// When it stopped being true: YYYY-MM-DD (UTC) or unix seconds (default: now)
+        #[arg(long)]
+        at: Option<String>,
     },
     /// Remove a memory that contained a credential, everywhere, and stop re-harvesting it
     Purge {

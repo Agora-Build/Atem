@@ -1,12 +1,12 @@
 //! The learning loop: harvest what Claude learned → push local changes →
 //! pull what other agents/machines learned → apply to every agent here.
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::HashSet;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
 use crate::memory::api::{ApiError, KnowledgeClient, OpResult, PULL_LIMIT};
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
-use crate::memory::model::{new_memory_id, now_secs, Memory, Scope, Skill};
+use crate::memory::model::{content_hash, new_memory_id, now_secs, Memory, Scope, Skill};
 use crate::memory::secrets::find_secrets;
 use crate::memory::store::{memory_cursor_key, skill_cursor_key, HarvestEntry, HarvestStatus, PendingOp, Store, LAST_SYNC_AT};
 #[cfg(test)]
@@ -38,6 +38,53 @@ fn release_memory(store: &Store, origin: &str, id: &str, atem_id: &str) -> Resul
     store.mark_memory_deleted(id)?;
     store.enqueue(&PendingOp::DeleteMemory { id: id.to_string() })?;
     Ok(true)
+}
+
+/// Invalidate `id` locally and queue the op; `successor` is recorded as its
+/// replacement. Returns false, and queues nothing, when `id` is unknown,
+/// deleted, or already invalid (invalidation is final).
+pub fn invalidate_and_queue(store: &Store, id: &str, invalid_at: i64, successor: Option<&str>) -> Result<bool> {
+    if !store.invalidate_memory(id, invalid_at, successor)? {
+        return Ok(false);
+    }
+    if let Some(s) = successor {
+        store.record_replacement(s, id)?;
+    }
+    store.enqueue(&PendingOp::InvalidateMemory {
+        id: id.to_string(),
+        invalid_at,
+        superseded_by: successor.map(str::to_string),
+    })?;
+    Ok(true)
+}
+
+/// Replace `old` with `content`: same scope/project/machine/confidence. An
+/// existing valid fact with the same text becomes the successor; otherwise
+/// a new memory is added. The add is queued before the invalidate (same
+/// batch unless a chunk boundary splits them). `old` stops being true when
+/// the new fact starts (`valid_at`, else now). The caller has already run
+/// the secret check on `content`. Returns the successor's id.
+pub fn replace_memory(store: &Store, old: &Memory, content: &str, valid_at: Option<i64>, source_agent: &str, source_machine: &str) -> Result<String> {
+    let hash = content_hash(content);
+    if hash == old.content_hash {
+        bail!("That is the same fact as {}; nothing to replace.", old.id);
+    }
+    let successor = match store.find_live_by_hash(old.scope, &old.project, &old.machine, &hash)? {
+        Some(existing) => existing.id,
+        None => {
+            let m = Memory {
+                id: new_memory_id(), scope: old.scope, project: old.project.clone(), machine: old.machine.clone(),
+                content: content.to_string(), content_hash: hash, confidence: old.confidence.clone(),
+                source_agent: source_agent.to_string(), source_machine: source_machine.to_string(),
+                created_at: now_secs(), valid_at, ..Default::default()
+            };
+            store.upsert_memory(&m)?;
+            store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
+            m.id
+        }
+    };
+    invalidate_and_queue(store, &old.id, valid_at.unwrap_or_else(now_secs), Some(&successor))?;
+    Ok(successor)
 }
 
 pub fn harvest_into_store(store: &Store, items: &[Harvested], prefix: &str, project_key: &str, atem_id: &str) -> Result<HarvestSummary> {
@@ -100,6 +147,7 @@ fn describe(op: &PendingOp) -> String {
     match op {
         PendingOp::AddMemory { memory } => format!("memory {}", memory.id),
         PendingOp::DeleteMemory { id } => format!("delete of {}", id),
+        PendingOp::InvalidateMemory { id, .. } => format!("invalidation of {}", id),
         PendingOp::PushSkill { skill, .. } => format!("skill {} v{}", skill.name, skill.version),
         PendingOp::DeleteSkill { name, .. } => format!("delete of skill {}", name),
         PendingOp::PurgeSkill { name, .. } => format!("purge of skill {}", name),
@@ -425,6 +473,76 @@ mod tests {
     use super::*;
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
+
+    fn valid(id: &str, content: &str) -> Memory {
+        Memory {
+            id: id.into(), scope: Scope::Global, content: content.into(), content_hash: content_hash(content),
+            confidence: "high".into(), source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replace_queues_add_then_invalidate() {
+        let s = Store::open_in_memory().unwrap();
+        let old = valid("mem_old", "DialF listens on TCP 8765");
+        s.upsert_memory(&old).unwrap();
+        let new_id = replace_memory(&s, &old, "DialF listens on TCP 9000", Some(1_790_000_000), "cli", "m1").unwrap();
+        let ops: Vec<PendingOp> = s.pending().unwrap().into_iter().map(|(_, op)| op).collect();
+        assert_eq!(ops.len(), 2);
+        let PendingOp::AddMemory { memory } = &ops[0] else { panic!("{:?}", ops[0]) };
+        assert_eq!(
+            (memory.id.as_str(), memory.content.as_str(), memory.valid_at, memory.confidence.as_str()),
+            (new_id.as_str(), "DialF listens on TCP 9000", Some(1_790_000_000), "high")
+        );
+        assert_eq!(ops[1], PendingOp::InvalidateMemory { id: "mem_old".into(), invalid_at: 1_790_000_000, superseded_by: Some(new_id.clone()) });
+        let o = s.get_memory("mem_old").unwrap().unwrap();
+        assert_eq!((o.invalid_at, o.superseded_by.as_deref(), o.content.as_str()), (Some(1_790_000_000), Some(new_id.as_str()), "DialF listens on TCP 8765"));
+        let live: Vec<String> = s.live_memories().unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(live, vec![new_id]);
+    }
+
+    #[test]
+    fn invalidate_and_queue_is_final() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&valid("mem_a", "A")).unwrap();
+        assert!(invalidate_and_queue(&s, "mem_a", 10, None).unwrap());
+        assert!(!invalidate_and_queue(&s, "mem_a", 20, Some("mem_b")).unwrap());
+        assert!(!invalidate_and_queue(&s, "mem_nope", 20, None).unwrap());
+        let a = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((a.invalid_at, a.superseded_by), (Some(10), None));
+        assert_eq!(s.pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn replace_reuses_an_existing_fact_and_refuses_the_same_fact() {
+        let s = Store::open_in_memory().unwrap();
+        let old = valid("mem_old", "port 8765");
+        s.upsert_memory(&old).unwrap();
+        s.upsert_memory(&valid("mem_9000", "port 9000")).unwrap();
+        assert_eq!(replace_memory(&s, &old, "Port  9000", None, "cli", "m1").unwrap(), "mem_9000");
+        let ops = s.pending().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0].1, PendingOp::InvalidateMemory { id, superseded_by: Some(sb), invalid_at } if id == "mem_old" && sb == "mem_9000" && *invalid_at > 0));
+        let same = valid("mem_same", "same fact");
+        s.upsert_memory(&same).unwrap();
+        assert!(replace_memory(&s, &same, "SAME  fact", None, "cli", "m1").unwrap_err().to_string().contains("same fact as mem_same"));
+    }
+
+    #[test]
+    fn canonical_rewrite_fixes_the_queued_invalidation() {
+        let s = Store::open_in_memory().unwrap();
+        let old = valid("mem_old", "port 8765");
+        s.upsert_memory(&old).unwrap();
+        replace_memory(&s, &old, "port 9000", None, "cli", "m1").unwrap();
+        // Only the add went out (a chunk boundary fell between the two ops).
+        let sent: Vec<_> = s.pending().unwrap().into_iter().take(1).collect();
+        apply_push_results(&s, &sent, &[OpResult { ok: true, canonical_id: Some("mem_canon".into()), seq: Some(4), ..Default::default() }]).unwrap();
+        let left = s.pending().unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(matches!(&left[0].1, PendingOp::InvalidateMemory { id, superseded_by: Some(sb), .. } if id == "mem_old" && sb == "mem_canon"));
+        assert_eq!(s.get_memory("mem_old").unwrap().unwrap().superseded_by.as_deref(), Some("mem_canon"));
+    }
 
     const P: &str = "m1:/home/u/.claude/projects/x/memory/";
 

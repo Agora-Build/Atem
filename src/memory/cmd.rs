@@ -7,7 +7,7 @@ use crate::memory::adapters::{valid_skill_name, Agent, Ctx};
 use crate::memory::api::KnowledgeClient;
 use crate::memory::block::{contains_reserved, one_line};
 use crate::memory::harvest::claude_memory_dir;
-use crate::memory::model::{content_hash, new_memory_id, now_secs, parse_confidence, skill_hash, Memory, Scope, Skill};
+use crate::memory::model::{content_hash, format_date, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, Memory, Scope, Skill};
 use crate::memory::project::{detect_repo, display_name};
 use crate::memory::secrets::{check_bytes, find_secrets, SecretFinding};
 use crate::memory::skills_fs::{self, DirState, SkillMarker};
@@ -225,8 +225,83 @@ fn print_memories(ms: &[Memory]) {
         println!("(no memories)");
     }
     for m in ms {
-        println!("{}  {:<24} {:<6} {}", m.id, where_label(m), m.confidence, truncate(&one_line(&m.content), 90));
+        let note = m.invalid_at.map(|t| format!("  (outdated since {})", format_date(t))).unwrap_or_default();
+        println!("{}  {:<24} {:<6} {}{}", m.id, where_label(m), m.confidence, truncate(&one_line(&m.content), 90), note);
     }
+}
+
+/// `memory list`'s default view: global, this machine, and the current
+/// project (or exactly `--scope` / `--project`; everything with `--all`).
+fn in_view(m: &Memory, scope: Option<Scope>, project: Option<&str>, all: bool, ctx: &Ctx) -> bool {
+    if let Some(sf) = scope
+        && m.scope != sf {
+        return false;
+    }
+    if let Some(p) = project {
+        return m.project == p;
+    }
+    if all {
+        return true;
+    }
+    match m.scope {
+        Scope::Global => true,
+        Scope::Machine => m.machine == ctx.atem_id,
+        Scope::Project => ctx.repo.as_ref().is_some_and(|r| r.key == m.project),
+    }
+}
+
+/// Replacement chains via `superseded_by`, each oldest first; chains ordered
+/// by their first memory's creation time. A successor not in `mems` ends
+/// the chain; a memory reached twice stays in the first chain.
+fn history_chains(mems: &[Memory]) -> Vec<Vec<Memory>> {
+    use std::collections::{HashMap, HashSet};
+    let by_id: HashMap<&str, &Memory> = mems.iter().map(|m| (m.id.as_str(), m)).collect();
+    let has_pred: HashSet<&str> = mems.iter()
+        .filter_map(|m| m.superseded_by.as_deref())
+        .filter(|s| by_id.contains_key(s))
+        .collect();
+    let mut order: Vec<&Memory> = mems.iter().collect();
+    order.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut chains = Vec::new();
+    // Heads first, then anything left (only a cycle, which the relay never makes).
+    let heads = order.iter().filter(|m| !has_pred.contains(m.id.as_str()));
+    let rest = order.iter().filter(|m| has_pred.contains(m.id.as_str()));
+    for start in heads.chain(rest) {
+        let mut chain = Vec::new();
+        let mut cur = Some(*start);
+        while let Some(m) = cur {
+            if !seen.insert(m.id.clone()) {
+                break;
+            }
+            chain.push(m.clone());
+            cur = m.superseded_by.as_deref().and_then(|s| by_id.get(s).copied());
+        }
+        if !chain.is_empty() {
+            chains.push(chain);
+        }
+    }
+    chains.sort_by(|a, b| a[0].created_at.cmp(&b[0].created_at).then(a[0].id.cmp(&b[0].id)));
+    chains
+}
+
+fn validity_span(m: &Memory) -> String {
+    format!("{} → {}", format_date(m.valid_from()), m.invalid_at.map(format_date).unwrap_or_else(|| "now".into()))
+}
+
+/// One numbered block per chain; later links indented under the first.
+fn render_history(chains: &[Vec<Memory>]) -> Vec<String> {
+    if chains.is_empty() {
+        return vec!["(no memories)".into()];
+    }
+    let mut out = Vec::new();
+    for (i, chain) in chains.iter().enumerate() {
+        for (j, m) in chain.iter().enumerate() {
+            let lead = if j == 0 { format!("{:>3}. ", i + 1) } else { "     ".to_string() };
+            out.push(format!("{}{}  {:<24} {:<25} {}", lead, m.id, where_label(m), validity_span(m), truncate(&one_line(&m.content), 80)));
+        }
+    }
+    out
 }
 
 fn files_under(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -289,8 +364,9 @@ pub async fn handle_sync(no_harvest: bool, allow_tracked: bool) -> Result<()> {
 pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
     crate::auth::require_pairing("Atem Memory")?;
     match command {
-        MemoryCommands::Add { content, scope, project, confidence, agent, force } => {
+        MemoryCommands::Add { content, scope, project, confidence, agent, force, valid_at } => {
             let ctx = build_ctx(false)?;
+            let valid_at = valid_at.as_deref().map(parse_date).transpose()?;
             if contains_reserved(&content) {
                 bail!("The text contains the reserved token `atem:memory:`.");
             }
@@ -314,7 +390,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             }
             let m = Memory {
                 id: new_memory_id(), scope, project, machine, content, content_hash: hash, confidence,
-                source_agent: agent, source_machine: ctx.atem_id.clone(), created_at: now_secs(), seq: 0, ..Default::default()
+                source_agent: agent, source_machine: ctx.atem_id.clone(), created_at: now_secs(), valid_at, seq: 0, ..Default::default()
             };
             store.upsert_memory(&m)?;
             println!("Added {} ({})", m.id, where_label(&m));
@@ -325,29 +401,32 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
             best_effort_sync(&store, &ctx).await;
         }
-        MemoryCommands::List { scope, project, all } => {
+        MemoryCommands::List { scope, project, all, history } => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
             let scope_f = scope.map(|s| Scope::parse(&s)).transpose()?;
-            let key = ctx.repo.as_ref().map(|r| r.key.clone());
-            let shown: Vec<Memory> = store.live_memories()?.into_iter().filter(|m| {
-                if let Some(sf) = scope_f
-                    && m.scope != sf {
-                    return false;
+            match history {
+                None => {
+                    let shown: Vec<Memory> = store.live_memories()?.into_iter()
+                        .filter(|m| in_view(m, scope_f, project.as_deref(), all, &ctx)).collect();
+                    print_memories(&shown);
                 }
-                if let Some(p) = &project {
-                    return &m.project == p;
+                Some(None) => {
+                    let shown: Vec<Memory> = store.history_memories()?.into_iter()
+                        .filter(|m| in_view(m, scope_f, project.as_deref(), all, &ctx)).collect();
+                    for l in render_history(&history_chains(&shown)) {
+                        println!("{}", l);
+                    }
                 }
-                if all {
-                    return true;
+                Some(Some(id)) => {
+                    let id = store.resolve_memory_id(&id)?;
+                    let chains: Vec<Vec<Memory>> = history_chains(&store.history_memories()?)
+                        .into_iter().filter(|c| c.iter().any(|m| m.id == id)).collect();
+                    for l in render_history(&chains) {
+                        println!("{}", l);
+                    }
                 }
-                match m.scope {
-                    Scope::Global => true,
-                    Scope::Machine => m.machine == ctx.atem_id,
-                    Scope::Project => Some(&m.project) == key.as_ref(),
-                }
-            }).collect();
-            print_memories(&shown);
+            }
         }
         MemoryCommands::Search { text } => {
             let store = Store::open(&store_path())?;
@@ -364,6 +443,43 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             store.enqueue(&PendingOp::DeleteMemory { id: id.clone() })?;
             println!("Removed {}", id);
             best_effort_sync(&store, &ctx).await;
+        }
+        MemoryCommands::Replace { id, content, valid_at } => {
+            let ctx = build_ctx(false)?;
+            if contains_reserved(&content) {
+                bail!("The text contains the reserved token `atem:memory:`.");
+            }
+            let findings = find_secrets(&content);
+            if !findings.is_empty() {
+                bail!(findings_message(&findings));
+            }
+            let valid_at = valid_at.as_deref().map(parse_date).transpose()?;
+            let store = Store::open(&store_path())?;
+            let old_id = store.resolve_memory_id(&id)?;
+            let old = store.get_memory(&old_id)?.ok_or_else(|| anyhow!("No memory {}", id))?;
+            if let Some(at) = old.invalid_at {
+                bail!(
+                    "{} is already outdated (since {}){}. See `atem memory list --history {}`.",
+                    old.id, format_date(at),
+                    old.superseded_by.as_deref().map(|s| format!(", replaced by {}", s)).unwrap_or_default(),
+                    old.id
+                );
+            }
+            let new_id = sync::replace_memory(&store, &old, &content, valid_at, "cli", &ctx.atem_id)?;
+            println!("Replaced {} with {}", old.id, new_id);
+            best_effort_sync(&store, &ctx).await;
+        }
+        MemoryCommands::Invalidate { id, at } => {
+            let ctx = build_ctx(false)?;
+            let at = at.as_deref().map(parse_date).transpose()?.unwrap_or_else(now_secs);
+            let store = Store::open(&store_path())?;
+            let id = store.resolve_memory_id(&id)?;
+            if sync::invalidate_and_queue(&store, &id, at, None)? {
+                println!("Marked {} outdated as of {}. It's kept in `atem memory list --history`.", id, format_date(at));
+                best_effort_sync(&store, &ctx).await;
+            } else {
+                println!("{} is already outdated; nothing changed.", id);
+            }
         }
         MemoryCommands::Purge { id } => {
             let ctx = build_ctx(false)?;
@@ -395,11 +511,20 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             println!("Astation:   {}", astation_status_line(&astation_id));
             println!("Machine:    {}", ctx.atem_id);
             println!("Project:    {}", ctx.repo.as_ref().map(|r| r.key.as_str()).unwrap_or("(not in a git repo)"));
-            println!("Memories:   {} live", store.live_memories()?.len());
+            let valid = store.live_memories()?.len();
+            let outdated = store.history_memories()?.len() - valid;
+            println!("Memories:   {} valid, {} outdated (kept as history)", valid, outdated);
             println!("Skills:     {} live", store.live_skills()?.len());
             println!("Pending:    {} change(s) waiting to sync", store.pending_count()?);
             println!("Last sync:  {}", if last == 0 { "never".to_string() } else { format!("{}s ago", now_secs() - last) });
             println!("Held back:  {} harvested memory file(s) (possible credentials)", store.held_back_count()?);
+            let forks = store.multi_successors()?;
+            if !forks.is_empty() {
+                println!("Replaced more than once (more than one valid successor — replace or invalidate all but one):");
+                for (old, news) in forks {
+                    println!("  {} → {}", old, news.join(", "));
+                }
+            }
             for agent in Agent::all() {
                 println!("Agent:      {} {}", agent.name(), if agent.discover(&ctx) { "(found)" } else { "(not installed)" });
             }
@@ -510,6 +635,50 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hist(id: &str, content: &str, created: i64, invalid_at: Option<i64>, superseded_by: Option<&str>) -> Memory {
+        Memory {
+            id: id.into(), scope: Scope::Global, content: content.into(), content_hash: content_hash(content),
+            confidence: "high".into(), source_agent: "cli".into(), source_machine: "m".into(), created_at: created,
+            invalid_at, superseded_by: superseded_by.map(str::to_string), ..Default::default()
+        }
+    }
+
+    #[test]
+    fn history_chains_run_oldest_first() {
+        let ms = vec![
+            hist("mem_c", "port 9100", 30, None, None),
+            hist("mem_x", "unrelated", 5, None, None),
+            hist("mem_a", "port 8765", 10, Some(20), Some("mem_b")),
+            hist("mem_b", "port 9000", 20, Some(30), Some("mem_c")),
+        ];
+        let chains: Vec<Vec<String>> = history_chains(&ms).into_iter().map(|c| c.into_iter().map(|m| m.id).collect()).collect();
+        assert_eq!(chains, vec![vec!["mem_x".to_string()], vec!["mem_a".into(), "mem_b".into(), "mem_c".into()]]);
+        let lines = render_history(&history_chains(&ms));
+        assert!(lines[0].starts_with("  1. mem_x"), "{}", lines[0]);
+        assert!(lines[1].starts_with("  2. mem_a") && lines[1].contains("1970-01-01 → 1970-01-01"), "{}", lines[1]);
+        assert!(lines[2].starts_with("     mem_b"), "{}", lines[2]);
+        assert!(lines[3].starts_with("     mem_c") && lines[3].contains("→ now"), "{}", lines[3]);
+        assert_eq!(render_history(&[]), vec!["(no memories)".to_string()]);
+    }
+
+    #[test]
+    fn validity_commands_parse() {
+        use clap::Parser;
+        let ok = |args: &[&str]| crate::cli::Cli::try_parse_from(args).is_ok();
+        assert!(ok(&["atem", "memory", "replace", "1a2b3c4d", "new fact"]));
+        assert!(ok(&["atem", "memory", "replace", "1a2b3c4d", "new fact", "--valid-at", "2026-09-30"]));
+        assert!(ok(&["atem", "memory", "invalidate", "mem_x", "--at", "1790000000"]));
+        assert!(ok(&["atem", "memory", "add", "x", "--valid-at", "2026-09-30"]));
+        let history = |args: &[&str]| match crate::cli::Cli::try_parse_from(args).unwrap().command {
+            Some(crate::cli::Commands::Memory { command: MemoryCommands::List { history, .. } }) => history,
+            _ => panic!("not memory list"),
+        };
+        assert_eq!(history(&["atem", "memory", "list"]), None);
+        assert_eq!(history(&["atem", "memory", "list", "--history"]), Some(None));
+        assert_eq!(history(&["atem", "memory", "list", "--history", "1a2b"]), Some(Some("1a2b".to_string())));
+        assert_eq!(history(&["atem", "memory", "list", "--history", "--all"]), Some(None));
+    }
 
     #[test]
     fn default_scope_depends_on_repo() {

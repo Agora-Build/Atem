@@ -1,6 +1,6 @@
 //! Each machine's local copy (offline-first) plus the outbound queue.
 //! `~/.config/atem/knowledge.db`, mode 0600. Holds no secrets by construction.
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -29,6 +29,7 @@ pub fn skill_cursor_key(account: &str) -> String {
 pub enum PendingOp {
     AddMemory { memory: Memory },
     DeleteMemory { id: String },
+    InvalidateMemory { id: String, invalid_at: i64, superseded_by: Option<String> },
     PushSkill { skill: Skill, base_version: i64 },
     DeleteSkill { scope: Scope, project: String, name: String },
     PurgeSkill { scope: Scope, project: String, name: String, versions: Option<Vec<i64>> },
@@ -36,7 +37,7 @@ pub enum PendingOp {
 
 impl PendingOp {
     pub fn is_memory(&self) -> bool {
-        matches!(self, PendingOp::AddMemory { .. } | PendingOp::DeleteMemory { .. })
+        matches!(self, PendingOp::AddMemory { .. } | PendingOp::DeleteMemory { .. } | PendingOp::InvalidateMemory { .. })
     }
 }
 
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, pay
 CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS harvest_map (
   origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS replacements (new_id TEXT PRIMARY KEY, old_id TEXT NOT NULL);
 ";
 
 /// Full-text index over `memories.content`: external content, and trigram
@@ -286,6 +288,77 @@ impl Store {
         Ok(())
     }
 
+    /// Set `invalid_at` (and `superseded_by`) on a memory that is neither
+    /// deleted nor already invalid. Returns false when nothing changed:
+    /// invalidation is final.
+    pub fn invalidate_memory(&self, id: &str, invalid_at: i64, superseded_by: Option<&str>) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memories SET invalid_at = ?2, superseded_by = ?3 WHERE id = ?1 AND deleted_at IS NULL AND invalid_at IS NULL",
+            params![id, invalid_at, superseded_by],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Local-only note that `new_id` was written to replace `old_id`. The
+    /// relay keeps only the first replacement of a fact (invalidation is
+    /// final), so this is how a second, concurrent replacement is noticed.
+    pub fn record_replacement(&self, new_id: &str, old_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO replacements (new_id, old_id) VALUES (?1, ?2) ON CONFLICT(new_id) DO UPDATE SET old_id = excluded.old_id",
+            params![new_id, old_id],
+        )?;
+        Ok(())
+    }
+
+    /// A full id, or a unique prefix of one. Without `mem_`, the prefix is of
+    /// the part after it (the short id shown in the Codex block). Deleted
+    /// memories never match.
+    pub fn resolve_memory_id(&self, input: &str) -> Result<String> {
+        let input = input.trim();
+        if input.is_empty() {
+            bail!("Pass a memory id");
+        }
+        let prefix = if input.starts_with("mem_") { input.to_string() } else { format!("mem_{}", input) };
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM memories WHERE deleted_at IS NULL AND (id = ?1 OR substr(id, 1, length(?2)) = ?2) ORDER BY id",
+        )?;
+        let ids: Vec<String> = stmt.query_map(params![input, prefix], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if let Some(exact) = ids.iter().find(|i| i.as_str() == input) {
+            return Ok(exact.clone());
+        }
+        match ids.len() {
+            0 => bail!("No memory {}", input),
+            1 => Ok(ids[0].clone()),
+            n => bail!("{} matches {} memories — use more characters of the id (more than one match)", input, n),
+        }
+    }
+
+    /// Facts (not deleted) with more than one valid successor: `(old id,
+    /// [successor ids])`. Links come from `superseded_by` and from this
+    /// machine's `replacements`.
+    pub fn multi_successors(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.old_id, l.new_id FROM (
+                 SELECT id AS old_id, superseded_by AS new_id FROM memories WHERE superseded_by IS NOT NULL
+                 UNION SELECT old_id, new_id FROM replacements
+             ) l
+             JOIN memories o ON o.id = l.old_id
+             JOIN memories s ON s.id = l.new_id
+             WHERE o.deleted_at IS NULL AND s.deleted_at IS NULL AND s.invalid_at IS NULL
+             ORDER BY l.old_id, l.new_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for row in rows {
+            let (old, new) = row?;
+            match out.last_mut() {
+                Some((o, v)) if *o == old => v.push(new),
+                _ => out.push((old, vec![new])),
+            }
+        }
+        Ok(out.into_iter().filter(|(_, v)| v.len() > 1).collect())
+    }
+
     pub fn set_memory_seq(&self, id: &str, seq: i64) -> Result<()> {
         self.conn.execute("UPDATE memories SET seq = ?2 WHERE id = ?1", params![id, seq])?;
         Ok(())
@@ -303,6 +376,27 @@ impl Store {
             self.conn.execute("UPDATE memories SET id = ?2 WHERE id = ?1", params![old, new])?;
         }
         self.conn.execute("UPDATE harvest_map SET memory_id = ?2 WHERE memory_id = ?1", params![old, new])?;
+        self.conn.execute("UPDATE memories SET superseded_by = ?2 WHERE superseded_by = ?1", params![old, new])?;
+        self.conn.execute("UPDATE OR REPLACE replacements SET new_id = ?2 WHERE new_id = ?1", params![old, new])?;
+        self.conn.execute("UPDATE replacements SET old_id = ?2 WHERE old_id = ?1", params![old, new])?;
+        // Queued ops that still name the old id (e.g. replace's invalidate,
+        // when a chunk boundary fell after its add).
+        for (n, op) in self.pending()? {
+            let fixed = match op {
+                PendingOp::InvalidateMemory { id, invalid_at, superseded_by }
+                    if id == old || superseded_by.as_deref() == Some(old) =>
+                {
+                    PendingOp::InvalidateMemory {
+                        id: if id == old { new.to_string() } else { id },
+                        invalid_at,
+                        superseded_by: superseded_by.map(|s| if s == old { new.to_string() } else { s }),
+                    }
+                }
+                PendingOp::DeleteMemory { id } if id == old => PendingOp::DeleteMemory { id: new.to_string() },
+                _ => continue,
+            };
+            self.replace_pending(n, &fixed)?;
+        }
         Ok(())
     }
 
@@ -359,6 +453,11 @@ impl Store {
 
     pub fn ack(&self, n: i64) -> Result<()> {
         self.conn.execute("DELETE FROM pending_ops WHERE n = ?1", params![n])?;
+        Ok(())
+    }
+
+    pub fn replace_pending(&self, n: i64, op: &PendingOp) -> Result<()> {
+        self.conn.execute("UPDATE pending_ops SET payload = ?2 WHERE n = ?1", params![n, serde_json::to_string(op)?])?;
         Ok(())
     }
 
@@ -434,6 +533,60 @@ mod tests {
     use super::*;
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn resolve_accepts_full_ids_and_unique_prefixes() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_1a2b3c4d5e", "A")).unwrap();
+        s.upsert_memory(&mem("mem_1a2bffff", "B")).unwrap();
+        s.upsert_memory(&mem("mem_9999", "C")).unwrap();
+        s.mark_memory_deleted("mem_9999").unwrap();
+        assert_eq!(s.resolve_memory_id("mem_1a2b3c4d5e").unwrap(), "mem_1a2b3c4d5e");
+        assert_eq!(s.resolve_memory_id("1a2b3c4d").unwrap(), "mem_1a2b3c4d5e");
+        assert_eq!(s.resolve_memory_id("mem_1a2bf").unwrap(), "mem_1a2bffff");
+        assert!(s.resolve_memory_id("1a2b").unwrap_err().to_string().contains("more than one"));
+        assert!(s.resolve_memory_id("9999").unwrap_err().to_string().contains("No memory"));
+        assert!(s.resolve_memory_id("zz").is_err());
+    }
+
+    #[test]
+    fn invalidate_is_final_locally() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_a", "A")).unwrap();
+        assert!(s.invalidate_memory("mem_a", 10, Some("mem_b")).unwrap());
+        assert!(!s.invalidate_memory("mem_a", 20, None).unwrap());
+        s.upsert_memory(&mem("mem_d", "D")).unwrap();
+        s.mark_memory_deleted("mem_d").unwrap();
+        assert!(!s.invalidate_memory("mem_d", 20, None).unwrap());
+        let a = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((a.invalid_at, a.superseded_by.as_deref(), a.content.as_str()), (Some(10), Some("mem_b"), "A"));
+    }
+
+    #[test]
+    fn two_valid_successors_are_reported() {
+        let s = Store::open_in_memory().unwrap();
+        let mut x = mem("mem_x", "X");
+        x.invalid_at = Some(5);
+        x.superseded_by = Some("mem_a".into());
+        s.upsert_memory(&x).unwrap();
+        s.upsert_memory(&mem("mem_a", "A")).unwrap();
+        s.upsert_memory(&mem("mem_b", "B")).unwrap();
+        assert!(s.multi_successors().unwrap().is_empty());
+        // This machine's replacement lost the race on the relay: only the local table knows.
+        s.record_replacement("mem_b", "mem_x").unwrap();
+        assert_eq!(s.multi_successors().unwrap(), vec![("mem_x".to_string(), vec!["mem_a".to_string(), "mem_b".to_string()])]);
+        s.invalidate_memory("mem_b", 6, None).unwrap();
+        assert!(s.multi_successors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalidate_op_is_a_memory_op() {
+        let op = PendingOp::InvalidateMemory { id: "mem_a".into(), invalid_at: 5, superseded_by: None };
+        assert!(op.is_memory());
+        let s = Store::open_in_memory().unwrap();
+        s.enqueue(&op).unwrap();
+        assert_eq!(s.pending().unwrap()[0].1, op);
+    }
 
     fn ids(ms: Vec<Memory>) -> Vec<String> {
         ms.into_iter().map(|m| m.id).collect()

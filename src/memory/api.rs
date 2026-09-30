@@ -28,6 +28,7 @@ pub fn op_to_wire(op: &PendingOp) -> Value {
     match op {
         PendingOp::AddMemory { memory } => json!({"op": "add", "memory": memory}),
         PendingOp::DeleteMemory { id } => json!({"op": "delete", "id": id}),
+        PendingOp::InvalidateMemory { id, invalid_at, superseded_by } => json!({"op": "invalidate", "id": id, "invalid_at": invalid_at, "superseded_by": superseded_by}),
         PendingOp::PushSkill { skill, base_version } => json!({"op": "push", "skill": skill, "base_version": base_version}),
         PendingOp::DeleteSkill { scope, project, name } => json!({"op": "delete", "scope": scope, "project": project, "name": name}),
         PendingOp::PurgeSkill { scope, project, name, versions } => json!({"op": "purge", "scope": scope, "project": project, "name": name, "versions": versions}),
@@ -195,6 +196,18 @@ mod tests {
     use crate::memory::model::{content_hash, skill_hash, Scope};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn invalidate_wire() {
+        let op = PendingOp::InvalidateMemory { id: "mem_old".into(), invalid_at: 1790000000, superseded_by: Some("mem_new".into()) };
+        assert_eq!(op_to_wire(&op), json!({"op": "invalidate", "id": "mem_old", "invalid_at": 1790000000, "superseded_by": "mem_new"}));
+        let bare = PendingOp::InvalidateMemory { id: "mem_old".into(), invalid_at: 5, superseded_by: None };
+        assert_eq!(op_to_wire(&bare)["superseded_by"], serde_json::Value::Null);
+        // A replace's add carries valid_at to the relay.
+        let mut m = sample();
+        m.valid_at = Some(1690000000);
+        assert_eq!(op_to_wire(&PendingOp::AddMemory { memory: m })["memory"]["valid_at"], 1690000000);
+    }
 
     fn sample() -> Memory {
         Memory {

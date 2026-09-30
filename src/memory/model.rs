@@ -184,6 +184,90 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// The short id shown in the Codex block: the first 8 characters after `mem_`.
+pub fn short_id(id: &str) -> &str {
+    let rest = id.strip_prefix("mem_").unwrap_or(id);
+    match rest.char_indices().nth(8) {
+        Some((i, _)) => &rest[..i],
+        None => rest,
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The inverse of `days_from_civil`: (year, month, day).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        _ => 28,
+    }
+}
+
+/// The one date parser for `--valid-at` / `--at`: `YYYY-MM-DD` (midnight
+/// UTC) or unix seconds. The result must be after the epoch.
+pub fn parse_date(s: &str) -> Result<i64> {
+    let t = s.trim();
+    let bad = || anyhow!("invalid date {:?}: use YYYY-MM-DD (UTC) or unix seconds", s);
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    let secs = if digits(t) {
+        t.parse::<i64>().map_err(|_| bad())?
+    } else {
+        let parts: Vec<&str> = t.split('-').collect();
+        if parts.len() != 3 {
+            return Err(bad());
+        }
+        let (y, m, d) = (parts[0], parts[1], parts[2]);
+        if y.len() != 4 || m.len() != 2 || d.len() != 2 || !digits(y) || !digits(m) || !digits(d) {
+            return Err(bad());
+        }
+        let (y, m, d): (i64, i64, i64) = (y.parse()?, m.parse()?, d.parse()?);
+        if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+            return Err(bad());
+        }
+        days_from_civil(y, m, d) * 86_400
+    };
+    if secs <= 0 {
+        return Err(bad());
+    }
+    Ok(secs)
+}
+
+/// `YYYY-MM-DD` (UTC).
+pub fn format_date(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC).
+pub fn format_datetime(secs: i64) -> String {
+    let s = secs.rem_euclid(86_400);
+    format!("{} {:02}:{:02}", format_date(secs), s / 3600, (s % 3600) / 60)
+}
+
 /// Sort key: high (0) before medium (1) before anything else (2).
 pub fn confidence_rank(c: &str) -> u8 {
     match c {
@@ -223,6 +307,29 @@ pub mod b64map {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_id_is_eight_chars_after_prefix() {
+        assert_eq!(short_id("mem_1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"), "1a2b3c4d");
+        assert_eq!(short_id("mem_abc"), "abc");
+        assert_eq!(short_id("xyz123456789"), "xyz12345");
+    }
+
+    #[test]
+    fn dates_parse_as_utc_midnight_or_unix_seconds() {
+        assert_eq!(parse_date("2026-09-30").unwrap(), 1_790_726_400);
+        assert_eq!(parse_date("2024-02-29").unwrap(), 1_709_164_800);
+        assert_eq!(parse_date("2000-03-01").unwrap(), 951_868_800);
+        assert_eq!(parse_date(" 1790000000 ").unwrap(), 1_790_000_000);
+        for bad in ["", "2026-13-01", "2026-02-30", "2025-02-29", "26-09-30", "2026/09/30", "1970-01-01", "0", "-5", "soon"] {
+            assert!(parse_date(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(format_date(1_790_726_400), "2026-09-30");
+        assert_eq!(format_datetime(1_791_036_600), "2026-10-03 14:10");
+        for s in ["2026-10-02", "2024-02-29", "2000-03-01", "1999-12-31"] {
+            assert_eq!(format_date(parse_date(s).unwrap()), s);
+        }
+    }
 
     #[test]
     fn memory_wire_keeps_deleted_flag_and_new_fields() {
