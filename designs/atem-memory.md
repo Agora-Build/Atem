@@ -246,6 +246,7 @@ there's no window where it's readable by others:
 | `GET /api/memory?since=<seq>&limit=<n>` | Pull memory rows (tombstones included; *planned:* invalidations too, with the validity fields) with `seq > since`. |
 | `POST /api/skills/batch` | Push skill ops (`push`, `delete`, `purge`). |
 | `GET /api/skills?since=<seq>&limit=<n>` | Pull skill versions with `seq > since`. |
+| *Planned:* `GET /api/skills/versions`, `GET /api/skills/version` | Skill history and one old version's files (see "Skill history and restore"). |
 
 Rules:
 
@@ -444,6 +445,8 @@ atem memory add … --valid-at <date>
 atem memory list --history [<id>]   # include invalid facts, show replacement chains
 atem memory search "<query>" [--scope …] [--project <key>] [--history] [--limit <n>]
                                     # FTS5 + BM25, trigram (works for CJK)
+atem skill history <name> [--scope …]              # every version (asks the relay)
+atem skill restore <name> --version <n> [--scope …]  # re-push version n as a new version
 
 atem memory apply                   # rewrite the managed blocks from the local store
 
@@ -616,6 +619,11 @@ lives.
     line in the block.
   - **Relay:** the `invalidate` op (unknown id ok, content unchanged, new
     `seq`, account isolation) and the dedup index ignoring invalid rows.
+    Skill `versions` and `version`: newest first, no files in the list,
+    404 unknown, 410 purged, another account's skill invisible.
+  - **Skill restore:** creates a new version with the old files, keeps
+    the history, refuses purged versions, re-runs the secret check, and
+    reports when offline.
   - **E2E:** A replaces a fact, B syncs, and the old fact leaves B's
     `CLAUDE.md` but is still in B's `memory list --history`.
 
@@ -780,6 +788,56 @@ facts are dropped silently. With search:
   telling the agent to run `atem memory search "<query>"` for the rest.
 - Phase 2's `atem mcp` exposes the same search as a `memory_search` tool.
 
+## Skill history and restore
+
+Status: design, not built yet.
+
+When two machines push the same skill at once, the later push becomes the
+latest version. The other version is kept on the relay, but there's no way
+to see or get it back. These two commands fix that.
+
+```
+atem skill history <name> [--scope …]            # list every version
+atem skill restore <name> --version <n> [--scope …]
+```
+
+`history` prints one line per version, newest first:
+
+```
+v5  latest   2026-10-02 14:10  mac-mini    claude   4 files
+v4           2026-10-02 14:09  genie       codex    4 files   ← concurrent push
+v3           2026-09-28 09:31  genie       cli      3 files
+v2  deleted  2026-09-20 17:02  mac-mini    cli
+v1  purged   2026-09-18 11:45  genie       claude
+```
+
+`restore` pushes the files of version *n* as a **new** version, based on the
+current latest. It's an ordinary push, so:
+
+- History is never rewritten. Restoring v4 over v5 creates v6 with v4's
+  files, and v5 stays in the history.
+- It syncs to every machine like any other push, and it takes part in the
+  usual concurrency and drift rules.
+- Restoring a deleted skill's earlier version brings the skill back.
+- A **purged** version can't be restored: its files were erased. A
+  **deleted** marker has no files to restore.
+- The files are secret-checked again before the push, like `skill add`.
+
+Where the data comes from: the local store keeps only the latest version of
+each skill, so both commands ask the relay. They need a connection and say
+so plainly when offline.
+
+New relay endpoints, with the same auth and account isolation as the other
+skill routes:
+
+| Method & path | Returns |
+|---|---|
+| `GET /api/skills/versions?scope=&project=&name=` | `{"versions":[{version, created_at, source_agent, source_machine, file_count, deleted, purged}]}`, newest first. No file contents. |
+| `GET /api/skills/version?scope=&project=&name=&version=<n>` | `{"skill": <skill row with files>}`. 404 for an unknown version; 410 for a purged one. |
+
+The concurrent-push note gains a pointer: *"… both versions are kept and v5
+is now the latest. See them with `atem skill history <name>`."*
+
 ## Future: semantic search and relationships
 
 Not planned. Build these only if an evaluation shows keyword search isn't
@@ -823,7 +881,7 @@ test.
 | Phase | Scope |
 |---|---|
 | **1 (MVP)** | Everything in this doc not marked *planned*. Built |
-| **1.1** | Fact validity and local Search (the *planned* items) |
+| **1.1** | Fact validity, local Search, and Skill history and restore (the *planned* items) |
 | 2 | `atemd` plus session-start hooks (sync and apply automatically, which also fixes worktrees). An `atem mcp` server with `memory_add` and `memory_search` tools, so agents save and search memory directly; this matters most for Codex, whose hooks are weaker |
 | 3 | A guarded nightly clean-up pass: back up first, run the LLM, sanity-check the result, restore the backup on failure. It merges duplicates, promotes project facts that apply everywhere to global, and flags contradictions. Also harvest session transcripts into searchable history before Claude deletes them (30 days by default), and distill them into memory |
 | 4 | Settings, MCP definitions, and hooks, with portable and machine-local fields separated and credential values replaced by references to the credential feature. Gemini and OpenCode adapters |
