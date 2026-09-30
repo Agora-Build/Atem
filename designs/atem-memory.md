@@ -1,10 +1,10 @@
 # Atem Memory — shared memory and skills for AI coding agents
 
 Status: built. MVP: Atem #23, #24; relay Astation #19. Phase 1.1 (**Fact
-validity**, **Search**, **Skill history and restore**): relay migrations
-0004/0005 and atem `feat/memory-1.1`. Spans two repos: **Atem** (CLI, local
-store, adapters, sync client) and **Astation** (relay-server `/api/memory`,
-`/api/skills` + Postgres).
+validity**, **Search**, **Skill history and restore**): relay side (migrations
+0004/0005) merged and deployed (Astation PR #22); atem `feat/memory-1.1`.
+Spans two repos: **Atem** (CLI, local store, adapters, sync client) and
+**Astation** (relay-server `/api/memory`, `/api/skills` + Postgres).
 
 ## Goal
 
@@ -763,9 +763,14 @@ LLM.
 
 ### Compatibility
 
-- Deploy the relay first. An older relay rejects the unknown `invalidate` op
-  with 400, so the whole batch stays queued and nothing is lost. It's sent
-  once the relay is updated.
+- The production relay is updated (Astation PR #22). A self-hosted relay
+  older than that rejects the unknown `invalidate` op with 400: that batch
+  and every memory change queued after the first invalidate wait, and sync
+  says "This relay doesn't support outdating facts yet — update the relay
+  (Astation)". Nothing is lost; it all goes out once the relay is updated.
+- An older atem's delete of a fact that newer atems invalidated erases
+  that fact's history text on the relay (the delete wins). Update every
+  machine.
 - An older atem ignores the new fields, so on that machine an invalid fact
   still looks valid until it's updated. Nothing breaks, but the
   release notes should say to update every machine.
