@@ -367,17 +367,31 @@ async fn send_chunk(store: &Store, client: &KnowledgeClient, chunk: &[(i64, Pend
 /// remaining ops stay queued, preserving order). A chunk the relay refuses
 /// as too large (413) is retried one op at a time; a single op that is still
 /// too large is never acked — it stays queued with a note.
-async fn push_group(store: &Store, client: &KnowledgeClient, group: &[(i64, PendingOp)], is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
-    for chunk in group.chunks(chunk_size) {
+///
+/// Every send re-reads its ops from the queue: an earlier chunk's results
+/// can rewrite still-queued ops (a relay canonical id), and the relay only
+/// knows the rewritten ids. `after` is the last op sent, so each send moves
+/// strictly forward in queue order.
+async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
+    let queued_after = |after: i64| -> Result<Vec<(i64, PendingOp)>> {
+        Ok(store.pending()?.into_iter().filter(|(n, op)| *n > after && op.is_memory() == is_mem).collect())
+    };
+    let mut after = i64::MIN;
+    loop {
         if out.offline {
             return Ok(());
         }
-        match send_chunk(store, client, chunk, is_mem, out).await? {
+        let chunk: Vec<_> = queued_after(after)?.into_iter().take(chunk_size).collect();
+        let Some(&(last, _)) = chunk.last() else { return Ok(()) };
+        match send_chunk(store, client, &chunk, is_mem, out).await? {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(ApiError::Http(413, _)) if chunk.len() > 1 => {
-                for one in chunk.chunks(1) {
-                    match send_chunk(store, client, one, is_mem, out).await? {
+                for n in chunk.iter().map(|(n, _)| *n) {
+                    // Re-fetched by `n`: an earlier single op may have rewritten it.
+                    let Some(one) = store.pending()?.into_iter().find(|(m, _)| *m == n) else { continue };
+                    let one = [one];
+                    match send_chunk(store, client, &one, is_mem, out).await? {
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
                         Err(e) => {
@@ -393,15 +407,13 @@ async fn push_group(store: &Store, client: &KnowledgeClient, group: &[(i64, Pend
                 return Ok(());
             }
         }
+        after = last;
     }
-    Ok(())
 }
 
 async fn push_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome) -> Result<()> {
-    let pending = store.pending()?;
-    let (mem_ops, skill_ops): (Vec<_>, Vec<_>) = pending.into_iter().partition(|(_, op)| op.is_memory());
-    push_group(store, client, &mem_ops, true, MEMORY_PUSH_CHUNK, out).await?;
-    push_group(store, client, &skill_ops, false, SKILL_PUSH_CHUNK, out).await?;
+    push_group(store, client, true, MEMORY_PUSH_CHUNK, out).await?;
+    push_group(store, client, false, SKILL_PUSH_CHUNK, out).await?;
     Ok(())
 }
 
@@ -1147,6 +1159,94 @@ mod tests {
         // Skills are a separate group and still go out.
         assert_eq!(posted, vec!["add,add,add", "add", "add", "delete"]);
         assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+    }
+
+    /// A relay that dedups the add of `dup_content` onto `mem_canon` and
+    /// accepts everything else; 413s any batch bigger than `max_ops`.
+    fn dedup_relay(dup_content: &'static str, max_ops: usize) -> Box<Handler> {
+        Box::new(move |m, p, body| {
+            if let Some(r) = empty_pulls(m, p) {
+                return r;
+            }
+            let ops = body["ops"].as_array().unwrap();
+            if ops.len() > max_ops {
+                return (413, serde_json::json!({"error": "request body too large"}));
+            }
+            let results: Vec<_> = ops.iter().enumerate().map(|(i, o)| {
+                if o["op"] == "add" && o["memory"]["content"] == dup_content {
+                    serde_json::json!({"ok": true, "seq": i + 1, "canonical_id": "mem_canon"})
+                } else {
+                    serde_json::json!({"ok": true, "seq": i + 1})
+                }
+            }).collect();
+            (200, serde_json::json!({"results": results}))
+        })
+    }
+
+    fn posted_ops(log: &std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) -> Vec<Vec<serde_json::Value>> {
+        log.lock().unwrap().iter().filter(|(m, _, _)| m == "POST")
+            .map(|(_, _, b)| b["ops"].as_array().unwrap().clone()).collect()
+    }
+
+    fn fillers(s: &Store, n: usize) {
+        let names: Vec<String> = (0..n).map(|i| format!("filler{i}")).collect();
+        queue_memories(s, &names.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn later_chunk_sends_the_canonical_successor() {
+        let s = Store::open_in_memory().unwrap();
+        let old = valid("mem_old", "port 8765");
+        s.upsert_memory(&old).unwrap();
+        fillers(&s, MEMORY_PUSH_CHUNK - 1);
+        // The add is op 50 (end of chunk 1); the invalidate is op 51.
+        replace_memory(&s, &old, "port 9000", None, "cli", "m1").unwrap();
+        let (base, log) = stub_relay(dedup_relay("port 9000", usize::MAX)).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        let posts = posted_ops(&log);
+        assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![MEMORY_PUSH_CHUNK, 1]);
+        assert_eq!(posts[1][0]["op"], "invalidate");
+        assert_eq!(posts[1][0]["id"], "mem_old");
+        assert_eq!(posts[1][0]["superseded_by"], "mem_canon");
+        assert_eq!(s.pending_count().unwrap(), 0);
+        assert_eq!(s.get_memory("mem_old").unwrap().unwrap().superseded_by.as_deref(), Some("mem_canon"));
+    }
+
+    #[tokio::test]
+    async fn later_chunk_invalidates_the_canonical_id() {
+        let s = Store::open_in_memory().unwrap();
+        fillers(&s, MEMORY_PUSH_CHUNK - 1);
+        queue_memories(&s, &["dup"]); // op 50: add mem_dup
+        assert!(invalidate_and_queue(&s, "mem_dup", 5, None).unwrap()); // op 51
+        let (base, log) = stub_relay(dedup_relay("dup", usize::MAX)).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        let posts = posted_ops(&log);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[1][0]["op"], "invalidate");
+        assert_eq!(posts[1][0]["id"], "mem_canon");
+        assert_eq!(s.pending_count().unwrap(), 0);
+        assert_eq!(s.get_memory("mem_canon").unwrap().unwrap().invalid_at, Some(5));
+    }
+
+    #[tokio::test]
+    async fn one_at_a_time_retry_sends_the_canonical_successor() {
+        let s = Store::open_in_memory().unwrap();
+        let old = valid("mem_old", "port 8765");
+        s.upsert_memory(&old).unwrap();
+        replace_memory(&s, &old, "port 9000", None, "cli", "m1").unwrap();
+        let (base, log) = stub_relay(dedup_relay("port 9000", 1)).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        let posts = posted_ops(&log);
+        assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1, 1]);
+        assert_eq!(posts[2][0]["op"], "invalidate");
+        assert_eq!(posts[2][0]["superseded_by"], "mem_canon");
+        assert_eq!(s.pending_count().unwrap(), 0);
     }
 
     #[tokio::test]
