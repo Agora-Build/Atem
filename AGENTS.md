@@ -183,7 +183,7 @@ Key methods:
 
 **Identity** (`config.rs`, `websocket_client.rs`):
 - `instance_id` — persistent UUID v4, the canonical atem identity (and the vault `client_id`). Generated once by `ensure_instance_id()`, stored in `config.toml`.
-- `atem_id` — the relay-room id `<host:12>-<suffix:8>`, generated once (`build_atem_id`) and frozen in `config.toml` so it survives restarts and hostname changes. Keeps non-ASCII hostnames (Chinese/Japanese/Korean), restricts ASCII to `[A-Za-z0-9-]`, percent-encoded into the relay URL. See `designs/atem-identity.md`.
+- `atem_id` — the relay-room id `<host>[-<filler>]-<suffix:8>` (host + filler = 12 chars; e.g. `Genie-dc1649f-956631ec`), generated once (`build_atem_id`) and frozen in `config.toml` so it survives restarts and hostname changes. Keeps non-ASCII hostnames (Chinese/Japanese/Korean), restricts ASCII to `[A-Za-z0-9-]`, percent-encoded into the relay URL. See `designs/atem-identity.md`.
 
 **Credentials** (`credentials.rs`):
 - `CredentialStore` wraps `Vec<CredentialEntry>`, AES-256-GCM encryption with HMAC-SHA256(machine-id) key derivation — file cannot be decrypted on another machine

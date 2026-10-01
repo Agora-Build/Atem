@@ -18,7 +18,7 @@ whenever the hostname changed.
 | Id | Form | Purpose | Persisted |
 |----|------|---------|-----------|
 | `instance_id` | UUID v4 (e.g. `550e8400-e29b-41d4-a716-446655440000`) | canonical unique identity; the value `atem_id` is derived from; the vault client id | `config.toml` |
-| `atem_id` | `<host:12>-<suffix:8>` (e.g. `MacBook-Prol-550e8400`) | relay room disambiguation + a human-readable id in relay logs / the instance list | `config.toml` |
+| `atem_id` | `<host>[-<filler>]-<suffix:8>`, host + filler = 12 chars (e.g. `mbp-e29b41d4a-550e8400`) | relay room disambiguation + a human-readable id in relay logs / the instance list | `config.toml` |
 
 Both are generated once and frozen, so they survive restarts. `atem_id` is also
 frozen against hostname changes (it's stored, not recomputed each connect).
@@ -38,10 +38,14 @@ Derived once from hostname + `instance_id`, then stored (`store_atem_id` /
 `stored_atem_id`). On connect: reuse the stored value if present, else build +
 store.
 
-**Shape:** `<host>-<suffix>`, 21 chars in the common case.
+**Shape:** `<host>-<filler>-<suffix>` for a short hostname, `<host>-<suffix>`
+when the hostname is 12 characters or longer.
 
-- **Host segment** — normalized to exactly **12 characters** (counted in chars,
-  not bytes — CJK is multibyte). Truncated if longer, padded if shorter.
+- **Host segment**: the hostname, truncated to **12 characters** (counted in
+  chars, not bytes; CJK is multibyte). A shorter hostname is followed by a `-`
+  and filler chars so hostname + filler is 12 characters. The `-` keeps the real
+  hostname readable (`Genie-dc1649f-…`, not `Geniedc1649f-…`). There is no
+  separator when the hostname is empty or already ends in `-`.
 - **Suffix** — the first 8 alphanumerics of `instance_id` (the first UUID block,
   e.g. `550e8400`). This is what guarantees global uniqueness: two machines that
   share a hostname differ in the suffix.
@@ -53,22 +57,24 @@ store.
 - **ASCII** is restricted to `[A-Za-z0-9-]`. Dots, underscores, and other
   punctuation are dropped.
 
-**Padding** for short hostnames is drawn from the `instance_id` pool (the chars
+**Filler** for short hostnames is drawn from the `instance_id` pool (the chars
 after the 8 used for the suffix), so it looks varied but is **stable** across
 restarts rather than fresh-random.
 
-Examples:
+Examples (instance id `550e8400-e29b-41d4-a716-446655440000`):
 
-| Hostname | `atem_id` (suffix from `550e8400-…`) |
-|----------|--------------------------------------|
-| `MacBook-Pro.local` | `MacBook-Prol-550e8400` (dot dropped, truncated to 12) |
-| `host-01.lan` | `host-01lanXX-550e8400` (digits kept, padded) |
-| `mbp` | `mbpXXXXXXXXX-550e8400` (padded to 12) |
-| `我的电脑` | `我的电脑XXXXXXXX-550e8400` (CJK kept, padded) |
-| `私のパソコン端末` | `私のパソコン端末XXXX-550e8400` |
-| `내컴퓨터` | `내컴퓨터XXXXXXXX-550e8400` |
+| Hostname | `atem_id` |
+|----------|-----------|
+| `MacBook-Pro.local` | `MacBook-Prol-550e8400` (dot dropped, truncated to 12, no filler) |
+| `host-01.lan` | `host-01lan-e2-550e8400` (digits kept, 2 filler chars) |
+| `mbp` | `mbp-e29b41d4a-550e8400` |
+| `私のパソコン端末` | `私のパソコン端末-e29b-550e8400` (CJK kept, counted in chars) |
+| `내컴퓨터` | `내컴퓨터-e29b41d4-550e8400` |
+| `web-` | `web-e29b41d4-550e8400` (no double dash) |
 
-(`X` = stable padding from the instance-id pool.)
+Ids generated before this rule (2026-10-01) have no separator, for example
+`Geniedc1649f-956631ec`. They stay as they are because `atem_id` is frozen in
+`config.toml`; only new installs use the new shape.
 
 ## URL handling
 

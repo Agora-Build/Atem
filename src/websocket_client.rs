@@ -1198,15 +1198,17 @@ const ATEM_ID_HOST_LEN: usize = 12;
 /// Length of the instance-id suffix of an `atem_id`.
 const ATEM_ID_SUFFIX_LEN: usize = 8;
 
-/// Build the relay `atem_id`: `<host:12>-<instance suffix:8>` (21 chars).
+/// Build the relay `atem_id`: `<host>[-<filler>]-<instance suffix:8>`.
 ///
 /// Lengths are counted in **characters**, not bytes (CJK chars are multibyte).
 /// Host charset: non-ASCII chars (CJK etc.) are kept as-is; ASCII is restricted
-/// to `[A-Za-z0-9-]` (dots, underscores, and other punctuation are dropped). The
-/// host is normalized to [`ATEM_ID_HOST_LEN`] chars — truncated if longer, padded
-/// if shorter. Padding and suffix are drawn from the instance-id hex (the suffix
-/// is the first UUID block), so the id is unique per install and *stable* across
-/// restarts, never fresh-random.
+/// to `[A-Za-z0-9-]` (dots, underscores, and other punctuation are dropped). A
+/// host longer than [`ATEM_ID_HOST_LEN`] chars is truncated; a shorter one is
+/// followed by a `-` and filler chars so host + filler is
+/// [`ATEM_ID_HOST_LEN`] chars (`Genie` → `Genie-dc1649f-956631ec`). Filler and
+/// suffix are drawn from the instance-id hex (the suffix is the first UUID
+/// block), so the id is unique per install and *stable* across restarts, never
+/// fresh-random.
 ///
 /// Because non-ASCII is allowed, the value must be percent-encoded before it
 /// goes into the relay URL (see `connect_relay_identity`).
@@ -1236,18 +1238,22 @@ fn build_atem_id(hostname: &str, instance_id: &str) -> String {
 
     let suffix: String = pool.iter().take(ATEM_ID_SUFFIX_LEN).collect();
 
-    // Pad the host segment to a uniform width using letters from the instance-id
-    // pool, drawn after the suffix chars so padding and suffix differ.
+    // Fill a short host up to a uniform width using chars from the instance-id
+    // pool, drawn after the suffix chars so filler and suffix differ. A `-`
+    // separates the real hostname from the filler (not when the host is empty
+    // or already ends in `-`).
     let pad: Vec<char> = pool.iter().skip(ATEM_ID_SUFFIX_LEN).copied().collect();
-    let mut i = 0;
-    while host.len() < ATEM_ID_HOST_LEN {
+    let fill = ATEM_ID_HOST_LEN.saturating_sub(host.len());
+    if fill > 0 && host.last().is_some_and(|&c| c != '-') {
+        host.push('-');
+    }
+    for i in 0..fill {
         let c = if pad.is_empty() {
             pool[i % pool.len()]
         } else {
             pad[i % pad.len()]
         };
         host.push(c);
-        i += 1;
     }
 
     let host: String = host.into_iter().collect();
@@ -3011,15 +3017,39 @@ mod tests {
         );
     }
 
+    // Instance id 550e8400-e29b-41d4-a716-446655440000 → suffix "550e8400",
+    // filler drawn from "e29b41d4a716446655440000".
+    const UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
     #[test]
-    fn atem_id_drops_dots_keeps_digits_and_truncates_to_12() {
-        // Dot dropped; "host01" digits kept: "host-01.lan" → "host-01lan" → padded.
-        let id = build_atem_id("host-01.lan", "550e8400-e29b-41d4-a716-446655440000");
-        let (host, suffix) = id.rsplit_once('-').unwrap();
-        assert!(host.starts_with("host-01lan"));
-        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
-        assert_eq!(suffix, "550e8400"); // first UUID block
+    fn atem_id_drops_dots_keeps_digits_and_fills_to_12() {
+        // Dot dropped: "host-01.lan" → "host-01lan" (10) → "-" + 2 filler chars.
+        let id = build_atem_id("host-01.lan", UUID_A);
+        assert_eq!(id, "host-01lan-e2-550e8400");
         assert_atem_id_charset(&id);
+    }
+
+    #[test]
+    fn atem_id_separates_hostname_from_filler() {
+        // The example that motivated the dash.
+        let id = build_atem_id("Genie", "956631ec-dc16-49f2-b546-86ca45ce7926");
+        assert_eq!(id, "Genie-dc1649f-956631ec");
+    }
+
+    #[test]
+    fn atem_id_has_no_filler_or_extra_dash_at_exactly_12() {
+        assert_eq!(build_atem_id("MacBookPro20", UUID_A), "MacBookPro20-550e8400");
+    }
+
+    #[test]
+    fn atem_id_does_not_double_a_trailing_dash() {
+        assert_eq!(build_atem_id("web-", UUID_A), "web-e29b41d4-550e8400");
+    }
+
+    #[test]
+    fn atem_id_is_filler_only_for_an_empty_hostname() {
+        // "..." sanitizes to nothing: no leading dash.
+        assert_eq!(build_atem_id("...", UUID_A), "e29b41d4a716-550e8400");
     }
 
     #[test]
@@ -3031,42 +3061,31 @@ mod tests {
     }
 
     #[test]
-    fn atem_id_pads_short_hostname_to_12() {
-        let id = build_atem_id("mbp", "550e8400-e29b-41d4-a716-446655440000");
-        let (host, _suffix) = id.rsplit_once('-').unwrap();
-        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
-        assert!(host.starts_with("mbp"));
+    fn atem_id_fills_short_hostname_to_12() {
+        let id = build_atem_id("mbp", UUID_A);
+        assert_eq!(id, "mbp-e29b41d4a-550e8400");
         assert_atem_id_charset(&id);
     }
 
     #[test]
     fn atem_id_keeps_chinese_hostname() {
         let id = build_atem_id("我的电脑", "abcdef12-3456-7890-abcd-ef1234567890");
-        let (host, suffix) = id.rsplit_once('-').unwrap();
-        assert!(host.starts_with("我的电脑"));
-        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
-        assert_eq!(suffix, "abcdef12");
+        assert_eq!(id, "我的电脑-34567890-abcdef12");
         assert_atem_id_charset(&id);
     }
 
     #[test]
     fn atem_id_keeps_japanese_hostname() {
-        // Mixed kanji + hiragana + katakana.
-        let id = build_atem_id("私のパソコン端末", "550e8400-e29b-41d4-a716-446655440000");
-        let (host, suffix) = id.rsplit_once('-').unwrap();
-        assert!(host.starts_with("私のパソコン端末"));
-        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
-        assert_eq!(suffix, "550e8400");
+        // Mixed kanji + hiragana + katakana; filler counted in chars.
+        let id = build_atem_id("私のパソコン端末", UUID_A);
+        assert_eq!(id, "私のパソコン端末-e29b-550e8400");
         assert_atem_id_charset(&id);
     }
 
     #[test]
     fn atem_id_keeps_korean_hostname() {
-        let id = build_atem_id("내컴퓨터", "550e8400-e29b-41d4-a716-446655440000");
-        let (host, suffix) = id.rsplit_once('-').unwrap();
-        assert!(host.starts_with("내컴퓨터"));
-        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
-        assert_eq!(suffix, "550e8400");
+        let id = build_atem_id("내컴퓨터", UUID_A);
+        assert_eq!(id, "내컴퓨터-e29b41d4-550e8400");
         assert_atem_id_charset(&id);
     }
 
@@ -3082,10 +3101,8 @@ mod tests {
     #[test]
     fn atem_id_keeps_mixed_korean_and_ascii_hostname() {
         // Korean + ASCII letters/digits kept; dot dropped.
-        let id = build_atem_id("서버01.dev", "550e8400-e29b-41d4-a716-446655440000");
-        let (host, _suffix) = id.rsplit_once('-').unwrap();
-        assert!(host.starts_with("서버01dev"));
-        assert_eq!(host.chars().count(), ATEM_ID_HOST_LEN);
+        let id = build_atem_id("서버01.dev", UUID_A);
+        assert_eq!(id, "서버01dev-e29b4-550e8400");
         assert_atem_id_charset(&id);
     }
 
