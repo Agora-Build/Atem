@@ -14,7 +14,7 @@ Implementation of Agora ConvoAI-based voice coding system with smart buffering.
 
 ### Completed Items:
 - [x] Created test LLM server (`test-llm-server.js`)
-- [x] Documented validation procedure (`docs/validation-week0.md`)
+- [x] Documented and ran the validation procedure (since removed; it passed)
 - [x] Test server simulates smart buffering (3 empty responses, then real response)
 
 ### Next Steps for Stage 0:
@@ -33,7 +33,6 @@ Implementation of Agora ConvoAI-based voice coding system with smart buffering.
 ### Files Created:
 ```
 test-llm-server.js           # Node.js test server for validation
-docs/validation-week0.md     # Comprehensive test plan and documentation
 ```
 
 ---
@@ -222,9 +221,9 @@ Sources/Menubar/JoinChannelWindowController.swift (modify)
 
 ---
 
-## ⏳ Stage 3: Atem Integration (PENDING)
+## ✅ Stage 3: Atem Integration (COMPLETED)
 
-**Status:** Not started
+**Status:** Done: `VoiceRequest` / `VoiceResponse` in `src/websocket_client.rs`, handled in `src/app.rs`
 **Duration:** ~1 day
 **Dependencies:** Stage 1 complete ✅
 

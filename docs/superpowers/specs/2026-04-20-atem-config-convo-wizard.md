@@ -1,5 +1,9 @@
 # `atem config convo` — ConvoAI Configuration Wizard
 
+> Initial design (2026-04). The shipped flow differs: Channel & User → Agent →
+> Preset → Custom override? → Pipeline (Cascaded | MLLM) → Avatar, with 10 ASR
+> and 4 MLLM vendors. AGENTS.md ("ConvoAI Config Wizard") is current.
+
 ## Goal
 
 Interactive TUI wizard that walks the user through configuring a ConvoAI agent, generates `~/.config/atem/convo.toml`, and validates it. After running the wizard, `atem serv convo` launches with the generated config.

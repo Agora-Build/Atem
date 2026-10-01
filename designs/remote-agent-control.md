@@ -1,6 +1,6 @@
 # Remote Agent Control (Astation → atem → claude/codex)
 
-Status: design — 2026-05-26
+Status: v1 implemented (`AgentInput` → `handle_agent_input` / `agent_key_to_bytes` in `src/app.rs`); v1.5 and v2 are future
 Owner: Brent G
 
 ## Goal

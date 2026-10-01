@@ -23,7 +23,7 @@ cargo build                              # Debug build
 cargo build --release                    # Release build
 cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
-cargo test                               # Run tests (500+ tests)
+cargo test                               # Run tests (900+; use -- --test-threads=1 if a test flakes)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
@@ -62,6 +62,7 @@ src/
 ├── webhook_server.rs    # atem serv webhooks — Agora webhook receiver +
                           # ngrok/cloudflared tunnel integration + SSE console
 ├── rtc_test_server.rs   # Browser-based RTC test page server
+├── files_server.rs      # atem serv files — static file server (Markdown rendered)
 ├── convo_config.rs      # ConvoAI TOML parsing + Agora REST /join body builder
 ├── convo_test_server.rs # atem serv convo — ConvoAI test server + --background mode
 ├── convo_wizard.rs      # atem config convo — interactive config wizard + validation
@@ -84,6 +85,7 @@ src/
 │   └── cmd.rs           #   CLI handlers
 └── tui/
     ├── mod.rs           # Main event loop, rendering dispatch
+    ├── draw.rs          # Frame rendering
     └── voice_fx.rs      # Voice activity visual effects
 native/
 ├── include/atem_rtm.h   # C header for RTM client interface
@@ -94,28 +96,22 @@ npm/
 ├── install.js           # Postinstall binary downloader from GitHub releases
 └── bin/atem             # Placeholder (replaced by real binary on install)
 scripts/
+├── install.sh           # curl | bash installer (dl.agora.build)
+├── release.sh           # Bump version + commit + tag (no push)
+├── run-local-dev-tests.sh # End-to-end CLI smoke test
+├── update-convoai-toolkit.sh # Refresh vendored assets/convo/ (pinned upstream commit)
 └── test-create-agent.sh # ConvoAI agent creation (requires env vars)
 designs/
-├── HLD.md               # High-level design
-├── LLD.md               # Low-level design
-├── roadmap.md           # Project roadmap
 ├── agent-visualize.md   # Agent diagram generation
-├── credential-flow.md   # Credential encryption architecture
 ├── session-auth.md      # Session-based pairing authentication
 ├── universal-sessions.md # Universal sessions (astation_id keying)
 ├── connection-priority.md # Connection cascade: local > relay
 ├── relay-support.md     # Relay server support
 ├── voice-coding-stages.md # Voice coding implementation stages
-├── validation-week0.md  # ConvoAI validation testing
-├── test-cases.md        # Manual release test cases
-├── data-flow-between-atem-and-astation.md  # Voice coding architecture
-├── codex-launcher-design.md  # Codex launcher design
 ├── remote-agent-control.md   # Astation → atem → agent (text/voice/control keys)
 ├── atem-identity.md          # instance_id + unique relay atem_id
 ├── vault.md                  # Shared cross-agent context store (relay + Postgres)
-├── vault-implementation-plan.md  # Vault atem-side implementation plan
-├── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
-└── atem-memory-implementation-plan.md  # Atem Memory implementation plan
+└── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
 ```
 
 ### Core Components
@@ -153,7 +149,7 @@ Key methods:
 
 **Vault** (`vault_client.rs`): Client for the relay-hosted shared cross-agent context store. `atem vault new/list/read/write/set-summary` — a versioned, append-only store that multiple atems read/write to hand off context between their agents. Pure request builders + human/plain renderers + a thin reqwest executor (auth: `Authorization: session <id>` + `?id=<instance_id>`). The `/api/vault` endpoints + Postgres live in the relay-server (Astation repo). See `designs/vault.md`.
 
-**Atem Memory** (`src/memory/`): `atem sync`, `atem memory …`, `atem skill …`. Agents learn from each other across agents and machines. Claude's saved memories are harvested (an edited file becomes a replacement, a deleted file an invalidation), Codex saves facts with `atem memory add --agent codex` and replaces outdated ones with `atem memory replace <id> "<new fact>"` (its block shows each fact's short id), and skills are versioned directories (`atem skill history`/`atem skill restore` read old versions from the relay). Facts are never edited in place: `memory replace`/`memory invalidate` keep the history (`valid_at`, `invalid_at`, `superseded_by`; see `memory list --history`), invalidation is final, and only valid facts are injected — a block that leaves facts out says how many and points to `atem memory search`, which is local FTS5 (trigram, BM25) over `knowledge.db`. Everything is synced through the relay (`/api/memory`, `/api/skills`, Astation pairing-session auth) with an offline SQLite store, then applied as a managed block in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `<repo>/CLAUDE.local.md`, and as skills in `.claude/skills` and `.agents/skills`. Credential values are never stored: names only, fetched via `atem vault get <name>`. Tracked files are never written. See `designs/atem-memory.md`.
+**Atem Memory** (`src/memory/`): `atem sync`, `atem memory …`, `atem skill …`. Agents learn from each other across agents and machines. Claude's saved memories are harvested (an edited file becomes a replacement, a deleted file an invalidation), Codex saves facts with `atem memory add --agent codex` and replaces outdated ones with `atem memory replace <id> "<new fact>"` (its block shows each fact's short id), and skills are versioned directories (`atem skill history`/`atem skill restore` read old versions from the relay). Facts are never edited in place: `memory replace`/`memory invalidate` keep the history (`valid_at`, `invalid_at`, `superseded_by`; see `memory list --history`), invalidation is final, and only valid facts are injected — a block that leaves facts out says how many and points to `atem memory search`, which is local FTS5 (trigram, BM25) over `knowledge.db`. Everything is synced through the relay (`/api/memory`, `/api/skills`, Astation pairing-session auth) with an offline SQLite store, then applied as a managed block in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `<repo>/CLAUDE.local.md`, and as skills in `.claude/skills` and `.agents/skills`. Credential values are never stored: names only. Tracked files are never written. See `designs/atem-memory.md`.
 
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
@@ -178,7 +174,7 @@ Key methods:
 | `config.toml` | Non-sensitive settings (astation_ws, relay URL, bff_url, sso_url) + auto-generated identity (`instance_id`, `atem_id`) + `files_last_port` (last port `atem serv files` bound, reused next run) + `[memory] harvest_claude = false` (turns off harvesting Claude's native memory during `atem sync`) | None |
 | `credentials.enc` | SSO + paired tokens (multi-entry `Vec<CredentialEntry>`) | AES-256-GCM (machine-bound) |
 | `project_cache.enc` | All projects + `current_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
-| `session.json` | Astation auth session ID + expiry | None |
+| `sessions.json` | Per-Astation device session IDs and tokens | None (chmod 0600) |
 | `knowledge.db` | Atem Memory local store: memories (with `deleted_at`/`valid_at`/`invalid_at`/`superseded_by`), the `memories_fts` FTS5 trigram search index, skills, harvest map, local `replacements`, and the pending-sync queue (SQLite, mode 0600; holds no secrets — credentials are refused before storing; migrated in place on open) | None |
 
 **Identity** (`config.rs`, `websocket_client.rs`):
@@ -276,7 +272,7 @@ Build script (`build.rs`) compiles C++17 code via the `cc` crate. With `real_rtm
 | FFI | libc, cc | C interop for RTM |
 | Config | toml, dirs | Configuration loading |
 | Crypto | hmac, sha2 | Token generation |
-| Storage | rusqlite (bundled) | Diagram SQLite store |
+| Storage | rusqlite (bundled) | Diagram store, Atem Memory store (`knowledge.db`) |
 
 ## Mark Task Flow
 
