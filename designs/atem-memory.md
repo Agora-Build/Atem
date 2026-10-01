@@ -79,8 +79,15 @@ share a folder name don't collide:
   `/`, and lowercases the whole string.
 
 If there's no remote, the key is `local:<git top-level dir name>`. If there's
-no git, it's `local:<cwd name>`. `--project <key>` overrides. The display
-name is the last path segment, for example `atem`.
+no git, it's `local:<cwd name>`. `--project <key>` overrides.
+
+The key is lowercased only for **matching**, so clones whose remotes differ
+in case (`agora-build/atem` vs `Agora-Build/Atem`) still share one project.
+What atem **shows** keeps the remote's own spelling:
+`Project: github.com/Agora-Build/Atem` in `memory status`, and the short name
+`project:Atem` in `memory list`, `search`, history and `skill list`. A project
+other than the one you're in has no remote to read, so it shows its stored
+(lowercase) key's last segment.
 
 ## Identity & auth
 

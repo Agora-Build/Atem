@@ -6,12 +6,39 @@ use std::process::Command;
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoInfo {
     pub root: PathBuf,
+    /// Lowercased match key (`github.com/agora-build/atem`): clones whose
+    /// remotes differ only in case still share one project.
     pub key: String,
+    /// The same path as the remote spells it (`github.com/Agora-Build/Atem`),
+    /// for display only.
+    pub label: String,
+}
+
+impl RepoInfo {
+    /// Short display name for a project key: this repo's own spelling when the
+    /// key is this repo, else the stored (lowercase) key's last segment.
+    pub fn name_for(&self, key: &str) -> String {
+        if key == self.key { display_name(&self.label) } else { display_name(key) }.to_string()
+    }
+}
+
+/// Short display name for `key`, using `repo`'s spelling when it is that repo.
+pub fn project_name(key: &str, repo: Option<&RepoInfo>) -> String {
+    match repo {
+        Some(r) => r.name_for(key),
+        None => display_name(key).to_string(),
+    }
 }
 
 /// `git@github.com:Agora-Build/Atem.git` and `https://github.com/Agora-Build/Atem`
 /// both become `github.com/agora-build/atem`.
 pub fn normalize_remote(url: &str) -> Option<String> {
+    remote_label(url).map(|s| s.to_lowercase())
+}
+
+/// The remote as `<host>/<path>` with its own capitalization
+/// (`github.com/Agora-Build/Atem`); credentials, port and `.git` dropped.
+pub fn remote_label(url: &str) -> Option<String> {
     let u = url.trim();
     if u.is_empty() {
         return None;
@@ -39,7 +66,7 @@ pub fn normalize_remote(url: &str) -> Option<String> {
     if host.is_empty() || path.is_empty() {
         return None;
     }
-    Some(format!("{}/{}", host, path).to_lowercase())
+    Some(format!("{}/{}", host, path))
 }
 
 /// Short name for display: the last path segment (`atem`, `scratch`).
@@ -62,10 +89,12 @@ fn dir_name(p: &Path) -> String {
 
 pub fn detect_repo(cwd: &Path) -> Option<RepoInfo> {
     let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
-    let key = git(&root, &["remote", "get-url", "origin"])
-        .and_then(|u| normalize_remote(&u))
+    let label = git(&root, &["remote", "get-url", "origin"])
+        .and_then(|u| remote_label(&u))
         .unwrap_or_else(|| format!("local:{}", dir_name(&root)));
-    Some(RepoInfo { root, key })
+    // `local:` keys keep the folder name's case, as they always have.
+    let key = if label.starts_with("local:") { label.clone() } else { label.to_lowercase() };
+    Some(RepoInfo { root, key, label })
 }
 
 #[cfg(test)]
@@ -122,7 +151,27 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let info = detect_repo(&sub).unwrap();
         assert_eq!(info.key, "github.com/agora-build/atem");
+        assert_eq!(info.label, "github.com/Agora-Build/Atem");
         assert_eq!(info.root, td.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn label_keeps_the_remotes_case_and_key_does_not() {
+        assert_eq!(remote_label("git@github.com:Agora-Build/Atem.git").as_deref(), Some("github.com/Agora-Build/Atem"));
+        assert_eq!(remote_label("https://user:tok@github.com/Agora-Build/Atem.git/").as_deref(), Some("github.com/Agora-Build/Atem"));
+        assert_eq!(normalize_remote("git@github.com:Agora-Build/Atem.git").as_deref(), Some("github.com/agora-build/atem"));
+    }
+
+    #[test]
+    fn project_name_uses_this_repos_spelling_only_for_this_repo() {
+        let repo = RepoInfo {
+            root: PathBuf::from("/r"),
+            key: "github.com/agora-build/atem".into(),
+            label: "github.com/Agora-Build/Atem".into(),
+        };
+        assert_eq!(project_name("github.com/agora-build/atem", Some(&repo)), "Atem");
+        assert_eq!(project_name("github.com/agora-build/astation", Some(&repo)), "astation");
+        assert_eq!(project_name("github.com/agora-build/atem", None), "atem");
     }
 
     #[test]
