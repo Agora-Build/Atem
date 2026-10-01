@@ -111,7 +111,8 @@ designs/
 ├── remote-agent-control.md   # Astation → atem → agent (text/voice/control keys)
 ├── atem-identity.md          # instance_id + unique relay atem_id
 ├── vault.md                  # Shared cross-agent context store (relay + Postgres)
-└── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
+├── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
+└── e2e-encryption.md         # Proposed: end-to-end encryption of memory, skills and vault
 ```
 
 ### Core Components
