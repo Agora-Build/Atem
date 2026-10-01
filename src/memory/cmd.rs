@@ -7,7 +7,7 @@ use crate::memory::adapters::{skill_targets, valid_skill_name, Agent, Ctx, Repor
 use crate::memory::api::KnowledgeClient;
 use crate::memory::block::{contains_reserved, one_line};
 use crate::memory::harvest::claude_memory_dir;
-use crate::memory::model::{content_hash, format_date, format_datetime, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, Memory, Scope, Skill};
+use crate::memory::model::{content_hash, display_id, format_date, format_datetime, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, Memory, Scope, Skill};
 use crate::memory::project::{detect_repo, project_name, RepoInfo};
 use crate::memory::secrets::{find_secrets, SecretFinding};
 use crate::memory::skills_fs::{self, DirState, SkillMarker};
@@ -268,13 +268,52 @@ fn where_label(m: &Memory, repo: Option<&RepoInfo>) -> String {
     }
 }
 
-fn print_memories(ms: &[Memory], repo: Option<&RepoInfo>) {
+fn status(m: &Memory) -> &'static str {
+    match (m.invalid_at, &m.superseded_by) {
+        (None, _) => "valid",
+        (Some(_), Some(_)) => "replaced",
+        (Some(_), None) => "invalidated",
+    }
+}
+
+/// `--full`: every field of one memory, the content whole (line breaks kept).
+fn full_record(m: &Memory, repo: Option<&RepoInfo>) -> Vec<String> {
+    let mut out = vec![
+        m.id.clone(),
+        format!("  status:       {}", status(m)),
+        format!("  where:        {}", where_label(m, repo)),
+        format!("  confidence:   {}", m.confidence),
+        format!("  source:       {} @ {}", m.source_agent, m.source_machine),
+        format!("  created_at:   {}", format_datetime(m.created_at)),
+        format!("  valid_at:     {}", format_datetime(m.valid_from())),
+        format!("  invalid_at:   {}", m.invalid_at.map(format_datetime).unwrap_or_else(|| "— (still valid)".into())),
+    ];
+    if let Some(next) = &m.superseded_by {
+        out.push(format!("  replaced_by:  {}", next));
+    }
+    out.push(format!("  seq:          {}", if m.seq > 0 { m.seq.to_string() } else { "— (not synced yet)".into() }));
+    let mut lines = m.content.lines();
+    out.push(format!("  content:      {}", lines.next().unwrap_or("")));
+    out.extend(lines.map(|l| format!("                {}", l)));
+    out
+}
+
+fn print_memories(ms: &[Memory], repo: Option<&RepoInfo>, full: bool) {
     if ms.is_empty() {
         println!("(no memories)");
     }
-    for m in ms {
+    for (i, m) in ms.iter().enumerate() {
+        if full {
+            if i > 0 {
+                println!();
+            }
+            for l in full_record(m, repo) {
+                println!("{}", l);
+            }
+            continue;
+        }
         let note = m.invalid_at.map(|t| format!("  (outdated since {})", format_date(t))).unwrap_or_default();
-        println!("{}  {:<24} {:<6} {}{}", m.id, where_label(m, repo), m.confidence, truncate(&one_line(&m.content), 90), note);
+        println!("{:<13}  {:<24} {:<6} {}{}", display_id(&m.id), where_label(m, repo), m.confidence, truncate(&one_line(&m.content), 90), note);
     }
 }
 
@@ -353,7 +392,7 @@ fn validity_span(m: &Memory) -> String {
 }
 
 /// One numbered block per chain; later links indented under the first.
-fn render_history(chains: &[Vec<Memory>], repo: Option<&RepoInfo>) -> Vec<String> {
+fn render_history(chains: &[Vec<Memory>], repo: Option<&RepoInfo>, full: bool) -> Vec<String> {
     if chains.is_empty() {
         return vec!["(no memories)".into()];
     }
@@ -361,7 +400,14 @@ fn render_history(chains: &[Vec<Memory>], repo: Option<&RepoInfo>) -> Vec<String
     for (i, chain) in chains.iter().enumerate() {
         for (j, m) in chain.iter().enumerate() {
             let lead = if j == 0 { format!("{:>3}. ", i + 1) } else { "     ".to_string() };
-            out.push(format!("{}{}  {:<24} {:<25} {}", lead, m.id, where_label(m, repo), validity_span(m), truncate(&one_line(&m.content), 80)));
+            if full {
+                // The chain number, then each link's record indented under it.
+                let rec = full_record(m, repo);
+                out.push(format!("{}{}", lead, rec[0]));
+                out.extend(rec[1..].iter().map(|l| format!("     {}", l)));
+                continue;
+            }
+            out.push(format!("{}{:<13}  {:<24} {:<25} {}", lead, display_id(&m.id), where_label(m, repo), validity_span(m), truncate(&one_line(&m.content), 80)));
         }
     }
     out
@@ -489,7 +535,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             store.enqueue(&PendingOp::AddMemory { memory: m.clone() })?;
             best_effort_sync(&store, &ctx).await;
         }
-        MemoryCommands::List { scope, project, all, history } => {
+        MemoryCommands::List { scope, project, all, history, full } => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
             let scope_f = scope.map(|s| Scope::parse(&s)).transpose()?;
@@ -497,12 +543,12 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 None => {
                     let shown: Vec<Memory> = store.live_memories()?.into_iter()
                         .filter(|m| in_view(m, scope_f, project.as_deref(), all, &ctx)).collect();
-                    print_memories(&shown, ctx.repo.as_ref());
+                    print_memories(&shown, ctx.repo.as_ref(), full);
                 }
                 Some(None) => {
                     let shown: Vec<Memory> = store.history_memories()?.into_iter()
                         .filter(|m| in_view(m, scope_f, project.as_deref(), all, &ctx)).collect();
-                    for l in render_history(&history_chains(&shown), ctx.repo.as_ref()) {
+                    for l in render_history(&history_chains(&shown), ctx.repo.as_ref(), full) {
                         println!("{}", l);
                     }
                 }
@@ -510,18 +556,18 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                     let id = store.resolve_memory_id(&id)?;
                     let chains: Vec<Vec<Memory>> = history_chains(&store.history_memories()?)
                         .into_iter().filter(|c| c.iter().any(|m| m.id == id)).collect();
-                    for l in render_history(&chains, ctx.repo.as_ref()) {
+                    for l in render_history(&chains, ctx.repo.as_ref(), full) {
                         println!("{}", l);
                     }
                 }
             }
         }
-        MemoryCommands::Search { text, scope, project, history, limit } => {
+        MemoryCommands::Search { text, scope, project, history, limit, full } => {
             let store = Store::open(&store_path())?;
             let scope = scope.map(|s| Scope::parse(&s)).transpose()?;
             let hits = store.search_memories(&SearchQuery { text, scope, project, history, limit })?;
             let repo = std::env::current_dir().ok().and_then(|d| detect_repo(&d));
-            print_memories(&hits, repo.as_ref());
+            print_memories(&hits, repo.as_ref(), full);
         }
         MemoryCommands::Rm { id } => {
             let ctx = build_ctx(false)?;
@@ -761,12 +807,31 @@ mod tests {
         ];
         let chains: Vec<Vec<String>> = history_chains(&ms).into_iter().map(|c| c.into_iter().map(|m| m.id).collect()).collect();
         assert_eq!(chains, vec![vec!["mem_x".to_string()], vec!["mem_a".into(), "mem_b".into(), "mem_c".into()]]);
-        let lines = render_history(&history_chains(&ms), None);
-        assert!(lines[0].starts_with("  1. mem_x"), "{}", lines[0]);
-        assert!(lines[1].starts_with("  2. mem_a") && lines[1].contains("1970-01-01 → 1970-01-01"), "{}", lines[1]);
-        assert!(lines[2].starts_with("     mem_b"), "{}", lines[2]);
-        assert!(lines[3].starts_with("     mem_c") && lines[3].contains("→ now"), "{}", lines[3]);
-        assert_eq!(render_history(&[], None), vec!["(no memories)".to_string()]);
+        let lines = render_history(&history_chains(&ms), None, false);
+        assert!(lines[0].starts_with("  1. x "), "{}", lines[0]);
+        assert!(lines[1].starts_with("  2. a ") && lines[1].contains("1970-01-01 → 1970-01-01"), "{}", lines[1]);
+        assert!(lines[2].starts_with("     b "), "{}", lines[2]);
+        assert!(lines[3].starts_with("     c ") && lines[3].contains("→ now"), "{}", lines[3]);
+        let full = render_history(&history_chains(&ms), None, true);
+        assert!(full.iter().any(|l| l == "  2. mem_a"), "{:?}", full);
+        assert!(full.iter().any(|l| l.contains("status:       replaced")), "{:?}", full);
+        assert!(full.iter().any(|l| l.contains("replaced_by:  mem_b")), "{:?}", full);
+        assert_eq!(render_history(&[], None, false), vec!["(no memories)".to_string()]);
+    }
+
+    #[test]
+    fn full_record_shows_every_timestamp_and_the_whole_content() {
+        let mut m = hist("mem_8245ecf61c944756afcca86b8c16e6fe", "line one\nline two", 86_400, Some(2 * 86_400), Some("mem_next"));
+        m.valid_at = Some(3_600 + 86_400);
+        let rec = full_record(&m, None);
+        assert_eq!(rec[0], "mem_8245ecf61c944756afcca86b8c16e6fe");
+        let has = |s: &str| rec.iter().any(|l| l.contains(s));
+        assert!(has("created_at:   1970-01-02 00:00"), "{:?}", rec);
+        assert!(has("valid_at:     1970-01-02 01:00"), "{:?}", rec);
+        assert!(has("invalid_at:   1970-01-03 00:00"), "{:?}", rec);
+        assert!(has("replaced_by:  mem_next") && has("status:       replaced"), "{:?}", rec);
+        assert!(has("seq:          — (not synced yet)"), "{:?}", rec);
+        assert!(has("content:      line one") && rec.last().unwrap().ends_with("line two"), "{:?}", rec);
     }
 
     #[test]
