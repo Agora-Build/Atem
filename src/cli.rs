@@ -505,12 +505,16 @@ pub enum MemoryCommands {
         scope: Option<String>,
         #[arg(long)]
         project: Option<String>,
+        /// List memories from every project and machine, not just this one
         #[arg(long)]
         all: bool,
         /// Include outdated facts and show replacement chains, oldest first
         /// (with an id: just the chain containing it)
         #[arg(long, value_name = "ID", num_args = 0..=1)]
         history: Option<Option<String>>,
+        /// Show everything about each memory: full id, status, timestamps, source, whole content
+        #[arg(long)]
+        full: bool,
     },
     /// Search memories on this machine (FTS5 + BM25; works for CJK; offline)
     Search {
@@ -526,6 +530,9 @@ pub enum MemoryCommands {
         history: bool,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Show everything about each memory: full id, status, timestamps, source, whole content
+        #[arg(long)]
+        full: bool,
     },
     /// Remove a memory everywhere
     Rm {

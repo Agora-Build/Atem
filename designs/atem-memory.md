@@ -458,8 +458,8 @@ atem memory add "<content>" [--scope global|project|machine] [--project <key>]
                             [--confidence high|medium|low] [--valid-at <date>]
 atem memory replace <id> "<new>" [--valid-at <date>]   # add new, invalidate old
 atem memory invalidate <id> [--at <date>]
-atem memory list   [--scope …] [--project <key>] [--all] [--history [<id>]]
-atem memory search "<query>" [--scope …] [--project <key>] [--history] [--limit <n>]
+atem memory list   [--scope …] [--project <key>] [--all] [--history [<id>]] [--full]
+atem memory search "<query>" [--scope …] [--project <key>] [--history] [--limit <n>] [--full]
                                     # FTS5 + BM25, trigram (works for CJK)
 atem memory rm <id>
 
@@ -479,7 +479,8 @@ atem memory status                  # account, machine, pending ops, last sync, 
                                     # facts with more than one valid successor
 ```
 
-- `<date>` is `YYYY-MM-DD` (midnight UTC) or unix seconds. `<id>` for `replace`, `invalidate` and `list --history` is a full id or a unique prefix, with or without `mem_` (the Codex block's short id works).
+- `<date>` is `YYYY-MM-DD` (midnight UTC) or unix seconds. `<id>` for `replace`, `invalidate`, `rm`, `purge` and `list --history` is a full id or a unique prefix, with or without `mem_` (the Codex block's short id works), or the listing form `<head>…<tail>` (`..` works in place of `…`).
+- `list` and `search` show one row per memory: the id abbreviated to the short id plus its last 4 characters (`8245ecf6…e6fe`), and the content cut to fit. `--all` widens *which* memories are shown; `--full` shows *everything* about each one, one field per line: the whole id, status (`valid` / `replaced` / `invalidated`), where, confidence, source agent @ machine, `created_at`, `valid_at`, `invalid_at`, `replaced_by`, the relay `seq`, and the content with its line breaks.
 
 - `memory add` defaults to `--scope project` inside a git repo and
   `--scope global` outside one.

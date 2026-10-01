@@ -193,6 +193,23 @@ pub fn short_id(id: &str) -> &str {
     }
 }
 
+/// Characters of the id's end shown after the short id in listings.
+pub const ID_TAIL_LEN: usize = 4;
+
+/// The id as listings show it: the short id, `…`, and the last
+/// `ID_TAIL_LEN` characters (`8245ecf6…e6fe`). Ids too short to abbreviate
+/// are shown whole, without `mem_`. Commands that take an id accept this form.
+pub fn display_id(id: &str) -> String {
+    let rest = id.strip_prefix("mem_").unwrap_or(id);
+    let n = rest.chars().count();
+    let head = short_id(id);
+    if n <= head.chars().count() + ID_TAIL_LEN + 1 {
+        return rest.to_string();
+    }
+    let tail: String = rest.chars().skip(n - ID_TAIL_LEN).collect();
+    format!("{}…{}", head, tail)
+}
+
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil`).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -313,6 +330,13 @@ mod tests {
         assert_eq!(short_id("mem_1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"), "1a2b3c4d");
         assert_eq!(short_id("mem_abc"), "abc");
         assert_eq!(short_id("xyz123456789"), "xyz12345");
+    }
+
+    #[test]
+    fn display_id_shows_the_short_id_and_the_end() {
+        assert_eq!(display_id("mem_8245ecf61c944756afcca86b8c16e6fe"), "8245ecf6…e6fe");
+        assert_eq!(display_id("mem_1a2b3c4d5e6f7"), "1a2b3c4d5e6f7");
+        assert_eq!(display_id("mem_abc"), "abc");
     }
 
     #[test]

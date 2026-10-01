@@ -436,18 +436,27 @@ impl Store {
     }
 
     /// A full id, or a unique prefix of one. Without `mem_`, the prefix is of
-    /// the part after it (the short id shown in the Codex block). Deleted
-    /// memories never match.
+    /// the part after it (the short id shown in the Codex block). The listing
+    /// form `<head>…<tail>` (or `<head>..<tail>`) matches ids that start with
+    /// head and end with tail. Deleted memories never match.
     pub fn resolve_memory_id(&self, input: &str) -> Result<String> {
         let input = input.trim();
         if input.is_empty() {
             bail!("Pass a memory id");
         }
-        let prefix = if input.starts_with("mem_") { input.to_string() } else { format!("mem_{}", input) };
+        let (head, tail) = match input.split_once('…').or_else(|| input.split_once("..")) {
+            Some((h, t)) => (h, t.trim_start_matches('.')),
+            None => (input, ""),
+        };
+        let prefix = if head.starts_with("mem_") { head.to_string() } else { format!("mem_{}", head) };
         let mut stmt = self.conn.prepare(
             "SELECT id FROM memories WHERE deleted_at IS NULL AND (id = ?1 OR substr(id, 1, length(?2)) = ?2) ORDER BY id",
         )?;
-        let ids: Vec<String> = stmt.query_map(params![input, prefix], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let ids: Vec<String> = stmt.query_map(params![input, prefix], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .filter(|id| id == input || (id.len() >= prefix.len() + tail.len() && id.ends_with(tail)))
+            .collect();
         if let Some(exact) = ids.iter().find(|i| i.as_str() == input) {
             return Ok(exact.clone());
         }
@@ -676,6 +685,19 @@ mod tests {
         assert!(s.resolve_memory_id("1a2b").unwrap_err().to_string().contains("more than one"));
         assert!(s.resolve_memory_id("9999").unwrap_err().to_string().contains("No memory"));
         assert!(s.resolve_memory_id("zz").is_err());
+    }
+
+    #[test]
+    fn resolve_accepts_the_listing_form() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_8245ecf61c944756afcca86b8c16e6fe", "A")).unwrap();
+        s.upsert_memory(&mem("mem_8245ecf6ffff0000aaaa1111bbbb2222", "B")).unwrap();
+        let want = "mem_8245ecf61c944756afcca86b8c16e6fe";
+        assert_eq!(s.resolve_memory_id("8245ecf6…e6fe").unwrap(), want);
+        assert_eq!(s.resolve_memory_id("8245ecf6..e6fe").unwrap(), want);
+        assert_eq!(s.resolve_memory_id("mem_8245ecf6...e6fe").unwrap(), want);
+        assert!(s.resolve_memory_id("8245ecf6…0000").unwrap_err().to_string().contains("No memory"));
+        assert!(s.resolve_memory_id("8245ecf6").unwrap_err().to_string().contains("more than one"));
     }
 
     #[test]
