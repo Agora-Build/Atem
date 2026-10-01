@@ -86,25 +86,25 @@ POST /api/vault/<id>?id=<client_id>     Authorization: session <session_id>
 Authorization predicates (server-side):
 
 ```
-can_read(vault, caller):
-    caller.work_session_id == vault.work_session_id    # in the same work session
-    OR caller.client_id = ANY(vault.writer_list)       # past content-writer
+can_read(vault, caller):                               # also list + set-summary
+    caller.work_session_id == vault.work_session_id    # same account only
 
 can_write(vault, caller):                              # append / override content
-    caller.work_session_id == vault.work_session_id    # in-session only
+    caller.work_session_id == vault.work_session_id
 ```
 
-- **In-session** atems get full read + write.
-- **Out-of-session** atems get **read-only**, and only if their `client_id` is
-  in the vault's `writer_list` (i.e. they contributed content earlier, in a
-  prior session).
-- **`set-summary` follows the read predicate** — any atem that can *see* the
-  vault may update its summary (summary is mutable and low-stakes).
+- **Same account** (the paired Astation the session is bound to): full read +
+  write. Any other account: nothing.
+- `client_id` (`?id=`) is self-reported, so it only labels writers
+  (`writer_list`, each entry's `writer_id`) and never grants access. The first
+  version let a past writer from another account keep reading; any session
+  could claim a writer's id that way, so it was removed. Cross-account sharing
+  needs a verifiable atem identity first.
 
 ## Data model (Postgres)
 
 Two tables. `vaults` holds mutable per-vault metadata plus a denormalized
-`writer_list` for fast authz. `vault_entries` is append-only and versioned.
+`writer_list` (who has written; a label, not a permission). `vault_entries` is append-only and versioned.
 
 ```sql
 CREATE TABLE vaults (
@@ -180,7 +180,7 @@ editing e3 never renumbers it and never reorders the view.
 | Command | Effect |
 |---------|--------|
 | `atem vault new --summary "<text>"` | Create a vault in the caller's current work session; print the new `vault_id`. |
-| `atem vault list` | List vaults the caller can read (in-session + vaults where caller ∈ writer_list), with id + summary. |
+| `atem vault list` | List the account's vaults, with id + summary. |
 | `atem vault read --vault-id <id> [--since <seq>] [--history] [--format human\|plain]` | Render current view (default), history, or only-new entries. |
 | `atem vault write --vault-id <id> [--entry-id <eN>] --text "<text>"` | Append (no `--entry-id`) or override entry `eN` (with `--entry-id`). Adds caller to `writer_list`. |
 | `atem vault set-summary --vault-id <id> --text "<text>"` | Update the mutable summary (read-permission only). |
