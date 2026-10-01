@@ -306,9 +306,9 @@ and safety checks for every agent.
 - DialF advertises _dialfd._tcp and listens on TCP 8765.
 - DialF's OpenAI key is the vault credential `dialf/openai`.
 
-Credentials are never stored in memory. When you need one, fetch it with
-`atem vault get <name>` at the moment you use it. Never paste a credential
-value into memory, skills, or instruction files.
+Credentials are never stored in memory. Save a credential's name, never its
+value, and never paste a credential value into memory, skills, or instruction
+files.
 <!-- atem:memory:end -->
 ```
 

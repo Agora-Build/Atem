@@ -94,11 +94,9 @@ wss://<relay>/ws?role=atem&code=<astation_id>&atem_id=<percent-encoded atem_id>
 
 ### Relay-side requirement (Astation repo)
 
-The relay-server has its own `atem_id` sanitizer that previously stripped to
-URL-safe ASCII. For non-ASCII ids to round-trip, that sanitizer must be updated
-to match this rule (keep non-ASCII; ASCII → `[A-Za-z0-9-]`) and to percent-decode
-the query param. If it keeps stripping non-ASCII, the relay's stored id won't
-match atem's canonical id.
+Done. The relay's `sanitize_atem_id` (`relay-server/src/relay.rs`) follows the
+same rule (keep non-ASCII; ASCII → `[A-Za-z0-9-]`) on the percent-decoded query
+param, so the relay stores the same id atem generated.
 
 ## Storage
 
@@ -133,5 +131,5 @@ query round-trip, and that a raw non-ASCII URL is rejected.
    (one `config.toml`), so two atem processes sharing a config dir share an id.
    Fine today (one atem per host); revisit if we support concurrent atems per
    machine.
-2. **Relay sanitizer alignment.** Tracked above — needs an Astation-repo change
-   before non-ASCII ids round-trip in production.
+2. ~~**Relay sanitizer alignment.**~~ Resolved: the relay's `sanitize_atem_id`
+   (`relay-server/src/relay.rs`) keeps decoded non-ASCII and is tested.

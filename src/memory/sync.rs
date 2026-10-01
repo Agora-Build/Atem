@@ -550,7 +550,7 @@ pub async fn restore_skill(store: &Store, client: &KnowledgeClient, atem_id: &st
     let problems = skill_file_problems(&old.files);
     if !problems.is_empty() {
         bail!(
-            "Refusing to restore v{} of skill {} — possible credentials (or unreadable files) found:\n  {}\nKeep credentials in the vault and read them at run time, e.g. `atem vault get <name>`.",
+            "Refusing to restore v{} of skill {} — possible credentials (or unreadable files) found:\n  {}\nRemove the credential values; refer to credentials by name only.",
             version, name, problems.join("\n  ")
         );
     }

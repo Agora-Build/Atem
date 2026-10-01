@@ -50,6 +50,9 @@ An idea to run an agent directly from an official Agora GitHub repository — `a
 
 Recent notable additions (see [releases](https://github.com/Agora-Build/Atem/releases) for the full history):
 
+- Atem Memory (`atem sync`, `atem memory`, `atem skill`) — agents share facts and skills across agents and machines, with fact history and offline search
+- `atem vault` — a shared, versioned context store for handing work between agents
+- Remote agent control — Astation types text and control keys into a running Claude Code / Codex session
 - MCP server support in `convo.toml` — agents can call tools from MCP servers
 - `atem serv files` — serve a directory/file over HTTPS, with Markdown rendering
 - ConvoAI MLLM pipeline (OpenAI Realtime, Gemini Live) end-to-end

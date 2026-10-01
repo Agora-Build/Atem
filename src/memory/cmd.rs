@@ -685,7 +685,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             let problems = crate::memory::secrets::skill_file_problems(&files);
             if !problems.is_empty() {
                 bail!(
-                    "Refusing to add the skill — possible credentials (or unreadable files) found:\n  {}\nKeep credentials in the vault and read them at run time, e.g. `atem vault get <name>`.",
+                    "Refusing to add the skill — possible credentials (or unreadable files) found:\n  {}\nRemove the credential values; refer to credentials by name only.",
                     problems.join("\n  ")
                 );
             }

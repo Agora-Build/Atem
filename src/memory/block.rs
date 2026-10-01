@@ -12,7 +12,7 @@ pub const RESERVED: &str = "atem:memory:";
 pub const MAX_ENTRIES: usize = 50;
 pub const MAX_BYTES: usize = 4096;
 
-pub const CREDENTIAL_INSTRUCTION: &str = "Credentials are never stored in memory. When you need one, fetch it with `atem vault get <name>` at the moment you use it. Never paste a credential value into memory, skills, or instruction files.";
+pub const CREDENTIAL_INSTRUCTION: &str = "Credentials are never stored in memory. Save a credential's name, never its value, and never paste a credential value into memory, skills, or instruction files.";
 pub const CODEX_CAPTURE_INSTRUCTION: &str = "To save a durable fact for future sessions, run `atem memory add --agent codex \"<fact>\"`.";
 pub const CODEX_REPLACE_INSTRUCTION: &str = "If a saved fact is outdated, run `atem memory replace <id> \"<new fact>\"`.";
 

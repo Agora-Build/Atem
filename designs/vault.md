@@ -1,6 +1,6 @@
 # Vault — Shared cross-agent context store (atem ↔ relay-server ↔ Postgres)
 
-Status: design — 2026-05-26
+Status: v1 implemented (`atem vault new/list/read/write/set-summary`); `watch` (v1.5) not built yet
 Owner: Brent G
 
 ## Goal
