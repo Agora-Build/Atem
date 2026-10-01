@@ -4,7 +4,7 @@
 //! it (and approved by it) can sync.
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::memory::model::{Memory, Skill};
+use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::store::PendingOp;
 
 pub const PULL_LIMIT: u32 = 200;
@@ -28,6 +28,7 @@ pub fn op_to_wire(op: &PendingOp) -> Value {
     match op {
         PendingOp::AddMemory { memory } => json!({"op": "add", "memory": memory}),
         PendingOp::DeleteMemory { id } => json!({"op": "delete", "id": id}),
+        PendingOp::InvalidateMemory { id, invalid_at, superseded_by } => json!({"op": "invalidate", "id": id, "invalid_at": invalid_at, "superseded_by": superseded_by}),
         PendingOp::PushSkill { skill, base_version } => json!({"op": "push", "skill": skill, "base_version": base_version}),
         PendingOp::DeleteSkill { scope, project, name } => json!({"op": "delete", "scope": scope, "project": project, "name": name}),
         PendingOp::PurgeSkill { scope, project, name, versions } => json!({"op": "purge", "scope": scope, "project": project, "name": name, "versions": versions}),
@@ -61,6 +62,52 @@ pub fn memory_pull_request(base: &str, client_id: &str, since: i64, limit: u32) 
 }
 pub fn skills_pull_request(base: &str, client_id: &str, since: i64, limit: u32) -> ApiRequest {
     pull(base, client_id, "skills", since, limit)
+}
+
+fn skill_key_query(scope: Scope, project: &str, name: &str) -> String {
+    format!("scope={}&project={}&name={}", scope.as_str(), enc(project), enc(name))
+}
+
+pub fn skill_versions_request(base: &str, client_id: &str, scope: Scope, project: &str, name: &str) -> ApiRequest {
+    ApiRequest {
+        method: "GET",
+        url: format!("{}/api/skills/versions?id={}&{}", base_trim(base), enc(client_id), skill_key_query(scope, project, name)),
+        body: None,
+    }
+}
+
+pub fn skill_version_request(base: &str, client_id: &str, scope: Scope, project: &str, name: &str, version: i64) -> ApiRequest {
+    ApiRequest {
+        method: "GET",
+        url: format!("{}/api/skills/version?id={}&{}&version={}", base_trim(base), enc(client_id), skill_key_query(scope, project, name), version),
+        body: None,
+    }
+}
+
+/// One entry of `GET /api/skills/versions` (no files).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SkillVersionInfo {
+    pub version: i64,
+    pub created_at: i64,
+    #[serde(default)]
+    pub source_agent: String,
+    #[serde(default)]
+    pub source_machine: String,
+    #[serde(default)]
+    pub file_count: i64,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub purged: bool,
+}
+
+#[derive(Deserialize)]
+struct VersionsPage {
+    versions: Vec<SkillVersionInfo>,
+}
+#[derive(Deserialize)]
+struct VersionPage {
+    skill: Skill,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -187,6 +234,20 @@ impl KnowledgeClient {
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(page.skills)
     }
+
+    /// A skill's history, newest first (no files).
+    pub async fn skill_versions(&self, scope: Scope, project: &str, name: &str) -> Result<Vec<SkillVersionInfo>, ApiError> {
+        let req = skill_versions_request(&self.base, &self.client_id, scope, project, name);
+        let page: VersionsPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        Ok(page.versions)
+    }
+
+    /// One version with its files. 404 unknown, 410 purged (as `ApiError::Http`).
+    pub async fn skill_version(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<Skill, ApiError> {
+        let req = skill_version_request(&self.base, &self.client_id, scope, project, name, version);
+        let page: VersionPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        Ok(page.skill)
+    }
 }
 
 #[cfg(test)]
@@ -196,12 +257,24 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn invalidate_wire() {
+        let op = PendingOp::InvalidateMemory { id: "mem_old".into(), invalid_at: 1790000000, superseded_by: Some("mem_new".into()) };
+        assert_eq!(op_to_wire(&op), json!({"op": "invalidate", "id": "mem_old", "invalid_at": 1790000000, "superseded_by": "mem_new"}));
+        let bare = PendingOp::InvalidateMemory { id: "mem_old".into(), invalid_at: 5, superseded_by: None };
+        assert_eq!(op_to_wire(&bare)["superseded_by"], serde_json::Value::Null);
+        // A replace's add carries valid_at to the relay.
+        let mut m = sample();
+        m.valid_at = Some(1690000000);
+        assert_eq!(op_to_wire(&PendingOp::AddMemory { memory: m })["memory"]["valid_at"], 1690000000);
+    }
+
     fn sample() -> Memory {
         Memory {
             id: "mem_1".into(), scope: Scope::Project, project: "github.com/acme/dialf".into(), machine: String::new(),
             content: "DialF uses TCP 8765".into(), content_hash: content_hash("DialF uses TCP 8765"),
             confidence: "high".into(), source_agent: "claude".into(), source_machine: "nixps-0001".into(),
-            created_at: 1700000000, deleted: false, seq: 0,
+            created_at: 1700000000, seq: 0, ..Default::default()
         }
     }
 
@@ -264,5 +337,19 @@ mod tests {
     fn api_error_display() {
         assert!(ApiError::Offline("x".into()).to_string().contains("unreachable"));
         assert!(ApiError::Http(403, "no".into()).to_string().contains("403"));
+    }
+
+    #[test]
+    fn skill_history_request_urls() {
+        let r = skill_versions_request("https://relay.example/", "inst 1", Scope::Project, "github.com/a/b", "deploy check");
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.url, "https://relay.example/api/skills/versions?id=inst%201&scope=project&project=github.com%2Fa%2Fb&name=deploy%20check");
+        assert!(r.body.is_none());
+        assert_eq!(
+            skill_version_request("https://relay.example", "i", Scope::Global, "", "demo", 4).url,
+            "https://relay.example/api/skills/version?id=i&scope=global&project=&name=demo&version=4"
+        );
+        let info: SkillVersionInfo = serde_json::from_value(json!({"version": 2, "created_at": 5})).unwrap();
+        assert_eq!((info.file_count, info.deleted, info.purged, info.source_agent.as_str()), (0, false, false, ""));
     }
 }

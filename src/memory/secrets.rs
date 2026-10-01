@@ -152,6 +152,18 @@ pub fn check_bytes(bytes: &[u8]) -> Vec<SecretFinding> {
     }
 }
 
+/// Every finding in a skill's files, as `path:line  kind masked`. Binary
+/// (non-UTF-8) files can't be checked and are reported as unreadable.
+pub fn skill_file_problems(files: &std::collections::BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, bytes) in files {
+        for f in check_bytes(bytes) {
+            out.push(format!("{}:{}  {} {}", path, f.line, f.kind, f.masked));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +281,17 @@ mod tests {
     #[test]
     fn entropy_of_empty_is_zero() {
         assert_eq!(entropy(""), 0.0);
+    }
+
+    #[test]
+    fn skill_file_problems_are_masked_per_file() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("SKILL.md".to_string(), b"# fine".to_vec());
+        files.insert("creds.txt".to_string(), b"AKIAIOSFODNN7EXAMPLE".to_vec());
+        files.insert("img.png".to_string(), vec![0xff, 0xfe, 0x00]);
+        let p = skill_file_problems(&files);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p.iter().any(|l| l.starts_with("creds.txt:1") && !l.contains("IOSFODNN7")));
+        assert!(p.iter().any(|l| l.starts_with("img.png:0") && l.contains("unreadable (binary)")));
     }
 }

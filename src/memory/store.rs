@@ -1,7 +1,7 @@
 //! Each machine's local copy (offline-first) plus the outbound queue.
 //! `~/.config/atem/knowledge.db`, mode 0600. Holds no secrets by construction.
-use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use crate::memory::model::{Memory, Scope, Skill};
@@ -29,6 +29,7 @@ pub fn skill_cursor_key(account: &str) -> String {
 pub enum PendingOp {
     AddMemory { memory: Memory },
     DeleteMemory { id: String },
+    InvalidateMemory { id: String, invalid_at: i64, superseded_by: Option<String> },
     PushSkill { skill: Skill, base_version: i64 },
     DeleteSkill { scope: Scope, project: String, name: String },
     PurgeSkill { scope: Scope, project: String, name: String, versions: Option<Vec<i64>> },
@@ -36,7 +37,7 @@ pub enum PendingOp {
 
 impl PendingOp {
     pub fn is_memory(&self) -> bool {
-        matches!(self, PendingOp::AddMemory { .. } | PendingOp::DeleteMemory { .. })
+        matches!(self, PendingOp::AddMemory { .. } | PendingOp::DeleteMemory { .. } | PendingOp::InvalidateMemory { .. })
     }
 }
 
@@ -72,12 +73,39 @@ pub struct HarvestEntry {
     pub status: HarvestStatus,
 }
 
+/// `atem memory search`. `scope`/`project` = `None` means any; valid facts
+/// only unless `history`.
+#[derive(Debug, Clone, Default)]
+pub struct SearchQuery {
+    pub text: String,
+    pub scope: Option<Scope>,
+    pub project: Option<String>,
+    pub history: bool,
+    pub limit: usize,
+}
+
+/// The whole query as one FTS5 phrase (internal `"` doubled), so FTS5
+/// syntax (`OR`, `NOT`, `*`, `:`…) in user text is matched literally.
+pub fn fts_phrase(text: &str) -> String {
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
+/// A LIKE substring pattern with `\` as the escape character.
+pub fn like_pattern(text: &str) -> String {
+    format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+fn prefixed_mem_cols(prefix: &str) -> String {
+    MEM_COLS.split(", ").map(|c| format!("{}{}", prefix, c)).collect::<Vec<_>>().join(", ")
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
   content TEXT NOT NULL, content_hash TEXT NOT NULL, confidence TEXT NOT NULL,
   source_agent TEXT NOT NULL, source_machine TEXT NOT NULL, created_at INTEGER NOT NULL,
-  deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+  deleted_at INTEGER, valid_at INTEGER, invalid_at INTEGER, superseded_by TEXT,
+  seq INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS skills (
   scope TEXT NOT NULL, project TEXT NOT NULL, name TEXT NOT NULL,
   version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL,
@@ -86,9 +114,134 @@ CREATE TABLE IF NOT EXISTS pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, pay
 CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS harvest_map (
   origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS replacements (new_id TEXT NOT NULL, old_id TEXT NOT NULL, PRIMARY KEY (new_id, old_id));
 ";
 
-const MEM_COLS: &str = "id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted, seq";
+/// Full-text index over `memories.content`: external content, and trigram
+/// so it matches inside CJK text too. Kept in step by triggers. `memories` is
+/// a rowid table (TEXT PRIMARY KEY, not WITHOUT ROWID). Never VACUUM this
+/// database without `INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')`
+/// afterwards: VACUUM may renumber those rowids.
+const FTS_SCHEMA: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  content, content='memories', content_rowid='rowid', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+";
+
+fn memory_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(cols.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn memories_current(cols: &[String]) -> bool {
+    let has = |c: &str| cols.iter().any(|x| x == c);
+    !has("deleted") && ["deleted_at", "valid_at", "invalid_at", "superseded_by"].iter().all(|c| has(c))
+}
+
+/// Bring a pre-1.1 `memories` table to the current shape: `deleted` →
+/// `deleted_at` (deleted rows get "now"; the real time was never stored),
+/// plus the validity columns. Idempotent; one IMMEDIATE transaction that
+/// re-reads the columns, so a second atem opening the same legacy DB waits
+/// for the first and then finds nothing to do.
+fn migrate_memories(conn: &Connection) -> Result<()> {
+    if memories_current(&memory_columns(conn)?) {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let cols = memory_columns(&tx)?;
+    if memories_current(&cols) {
+        return Ok(());
+    }
+    let has = |c: &str| cols.iter().any(|x| x == c);
+    if !has("deleted_at") {
+        tx.execute_batch("ALTER TABLE memories ADD COLUMN deleted_at INTEGER")?;
+        if has("deleted") {
+            tx.execute("UPDATE memories SET deleted_at = ?1 WHERE deleted != 0", params![crate::memory::model::now_secs()])?;
+        }
+    }
+    for (c, ty) in [("valid_at", "INTEGER"), ("invalid_at", "INTEGER"), ("superseded_by", "TEXT")] {
+        if !has(c) {
+            tx.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {} {}", c, ty))?;
+        }
+    }
+    if has("deleted") {
+        tx.execute_batch("ALTER TABLE memories DROP COLUMN deleted")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Whether `replacements` is keyed on (new_id, old_id). The first 1.1 build
+/// keyed it on new_id alone, which dropped a link when a successor was reused.
+fn replacements_current(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(replacements)")?;
+    let pk = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(pk.iter().any(|(c, k)| c == "old_id" && *k > 0))
+}
+
+/// Re-key an old `replacements` table on (new_id, old_id). Same IMMEDIATE
+/// pattern as `migrate_memories`.
+fn migrate_replacements(conn: &Connection) -> Result<()> {
+    if replacements_current(conn)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if replacements_current(&tx)? {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE replacements_new (new_id TEXT NOT NULL, old_id TEXT NOT NULL, PRIMARY KEY (new_id, old_id));
+         INSERT OR IGNORE INTO replacements_new (new_id, old_id) SELECT new_id, old_id FROM replacements;
+         DROP TABLE replacements;
+         ALTER TABLE replacements_new RENAME TO replacements;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// (index exists, update trigger is the current content-only one)
+fn fts_state(conn: &Connection) -> Result<(bool, bool)> {
+    let had_fts: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'memories_fts')", [], |r| r.get(0))?;
+    let au: Option<String> = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_fts_au'", [], |r| r.get(0)).optional()?;
+    Ok((had_fts, au.is_some_and(|s| s.contains("UPDATE OF content"))))
+}
+
+/// Create the FTS index and triggers, indexing existing rows the first
+/// time. An update trigger from an earlier build (fired on every update) is
+/// replaced by the content-only one. Same IMMEDIATE pattern as
+/// `migrate_memories`.
+fn setup_fts(conn: &Connection) -> Result<()> {
+    if fts_state(conn)? == (true, true) {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let (had_fts, trigger_current) = fts_state(&tx)?;
+    if !trigger_current {
+        tx.execute_batch("DROP TRIGGER IF EXISTS memories_fts_au")?;
+    }
+    tx.execute_batch(FTS_SCHEMA)?;
+    if !had_fts {
+        // Index the rows that existed before the index did.
+        tx.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+const MEM_COLS: &str = "id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted_at, valid_at, invalid_at, superseded_by, seq";
 
 fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
     let scope: String = r.get(1)?;
@@ -103,8 +256,11 @@ fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
         source_agent: r.get(7)?,
         source_machine: r.get(8)?,
         created_at: r.get(9)?,
-        deleted: r.get::<_, i64>(10)? != 0,
-        seq: r.get(11)?,
+        deleted_at: r.get(10)?,
+        valid_at: r.get(11)?,
+        invalid_at: r.get(12)?,
+        superseded_by: r.get(13)?,
+        seq: r.get(14)?,
     })
 }
 
@@ -135,6 +291,8 @@ impl Store {
             }
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // Another atem (e.g. a background sync) may hold the write lock.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -150,20 +308,40 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Store> {
         conn.execute_batch(SCHEMA)?;
+        migrate_memories(&conn)?;
+        migrate_replacements(&conn)?;
+        setup_fts(&conn)?;
         Ok(Store { conn })
     }
 
+    /// Run `f` in one IMMEDIATE transaction on this store: everything it
+    /// writes commits together, or (on an error) not at all. Not nestable.
+    pub fn in_transaction<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let out = f()?; // an error drops `tx`, which rolls back
+        tx.commit()?;
+        Ok(out)
+    }
+
     // ── memories ────────────────────────────────────────────────────────
+    /// Insert or overwrite (the relay is authoritative), except that a local
+    /// invalidation the incoming row doesn't have yet is kept. Invalidation
+    /// is final, so it can only be "not yet pulled", never undone. `valid_at`
+    /// is set once at add, so a row without it (an older relay) keeps ours.
     pub fn upsert_memory(&self, m: &Memory) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO memories (id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO memories (id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted_at, valid_at, invalid_at, superseded_by, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET scope=excluded.scope, project=excluded.project, machine=excluded.machine,
                content=excluded.content, content_hash=excluded.content_hash, confidence=excluded.confidence,
                source_agent=excluded.source_agent, source_machine=excluded.source_machine,
-               created_at=excluded.created_at, deleted=excluded.deleted, seq=excluded.seq",
+               created_at=excluded.created_at, deleted_at=excluded.deleted_at, valid_at=COALESCE(excluded.valid_at, memories.valid_at),
+               invalid_at=COALESCE(excluded.invalid_at, memories.invalid_at),
+               superseded_by=CASE WHEN excluded.invalid_at IS NOT NULL THEN excluded.superseded_by ELSE memories.superseded_by END,
+               seq=excluded.seq",
             params![m.id, m.scope.as_str(), m.project, m.machine, m.content, m.content_hash, m.confidence,
-                    m.source_agent, m.source_machine, m.created_at, m.deleted as i64, m.seq],
+                    m.source_agent, m.source_machine, m.created_at, m.deleted_at, m.valid_at, m.invalid_at,
+                    m.superseded_by, m.seq],
         )?;
         Ok(())
     }
@@ -174,26 +352,136 @@ impl Store {
             .optional()?)
     }
 
+    /// Valid facts: not deleted and not invalidated (what gets injected).
     pub fn live_memories(&self) -> Result<Vec<Memory>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM memories WHERE deleted = 0 ORDER BY created_at, id", MEM_COLS))?;
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM memories WHERE deleted_at IS NULL AND invalid_at IS NULL ORDER BY created_at, id", MEM_COLS))?;
         let rows = stmt.query_map([], row_to_memory)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Everything not deleted, including invalidated facts (the history).
+    pub fn history_memories(&self) -> Result<Vec<Memory>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM memories WHERE deleted_at IS NULL ORDER BY created_at, id", MEM_COLS))?;
+        let rows = stmt.query_map([], row_to_memory)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Local search. Three or more characters: FTS5 trigram phrase match,
+    /// ranked by BM25 (works for CJK). Shorter (trigram can't index it):
+    /// case-insensitive substring match, newest first.
+    pub fn search_memories(&self, q: &SearchQuery) -> Result<Vec<Memory>> {
+        let text = q.text.trim();
+        if text.is_empty() || q.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let validity = if q.history { "" } else { " AND m.invalid_at IS NULL" };
+        let filters = format!("m.deleted_at IS NULL{} AND (?2 IS NULL OR m.scope = ?2) AND (?3 IS NULL OR m.project = ?3)", validity);
+        let cols = prefixed_mem_cols("m.");
+        let short = text.chars().count() < 3;
+        let (sql, arg) = if short {
+            (format!("SELECT {cols} FROM memories m WHERE m.content LIKE ?1 ESCAPE '\\' AND {filters} ORDER BY m.created_at DESC, m.id LIMIT ?4"),
+             like_pattern(text))
+        } else {
+            (format!("SELECT {cols} FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid WHERE memories_fts MATCH ?1 AND {filters} ORDER BY bm25(memories_fts), m.created_at DESC, m.id LIMIT ?4"),
+             fts_phrase(text))
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![arg, q.scope.map(|s| s.as_str()), q.project, q.limit as i64], row_to_memory)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A valid fact with this dedup key. Invalid facts never match, so a fact
+    /// that becomes true again is added as a new memory.
     pub fn find_live_by_hash(&self, scope: Scope, project: &str, machine: &str, hash: &str) -> Result<Option<Memory>> {
         Ok(self.conn
             .query_row(
-                &format!("SELECT {} FROM memories WHERE deleted = 0 AND scope = ?1 AND project = ?2 AND machine = ?3 AND content_hash = ?4 LIMIT 1", MEM_COLS),
+                &format!("SELECT {} FROM memories WHERE deleted_at IS NULL AND invalid_at IS NULL AND scope = ?1 AND project = ?2 AND machine = ?3 AND content_hash = ?4 LIMIT 1", MEM_COLS),
                 params![scope.as_str(), project, machine, hash],
                 row_to_memory,
             )
             .optional()?)
     }
 
-    /// Tombstone: also clears the text so it doesn't linger locally.
+    /// Tombstone: also clears the text so it doesn't linger locally. The
+    /// first deletion time is kept.
     pub fn mark_memory_deleted(&self, id: &str) -> Result<()> {
-        self.conn.execute("UPDATE memories SET deleted = 1, content = '', content_hash = '' WHERE id = ?1", params![id])?;
+        self.conn.execute(
+            "UPDATE memories SET deleted_at = COALESCE(deleted_at, ?2), content = '', content_hash = '' WHERE id = ?1",
+            params![id, crate::memory::model::now_secs()],
+        )?;
         Ok(())
+    }
+
+    /// Set `invalid_at` (and `superseded_by`) on a memory that is neither
+    /// deleted nor already invalid. Returns false when nothing changed:
+    /// invalidation is final.
+    pub fn invalidate_memory(&self, id: &str, invalid_at: i64, superseded_by: Option<&str>) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memories SET invalid_at = ?2, superseded_by = ?3 WHERE id = ?1 AND deleted_at IS NULL AND invalid_at IS NULL",
+            params![id, invalid_at, superseded_by],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Local-only note that `new_id` was written to replace `old_id`. The
+    /// relay keeps only the first replacement of a fact (invalidation is
+    /// final), so this is how a second, concurrent replacement is noticed.
+    /// One successor may replace several facts; every link is kept.
+    pub fn record_replacement(&self, new_id: &str, old_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO replacements (new_id, old_id) VALUES (?1, ?2)",
+            params![new_id, old_id],
+        )?;
+        Ok(())
+    }
+
+    /// A full id, or a unique prefix of one. Without `mem_`, the prefix is of
+    /// the part after it (the short id shown in the Codex block). Deleted
+    /// memories never match.
+    pub fn resolve_memory_id(&self, input: &str) -> Result<String> {
+        let input = input.trim();
+        if input.is_empty() {
+            bail!("Pass a memory id");
+        }
+        let prefix = if input.starts_with("mem_") { input.to_string() } else { format!("mem_{}", input) };
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM memories WHERE deleted_at IS NULL AND (id = ?1 OR substr(id, 1, length(?2)) = ?2) ORDER BY id",
+        )?;
+        let ids: Vec<String> = stmt.query_map(params![input, prefix], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if let Some(exact) = ids.iter().find(|i| i.as_str() == input) {
+            return Ok(exact.clone());
+        }
+        match ids.len() {
+            0 => bail!("No memory {}", input),
+            1 => Ok(ids[0].clone()),
+            n => bail!("{} matches {} memories — use more characters of the id (more than one match)", input, n),
+        }
+    }
+
+    /// Facts (not deleted) with more than one valid successor: `(old id,
+    /// [successor ids])`. Links come from `superseded_by` and from this
+    /// machine's `replacements`.
+    pub fn multi_successors(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.old_id, l.new_id FROM (
+                 SELECT id AS old_id, superseded_by AS new_id FROM memories WHERE superseded_by IS NOT NULL
+                 UNION SELECT old_id, new_id FROM replacements
+             ) l
+             JOIN memories o ON o.id = l.old_id
+             JOIN memories s ON s.id = l.new_id
+             WHERE o.deleted_at IS NULL AND s.deleted_at IS NULL AND s.invalid_at IS NULL
+             ORDER BY l.old_id, l.new_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for row in rows {
+            let (old, new) = row?;
+            match out.last_mut() {
+                Some((o, v)) if *o == old => v.push(new),
+                _ => out.push((old, vec![new])),
+            }
+        }
+        Ok(out.into_iter().filter(|(_, v)| v.len() > 1).collect())
     }
 
     pub fn set_memory_seq(&self, id: &str, seq: i64) -> Result<()> {
@@ -213,6 +501,31 @@ impl Store {
             self.conn.execute("UPDATE memories SET id = ?2 WHERE id = ?1", params![old, new])?;
         }
         self.conn.execute("UPDATE harvest_map SET memory_id = ?2 WHERE memory_id = ?1", params![old, new])?;
+        self.conn.execute("UPDATE memories SET superseded_by = ?2 WHERE superseded_by = ?1", params![old, new])?;
+        // A link that already exists under the new id is kept once; the
+        // leftover under the old id is dropped.
+        self.conn.execute("UPDATE OR IGNORE replacements SET new_id = ?2 WHERE new_id = ?1", params![old, new])?;
+        self.conn.execute("DELETE FROM replacements WHERE new_id = ?1", params![old])?;
+        self.conn.execute("UPDATE OR IGNORE replacements SET old_id = ?2 WHERE old_id = ?1", params![old, new])?;
+        self.conn.execute("DELETE FROM replacements WHERE old_id = ?1", params![old])?;
+        // Queued ops that still name the old id (e.g. replace's invalidate,
+        // when a chunk boundary fell after its add).
+        for (n, op) in self.pending()? {
+            let fixed = match op {
+                PendingOp::InvalidateMemory { id, invalid_at, superseded_by }
+                    if id == old || superseded_by.as_deref() == Some(old) =>
+                {
+                    PendingOp::InvalidateMemory {
+                        id: if id == old { new.to_string() } else { id },
+                        invalid_at,
+                        superseded_by: superseded_by.map(|s| if s == old { new.to_string() } else { s }),
+                    }
+                }
+                PendingOp::DeleteMemory { id } if id == old => PendingOp::DeleteMemory { id: new.to_string() },
+                _ => continue,
+            };
+            self.replace_pending(n, &fixed)?;
+        }
         Ok(())
     }
 
@@ -269,6 +582,11 @@ impl Store {
 
     pub fn ack(&self, n: i64) -> Result<()> {
         self.conn.execute("DELETE FROM pending_ops WHERE n = ?1", params![n])?;
+        Ok(())
+    }
+
+    pub fn replace_pending(&self, n: i64, op: &PendingOp) -> Result<()> {
+        self.conn.execute("UPDATE pending_ops SET payload = ?2 WHERE n = ?1", params![n, serde_json::to_string(op)?])?;
         Ok(())
     }
 
@@ -345,11 +663,279 @@ mod tests {
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
 
+    #[test]
+    fn resolve_accepts_full_ids_and_unique_prefixes() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_1a2b3c4d5e", "A")).unwrap();
+        s.upsert_memory(&mem("mem_1a2bffff", "B")).unwrap();
+        s.upsert_memory(&mem("mem_9999", "C")).unwrap();
+        s.mark_memory_deleted("mem_9999").unwrap();
+        assert_eq!(s.resolve_memory_id("mem_1a2b3c4d5e").unwrap(), "mem_1a2b3c4d5e");
+        assert_eq!(s.resolve_memory_id("1a2b3c4d").unwrap(), "mem_1a2b3c4d5e");
+        assert_eq!(s.resolve_memory_id("mem_1a2bf").unwrap(), "mem_1a2bffff");
+        assert!(s.resolve_memory_id("1a2b").unwrap_err().to_string().contains("more than one"));
+        assert!(s.resolve_memory_id("9999").unwrap_err().to_string().contains("No memory"));
+        assert!(s.resolve_memory_id("zz").is_err());
+    }
+
+    #[test]
+    fn pull_without_valid_at_keeps_the_local_one() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = mem("mem_a", "A");
+        m.valid_at = Some(1_700_000_000);
+        s.upsert_memory(&m).unwrap();
+        let mut pulled = m.clone();
+        pulled.valid_at = None; // a relay that dropped the field
+        pulled.seq = 7;
+        s.upsert_memory(&pulled).unwrap();
+        let got = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((got.valid_at, got.seq), (Some(1_700_000_000), 7));
+    }
+
+    #[test]
+    fn invalidate_is_final_locally() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_a", "A")).unwrap();
+        assert!(s.invalidate_memory("mem_a", 10, Some("mem_b")).unwrap());
+        assert!(!s.invalidate_memory("mem_a", 20, None).unwrap());
+        s.upsert_memory(&mem("mem_d", "D")).unwrap();
+        s.mark_memory_deleted("mem_d").unwrap();
+        assert!(!s.invalidate_memory("mem_d", 20, None).unwrap());
+        let a = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((a.invalid_at, a.superseded_by.as_deref(), a.content.as_str()), (Some(10), Some("mem_b"), "A"));
+    }
+
+    #[test]
+    fn two_valid_successors_are_reported() {
+        let s = Store::open_in_memory().unwrap();
+        let mut x = mem("mem_x", "X");
+        x.invalid_at = Some(5);
+        x.superseded_by = Some("mem_a".into());
+        s.upsert_memory(&x).unwrap();
+        s.upsert_memory(&mem("mem_a", "A")).unwrap();
+        s.upsert_memory(&mem("mem_b", "B")).unwrap();
+        assert!(s.multi_successors().unwrap().is_empty());
+        // This machine's replacement lost the race on the relay: only the local table knows.
+        s.record_replacement("mem_b", "mem_x").unwrap();
+        assert_eq!(s.multi_successors().unwrap(), vec![("mem_x".to_string(), vec!["mem_a".to_string(), "mem_b".to_string()])]);
+        s.invalidate_memory("mem_b", 6, None).unwrap();
+        assert!(s.multi_successors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reused_successor_keeps_every_replacement_link() {
+        let s = Store::open_in_memory().unwrap();
+        for (id, c) in [("mem_x", "X"), ("mem_y", "Y"), ("mem_e", "E"), ("mem_f", "F")] {
+            s.upsert_memory(&mem(id, c)).unwrap();
+        }
+        s.record_replacement("mem_e", "mem_x").unwrap();
+        s.record_replacement("mem_e", "mem_y").unwrap();
+        s.record_replacement("mem_e", "mem_y").unwrap(); // a repeat is ignored
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM replacements WHERE new_id = 'mem_e'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+        // X was also replaced by F elsewhere: still a fork.
+        s.record_replacement("mem_f", "mem_x").unwrap();
+        assert_eq!(s.multi_successors().unwrap(), vec![("mem_x".to_string(), vec!["mem_e".to_string(), "mem_f".to_string()])]);
+        // The relay dedups F onto E: the links merge, and nothing is left under F.
+        s.rewrite_memory_id("mem_f", "mem_e").unwrap();
+        let mut st = s.conn.prepare("SELECT new_id, old_id FROM replacements ORDER BY old_id").unwrap();
+        let rows: Vec<(String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|x| x.unwrap()).collect();
+        assert_eq!(rows, vec![("mem_e".to_string(), "mem_x".to_string()), ("mem_e".to_string(), "mem_y".to_string())]);
+        assert!(s.multi_successors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replacements_table_keyed_on_new_id_is_migrated() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("knowledge.db");
+        {
+            let s = Store::open(&p).unwrap();
+            s.conn.execute_batch("DROP TABLE replacements;
+                CREATE TABLE replacements (new_id TEXT PRIMARY KEY, old_id TEXT NOT NULL);
+                INSERT INTO replacements VALUES ('mem_e', 'mem_x');").unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        s.record_replacement("mem_e", "mem_y").unwrap();
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM replacements", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+        drop(s);
+        let s = Store::open(&p).unwrap(); // idempotent
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM replacements", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn invalidate_op_is_a_memory_op() {
+        let op = PendingOp::InvalidateMemory { id: "mem_a".into(), invalid_at: 5, superseded_by: None };
+        assert!(op.is_memory());
+        let s = Store::open_in_memory().unwrap();
+        s.enqueue(&op).unwrap();
+        assert_eq!(s.pending().unwrap()[0].1, op);
+    }
+
+    fn ids(ms: Vec<Memory>) -> Vec<String> {
+        ms.into_iter().map(|m| m.id).collect()
+    }
+
+    fn fts_hits(s: &Store, q: &str) -> Vec<String> {
+        let mut st = s.conn.prepare(
+            "SELECT m.id FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid WHERE memories_fts MATCH ?1 ORDER BY m.id",
+        ).unwrap();
+        st.query_map(params![q], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+    }
+
+    #[test]
+    fn legacy_db_is_migrated_once() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("knowledge.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch("CREATE TABLE memories (
+              id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
+              content TEXT NOT NULL, content_hash TEXT NOT NULL, confidence TEXT NOT NULL,
+              source_agent TEXT NOT NULL, source_machine TEXT NOT NULL, created_at INTEGER NOT NULL,
+              deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO memories VALUES ('mem_live','global','','','DialF uses TCP 8765','h1','medium','cli','m',1,0,4);
+            INSERT INTO memories VALUES ('mem_gone','global','','','','','medium','cli','m',1,1,5);").unwrap();
+        }
+        let before = crate::memory::model::now_secs();
+        let s = Store::open(&p).unwrap();
+        let cols = memory_columns(&s.conn).unwrap();
+        for c in ["deleted_at", "valid_at", "invalid_at", "superseded_by"] {
+            assert!(cols.iter().any(|x| x == c), "{c}");
+        }
+        assert!(!cols.iter().any(|x| x == "deleted"));
+        let gone = s.get_memory("mem_gone").unwrap().unwrap();
+        assert!(gone.deleted_at.unwrap() >= before);
+        let live = s.get_memory("mem_live").unwrap().unwrap();
+        assert_eq!((live.deleted_at, live.valid_at, live.invalid_at, live.superseded_by.clone(), live.seq), (None, None, None, None, 4));
+        assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]); // rebuilt over existing rows
+        drop(s);
+        let s = Store::open(&p).unwrap(); // idempotent
+        assert_eq!(s.get_memory("mem_gone").unwrap().unwrap().deleted_at, gone.deleted_at);
+        assert_eq!(ids(s.live_memories().unwrap()), vec!["mem_live"]);
+        assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]);
+    }
+
+    fn write_legacy_db(p: &Path) {
+        let c = Connection::open(p).unwrap();
+        c.execute_batch("CREATE TABLE memories (
+          id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
+          content TEXT NOT NULL, content_hash TEXT NOT NULL, confidence TEXT NOT NULL,
+          source_agent TEXT NOT NULL, source_machine TEXT NOT NULL, created_at INTEGER NOT NULL,
+          deleted INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO memories VALUES ('mem_live','global','','','DialF uses TCP 8765','h1','medium','cli','m',1,0,4);").unwrap();
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_legacy_db_all_succeed() {
+        // Two atem processes opening a pre-1.1 DB at once: one migrates, the
+        // other waits for it and then sees the migrated table.
+        for round in 0..5 {
+            let td = tempfile::tempdir().unwrap();
+            let p = td.path().join("knowledge.db");
+            write_legacy_db(&p);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = (0..4).map(|_| {
+                let (p, b) = (p.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    Store::open(&p).map(|_| ()).map_err(|e| format!("{e:#}"))
+                })
+            }).collect();
+            for h in handles {
+                h.join().unwrap().unwrap_or_else(|e| panic!("round {round}: {e}"));
+            }
+            let s = Store::open(&p).unwrap();
+            assert!(!memory_columns(&s.conn).unwrap().iter().any(|x| x == "deleted"));
+            assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]);
+        }
+    }
+
+    #[test]
+    fn fts_update_trigger_is_content_only_and_replaced_on_old_dbs() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("knowledge.db");
+        {
+            let s = Store::open(&p).unwrap();
+            s.upsert_memory(&mem("mem_a", "DialF uses TCP 8765")).unwrap();
+            // Simulate a DB made by the first 1.1 build: a trigger on any update.
+            s.conn.execute_batch("DROP TRIGGER memories_fts_au;
+                CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN
+                  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+                END;").unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let sql: String = s.conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_fts_au'", [], |r| r.get(0)).unwrap();
+        assert!(sql.contains("UPDATE OF content"), "{sql}");
+        s.set_memory_seq("mem_a", 3).unwrap();
+        s.invalidate_memory("mem_a", 5, None).unwrap();
+        assert_eq!(fts_hits(&s, "\"8765\""), vec!["mem_a"]);
+        s.upsert_memory(&mem("mem_a", "DialF uses TCP 9000")).unwrap();
+        assert!(fts_hits(&s, "\"8765\"").is_empty());
+        assert_eq!(fts_hits(&s, "\"9000\""), vec!["mem_a"]);
+    }
+
+    #[test]
+    fn fts_index_follows_inserts_updates_and_deletes() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_a", "DialF uses TCP 8765")).unwrap();
+        assert_eq!(fts_hits(&s, "\"8765\""), vec!["mem_a"]);
+        s.upsert_memory(&mem("mem_a", "DialF uses TCP 9000")).unwrap();
+        assert!(fts_hits(&s, "\"8765\"").is_empty());
+        assert_eq!(fts_hits(&s, "\"9000\""), vec!["mem_a"]);
+        s.rewrite_memory_id("mem_a", "mem_b").unwrap();
+        assert_eq!(fts_hits(&s, "\"9000\""), vec!["mem_b"]);
+        s.mark_memory_deleted("mem_b").unwrap();
+        assert!(fts_hits(&s, "\"9000\"").is_empty());
+    }
+
+    #[test]
+    fn live_means_valid_and_history_keeps_invalid() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_a", "A")).unwrap();
+        let mut b = mem("mem_b", "B");
+        b.invalid_at = Some(10);
+        b.superseded_by = Some("mem_a".into());
+        s.upsert_memory(&b).unwrap();
+        s.upsert_memory(&mem("mem_c", "C")).unwrap();
+        s.mark_memory_deleted("mem_c").unwrap();
+        assert_eq!(ids(s.live_memories().unwrap()), vec!["mem_a"]);
+        assert_eq!(ids(s.history_memories().unwrap()), vec!["mem_a", "mem_b"]);
+        // An invalid fact is not a dedup target: re-adding it makes a new memory.
+        assert!(s.find_live_by_hash(Scope::Global, "", "", &content_hash("B")).unwrap().is_none());
+        let c = s.get_memory("mem_c").unwrap().unwrap();
+        assert!(c.is_deleted() && c.content.is_empty());
+    }
+
+    #[test]
+    fn pulled_row_without_invalidation_keeps_a_local_one() {
+        let s = Store::open_in_memory().unwrap();
+        let mut a = mem("mem_a", "A");
+        a.invalid_at = Some(10);
+        a.superseded_by = Some("mem_b".into());
+        s.upsert_memory(&a).unwrap();
+        // The relay hasn't seen the invalidation yet.
+        let mut stale = mem("mem_a", "A");
+        stale.seq = 9;
+        s.upsert_memory(&stale).unwrap();
+        let got = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((got.invalid_at, got.superseded_by.as_deref(), got.seq), (Some(10), Some("mem_b"), 9));
+        // The relay's invalidation wins when it has one.
+        let mut server = mem("mem_a", "A");
+        server.invalid_at = Some(7);
+        server.superseded_by = Some("mem_c".into());
+        s.upsert_memory(&server).unwrap();
+        let got = s.get_memory("mem_a").unwrap().unwrap();
+        assert_eq!((got.invalid_at, got.superseded_by.as_deref()), (Some(7), Some("mem_c")));
+    }
+
     fn mem(id: &str, content: &str) -> Memory {
         Memory {
             id: id.into(), scope: Scope::Global, project: String::new(), machine: String::new(),
             content: content.into(), content_hash: content_hash(content), confidence: "medium".into(),
-            source_agent: "cli".into(), source_machine: "m".into(), created_at: 1, deleted: false, seq: 0,
+            source_agent: "cli".into(), source_machine: "m".into(), created_at: 1, seq: 0, ..Default::default()
         }
     }
 
@@ -371,7 +957,7 @@ mod tests {
         assert_eq!(s.get_memory("mem_a").unwrap().unwrap().content, "A");
         s.mark_memory_deleted("mem_b").unwrap();
         let b = s.get_memory("mem_b").unwrap().unwrap();
-        assert!(b.deleted && b.content.is_empty() && b.content_hash.is_empty());
+        assert!(b.is_deleted() && b.content.is_empty() && b.content_hash.is_empty());
         assert_eq!(s.live_memories().unwrap().len(), 1);
     }
 
@@ -491,4 +1077,80 @@ mod tests {
         Store::open(&existing).unwrap();
         assert_eq!(std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o600);
     }
+
+    fn q(text: &str) -> SearchQuery {
+        SearchQuery { text: text.into(), limit: 20, ..Default::default() }
+    }
+
+    fn search_ids(s: &Store, query: &SearchQuery) -> Vec<String> {
+        s.search_memories(query).unwrap().into_iter().map(|m| m.id).collect()
+    }
+
+    #[test]
+    fn search_ranks_with_bm25_and_matches_cjk() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_once", "DialF listens on TCP 8765")).unwrap();
+        s.upsert_memory(&mem("mem_many", "tcp tcp tcp port notes")).unwrap();
+        s.upsert_memory(&mem("mem_cjk", "服务器端口是八七六五")).unwrap();
+        s.upsert_memory(&mem("mem_pnpm", "Use pnpm not npm")).unwrap();
+        assert_eq!(search_ids(&s, &q("tcp")), vec!["mem_many", "mem_once"]);
+        assert_eq!(search_ids(&s, &q("TCP 87")), vec!["mem_once"]);
+        assert_eq!(search_ids(&s, &q("端口是")), vec!["mem_cjk"]);
+        // Shorter than a trigram: substring fallback.
+        assert_eq!(search_ids(&s, &q("端口")), vec!["mem_cjk"]);
+        assert_eq!(search_ids(&s, &q("pn")), vec!["mem_pnpm"]);
+        // FTS5 syntax in the query is just text.
+        assert!(search_ids(&s, &q("a\"b OR c*")).is_empty());
+        // An FTS5 operator word is matched as text (case-insensitive), not parsed.
+        // ("notes" in mem_many also contains the trigram text "not".)
+        let mut not = search_ids(&s, &q("NOT"));
+        not.sort();
+        assert_eq!(not, vec!["mem_many", "mem_pnpm"]);
+        assert!(search_ids(&s, &q("  ")).is_empty());
+        let mut one = q("tcp");
+        one.limit = 1;
+        assert_eq!(search_ids(&s, &one), vec!["mem_many"]);
+    }
+
+    #[test]
+    fn search_filters_validity_scope_and_project() {
+        let s = Store::open_in_memory().unwrap();
+        let mut old = mem("mem_old", "port 8765");
+        old.invalid_at = Some(5);
+        s.upsert_memory(&old).unwrap();
+        let mut proj = mem("mem_proj", "port 9000");
+        proj.scope = Scope::Project;
+        proj.project = "github.com/acme/dialf".into();
+        s.upsert_memory(&proj).unwrap();
+        s.upsert_memory(&mem("mem_gone", "port 1234")).unwrap();
+        s.mark_memory_deleted("mem_gone").unwrap();
+        assert_eq!(search_ids(&s, &q("port")), vec!["mem_proj"]);
+        let mut hist = q("port");
+        hist.history = true;
+        let mut got = search_ids(&s, &hist);
+        got.sort();
+        assert_eq!(got, vec!["mem_old", "mem_proj"]);
+        let mut scoped = q("port");
+        scoped.scope = Some(Scope::Global);
+        assert!(search_ids(&s, &scoped).is_empty());
+        let mut other = q("port");
+        other.project = Some("github.com/acme/other".into());
+        assert!(search_ids(&s, &other).is_empty());
+        let mut mine = q("po");
+        mine.project = Some("github.com/acme/dialf".into());
+        assert_eq!(search_ids(&s, &mine), vec!["mem_proj"]);
+    }
+
+    #[test]
+    fn like_fallback_escapes_wildcards() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_memory(&mem("mem_pct", "5% off")).unwrap();
+        s.upsert_memory(&mem("mem_num", "50 users")).unwrap();
+        s.upsert_memory(&mem("mem_us", "a_b")).unwrap();
+        assert_eq!(search_ids(&s, &q("5%")), vec!["mem_pct"]);
+        assert_eq!(search_ids(&s, &q("_")), vec!["mem_us"]);
+        assert_eq!(like_pattern("a%b_c\\"), "%a\\%b\\_c\\\\%");
+        assert_eq!(fts_phrase("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
 }

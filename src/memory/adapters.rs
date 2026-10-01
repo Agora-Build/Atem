@@ -2,7 +2,7 @@
 //! locations. Agents only declare paths and instruction lines; one shared
 //! code path does the writing and the safety checks.
 use std::path::{Path, PathBuf};
-use crate::memory::block::{self, CODEX_CAPTURE_INSTRUCTION, CREDENTIAL_INSTRUCTION};
+use crate::memory::block::{self, CODEX_CAPTURE_INSTRUCTION, CODEX_REPLACE_INSTRUCTION, CREDENTIAL_INSTRUCTION};
 use crate::memory::gitguard;
 use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::project::RepoInfo;
@@ -100,8 +100,13 @@ impl Agent {
     pub fn instructions(&self) -> Vec<&'static str> {
         match self {
             Agent::Claude => vec![CREDENTIAL_INSTRUCTION],
-            Agent::Codex => vec![CODEX_CAPTURE_INSTRUCTION, CREDENTIAL_INSTRUCTION],
+            Agent::Codex => vec![CODEX_CAPTURE_INSTRUCTION, CODEX_REPLACE_INSTRUCTION, CREDENTIAL_INSTRUCTION],
         }
+    }
+
+    /// Codex's block shows each fact's short id so it can run `atem memory replace <id>`.
+    pub fn shows_ids(&self) -> bool {
+        *self == Agent::Codex
     }
 
     /// Claude already has the project memories it harvested itself on this
@@ -119,6 +124,11 @@ pub fn valid_skill_name(n: &str) -> bool {
         && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// The report targets `apply_skills` uses for this skill (one per agent).
+pub fn skill_targets(ctx: &Ctx, scope: Scope, name: &str) -> Vec<String> {
+    Agent::all().iter().filter_map(|a| a.skills_root(ctx, scope)).map(|r| display_path(&r.join(name), ctx)).collect()
+}
+
 fn display_path(p: &Path, ctx: &Ctx) -> String {
     match p.strip_prefix(&ctx.home) {
         Ok(rel) => format!("~/{}", rel.display()),
@@ -131,17 +141,16 @@ fn line(mark: Mark, target: String, detail: impl Into<String>) -> ReportLine {
 }
 
 pub fn apply_memory(agent: Agent, ctx: &Ctx, mems: &[Memory]) -> Vec<ReportLine> {
-    let visible: Vec<Memory> = mems.iter().filter(|m| !m.deleted && !agent.skips_echo(m, ctx)).cloned().collect();
+    let visible: Vec<Memory> = mems.iter().filter(|m| m.is_valid() && !agent.skips_echo(m, ctx)).cloned().collect();
     let global: Vec<Memory> = visible.iter()
         .filter(|m| m.scope == Scope::Global || (m.scope == Scope::Machine && m.machine == ctx.atem_id))
         .cloned().collect();
-    let instr = agent.instructions();
-    let mut report = vec![write_block(&agent.global_memory_file(ctx), None, &global, &instr, ctx)];
+    let mut report = vec![write_block(&agent.global_memory_file(ctx), None, &global, agent, ctx)];
     if let Some(repo) = &ctx.repo {
         let proj: Vec<Memory> = visible.iter()
             .filter(|m| m.scope == Scope::Project && m.project == repo.key)
             .cloned().collect();
-        report.push(write_block(&agent.project_memory_file(&repo.root), Some(&repo.root), &proj, &instr, ctx));
+        report.push(write_block(&agent.project_memory_file(&repo.root), Some(&repo.root), &proj, agent, ctx));
     }
     report
 }
@@ -183,7 +192,7 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     result
 }
 
-fn write_block(path: &Path, repo_root: Option<&Path>, mems: &[Memory], instr: &[&str], ctx: &Ctx) -> ReportLine {
+fn write_block(path: &Path, repo_root: Option<&Path>, mems: &[Memory], agent: Agent, ctx: &Ctx) -> ReportLine {
     let target = display_path(path, ctx);
     if let Some(root) = repo_root
         && !ctx.allow_tracked && gitguard::is_tracked(root, path) {
@@ -198,8 +207,8 @@ fn write_block(path: &Path, repo_root: Option<&Path>, mems: &[Memory], instr: &[
     } else {
         String::new()
     };
-    let entries = block::select_entries(mems);
-    let rendered = block::render_block(&entries, instr);
+    let sel = block::select_entries(mems, agent.shows_ids());
+    let rendered = block::render_block(&sel, &agent.instructions());
     let next = match block::splice(&current, &rendered) {
         Ok(n) => n,
         Err(e) => return line(Mark::Skipped, target, format!("skipped: {}", e)),
@@ -216,7 +225,7 @@ fn write_block(path: &Path, repo_root: Option<&Path>, mems: &[Memory], instr: &[
     if let (Some(root), false) = (repo_root, existed) {
         let _ = gitguard::exclude_locally(root, path);
     }
-    line(Mark::Applied, target, format!("{} memories", entries.len()))
+    line(Mark::Applied, target, format!("{} memories", sel.entries.len()))
 }
 
 pub fn apply_skills(agent: Agent, ctx: &Ctx, skills: &[Skill]) -> Vec<ReportLine> {
@@ -291,6 +300,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::process::Command;
 
+    #[test]
+    fn invalid_facts_are_not_applied() {
+        let (_td, ctx) = setup();
+        let mut old = m(Scope::Global, "", "", "DialF listens on TCP 8765", "cli", "x");
+        old.invalid_at = Some(5);
+        let new = m(Scope::Global, "", "", "DialF listens on TCP 9000", "cli", "x");
+        apply_memory(Agent::Claude, &ctx, &[old, new]);
+        let text = read(ctx.home.join(".claude/CLAUDE.md"));
+        assert!(text.contains("TCP 9000") && !text.contains("TCP 8765"));
+    }
+
     fn run_git(dir: &Path, args: &[&str]) {
         assert!(Command::new("git").arg("-C").arg(dir).args(args).output().unwrap().status.success());
     }
@@ -317,7 +337,7 @@ mod tests {
         Memory {
             id: format!("mem_{}", content_hash(content)), scope, project: project.into(), machine: machine.into(),
             content: content.into(), content_hash: content_hash(content), confidence: "medium".into(),
-            source_agent: agent.into(), source_machine: src.into(), created_at: 1, deleted: false, seq: 0,
+            source_agent: agent.into(), source_machine: src.into(), created_at: 1, seq: 0, ..Default::default()
         }
     }
 
@@ -362,6 +382,25 @@ mod tests {
         let codex = read(ctx.home.join(".codex/AGENTS.md"));
         assert!(claude.contains(CREDENTIAL_INSTRUCTION) && !claude.contains(CODEX_CAPTURE_INSTRUCTION));
         assert!(codex.contains(CREDENTIAL_INSTRUCTION) && codex.contains(CODEX_CAPTURE_INSTRUCTION));
+    }
+
+    #[test]
+    fn codex_block_shows_short_ids_and_replace_line() {
+        let (_td, ctx) = setup();
+        let mut f = m(Scope::Global, "", "", "Prefers ripgrep", "cli", "x");
+        f.id = "mem_1a2b3c4d5e6f".into();
+        apply_memory(Agent::Codex, &ctx, std::slice::from_ref(&f));
+        apply_memory(Agent::Claude, &ctx, &[f]);
+        let codex = read(ctx.home.join(".codex/AGENTS.md"));
+        assert!(codex.contains("- [1a2b3c4d] Prefers ripgrep"), "{codex}");
+        let (cap, rep, cred) = (
+            codex.find(CODEX_CAPTURE_INSTRUCTION).unwrap(),
+            codex.find(CODEX_REPLACE_INSTRUCTION).unwrap(),
+            codex.find(CREDENTIAL_INSTRUCTION).unwrap(),
+        );
+        assert!(cap < rep && rep < cred);
+        let claude = read(ctx.home.join(".claude/CLAUDE.md"));
+        assert!(claude.contains("- Prefers ripgrep") && !claude.contains("[1a2b3c4d]") && !claude.contains(CODEX_REPLACE_INSTRUCTION));
     }
 
     #[test]
