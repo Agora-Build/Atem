@@ -93,6 +93,46 @@ Lets multiple atems (each driving an agent) share a versioned, append-only
 context store via the relay. Requires a relay-hosted vault server (`/api/vault`);
 see `designs/vault.md`.
 
+### Memory & Skills (shared across agents and machines)
+
+Requires pairing with Astation. Agents learn from each other: facts and skills
+saved on one machine (by Claude Code, Codex, or you) reach every other paired
+atem.
+
+```bash
+atem sync                                        # Harvest Claude's memories → push → pull → apply
+atem memory add "Relay tests need Valkey on :56379"   # Save a fact (project scope inside a repo)
+atem memory add --scope global --confidence high "..."
+atem memory list                                 # Global, this machine, and this project
+atem memory list --all                           # Every project and machine
+atem memory list --full                          # Everything: full id, status, timestamps, whole content
+atem memory list --history [<id>]                # Include outdated facts, as replacement chains
+atem memory search "valkey"                      # Local full-text search (offline; CJK works)
+atem memory replace <id> "the fact as it is now" # New fact replaces the old one (history kept)
+atem memory invalidate <id>                      # Mark outdated without a replacement
+atem memory rm <id>                              # Remove everywhere
+atem memory status                               # Account, machine, project, pending changes
+
+atem skill add ./my-skill                        # Directory with SKILL.md (global by default)
+atem skill list
+atem skill history <name>                        # Every version, newest first
+atem skill restore <name> --version 3            # Re-push an old version as a new one
+```
+
+Listings show short ids like `8245ecf6…e6fe` (first 8 + last 4 characters).
+Any command that takes an `<id>` accepts that form (`…` or `..`), a full id,
+or a unique prefix.
+
+A project is identified by its git `origin` remote, so two repos with the same
+folder name never collide. atem shows the remote's own spelling
+(`github.com/Agora-Build/Atem`) but matches case-insensitively.
+
+Memories are applied as a managed block in `~/.claude/CLAUDE.md`,
+`~/.codex/AGENTS.md` and `<repo>/CLAUDE.local.md`; skills go to
+`.claude/skills` and `.agents/skills`. Files tracked by git are never written.
+Anything that looks like a credential value is refused; save the
+credential's name, never its value. See `designs/atem-memory.md`.
+
 ### Dev Servers
 
 ```bash
@@ -250,6 +290,7 @@ Files in `~/.config/atem/`:
 | `credentials.enc` | SSO tokens | AES-256-GCM (machine-bound) |
 | `project_cache.enc` | Project list + active project selection | AES-256-GCM (machine-bound) |
 | `sessions.json` | Per-Astation device session IDs and tokens | Plaintext (chmod 0600) |
+| `knowledge.db` | Atem Memory: memories, skills, search index, pending-sync queue (no credentials) | None (chmod 0600) |
 
 Encrypted files are bound to the machine they were created on — copying them to another machine won't decrypt.
 
