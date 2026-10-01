@@ -19,6 +19,10 @@ everything:
 Goal: these parties see only ciphertext. Only devices paired with the
 account (its atems) can read content.
 
+**Encryption is optional.** It is off by default, and the account owner turns
+it on or off in Astation's settings. Off is the current behavior; with it on,
+the relay can't read the data.
+
 ## Non-goals
 
 - Hiding *that* data exists, its size, timing, or which atem wrote it.
@@ -28,6 +32,56 @@ account (its atems) can read content.
   covers stored data only.
 
 ## Design
+
+### The Astation setting
+
+Settings → **Security** → "End-to-end encrypt memory, skills and vault"
+(off by default).
+
+**Turning it on:**
+
+1. Astation creates the account key `K` (below) and asks for Touch ID or the
+   Mac password before showing anything.
+2. It shows a notice the user must acknowledge:
+
+   > **Save your recovery key offline.** Your memories, skills and vaults will
+   > be encrypted with a key that only your paired devices hold. If you lose
+   > this Mac and every paired atem, the data can't be recovered without this
+   > key: not by you, and not by the server operator.
+   >
+   > `ABCD-EFGH-…` (the key, as groups of base32 characters)
+   >
+   > [Copy] [Save to file…]  ☐ I've saved my recovery key somewhere safe
+
+   The **Turn on** button stays disabled until the box is checked.
+3. Astation tells the relay the account is now encrypted:
+   `relayEncryption { enabled: true, kid }`, sent over its verified relay
+   connection, which proves it holds the account's relay key. The relay
+   stores the flag per account.
+4. Connected atems get `encryptionMode { enabled, kid }` and request the key
+   (see below). Atems that connect later get the same message on connect.
+
+**While it's on:**
+
+- The relay **refuses plain-text uploads** from the account. An old atem that
+  can't encrypt gets a clear error ("this account requires encryption;
+  update atem") instead of silently uploading plain text.
+- Settings shows "On since <date>", plus **Show recovery key…**, which asks for
+  Touch ID or the password first.
+
+**Turning it off** (confirmation required; it warns that the data goes back
+to being readable on the server):
+
+1. Astation sets the account to `disabling`. The relay then accepts both
+   plain text and ciphertext.
+2. Each atem that holds `K` pulls, decrypts, and re-uploads in plain text.
+   The relay then deletes the ciphertext rows.
+3. When no ciphertext remains, Astation sets the mode to off and deletes `K`
+   from the Keychain.
+
+**A new Astation** (lost Mac): during setup, or from Settings, the user can
+choose **Restore from recovery key**, paste the key, and continue. Atems that
+still hold `K` can also re-grant it (see "Losing the key").
 
 ### One key per account
 
@@ -87,8 +141,10 @@ open question 1.
 - **Accept ciphertext.** For fields starting with `e1.`, skip the credential
   scan. It can't read them. atem's local scan stays mandatory and fail-closed,
   and becomes the only check.
-- **Refuse plain text** once an account has switched over (open question 3),
-  so an old atem can't upload plain text by mistake.
+- **Per-account mode** (`off` | `on` | `disabling`), set only by the
+  account's verified Astation. When it's `on`, plain-text uploads are refused
+  so an old atem can't upload plain text by mistake. When it's `disabling`,
+  both are accepted.
 - No schema change: the fields are already text, and ciphertext fits in them.
 
 ### What changes in atem
@@ -129,8 +185,8 @@ gone for good. That's the point of the design. Mitigations:
 
 - every paired atem holds `K`, so any one of them can re-grant it to a new
   Astation (a new `keyOffer` message, approved on both sides);
-- optional: Astation can export `K` as a recovery phrase for the user to
-  keep offline.
+- the **recovery key**, shown when encryption is turned on and saved offline
+  by the user, covers losing every device at once.
 
 ## Costs
 
@@ -144,17 +200,22 @@ gone for good. That's the point of the design. Mitigations:
   and a small relay change. Moving existing data requires the history purge
   described above.
 
-## Open questions (decisions for the user)
+## Decisions
+
+Decided (2026-10-01):
+
+- **Optional.** Off by default, and turned on or off in Astation's settings.
+- **Recovery key.** Shown once when encryption is turned on (behind Touch ID
+  or the Mac password), and the user must confirm saving it offline. Any
+  paired atem can also re-grant the key.
+- **Plain text cut-over.** While encryption is on, the relay refuses plain
+  text. Turning it off goes through `disabling`.
+
+Still open:
 
 1. **Fingerprint check at pairing**: required in v1, or trust on first use
    now and add it later?
-2. **Recovery**: is "any paired atem can re-grant the key" enough, or should
-   Astation also offer a recovery phrase?
-3. **Plain text cut-over**: once an account has a key, should the relay
-   refuse plain-text uploads from that account (safer), or accept both for a
-   transition period (friendlier to atems that haven't upgraded)?
-4. **History purge**: OK for the migration to delete plain-text history
-   (old skill versions, old vault entry versions), which makes history
-   shorter?
-5. **Scope**: memory + skills + vault together, or vault first (smallest,
+2. **History purge**: OK for turning encryption on to delete plain-text
+   history (old skill versions, old vault entry versions)?
+3. **Scope**: memory + skills + vault together, or vault first (smallest,
    no dedup or project hashing)?
