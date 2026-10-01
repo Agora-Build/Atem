@@ -326,7 +326,7 @@ mod tests {
         run_git(&root, &["init", "-q"]);
         let ctx = Ctx {
             home,
-            repo: Some(RepoInfo { root, key: "github.com/acme/dialf".into() }),
+            repo: Some(RepoInfo { root, key: "github.com/acme/dialf".into(), label: "github.com/acme/dialf".into() }),
             atem_id: "nixps-0001".into(),
             allow_tracked: false,
         };

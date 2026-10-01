@@ -8,7 +8,7 @@ use crate::memory::api::KnowledgeClient;
 use crate::memory::block::{contains_reserved, one_line};
 use crate::memory::harvest::claude_memory_dir;
 use crate::memory::model::{content_hash, format_date, format_datetime, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, Memory, Scope, Skill};
-use crate::memory::project::{detect_repo, display_name};
+use crate::memory::project::{detect_repo, project_name, RepoInfo};
 use crate::memory::secrets::{find_secrets, SecretFinding};
 use crate::memory::skills_fs::{self, DirState, SkillMarker};
 use crate::memory::store::{HarvestStatus, PendingOp, SearchQuery, Store, LAST_SYNC_AT};
@@ -260,21 +260,21 @@ fn resolve_skill_add_target(dir: &Path, scope: Option<Scope>, name: Option<Strin
     Ok(SkillAddTarget { scope, project, name, write_marker })
 }
 
-fn where_label(m: &Memory) -> String {
+fn where_label(m: &Memory, repo: Option<&RepoInfo>) -> String {
     match m.scope {
         Scope::Global => "global".into(),
         Scope::Machine => format!("machine:{}", m.machine),
-        Scope::Project => format!("project:{}", display_name(&m.project)),
+        Scope::Project => format!("project:{}", project_name(&m.project, repo)),
     }
 }
 
-fn print_memories(ms: &[Memory]) {
+fn print_memories(ms: &[Memory], repo: Option<&RepoInfo>) {
     if ms.is_empty() {
         println!("(no memories)");
     }
     for m in ms {
         let note = m.invalid_at.map(|t| format!("  (outdated since {})", format_date(t))).unwrap_or_default();
-        println!("{}  {:<24} {:<6} {}{}", m.id, where_label(m), m.confidence, truncate(&one_line(&m.content), 90), note);
+        println!("{}  {:<24} {:<6} {}{}", m.id, where_label(m, repo), m.confidence, truncate(&one_line(&m.content), 90), note);
     }
 }
 
@@ -353,7 +353,7 @@ fn validity_span(m: &Memory) -> String {
 }
 
 /// One numbered block per chain; later links indented under the first.
-fn render_history(chains: &[Vec<Memory>]) -> Vec<String> {
+fn render_history(chains: &[Vec<Memory>], repo: Option<&RepoInfo>) -> Vec<String> {
     if chains.is_empty() {
         return vec!["(no memories)".into()];
     }
@@ -361,7 +361,7 @@ fn render_history(chains: &[Vec<Memory>]) -> Vec<String> {
     for (i, chain) in chains.iter().enumerate() {
         for (j, m) in chain.iter().enumerate() {
             let lead = if j == 0 { format!("{:>3}. ", i + 1) } else { "     ".to_string() };
-            out.push(format!("{}{}  {:<24} {:<25} {}", lead, m.id, where_label(m), validity_span(m), truncate(&one_line(&m.content), 80)));
+            out.push(format!("{}{}  {:<24} {:<25} {}", lead, m.id, where_label(m, repo), validity_span(m), truncate(&one_line(&m.content), 80)));
         }
     }
     out
@@ -481,7 +481,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 source_agent: agent, source_machine: ctx.atem_id.clone(), created_at: now_secs(), valid_at, seq: 0, ..Default::default()
             };
             store.upsert_memory(&m)?;
-            println!("Added {} ({})", m.id, where_label(&m));
+            println!("Added {} ({})", m.id, where_label(&m, ctx.repo.as_ref()));
             if plan == AddPlan::LocalOnly {
                 println!("{}", LOCAL_ONLY_MSG);
                 return Ok(());
@@ -497,12 +497,12 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 None => {
                     let shown: Vec<Memory> = store.live_memories()?.into_iter()
                         .filter(|m| in_view(m, scope_f, project.as_deref(), all, &ctx)).collect();
-                    print_memories(&shown);
+                    print_memories(&shown, ctx.repo.as_ref());
                 }
                 Some(None) => {
                     let shown: Vec<Memory> = store.history_memories()?.into_iter()
                         .filter(|m| in_view(m, scope_f, project.as_deref(), all, &ctx)).collect();
-                    for l in render_history(&history_chains(&shown)) {
+                    for l in render_history(&history_chains(&shown), ctx.repo.as_ref()) {
                         println!("{}", l);
                     }
                 }
@@ -510,7 +510,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                     let id = store.resolve_memory_id(&id)?;
                     let chains: Vec<Vec<Memory>> = history_chains(&store.history_memories()?)
                         .into_iter().filter(|c| c.iter().any(|m| m.id == id)).collect();
-                    for l in render_history(&chains) {
+                    for l in render_history(&chains, ctx.repo.as_ref()) {
                         println!("{}", l);
                     }
                 }
@@ -520,7 +520,8 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             let store = Store::open(&store_path())?;
             let scope = scope.map(|s| Scope::parse(&s)).transpose()?;
             let hits = store.search_memories(&SearchQuery { text, scope, project, history, limit })?;
-            print_memories(&hits);
+            let repo = std::env::current_dir().ok().and_then(|d| detect_repo(&d));
+            print_memories(&hits, repo.as_ref());
         }
         MemoryCommands::Rm { id } => {
             let ctx = build_ctx(false)?;
@@ -595,7 +596,7 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             let last = store.get_state(LAST_SYNC_AT)?;
             println!("Astation:   {}", astation_status_line(&astation_id));
             println!("Machine:    {}", ctx.atem_id);
-            println!("Project:    {}", ctx.repo.as_ref().map(|r| r.key.as_str()).unwrap_or("(not in a git repo)"));
+            println!("Project:    {}", ctx.repo.as_ref().map(|r| r.label.as_str()).unwrap_or("(not in a git repo)"));
             let valid = store.live_memories()?.len();
             let outdated = store.history_memories()?.len() - valid;
             println!("Memories:   {} valid, {} outdated (kept as history)", valid, outdated);
@@ -666,7 +667,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
                 println!("(no skills)");
             }
             for s in skills {
-                let where_ = if s.scope == Scope::Project { format!("project:{}", display_name(&s.project)) } else { "global".into() };
+                let where_ = if s.scope == Scope::Project { format!("project:{}", project_name(&s.project, ctx.repo.as_ref())) } else { "global".into() };
                 println!("{:<28} v{:<4} {:<24} {} file(s)", s.name, s.version, where_, s.files.len());
             }
         }
@@ -760,12 +761,12 @@ mod tests {
         ];
         let chains: Vec<Vec<String>> = history_chains(&ms).into_iter().map(|c| c.into_iter().map(|m| m.id).collect()).collect();
         assert_eq!(chains, vec![vec!["mem_x".to_string()], vec!["mem_a".into(), "mem_b".into(), "mem_c".into()]]);
-        let lines = render_history(&history_chains(&ms));
+        let lines = render_history(&history_chains(&ms), None);
         assert!(lines[0].starts_with("  1. mem_x"), "{}", lines[0]);
         assert!(lines[1].starts_with("  2. mem_a") && lines[1].contains("1970-01-01 → 1970-01-01"), "{}", lines[1]);
         assert!(lines[2].starts_with("     mem_b"), "{}", lines[2]);
         assert!(lines[3].starts_with("     mem_c") && lines[3].contains("→ now"), "{}", lines[3]);
-        assert_eq!(render_history(&[]), vec!["(no memories)".to_string()]);
+        assert_eq!(render_history(&[], None), vec!["(no memories)".to_string()]);
     }
 
     #[test]
@@ -880,7 +881,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let ctx = Ctx {
             home,
-            repo: Some(crate::memory::project::RepoInfo { root, key: "github.com/acme/dialf".into() }),
+            repo: Some(crate::memory::project::RepoInfo { root, key: "github.com/acme/dialf".into(), label: "github.com/acme/dialf".into() }),
             atem_id: "nixps-0001".into(),
             allow_tracked: false,
         };
