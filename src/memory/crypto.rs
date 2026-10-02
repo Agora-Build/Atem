@@ -194,8 +194,12 @@ impl DeviceKey {
 
     pub fn fingerprint(&self) -> String {
         let digest = Sha256::digest(PublicKey::from(&self.secret).as_bytes());
-        let hex = digest[..4].iter().map(|byte| format!("{byte:02X}")).collect::<String>();
-        format!("{}-{}", &hex[..4], &hex[4..])
+        let hex = digest[..8].iter().map(|byte| format!("{byte:02X}")).collect::<String>();
+        (0..hex.len())
+            .step_by(4)
+            .map(|offset| &hex[offset..offset + 4])
+            .collect::<Vec<_>>()
+            .join("-")
     }
 
     pub fn open_grant(&self, data_account: &str, kid: &str, wrapped: &str) -> Result<[u8; 32]> {
@@ -234,6 +238,7 @@ pub struct EncryptionContext {
     pub kid: Option<String>,
     key: Option<[u8; 32]>,
     previous_keys: HashMap<String, [u8; 32]>,
+    store_path: PathBuf,
 }
 
 impl EncryptionContext {
@@ -241,7 +246,7 @@ impl EncryptionContext {
         Self::for_astation_at(astation_id, &key_store_path())
     }
 
-    fn for_astation_at(astation_id: &str, path: &Path) -> Result<Self> {
+    pub(crate) fn for_astation_at(astation_id: &str, path: &Path) -> Result<Self> {
         let store = StoredKeys::load_from(path)?;
         let Some(mode) = store.astations.get(astation_id) else {
             return Ok(Self {
@@ -250,6 +255,7 @@ impl EncryptionContext {
                 kid: None,
                 key: None,
                 previous_keys: HashMap::new(),
+                store_path: path.to_path_buf(),
             });
         };
         let key = (mode.mode != EncryptionMode::Off).then(|| store.accounts.get(&mode.data_account)).flatten().map(|stored| {
@@ -282,6 +288,7 @@ impl EncryptionContext {
             kid: mode.kid.clone(),
             key,
             previous_keys,
+            store_path: path.to_path_buf(),
         })
     }
 
@@ -290,7 +297,7 @@ impl EncryptionContext {
         Self::update_mode_at(&path, astation_id, data_account, mode, kid)
     }
 
-    fn update_mode_at(path: &Path, astation_id: &str, data_account: &str, mode: EncryptionMode, kid: Option<&str>) -> Result<()> {
+    pub(crate) fn update_mode_at(path: &Path, astation_id: &str, data_account: &str, mode: EncryptionMode, kid: Option<&str>) -> Result<()> {
         let mut store = StoredKeys::load_or_recover_from(path)?;
         if mode == EncryptionMode::Off {
             store.accounts.remove(data_account);
@@ -314,7 +321,7 @@ impl EncryptionContext {
         Self::install_grant_at(&path, astation_id, data_account, kid, key)
     }
 
-    fn install_grant_at(path: &Path, astation_id: &str, data_account: &str, kid: &str, key: [u8; 32]) -> Result<()> {
+    pub(crate) fn install_grant_at(path: &Path, astation_id: &str, data_account: &str, kid: &str, key: [u8; 32]) -> Result<()> {
         let mut store = StoredKeys::load_from(&path)?;
         let mode = store.astations.get(astation_id)
             .ok_or_else(|| anyhow!("received an encryption key before the account mode"))?;
@@ -346,7 +353,7 @@ impl EncryptionContext {
 
     pub fn wire_project(&self, project: &str) -> Result<String> {
         if project.is_empty() || !self.should_encrypt() { return Ok(project.to_string()); }
-        remember_project(&self.data_account, self, project)?;
+        remember_project(self, project)?;
         self.keyed_hash(project.as_bytes())
     }
 
@@ -392,7 +399,7 @@ impl EncryptionContext {
 
     pub fn encrypt_memory(&self, mut memory: Memory) -> Result<Memory> {
         if !self.should_encrypt() { return Ok(memory); }
-        remember_project(&self.data_account, self, &memory.project)?;
+        remember_project(self, &memory.project)?;
         memory.project = if memory.project.is_empty() { String::new() } else { self.keyed_hash(memory.project.as_bytes())? };
         memory.content_hash = if memory.content.is_empty() { String::new() } else { self.keyed_hash(memory.content.as_bytes())? };
         memory.content = self.seal(&memory.id, "content", memory.content.as_bytes())?;
@@ -404,7 +411,7 @@ impl EncryptionContext {
             return Ok(memory);
         }
         if memory.project.starts_with("h1.") {
-            memory.project = resolve_project(&self.data_account, &memory.project)?;
+            memory.project = resolve_project(self, &memory.project)?;
         }
         if memory.content.starts_with("e1.") {
             memory.content = String::from_utf8(self.open(&memory.id, "content", &memory.content)?)
@@ -418,7 +425,7 @@ impl EncryptionContext {
 
     pub fn encrypt_skill(&self, mut skill: Skill) -> Result<Skill> {
         if !self.should_encrypt() { return Ok(skill); }
-        remember_project(&self.data_account, self, &skill.project)?;
+        remember_project(self, &skill.project)?;
         let record = skill_record(&skill);
         let mut encrypted = std::collections::BTreeMap::new();
         for (path, bytes) in &skill.files {
@@ -437,7 +444,7 @@ impl EncryptionContext {
             return Ok(skill);
         }
         if skill.project.starts_with("h1.") {
-            skill.project = resolve_project(&self.data_account, &skill.project)?;
+            skill.project = resolve_project(self, &skill.project)?;
         }
         if skill.files.keys().any(|path| path.starts_with("e1.")) {
             let record = skill_record(&skill);
@@ -466,20 +473,19 @@ fn skill_record(skill: &Skill) -> String {
     format!("{}:{}:{}", skill.scope.as_str(), skill.name, skill.version)
 }
 
-fn remember_project(account: &str, context: &EncryptionContext, project: &str) -> Result<()> {
+fn remember_project(context: &EncryptionContext, project: &str) -> Result<()> {
     if project.is_empty() { return Ok(()); }
     let hash = context.keyed_hash(project.as_bytes())?;
-    let path = key_store_path();
-    let mut store = StoredKeys::load_from(&path)?;
-    store.project_names.entry(account.into()).or_default().insert(hash, project.into());
-    store.save_to(&path)
+    let mut store = StoredKeys::load_from(&context.store_path)?;
+    store.project_names.entry(context.data_account.clone()).or_default().insert(hash, project.into());
+    store.save_to(&context.store_path)
 }
 
-fn resolve_project(account: &str, project_hash: &str) -> Result<String> {
+fn resolve_project(context: &EncryptionContext, project_hash: &str) -> Result<String> {
     if project_hash.is_empty() { return Ok(String::new()); }
-    StoredKeys::load_from(&key_store_path())?
+    StoredKeys::load_from(&context.store_path)?
         .project_names
-        .get(account)
+        .get(&context.data_account)
         .and_then(|projects| projects.get(project_hash))
         .cloned()
         .ok_or_else(|| anyhow!("encrypted project name is unknown on this Atem; sync from a device that used it first"))
@@ -527,6 +533,7 @@ mod tests {
             kid: Some("0123abcd".into()),
             key: Some([7; 32]),
             previous_keys: HashMap::new(),
+            store_path: key_store_path(),
         }
     }
 
@@ -559,7 +566,7 @@ mod tests {
         let secret = StaticSecret::from([3u8; 32]);
         let key = DeviceKey { secret };
         assert_eq!(key.fingerprint(), key.fingerprint());
-        assert_eq!(key.fingerprint().len(), 9);
+        assert_eq!(key.fingerprint().len(), 19);
     }
 
     #[test]

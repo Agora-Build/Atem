@@ -184,6 +184,8 @@ pub struct KnowledgeClient {
     /// The paired Astation id — the relay account this client syncs with.
     astation_id: String,
     http: reqwest::Client,
+    #[cfg(test)]
+    encryption_store: Option<std::path::PathBuf>,
 }
 
 impl KnowledgeClient {
@@ -197,7 +199,15 @@ impl KnowledgeClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            #[cfg(test)]
+            encryption_store: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_encryption_store(mut self, path: std::path::PathBuf) -> Self {
+        self.encryption_store = Some(path);
+        self
     }
 
     /// The account this client syncs with (the paired Astation id). Pull
@@ -225,6 +235,11 @@ impl KnowledgeClient {
     }
 
     fn encryption(&self) -> Result<EncryptionContext, ApiError> {
+        #[cfg(test)]
+        if let Some(path) = &self.encryption_store {
+            return EncryptionContext::for_astation_at(&self.astation_id, path)
+                .map_err(|error| ApiError::Encryption(error.to_string()));
+        }
         EncryptionContext::for_astation(&self.astation_id)
             .map_err(|error| ApiError::Encryption(error.to_string()))
     }

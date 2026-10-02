@@ -184,6 +184,8 @@ pub struct VaultClient {
     session_id: String,
     astation_id: String,
     http: reqwest::Client,
+    #[cfg(test)]
+    encryption_store: Option<std::path::PathBuf>,
 }
 
 impl VaultClient {
@@ -197,10 +199,22 @@ impl VaultClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            #[cfg(test)]
+            encryption_store: None,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_encryption_store(mut self, path: std::path::PathBuf) -> Self {
+        self.encryption_store = Some(path);
+        self
+    }
+
     fn encryption(&self) -> Result<EncryptionContext> {
+        #[cfg(test)]
+        if let Some(path) = &self.encryption_store {
+            return EncryptionContext::for_astation_at(&self.astation_id, path);
+        }
         EncryptionContext::for_astation(&self.astation_id)
     }
 
