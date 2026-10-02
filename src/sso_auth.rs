@@ -64,6 +64,26 @@ pub async fn valid_token_from(
     connected_astation_id: Option<&str>,
     sso_url: &str,
 ) -> Result<String> {
+    valid_token_with(path, connected_astation_id, sso_url, fetch_from_astation).await
+}
+
+/// `valid_token_from` with the "ask Astation" step injectable for tests.
+///
+/// An SSO entry (`atem login`) refreshes itself. A paired entry never does:
+/// Agora rotates refresh tokens, so refreshing atem's copy would invalidate
+/// Astation's (and every other paired atem's). Astation refreshes its own
+/// session and sends a fresh `credentialSync` whenever an atem connects, so a
+/// paired entry near expiry is renewed by connecting to Astation instead.
+async fn valid_token_with<F, Fut>(
+    path: &std::path::Path,
+    connected_astation_id: Option<&str>,
+    sso_url: &str,
+    fetch_paired: F,
+) -> Result<String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<PairedTokens>>,
+{
     use crate::credentials::{CredentialEntry, CredentialSource, CredentialStore};
     let mut store = CredentialStore::load_from(path);
     let now = CredentialEntry::now_secs();
@@ -84,30 +104,82 @@ pub async fn valid_token_from(
         return Ok(entry.access_token.clone());
     }
 
-    let refreshed = refresh_token(&refresh, sso_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("Session expired. Run 'atem login' or re-pair. ({e})"))?;
-
     match source {
         CredentialSource::Sso => {
+            let refreshed = refresh_token(&refresh, sso_url)
+                .await
+                .map_err(|e| anyhow::anyhow!("Session expired. Run 'atem login' or re-pair. ({e})"))?;
             if let Some(sso) = store.find_sso_mut() {
                 sso.access_token = refreshed.access_token.clone();
                 sso.refresh_token = refreshed.refresh_token.clone();
                 sso.expires_at = refreshed.expires_at;
             }
+            store.save_to(path)?;
+            Ok(refreshed.access_token)
         }
         CredentialSource::AstationPaired => {
-            if let Some(aid) = astation_id.as_deref() {
-                if let Some(p) = store.find_paired_mut(aid) {
-                    p.access_token = refreshed.access_token.clone();
-                    p.refresh_token = refreshed.refresh_token.clone();
-                    p.expires_at = refreshed.expires_at;
-                }
+            let aid = astation_id.ok_or_else(|| anyhow::anyhow!("Paired session has no Astation id. Run 'atem pair'."))?;
+            let fresh = fetch_paired(aid.clone()).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "The session from Astation has expired, and Astation couldn't send a new one ({e}). \
+                     Open Astation and try again, or run 'atem login'."
+                )
+            })?;
+            if let Some(p) = store.find_paired_mut(&aid) {
+                p.access_token = fresh.access_token.clone();
+                p.refresh_token = fresh.refresh_token;
+                p.expires_at = fresh.expires_at;
             }
+            store.save_to(path)?;
+            Ok(fresh.access_token)
         }
     }
-    store.save_to(path)?;
-    Ok(refreshed.access_token)
+}
+
+/// Fresh tokens from Astation's `credentialSync`.
+pub struct PairedTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: u64,
+}
+
+/// Connects to Astation without pairing (local first, then the relay identity
+/// room, as the TUI does) and waits for the `credentialSync` Astation sends
+/// on connect. Only accepts tokens from `astation_id`.
+async fn fetch_from_astation(astation_id: String) -> Result<PairedTokens> {
+    use crate::websocket_client::{AstationClient, AstationMessage};
+    use tokio::time::{timeout, Duration};
+
+    let config = crate::config::AtemConfig::load()?;
+    let mut client = AstationClient::new();
+    let local = client.connect_without_pairing(config.astation_ws()).await;
+    if local.is_err() {
+        let relay_code = config
+            .astation_relay_code
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Astation isn't reachable locally and no relay is configured"))?;
+        client = AstationClient::new();
+        client
+            .connect_relay_identity_without_pairing(config.astation_relay_url(), &relay_code)
+            .await?;
+    }
+
+    timeout(Duration::from_secs(15), async {
+        loop {
+            match client.recv_message_async().await {
+                Some(AstationMessage::CredentialSync { access_token, refresh_token, expires_at, astation_id: from, .. }) => {
+                    if from == astation_id {
+                        return Ok(PairedTokens { access_token, refresh_token, expires_at });
+                    }
+                    anyhow::bail!("connected to a different Astation ({})", from);
+                }
+                Some(_) => continue,
+                None => anyhow::bail!("Astation closed the connection before sending credentials"),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for Astation"))?
 }
 
 /// Exchange a refresh_token for a new SsoSession.
@@ -484,6 +556,61 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Not logged in"), "got: {}", msg);
+    }
+
+    fn paired_store(path: &std::path::Path, expires_at: u64) {
+        let mut store = crate::credentials::CredentialStore::load_from(path);
+        store.upsert(crate::credentials::CredentialEntry::new_paired(
+            "old-access".into(), "old-refresh".into(), expires_at, None,
+            "astation-A".into(), true, now(),
+        ));
+        store.save_to(path).unwrap();
+    }
+
+    #[test]
+    fn paired_token_near_expiry_comes_from_astation_not_sso_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.enc");
+        paired_store(&path, now() + 10);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // An unreachable SSO URL: a refresh attempt would fail the test.
+        let token = rt.block_on(valid_token_with(&path, None, "http://127.0.0.1:1", |aid| async move {
+            assert_eq!(aid, "astation-A");
+            Ok(PairedTokens { access_token: "new-access".into(), refresh_token: "new-refresh".into(), expires_at: now() + 7200 })
+        })).unwrap();
+        assert_eq!(token, "new-access");
+        let mut store = crate::credentials::CredentialStore::load_from(&path);
+        let e = store.find_paired_mut("astation-A").unwrap();
+        assert_eq!((e.access_token.as_str(), e.refresh_token.as_str()), ("new-access", "new-refresh"));
+    }
+
+    #[test]
+    fn paired_token_with_time_left_does_not_contact_astation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.enc");
+        paired_store(&path, now() + 3600);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let token = rt.block_on(valid_token_with(&path, None, "http://127.0.0.1:1", |_| async {
+            panic!("must not contact Astation");
+            #[allow(unreachable_code)]
+            Ok(PairedTokens { access_token: String::new(), refresh_token: String::new(), expires_at: 0 })
+        })).unwrap();
+        assert_eq!(token, "old-access");
+    }
+
+    #[test]
+    fn paired_token_says_to_open_astation_when_it_cannot_renew() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.enc");
+        paired_store(&path, now() + 10);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(valid_token_with(&path, None, "http://127.0.0.1:1", |_| async {
+            Err(anyhow::anyhow!("timed out waiting for Astation"))
+        })).unwrap_err().to_string();
+        assert!(err.contains("Open Astation") && err.contains("timed out"), "{}", err);
+        // The stored tokens are left alone.
+        let mut store = crate::credentials::CredentialStore::load_from(&path);
+        assert_eq!(store.find_paired_mut("astation-A").unwrap().access_token, "old-access");
     }
 
     #[test]

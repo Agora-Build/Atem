@@ -196,7 +196,7 @@ Key methods:
 - `atem logout` — removes the `sso` entry from `credentials.enc`
 - `atem pair [--save]` — connect to Astation, send `PairSavePreference`, wait for `SsoTokenSync`, write paired entry
 - `atem unpair` — remove all paired entries
-- `valid_token(connected_astation_id, sso_url)` — resolves via priority chain, refreshes if expiring within 60s, returns access token
+- `valid_token(connected_astation_id, sso_url)` — resolves via priority chain and returns an access token. Within 60s of expiry, an `sso` entry refreshes itself; a paired entry never does (Agora rotates refresh tokens, so it would invalidate Astation's copy): atem connects to Astation, which sends a fresh `credentialSync` on connect.
 
 **BFF API** (`agora_api.rs`):
 - `fetch_projects(access_token, bff_url)` — `GET {bff_url}/api/cli/v1/projects`, Bearer auth, returns `Vec<BffProject>`
