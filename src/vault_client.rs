@@ -1,6 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use crate::memory::crypto::EncryptionContext;
 
 /// A vault HTTP request, fully built but not yet sent. Pure + testable.
 #[derive(Debug, Clone, PartialEq)]
@@ -181,20 +182,26 @@ pub struct VaultClient {
     base: String,
     client_id: String,
     session_id: String,
+    astation_id: String,
     http: reqwest::Client,
 }
 
 impl VaultClient {
-    pub fn new(base: String, client_id: String, session_id: String) -> Self {
+    pub fn new(base: String, client_id: String, session_id: String, astation_id: String) -> Self {
         Self {
             base,
             client_id,
             session_id,
+            astation_id,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
+    }
+
+    fn encryption(&self) -> Result<EncryptionContext> {
+        EncryptionContext::for_astation(&self.astation_id)
     }
 
     async fn send(&self, req: VaultRequest) -> Result<reqwest::Response> {
@@ -216,28 +223,135 @@ impl VaultClient {
     }
 
     pub async fn create(&self, summary: &str) -> Result<CreatedVault> {
-        let req = create_vault_request(&self.base, &self.client_id, summary);
-        Ok(self.send(req).await?.json().await?)
+        let encryption = self.encryption()?;
+        let initial = if encryption.should_encrypt() { "" } else { summary };
+        let req = create_vault_request(&self.base, &self.client_id, initial);
+        let created: CreatedVault = self.send(req).await?.json().await?;
+        if encryption.should_encrypt() && !summary.is_empty() {
+            self.set_summary(&created.vault_id, summary).await?;
+        }
+        Ok(created)
     }
 
     pub async fn list(&self) -> Result<Vec<VaultListItem>> {
         let req = list_vaults_request(&self.base, &self.client_id);
-        Ok(self.send(req).await?.json().await?)
+        let encryption = self.encryption()?;
+        let mut items: Vec<VaultListItem> = self.send(req).await?.json().await?;
+        for item in &mut items {
+            if item.summary.starts_with("e1.") {
+                item.summary = String::from_utf8(
+                    encryption.open(&item.vault_id, "summary", &item.summary)?
+                ).context("vault summary is not UTF-8")?;
+            }
+        }
+        Ok(items)
     }
 
     pub async fn read(&self, vault_id: &str, since: Option<u64>, history: bool) -> Result<Vec<VaultEntry>> {
         let req = read_vault_request(&self.base, &self.client_id, vault_id, since, history);
-        Ok(self.send(req).await?.json().await?)
+        let encryption = self.encryption()?;
+        let mut entries: Vec<VaultEntry> = self.send(req).await?.json().await?;
+        for entry in &mut entries {
+            if entry.content.starts_with("e1.") {
+                entry.content = String::from_utf8(encryption.open(
+                    vault_id,
+                    "content",
+                    &entry.content,
+                )?).context("vault entry is not UTF-8")?;
+            }
+        }
+        Ok(entries)
     }
 
     pub async fn write(&self, vault_id: &str, text: &str, entry_id: Option<u32>) -> Result<WriteResult> {
-        let req = write_vault_request(&self.base, &self.client_id, vault_id, text, entry_id);
+        let encryption = self.encryption()?;
+        let text = if encryption.should_encrypt() {
+            encryption.seal(vault_id, "content", text.as_bytes())?
+        } else { text.to_string() };
+        let req = write_vault_request(&self.base, &self.client_id, vault_id, &text, entry_id);
         Ok(self.send(req).await?.json().await?)
     }
 
     pub async fn set_summary(&self, vault_id: &str, text: &str) -> Result<()> {
-        let req = set_summary_request(&self.base, &self.client_id, vault_id, text);
+        let encryption = self.encryption()?;
+        let text = if encryption.should_encrypt() {
+            encryption.seal(vault_id, "summary", text.as_bytes())?
+        } else { text.to_string() };
+        let req = set_summary_request(&self.base, &self.client_id, vault_id, &text);
         self.send(req).await?;
+        Ok(())
+    }
+
+    pub async fn migrate_encryption(&self) -> Result<()> {
+        use crate::memory::crypto::EncryptionMode;
+        let encryption = self.encryption()?;
+        if !matches!(encryption.mode, EncryptionMode::Enabling | EncryptionMode::Disabling) {
+            return Ok(());
+        }
+
+        let list: Vec<VaultListItem> = self
+            .send(list_vaults_request(&self.base, &self.client_id))
+            .await?
+            .json()
+            .await?;
+        let mut snapshot = Vec::with_capacity(list.len());
+        for item in list {
+            let entries: Vec<VaultEntry> = self
+                .send(read_vault_request(
+                    &self.base,
+                    &self.client_id,
+                    &item.vault_id,
+                    None,
+                    true,
+                ))
+                .await?
+                .json()
+                .await?;
+            snapshot.push((item, entries));
+        }
+
+        for (item, entries) in snapshot {
+            let plain_summary = if item.summary.starts_with("e1.") {
+                String::from_utf8(encryption.open(&item.vault_id, "summary", &item.summary)?)
+                    .context("vault summary is not UTF-8")?
+            } else {
+                item.summary
+            };
+            let summary = if encryption.mode == EncryptionMode::Enabling {
+                encryption.seal(&item.vault_id, "summary", plain_summary.as_bytes())?
+            } else {
+                plain_summary
+            };
+            let mut rewritten = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let plain = if entry.content.starts_with("e1.") {
+                    String::from_utf8(encryption.open(&item.vault_id, "content", &entry.content)?)
+                        .context("vault entry is not UTF-8")?
+                } else {
+                    entry.content
+                };
+                let content = if encryption.mode == EncryptionMode::Enabling {
+                    encryption.seal(&item.vault_id, "content", plain.as_bytes())?
+                } else {
+                    plain
+                };
+                rewritten.push(json!({
+                    "entry_no": entry.entry_no,
+                    "version": entry.version,
+                    "content": content,
+                }));
+            }
+            self.send(VaultRequest {
+                method: "POST",
+                url: format!(
+                    "{}/api/vault/{}/encryption?id={}",
+                    base_trim(&self.base),
+                    enc(&item.vault_id),
+                    enc(&self.client_id),
+                ),
+                body: Some(json!({"summary": summary, "entries": rewritten})),
+            }).await?;
+        }
         Ok(())
     }
 }

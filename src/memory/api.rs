@@ -6,8 +6,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::store::PendingOp;
+use crate::memory::crypto::EncryptionContext;
 
 pub const PULL_LIMIT: u32 = 200;
+const MEMORY_MIGRATION_CHUNK: usize = 64;
+const SKILL_MIGRATION_CHUNK: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiRequest {
@@ -146,6 +149,7 @@ pub enum ApiError {
     Offline(String),
     Http(u16, String),
     Decode(String),
+    Encryption(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -154,11 +158,18 @@ impl std::fmt::Display for ApiError {
             ApiError::Offline(e) => write!(f, "relay unreachable: {}", e),
             ApiError::Http(code, body) => write!(f, "relay returned {}: {}", code, body),
             ApiError::Decode(e) => write!(f, "unexpected relay response: {}", e),
+            ApiError::Encryption(e) => write!(f, "end-to-end encryption: {}", e),
         }
     }
 }
 
 impl std::error::Error for ApiError {}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Encryption(error.to_string())
+    }
+}
 
 /// The `Authorization` header value for a pairing session. Pure so it can be
 /// unit-tested without a live `KnowledgeClient`.
@@ -213,11 +224,51 @@ impl KnowledgeClient {
         Ok(resp)
     }
 
+    fn encryption(&self) -> Result<EncryptionContext, ApiError> {
+        EncryptionContext::for_astation(&self.astation_id)
+            .map_err(|error| ApiError::Encryption(error.to_string()))
+    }
+
+    fn encrypted_op(&self, op: &PendingOp, encryption: &EncryptionContext) -> Result<Value, ApiError> {
+        let value = match op {
+            PendingOp::AddMemory { memory } => json!({
+                "op": "add",
+                "memory": encryption.encrypt_memory(memory.clone())
+                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
+            }),
+            PendingOp::PushSkill { skill, base_version } => json!({
+                "op": "push",
+                "skill": encryption.encrypt_skill(skill.clone())
+                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
+                "base_version": base_version,
+            }),
+            PendingOp::DeleteSkill { scope, project, name } => json!({
+                "op": "delete", "scope": scope,
+                "project": encryption.wire_project(project)
+                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
+                "name": name,
+            }),
+            PendingOp::PurgeSkill { scope, project, name, versions } => json!({
+                "op": "purge", "scope": scope,
+                "project": encryption.wire_project(project)
+                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
+                "name": name, "versions": versions,
+            }),
+            _ => op_to_wire(op),
+        };
+        Ok(value)
+    }
+
     pub async fn push(&self, ops: &[&PendingOp], memory: bool) -> Result<Vec<OpResult>, ApiError> {
-        let req = if memory {
-            memory_batch_request(&self.base, &self.client_id, ops)
-        } else {
-            skills_batch_request(&self.base, &self.client_id, ops)
+        let encryption = self.encryption()?;
+        let kind = if memory { "memory" } else { "skills" };
+        let wire = ops.iter()
+            .map(|op| self.encrypted_op(op, &encryption))
+            .collect::<Result<Vec<_>, _>>()?;
+        let req = ApiRequest {
+            method: "POST",
+            url: format!("{}/api/{kind}/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
+            body: Some(json!({"ops": wire})),
         };
         let resp: BatchResponse = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(resp.results)
@@ -226,27 +277,138 @@ impl KnowledgeClient {
     pub async fn pull_memories(&self, since: i64) -> Result<Vec<Memory>, ApiError> {
         let req = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: MemoryPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        Ok(page.memories)
+        let encryption = self.encryption()?;
+        page.memories.into_iter()
+            .map(|memory| encryption.decrypt_memory(memory)
+                .map_err(|error| ApiError::Encryption(error.to_string())))
+            .collect()
     }
 
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let req = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        Ok(page.skills)
+        let encryption = self.encryption()?;
+        page.skills.into_iter()
+            .map(|skill| encryption.decrypt_skill(skill)
+                .map_err(|error| ApiError::Encryption(error.to_string())))
+            .collect()
     }
 
     /// A skill's history, newest first (no files).
     pub async fn skill_versions(&self, scope: Scope, project: &str, name: &str) -> Result<Vec<SkillVersionInfo>, ApiError> {
-        let req = skill_versions_request(&self.base, &self.client_id, scope, project, name);
+        let project = self.encryption()?.wire_project(project)
+            .map_err(|error| ApiError::Encryption(error.to_string()))?;
+        let req = skill_versions_request(&self.base, &self.client_id, scope, &project, name);
         let page: VersionsPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(page.versions)
     }
 
     /// One version with its files. 404 unknown, 410 purged (as `ApiError::Http`).
     pub async fn skill_version(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<Skill, ApiError> {
-        let req = skill_version_request(&self.base, &self.client_id, scope, project, name, version);
+        let encryption = self.encryption()?;
+        let project = encryption.wire_project(project)
+            .map_err(|error| ApiError::Encryption(error.to_string()))?;
+        let req = skill_version_request(&self.base, &self.client_id, scope, &project, name, version);
         let page: VersionPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        Ok(page.skill)
+        encryption.decrypt_skill(page.skill)
+            .map_err(|error| ApiError::Encryption(error.to_string()))
+    }
+
+    /// Snapshot every historical row before rewriting any of them. Rewrites
+    /// allocate fresh sequence values, so interleaving pull and rewrite could
+    /// otherwise keep rediscovering our own migration writes.
+    pub async fn migrate_encryption(&self) -> Result<(), ApiError> {
+        use crate::memory::crypto::EncryptionMode;
+        let encryption = self.encryption()?;
+        if !matches!(encryption.mode, EncryptionMode::Enabling | EncryptionMode::Disabling) {
+            return Ok(());
+        }
+
+        let mut memories = Vec::new();
+        let mut since = 0;
+        loop {
+            let request = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
+            let page: MemoryPage = self.send(request).await?.json().await
+                .map_err(|error| ApiError::Decode(error.to_string()))?;
+            if page.memories.is_empty() { break; }
+            since = page.memories.iter().map(|row| row.seq).max().unwrap_or(since);
+            let count = page.memories.len();
+            memories.extend(page.memories);
+            if count < PULL_LIMIT as usize { break; }
+        }
+
+        let mut skills = Vec::new();
+        since = 0;
+        loop {
+            let request = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
+            let page: SkillPage = self.send(request).await?.json().await
+                .map_err(|error| ApiError::Decode(error.to_string()))?;
+            if page.skills.is_empty() { break; }
+            since = page.skills.iter().map(|row| row.seq).max().unwrap_or(since);
+            let count = page.skills.len();
+            skills.extend(page.skills);
+            if count < PULL_LIMIT as usize { break; }
+        }
+
+        for chunk in memories.chunks(MEMORY_MIGRATION_CHUNK) {
+            let mut ops = Vec::with_capacity(chunk.len());
+            for raw in chunk {
+                let old = raw.clone();
+                let plain = encryption.decrypt_memory(raw.clone())?;
+                let desired = if encryption.mode == EncryptionMode::Enabling {
+                    encryption.encrypt_memory(plain)?
+                } else {
+                    plain
+                };
+                ops.push(json!({
+                    "op": "rewrite",
+                    "id": old.id,
+                    "project": desired.project,
+                    "content": desired.content,
+                    "content_hash": desired.content_hash,
+                }));
+            }
+            let response: BatchResponse = self.send(ApiRequest {
+                method: "POST",
+                url: format!("{}/api/memory/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
+                body: Some(json!({"ops": ops})),
+            }).await?.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
+            if response.results.len() != ops.len() || response.results.iter().any(|result| !result.ok) {
+                return Err(ApiError::Encryption("relay refused a memory encryption rewrite".into()));
+            }
+        }
+
+        for chunk in skills.chunks(SKILL_MIGRATION_CHUNK) {
+            let mut ops = Vec::with_capacity(chunk.len());
+            for raw in chunk {
+                let old_project = raw.project.clone();
+                let plain = encryption.decrypt_skill(raw.clone())?;
+                let desired = if encryption.mode == EncryptionMode::Enabling {
+                    encryption.encrypt_skill(plain)?
+                } else {
+                    plain
+                };
+                ops.push(json!({
+                    "op": "rewrite",
+                    "scope": desired.scope,
+                    "old_project": old_project,
+                    "name": desired.name,
+                    "version": desired.version,
+                    "project": desired.project,
+                    "files": desired.files,
+                    "content_hash": desired.content_hash,
+                }));
+            }
+            let response: BatchResponse = self.send(ApiRequest {
+                method: "POST",
+                url: format!("{}/api/skills/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
+                body: Some(json!({"ops": ops})),
+            }).await?.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
+            if response.results.len() != ops.len() || response.results.iter().any(|result| !result.ok) {
+                return Err(ApiError::Encryption("relay refused a skill encryption rewrite".into()));
+            }
+        }
+        Ok(())
     }
 }
 

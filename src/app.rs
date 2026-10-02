@@ -1775,6 +1775,17 @@ impl App {
     }
 
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
+        match self.astation_client.handle_encryption_message(&message).await {
+            Ok(Some(status)) => {
+                self.status_message = Some(status);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.status_message = Some(format!("Encryption setup failed: {error}"));
+                return;
+            }
+        }
         match message {
             AstationMessage::ProjectListResponse {
                 projects,

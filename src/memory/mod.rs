@@ -12,3 +12,4 @@ pub mod adapters;
 pub mod api;
 pub mod sync;
 pub mod cmd;
+pub mod crypto;
