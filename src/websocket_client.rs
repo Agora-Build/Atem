@@ -256,6 +256,28 @@ pub enum AstationMessage {
         save_credentials: bool,
     },
 
+    #[serde(rename = "encryptionMode")]
+    EncryptionMode {
+        mode: String,
+        #[serde(default)]
+        kid: Option<String>,
+        data_account: String,
+        astation_id: String,
+    },
+
+    #[serde(rename = "keyRequest")]
+    KeyRequest { public_key: String },
+
+    #[serde(rename = "keyGrant")]
+    KeyGrant {
+        kid: String,
+        wrapped_key: String,
+        data_account: String,
+    },
+
+    #[serde(rename = "encryptionMigrationComplete")]
+    EncryptionMigrationComplete { mode: String, kid: String },
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +315,7 @@ pub struct AstationClient {
     relay_code_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
+    connected_astation_id: Option<String>,
 }
 
 impl AstationClient {
@@ -306,6 +329,7 @@ impl AstationClient {
             #[cfg(test)]
             relay_code_path_override: None,
             ws_closed: false,
+            connected_astation_id: None,
         }
     }
 
@@ -502,6 +526,7 @@ impl AstationClient {
             } else {
                 return Err(anyhow!("Invalid auth_required message"));
             };
+        self.connected_astation_id = Some(astation_id.clone());
 
         if protocol.as_deref() != Some("2") {
             return Err(anyhow!("Astation authentication protocol v2 is required"));
@@ -618,6 +643,10 @@ impl AstationClient {
 
         println!("🔐 Pairing with Astation...");
         println!("   Code: {}", pairing_code);
+        match crate::memory::crypto::DeviceKey::load_or_create() {
+            Ok(key) => println!("   Encryption fingerprint: {}", key.fingerprint()),
+            Err(error) => println!("   Encryption fingerprint unavailable: {error}"),
+        }
         println!("   Waiting for approval...");
 
         // Send pairing auth
@@ -739,6 +768,56 @@ impl AstationClient {
             return Err(anyhow!("Not connected to Astation"));
         }
         Ok(())
+    }
+
+    /// Persist encryption mode/key messages before application code handles
+    /// ordinary Astation traffic. Returns a user-facing status when handled.
+    pub async fn handle_encryption_message(
+        &self,
+        message: &AstationMessage,
+    ) -> Result<Option<String>> {
+        use crate::memory::crypto::{DeviceKey, EncryptionContext, EncryptionMode};
+        match message {
+            AstationMessage::EncryptionMode { mode, kid, data_account, astation_id } => {
+                let mode = EncryptionMode::parse(mode)?;
+                EncryptionContext::update_mode(astation_id, data_account, mode, kid.as_deref())?;
+                if mode.requires_key() && EncryptionContext::for_astation(astation_id).is_err() {
+                    let device = DeviceKey::load_or_create()?;
+                    self.send_message(AstationMessage::KeyRequest {
+                        public_key: device.public_key_base64(),
+                    }).await?;
+                    return Ok(Some(format!(
+                        "Encryption key requested from Astation; verify fingerprint {}",
+                        device.fingerprint()
+                    )));
+                }
+                if let Some(target) = crate::memory::crypto::migrate_account(astation_id).await? {
+                    let kid = kid.clone().ok_or_else(|| anyhow!("encryption migration has no key id"))?;
+                    self.send_message(AstationMessage::EncryptionMigrationComplete {
+                        mode: target.to_string(),
+                        kid,
+                    }).await?;
+                    return Ok(Some(format!("Encryption migration complete; requesting {target}")));
+                }
+                Ok(Some(format!("Account encryption mode: {mode:?}")))
+            }
+            AstationMessage::KeyGrant { kid, wrapped_key, data_account } => {
+                let astation_id = self.connected_astation_id.as_deref()
+                    .ok_or_else(|| anyhow!("received an encryption key before Astation identity was known"))?;
+                let device = DeviceKey::load_or_create()?;
+                let key = device.open_grant(data_account, kid, wrapped_key)?;
+                EncryptionContext::install_grant(astation_id, data_account, kid, key)?;
+                if let Some(target) = crate::memory::crypto::migrate_account(astation_id).await? {
+                    self.send_message(AstationMessage::EncryptionMigrationComplete {
+                        mode: target.to_string(),
+                        kid: kid.clone(),
+                    }).await?;
+                    return Ok(Some(format!("Encryption key {kid} installed; migration complete")));
+                }
+                Ok(Some(format!("End-to-end encryption key {kid} installed")))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Non-blocking: returns a message if one is already queued, None otherwise.
