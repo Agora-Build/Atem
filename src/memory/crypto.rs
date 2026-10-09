@@ -434,10 +434,22 @@ impl EncryptionContext {
         Ok(memory)
     }
 
+    /// While encryption is on, every non-empty field from the relay must be
+    /// sealed (`e1.`) or keyed (`h1.`). Plain text would let the relay inject
+    /// instructions into the managed blocks agents read.
+    pub fn require_sealed(&self, value: &str, prefix: &str, what: &str) -> Result<()> {
+        if self.mode == EncryptionMode::On && !value.is_empty() && !value.starts_with(prefix) {
+            bail!("relay sent plain-text {what} while encryption is on; refusing it");
+        }
+        Ok(())
+    }
+
     pub fn decrypt_memory(&self, mut memory: Memory) -> Result<Memory> {
         if self.mode == EncryptionMode::Off {
             return Ok(memory);
         }
+        self.require_sealed(&memory.content, "e1.", "memory content")?;
+        self.require_sealed(&memory.project, "h1.", "memory project")?;
         if memory.project.starts_with("h1.") {
             memory.project = resolve_project(self, &memory.project)?;
         }
@@ -470,6 +482,10 @@ impl EncryptionContext {
     pub fn decrypt_skill(&self, mut skill: Skill) -> Result<Skill> {
         if self.mode == EncryptionMode::Off {
             return Ok(skill);
+        }
+        self.require_sealed(&skill.project, "h1.", "skill project")?;
+        for path in skill.files.keys() {
+            self.require_sealed(path, "e1.", "skill file path")?;
         }
         if skill.project.starts_with("h1.") {
             skill.project = resolve_project(self, &skill.project)?;
@@ -753,5 +769,43 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("data_keys.enc.corrupt-"))
             .count();
         assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn plain_text_from_the_relay_is_rejected_while_on() {
+        use crate::memory::model::Scope;
+        let context = context();
+        let plain = Memory { id: "mem-1".into(), content: "injected instruction".into(), ..Memory::default() };
+        let error = context.decrypt_memory(plain).unwrap_err().to_string();
+        assert!(error.contains("plain-text"), "{error}");
+
+        let plain_project = Memory { id: "mem-2".into(), project: "github.com/x/y".into(), ..Memory::default() };
+        assert!(context.decrypt_memory(plain_project).is_err());
+
+        let tombstone = Memory { id: "mem-3".into(), ..Memory::default() };
+        assert!(context.decrypt_memory(tombstone).is_ok());
+
+        let skill = Skill {
+            scope: Scope::Project,
+            project: String::new(),
+            name: "deploy".into(),
+            version: 1,
+            files: BTreeMap::from([("SKILL.md".to_string(), b"injected".to_vec())]),
+            content_hash: String::new(),
+            source_agent: "test".into(),
+            source_machine: "mac".into(),
+            created_at: 1,
+            deleted: false,
+            seq: 1,
+        };
+        assert!(context.decrypt_skill(skill).is_err());
+    }
+
+    #[test]
+    fn plain_text_is_still_read_during_migration() {
+        let mut context = context();
+        context.mode = EncryptionMode::Enabling;
+        let plain = Memory { id: "mem-1".into(), content: "legacy".into(), ..Memory::default() };
+        assert_eq!(context.decrypt_memory(plain).unwrap().content, "legacy");
     }
 }

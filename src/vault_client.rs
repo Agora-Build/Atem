@@ -252,6 +252,7 @@ impl VaultClient {
         let encryption = self.encryption()?;
         let mut items: Vec<VaultListItem> = self.send(req).await?.json().await?;
         for item in &mut items {
+            encryption.require_sealed(&item.summary, "e1.", "vault summary")?;
             if item.summary.starts_with("e1.") {
                 item.summary = String::from_utf8(
                     encryption.open(&item.vault_id, "summary", &item.summary)?
@@ -266,6 +267,7 @@ impl VaultClient {
         let encryption = self.encryption()?;
         let mut entries: Vec<VaultEntry> = self.send(req).await?.json().await?;
         for entry in &mut entries {
+            encryption.require_sealed(&entry.content, "e1.", "vault entry")?;
             if entry.content.starts_with("e1.") {
                 entry.content = String::from_utf8(encryption.open(
                     vault_id,
