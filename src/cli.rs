@@ -1528,16 +1528,17 @@ async fn run_device_verification(
     client: &mut crate::websocket_client::AstationClient,
     astation_id: &str,
 ) -> Result<()> {
-    use crate::memory::device_keys::DeviceKeys;
     use crate::memory::trust::TrustStore;
-    use crate::memory::verification::{AstationKeys, Handshake, KeyPaths, complete_verification};
+    use crate::memory::verification::{
+        AstationKeys, Handshake, KeyPaths, complete_verification, device_keys_for_verification,
+    };
     use crate::websocket_client::AstationMessage;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use tokio::time::{Duration, timeout};
 
     let paths = KeyPaths::default_paths();
     let device_id = crate::config::AtemConfig::ensure_instance_id();
-    let handshake = Handshake::start(DeviceKeys::generate());
+    let handshake = Handshake::start(device_keys_for_verification(&paths)?);
     client
         .send_message(AstationMessage::VerifyCommit {
             device_id: device_id.clone(),
@@ -1580,59 +1581,64 @@ async fn run_device_verification(
     let mut trust = TrustStore::load_from(&paths.trust)?;
     trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code);
     trust.save_to(&paths.trust)?;
-    let abandon = |trust: &mut TrustStore| -> Result<()> {
-        trust.remove_pending(astation_id);
-        trust.save_to(&paths.trust)
-    };
 
-    println!();
-    println!("Safety code:  {code}");
-    println!("Astation shows a code too. They must match exactly.");
-    if !prompt_yes_no("Do the codes match? [y/N]: ") {
-        client
-            .send_message(AstationMessage::VerifyAbort {
-                reason: "the codes didn't match on atem".into(),
-            })
-            .await?;
-        abandon(&mut trust)?;
-        anyhow::bail!(
-            "Device verification cancelled: the codes didn't match, so nothing was trusted."
-        );
-    }
-
-    println!("Confirm on your Mac with Touch ID…");
-    match timeout(Duration::from_secs(300), next_verify_message(client)).await {
-        Err(_) => {
-            abandon(&mut trust)?;
-            anyhow::bail!("Timed out waiting for Astation to confirm this device.")
+    let outcome: Result<()> = async {
+        println!();
+        println!("Safety code:  {code}");
+        println!("Astation shows a code too. They must match exactly.");
+        if !prompt_yes_no("Do the codes match? [y/N]: ") {
+            // Drop the pending pin first so it goes even if the send fails.
+            let mut t = TrustStore::load_from(&paths.trust)?;
+            t.remove_pending(astation_id);
+            t.save_to(&paths.trust)?;
+            let _ = client
+                .send_message(AstationMessage::VerifyAbort {
+                    reason: "the codes didn't match on atem".into(),
+                })
+                .await;
+            anyhow::bail!(
+                "Device verification cancelled: the codes didn't match, so nothing was trusted."
+            );
         }
-        Ok(result) => match result? {
-            AstationMessage::DeviceVerified {
-                device_verified,
-                account_state,
-                grants,
-            } => {
-                complete_verification(
-                    &paths,
-                    astation_id,
-                    handshake.into_keys(),
-                    &device_verified,
-                    &account_state,
-                    &grants,
-                )?;
-                println!("✅ Device verified with Astation (safety code {code}).");
-                Ok(())
-            }
-            AstationMessage::VerifyAbort { reason } => {
-                abandon(&mut trust)?;
-                anyhow::bail!("Astation declined device verification: {reason}")
-            }
-            _ => {
-                abandon(&mut trust)?;
-                anyhow::bail!("unexpected message during device verification")
-            }
-        },
+
+        println!("Confirm on your Mac with Touch ID…");
+        match timeout(Duration::from_secs(300), next_verify_message(client)).await {
+            Err(_) => anyhow::bail!("Timed out waiting for Astation to confirm this device."),
+            Ok(result) => match result? {
+                AstationMessage::DeviceVerified {
+                    device_verified,
+                    account_state,
+                    grants,
+                } => {
+                    complete_verification(
+                        &paths,
+                        astation_id,
+                        handshake.into_keys(),
+                        &device_verified,
+                        &account_state,
+                        &grants,
+                    )?;
+                    println!("✅ Device verified with Astation (safety code {code}).");
+                    Ok(())
+                }
+                AstationMessage::VerifyAbort { reason } => {
+                    anyhow::bail!("Astation declined device verification: {reason}")
+                }
+                _ => anyhow::bail!("unexpected message during device verification"),
+            },
+        }
     }
+    .await;
+
+    if outcome.is_err() {
+        // Every failure after set_pending drops the pending pin (a no-op if
+        // it is already gone or was confirmed).
+        if let Ok(mut t) = TrustStore::load_from(&paths.trust) {
+            t.remove_pending(astation_id);
+            let _ = t.save_to(&paths.trust);
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]

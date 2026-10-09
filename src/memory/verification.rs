@@ -255,6 +255,16 @@ pub fn complete_verification(
     Ok(())
 }
 
+/// The device keys to verify with: the saved ones when this machine already
+/// verified with an Astation (so earlier Astations' grants keep working),
+/// fresh ones otherwise.
+pub fn device_keys_for_verification(paths: &KeyPaths) -> Result<DeviceKeys> {
+    Ok(match DeviceKeys::load_from(&paths.device_keys)? {
+        Some(keys) => keys,
+        None => DeviceKeys::generate(),
+    })
+}
+
 /// Test stand-in for a verified device: pins a fake Astation next to
 /// `data_keys_path` and signs successive account states for it.
 #[cfg(test)]
@@ -337,6 +347,18 @@ mod tests {
             recovery_sign_pub: [6; 32],
             nonce_s: [7; 32],
         }
+    }
+
+    #[test]
+    fn verification_reuses_saved_device_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let first = device_keys_for_verification(&paths).unwrap();
+        first.save_to(&paths.device_keys).unwrap();
+        let second = device_keys_for_verification(&paths).unwrap();
+        assert_eq!(first.device_pub(), second.device_pub());
+        assert_eq!(first.device_sign_pub(), second.device_sign_pub());
+        assert_eq!(first.unlock_auth_pub(), second.unlock_auth_pub());
     }
 
     #[test]
