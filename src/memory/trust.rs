@@ -52,6 +52,11 @@ pub struct TrustStore {
     /// storage key may ever use one.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     abandoned_kids: BTreeSet<String>,
+    /// The home Astation never answered this device's first escrow (most
+    /// likely it doesn't support storage keys yet). Cleared by the first
+    /// confirmed escrow.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    escrow_unanswered: bool,
     #[serde(default)]
     astations: HashMap<String, AstationTrust>,
     #[serde(default)]
@@ -189,6 +194,20 @@ impl TrustStore {
 
     pub fn set_escrowed_kid(&mut self, storage_kid: &str) {
         self.escrowed_storage_kid = Some(storage_kid.into());
+        self.escrow_unanswered = false;
+    }
+
+    /// Whether the home Astation left this device's first escrow unanswered
+    /// (and none has been confirmed since).
+    pub fn escrow_unanswered(&self) -> bool {
+        self.escrow_unanswered && self.escrowed_storage_kid.is_none()
+    }
+
+    /// Records that the first escrow got no answer, unless one was confirmed.
+    pub fn record_escrow_unanswered(&mut self) {
+        if self.escrowed_storage_kid.is_none() {
+            self.escrow_unanswered = true;
+        }
     }
 
     /// Records a storage key id this device signed an abandon for.

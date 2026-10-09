@@ -103,8 +103,22 @@ async fn next_reply<L: AstationLink>(
     };
     tokio::time::timeout(wait, next)
         .await
-        .map_err(|_| anyhow!("timed out waiting for Astation {waiting_for}"))?
+        .map_err(|_| anyhow!(NoAnswer(waiting_for.to_string())))?
 }
+
+/// Astation sent nothing `next_reply` accepts before the wait ran out. An
+/// Astation without storage-key support drops these messages silently, so
+/// that is all atem can see of it.
+#[derive(Debug)]
+pub struct NoAnswer(pub String);
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timed out waiting for Astation {}", self.0)
+    }
+}
+
+impl std::error::Error for NoAnswer {}
 
 /// The pins of `astation_id` (blocking: file read).
 fn home_pins(paths: &KeyPaths, astation_id: &str) -> Result<AstationTrust> {
@@ -299,7 +313,7 @@ pub(crate) async fn rotate_via<L: AstationLink>(
             blocking(move || agent.begin_rotation(&astation_id)).await?
         }
     };
-    send_rotation(link, agent, astation_id, &home, rotation, wait).await
+    send_rotation(link, agent, paths, astation_id, &home, rotation, wait).await
 }
 
 async fn abandon_via_agent(
@@ -330,6 +344,7 @@ async fn abandon_via_agent(
 async fn send_rotation<L: AstationLink>(
     link: &mut L,
     agent: &Arc<dyn KeyAgentApi>,
+    paths: &KeyPaths,
     astation_id: &str,
     home: &AstationTrust,
     rotation: StorageRotation,
@@ -344,19 +359,38 @@ async fn send_rotation<L: AstationLink>(
             ciphertext: rotation.ciphertext.clone(),
         })
         .await?;
-        let reply = next_reply(
-            link,
-            wait,
-            "to store the new storage key",
-            |message| match message {
-                AstationMessage::StorageKeyAck { ack } => {
-                    check_storage_ack(home, &new_kid, ack).is_ok()
+        let reply =
+            match next_reply(
+                link,
+                wait,
+                "to store the new storage key",
+                |message| match message {
+                    AstationMessage::StorageKeyAck { ack } => {
+                        check_storage_ack(home, &new_kid, ack).is_ok()
+                    }
+                    AstationMessage::StorageKeyRejected { .. } => true,
+                    _ => false,
+                },
+            )
+            .await
+            {
+                Ok(reply) => reply,
+                Err(error) => {
+                    if error.downcast_ref::<NoAnswer>().is_some() {
+                        // Before any escrow was confirmed, `atem cred status`
+                        // says Astation may not take storage keys yet.
+                        let path = paths.trust.clone();
+                        let _ = blocking(move || {
+                            TrustStore::update(&path, |store| {
+                                store.record_escrow_unanswered();
+                                Ok(())
+                            })
+                        })
+                        .await;
+                    }
+                    return Err(error);
                 }
-                AstationMessage::StorageKeyRejected { .. } => true,
-                _ => false,
-            },
-        )
-        .await?;
+            };
         match reply {
             AstationMessage::StorageKeyAck { ack } => {
                 let (agent, astation_id) = (agent.clone(), astation_id.to_string());
@@ -485,13 +519,26 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
         let (paths, astation_id) = (paths.clone(), astation_id.to_string());
         blocking(move || home_pins(&paths, &astation_id)).await?
     };
-    send_rotation(link, agent, astation_id, &home, rotation, ROTATION_TIMEOUT)
-        .await
-        .map(PairEscrow::Escrowed)
+    send_rotation(
+        link,
+        agent,
+        paths,
+        astation_id,
+        &home,
+        rotation,
+        ROTATION_TIMEOUT,
+    )
+    .await
+    .map(PairEscrow::Escrowed)
 }
 
 /// What `atem pair` prints when the first escrow didn't complete.
 pub fn escrow_failure_message(error: &anyhow::Error) -> String {
+    if error.downcast_ref::<NoAnswer>().is_some() {
+        return format!(
+            "Astation didn't answer the storage-key handover ({error:#}); it may not support storage keys yet. This device keeps its keys in the plain ~/.config/atem/device_keys file (re-sealed whenever the key agent starts) and hands the key over at the next `atem pair` or `atem cred unlock` once Astation does, which deletes that file."
+        );
+    }
     format!(
         "Astation doesn't hold this device's storage key yet ({error:#}). Until it does, this device keeps its keys in the plain ~/.config/atem/device_keys file (re-sealed whenever the key agent starts); run `atem cred unlock` to hand the key over, which deletes that file."
     )
@@ -580,6 +627,11 @@ pub fn status_report(
         ),
     };
     let storage_line = match (storage_kid, waiting) {
+        // The first escrow went unanswered: most likely an Astation without
+        // storage-key support, where `atem cred unlock` can't help yet.
+        (Some(kid), true) if trust.escrow_unanswered() => format!(
+            "Storage key: {kid}  (not yet held by Astation: it hasn't answered storage-key requests, so it may not support them yet; the key is handed over at the next 'atem pair' or 'atem cred unlock' once it does, and until then this device keeps its plain device_keys file)"
+        ),
         (Some(kid), true) => {
             format!("Storage key: {kid}  (not yet held by Astation; run 'atem cred unlock')")
         }
@@ -1156,6 +1208,122 @@ mod tests {
             "{error}"
         );
         assert!(!agent.status().unwrap().unlocked);
+    }
+
+    /// A device whose storage key no Astation ever confirmed holding (a
+    /// fresh device or a migrated step-1 one before its first escrow),
+    /// unlocked in its agent.
+    fn never_escrowed(dir: &std::path::Path) -> (KeyPaths, FakeKeyServer, Arc<dyn KeyAgentApi>) {
+        let (paths, mut server, keys) = sealed_device(dir, "0a1b2c3d");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.trust).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("escrowed_storage_kid");
+        std::fs::write(&paths.trust, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(
+            TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
+            None
+        );
+        let storage_key = [9u8; 32];
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "0a1b2c3d", &storage_key)
+            .unwrap()
+            .save_to(&paths.device_keys_sealed)
+            .unwrap();
+        server.storage_keys.clear();
+        let agent = agent(&paths);
+        agent
+            .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &storage_key)
+            .unwrap();
+        (paths, server, agent)
+    }
+
+    /// `atem cred status` for `paths` with the agent as it is now.
+    fn status_now(paths: &KeyPaths, agent: &Arc<dyn KeyAgentApi>) -> String {
+        status_report(
+            &TrustStore::load_from(&paths.trust).unwrap(),
+            ASTATION_ID,
+            &AgentState::Running(agent.status().unwrap()),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn status_says_an_astation_that_never_answered_the_first_escrow_gets_it_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, agent) = never_escrowed(dir.path());
+        // An Astation without storage-key support drops storageKeyRotate.
+        let mut link = ScriptedLink::new(server);
+        link.silent = true;
+        link.hang = true;
+        let wait = Duration::from_millis(50);
+        let error = error_of(rotate_via(&mut link, &agent, &paths, ASTATION_ID, wait).await);
+        assert!(error.contains("timed out"), "{error}");
+        let report = status_now(&paths, &agent);
+        assert!(
+            report.contains("Storage key: 0a1b2c3d  (not yet held by Astation: it hasn't answered"),
+            "{report}"
+        );
+        assert!(report.contains("once it does"), "{report}");
+        assert!(!report.contains("run 'atem cred unlock'"), "{report}");
+        // Once an Astation takes it, the note goes.
+        link.silent = false;
+        link.hang = false;
+        rotate_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        let report = status_now(&paths, &agent);
+        assert!(!report.contains("not yet held"), "{report}");
+        assert!(
+            !TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .escrow_unanswered()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_timeout_after_the_first_escrow_still_says_run_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let storage_key = [9u8; 32];
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "0a1b2c3d", &storage_key)
+            .unwrap()
+            .save_to(&paths.device_keys_sealed)
+            .unwrap();
+        agent
+            .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &storage_key)
+            .unwrap();
+        let mut link = ScriptedLink::new(server);
+        link.silent = true;
+        link.hang = true;
+        let wait = Duration::from_millis(50);
+        assert!(
+            error_of(rotate_via(&mut link, &agent, &paths, ASTATION_ID, wait).await)
+                .contains("timed out")
+        );
+        // This Astation took storage keys before: a lost answer isn't a sign
+        // it can't.
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert!(!trust.escrow_unanswered());
+        let waiting = AgentState::Running(AgentStatus {
+            unlocked: true,
+            storage_kid: Some("4e5f6a7b".into()),
+            escrowed: false,
+        });
+        let report = status_report(&trust, ASTATION_ID, &waiting, None, None);
+        assert!(
+            report.contains("(not yet held by Astation; run 'atem cred unlock')"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_first_escrow_nobody_answered_says_when_it_completes() {
+        let message =
+            escrow_failure_message(&anyhow!(NoAnswer("to store the new storage key".into())));
+        assert!(message.contains("may not support"), "{message}");
+        assert!(message.contains("plain"), "{message}");
+        assert!(!message.contains(RESET), "{message}");
     }
 
     #[tokio::test]

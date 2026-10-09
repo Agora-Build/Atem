@@ -1214,6 +1214,11 @@ atem can't unlock against a real Astation until these land. atem doesn't
 need them to ship first: against an Astation without them, verification
 works as in step 1, the first escrow doesn't complete, and the device keeps
 its plain `device_keys` file (re-sealed at each agent start) until it does.
+Such an Astation drops the new message types without a word, so atem
+can't tell it from a slow one: each escrow attempt waits the full 60 s.
+atem then records that the first escrow went unanswered, and `atem cred
+status` says the key is handed over (at the next `atem pair` or `atem cred
+unlock`) once Astation supports it.
 `src/memory/fake_astation.rs` (test-only) implements the same rules and is
 the reference behaviour.
 
