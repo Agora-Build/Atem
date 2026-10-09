@@ -394,6 +394,13 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
+- **Private writes.** Every key file and `cred_state.json` is written to a
+  temp file with a name of its own (`.<name>.<pid>.<counter>.<random>.tmp`,
+  0600, `O_NOFOLLOW`), fsynced and renamed. A writer that crashes leaves
+  its temp behind, possibly holding key bytes, so each write first deletes
+  this user's temps of the same file whose writer process is gone (or that
+  are over an hour old), and the agent sweeps all its files' temps when it
+  starts.
 - **Agent lifetime.** The agent is detached with `setsid` but still runs
   in the user's login session. Where systemd-logind has
   `KillUserProcesses=yes` (some distributions' default), it is killed when

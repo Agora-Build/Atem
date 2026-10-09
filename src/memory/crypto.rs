@@ -162,6 +162,60 @@ fn unique_temp(path: &Path) -> PathBuf {
     ))
 }
 
+/// A temp of `path` (see `unique_temp`) that its writer left behind: the
+/// writer's process is gone, or the temp is over an hour old (a write takes
+/// milliseconds; the pid may have been reused). Not followed if a symlink.
+#[cfg(unix)]
+fn is_stale_temp(path: &Path, entry: &fs::DirEntry) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else { return false };
+    let entry_name = entry.file_name().to_string_lossy().into_owned();
+    let Some(rest) = entry_name.strip_prefix(&format!(".{name}.")).and_then(|rest| rest.strip_suffix(".tmp")) else {
+        return false;
+    };
+    // `<pid>.<counter>.<random>`
+    let parts: Vec<&str> = rest.split('.').collect();
+    let [pid, counter, random] = parts[..] else { return false };
+    let (Ok(pid), true, true) = (
+        pid.parse::<u32>(),
+        !counter.is_empty() && counter.bytes().all(|byte| byte.is_ascii_digit()),
+        random.len() == 8 && random.bytes().all(|byte| byte.is_ascii_hexdigit()),
+    ) else {
+        return false;
+    };
+    let Ok(meta) = entry.path().symlink_metadata() else { return false };
+    if meta.uid() != unsafe { libc::getuid() } || meta.is_dir() {
+        return false;
+    }
+    let gone = pid == 0
+        || i32::try_from(pid).is_err()
+        || (unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+    let old = meta.modified().ok().and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+    gone || old
+}
+
+/// Deletes the temps of `path` that crashed writers left behind (they can
+/// hold secrets: a sealed file's or a plain key file's bytes). Best effort.
+pub(crate) fn sweep_stale_temps(path: &Path) {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            if is_stale_temp(path, &entry) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[cfg(test)]
 thread_local! {
     static FAILING_WRITES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -195,6 +249,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         bail!("injected write failure for {}", path.display());
     }
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    sweep_stale_temps(path);
     let temp = unique_temp(path);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -869,6 +924,40 @@ mod tests {
         assert!(path.with_extension("tmp").symlink_metadata().is_ok());
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A pid no process has (above Linux's and macOS's pid limits).
+    #[cfg(unix)]
+    const DEAD_PID: u32 = 999_999_999;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_sweeps_temps_left_by_a_crashed_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred_state.json");
+        let crashed = dir.path().join(format!(".cred_state.json.{DEAD_PID}.3.0badf00d.tmp"));
+        fs::write(&crashed, b"half a secret").unwrap();
+        // A crashed writer's temp that is a symlink: the link goes, never its target.
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        let linked = dir.path().join(format!(".cred_state.json.{DEAD_PID}.4.0badf00e.tmp"));
+        std::os::unix::fs::symlink(&victim, &linked).unwrap();
+        // A live writer's temp (this process: another thread may be writing) stays.
+        let live = dir.path().join(format!(".cred_state.json.{}.9.0badf00f.tmp", std::process::id()));
+        fs::write(&live, b"in flight").unwrap();
+        // Another file's temp, and names that only look alike, stay.
+        let other = dir.path().join(format!(".data_keys.enc.{DEAD_PID}.1.0badf010.tmp"));
+        let unlike = dir.path().join(".cred_state.json.notapid.tmp");
+        fs::write(&other, b"x").unwrap();
+        fs::write(&unlike, b"x").unwrap();
+
+        write_private(&path, b"fresh").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"fresh");
+        assert!(crashed.symlink_metadata().is_err(), "the crashed writer's temp is swept");
+        assert!(linked.symlink_metadata().is_err(), "the stale symlink is swept");
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert!(live.exists(), "a live writer's temp is left alone");
+        assert!(other.exists() && unlike.exists(), "other files' temps are left alone");
     }
 
     #[test]

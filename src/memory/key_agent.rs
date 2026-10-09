@@ -242,9 +242,22 @@ pub(crate) fn open_sealed_checked(
 impl KeyAgent {
     /// An agent for the key files in `paths`: locked, unless a plain step-1
     /// `device_keys` file is migrated (then unlocked, not yet escrowed).
+    /// First it sweeps the temps crashed writers left beside those files.
     /// A migration or key-file error never stops the agent: it starts locked
     /// and logs the error and how to start over.
     pub fn new(paths: KeyPaths) -> Result<Self> {
+        // Temps a crashed writer left behind can hold key material.
+        for path in [
+            &paths.trust,
+            &paths.device_keys,
+            &paths.device_keys_sealed,
+            &paths.device_keys_next,
+            &paths.device_keys_prev,
+            &paths.unlock_auth_key,
+            &paths.agent_socket,
+        ] {
+            crate::memory::crypto::sweep_stale_temps(path);
+        }
         let mut agent = Self {
             paths,
             unlocked: None,
@@ -1146,6 +1159,33 @@ mod tests {
 
     fn agent(paths: &KeyPaths) -> Mutex<KeyAgent> {
         test_agent(paths)
+    }
+
+    #[test]
+    fn a_starting_agent_sweeps_temps_left_by_a_crashed_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _keys) = sealed_device(dir.path(), "0a1b2c3d");
+        // Left by a writer that died between creating its temp and renaming it.
+        let stale: Vec<_> = [
+            &paths.device_keys_sealed,
+            &paths.device_keys_next,
+            &paths.unlock_auth_key,
+            &paths.trust,
+            &paths.agent_socket,
+        ]
+        .iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            let temp = path.with_file_name(format!(".{name}.999999999.0.0badf00d.tmp"));
+            std::fs::write(&temp, b"half a secret").unwrap();
+            temp
+        })
+        .collect();
+        let agent = agent(&paths);
+        assert!(!agent.status().unwrap().unlocked);
+        for temp in stale {
+            assert!(!temp.exists(), "{} was left", temp.display());
+        }
     }
 
     #[test]
