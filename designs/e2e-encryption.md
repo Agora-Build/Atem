@@ -433,11 +433,13 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   pending at a time. Until it is confirmed Astation releases whichever key a
   request names. An unlock request names the current file's kid, or the
   `.next` or `.prev` file's only when the current file is missing (an
-  unreadable current file fails closed), and the agent opens the file that
-  carries the released `storage_kid`; a released `.next` is promoted then.
-  `.prev` is deleted after an unlock that releases the current
-  file's kid, which proves Astation holds it; after an unlock that opened
-  `.prev`, no rotation starts until an unlock opens the current file. A lost
+  unreadable current file fails closed); the grant must release exactly
+  the `storage_kid` the request names, and the agent opens the file that
+  carries it. A released `.next` is promoted then, and a lone `.prev` (no
+  current file) becomes the current file again. `.prev` is deleted after an
+  unlock that releases the current file's kid, which proves Astation holds
+  it; if a current file appears while an unlock that named `.prev` is in
+  flight, it is kept and no rotation starts until an unlock opens it. A lost
   confirmation is settled at the next unlock or rotation, which names the
   new kid. A failed rotation after an unlock is a warning: the keys stay
   unlocked and the key rotates at the next unlock.
@@ -1203,7 +1205,8 @@ the reference behaviour.
    `unlockDenied { reason }`.
 3. **On approve,** take the storage key whose kid equals the request's
    `storage_kid`: the current key or the pending one. No such key →
-   `unlockDenied`. If it is the pending key, the device has switched to it:
+   `unlockDenied`; never release another key (atem refuses a grant whose
+   `storage_kid` isn't the request's). If it is the pending key, the device has switched to it:
    make it current and delete the old current key (an implicit confirm;
    this also applies to a first escrow, where there is no current key yet).
    If it is the current key, release it and keep any pending key: a pending

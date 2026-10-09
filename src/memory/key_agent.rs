@@ -539,6 +539,14 @@ impl KeyAgent {
         {
             bail!("the sealed keys aren't this device's pinned keys");
         }
+        // A lone .prev that Astation just released becomes current again.
+        let source = match source {
+            SealedFile::Prev if !exists(&self.paths.device_keys_sealed)? => {
+                promote_next(&self.paths.device_keys_prev, &self.paths.device_keys_sealed)?;
+                SealedFile::Current
+            }
+            other => other,
+        };
         match source {
             // Astation released the key a crashed rotation left pending.
             SealedFile::Next => promote_keeping_prev(&self.paths)?,
@@ -857,6 +865,15 @@ fn promote_keeping_prev(paths: &KeyPaths) -> Result<()> {
         std::fs::rename(&paths.device_keys_sealed, &paths.device_keys_prev)?;
     }
     promote_next(&paths.device_keys_next, &paths.device_keys_sealed)
+}
+
+/// Whether anything (even a dangling symlink) is at `path`.
+fn exists(path: &std::path::Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Deletes the plain step-1 `device_keys` file (absent is fine).
@@ -1601,7 +1618,7 @@ mod tests {
             (
                 "storage_kid",
                 Box::new(|g| g.storage_kid = "ffffffff".into()),
-                "could not be opened",
+                "different storage key",
             ),
             (
                 "bad storage_kid",
@@ -1761,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn a_crash_between_ack_and_confirm_unlocks_with_the_next_file() {
+    fn a_crash_between_ack_and_confirm_unlocks_only_the_key_the_request_names() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
         {
@@ -1774,17 +1791,18 @@ mod tests {
         let new_kid = server.pending.as_ref().unwrap().0.clone();
         let agent = agent(&paths);
         assert!(!agent.status().unwrap().unlocked);
-        // Astation still holds both keys and releases the pending one.
+        // The request names the current file's key: a grant releasing the
+        // pending key instead is refused, even though .next carries it.
         let (_, request) = request(&agent, &paths, 5);
         let grant = server
             .unlock_grant(&server.astation, &request, &new_kid)
             .unwrap();
-        assert_eq!(
-            agent
-                .finish_unlock(ASTATION_ID, &request.statement, &grant)
-                .unwrap(),
-            new_kid
-        );
+        let error = error_of(agent.finish_unlock(ASTATION_ID, &request.statement, &grant));
+        assert!(error.contains("different storage key"), "{error}");
+        assert!(!agent.status().unwrap().unlocked);
+        assert!(paths.device_keys_next.exists(), "nothing promoted");
+        // Astation releases the key the request names: the current file opens.
+        assert_eq!(unlock(&agent, &server, &paths).unwrap(), "0a1b2c3d");
         assert_eq!(
             agent.public_keys().unwrap(),
             (keys.device_pub(), keys.device_sign_pub())
@@ -1794,13 +1812,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .storage_kid,
-            new_kid
-        );
-        assert!(!paths.device_keys_next.exists());
-        // The release proves Astation holds it: status reads this.
-        assert_eq!(
-            TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
-            Some(new_kid.as_str())
+            "0a1b2c3d"
         );
     }
 
@@ -2172,21 +2184,16 @@ mod tests {
         );
         drop(agent);
 
-        // Astation still only holds the old key (the confirm was lost and it
-        // rolled back): the old file opens, and the .prev stays.
+        // A release of the old key for a request naming the new one proves
+        // nothing and opens nothing: the .prev stays.
         let restarted = self::agent(&paths);
         let (_, request) = request(&restarted, &paths, 1);
         let grant = server
             .unlock_grant(&server.astation, &request, "0a1b2c3d")
             .unwrap();
-        assert_eq!(
-            restarted
-                .finish_unlock(ASTATION_ID, &request.statement, &grant)
-                .unwrap(),
-            "0a1b2c3d"
-        );
+        let error = error_of(restarted.finish_unlock(ASTATION_ID, &request.statement, &grant));
+        assert!(error.contains("different storage key"), "{error}");
         assert!(paths.device_keys_prev.exists());
-        restarted.lock_keys().unwrap();
 
         // An unlock that releases the current kid proves Astation holds it.
         let (_, request) = self::request(&restarted, &paths, 2);
@@ -2358,23 +2365,55 @@ mod tests {
     }
 
     #[test]
-    fn an_unlock_that_opened_the_previous_file_blocks_rotation_until_the_current_opens() {
+    fn an_unlock_of_a_lone_previous_file_makes_it_current() {
+        // Only .prev is left (e.g. the current file was lost): the request
+        // names its kid, and once Astation releases that key the file is
+        // current again, so the next start and rotation use it.
         let dir = tempfile::tempdir().unwrap();
-        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        std::fs::rename(&paths.device_keys_sealed, &paths.device_keys_prev).unwrap();
         let agent = agent(&paths);
-        unlock(&agent, &server, &paths).unwrap();
-        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
-        let ack = server.accept_rotation(&rotation).unwrap();
-        agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
-        agent.lock_keys().unwrap();
+        assert_eq!(unlock(&agent, &server, &paths).unwrap(), "0a1b2c3d");
+        assert_eq!(
+            agent.public_keys().unwrap(),
+            (keys.device_pub(), keys.device_sign_pub())
+        );
+        assert!(!paths.device_keys_prev.exists());
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .expect("the previous file is current again")
+                .storage_kid,
+            "0a1b2c3d"
+        );
+        assert!(agent.begin_rotation(ASTATION_ID).is_ok());
+    }
+
+    #[test]
+    fn an_unlock_that_opened_the_previous_file_blocks_rotation_until_the_current_opens() {
+        // A current file that appears during an unlock naming .prev is kept,
+        // and the keys unlocked from .prev may not rotate.
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        std::fs::rename(&paths.device_keys_sealed, &paths.device_keys_prev).unwrap();
+        let agent = agent(&paths);
         let (_, request) = request(&agent, &paths, 1);
-        let grant = server
-            .unlock_grant(&server.astation, &request, "0a1b2c3d")
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "4e5f6a7b", &new_storage_key())
+            .unwrap()
+            .save_to(&paths.device_keys_sealed)
             .unwrap();
+        let grant = server.grant_unlock(&request).unwrap();
         agent
             .finish_unlock(ASTATION_ID, &request.statement, &grant)
             .unwrap();
         assert!(error_of(agent.begin_rotation(ASTATION_ID)).contains("previous"));
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .unwrap()
+                .storage_kid,
+            "4e5f6a7b"
+        );
     }
 
     #[test]

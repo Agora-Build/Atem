@@ -14,9 +14,10 @@ use std::path::Path;
 use zeroize::Zeroizing;
 
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
-use crate::memory::encoding::enc;
+use crate::memory::encoding::{dec, enc};
 use crate::memory::statements::{
-    SignedWire, StorageAck, UnlockGrant, sealed_hash, unlock_request_hash, verify_astation,
+    SignedWire, StorageAck, UnlockGrant, UnlockRequest, sealed_hash, unlock_request_hash,
+    verify_astation,
 };
 use crate::memory::trust::AstationTrust;
 
@@ -192,6 +193,15 @@ pub fn check_unlock_grant(
     }
     if !crate::memory::crypto::valid_kid(&granted.storage_kid) {
         bail!("unlock grant has an invalid storage key id");
+    }
+    // Astation releases the key the request names, nothing else.
+    let requested = UnlockRequest::parse(&dec(request_bytes)?)?;
+    if granted.storage_kid != requested.storage_kid {
+        bail!(
+            "unlock grant releases a different storage key ({}) than the request names ({})",
+            granted.storage_kid,
+            requested.storage_kid
+        );
     }
     let encapped = STANDARD
         .decode(&grant.encapped_key)
