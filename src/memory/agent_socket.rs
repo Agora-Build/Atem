@@ -49,8 +49,10 @@ pub fn agent_socket_path() -> PathBuf {
 /// The socket path for `config_dir` and the runtime dir `runtime_dir`
 /// (used only when it is safe).
 fn socket_path_in(config_dir: &Path, runtime_dir: Option<OsString>) -> PathBuf {
-    let runtime = runtime_dir
-        .filter(|dir| !dir.is_empty() && check_parent_dir(Path::new(dir), own_uid()).is_ok());
+    // A relative runtime dir would depend on the current directory: unset.
+    let runtime = runtime_dir.filter(|dir| {
+        Path::new(dir).is_absolute() && check_parent_dir(Path::new(dir), own_uid()).is_ok()
+    });
     socket_path_from(runtime, config_dir)
 }
 
@@ -393,28 +395,76 @@ impl std::fmt::Display for StuckAgent {
 
 impl std::error::Error for StuckAgent {}
 
-/// The pid recorded in the key directory's lock file by the agent holding
-/// it, if that process is alive.
-fn lock_holder(lock_path: &Path) -> Option<u32> {
+/// Whether some process holds the key directory's lock (`None` when that
+/// can't be told). A shared, non-blocking try: it never waits, and a
+/// starting agent that meets it retries for `CLAIM_WAIT`.
+fn lock_is_held(lock_path: &Path) -> Option<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .ok()?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return Some(false);
+    }
+    (std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)).then_some(true)
+}
+
+/// The pid recorded in the (held) lock file, only when that process is
+/// confirmed to be an `atem key-agent`: the pid survives the agent (and
+/// reboots), so it may name an unrelated process. Linux: its command line
+/// has a `key-agent` argument and, where its fds can be listed (the agent
+/// is not dumpable, so usually they can't), one of them is the lock file.
+/// Elsewhere nothing can be confirmed.
+fn confirmed_holder(lock_path: &Path) -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(lock_path)
         .ok()?
         .trim()
         .parse()
         .ok()?;
-    let alive = pid > 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-    alive.then_some(pid)
+    if pid == 0 || unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        let cmdline = std::fs::read(proc.join("cmdline")).ok()?;
+        if !cmdline
+            .split(|byte| *byte == 0)
+            .any(|arg| arg == b"key-agent")
+        {
+            return None;
+        }
+        if let Ok(fds) = std::fs::read_dir(proc.join("fd")) {
+            let lock = std::fs::canonicalize(lock_path).ok()?;
+            let holds = fds
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == lock));
+            if !holds {
+                return None;
+            }
+        }
+        Some(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
-/// What to say when the key files' agent can't be reached: names the
-/// holder's pid and how to stop it.
+/// What to say when the key files' agent can't be reached (its lock is
+/// held): names the holder's pid when it is confirmed to be a key agent,
+/// else how to find and stop one.
 fn stuck_message(lock_path: &Path) -> String {
     let dir = lock_path.parent().unwrap_or(Path::new(".")).display();
-    match lock_holder(lock_path) {
+    match confirmed_holder(lock_path) {
         Some(pid) => format!(
             "a key agent (pid {pid}) holds the key files in {dir} but answers on no socket (its runtime dir may have been removed); stop it with `kill {pid}` and retry (its keys stay sealed on disk)"
         ),
         None => format!(
-            "a key agent holds the key files in {dir} but answers on no socket; stop it with `pkill -u \"$USER\" -f 'atem key-agent'` and retry (its keys stay sealed on disk)"
+            "a key agent holds the key files in {dir} but answers on no socket; find it with `pgrep -af '[a]tem key-agent'` and stop it (`pkill -u \"$USER\" -f 'atem key-agent'`), then retry (its keys stay sealed on disk)"
         ),
     }
 }
@@ -518,20 +568,30 @@ impl Watch {
     }
 
     /// Why the agent can no longer be reached, if it can't.
+    /// Only what proves it counts: the socket or the record is NotFound,
+    /// the socket is another file, or the record names another path. Any
+    /// other error (out of file descriptors, permissions) proves nothing.
     fn orphaned(&self) -> Option<String> {
         match std::fs::symlink_metadata(&self.socket) {
-            Ok(meta) if (meta.dev(), meta.ino()) == self.identity => {}
-            Ok(_) => return Some(format!("{} was replaced", self.socket.display())),
-            Err(error) => return Some(format!("{} is gone ({error})", self.socket.display())),
+            Ok(meta) if (meta.dev(), meta.ino()) != self.identity => {
+                return Some(format!("{} was replaced", self.socket.display()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Some(format!("{} is gone", self.socket.display()));
+            }
+            _ => {}
         }
-        if recorded_socket(&self.record).as_deref() != Some(self.socket.as_path()) {
-            return Some(format!(
+        match read_record(&self.record) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(format!("{} is gone", self.record.display()))
+            }
+            Ok(named) if named.as_deref() != Some(self.socket.as_path()) => Some(format!(
                 "{} no longer names {}",
                 self.record.display(),
                 self.socket.display()
-            ));
+            )),
+            _ => None,
         }
-        None
     }
 
     /// Removes the record if it still names this agent's socket and nothing
@@ -548,10 +608,15 @@ impl Watch {
 
 /// The socket path recorded in `record` by the running agent, if any.
 fn recorded_socket(record: &Path) -> Option<PathBuf> {
+    read_record(record).ok().flatten()
+}
+
+/// `record` read: `Ok(None)` when it names no absolute path.
+fn read_record(record: &Path) -> std::io::Result<Option<PathBuf>> {
     use std::os::unix::ffi::OsStrExt;
-    let bytes = std::fs::read(record).ok()?;
+    let bytes = std::fs::read(record)?;
     let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
-    path.is_absolute().then_some(path)
+    Ok(path.is_absolute().then_some(path))
 }
 
 /// Listens on `socket`: directory 0700, socket 0600. A socket file nobody
@@ -723,8 +788,8 @@ pub async fn run_key_agent() -> Result<()> {
     harden_process();
     let paths = KeyPaths::default_paths();
     let socket = agent_socket_path();
-    // `_key_dir` holds the key directory's lock until the process exits.
-    let (_key_dir, listener) = match claim(&paths, &socket) {
+    // `key_dir` holds the key directory's lock until the process exits.
+    let (key_dir, listener) = match claim(&paths, &socket) {
         Ok(claimed) => claimed,
         Err(error) if error.downcast_ref::<AlreadyRunning>().is_some() => {
             eprintln!("{error}; exiting");
@@ -741,13 +806,16 @@ pub async fn run_key_agent() -> Result<()> {
         std::process::id(),
         socket.display()
     );
-    serve_watched(
+    let served = serve_watched(
         listener,
         Arc::new(Mutex::new(agent)),
         own_uid(),
         Some(watch),
     )
-    .await
+    .await;
+    // A clean exit takes its pid out of the lock file before releasing it.
+    let _ = key_dir.set_len(0);
+    served
 }
 
 /// Starts `exe key-agent` detached from this command and its terminal, with
@@ -989,7 +1057,7 @@ impl KeyAgentClient {
                 }
                 // An agent nobody can reach still holds the key files.
                 if let Some(lock) = self.lock.as_deref()
-                    && lock_holder(lock).is_some()
+                    && lock_is_held(lock) == Some(true)
                 {
                     return Err(StuckAgent(stuck_message(lock)).into());
                 }
@@ -1856,13 +1924,25 @@ mod tests {
         assert_eq!(recorded_socket(&paths.agent_socket), Some(elsewhere));
     }
 
+    /// A client for the key files in `config` from a session whose runtime
+    /// dir is `runtime`, whose launcher starts nothing, waiting 300 ms.
+    fn idle_launch_client(config: &Path, runtime: &Path) -> KeyAgentClient {
+        KeyAgentClient::finding(
+            config,
+            Some(runtime.as_os_str().to_owned()),
+            Some(Box::new(|| -> Result<()> { Ok(()) })),
+        )
+        .waiting(Duration::from_millis(300))
+    }
+
     #[test]
-    fn a_claim_on_key_files_held_by_an_unreachable_agent_names_its_pid() {
+    fn a_holder_that_cant_be_confirmed_as_a_key_agent_is_not_named() {
         let dir = short_dir();
-        let paths = KeyPaths::in_dir(&dir.path().join("config"));
+        let config = dir.path().join("config");
+        let paths = KeyPaths::in_dir(&config);
         make_private(&dir.path().join("rb"));
-        // The holder (this process) records its pid in the lock file and
-        // answers on no socket.
+        // The holder (this test process) records its pid and answers on no
+        // socket, but it isn't an `atem key-agent`: no pid is named.
         let _held = lock_key_dir(&paths, Duration::ZERO).unwrap();
         let pid = std::process::id();
         assert_eq!(
@@ -1876,36 +1956,161 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
         assert!(error.downcast_ref::<StuckAgent>().is_some(), "{error:#}");
-        let text = format!("{error:#}");
-        assert!(text.contains(&format!("pid {pid}")), "{text}");
-        assert!(text.contains(&format!("`kill {pid}`")), "{text}");
-        assert!(!text.contains("already running"), "{text}");
+        for text in [
+            format!("{error:#}"),
+            format!(
+                "{:#}",
+                idle_launch_client(&config, &dir.path().join("rb"))
+                    .status()
+                    .err()
+                    .unwrap()
+            ),
+        ] {
+            assert!(!text.contains(&format!("{pid}")), "{text}");
+            assert!(text.contains("pgrep -af '[a]tem key-agent'"), "{text}");
+            assert!(text.contains("pkill -u"), "{text}");
+            assert!(!text.contains("didn't start"), "{text}");
+        }
         assert!(!socket.exists());
     }
 
     #[test]
-    fn a_client_names_the_unreachable_agent_that_holds_the_key_files() {
+    fn an_unheld_lock_naming_a_live_pid_names_no_one() {
         let dir = short_dir();
         let config = dir.path().join("config");
         let paths = KeyPaths::in_dir(&config);
-        let runtime = dir.path().join("rb");
-        make_private(&runtime);
-        let _held = lock_key_dir(&paths, Duration::ZERO).unwrap();
+        make_private(&dir.path().join("rb"));
+        // Left by an agent that exited (or from before a reboot): the pid
+        // now belongs to a live, unrelated process (here: this one).
+        std::fs::create_dir_all(&config).unwrap();
         let pid = std::process::id();
-        let client = KeyAgentClient::finding(
-            &config,
-            Some(runtime.into_os_string()),
-            Some(Box::new(|| -> Result<()> { Ok(()) })),
-        )
-        .waiting(Duration::from_millis(300));
-        let text = format!("{:#}", client.status().err().unwrap());
-        assert!(text.contains(&format!("pid {pid}")), "{text}");
-        assert!(text.contains(&format!("`kill {pid}`")), "{text}");
-        assert!(!text.contains("didn't start"), "{text}");
-        // Without a live holder it is the usual "didn't start".
-        drop(_held);
-        std::fs::write(&paths.agent_lock, b"").unwrap();
-        let text = format!("{:#}", client.status().err().unwrap());
+        std::fs::write(&paths.agent_lock, format!("{pid}\n")).unwrap();
+        let text = format!(
+            "{:#}",
+            idle_launch_client(&config, &dir.path().join("rb"))
+                .status()
+                .err()
+                .unwrap()
+        );
         assert!(text.contains("didn't start"), "{text}");
+        assert!(!text.contains(&format!("{pid}")), "{text}");
+        assert!(!text.contains("kill"), "{text}");
+    }
+
+    /// Makes `dir` unreadable until dropped (then 0700 again, so the temp
+    /// dir can be removed).
+    struct Unreadable(PathBuf);
+
+    impl Unreadable {
+        fn new(dir: &Path) -> Self {
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+            Self(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for Unreadable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(
+                &self.0,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_confirmed_key_agent_that_no_one_can_reach_is_named_with_its_pid() {
+        let dir = short_dir();
+        let home = dir.path().join("home");
+        let (run_a, run_b) = (dir.path().join("ra"), dir.path().join("rb"));
+        std::fs::create_dir_all(&home).unwrap();
+        make_private(&run_a);
+        make_private(&run_b);
+        let agent = key_agent_process(&home, &run_a, &dir.path().join("a.log"));
+        let socket_a = run_a.join("atem").join("agent.sock");
+        assert!(eventually(
+            || KeyAgentClient::at(socket_a.clone()).is_running()
+        ));
+        let pid = agent.0.id();
+        // Its socket directory can't be entered: nobody can connect, yet the
+        // agent itself can't tell (not a NotFound) and keeps its lock.
+        let _blocked = Unreadable::new(&run_a.join("atem"));
+        let config = home.join(".config").join("atem");
+        let paths = KeyPaths::in_dir(&config);
+        let error = claim_waiting(
+            &paths,
+            &run_b.join("atem").join("agent.sock"),
+            Duration::from_millis(300),
+        )
+        .err()
+        .unwrap();
+        let client = idle_launch_client(&config, &run_b);
+        for text in [
+            format!("{error:#}"),
+            format!("{:#}", client.status().err().unwrap()),
+        ] {
+            assert!(text.contains(&format!("pid {pid}")), "{text}");
+            assert!(text.contains(&format!("`kill {pid}`")), "{text}");
+        }
+    }
+
+    #[test]
+    fn only_a_missing_or_renamed_socket_orphans_the_agent() {
+        let dir = short_dir();
+        let run = dir.path().join("run");
+        make_private(&run);
+        let socket = run.join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let record = dir.path().join("agent.socket");
+        let write_record = |path: &Path| {
+            use std::os::unix::ffi::OsStrExt;
+            crate::memory::crypto::write_private(&record, path.as_os_str().as_bytes()).unwrap();
+        };
+        write_record(&socket);
+        let watch = Watch::new(&socket, &record, Duration::from_secs(5)).unwrap();
+        assert_eq!(watch.orphaned(), None);
+        // Errors other than NotFound (here: EACCES on the socket, EISDIR on
+        // the record) say nothing about the agent: it keeps serving.
+        {
+            let _blocked = Unreadable::new(&run);
+            assert_eq!(watch.orphaned(), None);
+        }
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert_eq!(watch.orphaned(), None);
+        std::fs::remove_dir(&record).unwrap();
+        // A missing record, or one naming another path, orphans it.
+        assert!(watch.orphaned().is_some());
+        write_record(&dir.path().join("other.sock"));
+        assert!(watch.orphaned().is_some());
+        write_record(&socket);
+        assert_eq!(watch.orphaned(), None);
+        std::fs::remove_file(&socket).unwrap();
+        assert!(watch.orphaned().is_some());
+    }
+
+    #[test]
+    fn a_relative_runtime_dir_is_ignored() {
+        let dir = short_dir();
+        let config = dir.path().join("config");
+        let private = dir.path().join("private");
+        make_private(&private);
+        // `private` as seen from the current directory.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(private.strip_prefix("/").unwrap());
+        assert!(relative.is_relative() && relative.is_dir());
+        assert_eq!(
+            socket_path_in(&config, Some(relative.into_os_string())),
+            config.join("agent.sock")
+        );
+        assert_eq!(
+            socket_path_in(&config, Some(private.clone().into_os_string())),
+            private.join("atem").join("agent.sock")
+        );
     }
 }

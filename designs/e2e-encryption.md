@@ -427,7 +427,15 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   answer on its recorded socket (then it exits: one is running) or to go
   away (an orphaned agent exits by itself, see above). If neither happens,
   the starting agent and the client that started it print an error naming
-  the holder's pid and the `kill <pid>` that stops it.
+  the holder's pid and the `kill <pid>` that stops it, but only when the
+  lock is really held and (Linux) that pid's command line is `atem
+  key-agent` (the pid stays in the file after a crash and across reboots,
+  so it could name an unrelated process); otherwise the error gives the
+  `pgrep`/`pkill` lines. A clean agent exit clears the pid. The agent
+  counts as orphaned only when its socket or `agent.socket` is gone
+  (NotFound), the socket is another file, or `agent.socket` names another
+  path; other errors (out of file descriptors, permissions) prove nothing.
+  A relative `$XDG_RUNTIME_DIR` is ignored (treated as unset).
 - **Home Astation.** One storage key per device, held by the device's first
   verified Astation and recorded as `home_astation` in `cred_state.json`;
   the home never moves. Unlock and rotation go only through the home
