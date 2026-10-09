@@ -290,6 +290,7 @@ pub fn complete_verification(
     grants: &[GrantWire],
 ) -> Result<VerificationOutcome> {
     let mut staged = TrustStore::load_from(&paths.trust)?;
+    let first = staged.verified(astation_id).is_none();
     staged.confirm(astation_id, device_verified)?;
     let changed = staged.accept_account_state(astation_id, account_state)?;
     let entry = staged
@@ -313,6 +314,11 @@ pub fn complete_verification(
     }
 
     keys.save_to(&paths.device_keys)?;
+    if first {
+        // Whatever the unauthenticated path stored for this Astation (mode,
+        // K, rotation history, project names) is dropped, not trusted.
+        EncryptionContext::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
+    }
     EncryptionContext::update_mode_at(
         &paths.data_keys,
         astation_id,
@@ -1000,5 +1006,38 @@ mod ceremony_tests {
         });
         assert!(result.is_err());
         assert_nothing_written(&paths);
+    }
+
+    #[test]
+    fn first_verification_purges_legacy_keys() {
+        use crate::memory::crypto::stored_summary_at;
+        let dir = tempfile::tempdir().unwrap();
+        let data_keys = KeyPaths::in_dir(dir.path()).data_keys;
+        // K and its rotation history from the unauthenticated #36 path.
+        for (kid, key) in [("0123abcd", [1; 32]), ("11112222", [2; 32])] {
+            EncryptionContext::update_mode_at(
+                &data_keys,
+                ASTATION_ID,
+                "acct",
+                EncryptionMode::Enabling,
+                Some(kid),
+            )
+            .unwrap();
+            EncryptionContext::install_grant_at(&data_keys, ASTATION_ID, "acct", kid, key).unwrap();
+        }
+        assert_eq!(
+            stored_summary_at(&data_keys, ASTATION_ID, "acct").2,
+            vec!["0123abcd".to_string()]
+        );
+
+        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+            (state(fake, EncryptionMode::On, Some("89abcdef"), 2), vec![])
+        });
+        result.unwrap();
+        assert_eq!(
+            stored_summary_at(&paths.data_keys, ASTATION_ID, "acct"),
+            (Some(Some("89abcdef".into())), None, vec![], 0),
+            "the old K and its history must be gone"
+        );
     }
 }

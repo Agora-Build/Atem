@@ -291,6 +291,26 @@ impl EncryptionContext {
         store.save_to(path)
     }
 
+    /// Removes what the unauthenticated #36 path may have stored for this
+    /// Astation: its mode entry, and the keys, rotation history and project
+    /// names of `data_account` and of the account that entry named. Called on
+    /// a device's first verification with this Astation, before the signed
+    /// state is applied.
+    pub(crate) fn purge_unverified_at(path: &Path, astation_id: &str, data_account: &str) -> Result<()> {
+        if !path.exists() { return Ok(()); }
+        let mut store = StoredKeys::load_or_recover_from(path)?;
+        let mut accounts = vec![data_account.to_string()];
+        if let Some(legacy) = store.astations.remove(astation_id) && legacy.data_account != data_account {
+            accounts.push(legacy.data_account);
+        }
+        for account in &accounts {
+            store.accounts.remove(account);
+            store.previous_keys.remove(account);
+            store.project_names.remove(account);
+        }
+        store.save_to(path)
+    }
+
     fn key(&self) -> Result<&[u8; 32]> {
         self.key.as_ref().ok_or_else(|| anyhow!(
             "this account requires encryption; connect to Astation to receive the encryption key"
@@ -485,6 +505,19 @@ pub async fn migrate_account(astation_id: &str) -> Result<Option<&'static str>> 
         .map_err(|error| anyhow!(error.to_string()))?;
     vault.migrate_encryption().await?;
     Ok(Some(target))
+}
+
+/// Test view of `data_keys.enc`: (mode entry's kid, current key's kid,
+/// previous kids, number of remembered project names) for an account.
+#[cfg(test)]
+pub(crate) fn stored_summary_at(path: &Path, astation_id: &str, data_account: &str) -> (Option<Option<String>>, Option<String>, Vec<String>, usize) {
+    let store = StoredKeys::load_from(path).unwrap();
+    (
+        store.astations.get(astation_id).map(|mode| mode.kid.clone()),
+        store.accounts.get(data_account).map(|key| key.kid.clone()),
+        store.previous_keys.get(data_account).map(|keys| keys.iter().map(|key| key.kid.clone()).collect()).unwrap_or_default(),
+        store.project_names.get(data_account).map(HashMap::len).unwrap_or(0),
+    )
 }
 
 #[cfg(test)]
@@ -705,6 +738,38 @@ mod tests {
             seq: 1,
         };
         assert!(context.decrypt_skill(skill).is_err());
+    }
+
+    #[test]
+    fn purge_unverified_removes_legacy_keys_history_and_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data_keys.enc");
+        EncryptionContext::update_mode_at(&path, "astation", "legacy", EncryptionMode::Enabling, Some("0123abcd")).unwrap();
+        EncryptionContext::install_grant_at(&path, "astation", "legacy", "0123abcd", [1; 32]).unwrap();
+        EncryptionContext::update_mode_at(&path, "astation", "legacy", EncryptionMode::Enabling, Some("11112222")).unwrap();
+        EncryptionContext::install_grant_at(&path, "astation", "legacy", "11112222", [2; 32]).unwrap();
+        EncryptionContext::update_mode_at(&path, "other", "kept", EncryptionMode::On, Some("33334444")).unwrap();
+        EncryptionContext::install_grant_at(&path, "other", "kept", "33334444", [3; 32]).unwrap();
+        let mut legacy = context();
+        legacy.data_account = "legacy".into();
+        legacy.store_path = path.clone();
+        legacy.wire_project("github.com/agora/atem").unwrap();
+        assert_eq!(
+            stored_summary_at(&path, "astation", "legacy"),
+            (Some(Some("11112222".into())), Some("11112222".into()), vec!["0123abcd".into()], 1)
+        );
+
+        EncryptionContext::purge_unverified_at(&path, "astation", "certified").unwrap();
+        assert_eq!(stored_summary_at(&path, "astation", "legacy"), (None, None, vec![], 0));
+        assert_eq!(
+            stored_summary_at(&path, "other", "kept"),
+            (Some(Some("33334444".into())), Some("33334444".into()), vec![], 0),
+            "other Astations' keys are untouched"
+        );
+        // A missing store stays missing.
+        let absent = dir.path().join("absent.enc");
+        EncryptionContext::purge_unverified_at(&absent, "astation", "certified").unwrap();
+        assert!(!absent.exists());
     }
 
     #[test]
