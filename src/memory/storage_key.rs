@@ -106,6 +106,8 @@ impl SealedDeviceKeys {
         })
     }
 
+    /// The device keys only (tests; the key agent opens with the account keys).
+    #[cfg(test)]
     pub fn open(&self, storage_key: &[u8; 32], unlock_auth: UnlockAuthKey) -> Result<DeviceKeys> {
         self.open_with_accounts(storage_key, unlock_auth)
             .map(|(keys, _)| keys)

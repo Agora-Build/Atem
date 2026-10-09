@@ -5,14 +5,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use crate::memory::device_keys::DeviceKeys;
+use crate::memory::account_keys::AccountKeys;
+use crate::memory::crypto::EncryptionMode;
+use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
 use crate::memory::encoding::dec;
-use crate::memory::grant::{hpke_open, hpke_seal};
+use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, seal_k_grant};
+use crate::memory::key_agent::{KeyAgent, KeyAgentApi, build_unlock_request, test_agent};
 use crate::memory::statements::{
-    DeviceVerified, FakeAstation, SignedWire, StorageAbandon, StorageAck, StorageConfirm,
-    StorageRotate, UnlockGrant, UnlockRequest, sealed_hash, storage_key_info, unlock_info,
-    unlock_request_hash, verify_device,
+    AccountState, DeviceVerified, FakeAstation, SignedWire, StorageAbandon, StorageAck,
+    StorageConfirm, StorageRotate, UnlockGrant, UnlockRequest, sealed_hash, storage_key_info,
+    unlock_info, unlock_request_hash, verify_device,
 };
 use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, UnlockGrantWire, new_storage_key,
@@ -394,6 +398,131 @@ impl FakeKeyServer {
             None if self.storage_keys.contains_key(&confirmed.storage_kid) => Ok(()),
             _ => bail!("confirmation for another storage key"),
         }
+    }
+}
+
+/// What `atem cred unlock` does with `agent`, against `server`.
+pub(crate) fn unlock_with(
+    agent: &dyn KeyAgentApi,
+    server: &FakeKeyServer,
+    paths: &KeyPaths,
+) -> Result<String> {
+    let challenge = agent.begin_unlock(ASTATION_ID)?;
+    let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?
+        .ok_or_else(|| anyhow!("unlock_auth_key is missing"))?;
+    let request = build_unlock_request(&challenge, "boot-1", 1_760_000_000, &unlock_auth);
+    let grant = server.grant_unlock(&request)?;
+    agent.finish_unlock(ASTATION_ID, &request.statement, &grant)
+}
+
+/// Signs `mode`/`kid` at `epoch` as `astation` and accepts it into
+/// `paths.trust`, as `apply_account_state` does.
+pub(crate) fn set_state(
+    paths: &KeyPaths,
+    astation: &FakeAstation,
+    mode: EncryptionMode,
+    kid: Option<&str>,
+    epoch: u64,
+) {
+    let signed = astation.sign(
+        &AccountState {
+            account: ACCOUNT.into(),
+            sign_gen: 1,
+            mode,
+            kid: kid.map(str::to_string),
+            epoch,
+        }
+        .encode(),
+    );
+    TrustStore::update(&paths.trust, |trust| {
+        trust.accept_account_state(ASTATION_ID, &signed)?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The account keys in `path`, opened directly with the storage key
+/// `server` holds for it (not through an agent).
+pub(crate) fn sealed_account_keys(
+    server: &FakeKeyServer,
+    paths: &KeyPaths,
+    path: &Path,
+) -> AccountKeys {
+    let sealed = SealedDeviceKeys::load_from(path).unwrap().unwrap();
+    let storage_key = server
+        .storage_keys
+        .get(&sealed.storage_kid)
+        .copied()
+        .or_else(|| {
+            server
+                .pending
+                .as_ref()
+                .filter(|(kid, _)| *kid == sealed.storage_kid)
+                .map(|(_, key)| *key)
+        })
+        .expect("Astation holds the storage key of the sealed file");
+    let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)
+        .unwrap()
+        .unwrap();
+    sealed
+        .open_with_accounts(&storage_key, unlock_auth)
+        .unwrap()
+        .1
+}
+
+/// A verified device with its home Astation, unlocked through the
+/// in-process agent (shared, so contexts and clients can hold it).
+pub(crate) struct UnlockedDevice {
+    pub paths: KeyPaths,
+    pub server: FakeKeyServer,
+    pub keys: DeviceKeys,
+    pub agent: Arc<Mutex<KeyAgent>>,
+    epoch: u64,
+}
+
+impl UnlockedDevice {
+    pub(crate) fn new(dir: &Path) -> Self {
+        let (paths, server, keys) = sealed_device(dir, "0a1b2c3d");
+        let agent = Arc::new(test_agent(&paths));
+        unlock_with(agent.as_ref(), &server, &paths).unwrap();
+        Self {
+            paths,
+            server,
+            keys,
+            agent,
+            epoch: 1,
+        }
+    }
+
+    /// Signs and applies the next account state.
+    pub(crate) fn state(&mut self, mode: EncryptionMode, kid: Option<&str>) {
+        self.epoch += 1;
+        set_state(&self.paths, &self.server.astation, mode, kid, self.epoch);
+    }
+
+    /// A signed `K` grant for this device.
+    pub(crate) fn grant(&self, kid: &str, key: [u8; 32]) -> GrantWire {
+        seal_k_grant(
+            &self.server.astation,
+            ACCOUNT,
+            DEVICE_ID,
+            self.keys.device_pub(),
+            kid,
+            key,
+        )
+    }
+
+    /// A new state with `kid`, and its grant installed by the agent.
+    pub(crate) fn set_key(&mut self, mode: EncryptionMode, kid: &str, key: [u8; 32]) {
+        self.state(mode, Some(kid));
+        self.agent
+            .install_grant(ASTATION_ID, &self.grant(kid, key))
+            .unwrap();
+    }
+
+    /// The account keys in the current sealed file, opened directly.
+    pub(crate) fn sealed_accounts(&self) -> AccountKeys {
+        sealed_account_keys(&self.server, &self.paths, &self.paths.device_keys_sealed)
     }
 }
 

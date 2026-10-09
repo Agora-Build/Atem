@@ -6,9 +6,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+use crate::memory::account_keys::{AccountKeys, CryptOp, CryptOut, SignedModes};
+use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::encoding::dec;
 use crate::memory::grant::{
@@ -23,7 +26,7 @@ use crate::memory::storage_key::{
     check_storage_ack, check_unlock_grant, new_storage_key, new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::KeyPaths;
+use crate::memory::verification::{KeyPaths, stored_state};
 
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
 /// other version with an error, so an old agent and a newer CLI fail clearly.
@@ -63,6 +66,29 @@ pub enum Request {
         grant: GrantWire,
         #[serde(default)]
         trust: Option<AstationTrust>,
+    },
+    /// Opens a `K` grant from a verified Astation and stores `K` in the
+    /// sealed file (it is never handed back). The grant must name the kid
+    /// of the latest signed account state in cred_state.json.
+    InstallGrant {
+        astation_id: String,
+        grant: GrantWire,
+    },
+    /// Verification only: opens a grant against pins not saved yet, to
+    /// check it, and drops `K`.
+    CheckGrant {
+        grant: GrantWire,
+        trust: AstationTrust,
+    },
+    /// Field operations with the account's `K` (account_keys.rs), in order.
+    Crypt {
+        astation_id: String,
+        ops: Vec<CryptOp>,
+    },
+    /// The current kid held for `astation_id`'s account, once the keys a
+    /// newer signed state retired are dropped.
+    HeldKid {
+        astation_id: String,
     },
     /// Starts an unlock through the home Astation: a single-use X25519 key.
     BeginUnlock {
@@ -113,6 +139,18 @@ pub enum Reply {
         kid: String,
         key: Zeroizing<String>,
     },
+    GrantInstalled {
+        kid: String,
+    },
+    GrantChecked {
+        kid: String,
+    },
+    Crypted {
+        results: Vec<CryptOut>,
+    },
+    HeldKid {
+        kid: Option<String>,
+    },
     UnlockChallenge {
         e_pub: String,
         nonce: String,
@@ -150,6 +188,9 @@ pub struct AgentStatus {
 
 struct Unlocked {
     keys: DeviceKeys,
+    /// `K` and the keys it replaced, per account (build step 2b), as sealed
+    /// in the file this agent holds the storage key for.
+    accounts: AccountKeys,
     device_id: String,
     storage_kid: String,
     storage_key: StorageKey,
@@ -157,6 +198,9 @@ struct Unlocked {
     /// Opened with the `.prev` file: Astation may not hold the current key,
     /// so no rotation until an unlock opens the current file.
     via_prev: bool,
+    /// `accounts` dropped retired keys the sealed file still carries (a
+    /// best-effort re-seal failed): the next call writes the file again.
+    unsaved: bool,
 }
 
 /// The single-use key of an unlock in progress. `StaticSecret` zeroizes on drop.
@@ -226,7 +270,7 @@ pub(crate) fn open_sealed_checked(
     storage_kid: &str,
     storage_key: &[u8; 32],
     unlock_auth: UnlockAuthKey,
-) -> Result<DeviceKeys> {
+) -> Result<(DeviceKeys, AccountKeys)> {
     if sealed.device_id != device_id {
         bail!("device_keys.sealed belongs to another device");
     }
@@ -236,7 +280,7 @@ pub(crate) fn open_sealed_checked(
             sealed.storage_kid
         );
     }
-    sealed.open(storage_key, unlock_auth)
+    sealed.open_with_accounts(storage_key, unlock_auth)
 }
 
 impl KeyAgent {
@@ -301,6 +345,15 @@ impl KeyAgent {
                 grant,
                 trust,
             } => self.open_grant(&astation_id, &grant, trust),
+            Request::InstallGrant { astation_id, grant } => {
+                self.install_grant(&astation_id, &grant)
+            }
+            Request::CheckGrant { grant, trust } => {
+                let opened = open_sealed_grant(&trust, &self.unlocked()?.keys, &grant)?;
+                Ok(Reply::GrantChecked { kid: opened.kid })
+            }
+            Request::Crypt { astation_id, ops } => self.crypt(&astation_id, ops),
+            Request::HeldKid { astation_id } => self.held_kid(&astation_id),
             Request::BeginUnlock { astation_id } => self.begin_unlock(&astation_id),
             Request::FinishUnlock {
                 astation_id,
@@ -386,11 +439,13 @@ impl KeyAgent {
         self.pending_rotation = None;
         self.unlocked = Some(Unlocked {
             keys,
+            accounts: AccountKeys::default(),
             device_id,
             storage_kid,
             storage_key,
             escrowed: false,
             via_prev: false,
+            unsaved: false,
         });
         Ok(Reply::Done)
     }
@@ -415,6 +470,183 @@ impl KeyAgent {
             kid: opened.kid,
             key,
         })
+    }
+
+    fn install_grant(&mut self, astation_id: &str, grant: &GrantWire) -> Result<Reply> {
+        let unlocked = self.unlocked()?;
+        let trust = TrustStore::load_from(&self.paths.trust)?;
+        let entry = trust
+            .verified(astation_id)
+            .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))?;
+        let opened = open_sealed_grant(entry, &unlocked.keys, grant)?;
+        if !crate::memory::crypto::valid_kid(&opened.kid) {
+            bail!("encryption key id must be 8 lowercase hex characters");
+        }
+        let state = stored_state(entry)?
+            .ok_or_else(|| anyhow!("received an encryption key before the account mode"))?;
+        if state.kid.as_deref() != Some(opened.kid.as_str()) {
+            bail!("encryption key grant does not match the announced account mode");
+        }
+        let kid = opened.kid.clone();
+        let mut accounts = unlocked.accounts.clone();
+        accounts.install(&entry.data_account, &kid, opened.key);
+        accounts.reconcile(&self.signed_modes()?);
+        // Saved before it is used: K is in memory only once it is on disk.
+        self.persist(&accounts)?;
+        let unlocked = self.unlocked.as_mut().expect("unlocked above");
+        unlocked.accounts = accounts;
+        unlocked.unsaved = false;
+        Ok(Reply::GrantInstalled { kid })
+    }
+
+    fn crypt(&mut self, astation_id: &str, ops: Vec<CryptOp>) -> Result<Reply> {
+        self.unlocked()?;
+        self.prune_retired();
+        let trust = TrustStore::load_from(&self.paths.trust)?;
+        let entry = trust
+            .verified(astation_id)
+            .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))?;
+        let state = stored_state(entry)?.ok_or_else(|| {
+            anyhow!("waiting for Astation's signed encryption state; reconnect to Astation")
+        })?;
+        let results = self.unlocked()?.accounts.crypt(
+            &entry.data_account,
+            state.mode,
+            state.kid.as_deref(),
+            ops,
+        )?;
+        Ok(Reply::Crypted { results })
+    }
+
+    fn held_kid(&mut self, astation_id: &str) -> Result<Reply> {
+        self.unlocked()?;
+        self.prune_retired();
+        let trust = TrustStore::load_from(&self.paths.trust)?;
+        let kid = trust.verified(astation_id).and_then(|entry| {
+            self.unlocked
+                .as_ref()?
+                .accounts
+                .current_kid(&entry.data_account)
+                .map(str::to_string)
+        });
+        Ok(Reply::HeldKid { kid })
+    }
+
+    /// The latest signed state of every account a verified Astation names
+    /// (the highest epoch when two name one account).
+    fn signed_modes(&self) -> Result<SignedModes> {
+        let trust = TrustStore::load_from(&self.paths.trust)?;
+        let mut latest: BTreeMap<String, Option<(u64, EncryptionMode, Option<String>)>> =
+            BTreeMap::new();
+        for entry in trust.verified_entries() {
+            let state = stored_state(entry)?;
+            let slot = latest.entry(entry.data_account.clone()).or_insert(None);
+            if let Some(state) = state
+                && slot
+                    .as_ref()
+                    .is_none_or(|(epoch, _, _)| state.epoch > *epoch)
+            {
+                *slot = Some((state.epoch, state.mode, state.kid));
+            }
+        }
+        Ok(latest
+            .into_iter()
+            .map(|(account, state)| (account, state.map(|(_, mode, kid)| (mode, kid))))
+            .collect())
+    }
+
+    /// Drops the account keys the signed states retired (`off`, or previous
+    /// keys once `on` names the current kid). Best effort: they go from
+    /// memory at once (the signed state already forbids them), and a failed
+    /// re-seal is logged and retried at the next call, never failing it.
+    fn prune_retired(&mut self) {
+        if let Err(error) = self.try_prune() {
+            eprintln!("key agent: could not re-seal the account keys: {error:#}");
+        }
+    }
+
+    fn try_prune(&mut self) -> Result<()> {
+        let modes = self.signed_modes()?;
+        let unlocked = self.unlocked.as_mut().ok_or_else(|| anyhow!(LOCKED))?;
+        if unlocked.accounts.reconcile(&modes) {
+            unlocked.unsaved = true;
+        }
+        if !unlocked.unsaved {
+            return Ok(());
+        }
+        let unlocked = self.unlocked()?;
+        self.persist(&unlocked.accounts)?;
+        self.unlocked.as_mut().expect("unlocked above").unsaved = false;
+        Ok(())
+    }
+
+    /// Writes the sealed file this agent holds the storage key for (and a
+    /// pending rotation's `.next`) again, with `accounts`, under the storage
+    /// keys they already use (temp file, fsync, rename). Only a file whose
+    /// header names the storage kid the agent holds is ever rewritten:
+    /// another kid there means another run changed it, and that file is
+    /// left alone. A crash leaves the old or the new file, both opened by
+    /// the same storage key; at worst a newly installed `K` is missing, and
+    /// atem asks Astation for it again (a `K` always comes as a signed grant).
+    fn persist(&self, accounts: &AccountKeys) -> Result<()> {
+        let unlocked = self.unlocked()?;
+        let held = if unlocked.via_prev {
+            &self.paths.device_keys_prev
+        } else {
+            &self.paths.device_keys_sealed
+        };
+        let on_disk = SealedDeviceKeys::load_from(held)?.ok_or_else(|| {
+            anyhow!(
+                "{} is missing; the account keys can't be stored",
+                held.display()
+            )
+        })?;
+        if on_disk.device_id != unlocked.device_id || on_disk.storage_kid != unlocked.storage_kid {
+            bail!(
+                "{} is under storage key {}, not the one this agent holds ({}); run `atem cred lock`, then `atem cred unlock`",
+                held.display(),
+                on_disk.storage_kid,
+                unlocked.storage_kid
+            );
+        }
+        // A rotation in progress promotes .next: it must carry the same keys.
+        // Written first, so a failure leaves the current file as it was.
+        if let Some(pending) = &self.pending_rotation
+            && !pending.initial
+        {
+            if let Some(next) = SealedDeviceKeys::load_from(&self.paths.device_keys_next)?
+                && (next.device_id != unlocked.device_id || next.storage_kid != pending.storage_kid)
+            {
+                bail!(
+                    "device_keys.sealed.next is under storage key {}, not the pending rotation's ({})",
+                    next.storage_kid,
+                    pending.storage_kid
+                );
+            }
+            SealedDeviceKeys::seal_with(
+                &unlocked.keys,
+                accounts,
+                &unlocked.device_id,
+                &pending.storage_kid,
+                &pending.storage_key,
+            )?
+            .save_to(&self.paths.device_keys_next)?;
+        }
+        SealedDeviceKeys::seal_with(
+            &unlocked.keys,
+            accounts,
+            &unlocked.device_id,
+            &unlocked.storage_kid,
+            &unlocked.storage_key,
+        )?
+        .save_to(held)?;
+        Ok(())
+    }
+
+    /// Once unlocked: drops account keys a signed state retired while the
+    /// agent was locked. Never fatal: logged.
+    fn after_unlock(&mut self) {
+        self.prune_retired();
     }
 
     /// The pins of the home Astation, which must be `astation_id`.
@@ -544,7 +776,7 @@ impl KeyAgent {
         let (sealed, source) = self.sealed_with_kid(&granted.storage_kid)?;
         let unlock_auth = UnlockAuthKey::load_from(&self.paths.unlock_auth_key)?
             .ok_or_else(|| anyhow!("unlock_auth_key is missing. {RESET}"))?;
-        let keys = open_sealed_checked(
+        let (keys, accounts) = open_sealed_checked(
             &sealed,
             &trust.device_id,
             &granted.storage_kid,
@@ -590,12 +822,15 @@ impl KeyAgent {
         }
         self.unlocked = Some(Unlocked {
             keys,
+            accounts,
             device_id: trust.device_id,
             storage_kid: granted.storage_kid.clone(),
             storage_key,
             escrowed: true,
             via_prev: source == SealedFile::Prev,
+            unsaved: false,
         });
+        self.after_unlock();
         Ok(Reply::Unlocked {
             storage_kid: granted.storage_kid,
         })
@@ -635,9 +870,16 @@ impl KeyAgent {
             let kid = TrustStore::load_from(&self.paths.trust)?
                 .pick_storage_kid(&unlocked.storage_kid, new_storage_kid);
             let key = new_storage_key();
-            // Phase 1: the re-sealed file waits beside the current one.
-            SealedDeviceKeys::seal(&unlocked.keys, &unlocked.device_id, &kid, &key)?
-                .save_to(&self.paths.device_keys_next)?;
+            // Phase 1: the re-sealed file (with the account keys) waits
+            // beside the current one.
+            SealedDeviceKeys::seal_with(
+                &unlocked.keys,
+                &unlocked.accounts,
+                &unlocked.device_id,
+                &kid,
+                &key,
+            )?
+            .save_to(&self.paths.device_keys_next)?;
             (unlocked.storage_kid.clone(), kid, key)
         };
         let enc_pub = decode32(&trust.astation_enc_pub, "Astation encryption key")?;
@@ -852,8 +1094,18 @@ impl KeyAgent {
             .map(|sealed| sealed.storage_kid)
             .unwrap_or_default();
         let storage_kid = trust.pick_storage_kid(&earlier, new_storage_kid);
-        SealedDeviceKeys::seal(&keys, &entry.device_id, &storage_kid, &storage_key)?
-            .save_to(&self.paths.device_keys_sealed)?;
+        // The sealed file this overwrites can't be opened (its storage key
+        // went with the agent that wrote it): any `K` in it is asked for
+        // again (a `K` always comes as a signed grant), so none is sealed.
+        let accounts = AccountKeys::default();
+        SealedDeviceKeys::seal_with(
+            &keys,
+            &accounts,
+            &entry.device_id,
+            &storage_kid,
+            &storage_key,
+        )?
+        .save_to(&self.paths.device_keys_sealed)?;
         keys.unlock_auth_key()
             .save_to(&self.paths.unlock_auth_key)?;
         trust.set_home(&home);
@@ -864,11 +1116,13 @@ impl KeyAgent {
         );
         self.unlocked = Some(Unlocked {
             keys,
+            accounts,
             device_id: entry.device_id,
             storage_kid,
             storage_key,
             escrowed: false,
             via_prev: false,
+            unsaved: false,
         });
         Ok(())
     }
@@ -1068,6 +1322,53 @@ pub trait KeyAgentApi: Send + Sync {
         }
     }
 
+    /// Installs a granted `K` in the agent; returns its kid.
+    fn install_grant(&self, astation_id: &str, grant: &GrantWire) -> Result<String> {
+        match self.call(Request::InstallGrant {
+            astation_id: astation_id.into(),
+            grant: grant.clone(),
+        })? {
+            Reply::GrantInstalled { kid } => Ok(kid),
+            _ => unexpected(),
+        }
+    }
+
+    /// Checks a grant against pins not saved yet (verification); its kid.
+    fn check_grant(&self, grant: &GrantWire, trust: &AstationTrust) -> Result<String> {
+        match self.call(Request::CheckGrant {
+            grant: grant.clone(),
+            trust: trust.clone(),
+        })? {
+            Reply::GrantChecked { kid } => Ok(kid),
+            _ => unexpected(),
+        }
+    }
+
+    /// Runs field operations with `astation_id`'s `K`, results in order.
+    fn crypt(&self, astation_id: &str, ops: Vec<CryptOp>) -> Result<Vec<CryptOut>> {
+        let count = ops.len();
+        match self.call(Request::Crypt {
+            astation_id: astation_id.into(),
+            ops,
+        })? {
+            Reply::Crypted { results } if results.len() == count => Ok(results),
+            Reply::Crypted { .. } => {
+                bail!("the key agent answered a different number of operations")
+            }
+            _ => unexpected(),
+        }
+    }
+
+    /// The current kid held for `astation_id`'s account.
+    fn held_kid(&self, astation_id: &str) -> Result<Option<String>> {
+        match self.call(Request::HeldKid {
+            astation_id: astation_id.into(),
+        })? {
+            Reply::HeldKid { kid } => Ok(kid),
+            _ => unexpected(),
+        }
+    }
+
     /// Wipes the unlocked keys. (Not `lock`: `Mutex::lock` would shadow it.)
     fn lock_keys(&self) -> Result<()> {
         match self.call(Request::Lock)? {
@@ -1086,6 +1387,13 @@ impl KeyAgentApi for std::sync::Mutex<KeyAgent> {
         self.lock()
             .map_err(|_| anyhow!("the key agent's state is poisoned"))?
             .handle(request)
+    }
+}
+
+/// A shared agent (`EncryptionContext` holds an `Arc<dyn KeyAgentApi>`).
+impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T> {
+    fn call(&self, request: Request) -> Result<Reply> {
+        (**self).call(request)
     }
 }
 
@@ -1141,6 +1449,14 @@ pub(crate) fn error_of<T>(result: Result<T>) -> String {
         Ok(_) => panic!("expected an error"),
         Err(error) => format!("{error:#}"),
     }
+}
+
+/// Whether `agent` holds `K` for `astation_id`'s account: it can seal.
+#[cfg(test)]
+pub(crate) fn holds_k(agent: &dyn KeyAgentApi, astation_id: &str) -> bool {
+    agent
+        .crypt(astation_id, vec![CryptOp::seal("mem", "content", b"x")])
+        .is_ok()
 }
 
 /// The one in-process agent over `paths` that tests share.
@@ -1463,12 +1779,8 @@ mod tests {
         (challenge, request)
     }
 
-    /// A whole unlock against `server`.
-    fn unlock(agent: &Mutex<KeyAgent>, server: &FakeKeyServer, paths: &KeyPaths) -> Result<String> {
-        let (_, request) = request(agent, paths, 1_760_000_000);
-        let grant = server.grant_unlock(&request)?;
-        agent.finish_unlock(ASTATION_ID, &request.statement, &grant)
-    }
+    /// A whole unlock against `server`: the one helper every test shares.
+    use crate::memory::fake_astation::unlock_with as unlock;
 
     #[test]
     fn unlock_opens_the_sealed_keys() {
@@ -2064,11 +2376,13 @@ mod tests {
         // Unlocked by some other path while the request was out.
         agent.lock().unwrap().unlocked = Some(Unlocked {
             keys,
+            accounts: AccountKeys::default(),
             device_id: DEVICE_ID.into(),
             storage_kid: "0a1b2c3d".into(),
             storage_key: Zeroizing::new([9; 32]),
             escrowed: false,
             via_prev: false,
+            unsaved: false,
         });
         let message = error_of(agent.finish_unlock(ASTATION_ID, &signed.statement, &grant));
         assert!(message.contains("already unlocked"), "{message}");

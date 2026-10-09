@@ -198,10 +198,14 @@ impl DeviceKeys {
             account_keys,
         } = serde_json::from_slice(plain).context("sealed device keys are unreadable")?;
         let (device, device_sign) = (Zeroizing::new(device), Zeroizing::new(device_sign));
-        if version != 1 && version != 2 {
-            bail!("unsupported sealed device keys version {version}");
-        }
-        let accounts = AccountKeys::from_wire(account_keys)?;
+        // Strict: version 1 (step 2a) never carries account keys, version 2
+        // always does, so neither can be mistaken for the other.
+        let accounts = match (version, account_keys) {
+            (1, None) => AccountKeys::default(),
+            (2, Some(wire)) if !wire.is_empty() => AccountKeys::from_wire(wire)?,
+            (1 | 2, _) => bail!("sealed device keys version {version} has the wrong account keys"),
+            _ => bail!("unsupported sealed device keys version {version}"),
+        };
         Ok((
             Self {
                 device: StaticSecret::from(*decode32(&device, "device key")?),
@@ -275,7 +279,7 @@ struct SealedPlain {
     device: String,
     device_sign: String,
     #[serde(default)]
-    account_keys: AccountKeysWire,
+    account_keys: Option<AccountKeysWire>,
 }
 
 /// Signs `statement` with an Ed25519 key; carried like Astation's statements.
@@ -402,6 +406,42 @@ mod tests {
         let (_, held) =
             DeviceKeys::from_sealed_plaintext_with(&none, keys.unlock_auth_key()).unwrap();
         assert!(held.is_empty());
+    }
+
+    #[test]
+    fn the_sealed_payload_version_and_account_keys_must_agree() {
+        use crate::memory::account_keys::AccountKeys;
+        let keys = DeviceKeys::generate();
+        let mut accounts = AccountKeys::default();
+        accounts.install("acct", "0123abcd", Zeroizing::new([1; 32]));
+        let with = keys.sealed_plaintext_with(&accounts).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&with).unwrap();
+        let ring = json["account_keys"].clone();
+        let opens = |json: &serde_json::Value| {
+            DeviceKeys::from_sealed_plaintext_with(
+                &serde_json::to_vec(json).unwrap(),
+                keys.unlock_auth_key(),
+            )
+        };
+        assert!(opens(&json).is_ok());
+        // Version 1 never carries account keys, not even an empty map.
+        json["version"] = 1.into();
+        assert!(opens(&json).is_err());
+        json["account_keys"] = serde_json::json!({});
+        assert!(opens(&json).is_err());
+        // Version 2 always carries some.
+        json["version"] = 2.into();
+        assert!(opens(&json).is_err());
+        json.as_object_mut().unwrap().remove("account_keys");
+        assert!(opens(&json).is_err());
+        // Any other version is refused.
+        for version in [0, 3, 255] {
+            json["version"] = version.into();
+            assert!(opens(&json).is_err(), "version {version}");
+            json["account_keys"] = ring.clone();
+            assert!(opens(&json).is_err(), "version {version} with keys");
+            json.as_object_mut().unwrap().remove("account_keys");
+        }
     }
 
     #[test]
