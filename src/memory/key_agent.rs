@@ -403,24 +403,22 @@ impl KeyAgent {
             bail!("this device's keys are already unlocked");
         }
         let trust = self.home(astation_id)?;
-        // Stop at the first readable file; a damaged spare must not matter.
-        let mut sealed = None;
-        let mut first_error = None;
-        for path in [
-            &self.paths.device_keys_sealed,
-            &self.paths.device_keys_next,
-            &self.paths.device_keys_prev,
-        ] {
+        // The current file decides: only when it is absent (between a
+        // promotion's renames) may a spare be named. Any error reading it
+        // fails closed, so a transient error can't make a request name a
+        // stale .next kid. A damaged spare doesn't matter if a later one reads.
+        let mut sealed = SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)?;
+        let mut spare_error = None;
+        for path in [&self.paths.device_keys_next, &self.paths.device_keys_prev] {
+            if sealed.is_some() {
+                break;
+            }
             match SealedDeviceKeys::load_from(path) {
-                Ok(Some(file)) => {
-                    sealed = Some(file);
-                    break;
-                }
-                Ok(None) => {}
-                Err(error) => first_error = first_error.or(Some(error)),
+                Ok(file) => sealed = file,
+                Err(error) => spare_error = spare_error.or(Some(error)),
             }
         }
-        let sealed = match (sealed, first_error) {
+        let sealed = match (sealed, spare_error) {
             (Some(file), _) => file,
             (None, Some(error)) => return Err(error),
             (None, None) => {
@@ -2262,5 +2260,20 @@ mod tests {
             agent.status().unwrap().storage_kid.as_deref(),
             Some("4e5f6a7b")
         );
+    }
+
+    #[test]
+    fn an_unreadable_current_file_fails_the_unlock_instead_of_naming_a_spare() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "4e5f6a7b", &new_storage_key())
+            .unwrap()
+            .save_to(&paths.device_keys_next)
+            .unwrap();
+        std::fs::write(&paths.device_keys_sealed, b"not json").unwrap();
+        let agent = agent(&paths);
+        let message = error_of(agent.begin_unlock(ASTATION_ID));
+        assert!(message.contains("unreadable"), "{message}");
+        assert!(agent.lock().unwrap().pending_unlock.is_none());
     }
 }
