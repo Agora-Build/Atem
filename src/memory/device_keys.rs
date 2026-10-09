@@ -59,6 +59,14 @@ impl PublicKeys for DeviceKeys {
     }
 }
 
+/// The device key, device signing key and unlock-auth key secrets, wiped
+/// when dropped.
+pub(crate) type SecretParts = (
+    Zeroizing<[u8; 32]>,
+    Zeroizing<[u8; 32]>,
+    Zeroizing<[u8; 32]>,
+);
+
 #[derive(Deserialize)]
 struct StoredDeviceKeys {
     version: u8,
@@ -140,13 +148,7 @@ impl DeviceKeys {
     }
 
     /// The three secrets, for handing unlocked keys to the key agent.
-    pub(crate) fn secret_parts(
-        &self,
-    ) -> (
-        Zeroizing<[u8; 32]>,
-        Zeroizing<[u8; 32]>,
-        Zeroizing<[u8; 32]>,
-    ) {
+    pub(crate) fn secret_parts(&self) -> SecretParts {
         (
             Zeroizing::new(self.device.to_bytes()),
             Zeroizing::new(self.device_sign.to_bytes()),

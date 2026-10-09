@@ -38,6 +38,10 @@ pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, devic
 /// Fields that carry secrets are `Zeroizing`.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one short-lived request per call; boxing the grant would only add an allocation"
+)]
 pub enum Request {
     Status,
     PublicKeys,
@@ -586,7 +590,9 @@ impl KeyAgent {
 
     fn begin_rotation(&mut self, astation_id: &str) -> Result<Reply> {
         if self.pending_rotation.is_some() {
-            bail!("a storage-key rotation is already in progress; lock the agent to abandon it");
+            bail!(
+                "a storage-key rotation is already in progress; `atem cred unlock` resends it to Astation"
+            );
         }
         let unlocked = self.unlocked.as_ref().ok_or_else(|| anyhow!(LOCKED))?;
         let trust = self.home(astation_id)?;
@@ -600,7 +606,7 @@ impl KeyAgent {
         // Astation may have stored its key: that pending key must be abandoned first.
         if let Some(stale) = SealedDeviceKeys::load_from(&self.paths.device_keys_next)? {
             bail!(
-                "an interrupted rotation to storage key {} may be pending at Astation; abandon it first",
+                "device_keys.sealed.next (storage key {}) is left from an interrupted rotation that Astation may hold as pending; `atem cred unlock` abandons that key with Astation, then rotates",
                 stale.storage_kid
             );
         }
@@ -2088,7 +2094,15 @@ mod tests {
         unlock(&agent, &server, &paths).unwrap();
         agent.begin_rotation(ASTATION_ID).unwrap();
         let next = std::fs::read(&paths.device_keys_next).unwrap();
-        assert!(error_of(agent.begin_rotation(ASTATION_ID)).contains("in progress"));
+        let message = error_of(agent.begin_rotation(ASTATION_ID));
+        assert!(
+            message.contains("in progress") && message.contains("atem cred unlock"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("lock the agent"),
+            "locking strands nothing it needs: {message}"
+        );
         assert_eq!(std::fs::read(&paths.device_keys_next).unwrap(), next);
     }
 
@@ -2237,7 +2251,9 @@ mod tests {
         let (paths, mut server, _, agent, stale) = device_with_a_stale_rotation(dir.path());
         let message = error_of(agent.begin_rotation(ASTATION_ID));
         assert!(
-            message.contains("abandon") && message.contains(&stale),
+            message.contains("abandon")
+                && message.contains(&stale)
+                && message.contains("atem cred unlock"),
             "{message}"
         );
         assert!(

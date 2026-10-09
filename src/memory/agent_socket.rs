@@ -264,7 +264,7 @@ pub(crate) fn decode_response(line: &str) -> Result<Reply> {
         serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
     if head.v != PROTOCOL_VERSION {
         bail!(
-            "the running key agent speaks protocol v{}, this atem speaks v{PROTOCOL_VERSION}; stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry",
+            "the running key agent speaks protocol v{}, this atem speaks v{PROTOCOL_VERSION}; check `atem cred status` first (a storage key not yet held by Astation needs `atem cred unlock` from the atem that started the agent), then stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry",
             head.v
         );
     }
@@ -680,7 +680,8 @@ pub struct KeyAgentClient {
 
 impl KeyAgentClient {
     /// A client for the agent at `socket` that never starts one.
-    pub fn at(socket: PathBuf) -> Self {
+    #[cfg(test)]
+    pub(crate) fn at(socket: PathBuf) -> Self {
         Self {
             socket,
             record: None,
@@ -934,7 +935,13 @@ mod tests {
     #[test]
     fn a_newer_cli_gets_a_clear_error_from_an_older_agent() {
         let newer_agent = decode_response(r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#);
-        assert!(format!("{:#}", newer_agent.err().unwrap()).contains("pkill"));
+        let hint = format!("{:#}", newer_agent.err().unwrap());
+        // Check first that Astation holds the storage key, then stop it.
+        let (status, pkill) = (
+            hint.find("atem cred status").expect(&hint),
+            hint.find("pkill").expect(&hint),
+        );
+        assert!(status < pkill, "{hint}");
         let refused = decode_response(
             r#"{"v":1,"ok":false,"error":"unsupported key agent protocol version 2"}"#,
         );

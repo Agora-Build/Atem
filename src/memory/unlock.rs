@@ -567,10 +567,15 @@ pub fn status_report(
             status.storage_kid.clone(),
             !status.escrowed,
         ),
+        // A locked agent vouches for nothing: cred_state.json decides, as
+        // when the agent isn't running.
         AgentState::Running(status) => (
             "locked (run 'atem cred unlock')".to_string(),
             status.storage_kid.clone(),
-            false,
+            status
+                .storage_kid
+                .as_deref()
+                .is_some_and(|kid| trust.escrowed_kid() != Some(kid)),
         ),
     };
     let storage_line = match (storage_kid, waiting) {
@@ -1306,9 +1311,23 @@ mod tests {
             storage_kid: Some("0a1b2c3d".into()),
             escrowed: false,
         });
+        let report = status_report(&trust, ASTATION_ID, &locked, None, None);
         assert!(
-            status_report(&trust, ASTATION_ID, &locked, None, None)
-                .contains("Key agent: locked (run 'atem cred unlock')")
+            report.contains("Key agent: locked (run 'atem cred unlock')"),
+            "{report}"
+        );
+        assert!(report.contains("Storage key: 0a1b2c3d\n"), "{report}");
+        // A locked agent's sealed file under a key Astation never confirmed
+        // is flagged, as when the agent isn't running.
+        let unconfirmed = AgentState::Running(AgentStatus {
+            unlocked: false,
+            storage_kid: Some("9a9b9c9d".into()),
+            escrowed: false,
+        });
+        let report = status_report(&trust, ASTATION_ID, &unconfirmed, None, None);
+        assert!(
+            report.contains("Storage key: 9a9b9c9d  (not yet held by Astation"),
+            "{report}"
         );
         let broken = AgentState::Unreachable("protocol v2".into());
         assert!(
