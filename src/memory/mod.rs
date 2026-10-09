@@ -21,6 +21,7 @@ pub mod trust;
 pub mod grant;
 pub mod storage_key;
 pub mod key_agent;
+pub mod unlock;
 #[cfg(unix)]
 pub mod agent_socket;
 

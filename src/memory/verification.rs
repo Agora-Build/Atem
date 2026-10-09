@@ -473,13 +473,27 @@ pub fn complete_verification(
         staged.save_to(&paths.trust)
     };
     if let Err(error) = write() {
-        if sealed.is_some() {
+        if let (Some((written, unlock_auth)), VerificationKeys::Fresh(fresh)) = (&sealed, &keys) {
             // Undo the fresh keys entirely: no sealed file without its
             // verification, and no agent holding keys that aren't on disk.
+            // Only files this call wrote go: a concurrent pairing run's stay.
             // With the files gone the agent accepts the lock.
-            let _ = remove_if_exists(&paths.device_keys_sealed);
-            let _ = remove_if_exists(&paths.unlock_auth_key);
-            let _ = agent.lock_keys();
+            if SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .is_ok_and(|file| file.is_some_and(|file| file.storage_kid == written.storage_kid))
+            {
+                let _ = remove_if_exists(&paths.device_keys_sealed);
+            }
+            if UnlockAuthKey::load_from(&paths.unlock_auth_key)
+                .is_ok_and(|file| file.is_some_and(|file| file.public() == unlock_auth.public()))
+            {
+                let _ = remove_if_exists(&paths.unlock_auth_key);
+            }
+            if agent
+                .public_keys()
+                .is_ok_and(|held| held == (fresh.device_pub(), fresh.device_sign_pub()))
+            {
+                let _ = agent.lock_keys();
+            }
         }
         return Err(error);
     }
@@ -1777,5 +1791,80 @@ mod ceremony_tests {
             apply_grant(&paths, &raced, ASTATION_ID, Some(&grant)).unwrap(),
             Applied::Locked
         ));
+    }
+
+    /// Forwards to `agent`. Right after the keys are loaded, a concurrent
+    /// pairing run writes its own key files, and this run's write of the
+    /// sealed file fails.
+    struct RacedByAnotherRun {
+        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        paths: KeyPaths,
+        other: DeviceKeys,
+    }
+
+    impl KeyAgentApi for RacedByAnotherRun {
+        fn call(
+            &self,
+            request: crate::memory::key_agent::Request,
+        ) -> Result<crate::memory::key_agent::Reply> {
+            let load = matches!(request, crate::memory::key_agent::Request::LoadUnlocked { .. });
+            let reply = self.agent.call(request)?;
+            if load {
+                SealedDeviceKeys::seal(&self.other, "dev-1", "7a7b7c7d", &new_storage_key())
+                    .unwrap()
+                    .save_to(&self.paths.device_keys_sealed)
+                    .unwrap();
+                self.other
+                    .unlock_auth_key()
+                    .save_to(&self.paths.unlock_auth_key)
+                    .unwrap();
+                // device_keys.sealed is written through device_keys.tmp.
+                let blocker = self.paths.device_keys_sealed.with_extension("tmp");
+                std::fs::create_dir_all(blocker.join("x")).unwrap();
+            }
+            Ok(reply)
+        }
+    }
+
+    #[test]
+    fn a_failed_fresh_write_leaves_another_runs_key_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let other = DeviceKeys::generate();
+        let other_unlock_auth = other.unlock_auth_pub();
+        let agent = RacedByAnotherRun {
+            agent: test_agent(&paths),
+            paths: paths.clone(),
+            other,
+        };
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
+        assert!(
+            complete_verification(
+                &paths,
+                &agent,
+                ASTATION_ID,
+                handshake.into_keys(),
+                &fake.sign(&certificate.encode()),
+                &state(&fake, EncryptionMode::Off, None, 2),
+                &[],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .expect("the other run's sealed file stays")
+                .storage_kid,
+            "7a7b7c7d"
+        );
+        assert_eq!(
+            UnlockAuthKey::load_from(&paths.unlock_auth_key)
+                .unwrap()
+                .expect("the other run's unlock_auth_key stays")
+                .public(),
+            other_unlock_auth
+        );
+        assert!(!agent.status().unwrap().unlocked, "this run's keys are dropped");
     }
 }

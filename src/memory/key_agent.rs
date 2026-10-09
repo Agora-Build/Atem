@@ -77,6 +77,9 @@ pub enum Request {
     BeginRotation {
         astation_id: String,
     },
+    /// The rotation in progress (phase 1 done, not yet confirmed), unchanged,
+    /// so the CLI can resend it: Astation accepts an identical resend.
+    PendingRotation,
     /// Rotation phase 3, after Astation's signed acknowledgement.
     ConfirmRotation {
         astation_id: String,
@@ -121,6 +124,9 @@ pub enum Reply {
     },
     Rotation {
         rotation: StorageRotation,
+    },
+    PendingRotation {
+        rotation: Option<StorageRotation>,
     },
     Confirmed {
         storage_kid: String,
@@ -168,6 +174,8 @@ struct PendingRotation {
     storage_key: StorageKey,
     /// The first escrow of the current key: nothing to rename.
     initial: bool,
+    /// What phase 1 returned, for an identical resend.
+    wire: StorageRotation,
 }
 
 /// What the CLI needs to build and sign an unlock request.
@@ -286,6 +294,12 @@ impl KeyAgent {
                 grant,
             } => self.finish_unlock(&astation_id, &request, &grant),
             Request::BeginRotation { astation_id } => self.begin_rotation(&astation_id),
+            Request::PendingRotation => Ok(Reply::PendingRotation {
+                rotation: self
+                    .pending_rotation
+                    .as_ref()
+                    .map(|pending| pending.wire.clone()),
+            }),
             Request::ConfirmRotation { astation_id, ack } => {
                 self.confirm_rotation(&astation_id, &ack)
             }
@@ -362,6 +376,10 @@ impl KeyAgent {
         storage_kid: String,
         storage_key: &str,
     ) -> Result<Reply> {
+        // A concurrent pairing run must not replace keys another one loaded.
+        if self.unlocked.is_some() {
+            bail!("the key agent already holds keys; run `atem cred lock` first");
+        }
         if !crate::memory::crypto::valid_kid(&storage_kid) {
             bail!("storage key id must be 8 lowercase hex characters");
         }
@@ -655,19 +673,18 @@ impl KeyAgent {
             sealed_hash: sealed_hash(&encapped, &ciphertext),
         }
         .encode();
-        let rotate = unlocked.keys.sign_statement(&statement);
+        let rotation = StorageRotation {
+            rotate: unlocked.keys.sign_statement(&statement),
+            encapped_key: STANDARD.encode(encapped),
+            ciphertext: STANDARD.encode(ciphertext),
+        };
         self.pending_rotation = Some(PendingRotation {
             storage_kid: new_kid,
             storage_key: new_key,
             initial,
+            wire: rotation.clone(),
         });
-        Ok(Reply::Rotation {
-            rotation: StorageRotation {
-                rotate,
-                encapped_key: STANDARD.encode(encapped),
-                ciphertext: STANDARD.encode(ciphertext),
-            },
-        })
+        Ok(Reply::Rotation { rotation })
     }
 
     fn confirm_rotation(&mut self, astation_id: &str, ack: &SignedWire) -> Result<Reply> {
@@ -972,6 +989,14 @@ pub trait KeyAgentApi: Send + Sync {
         }
     }
 
+    /// The rotation in progress, to resend unchanged; `None` when there is none.
+    fn pending_rotation(&self) -> Result<Option<StorageRotation>> {
+        match self.call(Request::PendingRotation)? {
+            Reply::PendingRotation { rotation } => Ok(rotation),
+            _ => unexpected(),
+        }
+    }
+
     /// The signed abandon for a pending key id (see `KeyAgent::abandon_pending`).
     fn abandon_pending(&self, astation_id: &str, storage_kid: &str) -> Result<SignedWire> {
         match self.call(Request::AbandonPending {
@@ -1189,6 +1214,28 @@ mod tests {
         agent.lock_keys().unwrap();
         assert!(!agent.status().unwrap().unlocked);
         assert!(error_of(agent.open_grant(ASTATION_ID, &grant, None)).contains("locked"));
+    }
+
+    #[test]
+    fn loading_keys_is_refused_while_the_agent_already_holds_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        agent
+            .load_unlocked(DEVICE_ID, &keys, "1a2b3c4d", &[9; 32])
+            .unwrap();
+        // A second pairing run with other fresh keys must not replace them.
+        let other = DeviceKeys::generate();
+        let error = error_of(agent.load_unlocked(DEVICE_ID, &other, "2a3b4c5d", &[8; 32]));
+        assert!(error.contains("atem cred lock"), "{error}");
+        assert_eq!(
+            agent.public_keys().unwrap(),
+            (keys.device_pub(), keys.device_sign_pub())
+        );
+        assert_eq!(
+            agent.status().unwrap().storage_kid.as_deref(),
+            Some("1a2b3c4d")
+        );
     }
 
     #[test]
@@ -1753,6 +1800,25 @@ mod tests {
         assert!(current.open(&Zeroizing::new(old_key), unlock_auth).is_err());
         agent.lock_keys().unwrap();
         assert_eq!(unlock(&agent, &server, &paths).unwrap(), kid);
+    }
+
+    #[test]
+    fn the_pending_rotation_is_returned_unchanged_for_a_resend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        assert_eq!(agent.pending_rotation().unwrap(), None);
+        unlock(&agent, &server, &paths).unwrap();
+        assert_eq!(agent.pending_rotation().unwrap(), None);
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        // The same payload every time: Astation accepts an identical resend.
+        assert_eq!(agent.pending_rotation().unwrap(), Some(rotation.clone()));
+        assert_eq!(agent.pending_rotation().unwrap(), Some(rotation.clone()));
+        server.accept_rotation(&rotation).unwrap();
+        let resent = agent.pending_rotation().unwrap().unwrap();
+        let ack = server.accept_rotation(&resent).unwrap();
+        agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert_eq!(agent.pending_rotation().unwrap(), None);
     }
 
     #[test]

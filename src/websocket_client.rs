@@ -304,6 +304,50 @@ pub enum AstationMessage {
     #[serde(rename = "verifyAbort")]
     VerifyAbort { reason: String },
 
+    /// Atem → Astation: an `atem-unlock-request-v1` statement (base64) and
+    /// its Ed25519 signature by this device's unlock-auth key.
+    #[serde(rename = "unlockRequest")]
+    UnlockRequest { request: String, signature: String },
+
+    /// Astation → Atem: after Touch ID, the storage key sealed to the
+    /// request's `e_pub`, with a signed `atem-unlock-grant-v1`.
+    #[serde(rename = "unlockGrant")]
+    UnlockGrant { grant: crate::memory::statements::SignedWire, encapped_key: String, ciphertext: String },
+
+    /// Astation → Atem: the unlock was denied.
+    #[serde(rename = "unlockDenied")]
+    UnlockDenied { reason: String },
+
+    /// Atem → Astation: a storage key sealed to Astation's encryption key,
+    /// with a device-signed `atem-storage-rotate-v1`.
+    #[serde(rename = "storageKeyRotate")]
+    StorageKeyRotate { rotate: crate::memory::statements::SignedWire, encapped_key: String, ciphertext: String },
+
+    /// Astation → Atem: the storage key is stored as pending (`atem-storage-ack-v1`).
+    #[serde(rename = "storageKeyAck")]
+    StorageKeyAck { ack: crate::memory::statements::SignedWire },
+
+    /// Astation → Atem: the rotate was refused. `pending_kid` names the
+    /// pending key Astation is committed to when that is the reason; the
+    /// device may give it up with `storageKeyAbandon` and send the rotate again.
+    #[serde(rename = "storageKeyRejected")]
+    StorageKeyRejected {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_kid: Option<String>,
+    },
+
+    /// Atem → Astation: this device switched to the new storage key
+    /// (device-signed `atem-storage-confirm-v1`); Astation drops the old one.
+    #[serde(rename = "storageKeyConfirm")]
+    StorageKeyConfirm { confirm: crate::memory::statements::SignedWire },
+
+    /// Atem → Astation: a device-signed `atem-storage-abandon-v1`; Astation
+    /// drops its pending key only if it is exactly the one named (the kid
+    /// stays acked, so it is never reused). A replay is a no-op.
+    #[serde(rename = "storageKeyAbandon")]
+    StorageKeyAbandon { abandon: crate::memory::statements::SignedWire },
+
     #[serde(rename = "encryptionMigrationComplete")]
     EncryptionMigrationComplete { mode: String, kid: String },
 
@@ -3142,6 +3186,55 @@ mod tests {
         let message = AstationMessage::VerifyCommit { device_id: "d".into(), commitment: "c".into() };
         let json = serde_json::to_string(&message).unwrap();
         assert_eq!(json, r#"{"type":"verifyCommit","data":{"device_id":"d","commitment":"c"}}"#);
+    }
+
+    #[test]
+    fn unlock_and_storage_messages_round_trip() {
+        use crate::memory::statements::SignedWire;
+        let signed = SignedWire { statement: "s".into(), signature: "g".into() };
+        let messages = vec![
+            (
+                AstationMessage::UnlockRequest { request: "r".into(), signature: "g".into() },
+                r#"{"type":"unlockRequest","data":{"request":"r","signature":"g"}}"#,
+            ),
+            (
+                AstationMessage::UnlockGrant { grant: signed.clone(), encapped_key: "e".into(), ciphertext: "c".into() },
+                r#"{"type":"unlockGrant","data":{"grant":{"statement":"s","signature":"g"},"encapped_key":"e","ciphertext":"c"}}"#,
+            ),
+            (
+                AstationMessage::UnlockDenied { reason: "no".into() },
+                r#"{"type":"unlockDenied","data":{"reason":"no"}}"#,
+            ),
+            (
+                AstationMessage::StorageKeyRotate { rotate: signed.clone(), encapped_key: "e".into(), ciphertext: "c".into() },
+                r#"{"type":"storageKeyRotate","data":{"rotate":{"statement":"s","signature":"g"},"encapped_key":"e","ciphertext":"c"}}"#,
+            ),
+            (
+                AstationMessage::StorageKeyAck { ack: signed.clone() },
+                r#"{"type":"storageKeyAck","data":{"ack":{"statement":"s","signature":"g"}}}"#,
+            ),
+            (
+                AstationMessage::StorageKeyRejected { reason: "pending".into(), pending_kid: Some("4e5f6a7b".into()) },
+                r#"{"type":"storageKeyRejected","data":{"reason":"pending","pending_kid":"4e5f6a7b"}}"#,
+            ),
+            (
+                AstationMessage::StorageKeyRejected { reason: "bad".into(), pending_kid: None },
+                r#"{"type":"storageKeyRejected","data":{"reason":"bad"}}"#,
+            ),
+            (
+                AstationMessage::StorageKeyConfirm { confirm: signed.clone() },
+                r#"{"type":"storageKeyConfirm","data":{"confirm":{"statement":"s","signature":"g"}}}"#,
+            ),
+            (
+                AstationMessage::StorageKeyAbandon { abandon: signed },
+                r#"{"type":"storageKeyAbandon","data":{"abandon":{"statement":"s","signature":"g"}}}"#,
+            ),
+        ];
+        for (message, json) in messages {
+            assert_eq!(serde_json::to_string(&message).unwrap(), json);
+            let parsed: AstationMessage = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
     }
 
     // --- atem_id shape + charset + uniqueness ---

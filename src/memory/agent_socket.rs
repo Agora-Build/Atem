@@ -947,6 +947,7 @@ mod tests {
             error_of(client.abandon_pending("a", "abcd1234")),
             error_of(local.abandon_pending("a", "abcd1234"))
         );
+        assert_eq!(client.pending_rotation().unwrap(), None);
         // None of them was rejected for its shape.
         let shape = error_of(client.begin_rotation("a"));
         assert!(
@@ -971,6 +972,7 @@ mod tests {
             Request::BeginRotation {
                 astation_id: "a".into(),
             },
+            Request::PendingRotation,
             Request::ConfirmRotation {
                 astation_id: "a".into(),
                 ack: signed,
