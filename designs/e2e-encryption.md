@@ -1350,6 +1350,13 @@ If this device's keys can't be unlocked (the sealed file or
 > device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and
 > cred_state.json, then run `atem pair`.
 
+An Astation rolled back or restored from a backup to an older storage key
+counts as having lost it: the storage key rotates at every unlock, so the
+restored key only opens a sealed file this device has since replaced (and
+deleted once an unlock proved Astation held the newer key). Astation can't
+release the kid the device asks for and answers `unlockDenied`; start over
+as above.
+
 `atem pair` then verifies the device again with fresh keys. Astation keys
 storage keys by `(device_id, device_pub)`, so the new keys start a fresh
 escrow (empty old kid) and nothing held for the old keys is released.
