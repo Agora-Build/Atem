@@ -158,6 +158,18 @@ impl FakeKeyServer {
         if rotate.account != ACCOUNT || rotate.device_id != DEVICE_ID {
             bail!("rotation for another account or device");
         }
+        if !crate::memory::crypto::valid_kid(&rotate.new_storage_kid) {
+            bail!("rotation has an invalid new storage key id");
+        }
+        if rotate.new_storage_kid == rotate.old_storage_kid {
+            bail!("rotation to the same storage key id");
+        }
+        if self.storage_keys.contains_key(&rotate.new_storage_kid) {
+            bail!(
+                "Astation already holds storage key {}",
+                rotate.new_storage_kid
+            );
+        }
         if rotate.old_storage_kid.is_empty() {
             if !self.storage_keys.is_empty() {
                 bail!("first-sealing rotation, but Astation already holds a storage key");
@@ -268,5 +280,28 @@ mod tests {
         server
             .accept_rotation(&rotation(&server, &keys, "", "4e5f6a7b"))
             .unwrap();
+    }
+
+    #[test]
+    fn rotation_rejects_a_bad_new_kid_an_unchanged_kid_or_a_held_kid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        for (old, new, expected) in [
+            ("0a1b2c3d", "NOPE", "invalid"),
+            ("0a1b2c3d", "0a1b2c3d", "same"),
+        ] {
+            let error = server
+                .accept_rotation(&rotation(&server, &keys, old, new))
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{new}: {error}");
+            assert!(server.pending.is_none());
+        }
+        // A kid Astation already holds (here: a second one it keeps).
+        server.storage_keys.insert("4e5f6a7b".into(), [3; 32]);
+        let error = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap_err();
+        assert!(error.to_string().contains("already holds"), "{error}");
+        assert!(server.pending.is_none());
     }
 }

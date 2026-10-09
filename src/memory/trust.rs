@@ -41,6 +41,10 @@ pub struct TrustStore {
     /// one. Unlock and storage-key rotation go only through it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     home_astation: Option<String>,
+    /// The storage key id Astation confirmed holding at the first escrow. Lets
+    /// a restart tell an escrowed sealed file from a freshly migrated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    escrowed_storage_kid: Option<String>,
     #[serde(default)]
     astations: HashMap<String, AstationTrust>,
     #[serde(default)]
@@ -103,6 +107,14 @@ impl TrustStore {
         if self.home_astation.is_none() {
             self.home_astation = Some(astation_id.into());
         }
+    }
+
+    pub fn escrowed_kid(&self) -> Option<&str> {
+        self.escrowed_storage_kid.as_deref()
+    }
+
+    pub fn set_escrowed_kid(&mut self, storage_kid: &str) {
+        self.escrowed_storage_kid = Some(storage_kid.into());
     }
 
     /// The home Astation, or, for a step-1 store whose home was never set,

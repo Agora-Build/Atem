@@ -11,13 +11,16 @@ use zeroize::Zeroizing;
 
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::encoding::dec;
-use crate::memory::grant::{GrantWire, OpenedGrant, hpke_open, open_grant as open_sealed_grant};
+use crate::memory::grant::{
+    GrantWire, OpenedGrant, hpke_open, hpke_seal, open_grant as open_sealed_grant,
+};
 use crate::memory::statements::{
-    SignedWire, UnlockGrant, UnlockRequest, sealed_hash, unlock_info, unlock_request_hash,
-    verify_astation,
+    SignedWire, StorageAck, StorageConfirm, StorageRotate, UnlockGrant, UnlockRequest, sealed_hash,
+    storage_key_info, unlock_info, unlock_request_hash, verify_astation,
 };
 use crate::memory::storage_key::{
-    SealedDeviceKeys, StorageKey, UnlockGrantWire, new_storage_key, new_storage_kid, promote_next,
+    SealedDeviceKeys, StorageKey, StorageRotation, UnlockGrantWire, new_storage_key,
+    new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
 use crate::memory::verification::KeyPaths;
@@ -67,6 +70,15 @@ pub enum Request {
         request: String,
         grant: UnlockGrantWire,
     },
+    /// Rotation phase 1: a new storage key for the home Astation.
+    BeginRotation {
+        astation_id: String,
+    },
+    /// Rotation phase 3, after Astation's signed acknowledgement.
+    ConfirmRotation {
+        astation_id: String,
+        ack: SignedWire,
+    },
     Lock,
 }
 
@@ -98,6 +110,13 @@ pub enum Reply {
     Unlocked {
         storage_kid: String,
     },
+    Rotation {
+        rotation: StorageRotation,
+    },
+    Confirmed {
+        storage_kid: String,
+        confirm: SignedWire,
+    },
     Done,
 }
 
@@ -112,10 +131,8 @@ pub struct AgentStatus {
 
 struct Unlocked {
     keys: DeviceKeys,
-    #[allow(dead_code)] // used by rotation (Task 6)
     device_id: String,
     storage_kid: String,
-    #[allow(dead_code)] // used by rotation (Task 6)
     storage_key: StorageKey,
     escrowed: bool,
 }
@@ -123,9 +140,19 @@ struct Unlocked {
 /// The single-use key of an unlock in progress. `StaticSecret` zeroizes on drop.
 struct PendingUnlock {
     astation_id: String,
+    /// The storage key the challenge named; the request must name the same.
+    storage_kid: String,
     e_secret: StaticSecret,
     e_pub: [u8; 32],
     nonce: [u8; 32],
+}
+
+/// A storage key sent to Astation and not yet acknowledged.
+struct PendingRotation {
+    storage_kid: String,
+    storage_key: StorageKey,
+    /// The first escrow of the current key: nothing to rename.
+    initial: bool,
 }
 
 /// What the CLI needs to build and sign an unlock request.
@@ -164,6 +191,7 @@ pub struct KeyAgent {
     paths: KeyPaths,
     unlocked: Option<Unlocked>,
     pending_unlock: Option<PendingUnlock>,
+    pending_rotation: Option<PendingRotation>,
 }
 
 /// Opens a sealed device-keys file only when its header names the device and
@@ -197,6 +225,7 @@ impl KeyAgent {
             paths,
             unlocked: None,
             pending_unlock: None,
+            pending_rotation: None,
         };
         if let Err(error) = agent.migrate_plain_keys() {
             eprintln!("key agent: {error:#}");
@@ -241,6 +270,10 @@ impl KeyAgent {
                 request,
                 grant,
             } => self.finish_unlock(&astation_id, &request, &grant),
+            Request::BeginRotation { astation_id } => self.begin_rotation(&astation_id),
+            Request::ConfirmRotation { astation_id, ack } => {
+                self.confirm_rotation(&astation_id, &ack)
+            }
             Request::Lock => {
                 self.wipe();
                 Ok(Reply::Done)
@@ -252,6 +285,7 @@ impl KeyAgent {
     fn wipe(&mut self) {
         self.unlocked = None;
         self.pending_unlock = None;
+        self.pending_rotation = None;
     }
 
     fn unlocked(&self) -> Result<&Unlocked> {
@@ -294,6 +328,8 @@ impl KeyAgent {
             *decode32(unlock_auth, "unlock-auth key")?,
         );
         let storage_key = decode32(storage_key, "storage key")?;
+        self.pending_unlock = None;
+        self.pending_rotation = None;
         self.unlocked = Some(Unlocked {
             keys,
             device_id,
@@ -361,6 +397,7 @@ impl KeyAgent {
         OsRng.fill_bytes(&mut nonce);
         self.pending_unlock = Some(PendingUnlock {
             astation_id: astation_id.into(),
+            storage_kid: sealed.storage_kid.clone(),
             e_secret,
             e_pub,
             nonce,
@@ -385,6 +422,9 @@ impl KeyAgent {
             .pending_unlock
             .take()
             .ok_or_else(|| anyhow!("no unlock is in progress; run `atem cred unlock` again"))?;
+        if self.unlocked.is_some() {
+            bail!("this device's keys are already unlocked");
+        }
         if pending.astation_id != astation_id {
             bail!("the unlock reply came from a different Astation");
         }
@@ -395,6 +435,9 @@ impl KeyAgent {
         let sent = UnlockRequest::parse(&dec(&request_bytes)?)?;
         if sent.e_pub != pending.e_pub || sent.nonce != pending.nonce {
             bail!("the unlock reply answers a different request");
+        }
+        if sent.storage_kid != pending.storage_kid {
+            bail!("the unlock request names a different storage key than the challenge");
         }
         if sent.account != trust.data_account || sent.device_id != trust.device_id {
             bail!("the unlock request names another account or device");
@@ -479,6 +522,103 @@ impl KeyAgent {
         })
     }
 
+    fn begin_rotation(&mut self, astation_id: &str) -> Result<Reply> {
+        let unlocked = self.unlocked.as_ref().ok_or_else(|| anyhow!(LOCKED))?;
+        let trust = self.home(astation_id)?;
+        if unlocked.device_id != trust.device_id {
+            bail!("the unlocked keys belong to another device id");
+        }
+        let initial = !unlocked.escrowed;
+        let (old_kid, new_kid, new_key) = if initial {
+            (
+                String::new(),
+                unlocked.storage_kid.clone(),
+                unlocked.storage_key.clone(),
+            )
+        } else {
+            let mut kid = new_storage_kid();
+            while kid == unlocked.storage_kid {
+                kid = new_storage_kid();
+            }
+            let key = new_storage_key();
+            // Phase 1: the re-sealed file waits beside the current one.
+            SealedDeviceKeys::seal(&unlocked.keys, &unlocked.device_id, &kid, &key)?
+                .save_to(&self.paths.device_keys_next)?;
+            (unlocked.storage_kid.clone(), kid, key)
+        };
+        let enc_pub = decode32(&trust.astation_enc_pub, "Astation encryption key")?;
+        let (encapped, ciphertext) = hpke_seal(
+            &enc_pub,
+            &storage_key_info(&trust.data_account, &unlocked.device_id, &new_kid),
+            new_key.as_slice(),
+        )?;
+        let statement = StorageRotate {
+            account: trust.data_account.clone(),
+            device_id: unlocked.device_id.clone(),
+            old_storage_kid: old_kid,
+            new_storage_kid: new_kid.clone(),
+            sealed_hash: sealed_hash(&encapped, &ciphertext),
+        }
+        .encode();
+        let rotate = unlocked.keys.sign_statement(&statement);
+        self.pending_rotation = Some(PendingRotation {
+            storage_kid: new_kid,
+            storage_key: new_key,
+            initial,
+        });
+        Ok(Reply::Rotation {
+            rotation: StorageRotation {
+                rotate,
+                encapped_key: STANDARD.encode(encapped),
+                ciphertext: STANDARD.encode(ciphertext),
+            },
+        })
+    }
+
+    fn confirm_rotation(&mut self, astation_id: &str, ack: &SignedWire) -> Result<Reply> {
+        let trust = self.home(astation_id)?;
+        let pending = self
+            .pending_rotation
+            .take()
+            .ok_or_else(|| anyhow!("no storage-key rotation is in progress"))?;
+        let sign_pub = STANDARD.decode(&trust.astation_sign_pub)?;
+        let acked = StorageAck::parse(&verify_astation(&sign_pub, ack)?)?;
+        if acked.account != trust.data_account
+            || acked.sign_gen != trust.sign_gen
+            || acked.device_id != trust.device_id
+            || acked.storage_kid != pending.storage_kid
+        {
+            bail!("Astation's acknowledgement is for a different storage key");
+        }
+        let unlocked = self.unlocked.as_mut().ok_or_else(|| anyhow!(LOCKED))?;
+        if pending.initial {
+            // Astation holds the key now: record which one, then (and only
+            // then) drop the plain step-1 file.
+            let mut store = TrustStore::load_from(&self.paths.trust)?;
+            store.set_escrowed_kid(&pending.storage_kid);
+            store.save_to(&self.paths.trust)?;
+            remove_plain_keys(&self.paths)?;
+        } else {
+            // Phase 3: Astation holds the new key, so the new file becomes current.
+            promote_next(&self.paths.device_keys_next, &self.paths.device_keys_sealed)?;
+        }
+        let confirm = unlocked.keys.sign_statement(
+            &StorageConfirm {
+                account: trust.data_account,
+                device_id: trust.device_id,
+                storage_kid: pending.storage_kid.clone(),
+            }
+            .encode(),
+        );
+        unlocked.storage_kid = pending.storage_kid.clone();
+        unlocked.storage_key = pending.storage_key;
+        unlocked.escrowed = true;
+        Ok(Reply::Confirmed {
+            storage_kid: pending.storage_kid,
+            confirm,
+        })
+    }
+
     /// The sealed file the released key belongs to: the current one, or the
     /// `.next` a rotation left when it crashed after Astation stored the key.
     fn sealed_with_kid(&self, storage_kid: &str) -> Result<(SealedDeviceKeys, bool)> {
@@ -510,6 +650,15 @@ impl KeyAgent {
             return Ok(());
         };
         let mut trust = TrustStore::load_from(&self.paths.trust)?;
+        // A crash after the first escrow was recorded but before the plain
+        // file went: the sealed file is already escrowed, so just delete it.
+        if let Some(escrowed) = trust.escrowed_kid()
+            && let Some(sealed) = SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)?
+            && sealed.storage_kid == escrowed
+        {
+            remove_plain_keys(&self.paths)?;
+            return Ok(());
+        }
         let Some(home) = trust.home_or_first_verified() else {
             if trust.home_is_set() {
                 eprintln!(
@@ -550,6 +699,14 @@ impl KeyAgent {
             escrowed: false,
         });
         Ok(())
+    }
+}
+
+/// Deletes the plain step-1 `device_keys` file (absent is fine).
+fn remove_plain_keys(paths: &KeyPaths) -> Result<()> {
+    match std::fs::remove_file(&paths.device_keys) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
     }
 }
 
@@ -621,6 +778,33 @@ pub trait KeyAgentApi: Send + Sync {
             grant: grant.clone(),
         })? {
             Reply::Unlocked { storage_kid } => Ok(storage_kid),
+            _ => unexpected(),
+        }
+    }
+
+    fn begin_rotation(&self, astation_id: &str) -> Result<StorageRotation> {
+        match self.call(Request::BeginRotation {
+            astation_id: astation_id.into(),
+        })? {
+            Reply::Rotation { rotation } => Ok(rotation),
+            _ => unexpected(),
+        }
+    }
+
+    /// Returns the new storage key id and the signed confirmation to send.
+    fn confirm_rotation(
+        &self,
+        astation_id: &str,
+        ack: &SignedWire,
+    ) -> Result<(String, SignedWire)> {
+        match self.call(Request::ConfirmRotation {
+            astation_id: astation_id.into(),
+            ack: ack.clone(),
+        })? {
+            Reply::Confirmed {
+                storage_kid,
+                confirm,
+            } => Ok((storage_kid, confirm)),
             _ => unexpected(),
         }
     }
@@ -1196,6 +1380,351 @@ mod tests {
             .unwrap();
         let message = error_of(agent.finish_unlock(ASTATION_ID, &request.statement, &grant));
         assert!(message.contains("another device"), "{message}");
+        assert!(!agent.status().unwrap().unlocked);
+    }
+
+    use crate::memory::statements::{StorageAck, StorageRotate, verify_device};
+
+    #[test]
+    fn the_first_escrow_sends_the_current_storage_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        // As after a first verification: the agent has the key, Astation doesn't.
+        let storage_key = [9u8; 32];
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "0a1b2c3d", &storage_key)
+            .unwrap()
+            .save_to(&paths.device_keys_sealed)
+            .unwrap();
+        server.storage_keys.clear();
+        let agent = agent(&paths);
+        agent
+            .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &storage_key)
+            .unwrap();
+
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let statement = StorageRotate::parse(
+            &verify_device(&keys.device_sign_pub(), &rotation.rotate).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                statement.old_storage_kid.as_str(),
+                statement.new_storage_kid.as_str()
+            ),
+            ("", "0a1b2c3d")
+        );
+        assert!(
+            !paths.device_keys_next.exists(),
+            "the first escrow re-seals nothing"
+        );
+        let ack = server.accept_rotation(&rotation).unwrap();
+        assert_eq!(server.pending, Some(("0a1b2c3d".to_string(), storage_key)));
+        let (kid, confirm) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert_eq!(kid, "0a1b2c3d");
+        server.confirm(&confirm).unwrap();
+        assert!(agent.status().unwrap().escrowed);
+
+        agent.lock_keys().unwrap();
+        assert_eq!(unlock(&agent, &server, &paths).unwrap(), "0a1b2c3d");
+    }
+
+    #[test]
+    fn rotation_after_unlock_replaces_the_storage_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let old_key = server.storage_keys["0a1b2c3d"];
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let next = SealedDeviceKeys::load_from(&paths.device_keys_next)
+            .unwrap()
+            .expect("phase 1 writes .next");
+        assert_ne!(next.storage_kid, "0a1b2c3d");
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .unwrap()
+                .storage_kid,
+            "0a1b2c3d",
+            "the current file stays until Astation acks"
+        );
+        let ack = server.accept_rotation(&rotation).unwrap();
+        let (kid, confirm) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert_eq!(kid, next.storage_kid);
+        assert!(!paths.device_keys_next.exists());
+        let current = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.storage_kid, kid);
+        server.confirm(&confirm).unwrap();
+        assert_eq!(server.storage_keys.keys().collect::<Vec<_>>(), vec![&kid]);
+
+        // A stolen copy of the old storage key no longer opens the file.
+        let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)
+            .unwrap()
+            .unwrap();
+        assert!(current.open(&Zeroizing::new(old_key), unlock_auth).is_err());
+        agent.lock_keys().unwrap();
+        assert_eq!(unlock(&agent, &server, &paths).unwrap(), kid);
+    }
+
+    #[test]
+    fn a_crash_between_ack_and_confirm_unlocks_with_the_next_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        {
+            let agent = agent(&paths);
+            unlock(&agent, &server, &paths).unwrap();
+            let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+            server.accept_rotation(&rotation).unwrap();
+            // The process dies here: no phase 3.
+        }
+        let new_kid = server.pending.as_ref().unwrap().0.clone();
+        let agent = agent(&paths);
+        assert!(!agent.status().unwrap().unlocked);
+        // Astation still holds both keys and releases the pending one.
+        let (_, request) = request(&agent, &paths, 5);
+        let grant = server
+            .unlock_grant(&server.astation, &request, &new_kid)
+            .unwrap();
+        assert_eq!(
+            agent
+                .finish_unlock(ASTATION_ID, &request.statement, &grant)
+                .unwrap(),
+            new_kid
+        );
+        assert_eq!(
+            agent.public_keys().unwrap(),
+            (keys.device_pub(), keys.device_sign_pub())
+        );
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .unwrap()
+                .storage_kid,
+            new_kid
+        );
+        assert!(!paths.device_keys_next.exists());
+    }
+
+    #[test]
+    fn a_forged_or_mismatched_ack_promotes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        agent.begin_rotation(ASTATION_ID).unwrap();
+        let new_kid = SealedDeviceKeys::load_from(&paths.device_keys_next)
+            .unwrap()
+            .unwrap()
+            .storage_kid;
+        let ack = |kid: &str| StorageAck {
+            account: ACCOUNT.into(),
+            sign_gen: 1,
+            device_id: DEVICE_ID.into(),
+            storage_kid: kid.into(),
+        };
+        let forged = FakeAstation::new().sign(&ack(&new_kid).encode());
+        assert!(error_of(agent.confirm_rotation(ASTATION_ID, &forged)).contains("signature"));
+
+        agent.begin_rotation(ASTATION_ID).unwrap();
+        let wrong = server.astation.sign(&ack("ffffffff").encode());
+        assert!(
+            error_of(agent.confirm_rotation(ASTATION_ID, &wrong)).contains("different storage key")
+        );
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .unwrap()
+                .storage_kid,
+            "0a1b2c3d"
+        );
+        assert!(paths.device_keys_next.exists());
+        assert_eq!(
+            agent.status().unwrap().storage_kid.as_deref(),
+            Some("0a1b2c3d")
+        );
+    }
+
+    #[test]
+    fn rotation_needs_unlocked_keys_and_the_home_astation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        assert!(error_of(agent.begin_rotation(ASTATION_ID)).contains("locked"));
+        unlock(&agent, &server, &paths).unwrap();
+        assert!(error_of(agent.begin_rotation("astation-2")).contains("home Astation"));
+    }
+
+    /// A migrated step-1 device: plain file, sealed file, an agent holding
+    /// the new key, and a server speaking for the Astation that was pinned.
+    fn migrated_device(
+        dir: &std::path::Path,
+    ) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>) {
+        let paths = KeyPaths::in_dir(dir);
+        let keys = DeviceKeys::generate();
+        keys.save_to(&paths.device_keys).unwrap();
+        let astation = FakeAstation::new();
+        pin(&paths, &astation, &keys, false);
+        let agent = agent(&paths);
+        let server = FakeKeyServer {
+            astation,
+            device_sign_pub: keys.device_sign_pub(),
+            unlock_auth_pub: keys.unlock_auth_pub(),
+            storage_keys: Default::default(),
+            pending: None,
+        };
+        (paths, server, keys, agent)
+    }
+
+    #[test]
+    fn the_plain_file_goes_only_after_astation_confirms_the_first_escrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _, agent) = migrated_device(dir.path());
+        let kid = agent.status().unwrap().storage_kid.unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        assert!(
+            paths.device_keys.exists(),
+            "kept while the rotation is open"
+        );
+        let ack = server.accept_rotation(&rotation).unwrap();
+        assert!(paths.device_keys.exists(), "kept until the ack is verified");
+        assert_eq!(
+            TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
+            None
+        );
+        let (confirmed, confirm) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert_eq!(confirmed, kid);
+        server.confirm(&confirm).unwrap();
+        assert_eq!(
+            TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
+            Some(kid.as_str())
+        );
+        assert!(!paths.device_keys.exists());
+        assert!(paths.device_keys_sealed.exists());
+    }
+
+    #[test]
+    fn a_crash_after_the_escrow_is_recorded_keeps_the_sealed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, keys, first) = migrated_device(dir.path());
+        let kid = first.status().unwrap().storage_kid.unwrap();
+        let sealed_before = std::fs::read(&paths.device_keys_sealed).unwrap();
+        let rotation = first.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        first.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        // The crash: the kid is recorded, but the plain file is still there.
+        keys.save_to(&paths.device_keys).unwrap();
+        drop(first);
+
+        let restarted = agent(&paths);
+        assert!(!paths.device_keys.exists(), "the plain file is deleted");
+        assert_eq!(
+            std::fs::read(&paths.device_keys_sealed).unwrap(),
+            sealed_before,
+            "the sealed file is never re-sealed under a fresh key"
+        );
+        let status = restarted.status().unwrap();
+        assert!(!status.unlocked, "it waits for a Touch ID unlock");
+        assert_eq!(status.storage_kid.as_deref(), Some(kid.as_str()));
+        assert_eq!(unlock(&restarted, &server, &paths).unwrap(), kid);
+    }
+
+    #[test]
+    fn a_plain_file_with_a_different_sealed_kid_is_still_re_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _, keys, first) = migrated_device(dir.path());
+        drop(first);
+        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+        trust.set_escrowed_kid("deadbeef");
+        trust.save_to(&paths.trust).unwrap();
+        let again = agent(&paths);
+        assert!(again.status().unwrap().unlocked);
+        assert!(paths.device_keys.exists());
+        assert_ne!(
+            again.status().unwrap().storage_kid.as_deref(),
+            Some("deadbeef")
+        );
+        let _ = keys;
+    }
+
+    #[test]
+    fn a_second_begin_unlock_invalidates_the_first_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (_, first) = request(&agent, &paths, 1);
+        let (_, _second) = request(&agent, &paths, 2);
+        let grant = server.grant_unlock(&first).unwrap();
+        let message = error_of(agent.finish_unlock(ASTATION_ID, &first.statement, &grant));
+        assert!(message.contains("different request"), "{message}");
+        assert!(!agent.status().unwrap().unlocked);
+        // E was consumed by the failed attempt.
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &first.statement, &grant))
+                .contains("no unlock is in progress")
+        );
+    }
+
+    #[test]
+    fn loading_keys_cancels_a_pending_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (_, signed) = request(&agent, &paths, 1);
+        let grant = server.grant_unlock(&signed).unwrap();
+        agent
+            .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &[9; 32])
+            .unwrap();
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &signed.statement, &grant))
+                .contains("no unlock is in progress")
+        );
+    }
+
+    #[test]
+    fn finishing_an_unlock_refuses_when_already_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (_, signed) = request(&agent, &paths, 1);
+        let grant = server.grant_unlock(&signed).unwrap();
+        // Unlocked by some other path while the request was out.
+        agent.lock().unwrap().unlocked = Some(Unlocked {
+            keys,
+            device_id: DEVICE_ID.into(),
+            storage_kid: "0a1b2c3d".into(),
+            storage_key: Zeroizing::new([9; 32]),
+            escrowed: false,
+        });
+        let message = error_of(agent.finish_unlock(ASTATION_ID, &signed.statement, &grant));
+        assert!(message.contains("already unlocked"), "{message}");
+        assert!(
+            agent.lock().unwrap().pending_unlock.is_none(),
+            "E is consumed"
+        );
+        assert!(
+            !agent.status().unwrap().escrowed,
+            "the held keys are untouched"
+        );
+    }
+
+    #[test]
+    fn a_request_naming_another_storage_key_than_the_challenge_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        server.storage_keys.insert("ffffffff".into(), [1; 32]);
+        let agent = agent(&paths);
+        let mut challenge = agent.begin_unlock(ASTATION_ID).unwrap();
+        challenge.storage_kid = "ffffffff".into();
+        let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)
+            .unwrap()
+            .unwrap();
+        let signed = build_unlock_request(&challenge, "boot-1", 1, &unlock_auth);
+        let grant = server.grant_unlock(&signed).unwrap();
+        let message = error_of(agent.finish_unlock(ASTATION_ID, &signed.statement, &grant));
+        assert!(message.contains("different storage key"), "{message}");
         assert!(!agent.status().unwrap().unlocked);
     }
 }
