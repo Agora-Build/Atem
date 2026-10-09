@@ -41,6 +41,20 @@ impl DeviceKeys {
         }
     }
 
+    /// Fixed keys for known-answer tests.
+    #[cfg(test)]
+    pub(crate) fn from_secrets(
+        device: [u8; 32],
+        device_sign: [u8; 32],
+        unlock_auth: [u8; 32],
+    ) -> Self {
+        Self {
+            device: StaticSecret::from(device),
+            device_sign: SigningKey::from_bytes(&device_sign),
+            unlock_auth: SigningKey::from_bytes(&unlock_auth),
+        }
+    }
+
     pub fn device_pub(&self) -> [u8; 32] {
         PublicKey::from(&self.device).to_bytes()
     }

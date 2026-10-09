@@ -22,3 +22,5 @@ pub mod grant;
 
 #[cfg(test)]
 mod e2e_tests;
+#[cfg(test)]
+mod kat_tests;
