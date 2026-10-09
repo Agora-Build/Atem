@@ -58,6 +58,12 @@ pub struct TrustStore {
     pending: HashMap<String, AstationTrust>,
 }
 
+/// Holds `cred_state.lock` (see `TrustStore::lock`) until dropped.
+pub struct TrustLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
 fn store_version() -> u8 {
     1
 }
@@ -90,6 +96,62 @@ impl TrustStore {
     pub fn save_to(&mut self, path: &Path) -> Result<()> {
         self.version = 1;
         crate::memory::crypto::write_private(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    /// Takes the exclusive lock on `cred_state.lock` beside `path`, held
+    /// until the guard drops. Every read-modify-write of the store holds it,
+    /// so the key agent and other atem commands don't drop each other's
+    /// changes. Never call the key agent while holding it (the agent takes it
+    /// too).
+    pub fn lock(path: &Path) -> Result<TrustLock> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let lock_path = path.with_extension("lock");
+            if let Some(dir) = lock_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&lock_path)
+                .with_context(|| {
+                    format!(
+                        "could not open {} (a symlink there is refused)",
+                        lock_path.display()
+                    )
+                })?;
+            loop {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    return Ok(TrustLock { _file: file });
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(
+                        anyhow!(error).context(format!("could not lock {}", lock_path.display()))
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(TrustLock {})
+        }
+    }
+
+    /// Loads the store at `path`, applies `change` and saves it, all under
+    /// the store's lock. Nothing is saved when `change` fails.
+    pub fn update<T>(path: &Path, change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let _lock = Self::lock(path)?;
+        let mut store = Self::load_from(path)?;
+        let out = change(&mut store)?;
+        store.save_to(path)?;
+        Ok(out)
     }
 
     pub fn verified(&self, astation_id: &str) -> Option<&AstationTrust> {
@@ -313,6 +375,41 @@ impl TrustStore {
 mod tests {
     use super::*;
     use crate::memory::crypto::EncryptionMode;
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_updates_lose_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred_state.json");
+        let writers: Vec<_> = (0..4)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..50 {
+                        TrustStore::update(&path, |store| {
+                            store.record_abandoned(&format!("{writer:04x}{n:04x}"));
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let store = TrustStore::load_from(&path).unwrap();
+        assert_eq!(store.abandoned_kids.len(), 200);
+        assert_eq!(
+            std::fs::metadata(path.with_extension("lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     use crate::memory::device_keys::DeviceKeys;
     use crate::memory::statements::FakeAstation;
 

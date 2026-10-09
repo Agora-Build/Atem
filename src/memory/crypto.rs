@@ -148,17 +148,54 @@ fn set_mode_600(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_mode_600(_path: &Path) -> Result<()> { Ok(()) }
 
-/// Writes `bytes` to `path` as a 0600 file: a fresh temp file (never a
-/// stale one or a symlink), fsync, rename, then fsync the directory.
+/// A temp name beside `path` that no other writer (thread or process) uses:
+/// `.<name>.<pid>.<counter>.<random>.tmp`.
+fn unique_temp(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let random = rand::RngCore::next_u32(&mut OsRng);
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!(
+        ".{name}.{}.{}.{random:08x}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAILING_WRITES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test hook: `write_private` to `path` fails on this thread until the
+/// guard is dropped.
+#[cfg(test)]
+pub(crate) fn fail_writes_to(path: &Path) -> FailingWrite {
+    FAILING_WRITES.with(|failing| failing.borrow_mut().push(path.to_path_buf()));
+    FailingWrite(path.to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) struct FailingWrite(PathBuf);
+
+#[cfg(test)]
+impl Drop for FailingWrite {
+    fn drop(&mut self) {
+        FAILING_WRITES.with(|failing| failing.borrow_mut().retain(|path| *path != self.0));
+    }
+}
+
+/// Writes `bytes` to `path` as a 0600 file: a fresh temp file with a name of
+/// its own (never a stale one or a symlink, never another writer's), fsync,
+/// rename, then fsync the directory.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-    let temp = path.with_extension("tmp");
-    match fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    #[cfg(test)]
+    if FAILING_WRITES.with(|failing| failing.borrow().iter().any(|failing| failing == path)) {
+        bail!("injected write failure for {}", path.display());
     }
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    let temp = unique_temp(path);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -796,6 +833,27 @@ mod tests {
         assert!(!absent.exists());
     }
 
+    #[test]
+    fn concurrent_private_writes_to_one_file_never_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred_state.json");
+        let writers: Vec<_> = (0..4u8)
+            .map(|id| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        write_private(&path, &[id; 64]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers { writer.join().unwrap(); }
+        let last = fs::read(&path).unwrap();
+        assert!(last.len() == 64 && last.iter().all(|byte| *byte == last[0]));
+        let left: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("cred_state.json")], "no temp files left");
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_private_replaces_a_stale_temp_without_following_it() {
@@ -807,7 +865,8 @@ mod tests {
         write_private(&path, b"fresh").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"fresh");
         assert_eq!(fs::read(&victim).unwrap(), b"untouched");
-        assert!(!path.with_extension("tmp").exists());
+        // Not its temp name: left alone.
+        assert!(path.with_extension("tmp").symlink_metadata().is_ok());
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }

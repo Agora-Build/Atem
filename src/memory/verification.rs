@@ -261,6 +261,7 @@ pub fn apply_account_state(
             "an unsigned encryption mode from the relay",
         ));
     };
+    let _trust_lock = TrustStore::lock(&paths.trust)?;
     let mut trust = TrustStore::load_from(&paths.trust)?;
     if trust.verified(astation_id).is_none() {
         return Ok(Applied::Ignored(
@@ -446,7 +447,6 @@ pub fn complete_verification(
             let sealed =
                 SealedDeviceKeys::seal(fresh, &entry.device_id, &storage_kid, &storage_key)?;
             agent.load_unlocked(&entry.device_id, fresh, &storage_kid, &storage_key)?;
-            staged.set_home(astation_id);
             Some((sealed, fresh.unlock_auth_key()))
         }
         VerificationKeys::Sealed(_) => None,
@@ -482,7 +482,20 @@ pub fn complete_verification(
                 *grant.key,
             )?;
         }
-        staged.save_to(&paths.trust)
+        // The staged changes again, on the store as it is now, under its
+        // lock (never held across an agent call): another process's changes
+        // since `staged` was loaded aren't lost.
+        let _trust_lock = TrustStore::lock(&paths.trust)?;
+        let mut current = TrustStore::load_from(&paths.trust)?;
+        current.confirm(astation_id, device_verified)?;
+        current.accept_account_state(astation_id, account_state)?;
+        if sealed.is_some() {
+            if current.home_is_set() && current.recorded_home() != Some(astation_id) {
+                bail!("another run made a different Astation this device's home");
+            }
+            current.set_home(astation_id);
+        }
+        current.save_to(&paths.trust)
     };
     if let Err(error) = write() {
         if let (Some((written, unlock_auth)), VerificationKeys::Fresh(fresh)) = (&sealed, &keys) {
@@ -1776,10 +1789,9 @@ mod ceremony_tests {
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
-        // cred_state.json can't be saved (its temp path is a non-empty
-        // directory): the last write, after the key files, fails.
-        let blocker = paths.trust.with_extension("tmp");
-        std::fs::create_dir_all(blocker.join("x")).unwrap();
+        // cred_state.json can't be saved: the last write, after the key
+        // files, fails.
+        let _failing = crate::memory::crypto::fail_writes_to(&paths.trust);
         assert!(
             complete_verification(
                 &paths,
@@ -1925,6 +1937,7 @@ mod ceremony_tests {
         agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
         paths: KeyPaths,
         other: DeviceKeys,
+        failing: std::sync::Mutex<Option<crate::memory::crypto::FailingWrite>>,
     }
 
     impl KeyAgentApi for RacedByAnotherRun {
@@ -1944,12 +1957,53 @@ mod ceremony_tests {
                     .save_to(&self.paths.unlock_auth_key)
                     .unwrap();
                 self.other.save_to(&self.paths.device_keys).unwrap();
-                // device_keys.sealed is written through device_keys.tmp.
-                let blocker = self.paths.device_keys_sealed.with_extension("tmp");
-                std::fs::create_dir_all(blocker.join("x")).unwrap();
+                // This run's own write of device_keys.sealed then fails.
+                *self.failing.lock().unwrap() = Some(crate::memory::crypto::fail_writes_to(
+                    &self.paths.device_keys_sealed,
+                ));
             }
             Ok(reply)
         }
+    }
+
+    /// Forwards to `agent`; right after the keys are loaded, another atem
+    /// process changes cred_state.json (here: records an abandoned kid).
+    struct ChangedMeanwhile {
+        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        paths: KeyPaths,
+    }
+
+    impl KeyAgentApi for ChangedMeanwhile {
+        fn call(
+            &self,
+            request: crate::memory::key_agent::Request,
+        ) -> Result<crate::memory::key_agent::Reply> {
+            let load = matches!(request, crate::memory::key_agent::Request::LoadUnlocked { .. });
+            let reply = self.agent.call(request)?;
+            if load {
+                TrustStore::update(&self.paths.trust, |store| {
+                    store.record_abandoned("5a5b5c5d");
+                    Ok(())
+                })?;
+            }
+            Ok(reply)
+        }
+    }
+
+    #[test]
+    fn verification_keeps_changes_made_to_cred_state_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = ChangedMeanwhile {
+            agent: test_agent(&paths),
+            paths: paths.clone(),
+        };
+        let fake = FakeAstation::new();
+        verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert!(trust.verified(ASTATION_ID).is_some());
+        assert_eq!(trust.home(), Some(ASTATION_ID));
+        assert!(trust.was_abandoned("5a5b5c5d"), "the other change survives");
     }
 
     #[test]
@@ -1962,6 +2016,7 @@ mod ceremony_tests {
             agent: test_agent(&paths),
             paths: paths.clone(),
             other,
+            failing: Default::default(),
         };
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);

@@ -1622,10 +1622,11 @@ async fn run_device_verification(
         .await?;
     let code = handshake.safety_code(&astation);
 
-    let mut trust = TrustStore::load_from(&paths.trust)?;
     let transcript = handshake.transcript(&astation);
-    trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code, &transcript);
-    trust.save_to(&paths.trust)?;
+    TrustStore::update(&paths.trust, |trust| {
+        trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code, &transcript);
+        Ok(())
+    })?;
 
     let outcome: Result<()> = async {
         println!();
@@ -1633,9 +1634,10 @@ async fn run_device_verification(
         println!("Astation shows a code too. They must match exactly.");
         if !prompt_yes_no("Do the codes match? [y/N]: ") {
             // Drop the pending pin first so it goes even if the send fails.
-            let mut t = TrustStore::load_from(&paths.trust)?;
-            t.remove_pending(astation_id);
-            t.save_to(&paths.trust)?;
+            TrustStore::update(&paths.trust, |t| {
+                t.remove_pending(astation_id);
+                Ok(())
+            })?;
             let _ = client
                 .send_message(AstationMessage::VerifyAbort {
                     reason: "the codes didn't match on atem".into(),
@@ -1722,10 +1724,10 @@ async fn run_device_verification(
     if outcome.is_err() {
         // Every failure after set_pending drops the pending pin (a no-op if
         // it is already gone or was confirmed).
-        if let Ok(mut t) = TrustStore::load_from(&paths.trust) {
+        let _ = TrustStore::update(&paths.trust, |t| {
             t.remove_pending(astation_id);
-            let _ = t.save_to(&paths.trust);
-        }
+            Ok(())
+        });
     }
     outcome
 }

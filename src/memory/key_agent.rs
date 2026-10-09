@@ -562,9 +562,10 @@ impl KeyAgent {
         if source != SealedFile::Prev {
             // The unlock proves Astation holds the key the current file is
             // now sealed under: record it (`atem cred status` reads it).
-            let mut store = TrustStore::load_from(&self.paths.trust)?;
-            store.set_escrowed_kid(&granted.storage_kid);
-            store.save_to(&self.paths.trust)?;
+            TrustStore::update(&self.paths.trust, |store| {
+                store.set_escrowed_kid(&granted.storage_kid);
+                Ok(())
+            })?;
             // A pending first escrow is settled, so the plain file goes.
             if source == SealedFile::Current {
                 remove_plain_keys(&self.paths)?;
@@ -666,9 +667,10 @@ impl KeyAgent {
             }
         }
         // Astation holds the key now: record which one.
-        let mut store = TrustStore::load_from(&self.paths.trust)?;
-        store.set_escrowed_kid(&pending.storage_kid);
-        store.save_to(&self.paths.trust)?;
+        TrustStore::update(&self.paths.trust, |store| {
+            store.set_escrowed_kid(&pending.storage_kid);
+            Ok(())
+        })?;
         if pending.initial {
             // Only now does the plain step-1 file go.
             remove_plain_keys(&self.paths)?;
@@ -739,9 +741,10 @@ impl KeyAgent {
             }
         }
         // Recorded before it is signed, so the kid is never picked again.
-        let mut store = TrustStore::load_from(&self.paths.trust)?;
-        store.record_abandoned(storage_kid);
-        store.save_to(&self.paths.trust)?;
+        TrustStore::update(&self.paths.trust, |store| {
+            store.record_abandoned(storage_kid);
+            Ok(())
+        })?;
         let abandon = unlocked.keys.sign_statement(
             &StorageAbandon {
                 account: trust.data_account,
@@ -789,6 +792,8 @@ impl KeyAgent {
         let Some(keys) = DeviceKeys::load_from(&self.paths.device_keys)? else {
             return Ok(());
         };
+        // The whole migration reads and writes cred_state.json under its lock.
+        let _trust_lock = TrustStore::lock(&self.paths.trust)?;
         let mut trust = TrustStore::load_from(&self.paths.trust)?;
         // A crash after the first escrow was recorded but before the plain
         // file went: the sealed file is already escrowed, so just delete it.
