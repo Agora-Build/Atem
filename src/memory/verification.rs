@@ -313,6 +313,27 @@ pub(crate) fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>
         .transpose()
 }
 
+/// The newest signed state of every account a verified Astation names: the
+/// highest epoch when two name one account, `None` while none of them has a
+/// signed state. The one rule for which `K` an account needs, shared by the
+/// key agent (which keys it keeps) and `key_needed` (which it asks for).
+pub(crate) fn newest_states(
+    trust: &TrustStore,
+) -> Result<std::collections::BTreeMap<String, Option<AccountState>>> {
+    let mut newest = std::collections::BTreeMap::new();
+    for entry in trust.verified_entries() {
+        let state = stored_state(entry)?;
+        let slot: &mut Option<AccountState> =
+            newest.entry(entry.data_account.clone()).or_insert(None);
+        if let Some(state) = state
+            && slot.as_ref().is_none_or(|current| state.epoch > current.epoch)
+        {
+            *slot = Some(state);
+        }
+    }
+    Ok(newest)
+}
+
 /// What the latest signed account state says for this device and
 /// `astation_id`: the one source of the encryption mode and kid (build
 /// step 2b). `data_account` is the Astation id when it isn't verified.
@@ -586,8 +607,15 @@ pub fn complete_verification(
         },
         None => None,
     };
+    // Saved: an agent that can't answer means K is asked for, never an error.
+    let key_needed = key_needed(paths, agent, astation_id).unwrap_or_else(|error| {
+        warnings.push(format!(
+            "couldn't check whether the key agent holds the encryption key ({error:#}); atem asks Astation for it"
+        ));
+        true
+    });
     Ok(VerificationOutcome {
-        key_needed: key_needed(paths, agent, astation_id)?,
+        key_needed,
         escrow,
         warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
@@ -601,16 +629,21 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-/// Whether this device is verified with `astation_id`, its signed state
-/// needs `K`, and the key agent doesn't hold that `K` (a locked agent counts
-/// as not holding it): then it should send `keyRequest`. Blocking: from
-/// async code call it inside `key_agent::blocking`.
+/// Whether this device is verified with `astation_id`, the newest signed
+/// state of its account (from any verified Astation naming it, as the key
+/// agent decides which keys to keep) needs `K`, and the key agent doesn't
+/// hold that `K` (a locked agent counts as not holding it): then it should
+/// send `keyRequest`. Blocking: from async code call it inside
+/// `key_agent::blocking`.
 pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) -> Result<bool> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let Some(entry) = trust.verified(astation_id) else {
         return Ok(false);
     };
-    let Some(state) = stored_state(entry)? else {
+    let Some(state) = newest_states(&trust)?
+        .remove(&entry.data_account)
+        .flatten()
+    else {
         return Ok(false);
     };
     if !state.mode.requires_key() {
@@ -1871,6 +1904,89 @@ mod ceremony_tests {
                 _ => self.rest.call(request),
             }
         }
+    }
+
+    /// Forwards to `agent`, failing `InstallGrant` and/or `HeldKid` with a
+    /// non-lock error (a socket or protocol failure).
+    struct FailingAfterWrite {
+        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        fail_install: bool,
+        fail_held_kid: bool,
+    }
+
+    impl KeyAgentApi for FailingAfterWrite {
+        fn call(
+            &self,
+            request: crate::memory::key_agent::Request,
+        ) -> Result<crate::memory::key_agent::Reply> {
+            use crate::memory::key_agent::Request;
+            match request {
+                Request::InstallGrant { .. } if self.fail_install => {
+                    bail!("the key agent closed the connection")
+                }
+                Request::HeldKid { .. } if self.fail_held_kid => {
+                    bail!("the key agent sent an unreadable reply")
+                }
+                _ => self.agent.call(request),
+            }
+        }
+    }
+
+    /// A first verification (state on, kid 0123abcd, its grant) through
+    /// `agent`.
+    fn verify_on_with_grant(paths: &KeyPaths, agent: &dyn KeyAgentApi) -> Result<VerificationOutcome> {
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(paths, &fake, DeviceKeys::generate(), 7, 1);
+        let grant = seal_k_grant(
+            &fake,
+            "acct",
+            "dev-1",
+            certificate.device_pub,
+            "0123abcd",
+            [42; 32],
+        );
+        complete_verification(
+            paths,
+            agent,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(&fake, EncryptionMode::On, Some("0123abcd"), 2),
+            &[grant],
+        )
+    }
+
+    #[test]
+    fn a_failed_install_after_a_saved_verification_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = FailingAfterWrite {
+            agent: test_agent(&paths),
+            fail_install: true,
+            fail_held_kid: false,
+        };
+        let outcome = verify_on_with_grant(&paths, &agent).expect("the verification is saved");
+        let warning = outcome.warning.expect("a warning");
+        assert!(warning.contains("couldn't be stored in the key agent"), "{warning}");
+        assert!(outcome.key_needed, "K is asked for again");
+        assert!(TrustStore::load_from(&paths.trust).unwrap().verified(ASTATION_ID).is_some());
+        assert!(!holds_k(&agent.agent, ASTATION_ID));
+    }
+
+    #[test]
+    fn an_agent_error_after_a_saved_verification_means_k_is_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = FailingAfterWrite {
+            agent: test_agent(&paths),
+            fail_install: false,
+            fail_held_kid: true,
+        };
+        let outcome = verify_on_with_grant(&paths, &agent).expect("the verification is saved");
+        assert!(outcome.key_needed, "an unknown answer counts as K missing");
+        let warning = outcome.warning.expect("a warning");
+        assert!(warning.contains("unreadable reply"), "{warning}");
+        assert!(TrustStore::load_from(&paths.trust).unwrap().verified(ASTATION_ID).is_some());
     }
 
     #[test]

@@ -6,12 +6,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::memory::account_keys::{AccountKeys, CryptOp, CryptOut, SignedModes};
-use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::encoding::dec;
 use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, open_grant as open_sealed_grant};
@@ -24,7 +22,7 @@ use crate::memory::storage_key::{
     check_storage_ack, check_unlock_grant, new_storage_key, new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::{KeyPaths, stored_state};
+use crate::memory::verification::{KeyPaths, newest_states, stored_state};
 
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
 /// other version with an error, so an old agent and a newer CLI fail clearly.
@@ -243,7 +241,9 @@ pub struct KeyAgent {
     unlocked: Option<Unlocked>,
     pending_unlock: Option<PendingUnlock>,
     pending_rotation: Option<PendingRotation>,
-    /// How often a failed prune re-seal was logged.
+    /// The last prune failure, so it is logged once, not at every call.
+    last_prune_error: Option<String>,
+    /// How often a prune failure was logged.
     #[cfg(test)]
     pub(crate) prune_failures_logged: usize,
 }
@@ -293,6 +293,7 @@ impl KeyAgent {
             unlocked: None,
             pending_unlock: None,
             pending_rotation: None,
+            last_prune_error: None,
             #[cfg(test)]
             prune_failures_logged: 0,
         };
@@ -502,46 +503,36 @@ impl KeyAgent {
     /// (the highest epoch when two name one account).
     fn signed_modes(&self) -> Result<SignedModes> {
         let trust = TrustStore::load_from(&self.paths.trust)?;
-        let mut latest: BTreeMap<String, Option<(u64, EncryptionMode, Option<String>)>> =
-            BTreeMap::new();
-        for entry in trust.verified_entries() {
-            let state = stored_state(entry)?;
-            let slot = latest.entry(entry.data_account.clone()).or_insert(None);
-            if let Some(state) = state
-                && slot
-                    .as_ref()
-                    .is_none_or(|(epoch, _, _)| state.epoch > *epoch)
-            {
-                *slot = Some((state.epoch, state.mode, state.kid));
-            }
-        }
-        Ok(latest
+        Ok(newest_states(&trust)?
             .into_iter()
-            .map(|(account, state)| (account, state.map(|(_, mode, kid)| (mode, kid))))
+            .map(|(account, state)| (account, state.map(|state| (state.mode, state.kid))))
             .collect())
     }
 
     /// Drops the account keys the signed states retired (`off`, or previous
     /// keys once `on` names the current kid). Best effort: they go from
     /// memory at once (the signed state already forbids them), and a failed
-    /// re-seal is retried at the next call, never failing it. It is logged
-    /// once, when the keys first go unsaved, not at every retry.
+    /// re-seal is retried at the next call, never failing it. A failure is
+    /// logged once: not again at every retry of an unsaved re-seal, nor
+    /// while the same error repeats.
     fn prune_retired(&mut self) {
         let was_unsaved = self
             .unlocked
             .as_ref()
             .is_some_and(|unlocked| unlocked.unsaved);
-        if let Err(error) = self.try_prune() {
-            let unsaved = self
-                .unlocked
-                .as_ref()
-                .is_some_and(|unlocked| unlocked.unsaved);
-            if unsaved && !was_unsaved {
-                eprintln!("key agent: could not re-seal the account keys: {error:#}");
-                #[cfg(test)]
-                {
-                    self.prune_failures_logged += 1;
+        match self.try_prune() {
+            Ok(()) => self.last_prune_error = None,
+            Err(error) => {
+                let message = format!("{error:#}");
+                let retry = was_unsaved && self.last_prune_error.is_some();
+                if !retry && self.last_prune_error.as_deref() != Some(message.as_str()) {
+                    eprintln!("key agent: could not prune the account keys: {message}");
+                    #[cfg(test)]
+                    {
+                        self.prune_failures_logged += 1;
+                    }
                 }
+                self.last_prune_error = Some(message);
             }
         }
     }
@@ -1429,7 +1420,9 @@ pub(crate) fn test_agent(paths: &KeyPaths) -> std::sync::Mutex<KeyAgent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::fake_astation::{ACCOUNT, ASTATION_ID, DEVICE_ID, pin, sealed_device};
+    use crate::memory::fake_astation::{
+        ACCOUNT, ASTATION_ID, DEVICE_ID, migrated_device, pin, sealed_device,
+    };
     use crate::memory::grant::seal_k_grant;
     use crate::memory::statements::FakeAstation;
     use std::sync::Mutex;
@@ -2199,8 +2192,6 @@ mod tests {
         unlock(&agent, &server, &paths).unwrap();
         assert!(error_of(agent.begin_rotation("astation-2")).contains("home Astation"));
     }
-
-    use crate::memory::fake_astation::migrated_device;
 
     #[test]
     fn the_plain_file_goes_only_after_astation_confirms_the_first_escrow() {

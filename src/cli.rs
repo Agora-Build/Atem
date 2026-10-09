@@ -1675,6 +1675,11 @@ async fn run_device_verification(
                         .await?
                     };
                     println!("✅ Device verified with Astation (safety code {code}).");
+                    // Every warning, whatever the escrow below does (e.g. K
+                    // couldn't be stored in the key agent).
+                    if let Some(warning) = &outcome.warning {
+                        eprintln!("⚠️  {warning}");
+                    }
                     // The first escrow, in this run. Until Astation holds the
                     // storage key the plain device_keys file stays on disk.
                     let escrowed = crate::memory::unlock::pair_escrow(
@@ -1692,11 +1697,7 @@ async fn run_device_verification(
                         Ok(PairEscrow::HeldByHome(home)) => println!(
                             "This device's storage key is held via your home Astation {home}; nothing to do."
                         ),
-                        Ok(PairEscrow::Nothing) => {
-                            if let Some(warning) = &outcome.warning {
-                                eprintln!("⚠️  {warning}");
-                            }
-                        }
+                        Ok(PairEscrow::Nothing) => {}
                         Err(error) => eprintln!(
                             "⚠️  {}",
                             crate::memory::unlock::escrow_failure_message(&error)

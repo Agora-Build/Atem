@@ -505,3 +505,70 @@ fn a_failed_current_file_write_mid_rotation_installs_nothing() {
     assert!(holds_k(device.agent.as_ref(), ASTATION_ID));
     assert_eq!(device.sealed_accounts().current_kid(ACCOUNT), Some(A));
 }
+
+#[test]
+fn key_needed_follows_the_newest_signed_state_of_the_account() {
+    use crate::memory::verification::key_needed;
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.state(EncryptionMode::On, Some(A));
+    let other = FakeAstation::new();
+    pin_as(&device.paths, "astation-2", &other, &device.keys, false);
+    // astation-1's state is stale: the newer one, from astation-2, is off.
+    set_state_as(
+        &device.paths,
+        "astation-2",
+        &other,
+        EncryptionMode::Off,
+        None,
+        9,
+    );
+    let agent = device.agent.as_ref();
+    assert!(!key_needed(&device.paths, agent, ASTATION_ID).unwrap());
+    assert!(!key_needed(&device.paths, agent, "astation-2").unwrap());
+    // The newer state moves to B: K for B is what both need.
+    set_state_as(
+        &device.paths,
+        "astation-2",
+        &other,
+        EncryptionMode::On,
+        Some(B),
+        10,
+    );
+    assert!(key_needed(&device.paths, agent, ASTATION_ID).unwrap());
+    let grant = seal_k_grant(
+        &other,
+        ACCOUNT,
+        DEVICE_ID,
+        device.keys.device_pub(),
+        B,
+        [7; 32],
+    );
+    agent.install_grant("astation-2", &grant).unwrap();
+    assert!(!key_needed(&device.paths, agent, ASTATION_ID).unwrap());
+    assert!(!key_needed(&device.paths, agent, "astation-2").unwrap());
+}
+
+#[test]
+fn a_prune_error_before_anything_changed_is_logged_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::On, A, [1; 32]);
+    let logged = |device: &UnlockedDevice| device.agent.lock().unwrap().prune_failures_logged;
+    let trust = std::fs::read(&device.paths.trust).unwrap();
+    std::fs::write(&device.paths.trust, b"not json").unwrap();
+    for _ in 0..3 {
+        assert!(device.agent.held_kid(ASTATION_ID).is_err());
+    }
+    assert_eq!(
+        logged(&device),
+        1,
+        "an unreadable cred_state.json is logged once"
+    );
+    std::fs::write(&device.paths.trust, trust).unwrap();
+    assert_eq!(
+        device.agent.held_kid(ASTATION_ID).unwrap().as_deref(),
+        Some(A)
+    );
+    assert_eq!(logged(&device), 1);
+}

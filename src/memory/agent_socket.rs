@@ -1524,20 +1524,24 @@ mod tests {
 
     #[test]
     fn replies_decode_through_their_kind() {
+        let line = |reply: &str| format!(r#"{{"v":{PROTOCOL_VERSION},"ok":true,"reply":{reply}}}"#);
         assert!(matches!(
-            decode_response(r#"{"v":1,"ok":true,"reply":{"kind":"grant_installed","kid":"ab12cd34"}}"#).unwrap(),
+            decode_response(&line(r#"{"kind":"grant_installed","kid":"ab12cd34"}"#)).unwrap(),
             Reply::GrantInstalled { kid } if kid == "ab12cd34"
         ));
         assert!(matches!(
-            decode_response(r#"{"v":1,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false}}"#).unwrap(),
-            Reply::Status { unlocked: false, .. }
+            decode_response(&line(
+                r#"{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false}"#
+            ))
+            .unwrap(),
+            Reply::Status {
+                unlocked: false,
+                ..
+            }
         ));
         // No reply carries K any more.
         assert!(
-            decode_response(
-                r#"{"v":1,"ok":true,"reply":{"kind":"grant","kid":"ab12cd34","key":"AAAA"}}"#
-            )
-            .is_err()
+            decode_response(&line(r#"{"kind":"grant","kid":"ab12cd34","key":"AAAA"}"#)).is_err()
         );
     }
 
