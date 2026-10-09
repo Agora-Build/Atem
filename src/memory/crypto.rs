@@ -42,6 +42,15 @@ impl EncryptionMode {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Enabling => "enabling",
+            Self::On => "on",
+            Self::Disabling => "disabling",
+        }
+    }
+
     pub fn requires_key(self) -> bool {
         self != Self::Off
     }
