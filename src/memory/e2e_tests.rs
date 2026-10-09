@@ -103,7 +103,14 @@ fn clients(base: &str, store_path: &Path) -> (KnowledgeClient, VaultClient) {
     )
 }
 
-fn set_key(path: &Path, mode: EncryptionMode, kid: &str, key: [u8; 32]) {
+fn set_key(
+    verified: &mut crate::memory::verification::VerifiedForTest,
+    path: &Path,
+    mode: EncryptionMode,
+    kid: &str,
+    key: [u8; 32],
+) {
+    verified.state(mode, Some(kid));
     EncryptionContext::update_mode_at(path, ASTATION, ACCOUNT, mode, Some(kid)).unwrap();
     EncryptionContext::install_grant_at(path, ASTATION, ACCOUNT, kid, key).unwrap();
 }
@@ -269,6 +276,7 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
     let relay_state = Arc::new(Mutex::new(RelayState::seeded()));
     let base = stub_relay(relay_state.clone()).await;
     let (knowledge, vault) = clients(&base, &key_store);
+    let mut verified = crate::memory::verification::VerifiedForTest::new(&key_store, ASTATION, ACCOUNT);
 
     {
         let state = relay_state.lock().unwrap();
@@ -277,7 +285,7 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
         assert_eq!(state.vault_entries.len(), 3);
     }
 
-    set_key(&key_store, EncryptionMode::Enabling, OLD_KID, [7; 32]);
+    set_key(&mut verified, &key_store, EncryptionMode::Enabling, OLD_KID, [7; 32]);
     knowledge.migrate_encryption().await.unwrap();
     vault.migrate_encryption().await.unwrap();
     assert_all_encrypted_with(&relay_state.lock().unwrap(), OLD_KID);
@@ -322,7 +330,7 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
         vec!["first secret", "rotated secret", "recovery note"]
     );
 
-    set_key(&key_store, EncryptionMode::Enabling, NEW_KID, [8; 32]);
+    set_key(&mut verified, &key_store, EncryptionMode::Enabling, NEW_KID, [8; 32]);
     assert_eq!(
         knowledge.pull_memories(0).await.unwrap()[0].content,
         "relay starts as plaintext"
@@ -339,6 +347,7 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
         Some(NEW_KID),
     )
     .unwrap();
+    verified.state(EncryptionMode::On, Some(NEW_KID));
     assert!(
         knowledge
             .pull_memories(0)
@@ -362,6 +371,7 @@ async fn missing_encryption_key_keeps_sync_operations_queued() {
         Some(OLD_KID),
     )
     .unwrap();
+    crate::memory::verification::VerifiedForTest::new(&key_store, ASTATION, ACCOUNT).state(EncryptionMode::On, Some(OLD_KID));
     let relay_state = Arc::new(Mutex::new(RelayState::seeded()));
     let base = stub_relay(relay_state).await;
     let (knowledge, _) = clients(&base, &key_store);

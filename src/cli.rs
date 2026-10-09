@@ -1401,9 +1401,16 @@ async fn run_pair(save: bool) -> Result<()> {
         loop {
             match client.recv_message_async().await {
                 Some(message) => {
-                    if let Some(status) = client.handle_encryption_message(&message).await? {
-                        println!("{status}");
-                        continue;
+                    match client.handle_encryption_message(&message).await {
+                        Ok(Some(status)) => {
+                            println!("{status}");
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            println!("Ignored an encryption message: {error}");
+                            continue;
+                        }
                     }
                     if let crate::websocket_client::AstationMessage::CredentialSync {
                         access_token,

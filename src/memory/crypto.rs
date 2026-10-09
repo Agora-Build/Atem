@@ -186,20 +186,38 @@ impl EncryptionContext {
 
     pub(crate) fn for_astation_at(astation_id: &str, path: &Path) -> Result<Self> {
         let trust = crate::memory::trust::TrustStore::load_from(&crate::memory::trust::trust_path_for(path))?;
-        if trust.verified(astation_id).is_some_and(|entry| entry.account_state.is_none()) {
-            bail!("waiting for Astation's signed encryption state; reconnect to Astation");
-        }
-        let store = StoredKeys::load_from(path)?;
-        let Some(mode) = store.astations.get(astation_id) else {
-            return Ok(Self {
-                mode: EncryptionMode::Off,
-                data_account: astation_id.into(),
-                kid: None,
-                key: None,
-                previous_keys: HashMap::new(),
-                store_path: path.to_path_buf(),
-            });
+        let off = || Self {
+            mode: EncryptionMode::Off,
+            data_account: astation_id.into(),
+            kid: None,
+            key: None,
+            previous_keys: HashMap::new(),
+            store_path: path.to_path_buf(),
         };
+        // Unverified devices never obey stored state: it may come from the
+        // old unauthenticated path. The file is left untouched.
+        let Some(verified) = trust.verified(astation_id) else {
+            return Ok(off());
+        };
+        let Some(signed) = verified.account_state.as_ref() else {
+            bail!("waiting for Astation's signed encryption state; reconnect to Astation");
+        };
+        let store = StoredKeys::load_from(path)?;
+        let signed_state = STANDARD
+            .decode(&signed.statement)
+            .context("stored signed state is not base64")
+            .and_then(|bytes| crate::memory::encoding::dec(&bytes))
+            .and_then(|fields| crate::memory::statements::AccountState::parse(&fields))?;
+        let mismatch = || anyhow!("local encryption state doesn't match Astation's signed state; reconnect to Astation");
+        let Some(mode) = store.astations.get(astation_id) else {
+            if signed_state.mode == EncryptionMode::Off {
+                return Ok(off());
+            }
+            return Err(mismatch());
+        };
+        if mode.mode != signed_state.mode || mode.kid != signed_state.kid {
+            return Err(mismatch());
+        }
         let key = (mode.mode != EncryptionMode::Off).then(|| store.accounts.get(&mode.data_account)).flatten().map(|stored| {
             let bytes = STANDARD.decode(&stored.key).context("invalid stored account key")?;
             if bytes.len() != 32 { bail!("stored account key has the wrong length"); }
@@ -234,11 +252,6 @@ impl EncryptionContext {
         })
     }
 
-    pub fn update_mode(astation_id: &str, data_account: &str, mode: EncryptionMode, kid: Option<&str>) -> Result<()> {
-        let path = key_store_path();
-        Self::update_mode_at(&path, astation_id, data_account, mode, kid)
-    }
-
     pub(crate) fn update_mode_at(path: &Path, astation_id: &str, data_account: &str, mode: EncryptionMode, kid: Option<&str>) -> Result<()> {
         let mut store = StoredKeys::load_or_recover_from(path)?;
         if mode == EncryptionMode::Off {
@@ -256,11 +269,6 @@ impl EncryptionContext {
             data_account: data_account.into(), mode, kid: kid.map(str::to_string),
         });
         store.save_to(path)
-    }
-
-    pub fn install_grant(astation_id: &str, data_account: &str, kid: &str, key: [u8; 32]) -> Result<()> {
-        let path = key_store_path();
-        Self::install_grant_at(&path, astation_id, data_account, kid, key)
     }
 
     pub(crate) fn install_grant_at(path: &Path, astation_id: &str, data_account: &str, kid: &str, key: [u8; 32]) -> Result<()> {
@@ -550,6 +558,7 @@ mod tests {
     fn rotation_keeps_old_key_until_migration_and_off_removes_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data_keys.enc");
+        let mut verified = crate::memory::verification::VerifiedForTest::new(&path, "astation", "account");
         EncryptionContext::update_mode_at(
             &path,
             "astation",
@@ -558,6 +567,7 @@ mod tests {
             Some("0123abcd"),
         )
         .unwrap();
+        verified.state(EncryptionMode::Enabling, Some("0123abcd"));
         EncryptionContext::install_grant_at(
             &path,
             "astation",
@@ -579,6 +589,7 @@ mod tests {
             Some("89abcdef"),
         )
         .unwrap();
+        verified.state(EncryptionMode::Enabling, Some("89abcdef"));
         assert!(EncryptionContext::for_astation_at("astation", &path).is_err());
         EncryptionContext::install_grant_at(
             &path,
@@ -599,6 +610,7 @@ mod tests {
             Some("89abcdef"),
         )
         .unwrap();
+        verified.state(EncryptionMode::On, Some("89abcdef"));
         let completed = EncryptionContext::for_astation_at("astation", &path).unwrap();
         assert!(completed.previous_keys.is_empty());
         assert!(completed.open("mem", "content", &old).is_err());
@@ -611,6 +623,7 @@ mod tests {
             None,
         )
         .unwrap();
+        verified.state(EncryptionMode::Off, None);
         let off = EncryptionContext::for_astation_at("astation", &path).unwrap();
         assert_eq!(off.mode, EncryptionMode::Off);
         assert!(off.key.is_none());
@@ -618,10 +631,34 @@ mod tests {
     }
 
     #[test]
+    fn unverified_astation_ignores_stored_mode_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data_keys.enc");
+        EncryptionContext::update_mode_at(&path, "astation", "account", EncryptionMode::On, Some("0123abcd")).unwrap();
+        EncryptionContext::install_grant_at(&path, "astation", "account", "0123abcd", [7; 32]).unwrap();
+        let context = EncryptionContext::for_astation_at("astation", &path).unwrap();
+        assert_eq!(context.mode, EncryptionMode::Off);
+        assert!(path.exists(), "stored state is left on disk");
+    }
+
+    #[test]
+    fn verified_signed_on_with_missing_key_store_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data_keys.enc");
+        let mut verified = crate::memory::verification::VerifiedForTest::new(&path, "astation", "account");
+        verified.state(EncryptionMode::On, Some("0123abcd"));
+        let error = EncryptionContext::for_astation_at("astation", &path).unwrap_err().to_string();
+        assert!(error.contains("doesn't match"), "{error}");
+        verified.state(EncryptionMode::Off, None);
+        assert_eq!(EncryptionContext::for_astation_at("astation", &path).unwrap().mode, EncryptionMode::Off);
+    }
+
+    #[test]
     fn unreadable_key_store_is_preserved_before_requesting_a_new_grant() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data_keys.enc");
         fs::write(&path, b"not a machine-bound key store").unwrap();
+        let mut verified = crate::memory::verification::VerifiedForTest::new(&path, "astation", "account");
         EncryptionContext::update_mode_at(
             &path,
             "astation",
@@ -630,6 +667,7 @@ mod tests {
             Some("0123abcd"),
         )
         .unwrap();
+        verified.state(EncryptionMode::On, Some("0123abcd"));
         assert!(EncryptionContext::for_astation_at("astation", &path).is_err());
         let backups = fs::read_dir(dir.path())
             .unwrap()

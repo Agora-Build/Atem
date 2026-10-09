@@ -167,7 +167,9 @@ pub fn apply_account_state(
     signed: Option<&SignedWire>,
 ) -> Result<Applied> {
     let Some(signed) = signed else {
-        return Ok(Applied::Ignored("an unsigned encryption mode from the relay"));
+        return Ok(Applied::Ignored(
+            "an unsigned encryption mode from the relay",
+        ));
     };
     let mut trust = TrustStore::load_from(&paths.trust)?;
     if trust.verified(astation_id).is_none() {
@@ -253,6 +255,77 @@ pub fn complete_verification(
     Ok(())
 }
 
+/// Test stand-in for a verified device: pins a fake Astation next to
+/// `data_keys_path` and signs successive account states for it.
+#[cfg(test)]
+pub(crate) struct VerifiedForTest {
+    fake: crate::memory::statements::FakeAstation,
+    trust_path: PathBuf,
+    astation_id: String,
+    account: String,
+    epoch: u64,
+}
+
+#[cfg(test)]
+impl VerifiedForTest {
+    pub(crate) fn new(data_keys_path: &Path, astation_id: &str, account: &str) -> Self {
+        use crate::memory::statements::{DeviceVerified, FakeAstation};
+        let fake = FakeAstation::new();
+        let handshake = Handshake::start(DeviceKeys::generate());
+        let astation = AstationKeys {
+            sign_pub: fake.sign_pub(),
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [7; 32],
+        };
+        let code = handshake.safety_code(&astation);
+        let trust_path = crate::memory::trust::trust_path_for(data_keys_path);
+        let mut trust = TrustStore::default();
+        trust.set_pending(astation_id, "dev-1", handshake.keys(), &astation, &code);
+        let reveal = handshake.reveal();
+        let certificate = DeviceVerified {
+            account: account.into(),
+            sign_gen: 1,
+            device_id: "dev-1".into(),
+            device_pub: reveal.device_pub,
+            device_sign_pub: reveal.device_sign_pub,
+            unlock_auth_pub: reveal.unlock_auth_pub,
+            epoch: 1,
+        };
+        trust
+            .confirm(astation_id, &fake.sign(&certificate.encode()))
+            .unwrap();
+        trust.save_to(&trust_path).unwrap();
+        Self {
+            fake,
+            trust_path,
+            astation_id: astation_id.into(),
+            account: account.into(),
+            epoch: 0,
+        }
+    }
+
+    /// Signs and accepts a newer account state with this mode and kid.
+    pub(crate) fn state(&mut self, mode: crate::memory::crypto::EncryptionMode, kid: Option<&str>) {
+        self.epoch += 1;
+        let signed = self.fake.sign(
+            &AccountState {
+                account: self.account.clone(),
+                sign_gen: 1,
+                mode,
+                kid: kid.map(str::to_string),
+                epoch: self.epoch,
+            }
+            .encode(),
+        );
+        let mut trust = TrustStore::load_from(&self.trust_path).unwrap();
+        trust
+            .accept_account_state(&self.astation_id, &signed)
+            .unwrap();
+        trust.save_to(&self.trust_path).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,8 +389,21 @@ mod tests {
 
     const ASTATION_ID: &str = "astation-1";
 
-    fn signed_state(fake: &FakeAstation, mode: EncryptionMode, epoch: u64) -> crate::memory::statements::SignedWire {
-        fake.sign(&AccountState { account: "acct".into(), sign_gen: 1, mode, kid: Some("0123abcd".into()), epoch }.encode())
+    fn signed_state(
+        fake: &FakeAstation,
+        mode: EncryptionMode,
+        epoch: u64,
+    ) -> crate::memory::statements::SignedWire {
+        fake.sign(
+            &AccountState {
+                account: "acct".into(),
+                sign_gen: 1,
+                mode,
+                kid: Some("0123abcd".into()),
+                epoch,
+            }
+            .encode(),
+        )
     }
 
     /// Runs the atem side of verification against a fake Astation and returns
@@ -327,23 +413,47 @@ mod tests {
         std::fs::write(&paths.legacy_device_key, [1u8; 32]).unwrap();
         let fake = FakeAstation::new();
         let handshake = Handshake::start(DeviceKeys::generate());
-        let astation = AstationKeys { sign_pub: fake.sign_pub(), enc_pub: [5; 32], recovery_sign_pub: [6; 32], nonce_s: [7; 32] };
+        let astation = AstationKeys {
+            sign_pub: fake.sign_pub(),
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [7; 32],
+        };
         let code = handshake.safety_code(&astation);
         let mut trust = TrustStore::default();
         trust.set_pending(ASTATION_ID, "dev-1", handshake.keys(), &astation, &code);
         trust.save_to(&paths.trust).unwrap();
         let reveal = handshake.reveal();
         let certificate = DeviceVerified {
-            account: "acct".into(), sign_gen: 1, device_id: "dev-1".into(),
-            device_pub: reveal.device_pub, device_sign_pub: reveal.device_sign_pub,
-            unlock_auth_pub: reveal.unlock_auth_pub, epoch: 1,
+            account: "acct".into(),
+            sign_gen: 1,
+            device_id: "dev-1".into(),
+            device_pub: reveal.device_pub,
+            device_sign_pub: reveal.device_sign_pub,
+            unlock_auth_pub: reveal.unlock_auth_pub,
+            epoch: 1,
         };
         let grants = if mode.requires_key() {
-            vec![seal_k_grant(&fake, "acct", "dev-1", reveal.device_pub, "0123abcd", [42; 32])]
+            vec![seal_k_grant(
+                &fake,
+                "acct",
+                "dev-1",
+                reveal.device_pub,
+                "0123abcd",
+                [42; 32],
+            )]
         } else {
             vec![]
         };
-        complete_verification(&paths, ASTATION_ID, handshake.into_keys(), &fake.sign(&certificate.encode()), &signed_state(&fake, mode, 1), &grants).unwrap();
+        complete_verification(
+            &paths,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &signed_state(&fake, mode, 1),
+            &grants,
+        )
+        .unwrap();
         (paths, fake, reveal.device_pub)
     }
 
@@ -354,7 +464,10 @@ mod tests {
         let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
         assert_eq!(context.mode, EncryptionMode::On);
         assert!(context.seal("mem-1", "content", b"x").is_ok());
-        assert!(!paths.legacy_device_key.exists(), "old plain device_key must be deleted");
+        assert!(
+            !paths.legacy_device_key.exists(),
+            "old plain device_key must be deleted"
+        );
         assert!(DeviceKeys::load_from(&paths.device_keys).unwrap().is_some());
     }
 
@@ -362,7 +475,10 @@ mod tests {
     fn unsigned_or_forged_mode_changes_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, _, _) = verify(dir.path(), EncryptionMode::On);
-        assert!(matches!(apply_account_state(&paths, ASTATION_ID, None).unwrap(), Applied::Ignored(_)));
+        assert!(matches!(
+            apply_account_state(&paths, ASTATION_ID, None).unwrap(),
+            Applied::Ignored(_)
+        ));
         let forged = signed_state(&FakeAstation::new(), EncryptionMode::Off, 9);
         assert!(apply_account_state(&paths, ASTATION_ID, Some(&forged)).is_err());
         let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
@@ -374,17 +490,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (paths, fake, _) = verify(dir.path(), EncryptionMode::On);
         let disabling = signed_state(&fake, EncryptionMode::Disabling, 2);
-        assert!(matches!(apply_account_state(&paths, ASTATION_ID, Some(&disabling)).unwrap(), Applied::ModeChanged(_)));
-        assert_eq!(EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap().mode, EncryptionMode::Disabling);
+        assert!(matches!(
+            apply_account_state(&paths, ASTATION_ID, Some(&disabling)).unwrap(),
+            Applied::ModeChanged(_)
+        ));
+        assert_eq!(
+            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
+                .unwrap()
+                .mode,
+            EncryptionMode::Disabling
+        );
     }
 
     #[test]
     fn signed_state_with_invalid_kid_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, fake, _) = verify(dir.path(), EncryptionMode::On);
-        let bad = fake.sign(&AccountState { account: "acct".into(), sign_gen: 1, mode: EncryptionMode::Disabling, kid: Some("XYZ".into()), epoch: 2 }.encode());
+        let bad = fake.sign(
+            &AccountState {
+                account: "acct".into(),
+                sign_gen: 1,
+                mode: EncryptionMode::Disabling,
+                kid: Some("XYZ".into()),
+                epoch: 2,
+            }
+            .encode(),
+        );
         assert!(apply_account_state(&paths, ASTATION_ID, Some(&bad)).is_err());
-        assert_eq!(EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap().mode, EncryptionMode::On);
+        assert_eq!(
+            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
+                .unwrap()
+                .mode,
+            EncryptionMode::On
+        );
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert_eq!(trust.verified(ASTATION_ID).unwrap().account_epoch, 1);
     }
@@ -394,10 +532,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = KeyPaths::in_dir(dir.path());
         let fake = FakeAstation::new();
-        assert!(matches!(apply_account_state(&paths, ASTATION_ID, Some(&signed_state(&fake, EncryptionMode::Off, 1))).unwrap(), Applied::Ignored(_)));
+        assert!(matches!(
+            apply_account_state(
+                &paths,
+                ASTATION_ID,
+                Some(&signed_state(&fake, EncryptionMode::Off, 1))
+            )
+            .unwrap(),
+            Applied::Ignored(_)
+        ));
         let grant = seal_k_grant(&fake, "acct", "dev-1", [9; 32], "0123abcd", [42; 32]);
-        assert!(matches!(apply_grant(&paths, ASTATION_ID, Some(&grant)).unwrap(), Applied::Ignored(_)));
-        assert_eq!(EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap().mode, EncryptionMode::Off);
+        assert!(matches!(
+            apply_grant(&paths, ASTATION_ID, Some(&grant)).unwrap(),
+            Applied::Ignored(_)
+        ));
+        assert_eq!(
+            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
+                .unwrap()
+                .mode,
+            EncryptionMode::Off
+        );
     }
 
     #[test]
@@ -406,11 +560,15 @@ mod tests {
         let (paths, _, _) = verify(dir.path(), EncryptionMode::Off);
         // Simulate a verified entry that never received a state: an Option
         // field missing from the JSON deserializes as None.
-        let raw = std::fs::read_to_string(&paths.trust).unwrap().replace("\"account_state\": {", "\"account_state_was\": {");
+        let raw = std::fs::read_to_string(&paths.trust)
+            .unwrap()
+            .replace("\"account_state\": {", "\"account_state_was\": {");
         std::fs::write(&paths.trust, raw).unwrap();
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(trust.verified(ASTATION_ID).unwrap().account_state.is_none());
-        let error = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap_err().to_string();
+        let error = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("signed encryption state"), "{error}");
     }
 }
