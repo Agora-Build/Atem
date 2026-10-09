@@ -88,6 +88,12 @@ src/
 │   ├── verification.rs  #   commit-then-reveal safety code; apply signed state/grants
 │   ├── trust.rs         #   cred_state.json: pinned Astation keys, epochs
 │   ├── grant.rs         #   signed RFC 9180 HPKE key grants
+│   ├── storage_key.rs   #   storage key + device_keys.sealed (XChaCha20-Poly1305); unlock-grant/ack checks
+│   ├── key_agent.rs     #   key agent state: unlock, rotation, abandon, grants opened in memory
+│   ├── agent_socket.rs  #   `atem key-agent` Unix socket server + client (v1 JSON lines, same UID only)
+│   ├── unlock.rs        #   `atem cred status|unlock|lock`; unlock/rotation carried over the Astation link
+│   ├── fake_astation.rs #   (test-only) Astation's side of unlock and rotation, mirrors the design doc
+│   ├── kat_tests.rs     #   (test-only) known-answer vectors listed in designs/e2e-encryption.md
 │   └── cmd.rs           #   CLI handlers
 └── tui/
     ├── mod.rs           # Main event loop, rendering dispatch
@@ -159,6 +165,8 @@ Key methods:
 
 **Atem Memory** (`src/memory/`): `atem sync`, `atem memory …`, `atem skill …`. Agents learn from each other across agents and machines. Claude's saved memories are harvested (an edited file becomes a replacement, a deleted file an invalidation), Codex saves facts with `atem memory add --agent codex` and replaces outdated ones with `atem memory replace <id> "<new fact>"` (its block shows each fact's short id), and skills are versioned directories (`atem skill history`/`atem skill restore` read old versions from the relay). Facts are never edited in place: `memory replace`/`memory invalidate` keep the history (`valid_at`, `invalid_at`, `superseded_by`; see `memory list --history`), invalidation is final, and only valid facts are injected — a block that leaves facts out says how many and points to `atem memory search`, which is local FTS5 (trigram, BM25) over `knowledge.db`. Everything is synced through the relay (`/api/memory`, `/api/skills`, Astation pairing-session auth) with an offline SQLite store, then applied as a managed block in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `<repo>/CLAUDE.local.md`, and as skills in `.claude/skills` and `.agents/skills`. Credential values are never stored: names only. Tracked files are never written. See `designs/atem-memory.md`.
 
+**Key agent** (`src/memory/key_agent.rs`, `agent_socket.rs`, `unlock.rs`): this device's keys live sealed in `device_keys.sealed` under a storage key only the home Astation (the first one this device verified with) holds. The hidden `atem key-agent` (same binary, started on demand, detached; Unix socket, same-UID peers only, `"v": 1` JSON lines; `PR_SET_DUMPABLE=0` and `mlockall` on Linux) holds the unlocked keys and opens grants in memory; while it is locked, grants are ignored. `atem cred unlock` asks it for a single-use key, sends an `unlockRequest` signed by `unlock_auth_key`, and hands Astation's Touch-ID-approved, signed `unlockGrant` straight back to the agent; the agent then rotates the storage key in three crash-safe phases (`.next` → `storageKeyAck` → promote, `.prev` kept until the next unlock → `storageKeyConfirm`), abandoning a stale pending key if needed. `atem pair` escrows the first storage key in the same run; `atem cred lock` wipes the agent (refused until Astation holds the storage key); `atem cred status` shows verified / home Astation / agent / storage key, and the reset steps when a key file is broken. Until step 2b the agent hands `K` back to the caller. See `designs/e2e-encryption.md` "Keys on disk (atem)" and "Astation work for step 2a".
+
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
 **RTM Signaling** (`rtm_client.rs`): FFI wrapper for native C RTM client with async Tokio channels. Default build uses a stub; enable `real_rtm` feature for Agora SDK.
@@ -184,8 +192,12 @@ Key methods:
 | `project_cache.enc` | All projects + `current_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
 | `sessions.json` | Per-Astation device session IDs and tokens | None (chmod 0600) |
 | `knowledge.db` | Atem Memory local store: memories (with `deleted_at`/`valid_at`/`invalid_at`/`superseded_by`), the `memories_fts` FTS5 trigram search index, skills, harvest map, local `replacements`, and the pending-sync queue (SQLite, mode 0600; holds no secrets — credentials are refused before storing; migrated in place on open) | None |
-| `device_keys` | This device's X25519, Ed25519 signing and unlock-auth keys (created by `atem pair` verification; sealed in build step 2) | None (chmod 0600) |
-| `cred_state.json` | Verified Astation pins (signing, encryption, recovery keys), safety code, epoch floor, latest signed account state | None (chmod 0600; no secrets) |
+| `device_keys` | Build-step-1 plain keys; the key agent seals them into `device_keys.sealed` at each start while this file exists, and deletes it once the home Astation is known to hold the storage key | None (chmod 0600) |
+| `device_keys.sealed` | This device's X25519 device key and Ed25519 signing key (`{version, device_id, storage_kid, nonce, ciphertext}`); `device_keys.sealed.next` exists only mid-rotation, `device_keys.sealed.prev` (the replaced file) until an unlock proves Astation holds the current key | XChaCha20-Poly1305 under the storage key (held only by the home Astation, replaced at every unlock) |
+| `unlock_auth_key` | Ed25519 key that signs unlock requests | None (chmod 0600; it can only ask Astation) |
+| `cred_state.json` | Verified Astation pins (signing, encryption, recovery keys), safety code, epoch floor, latest signed account state, `home_astation` (holds the storage key), `escrowed_storage_kid` (last storage kid Astation is known to hold), `abandoned_kids` (never reused) | None (chmod 0600; no secrets) |
+| `key-agent.log` | Output of the detached `atem key-agent` | None |
+| `agent.sock`, `agent.lock` | Key-agent socket and its single-instance lock, here only when `$XDG_RUNTIME_DIR` is unset (else `$XDG_RUNTIME_DIR/atem/`); directory 0700, socket 0600, same-UID peers only | — |
 
 **Identity** (`config.rs`, `websocket_client.rs`):
 - `instance_id` — persistent UUID v4, the canonical atem identity (and the vault `client_id`). Generated once by `ensure_instance_id()`, stored in `config.toml`.
@@ -204,7 +216,8 @@ Key methods:
 **SSO auth** (`sso_auth.rs`):
 - `atem login` — OAuth 2.0 + PKCE browser flow against `sso2.agora.io`; writes an `sso` entry to `credentials.enc`
 - `atem logout` — removes the `sso` entry from `credentials.enc`
-- `atem pair [--save]` — connect to Astation, send `PairSavePreference`, wait for `SsoTokenSync`, write paired entry, then verify the device: commit-then-reveal (`verifyCommit` → `verifyKeys` → `verifyReveal`), both sides show a 12-character safety code, the user answers `codes match? [y/N]` and confirms on Astation with Touch ID, and atem applies the signed `deviceVerified` atomically (pins, device keys, signed state, grants; nothing on failure). If `K` is needed but missing it sends `keyRequest`. Astations that don't answer within 15s leave the device as it was (see `designs/e2e-encryption.md`)
+- `atem pair [--save]` — connect to Astation, send `PairSavePreference`, wait for `SsoTokenSync`, write paired entry, then verify the device: commit-then-reveal (`verifyCommit` → `verifyKeys` → `verifyReveal`), both sides show a 12-character safety code, the user answers `codes match? [y/N]` and confirms on Astation with Touch ID, and atem applies the signed `deviceVerified` atomically (pins, device keys, signed state, grants; nothing on failure). If `K` is needed but missing it sends `keyRequest`. Astations that don't answer within 15s leave the device as it was (see `designs/e2e-encryption.md`). On the home Astation's first verification the fresh keys are sealed and the first storage key is escrowed (`storageKeyRotate` with an empty old kid, then confirmed) in the same run
+- `atem cred status|unlock|lock` (tier 2) — key agent state; Touch ID unlock through the home Astation (waits up to 300 s, then rotates the storage key); wipe the unlocked keys. `atem key-agent` is the hidden agent process itself
 - `atem unpair` — remove all paired entries
 - `valid_token(connected_astation_id, sso_url)` — resolves via priority chain and returns an access token. Within 60s of expiry, an `sso` entry refreshes itself; a paired entry never does (Agora rotates refresh tokens, so it would invalidate Astation's copy): atem connects to Astation, which sends a fresh `credentialSync` on connect.
 
@@ -232,6 +245,11 @@ An unverified pairing shows `Verified: no  (run 'atem pair' to verify this devic
 - `EncryptionMode { account_state }` — Astation → Atem, a signed `atem-account-state-v1`; ignored when unsigned or when the device isn't verified
 - `KeyRequest { public_key }` — Atem → Astation, a verified device asks for `K`
 - `KeyGrant { grant }` — Astation → Atem, `K` sealed to this device with a signed grant; ignored when unsigned or unverified
+- `UnlockRequest { request, signature }` — Atem → home Astation, `atem-unlock-request-v1` signed by the unlock-auth key
+- `UnlockGrant { grant, encapped_key, ciphertext }` / `UnlockDenied { reason }` — Astation → Atem, the storage key sealed to the request's single-use key, or a denial
+- `StorageKeyRotate { rotate, encapped_key, ciphertext }` — Atem → home Astation, a new storage key sealed to Astation's encryption key, device-signed
+- `StorageKeyAck { ack }` / `StorageKeyRejected { reason, pending_kid? }` — Astation → Atem, stored as pending, or refused (`pending_kid`: Astation is committed to that pending key)
+- `StorageKeyConfirm { confirm }` / `StorageKeyAbandon { abandon }` — Atem → home Astation, device-signed: switched to the new key / give up a pending key this device has no file for
 
 **Active project resolution** (`ActiveProject::resolve_app_id/resolve_app_certificate`):
 1. CLI flag (`--app-id`)
@@ -250,7 +268,7 @@ with Astation unlocks the full set (tier 2) — Astation is the control plane.
 |---|---|---|
 | 0 | — | serv files, config, token with AGORA_APP_ID/CERT env, `project use <index>`, `project show` (local cache) |
 | 1 | `atem login` | `project list`, `project use <app-id>`, token (active project), serv rtc/convo/webhooks |
-| 2 | paired with Astation | vault, sync, memory, skill, and Astation-driven remote agent control, voice coding, mark tasks, visualize |
+| 2 | paired with Astation | vault, sync, memory, skill, cred, and Astation-driven remote agent control, voice coding, mark tasks, visualize |
 
 Gates are centralized in `src/auth.rs`: `require_login(feature)` is the tier-1
 gate (passes when `CredentialStore::load().entries` is non-empty);
