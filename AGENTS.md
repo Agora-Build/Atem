@@ -113,7 +113,7 @@ designs/
 ├── vault.md                  # Shared cross-agent context store (relay + Postgres)
 ├── agora-account-grouping.md # Proposed: merge Astations under one Agora login (opt-in)
 ├── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
-└── e2e-encryption.md         # Proposed: end-to-end encryption of memory, skills and vault
+└── e2e-encryption.md         # E2E encryption: memory, skills, vault (atem side built) + credentials (atem cred, proposed)
 ```
 
 ### Core Components
