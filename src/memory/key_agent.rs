@@ -15,13 +15,12 @@ use crate::memory::grant::{
     GrantWire, OpenedGrant, hpke_open, hpke_seal, open_grant as open_sealed_grant,
 };
 use crate::memory::statements::{
-    SignedWire, StorageAbandon, StorageAck, StorageConfirm, StorageRotate, UnlockGrant,
-    UnlockRequest, sealed_hash, storage_key_info, unlock_info, unlock_request_hash,
-    verify_astation,
+    SignedWire, StorageAbandon, StorageConfirm, StorageRotate, UnlockRequest, sealed_hash,
+    storage_key_info, unlock_info,
 };
 use crate::memory::storage_key::{
-    SealedDeviceKeys, StorageKey, StorageRotation, UnlockGrantWire, new_storage_key,
-    new_storage_kid, promote_next,
+    CheckedGrant, SealedDeviceKeys, StorageKey, StorageRotation, UnlockGrantWire,
+    check_storage_ack, check_unlock_grant, new_storage_key, new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
 use crate::memory::verification::KeyPaths;
@@ -522,33 +521,12 @@ impl KeyAgent {
         if sent.account != trust.data_account || sent.device_id != trust.device_id {
             bail!("the unlock request names another account or device");
         }
-        let request_hash = unlock_request_hash(&request_bytes);
-        let sign_pub = STANDARD.decode(&trust.astation_sign_pub)?;
-        let granted = UnlockGrant::parse(&verify_astation(&sign_pub, &grant.grant)?)?;
-        if granted.account != trust.data_account {
-            bail!("unlock grant is for a different account");
-        }
-        if granted.sign_gen != trust.sign_gen {
-            bail!("unlock grant is signed by a different signing-key generation");
-        }
-        if granted.device_id != trust.device_id {
-            bail!("unlock grant is for a different device");
-        }
-        if granted.request_hash != request_hash {
-            bail!("unlock grant answers a different request");
-        }
-        if !crate::memory::crypto::valid_kid(&granted.storage_kid) {
-            bail!("unlock grant has an invalid storage key id");
-        }
-        let encapped = STANDARD
-            .decode(&grant.encapped_key)
-            .context("unlock grant key encapsulation is not base64")?;
-        let ciphertext = STANDARD
-            .decode(&grant.ciphertext)
-            .context("unlock grant ciphertext is not base64")?;
-        if sealed_hash(&encapped, &ciphertext) != granted.sealed_hash {
-            bail!("unlock grant does not match what Astation signed");
-        }
+        let CheckedGrant {
+            grant: granted,
+            request_hash,
+            encapped,
+            ciphertext,
+        } = check_unlock_grant(&trust, &request_bytes, grant)?;
         let info = unlock_info(
             &granted.account,
             &granted.device_id,
@@ -588,23 +566,24 @@ impl KeyAgent {
             // Astation released the key a crashed rotation left pending.
             SealedFile::Next => promote_keeping_prev(&self.paths)?,
             // Astation holds the current key, so the file it replaced can go.
-            SealedFile::Current => {
-                match std::fs::remove_file(&self.paths.device_keys_prev) {
-                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                        return Err(error.into());
-                    }
-                    _ => {}
+            SealedFile::Current => match std::fs::remove_file(&self.paths.device_keys_prev) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into());
                 }
-                // The unlock proves Astation holds the current key: a
-                // pending first escrow is settled, so the plain file goes.
-                if self.paths.device_keys.exists() {
-                    let mut store = TrustStore::load_from(&self.paths.trust)?;
-                    store.set_escrowed_kid(&granted.storage_kid);
-                    store.save_to(&self.paths.trust)?;
-                    remove_plain_keys(&self.paths)?;
-                }
-            }
+                _ => {}
+            },
             SealedFile::Prev => {}
+        }
+        if source != SealedFile::Prev {
+            // The unlock proves Astation holds the key the current file is
+            // now sealed under: record it (`atem cred status` reads it).
+            let mut store = TrustStore::load_from(&self.paths.trust)?;
+            store.set_escrowed_kid(&granted.storage_kid);
+            store.save_to(&self.paths.trust)?;
+            // A pending first escrow is settled, so the plain file goes.
+            if source == SealedFile::Current {
+                remove_plain_keys(&self.paths)?;
+            }
         }
         self.unlocked = Some(Unlocked {
             keys,
@@ -692,15 +671,7 @@ impl KeyAgent {
             .pending_rotation
             .as_ref()
             .ok_or_else(|| anyhow!("no storage-key rotation is in progress"))?;
-        let sign_pub = STANDARD.decode(&trust.astation_sign_pub)?;
-        let acked = StorageAck::parse(&verify_astation(&sign_pub, ack)?)?;
-        if acked.account != trust.data_account
-            || acked.sign_gen != trust.sign_gen
-            || acked.device_id != trust.device_id
-            || acked.storage_kid != pending.storage_kid
-        {
-            bail!("Astation's acknowledgement is for a different storage key");
-        }
+        check_storage_ack(&trust, &pending.storage_kid, ack)?;
         let unlocked = self.unlocked.as_ref().ok_or_else(|| anyhow!(LOCKED))?;
         if !pending.initial {
             let next = SealedDeviceKeys::load_from(&self.paths.device_keys_next)?
@@ -1857,6 +1828,11 @@ mod tests {
             new_kid
         );
         assert!(!paths.device_keys_next.exists());
+        // The release proves Astation holds it: status reads this.
+        assert_eq!(
+            TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
+            Some(new_kid.as_str())
+        );
     }
 
     #[test]

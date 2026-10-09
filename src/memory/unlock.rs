@@ -14,11 +14,10 @@ use crate::memory::encoding::dec;
 use crate::memory::key_agent::{
     AgentStatus, KeyAgentApi, RESET, blocking, build_unlock_request, default_agent, running_agent,
 };
-use crate::memory::statements::{
-    SignedWire, StorageAck, StorageRotate, UnlockGrant, sealed_hash, unlock_request_hash,
-    verify_astation,
+use crate::memory::statements::{SignedWire, StorageRotate};
+use crate::memory::storage_key::{
+    SealedDeviceKeys, StorageRotation, UnlockGrantWire, check_storage_ack, check_unlock_grant,
 };
-use crate::memory::storage_key::{SealedDeviceKeys, StorageRotation, UnlockGrantWire};
 use crate::memory::trust::{AstationTrust, TrustStore};
 use crate::memory::verification::{KeyPaths, key_needed};
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -59,13 +58,26 @@ fn now_secs() -> u64 {
 }
 
 /// Astation-supplied text as it may be shown: without control characters
-/// (a relay could otherwise rewrite the terminal), at most 200 characters.
+/// (a relay could otherwise rewrite the terminal) or invisible and bidi
+/// format characters (which could reorder what the user reads), at most
+/// 200 characters.
 fn shown(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(200).collect()
+    text.chars()
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(200)
+        .collect()
 }
 
 /// The next message `wanted` accepts within `wait`, skipping unrelated
 /// traffic and replies `wanted` rejects (stale or forged ones).
+///
+/// Unsigned refusals (`unlockDenied`, `storageKeyRejected`) are accepted and
+/// end the flow. They only cost liveness: a relay that can forge one can
+/// as well drop every reply, and neither unlocks, rotates or abandons
+/// anything by itself (an abandon is still the agent's decision).
 async fn next_reply<L: AstationLink>(
     link: &mut L,
     wait: Duration,
@@ -97,33 +109,11 @@ fn home_pins(paths: &KeyPaths, astation_id: &str) -> Result<AstationTrust> {
 /// Whether `grant` is the pinned Astation's answer to `request` (the
 /// statement this run sent). Anything else is skipped, not handed to the
 /// agent: its single-use key would be spent on a stale or forged reply.
-/// The agent checks everything again.
+/// The agent runs the same check (`check_unlock_grant`) again.
 fn grant_answers(home: &AstationTrust, request: &str, grant: &UnlockGrantWire) -> bool {
-    let check = || -> Result<bool> {
-        let sign_pub = STANDARD.decode(&home.astation_sign_pub)?;
-        let granted = UnlockGrant::parse(&verify_astation(&sign_pub, &grant.grant)?)?;
-        let encapped = STANDARD.decode(&grant.encapped_key)?;
-        let ciphertext = STANDARD.decode(&grant.ciphertext)?;
-        Ok(granted.account == home.data_account
-            && granted.sign_gen == home.sign_gen
-            && granted.device_id == home.device_id
-            && granted.request_hash == unlock_request_hash(&STANDARD.decode(request)?)
-            && granted.sealed_hash == sealed_hash(&encapped, &ciphertext))
-    };
-    check().unwrap_or(false)
-}
-
-/// Whether `ack` is the pinned Astation's acknowledgement of `storage_kid`.
-fn ack_answers(home: &AstationTrust, storage_kid: &str, ack: &SignedWire) -> bool {
-    let check = || -> Result<bool> {
-        let sign_pub = STANDARD.decode(&home.astation_sign_pub)?;
-        let acked = StorageAck::parse(&verify_astation(&sign_pub, ack)?)?;
-        Ok(acked.account == home.data_account
-            && acked.sign_gen == home.sign_gen
-            && acked.device_id == home.device_id
-            && acked.storage_kid == storage_kid)
-    };
-    check().unwrap_or(false)
+    STANDARD
+        .decode(request)
+        .is_ok_and(|request| check_unlock_grant(home, &request, grant).is_ok())
 }
 
 /// The new storage key id a rotation carries.
@@ -351,7 +341,9 @@ async fn send_rotation<L: AstationLink>(
             wait,
             "to store the new storage key",
             |message| match message {
-                AstationMessage::StorageKeyAck { ack } => ack_answers(home, &new_kid, ack),
+                AstationMessage::StorageKeyAck { ack } => {
+                    check_storage_ack(home, &new_kid, ack).is_ok()
+                }
                 AstationMessage::StorageKeyRejected { .. } => true,
                 _ => false,
             },
@@ -429,6 +421,17 @@ pub(crate) async fn escrow_if_needed<L: AstationLink>(
         .map(Some)
 }
 
+/// What `atem pair` did about the storage key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PairEscrow {
+    /// Astation now holds this storage key.
+    Escrowed(String),
+    /// The storage key belongs to this home Astation, not the one paired with.
+    HeldByHome(String),
+    /// Nothing to hand over.
+    Nothing,
+}
+
 /// `atem pair`'s first escrow, in the same run: sends `escrow` (the
 /// verification's `outcome.escrow`, already begun in the agent) and confirms
 /// it; without one, hands over any storage key Astation doesn't hold yet.
@@ -438,9 +441,20 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
     paths: &KeyPaths,
     astation_id: &str,
     escrow: Option<StorageRotation>,
-) -> Result<Option<String>> {
+) -> Result<PairEscrow> {
     let Some(rotation) = escrow else {
-        return escrow_if_needed(link, agent, paths, astation_id).await;
+        // Only the home Astation holds the storage key: pairing with another
+        // one has nothing to hand over.
+        let trust = TrustStore::load_from(&paths.trust)?;
+        if let Some(home) = trust.home().filter(|home| *home != astation_id) {
+            return Ok(PairEscrow::HeldByHome(home.to_string()));
+        }
+        return Ok(
+            match escrow_if_needed(link, agent, paths, astation_id).await? {
+                Some(kid) => PairEscrow::Escrowed(kid),
+                None => PairEscrow::Nothing,
+            },
+        );
     };
     let home = {
         let (paths, astation_id) = (paths.clone(), astation_id.to_string());
@@ -448,7 +462,7 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
     };
     send_rotation(link, agent, astation_id, &home, rotation, ROTATION_TIMEOUT)
         .await
-        .map(Some)
+        .map(PairEscrow::Escrowed)
 }
 
 /// What `atem pair` prints when the first escrow didn't complete.
@@ -511,15 +525,18 @@ pub fn status_report(
     key_problem: Option<&str>,
 ) -> String {
     let (agent_line, storage_kid, waiting) = match agent {
+        // Without the agent, only cred_state.json tells whether Astation
+        // confirmed holding the sealed file's key (R24: until it does, the
+        // keys can't be unlocked once the agent is gone).
         AgentState::NotRunning => (
             "not running (starts with 'atem cred unlock')".to_string(),
             sealed_kid.map(str::to_string),
-            false,
+            sealed_kid.is_some_and(|kid| trust.escrowed_kid() != Some(kid)),
         ),
         AgentState::Unreachable(error) => (
             format!("not answering ({error})"),
             sealed_kid.map(str::to_string),
-            false,
+            sealed_kid.is_some_and(|kid| trust.escrowed_kid() != Some(kid)),
         ),
         AgentState::Running(status) if status.unlocked => (
             "unlocked".to_string(),
@@ -641,12 +658,42 @@ async fn unlock_command(paths: &KeyPaths) -> Result<()> {
         (None, None) => bail!("This device isn't verified yet. Run `atem pair` first."),
     };
     let agent: Arc<dyn KeyAgentApi> = Arc::from(default_agent());
+    let nothing_to_do = {
+        let (agent, paths, home) = (agent.clone(), paths.clone(), home.clone());
+        blocking(move || already_unlocked(agent.as_ref(), &paths, &home)).await?
+    };
+    if let Some(message) = nothing_to_do {
+        println!("{message}");
+        return Ok(());
+    }
     let mut client = connect_home(&home).await?;
     unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
     if key_needed(paths, &home)? {
         request_missing_key(&mut client, &trust, &home).await?;
     }
     Ok(())
+}
+
+/// "Already unlocked" when `atem cred unlock` has nothing to ask Astation:
+/// the keys are unlocked, Astation holds their storage key, no rotation is
+/// waiting to be resent and `K` isn't missing (blocking: agent call).
+fn already_unlocked(
+    agent: &dyn KeyAgentApi,
+    paths: &KeyPaths,
+    home: &str,
+) -> Result<Option<String>> {
+    let status = agent.status()?;
+    if !status.unlocked
+        || !status.escrowed
+        || agent.pending_rotation()?.is_some()
+        || key_needed(paths, home)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "Already unlocked (storage key {}).",
+        status.storage_kid.unwrap_or_default()
+    )))
 }
 
 /// A grant that arrived while the keys were locked was ignored: ask again,
@@ -718,6 +765,8 @@ mod tests {
         stale: Option<AstationMessage>,
         /// Grants are signed by this impostor instead of the pinned Astation.
         forger: Option<FakeAstation>,
+        /// Grants name this storage key id instead of the requested one.
+        grant_kid: Option<String>,
         /// Sending the confirmation fails (the connection dropped).
         fail_confirm: bool,
         abandons: usize,
@@ -735,6 +784,7 @@ mod tests {
                 hang: false,
                 stale: None,
                 forger: None,
+                grant_kid: None,
                 fail_confirm: false,
                 abandons: 0,
                 rotates: 0,
@@ -764,11 +814,16 @@ mod tests {
                                 statement: request,
                                 signature,
                             };
-                            let grant = match &self.forger {
-                                Some(forger) => {
+                            let grant = match (&self.forger, &self.grant_kid) {
+                                (Some(forger), _) => {
                                     self.server.unlock_grant(forger, &request, "0a1b2c3d")?
                                 }
-                                None => self.server.grant_unlock(&request)?,
+                                (None, Some(kid)) => self.server.unlock_grant(
+                                    &self.server.astation,
+                                    &request,
+                                    kid,
+                                )?,
+                                (None, None) => self.server.grant_unlock(&request)?,
                             };
                             AstationMessage::UnlockGrant {
                                 grant: grant.grant,
@@ -1363,9 +1418,8 @@ mod tests {
         assert_eq!(
             pair_escrow(&mut link, &agent, &paths, ASTATION_ID, Some(escrow))
                 .await
-                .unwrap()
-                .as_deref(),
-            Some("0a1b2c3d")
+                .unwrap(),
+            PairEscrow::Escrowed("0a1b2c3d".into())
         );
         assert_eq!(link.rotates, 1);
         assert_eq!(link.server.storage_keys.get("0a1b2c3d"), Some(&[9u8; 32]));
@@ -1386,11 +1440,87 @@ mod tests {
         assert_eq!(
             pair_escrow(&mut link, &agent, &paths, ASTATION_ID, None)
                 .await
-                .unwrap()
-                .as_deref(),
-            Some("0a1b2c3d")
+                .unwrap(),
+            PairEscrow::Escrowed("0a1b2c3d".into())
         );
         assert!(agent.status().unwrap().escrowed);
+    }
+
+    #[tokio::test]
+    async fn a_grant_with_an_invalid_storage_kid_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        server.storage_keys.insert("NOT-A-KID".into(), [1; 32]);
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        link.grant_kid = Some("NOT-A-KID".into());
+        link.hang = true;
+        let wait = Duration::from_millis(200);
+        let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, wait).await);
+        assert!(error.contains("timed out"), "{error}");
+        assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn pairing_with_another_astation_leaves_the_escrow_to_the_home_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, agent) = fresh_device(dir.path());
+        let mut link = ScriptedLink::new(server);
+        let outcome = pair_escrow(&mut link, &agent, &paths, "astation-2", None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, PairEscrow::HeldByHome(ASTATION_ID.into()));
+        assert_eq!(link.rotates, 0);
+    }
+
+    #[test]
+    fn shown_text_drops_bidi_and_format_characters() {
+        let text = "a\u{200b}b\u{200f}c\u{202a}d\u{202e}e\u{2066}f\u{2069}g";
+        assert_eq!(shown(text), "abcdefg");
+    }
+
+    #[test]
+    fn status_without_the_agent_flags_a_storage_key_astation_never_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+        trust.set_escrowed_kid("ffffffff");
+        for agent in [AgentState::NotRunning, AgentState::Unreachable("v2".into())] {
+            let report = status_report(&trust, ASTATION_ID, &agent, Some("0a1b2c3d"), None);
+            assert!(
+                report.contains(
+                    "Storage key: 0a1b2c3d  (not yet held by Astation; run 'atem cred unlock')"
+                ),
+                "{report}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unlock_has_nothing_to_ask_only_when_unlocked_escrowed_and_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        assert_eq!(
+            already_unlocked(agent.as_ref(), &paths, ASTATION_ID).unwrap(),
+            None
+        );
+        let mut link = ScriptedLink::new(server);
+        unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert!(
+            already_unlocked(agent.as_ref(), &paths, ASTATION_ID)
+                .unwrap()
+                .unwrap()
+                .contains("Already unlocked (storage key 0a1b2c3d)")
+        );
+        // A rotation waiting to be resent needs Astation.
+        agent.begin_rotation(ASTATION_ID).unwrap();
+        assert_eq!(
+            already_unlocked(agent.as_ref(), &paths, ASTATION_ID).unwrap(),
+            None
+        );
     }
 
     #[test]

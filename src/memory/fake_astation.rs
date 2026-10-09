@@ -68,6 +68,9 @@ pub(crate) fn sealed_device(dir: &Path, kid: &str) -> (KeyPaths, FakeKeyServer, 
     let keys = DeviceKeys::generate();
     let astation = FakeAstation::new();
     pin(&paths, &astation, &keys, true);
+    let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+    trust.set_escrowed_kid(kid);
+    trust.save_to(&paths.trust).unwrap();
     let storage_key = new_storage_key();
     SealedDeviceKeys::seal(&keys, DEVICE_ID, kid, &storage_key)
         .unwrap()

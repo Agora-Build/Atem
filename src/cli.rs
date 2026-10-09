@@ -1559,6 +1559,7 @@ async fn run_device_verification(
 ) -> Result<()> {
     use crate::memory::key_agent::blocking;
     use crate::memory::trust::TrustStore;
+    use crate::memory::unlock::PairEscrow;
     use crate::memory::verification::{
         AstationKeys, Handshake, KeyPaths, complete_verification, device_keys_for_verification,
     };
@@ -1683,10 +1684,13 @@ async fn run_device_verification(
                     )
                     .await;
                     match escrowed {
-                        Ok(Some(storage_kid)) => {
+                        Ok(PairEscrow::Escrowed(storage_kid)) => {
                             println!("Astation holds this device's storage key ({storage_kid}).")
                         }
-                        Ok(None) => {
+                        Ok(PairEscrow::HeldByHome(home)) => println!(
+                            "This device's storage key is held via your home Astation {home}; nothing to do."
+                        ),
+                        Ok(PairEscrow::Nothing) => {
                             if let Some(warning) = &outcome.warning {
                                 eprintln!("⚠️  {warning}");
                             }
