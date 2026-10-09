@@ -384,10 +384,18 @@ impl KeyAgent {
             bail!("this device's keys are already unlocked");
         }
         let trust = self.home(astation_id)?;
-        let sealed =
-            SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)?.ok_or_else(|| {
-                anyhow!("this device has no sealed keys; run `atem pair` to verify it")
-            })?;
+        // The current file is missing only between a promotion's two renames.
+        let mut sealed = None;
+        for path in [
+            &self.paths.device_keys_sealed,
+            &self.paths.device_keys_next,
+            &self.paths.device_keys_prev,
+        ] {
+            sealed = sealed.or(SealedDeviceKeys::load_from(path)?);
+        }
+        let sealed = sealed.ok_or_else(|| {
+            anyhow!("this device has no sealed keys; run `atem pair` to verify it")
+        })?;
         if sealed.device_id != trust.device_id {
             bail!("device_keys.sealed belongs to another device id");
         }
@@ -489,7 +497,7 @@ impl KeyAgent {
                 .map_err(|_| anyhow!("storage key has the wrong length"))?,
         );
         drop(plain);
-        let (sealed, from_next) = self.sealed_with_kid(&granted.storage_kid)?;
+        let (sealed, source) = self.sealed_with_kid(&granted.storage_kid)?;
         let unlock_auth =
             UnlockAuthKey::load_from(&self.paths.unlock_auth_key)?.ok_or_else(|| {
                 anyhow!("unlock_auth_key is missing; run `atem pair` to verify this device again")
@@ -506,9 +514,17 @@ impl KeyAgent {
         {
             bail!("the sealed keys aren't this device's pinned keys");
         }
-        if from_next {
+        match source {
             // Astation released the key a crashed rotation left pending.
-            promote_next(&self.paths.device_keys_next, &self.paths.device_keys_sealed)?;
+            SealedFile::Next => promote_keeping_prev(&self.paths)?,
+            // Astation holds the current key, so the file it replaced can go.
+            SealedFile::Current => match std::fs::remove_file(&self.paths.device_keys_prev) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into());
+                }
+                _ => {}
+            },
+            SealedFile::Prev => {}
         }
         self.unlocked = Some(Unlocked {
             keys,
@@ -523,6 +539,9 @@ impl KeyAgent {
     }
 
     fn begin_rotation(&mut self, astation_id: &str) -> Result<Reply> {
+        if self.pending_rotation.is_some() {
+            bail!("a storage-key rotation is already in progress; lock the agent to abandon it");
+        }
         let unlocked = self.unlocked.as_ref().ok_or_else(|| anyhow!(LOCKED))?;
         let trust = self.home(astation_id)?;
         if unlocked.device_id != trust.device_id {
@@ -577,9 +596,11 @@ impl KeyAgent {
 
     fn confirm_rotation(&mut self, astation_id: &str, ack: &SignedWire) -> Result<Reply> {
         let trust = self.home(astation_id)?;
+        // Nothing is consumed until the ack checks out: a forged or stale ack
+        // must not cancel the rotation Astation is really holding.
         let pending = self
             .pending_rotation
-            .take()
+            .as_ref()
             .ok_or_else(|| anyhow!("no storage-key rotation is in progress"))?;
         let sign_pub = STANDARD.decode(&trust.astation_sign_pub)?;
         let acked = StorageAck::parse(&verify_astation(&sign_pub, ack)?)?;
@@ -590,17 +611,25 @@ impl KeyAgent {
         {
             bail!("Astation's acknowledgement is for a different storage key");
         }
-        let unlocked = self.unlocked.as_mut().ok_or_else(|| anyhow!(LOCKED))?;
+        let unlocked = self.unlocked.as_ref().ok_or_else(|| anyhow!(LOCKED))?;
+        if !pending.initial {
+            let next = SealedDeviceKeys::load_from(&self.paths.device_keys_next)?
+                .ok_or_else(|| anyhow!("device_keys.sealed.next is missing"))?;
+            if next.storage_kid != pending.storage_kid || next.device_id != trust.device_id {
+                bail!("device_keys.sealed.next is not the file this rotation wrote");
+            }
+        }
+        // Astation holds the key now: record which one.
+        let mut store = TrustStore::load_from(&self.paths.trust)?;
+        store.set_escrowed_kid(&pending.storage_kid);
+        store.save_to(&self.paths.trust)?;
         if pending.initial {
-            // Astation holds the key now: record which one, then (and only
-            // then) drop the plain step-1 file.
-            let mut store = TrustStore::load_from(&self.paths.trust)?;
-            store.set_escrowed_kid(&pending.storage_kid);
-            store.save_to(&self.paths.trust)?;
+            // Only now does the plain step-1 file go.
             remove_plain_keys(&self.paths)?;
         } else {
-            // Phase 3: Astation holds the new key, so the new file becomes current.
-            promote_next(&self.paths.device_keys_next, &self.paths.device_keys_sealed)?;
+            // Phase 3: the new file becomes current. The old one stays as
+            // .prev until an unlock shows Astation really holds the new key.
+            promote_keeping_prev(&self.paths)?;
         }
         let confirm = unlocked.keys.sign_statement(
             &StorageConfirm {
@@ -610,6 +639,8 @@ impl KeyAgent {
             }
             .encode(),
         );
+        let pending = self.pending_rotation.take().expect("checked above");
+        let unlocked = self.unlocked.as_mut().expect("checked above");
         unlocked.storage_kid = pending.storage_kid.clone();
         unlocked.storage_key = pending.storage_key;
         unlocked.escrowed = true;
@@ -619,18 +650,21 @@ impl KeyAgent {
         })
     }
 
-    /// The sealed file the released key belongs to: the current one, or the
-    /// `.next` a rotation left when it crashed after Astation stored the key.
-    fn sealed_with_kid(&self, storage_kid: &str) -> Result<(SealedDeviceKeys, bool)> {
-        if let Some(sealed) = SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)?
-            && sealed.storage_kid == storage_kid
-        {
-            return Ok((sealed, false));
-        }
-        if let Some(next) = SealedDeviceKeys::load_from(&self.paths.device_keys_next)?
-            && next.storage_kid == storage_kid
-        {
-            return Ok((next, true));
+    /// The sealed file the released key belongs to: the current one, the
+    /// `.next` a rotation left when it crashed after Astation stored the key,
+    /// or the `.prev` a promotion kept when Astation turned out to hold only
+    /// the older key.
+    fn sealed_with_kid(&self, storage_kid: &str) -> Result<(SealedDeviceKeys, SealedFile)> {
+        for (path, which) in [
+            (&self.paths.device_keys_sealed, SealedFile::Current),
+            (&self.paths.device_keys_next, SealedFile::Next),
+            (&self.paths.device_keys_prev, SealedFile::Prev),
+        ] {
+            if let Some(sealed) = SealedDeviceKeys::load_from(path)?
+                && sealed.storage_kid == storage_kid
+            {
+                return Ok((sealed, which));
+            }
         }
         bail!("no sealed keys on disk match the storage key Astation released ({storage_kid})")
     }
@@ -700,6 +734,23 @@ impl KeyAgent {
         });
         Ok(())
     }
+}
+
+/// Which sealed file a released storage key opened.
+#[derive(PartialEq, Eq)]
+enum SealedFile {
+    Current,
+    Next,
+    Prev,
+}
+
+/// Renames the current sealed file to `.prev`, then `.next` over it. A crash
+/// between the renames leaves `.prev` + `.next`, which unlock also accepts.
+fn promote_keeping_prev(paths: &KeyPaths) -> Result<()> {
+    if paths.device_keys_sealed.exists() {
+        std::fs::rename(&paths.device_keys_sealed, &paths.device_keys_prev)?;
+    }
+    promote_next(&paths.device_keys_next, &paths.device_keys_sealed)
 }
 
 /// Deletes the plain step-1 `device_keys` file (absent is fine).
@@ -1459,6 +1510,11 @@ mod tests {
         assert_eq!(current.storage_kid, kid);
         server.confirm(&confirm).unwrap();
         assert_eq!(server.storage_keys.keys().collect::<Vec<_>>(), vec![&kid]);
+        assert_eq!(
+            TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
+            Some(kid.as_str()),
+            "every confirmed rotation updates the recorded kid"
+        );
 
         // A stolen copy of the old storage key no longer opens the file.
         let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)
@@ -1528,7 +1584,6 @@ mod tests {
         let forged = FakeAstation::new().sign(&ack(&new_kid).encode());
         assert!(error_of(agent.confirm_rotation(ASTATION_ID, &forged)).contains("signature"));
 
-        agent.begin_rotation(ASTATION_ID).unwrap();
         let wrong = server.astation.sign(&ack("ffffffff").encode());
         assert!(
             error_of(agent.confirm_rotation(ASTATION_ID, &wrong)).contains("different storage key")
@@ -1574,6 +1629,7 @@ mod tests {
             unlock_auth_pub: keys.unlock_auth_pub(),
             storage_keys: Default::default(),
             pending: None,
+            acked: Default::default(),
         };
         (paths, server, keys, agent)
     }
@@ -1634,19 +1690,30 @@ mod tests {
     #[test]
     fn a_plain_file_with_a_different_sealed_kid_is_still_re_sealed() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, _, keys, first) = migrated_device(dir.path());
+        let (paths, _, _, first) = migrated_device(dir.path());
         drop(first);
         let mut trust = TrustStore::load_from(&paths.trust).unwrap();
         trust.set_escrowed_kid("deadbeef");
         trust.save_to(&paths.trust).unwrap();
+        let before = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+            .unwrap()
+            .unwrap()
+            .storage_kid;
         let again = agent(&paths);
         assert!(again.status().unwrap().unlocked);
         assert!(paths.device_keys.exists());
+        let after = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+            .unwrap()
+            .unwrap()
+            .storage_kid;
         assert_ne!(
-            again.status().unwrap().storage_kid.as_deref(),
-            Some("deadbeef")
+            after, before,
+            "the sealed file was rewritten under a fresh key"
         );
-        let _ = keys;
+        assert_eq!(
+            again.status().unwrap().storage_kid.as_deref(),
+            Some(after.as_str())
+        );
     }
 
     #[test]
@@ -1726,5 +1793,168 @@ mod tests {
         let message = error_of(agent.finish_unlock(ASTATION_ID, &signed.statement, &grant));
         assert!(message.contains("different storage key"), "{message}");
         assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[test]
+    fn a_replayed_old_rotate_between_ack_and_confirm_cannot_strand_the_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        // A relay replays an older device-signed rotate from the same key.
+        let old =
+            crate::memory::fake_astation::captured_rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b");
+        assert!(
+            server.accept_rotation(&old).is_err(),
+            "a pending key is a commitment"
+        );
+        let (kid, confirm) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        server.confirm(&confirm).unwrap();
+        drop(agent);
+        let restarted = self::agent(&paths);
+        assert_eq!(unlock(&restarted, &server, &paths).unwrap(), kid);
+        assert_eq!(
+            restarted.public_keys().unwrap(),
+            (keys.device_pub(), keys.device_sign_pub())
+        );
+    }
+
+    #[test]
+    fn a_second_rotation_is_refused_while_one_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        agent.begin_rotation(ASTATION_ID).unwrap();
+        let next = std::fs::read(&paths.device_keys_next).unwrap();
+        assert!(error_of(agent.begin_rotation(ASTATION_ID)).contains("in progress"));
+        assert_eq!(std::fs::read(&paths.device_keys_next).unwrap(), next);
+    }
+
+    #[test]
+    fn a_lost_confirm_is_settled_by_the_next_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        let (kid, _lost_confirm) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        drop(agent);
+
+        let restarted = self::agent(&paths);
+        let (_, request) = request(&restarted, &paths, 9);
+        let grant = server.grant_unlock_confirming(&request).unwrap();
+        assert_eq!(
+            restarted
+                .finish_unlock(ASTATION_ID, &request.statement, &grant)
+                .unwrap(),
+            kid
+        );
+        assert!(server.pending.is_none());
+        assert_eq!(server.storage_keys.keys().collect::<Vec<_>>(), vec![&kid]);
+        // A later rotation goes through.
+        let rotation = restarted.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        let (newer, confirm) = restarted.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        server.confirm(&confirm).unwrap();
+        assert_ne!(newer, kid);
+    }
+
+    #[test]
+    fn a_forged_ack_does_not_consume_the_pending_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let kid = SealedDeviceKeys::load_from(&paths.device_keys_next)
+            .unwrap()
+            .unwrap()
+            .storage_kid;
+        let forged = FakeAstation::new().sign(
+            &StorageAck {
+                account: ACCOUNT.into(),
+                sign_gen: 1,
+                device_id: DEVICE_ID.into(),
+                storage_kid: kid.clone(),
+            }
+            .encode(),
+        );
+        assert!(error_of(agent.confirm_rotation(ASTATION_ID, &forged)).contains("signature"));
+        // The real ack still completes it.
+        let ack = server.accept_rotation(&rotation).unwrap();
+        assert_eq!(agent.confirm_rotation(ASTATION_ID, &ack).unwrap().0, kid);
+    }
+
+    #[test]
+    fn the_next_file_must_match_the_pending_rotation_before_it_is_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "ffffffff", &new_storage_key())
+            .unwrap()
+            .save_to(&paths.device_keys_next)
+            .unwrap();
+        assert!(error_of(agent.confirm_rotation(ASTATION_ID, &ack)).contains(".next"));
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .unwrap()
+                .storage_kid,
+            "0a1b2c3d"
+        );
+        assert!(!paths.device_keys_prev.exists());
+    }
+
+    #[test]
+    fn the_previous_file_goes_only_after_an_unlock_confirms_the_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        let (kid, _lost) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_prev)
+                .unwrap()
+                .expect("promotion keeps the replaced file")
+                .storage_kid,
+            "0a1b2c3d"
+        );
+        drop(agent);
+
+        // Astation still only holds the old key (the confirm was lost and it
+        // rolled back): the old file opens, and the .prev stays.
+        let restarted = self::agent(&paths);
+        let (_, request) = request(&restarted, &paths, 1);
+        let grant = server
+            .unlock_grant(&server.astation, &request, "0a1b2c3d")
+            .unwrap();
+        assert_eq!(
+            restarted
+                .finish_unlock(ASTATION_ID, &request.statement, &grant)
+                .unwrap(),
+            "0a1b2c3d"
+        );
+        assert!(paths.device_keys_prev.exists());
+        restarted.lock_keys().unwrap();
+
+        // An unlock that releases the current kid proves Astation holds it.
+        let (_, request) = self::request(&restarted, &paths, 2);
+        let grant = server.grant_unlock_confirming(&request).unwrap();
+        assert_eq!(
+            restarted
+                .finish_unlock(ASTATION_ID, &request.statement, &grant)
+                .unwrap(),
+            kid
+        );
+        assert!(!paths.device_keys_prev.exists());
     }
 }

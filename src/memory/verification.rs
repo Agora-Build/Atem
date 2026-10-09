@@ -161,6 +161,9 @@ pub struct KeyPaths {
     pub device_keys_sealed: PathBuf,
     /// Written in rotation phase 1, renamed over `device_keys_sealed` in phase 3.
     pub device_keys_next: PathBuf,
+    /// The sealed file a rotation replaced, kept until an unlock proves
+    /// Astation holds the new storage key.
+    pub device_keys_prev: PathBuf,
     pub unlock_auth_key: PathBuf,
     /// The plain X25519 key from #36; deleted once a device is verified.
     pub legacy_device_key: PathBuf,
@@ -178,6 +181,7 @@ impl KeyPaths {
             device_keys: dir.join("device_keys"),
             device_keys_sealed: dir.join("device_keys.sealed"),
             device_keys_next: dir.join("device_keys.sealed.next"),
+            device_keys_prev: dir.join("device_keys.sealed.prev"),
             unlock_auth_key: dir.join("unlock_auth_key"),
             legacy_device_key: dir.join("device_key"),
         }
