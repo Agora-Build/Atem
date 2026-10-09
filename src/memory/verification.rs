@@ -341,7 +341,23 @@ pub fn complete_verification(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    Ok(VerificationOutcome { key_needed: false })
+    Ok(VerificationOutcome {
+        key_needed: key_needed(paths, astation_id)?,
+    })
+}
+
+/// Whether this device is verified with `astation_id`, its signed state
+/// needs `K`, and no usable `K` is stored: then it should send `keyRequest`.
+pub fn key_needed(paths: &KeyPaths, astation_id: &str) -> Result<bool> {
+    let trust = TrustStore::load_from(&paths.trust)?;
+    let Some(entry) = trust.verified(astation_id) else {
+        return Ok(false);
+    };
+    let Some(state) = stored_state(entry)? else {
+        return Ok(false);
+    };
+    Ok(state.mode.requires_key()
+        && EncryptionContext::for_astation_at(astation_id, &paths.data_keys).is_err())
 }
 
 /// The device keys to verify with: the saved ones when this machine already
@@ -1039,5 +1055,35 @@ mod ceremony_tests {
             (Some(Some("89abcdef".into())), None, vec![], 0),
             "the old K and its history must be gone"
         );
+    }
+
+    #[test]
+    fn outcome_says_when_k_is_still_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+            (state(fake, EncryptionMode::On, Some("0123abcd"), 2), vec![])
+        });
+        assert!(result.unwrap().key_needed);
+        assert!(key_needed(&paths, ASTATION_ID).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, device_pub| {
+            (
+                state(fake, EncryptionMode::On, Some("0123abcd"), 2),
+                vec![seal_k_grant(
+                    fake, "acct", "dev-1", device_pub, "0123abcd", [42; 32],
+                )],
+            )
+        });
+        assert!(!result.unwrap().key_needed);
+        assert!(!key_needed(&paths, ASTATION_ID).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+            (state(fake, EncryptionMode::Off, None, 2), vec![])
+        });
+        assert!(!result.unwrap().key_needed);
+        assert!(!key_needed(&paths, ASTATION_ID).unwrap());
+        assert!(!key_needed(&paths, "never-verified").unwrap());
     }
 }

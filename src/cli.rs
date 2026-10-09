@@ -1611,7 +1611,7 @@ async fn run_device_verification(
                     account_state,
                     grants,
                 } => {
-                    complete_verification(
+                    let outcome = complete_verification(
                         &paths,
                         astation_id,
                         handshake.into_keys(),
@@ -1620,6 +1620,14 @@ async fn run_device_verification(
                         &grants,
                     )?;
                     println!("✅ Device verified with Astation (safety code {code}).");
+                    if outcome.key_needed {
+                        client
+                            .send_message(AstationMessage::KeyRequest {
+                                public_key: STANDARD.encode(reveal.device_pub),
+                            })
+                            .await?;
+                        println!("Encryption key requested from Astation");
+                    }
                     Ok(())
                 }
                 AstationMessage::VerifyAbort { reason } => {

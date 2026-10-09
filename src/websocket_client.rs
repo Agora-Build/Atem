@@ -801,8 +801,7 @@ impl AstationClient {
         &self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
-        use crate::memory::crypto::EncryptionContext;
-        use crate::memory::verification::{apply_account_state, apply_grant, Applied, KeyPaths};
+        use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied, KeyPaths};
         use base64::{engine::general_purpose::STANDARD, Engine};
 
         if !matches!(message, AstationMessage::EncryptionMode { .. } | AstationMessage::KeyGrant { .. }) {
@@ -817,15 +816,25 @@ impl AstationClient {
             AstationMessage::KeyGrant { grant } => apply_grant(&paths, &astation_id, grant.as_ref())?,
             _ => unreachable!("filtered above"),
         };
+        let request_key = || async {
+            let keys = crate::memory::device_keys::DeviceKeys::load_from(&paths.device_keys)?
+                .ok_or_else(|| anyhow!("this device's keys are missing; run 'atem pair' to verify it again"))?;
+            self.send_message(AstationMessage::KeyRequest { public_key: STANDARD.encode(keys.device_pub()) }).await?;
+            Ok::<_, anyhow::Error>(Some("Encryption key requested from Astation".to_string()))
+        };
         match applied {
             Applied::Ignored(reason) => Ok(Some(format!("Ignored {reason}"))),
-            Applied::Unchanged => Ok(Some("Account encryption state unchanged".into())),
+            Applied::Unchanged => {
+                // A repeat of the stored state still asks for K if it is missing
+                // (e.g. a keyRequest or grant was lost earlier).
+                if key_needed(&paths, &astation_id)? {
+                    return request_key().await;
+                }
+                Ok(Some("Account encryption state unchanged".into()))
+            }
             Applied::ModeChanged(state) => {
-                if state.mode.requires_key() && EncryptionContext::for_astation(&astation_id).is_err() {
-                    let keys = crate::memory::device_keys::DeviceKeys::load_from(&paths.device_keys)?
-                        .ok_or_else(|| anyhow!("this device's keys are missing; run 'atem pair' to verify it again"))?;
-                    self.send_message(AstationMessage::KeyRequest { public_key: STANDARD.encode(keys.device_pub()) }).await?;
-                    return Ok(Some("Encryption key requested from Astation".into()));
+                if key_needed(&paths, &astation_id)? {
+                    return request_key().await;
                 }
                 self.finish_encryption_migration(&astation_id, state.kid).await
             }
