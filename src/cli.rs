@@ -1541,11 +1541,11 @@ async fn run_device_verification(
     client: &mut crate::websocket_client::AstationClient,
     astation_id: &str,
 ) -> Result<()> {
+    use crate::memory::key_agent::blocking;
     use crate::memory::trust::TrustStore;
     use crate::memory::verification::{
         AstationKeys, Handshake, KeyPaths, complete_verification, device_keys_for_verification,
     };
-    use crate::memory::key_agent::blocking;
     use crate::websocket_client::AstationMessage;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use tokio::time::{Duration, timeout};
@@ -1657,6 +1657,9 @@ async fn run_device_verification(
                     };
                     // outcome.escrow (the first storageKeyRotate) is sent and confirmed by Task 10.
                     println!("✅ Device verified with Astation (safety code {code}).");
+                    if let Some(warning) = &outcome.warning {
+                        eprintln!("⚠️  {warning}");
+                    }
                     if outcome.key_needed {
                         client
                             .send_message(AstationMessage::KeyRequest {

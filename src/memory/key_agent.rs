@@ -32,6 +32,8 @@ pub const PROTOCOL_VERSION: u64 = 1;
 
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 
+pub const LOCK_BEFORE_ESCROW: &str = "this device's storage key isn't with Astation yet; finish `atem pair` or run `atem cred unlock` first";
+
 /// Appended to key-file errors, which never stop the agent (it starts locked).
 pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys (if present), device_keys.sealed and unlock_auth_key, then run `atem pair` to verify this device again.";
 
@@ -292,6 +294,7 @@ impl KeyAgent {
                 storage_kid,
             } => self.abandon_pending(&astation_id, &storage_kid),
             Request::Lock => {
+                self.refuse_lock_before_escrow()?;
                 self.wipe();
                 Ok(Reply::Done)
             }
@@ -303,6 +306,28 @@ impl KeyAgent {
         self.unlocked = None;
         self.pending_unlock = None;
         self.pending_rotation = None;
+    }
+
+    /// Locking would wipe the only copy of a storage key that seals the keys
+    /// on disk while Astation doesn't hold it yet (a fresh device before its
+    /// first escrow): those keys could never be unlocked again. A plain
+    /// step-1 file still on disk makes locking safe (it is re-sealed).
+    fn refuse_lock_before_escrow(&self) -> Result<()> {
+        let Some(unlocked) = &self.unlocked else {
+            return Ok(());
+        };
+        if unlocked.escrowed || self.paths.device_keys.exists() {
+            return Ok(());
+        }
+        // An unreadable current file counts as sealed under this key: keep it.
+        let sealed_here = SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)
+            .map_or(true, |sealed| {
+                sealed.is_some_and(|sealed| sealed.storage_kid == unlocked.storage_kid)
+            });
+        if sealed_here {
+            bail!(LOCK_BEFORE_ESCROW);
+        }
+        Ok(())
     }
 
     fn unlocked(&self) -> Result<&Unlocked> {
@@ -1139,12 +1164,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
         let agent = agent(&paths);
+        // Under a storage key that seals nothing on disk, so it may be locked
+        // before Astation holds it.
         agent
-            .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &[9; 32])
+            .load_unlocked(DEVICE_ID, &keys, "1a2b3c4d", &[9; 32])
             .unwrap();
         let status = agent.status().unwrap();
         assert!(status.unlocked && !status.escrowed);
-        assert_eq!(status.storage_kid.as_deref(), Some("0a1b2c3d"));
+        assert_eq!(status.storage_kid.as_deref(), Some("1a2b3c4d"));
         assert_eq!(
             agent.public_keys().unwrap(),
             (keys.device_pub(), keys.device_sign_pub())
@@ -1162,6 +1189,45 @@ mod tests {
         agent.lock_keys().unwrap();
         assert!(!agent.status().unwrap().unlocked);
         assert!(error_of(agent.open_grant(ASTATION_ID, &grant, None)).contains("locked"));
+    }
+
+    #[test]
+    fn lock_is_refused_while_the_sealed_keys_storage_key_is_not_with_astation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let keys = DeviceKeys::generate();
+        let astation = FakeAstation::new();
+        pin(&paths, &astation, &keys, true);
+        let storage_key = new_storage_key();
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "0a1b2c3d", &storage_key)
+            .unwrap()
+            .save_to(&paths.device_keys_sealed)
+            .unwrap();
+        let agent = agent(&paths);
+        agent
+            .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &storage_key)
+            .unwrap();
+        let error = error_of(agent.lock_keys());
+        assert!(
+            error.contains("storage key isn't with Astation yet"),
+            "{error}"
+        );
+        assert!(agent.status().unwrap().unlocked, "the keys stay");
+
+        let mut server = FakeKeyServer {
+            astation,
+            device_sign_pub: keys.device_sign_pub(),
+            unlock_auth_pub: keys.unlock_auth_pub(),
+            storage_keys: Default::default(),
+            pending: None,
+            acked: Default::default(),
+        };
+        let ack = server
+            .accept_rotation(&agent.begin_rotation(ASTATION_ID).unwrap())
+            .unwrap();
+        agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        agent.lock_keys().unwrap();
+        assert!(!agent.status().unwrap().unlocked);
     }
 
     #[test]

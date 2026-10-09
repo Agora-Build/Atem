@@ -326,7 +326,12 @@ pub fn apply_grant(
     if !agent.status()?.unlocked {
         return Ok(Applied::Locked);
     }
-    let opened = agent.open_grant(astation_id, grant, None)?;
+    let opened = match agent.open_grant(astation_id, grant, None) {
+        Ok(opened) => opened,
+        // Locked between the two calls.
+        Err(error) if format!("{error:#}").contains(LOCKED) => return Ok(Applied::Locked),
+        Err(error) => return Err(error),
+    };
     EncryptionContext::install_grant_at(
         &paths.data_keys,
         astation_id,
@@ -345,6 +350,8 @@ pub struct VerificationOutcome {
     /// Astation (`storageKeyRotate` from old kid `""`), which the CLI must
     /// send, then confirm with the agent once Astation acks it.
     pub escrow: Option<StorageRotation>,
+    /// Something the user must act on although verification succeeded.
+    pub warning: Option<String>,
 }
 
 /// Finishes verification once the user confirmed the code on this device and
@@ -387,6 +394,11 @@ pub fn complete_verification(
         // New keys become the home Astation's to hold: never under another
         // home (R12: the home never moves), which could never unlock them.
         VerificationKeys::Fresh(_) => {
+            if has_device_keys(paths) {
+                bail!(
+                    "this device already has keys; verify with them (run `atem cred unlock`, then `atem pair` again)"
+                );
+            }
             if staged.home_is_set() && staged.home() != Some(astation_id) {
                 bail!(
                     "this device's home Astation is {}; verify with it, or start over (delete ~/.config/atem/cred_state.json too)",
@@ -432,13 +444,10 @@ pub fn complete_verification(
         VerificationKeys::Sealed(_) => None,
     };
     let write = || -> Result<()> {
+        // Fresh keys: no key file exists (checked above).
         if let Some((sealed, unlock_auth)) = &sealed {
             sealed.save_to(&paths.device_keys_sealed)?;
             unlock_auth.save_to(&paths.unlock_auth_key)?;
-            // Spares of earlier keys (none on a first verification) can't stay.
-            remove_if_exists(&paths.device_keys_next)?;
-            remove_if_exists(&paths.device_keys_prev)?;
-            remove_if_exists(&paths.device_keys)?;
         }
         if first {
             // Whatever the unauthenticated path stored for this Astation (mode,
@@ -463,22 +472,34 @@ pub fn complete_verification(
         }
         staged.save_to(&paths.trust)
     };
-    let written = write();
-    if written.is_err() && sealed.is_some() {
-        // The agent must not hold keys whose sealed file isn't on disk.
-        let _ = agent.lock_keys();
+    if let Err(error) = write() {
+        if sealed.is_some() {
+            // Undo the fresh keys entirely: no sealed file without its
+            // verification, and no agent holding keys that aren't on disk.
+            // With the files gone the agent accepts the lock.
+            let _ = remove_if_exists(&paths.device_keys_sealed);
+            let _ = remove_if_exists(&paths.unlock_auth_key);
+            let _ = agent.lock_keys();
+        }
+        return Err(error);
     }
-    written?;
     remove_if_exists(&paths.legacy_device_key)?;
-    let escrow = match sealed {
-        Some(_) => Some(agent.begin_rotation(astation_id).context(
-            "the device is verified, but its storage key couldn't be prepared for Astation",
-        )?),
-        None => None,
+    let (escrow, warning) = match sealed {
+        Some(_) => match agent.begin_rotation(astation_id) {
+            Ok(rotation) => (Some(rotation), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "this device's storage key couldn't be prepared for Astation ({error:#}); run `atem cred unlock` before this machine restarts"
+                )),
+            ),
+        },
+        None => (None, None),
     };
     Ok(VerificationOutcome {
         key_needed: key_needed(paths, astation_id)?,
         escrow,
+        warning,
     })
 }
 
@@ -504,6 +525,19 @@ pub fn key_needed(paths: &KeyPaths, astation_id: &str) -> Result<bool> {
         && EncryptionContext::for_astation_at(astation_id, &paths.data_keys).is_err())
 }
 
+/// Whether this device has keys on disk: a plain step-1 file, or any sealed
+/// file (the current one, or a rotation's `.next` / `.prev`).
+fn has_device_keys(paths: &KeyPaths) -> bool {
+    [
+        &paths.device_keys,
+        &paths.device_keys_sealed,
+        &paths.device_keys_next,
+        &paths.device_keys_prev,
+    ]
+    .into_iter()
+    .any(|path| path.symlink_metadata().is_ok())
+}
+
 /// The keys to verify with: this device's sealed keys when it has them (so
 /// every Astation pins the same device key), fresh ones otherwise. Sealed
 /// keys are revealed only while the key agent holds them unlocked; starting
@@ -512,7 +546,7 @@ pub fn device_keys_for_verification(
     paths: &KeyPaths,
     agent: &dyn KeyAgentApi,
 ) -> Result<VerificationKeys> {
-    if !paths.device_keys_sealed.exists() && !paths.device_keys.exists() {
+    if !has_device_keys(paths) {
         return Ok(VerificationKeys::Fresh(DeviceKeys::generate()));
     }
     if !agent.status()?.unlocked {
@@ -1441,14 +1475,14 @@ mod ceremony_tests {
         let error = error_of(device_keys_for_verification(&paths, &rebooted));
         assert!(error.contains("atem cred unlock"), "{error}");
 
-        // Locked between the handshake and Astation's certificate: nothing changes.
+        // The agent restarted (locked) between the handshake and Astation's
+        // certificate: nothing changes.
         let keys = device_keys_for_verification(&paths, &agent).unwrap();
         let (handshake, certificate) = start(&paths, &fake, keys, 8, 3);
-        agent.lock_keys().unwrap();
         let before = std::fs::read(&paths.trust).unwrap();
         let error = error_of(complete_verification(
             &paths,
-            &agent,
+            &rebooted,
             ASTATION_ID,
             handshake.into_keys(),
             &fake.sign(&certificate.encode()),
@@ -1571,6 +1605,177 @@ mod ceremony_tests {
         assert!(matches!(
             apply_grant(&paths, &agent, ASTATION_ID, Some(&grant)).unwrap(),
             Applied::KeyInstalled(_)
+        ));
+    }
+
+    /// Answers `Status` from one agent and everything else from another
+    /// (e.g. a lock between the two calls), or fails `BeginRotation`.
+    struct Scripted {
+        status: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        rest: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        fail_rotation: bool,
+    }
+
+    impl KeyAgentApi for Scripted {
+        fn call(
+            &self,
+            request: crate::memory::key_agent::Request,
+        ) -> Result<crate::memory::key_agent::Reply> {
+            use crate::memory::key_agent::Request;
+            match request {
+                Request::Status => self.status.call(request),
+                Request::BeginRotation { .. } if self.fail_rotation => {
+                    bail!("Astation's encryption key is unusable")
+                }
+                _ => self.rest.call(request),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_write_on_a_fresh_device_leaves_no_sealed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
+        // cred_state.json can't be saved (its temp path is a non-empty
+        // directory): the last write, after the key files, fails.
+        let blocker = paths.trust.with_extension("tmp");
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+        assert!(
+            complete_verification(
+                &paths,
+                &agent,
+                ASTATION_ID,
+                handshake.into_keys(),
+                &fake.sign(&certificate.encode()),
+                &state(&fake, EncryptionMode::Off, None, 2),
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            !agent.status().unwrap().unlocked,
+            "the agent is left locked"
+        );
+        assert!(!paths.device_keys_sealed.exists(), "no sealed keys left");
+        assert!(!paths.unlock_auth_key.exists(), "no unlock_auth_key left");
+        assert!(
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .verified(ASTATION_ID)
+                .is_none()
+        );
+        assert!(matches!(
+            device_keys_for_verification(&paths, &agent).unwrap(),
+            VerificationKeys::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn any_sealed_file_means_this_device_has_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let keys = DeviceKeys::generate();
+        let storage_key = new_storage_key();
+        for (path, kid) in [
+            (&paths.device_keys_next, "0a1b2c3d"),
+            (&paths.device_keys_prev, "1a2b3c4d"),
+        ] {
+            SealedDeviceKeys::seal(&keys, "dev-1", kid, &storage_key)
+                .unwrap()
+                .save_to(path)
+                .unwrap();
+        }
+        let agent = test_agent(&paths);
+        let error = error_of(device_keys_for_verification(&paths, &agent));
+        assert!(error.contains("atem cred unlock"), "{error}");
+
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
+        let error = error_of(complete_verification(
+            &paths,
+            &agent,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(&fake, EncryptionMode::Off, None, 2),
+            &[],
+        ));
+        assert!(error.contains("already has keys"), "{error}");
+        assert!(!agent.status().unwrap().unlocked);
+        assert!(!paths.device_keys_sealed.exists() && !paths.unlock_auth_key.exists());
+        assert!(
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .verified(ASTATION_ID)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_failed_escrow_preparation_still_verifies_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = Scripted {
+            status: test_agent(&paths),
+            rest: test_agent(&paths),
+            fail_rotation: true,
+        };
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
+        let outcome = complete_verification(
+            &paths,
+            &agent,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(&fake, EncryptionMode::On, Some("0123abcd"), 2),
+            &[],
+        )
+        .unwrap();
+        assert!(outcome.escrow.is_none());
+        let warning = outcome.warning.expect("a warning about the escrow");
+        assert!(warning.contains("atem cred unlock"), "{warning}");
+        assert!(outcome.key_needed, "K is still asked for");
+        assert!(
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .verified(ASTATION_ID)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_lock_between_status_and_open_is_reported_as_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let unlocked = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (certificate, _) = verified_device(
+            &paths,
+            &unlocked,
+            &fake,
+            EncryptionMode::On,
+            Some("0123abcd"),
+        );
+        let grant = seal_k_grant(
+            &fake,
+            "acct",
+            "dev-1",
+            certificate.device_pub,
+            "0123abcd",
+            [42; 32],
+        );
+        let raced = Scripted {
+            status: unlocked,
+            rest: test_agent(&paths),
+            fail_rotation: false,
+        };
+        assert!(matches!(
+            apply_grant(&paths, &raced, ASTATION_ID, Some(&grant)).unwrap(),
+            Applied::Locked
         ));
     }
 }

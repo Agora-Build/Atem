@@ -821,6 +821,10 @@ impl AstationClient {
             _ => unreachable!("filtered above"),
         };
         let request_key = || async {
+            // A grant can't be opened while the keys are locked: ask after `atem cred unlock`.
+            if !blocking(|| default_agent().status().map(|status| status.unlocked)).await? {
+                return Ok(Some(format!("Encryption key needed, but {LOCKED}")));
+            }
             // Astation answers only for the device key it pinned, so ask with exactly that one.
             let trust = crate::memory::trust::TrustStore::load_from(&paths.trust)?;
             let public_key = trust
