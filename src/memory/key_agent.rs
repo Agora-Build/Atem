@@ -4,12 +4,21 @@
 //! when the process exits. See designs/e2e-encryption.md "Keys on disk (atem)".
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
-use crate::memory::grant::{GrantWire, OpenedGrant, open_grant as open_sealed_grant};
-use crate::memory::storage_key::{SealedDeviceKeys, StorageKey, new_storage_key, new_storage_kid};
+use crate::memory::encoding::dec;
+use crate::memory::grant::{GrantWire, OpenedGrant, hpke_open, open_grant as open_sealed_grant};
+use crate::memory::statements::{
+    SignedWire, UnlockGrant, UnlockRequest, sealed_hash, unlock_info, unlock_request_hash,
+    verify_astation,
+};
+use crate::memory::storage_key::{
+    SealedDeviceKeys, StorageKey, UnlockGrantWire, new_storage_key, new_storage_kid, promote_next,
+};
 use crate::memory::trust::{AstationTrust, TrustStore};
 use crate::memory::verification::KeyPaths;
 
@@ -48,6 +57,16 @@ pub enum Request {
         #[serde(default)]
         trust: Option<AstationTrust>,
     },
+    /// Starts an unlock through the home Astation: a single-use X25519 key.
+    BeginUnlock {
+        astation_id: String,
+    },
+    /// Astation's answer to the request built from the challenge.
+    FinishUnlock {
+        astation_id: String,
+        request: String,
+        grant: UnlockGrantWire,
+    },
     Lock,
 }
 
@@ -69,6 +88,16 @@ pub enum Reply {
         kid: String,
         key: Zeroizing<String>,
     },
+    UnlockChallenge {
+        e_pub: String,
+        nonce: String,
+        storage_kid: String,
+        device_id: String,
+        account: String,
+    },
+    Unlocked {
+        storage_kid: String,
+    },
     Done,
 }
 
@@ -83,7 +112,7 @@ pub struct AgentStatus {
 
 struct Unlocked {
     keys: DeviceKeys,
-    #[allow(dead_code)] // used by unlock and rotation (Tasks 5-6)
+    #[allow(dead_code)] // used by rotation (Task 6)
     device_id: String,
     storage_kid: String,
     #[allow(dead_code)] // used by rotation (Task 6)
@@ -91,14 +120,54 @@ struct Unlocked {
     escrowed: bool,
 }
 
+/// The single-use key of an unlock in progress. `StaticSecret` zeroizes on drop.
+struct PendingUnlock {
+    astation_id: String,
+    e_secret: StaticSecret,
+    e_pub: [u8; 32],
+    nonce: [u8; 32],
+}
+
+/// What the CLI needs to build and sign an unlock request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlockChallenge {
+    pub e_pub: [u8; 32],
+    pub nonce: [u8; 32],
+    pub storage_kid: String,
+    pub device_id: String,
+    pub account: String,
+}
+
+/// The CLI's half: the `atem-unlock-request-v1` statement for `challenge`,
+/// signed by the unlock-auth key. Auto-unlock tickets come in build step 7.
+pub fn build_unlock_request(
+    challenge: &UnlockChallenge,
+    boot_id: &str,
+    time: u64,
+    unlock_auth: &UnlockAuthKey,
+) -> SignedWire {
+    let statement = UnlockRequest {
+        account: challenge.account.clone(),
+        device_id: challenge.device_id.clone(),
+        boot_id: boot_id.into(),
+        ticket: String::new(),
+        e_pub: challenge.e_pub,
+        nonce: challenge.nonce,
+        time,
+        storage_kid: challenge.storage_kid.clone(),
+    }
+    .encode();
+    unlock_auth.sign_statement(&statement)
+}
+
 pub struct KeyAgent {
     paths: KeyPaths,
     unlocked: Option<Unlocked>,
+    pending_unlock: Option<PendingUnlock>,
 }
 
 /// Opens a sealed device-keys file only when its header names the device and
 /// the storage key the caller expects; anything else fails closed.
-#[allow(dead_code)] // used by unlock and rotation (Tasks 5-6)
 pub(crate) fn open_sealed_checked(
     sealed: &SealedDeviceKeys,
     device_id: &str,
@@ -127,6 +196,7 @@ impl KeyAgent {
         let mut agent = Self {
             paths,
             unlocked: None,
+            pending_unlock: None,
         };
         if let Err(error) = agent.migrate_plain_keys() {
             eprintln!("key agent: {error:#}");
@@ -165,6 +235,12 @@ impl KeyAgent {
                 grant,
                 trust,
             } => self.open_grant(&astation_id, &grant, trust),
+            Request::BeginUnlock { astation_id } => self.begin_unlock(&astation_id),
+            Request::FinishUnlock {
+                astation_id,
+                request,
+                grant,
+            } => self.finish_unlock(&astation_id, &request, &grant),
             Request::Lock => {
                 self.wipe();
                 Ok(Reply::Done)
@@ -175,6 +251,7 @@ impl KeyAgent {
     /// Drops every secret; their types zeroize on drop.
     fn wipe(&mut self) {
         self.unlocked = None;
+        self.pending_unlock = None;
     }
 
     fn unlocked(&self) -> Result<&Unlocked> {
@@ -247,6 +324,175 @@ impl KeyAgent {
             kid: opened.kid,
             key,
         })
+    }
+
+    /// The pins of the home Astation, which must be `astation_id`.
+    fn home(&self, astation_id: &str) -> Result<AstationTrust> {
+        let store = TrustStore::load_from(&self.paths.trust)?;
+        let home = store.home().ok_or_else(|| {
+            anyhow!("this device has no home Astation yet; run `atem pair` to verify it")
+        })?;
+        if home != astation_id {
+            bail!(
+                "this device's keys unlock through its home Astation ({home}), not {astation_id}"
+            );
+        }
+        store
+            .verified(home)
+            .cloned()
+            .ok_or_else(|| anyhow!("the home Astation's pins are missing; run `atem pair`"))
+    }
+
+    fn begin_unlock(&mut self, astation_id: &str) -> Result<Reply> {
+        if self.unlocked.is_some() {
+            bail!("this device's keys are already unlocked");
+        }
+        let trust = self.home(astation_id)?;
+        let sealed =
+            SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)?.ok_or_else(|| {
+                anyhow!("this device has no sealed keys; run `atem pair` to verify it")
+            })?;
+        if sealed.device_id != trust.device_id {
+            bail!("device_keys.sealed belongs to another device id");
+        }
+        let e_secret = StaticSecret::random_from_rng(OsRng);
+        let e_pub = PublicKey::from(&e_secret).to_bytes();
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        self.pending_unlock = Some(PendingUnlock {
+            astation_id: astation_id.into(),
+            e_secret,
+            e_pub,
+            nonce,
+        });
+        Ok(Reply::UnlockChallenge {
+            e_pub: STANDARD.encode(e_pub),
+            nonce: STANDARD.encode(nonce),
+            storage_kid: sealed.storage_kid,
+            device_id: trust.device_id,
+            account: trust.data_account,
+        })
+    }
+
+    fn finish_unlock(
+        &mut self,
+        astation_id: &str,
+        request: &str,
+        grant: &UnlockGrantWire,
+    ) -> Result<Reply> {
+        // Single use: E is gone after this call, whatever the outcome.
+        let pending = self
+            .pending_unlock
+            .take()
+            .ok_or_else(|| anyhow!("no unlock is in progress; run `atem cred unlock` again"))?;
+        if pending.astation_id != astation_id {
+            bail!("the unlock reply came from a different Astation");
+        }
+        let trust = self.home(astation_id)?;
+        let request_bytes = STANDARD
+            .decode(request)
+            .context("unlock request is not base64")?;
+        let sent = UnlockRequest::parse(&dec(&request_bytes)?)?;
+        if sent.e_pub != pending.e_pub || sent.nonce != pending.nonce {
+            bail!("the unlock reply answers a different request");
+        }
+        if sent.account != trust.data_account || sent.device_id != trust.device_id {
+            bail!("the unlock request names another account or device");
+        }
+        let request_hash = unlock_request_hash(&request_bytes);
+        let sign_pub = STANDARD.decode(&trust.astation_sign_pub)?;
+        let granted = UnlockGrant::parse(&verify_astation(&sign_pub, &grant.grant)?)?;
+        if granted.account != trust.data_account {
+            bail!("unlock grant is for a different account");
+        }
+        if granted.sign_gen != trust.sign_gen {
+            bail!("unlock grant is signed by a different signing-key generation");
+        }
+        if granted.device_id != trust.device_id {
+            bail!("unlock grant is for a different device");
+        }
+        if granted.request_hash != request_hash {
+            bail!("unlock grant answers a different request");
+        }
+        if !crate::memory::crypto::valid_kid(&granted.storage_kid) {
+            bail!("unlock grant has an invalid storage key id");
+        }
+        let encapped = STANDARD
+            .decode(&grant.encapped_key)
+            .context("unlock grant key encapsulation is not base64")?;
+        let ciphertext = STANDARD
+            .decode(&grant.ciphertext)
+            .context("unlock grant ciphertext is not base64")?;
+        if sealed_hash(&encapped, &ciphertext) != granted.sealed_hash {
+            bail!("unlock grant does not match what Astation signed");
+        }
+        let info = unlock_info(
+            &granted.account,
+            &granted.device_id,
+            &granted.storage_kid,
+            &request_hash,
+        );
+        // E's private key is dropped as soon as the storage key is open.
+        let plain = {
+            let e_secret = Zeroizing::new(pending.e_secret.to_bytes());
+            drop(pending);
+            hpke_open(&e_secret, &encapped, &ciphertext, &info)
+                .context("the storage key could not be opened")?
+        };
+        let storage_key: StorageKey = Zeroizing::new(
+            plain
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("storage key has the wrong length"))?,
+        );
+        drop(plain);
+        let (sealed, from_next) = self.sealed_with_kid(&granted.storage_kid)?;
+        let unlock_auth =
+            UnlockAuthKey::load_from(&self.paths.unlock_auth_key)?.ok_or_else(|| {
+                anyhow!("unlock_auth_key is missing; run `atem pair` to verify this device again")
+            })?;
+        let keys = open_sealed_checked(
+            &sealed,
+            &trust.device_id,
+            &granted.storage_kid,
+            &storage_key,
+            unlock_auth,
+        )?;
+        if STANDARD.encode(keys.device_pub()) != trust.device_pub
+            || STANDARD.encode(keys.device_sign_pub()) != trust.device_sign_pub
+        {
+            bail!("the sealed keys aren't this device's pinned keys");
+        }
+        if from_next {
+            // Astation released the key a crashed rotation left pending.
+            promote_next(&self.paths.device_keys_next, &self.paths.device_keys_sealed)?;
+        }
+        self.unlocked = Some(Unlocked {
+            keys,
+            device_id: trust.device_id,
+            storage_kid: granted.storage_kid.clone(),
+            storage_key,
+            escrowed: true,
+        });
+        Ok(Reply::Unlocked {
+            storage_kid: granted.storage_kid,
+        })
+    }
+
+    /// The sealed file the released key belongs to: the current one, or the
+    /// `.next` a rotation left when it crashed after Astation stored the key.
+    fn sealed_with_kid(&self, storage_kid: &str) -> Result<(SealedDeviceKeys, bool)> {
+        if let Some(sealed) = SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)?
+            && sealed.storage_kid == storage_kid
+        {
+            return Ok((sealed, false));
+        }
+        if let Some(next) = SealedDeviceKeys::load_from(&self.paths.device_keys_next)?
+            && next.storage_kid == storage_kid
+        {
+            return Ok((next, true));
+        }
+        bail!("no sealed keys on disk match the storage key Astation released ({storage_kid})")
     }
 
     /// A plain step-1 `device_keys` is authoritative whenever it exists (it stays until the first escrow is confirmed): seal
@@ -337,6 +583,44 @@ pub trait KeyAgentApi: Send + Sync {
                 *decode32(&device_pub, "device key")?,
                 *decode32(&device_sign_pub, "device signing key")?,
             )),
+            _ => unexpected(),
+        }
+    }
+
+    fn begin_unlock(&self, astation_id: &str) -> Result<UnlockChallenge> {
+        match self.call(Request::BeginUnlock {
+            astation_id: astation_id.into(),
+        })? {
+            Reply::UnlockChallenge {
+                e_pub,
+                nonce,
+                storage_kid,
+                device_id,
+                account,
+            } => Ok(UnlockChallenge {
+                e_pub: *decode32(&e_pub, "unlock key")?,
+                nonce: *decode32(&nonce, "unlock nonce")?,
+                storage_kid,
+                device_id,
+                account,
+            }),
+            _ => unexpected(),
+        }
+    }
+
+    /// Returns the storage key id Astation released.
+    fn finish_unlock(
+        &self,
+        astation_id: &str,
+        request: &str,
+        grant: &UnlockGrantWire,
+    ) -> Result<String> {
+        match self.call(Request::FinishUnlock {
+            astation_id: astation_id.into(),
+            request: request.into(),
+            grant: grant.clone(),
+        })? {
+            Reply::Unlocked { storage_kid } => Ok(storage_kid),
             _ => unexpected(),
         }
     }
@@ -640,5 +924,278 @@ mod tests {
             auth(),
         ));
         assert!(message.contains("storage key"), "{message}");
+    }
+
+    use crate::memory::encoding::dec;
+    use crate::memory::fake_astation::FakeKeyServer;
+    use crate::memory::statements::{SignedWire, UnlockGrant, UnlockRequest};
+
+    /// What the CLI does: take a challenge, sign the request.
+    fn request(
+        agent: &Mutex<KeyAgent>,
+        paths: &KeyPaths,
+        time: u64,
+    ) -> (UnlockChallenge, SignedWire) {
+        let challenge = agent.begin_unlock(ASTATION_ID).unwrap();
+        let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)
+            .unwrap()
+            .unwrap();
+        let request = build_unlock_request(&challenge, "boot-1", time, &unlock_auth);
+        (challenge, request)
+    }
+
+    /// A whole unlock against `server`.
+    fn unlock(agent: &Mutex<KeyAgent>, server: &FakeKeyServer, paths: &KeyPaths) -> Result<String> {
+        let (_, request) = request(agent, paths, 1_760_000_000);
+        let grant = server.grant_unlock(&request)?;
+        agent.finish_unlock(ASTATION_ID, &request.statement, &grant)
+    }
+
+    #[test]
+    fn unlock_opens_the_sealed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        assert_eq!(unlock(&agent, &server, &paths).unwrap(), "0a1b2c3d");
+        let status = agent.status().unwrap();
+        assert!(status.unlocked && status.escrowed);
+        assert_eq!(
+            agent.public_keys().unwrap(),
+            (keys.device_pub(), keys.device_sign_pub())
+        );
+        assert!(error_of(agent.begin_unlock(ASTATION_ID)).contains("already unlocked"));
+    }
+
+    #[test]
+    fn the_challenge_names_this_device_and_a_fresh_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let first = agent.begin_unlock(ASTATION_ID).unwrap();
+        assert_eq!(
+            (
+                first.account.as_str(),
+                first.device_id.as_str(),
+                first.storage_kid.as_str()
+            ),
+            (ACCOUNT, DEVICE_ID, "0a1b2c3d")
+        );
+        let second = agent.begin_unlock(ASTATION_ID).unwrap();
+        assert_ne!(first.e_pub, second.e_pub);
+        assert_ne!(first.nonce, second.nonce);
+        let (_, signed) = request(&agent, &paths, 7);
+        let parsed =
+            UnlockRequest::parse(&dec(&STANDARD.decode(&signed.statement).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            (parsed.boot_id.as_str(), parsed.ticket.as_str(), parsed.time),
+            ("boot-1", "", 7)
+        );
+    }
+
+    #[test]
+    fn a_relay_swapped_e_pub_is_refused_on_both_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (challenge, honest) = request(&agent, &paths, 1);
+        let relay_key = x25519_dalek::PublicKey::from(
+            &x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+        )
+        .to_bytes();
+        // The relay swaps in its own e_pub: Astation's unlock-auth check fails.
+        let mut swapped =
+            UnlockRequest::parse(&dec(&STANDARD.decode(&honest.statement).unwrap()).unwrap())
+                .unwrap();
+        swapped.e_pub = relay_key;
+        let forged = SignedWire {
+            statement: STANDARD.encode(swapped.encode()),
+            signature: honest.signature.clone(),
+        };
+        assert!(server.grant_unlock(&forged).is_err());
+        // Even a validly signed request for another e_pub doesn't unlock this agent.
+        let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)
+            .unwrap()
+            .unwrap();
+        let other = UnlockChallenge {
+            e_pub: relay_key,
+            ..challenge
+        };
+        let relay_request = build_unlock_request(&other, "boot-1", 1, &unlock_auth);
+        let grant = server.grant_unlock(&relay_request).unwrap();
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &relay_request.statement, &grant))
+                .contains("different request")
+        );
+        assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[test]
+    fn a_replayed_grant_for_an_old_request_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (_, old_request) = request(&agent, &paths, 1);
+        let old_grant = server.grant_unlock(&old_request).unwrap();
+        agent
+            .finish_unlock(ASTATION_ID, &old_request.statement, &old_grant)
+            .unwrap();
+        agent.lock_keys().unwrap();
+
+        // After a lock (or reboot) the relay replays the recorded exchange.
+        let (_, new_request) = request(&agent, &paths, 2);
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &old_request.statement, &old_grant))
+                .contains("different request")
+        );
+        // E is single use: the failed attempt consumed it.
+        let new_grant = server.grant_unlock(&new_request).unwrap();
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &new_request.statement, &new_grant))
+                .contains("no unlock is in progress")
+        );
+        // A fresh request paired with the old grant: the request hash differs.
+        let (_, fresh) = request(&agent, &paths, 3);
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &fresh.statement, &old_grant))
+                .contains("different request")
+        );
+        assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[test]
+    fn a_grant_signed_by_anyone_else_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (_, request) = request(&agent, &paths, 1);
+        let forged = server
+            .unlock_grant(&FakeAstation::new(), &request, "0a1b2c3d")
+            .unwrap();
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &request.statement, &forged))
+                .contains("signature")
+        );
+        assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[test]
+    fn a_tampered_seal_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (_, request) = request(&agent, &paths, 1);
+        let mut grant = server.grant_unlock(&request).unwrap();
+        let mut ciphertext = STANDARD.decode(&grant.ciphertext).unwrap();
+        ciphertext[0] ^= 1;
+        grant.ciphertext = STANDARD.encode(ciphertext);
+        assert!(
+            error_of(agent.finish_unlock(ASTATION_ID, &request.statement, &grant))
+                .contains("does not match what Astation signed")
+        );
+    }
+
+    #[test]
+    fn only_the_home_astation_unlocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        assert!(error_of(agent.begin_unlock("astation-2")).contains("home Astation"));
+    }
+
+    #[test]
+    fn a_device_without_a_verified_home_cannot_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        std::fs::remove_file(&paths.trust).unwrap();
+        let agent = agent(&paths);
+        assert!(error_of(agent.begin_unlock(ASTATION_ID)).contains("no home Astation"));
+    }
+
+    /// Re-signs the honest grant with one statement field changed.
+    fn tampered_grant(
+        server: &FakeKeyServer,
+        request: &SignedWire,
+        change: impl Fn(&mut UnlockGrant),
+    ) -> crate::memory::storage_key::UnlockGrantWire {
+        let honest = server.grant_unlock(request).unwrap();
+        let bytes = STANDARD.decode(&honest.grant.statement).unwrap();
+        let mut statement = UnlockGrant::parse(&dec(&bytes).unwrap()).unwrap();
+        change(&mut statement);
+        crate::memory::storage_key::UnlockGrantWire {
+            grant: server.astation.sign(&statement.encode()),
+            ..honest
+        }
+    }
+
+    #[test]
+    fn a_grant_with_any_wrong_field_leaves_the_agent_locked() {
+        type Change = Box<dyn Fn(&mut UnlockGrant)>;
+        let cases: Vec<(&str, Change, &str)> = vec![
+            (
+                "account",
+                Box::new(|g| g.account = "other".into()),
+                "different account",
+            ),
+            (
+                "sign_gen",
+                Box::new(|g| g.sign_gen = 9),
+                "signing-key generation",
+            ),
+            (
+                "device_id",
+                Box::new(|g| g.device_id = "dev-2".into()),
+                "different device",
+            ),
+            (
+                "storage_kid",
+                Box::new(|g| g.storage_kid = "ffffffff".into()),
+                "could not be opened",
+            ),
+            (
+                "bad storage_kid",
+                Box::new(|g| g.storage_kid = "NOPE".into()),
+                "invalid storage key id",
+            ),
+            (
+                "request_hash",
+                Box::new(|g| g.request_hash = [0; 32]),
+                "different request",
+            ),
+        ];
+        for (name, change, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+            let agent = agent(&paths);
+            let (_, request) = request(&agent, &paths, 1);
+            let grant = tampered_grant(&server, &request, change);
+            let message = error_of(agent.finish_unlock(ASTATION_ID, &request.statement, &grant));
+            assert!(message.contains(expected), "{name}: {message}");
+            assert!(!agent.status().unwrap().unlocked, "{name}");
+            // E was consumed.
+            assert!(
+                error_of(agent.finish_unlock(ASTATION_ID, &request.statement, &grant))
+                    .contains("no unlock is in progress"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sealed_file_for_another_device_is_refused_after_the_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let (_, request) = request(&agent, &paths, 1);
+        let grant = server.grant_unlock(&request).unwrap();
+        // The file is swapped for one naming another device, under the same key.
+        let storage_key = server.storage_keys["0a1b2c3d"];
+        SealedDeviceKeys::seal(&keys, "dev-2", "0a1b2c3d", &Zeroizing::new(storage_key))
+            .unwrap()
+            .save_to(&paths.device_keys_sealed)
+            .unwrap();
+        let message = error_of(agent.finish_unlock(ASTATION_ID, &request.statement, &grant));
+        assert!(message.contains("another device"), "{message}");
+        assert!(!agent.status().unwrap().unlocked);
     }
 }
