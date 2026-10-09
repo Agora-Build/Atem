@@ -1095,8 +1095,7 @@ pub async fn blocking<T: Send + 'static>(
 pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
     #[cfg(unix)]
     {
-        use crate::memory::agent_socket::{KeyAgentClient, agent_socket_path};
-        let client = KeyAgentClient::at(agent_socket_path());
+        let client = crate::memory::agent_socket::KeyAgentClient::existing();
         if client.is_running() {
             return Some(Box::new(client));
         }

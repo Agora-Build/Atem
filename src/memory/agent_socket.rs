@@ -40,10 +40,18 @@ fn own_uid() -> u32 {
 /// `$XDG_RUNTIME_DIR/atem/agent.sock` when that directory is safe, else
 /// `~/.config/atem/agent.sock`.
 pub fn agent_socket_path() -> PathBuf {
-    let config = crate::config::AtemConfig::config_dir();
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+    socket_path_in(
+        &crate::config::AtemConfig::config_dir(),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    )
+}
+
+/// The socket path for `config_dir` and the runtime dir `runtime_dir`
+/// (used only when it is safe).
+fn socket_path_in(config_dir: &Path, runtime_dir: Option<OsString>) -> PathBuf {
+    let runtime = runtime_dir
         .filter(|dir| !dir.is_empty() && check_parent_dir(Path::new(dir), own_uid()).is_ok());
-    socket_path_from(runtime, &config)
+    socket_path_from(runtime, config_dir)
 }
 
 fn socket_path_from(runtime_dir: Option<OsString>, config_dir: &Path) -> PathBuf {
@@ -310,13 +318,19 @@ fn respond(agent: &Mutex<KeyAgent>, line: &str) -> WipingBuf {
     })
 }
 
-/// Another key agent holds the lock or answers on the socket.
+/// Another key agent holds a lock or answers on the socket.
 #[derive(Debug)]
-pub struct AlreadyRunning(PathBuf);
+pub struct AlreadyRunning(String);
+
+impl AlreadyRunning {
+    fn at(socket: &Path) -> Self {
+        Self(format!("at {}", socket.display()))
+    }
+}
 
 impl std::fmt::Display for AlreadyRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "a key agent is already running at {}", self.0.display())
+        write!(f, "a key agent is already running {}", self.0)
     }
 }
 
@@ -348,13 +362,71 @@ fn lock_agent(socket: &Path) -> Result<std::fs::File> {
             return Ok(file);
         }
         if UnixStream::connect(socket).is_ok() {
-            return Err(AlreadyRunning(socket.to_path_buf()).into());
+            return Err(AlreadyRunning::at(socket).into());
         }
         if attempt < 29 {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    Err(AlreadyRunning(socket.to_path_buf()).into())
+    Err(AlreadyRunning::at(socket).into())
+}
+
+/// An exclusive lock on `paths.agent_lock`, so one agent serves a key
+/// directory whatever runtime dir (and so socket path) it was started with:
+/// two agents rotating one storage key could each strand the other's files.
+/// Held by the returned file until it is dropped or the process exits.
+fn lock_key_dir(paths: &KeyPaths) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_path = &paths.agent_lock;
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .with_context(|| {
+            format!(
+                "could not open {} (a symlink there is refused)",
+                lock_path.display()
+            )
+        })?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(AlreadyRunning(format!(
+                "for the key files in {}",
+                lock_path.parent().unwrap_or(Path::new(".")).display()
+            ))
+            .into());
+        }
+        return Err(anyhow!(error).context(format!("could not lock {}", lock_path.display())));
+    }
+    Ok(file)
+}
+
+/// Takes the key directory for this agent and listens on `socket`, then
+/// records `socket` in `paths.agent_socket` (0600, atomic) for clients that
+/// would look elsewhere. The returned lock must live as long as the agent.
+pub fn claim(paths: &KeyPaths, socket: &Path) -> Result<(std::fs::File, tokio::net::UnixListener)> {
+    let lock = lock_key_dir(paths)?;
+    let listener = bind(socket)?;
+    {
+        use std::os::unix::ffi::OsStrExt;
+        crate::memory::crypto::write_private(&paths.agent_socket, socket.as_os_str().as_bytes())?;
+    }
+    Ok((lock, listener))
+}
+
+/// The socket path recorded in `record` by the running agent, if any.
+fn recorded_socket(record: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = std::fs::read(record).ok()?;
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+    path.is_absolute().then_some(path)
 }
 
 /// Listens on `socket`: directory 0700, socket 0600. A socket file nobody
@@ -380,7 +452,7 @@ fn bind_as(socket: &Path, uid: u32) -> Result<tokio::net::UnixListener> {
                 );
             }
             if UnixStream::connect(socket).is_ok() {
-                return Err(AlreadyRunning(socket.to_path_buf()).into());
+                return Err(AlreadyRunning::at(socket).into());
             }
             std::fs::remove_file(socket)?;
         }
@@ -490,9 +562,11 @@ fn harden_process() {
 /// `atem key-agent`: serve this user's agent until the process exits.
 pub async fn run_key_agent() -> Result<()> {
     harden_process();
+    let paths = KeyPaths::default_paths();
     let socket = agent_socket_path();
-    let listener = match bind(&socket) {
-        Ok(listener) => listener,
+    // `_key_dir` holds the key directory's lock until the process exits.
+    let (_key_dir, listener) = match claim(&paths, &socket) {
+        Ok(claimed) => claimed,
         Err(error) if error.downcast_ref::<AlreadyRunning>().is_some() => {
             eprintln!("{error}; exiting");
             return Ok(());
@@ -501,7 +575,7 @@ pub async fn run_key_agent() -> Result<()> {
     };
     // A key-file error never stops the agent: it starts locked and says why
     // on `atem cred status` (see KeyAgent::new).
-    let agent = KeyAgent::new(KeyPaths::default_paths())?;
+    let agent = KeyAgent::new(paths)?;
     eprintln!(
         "atem key agent (protocol v{PROTOCOL_VERSION}) listening on {}",
         socket.display()
@@ -592,7 +666,11 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 type Launcher = Box<dyn Fn() -> Result<()> + Send + Sync>;
 
 pub struct KeyAgentClient {
+    /// Where this session's agent would listen (from its runtime dir).
     socket: PathBuf,
+    /// The running agent's own record of its socket (`agent.socket`), tried
+    /// first: it may have been started from another session.
+    record: Option<PathBuf>,
     launcher: Option<Launcher>,
     /// Where a started agent writes; named when it doesn't come up.
     log: PathBuf,
@@ -605,6 +683,7 @@ impl KeyAgentClient {
     pub fn at(socket: PathBuf) -> Self {
         Self {
             socket,
+            record: None,
             launcher: None,
             log: agent_log_path(),
             expected_uid: own_uid(),
@@ -613,12 +692,37 @@ impl KeyAgentClient {
 
     /// A client for this user's agent that starts it when none answers.
     pub fn autostart() -> Self {
-        Self {
-            socket: agent_socket_path(),
-            launcher: Some(Box::new(|| {
+        Self::finding(
+            &crate::config::AtemConfig::config_dir(),
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            Some(Box::new(|| {
                 spawn_agent(&std::env::current_exe()?, &agent_log_path(), &[]).map(|_| ())
             })),
-            log: agent_log_path(),
+        )
+    }
+
+    /// A client for this user's running agent that never starts one.
+    pub fn existing() -> Self {
+        Self::finding(
+            &crate::config::AtemConfig::config_dir(),
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            None,
+        )
+    }
+
+    /// A client for the agent of the key files in `config_dir`, as seen from
+    /// a session whose runtime dir is `runtime_dir`; `launcher` starts one
+    /// when none answers.
+    pub(crate) fn finding(
+        config_dir: &Path,
+        runtime_dir: Option<OsString>,
+        launcher: Option<Launcher>,
+    ) -> Self {
+        Self {
+            socket: socket_path_in(config_dir, runtime_dir),
+            record: Some(config_dir.join("agent.socket")),
+            launcher,
+            log: config_dir.join("key-agent.log"),
             expected_uid: own_uid(),
         }
     }
@@ -628,6 +732,7 @@ impl KeyAgentClient {
     pub(crate) fn with_launcher(socket: PathBuf, launcher: Launcher) -> Self {
         Self {
             socket,
+            record: None,
             launcher: Some(launcher),
             log: agent_log_path(),
             expected_uid: own_uid(),
@@ -648,14 +753,25 @@ impl KeyAgentClient {
         self
     }
 
-    /// Connects, and refuses a listener that isn't `expected_uid`.
+    /// Connects to the recorded socket, else this session's, and refuses a
+    /// listener that isn't `expected_uid`.
     fn dial(&self) -> std::io::Result<Result<UnixStream>> {
-        let stream = UnixStream::connect(&self.socket)?;
+        if let Some(recorded) = self.record.as_deref().and_then(recorded_socket)
+            && recorded != self.socket
+            && let Ok(checked) = self.dial_at(&recorded)
+        {
+            return Ok(checked);
+        }
+        self.dial_at(&self.socket)
+    }
+
+    fn dial_at(&self, socket: &Path) -> std::io::Result<Result<UnixStream>> {
+        let stream = UnixStream::connect(socket)?;
         let peer = peer_uid(&stream)?;
         if peer != self.expected_uid {
             return Ok(Err(anyhow!(
                 "the socket at {} is served by another user (uid {peer}); refusing to talk to it",
-                self.socket.display()
+                socket.display()
             )));
         }
         Ok(Ok(stream))
@@ -1272,6 +1388,148 @@ mod tests {
             std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
             0o770
         );
+    }
+
+    /// The atem binary next to the test binary (built because integration
+    /// tests exist).
+    fn atem_binary() -> PathBuf {
+        let exe = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("atem");
+        assert!(
+            exe.exists(),
+            "atem binary missing or stale at {}: run `cargo build` first",
+            exe.display()
+        );
+        exe
+    }
+
+    /// Kills the child when the test ends, however it ends.
+    struct Reaped(std::process::Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// `atem key-agent` for `home`, with its socket under `runtime`.
+    fn key_agent_process(home: &Path, runtime: &Path, log: &Path) -> Reaped {
+        let log = std::fs::File::create(log).unwrap();
+        Reaped(
+            std::process::Command::new(atem_binary())
+                .arg("key-agent")
+                .env("HOME", home)
+                .env("XDG_RUNTIME_DIR", runtime)
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    /// Polls `done` for up to five seconds.
+    fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..50 {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    #[test]
+    fn one_agent_serves_a_key_directory_whatever_the_runtime_dir() {
+        let dir = short_dir();
+        let home = dir.path().join("home");
+        let (run_a, run_b) = (dir.path().join("ra"), dir.path().join("rb"));
+        std::fs::create_dir_all(&home).unwrap();
+        make_private(&run_a);
+        make_private(&run_b);
+        let mut first = key_agent_process(&home, &run_a, &dir.path().join("a.log"));
+        let socket_a = run_a.join("atem").join("agent.sock");
+        assert!(eventually(
+            || KeyAgentClient::at(socket_a.clone()).is_running()
+        ));
+        // A second agent for the same key files (another login session with
+        // its own runtime dir) must not run beside the first: two agents
+        // rotating one storage key could each strand the other's files.
+        let mut second = key_agent_process(&home, &run_b, &dir.path().join("b.log"));
+        assert!(
+            eventually(|| second.0.try_wait().unwrap().is_some()),
+            "the second agent kept running"
+        );
+        assert!(!run_b.join("atem").join("agent.sock").exists());
+        let log = std::fs::read_to_string(dir.path().join("b.log")).unwrap();
+        assert!(log.contains("already running"), "{log}");
+        // A client from the second session finds the first agent through
+        // the socket path it recorded, and starts no other.
+        let client = KeyAgentClient::finding(
+            &home.join(".config").join("atem"),
+            Some(run_b.clone().into_os_string()),
+            Some(Box::new(|| -> Result<()> {
+                panic!("a second agent must not be started")
+            })),
+        );
+        assert!(client.is_running());
+        assert!(!client.status().unwrap().unlocked);
+        assert!(first.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_second_claim_on_the_same_key_files_is_refused_and_the_socket_recorded() {
+        let dir = short_dir();
+        let paths = KeyPaths::in_dir(&dir.path().join("config"));
+        let (run_a, run_b) = (dir.path().join("ra"), dir.path().join("rb"));
+        make_private(&run_a);
+        make_private(&run_b);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket_a = run_a.join("atem").join("agent.sock");
+            let (lock, _listener) = claim(&paths, &socket_a).unwrap();
+            assert_eq!(recorded_socket(&paths.agent_socket), Some(socket_a.clone()));
+            assert_eq!(
+                std::fs::metadata(&paths.agent_socket)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            let error = claim(&paths, &run_b.join("atem").join("agent.sock"))
+                .err()
+                .unwrap();
+            assert!(
+                error.downcast_ref::<AlreadyRunning>().is_some(),
+                "{error:#}"
+            );
+            assert!(!run_b.join("atem").join("agent.sock").exists());
+            assert_eq!(recorded_socket(&paths.agent_socket), Some(socket_a));
+            // Once the first agent is gone, another may take the directory.
+            drop(lock);
+            claim(&paths, &run_b.join("atem").join("agent.sock")).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_symlinked_key_directory_lock_is_refused() {
+        let dir = short_dir();
+        let paths = KeyPaths::in_dir(dir.path());
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &paths.agent_lock).unwrap();
+        let error = lock_key_dir(&paths).err().unwrap();
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 
     #[test]

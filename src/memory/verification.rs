@@ -210,6 +210,11 @@ pub struct KeyPaths {
     pub unlock_auth_key: PathBuf,
     /// The plain X25519 key from #36; deleted once a device is verified.
     pub legacy_device_key: PathBuf,
+    /// Held (flock) by the one key agent serving these files, for its life.
+    pub agent_lock: PathBuf,
+    /// The socket path that agent listens on, for clients whose runtime
+    /// dir differs from the agent's.
+    pub agent_socket: PathBuf,
 }
 
 impl KeyPaths {
@@ -227,6 +232,8 @@ impl KeyPaths {
             device_keys_prev: dir.join("device_keys.sealed.prev"),
             unlock_auth_key: dir.join("unlock_auth_key"),
             legacy_device_key: dir.join("device_key"),
+            agent_lock: dir.join("key_agent.lock"),
+            agent_socket: dir.join("agent.socket"),
         }
     }
 }

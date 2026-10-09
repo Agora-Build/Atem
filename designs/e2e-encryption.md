@@ -388,6 +388,14 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
+- **One agent per key directory.** The agent takes an exclusive `flock` on
+  `~/.config/atem/key_agent.lock` for its whole life and exits if another
+  agent holds it, so two login sessions with different `$XDG_RUNTIME_DIR`s
+  never run two agents over one set of key files (each would rotate the
+  storage key and strand the other's sealed files). It records its socket
+  path in `~/.config/atem/agent.socket` (0600, written atomically);
+  clients try that path first, then their own session's, and still refuse
+  a listener that isn't their user.
 - **Home Astation.** One storage key per device, held by the device's first
   verified Astation and recorded as `home_astation` in `cred_state.json`;
   the home never moves. Unlock and rotation go only through the home
@@ -922,7 +930,9 @@ A plain credential value is never written to disk anywhere.
   home Astation that holds the storage key, the last storage kid it is
   known to hold, and every storage kid the device abandoned.
 - `key-agent.log`; the agent socket `agent.sock` and its `agent.lock` (in
-  `$XDG_RUNTIME_DIR/atem/` when set, else here).
+  `$XDG_RUNTIME_DIR/atem/` when set, else here); `key_agent.lock`, which
+  the one agent serving these key files holds (`flock`) for its life, and
+  `agent.socket`, the socket path it records for clients.
 - Key agent memory: the unsealed device keys, `K` subkeys, index subkeys and
   scope keys.
 - Credential values: never cached. `knowledge.db` holds plain memory and
