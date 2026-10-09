@@ -369,9 +369,10 @@ pub struct VerificationOutcome {
 /// agent holds. Fresh keys (a device's first verification) make this
 /// Astation the home: they are sealed under a new storage key and handed to
 /// the key agent before anything is written, so if the agent can't take
-/// them nothing is saved. Then the sealed keys, the state and grants, the
-/// pins and the home are written and the old plain files deleted. On any
-/// failure before that point nothing is written.
+/// them nothing is saved. Then the sealed keys (and, for fresh keys, a
+/// plain `device_keys` kept until the first escrow is confirmed), the state
+/// and grants, the pins and the home are written and the legacy plain key
+/// deleted. On any failure before that point nothing is written.
 ///
 /// For fresh keys the outcome carries the storage key for the home Astation
 /// (the first escrow), prepared by the agent once the home is saved.
@@ -451,10 +452,14 @@ pub fn complete_verification(
         VerificationKeys::Sealed(_) => None,
     };
     let write = || -> Result<()> {
-        // Fresh keys: no key file exists (checked above).
-        if let Some((sealed, unlock_auth)) = &sealed {
+        // Fresh keys: no key file exists (checked above). The plain file
+        // stays until Astation confirms it holds the storage key (the agent
+        // deletes it then), so an agent that stops before that re-seals the
+        // keys from it instead of losing them.
+        if let (Some((sealed, unlock_auth)), VerificationKeys::Fresh(fresh)) = (&sealed, &keys) {
             sealed.save_to(&paths.device_keys_sealed)?;
             unlock_auth.save_to(&paths.unlock_auth_key)?;
+            fresh.save_to(&paths.device_keys)?;
         }
         if first {
             // Whatever the unauthenticated path stored for this Astation (mode,
@@ -494,6 +499,11 @@ pub fn complete_verification(
                 .is_ok_and(|file| file.is_some_and(|file| file.public() == unlock_auth.public()))
             {
                 let _ = remove_if_exists(&paths.unlock_auth_key);
+            }
+            if DeviceKeys::load_from(&paths.device_keys).is_ok_and(|file| {
+                file.is_some_and(|file| file.device_sign_pub() == fresh.device_sign_pub())
+            }) {
+                let _ = remove_if_exists(&paths.device_keys);
             }
             if agent
                 .public_keys()
@@ -866,8 +876,8 @@ mod tests {
             "old plain device_key must be deleted"
         );
         assert!(
-            !paths.device_keys.exists(),
-            "device keys are never written in plain"
+            paths.device_keys.exists(),
+            "fresh keys stay in plain until the first escrow is confirmed"
         );
         assert!(paths.device_keys_sealed.exists() && paths.unlock_auth_key.exists());
         assert!(agent.status().unwrap().unlocked);
@@ -1396,7 +1406,6 @@ mod ceremony_tests {
         let fake = FakeAstation::new();
         let (certificate, outcome) =
             verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
-        assert!(!paths.device_keys.exists(), "no plain device_keys any more");
         let sealed = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
             .unwrap()
             .unwrap();
@@ -1448,6 +1457,109 @@ mod ceremony_tests {
         assert_eq!(kid, sealed.storage_kid);
         assert!(server.storage_keys.contains_key(&kid));
         assert!(agent.status().unwrap().escrowed);
+        assert!(
+            !paths.device_keys.exists(),
+            "the plain file goes once Astation holds the storage key"
+        );
+    }
+
+    /// A key server that holds nothing yet for the device `certificate` names.
+    fn empty_server(fake: FakeAstation, certificate: &DeviceVerified) -> FakeKeyServer {
+        FakeKeyServer {
+            astation: fake,
+            device_sign_pub: certificate.device_sign_pub,
+            unlock_auth_pub: certificate.unlock_auth_pub,
+            storage_keys: Default::default(),
+            pending: None,
+            pending_statement: None,
+            acked: Default::default(),
+        }
+    }
+
+    /// The first escrow of a fresh verification, as `atem pair` completes
+    /// it: Astation holds the storage key and the plain file goes, so a
+    /// restarted agent starts locked.
+    fn escrow_first(
+        agent: &dyn KeyAgentApi,
+        fake: &FakeAstation,
+        certificate: &DeviceVerified,
+        outcome: VerificationOutcome,
+    ) {
+        let mut server = empty_server(fake.clone(), certificate);
+        let ack = server
+            .accept_rotation(&outcome.escrow.expect("a fresh verification escrows"))
+            .unwrap();
+        agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_device_whose_agent_stops_before_the_escrow_re_seals_from_the_plain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (certificate, _outcome) =
+            verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        let first_kid = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+            .unwrap()
+            .unwrap()
+            .storage_kid;
+        // The plain file holds exactly the verified keys, 0600.
+        let plain = DeviceKeys::load_from(&paths.device_keys).unwrap().unwrap();
+        assert_eq!(
+            (plain.device_pub(), plain.device_sign_pub(), plain.unlock_auth_pub()),
+            (
+                certificate.device_pub,
+                certificate.device_sign_pub,
+                certificate.unlock_auth_pub
+            )
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&paths.device_keys)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        // The agent exits (reboot, crash) before Astation holds the key: the
+        // next agent re-seals the keys from the plain file, unlocked.
+        drop(agent);
+        let restarted = test_agent(&paths);
+        let status = restarted.status().unwrap();
+        assert!(status.unlocked && !status.escrowed, "{status:?}");
+        assert_ne!(status.storage_kid.as_deref(), Some(first_kid.as_str()));
+        assert_eq!(
+            restarted.public_keys().unwrap(),
+            (certificate.device_pub, certificate.device_sign_pub)
+        );
+
+        // The escrow then completes and the plain file goes.
+        let mut server = empty_server(fake, &certificate);
+        let ack = server
+            .accept_rotation(&restarted.begin_rotation(ASTATION_ID).unwrap())
+            .unwrap();
+        let (kid, confirm) = restarted.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        server.confirm(&confirm).unwrap();
+        assert_eq!(Some(kid.clone()), status.storage_kid);
+        assert!(!paths.device_keys.exists());
+
+        // From now on a restart starts locked, sealed under the escrowed key.
+        drop(restarted);
+        let rebooted = test_agent(&paths);
+        assert!(!rebooted.status().unwrap().unlocked);
+        assert_eq!(
+            SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                .unwrap()
+                .unwrap()
+                .storage_kid,
+            kid
+        );
     }
 
     #[test]
@@ -1491,7 +1603,9 @@ mod ceremony_tests {
         let paths = KeyPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
-        verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        let (certificate, outcome) =
+            verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        escrow_first(&agent, &fake, &certificate, outcome);
         // After a reboot the agent starts locked.
         let rebooted = test_agent(&paths);
         let error = error_of(device_keys_for_verification(&paths, &rebooted));
@@ -1608,8 +1722,9 @@ mod ceremony_tests {
         let paths = KeyPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
-        let (certificate, _) =
+        let (certificate, outcome) =
             verified_device(&paths, &agent, &fake, EncryptionMode::On, Some("0123abcd"));
+        escrow_first(&agent, &fake, &certificate, outcome);
         let grant = seal_k_grant(
             &fake,
             "acct",
@@ -1683,6 +1798,7 @@ mod ceremony_tests {
         );
         assert!(!paths.device_keys_sealed.exists(), "no sealed keys left");
         assert!(!paths.unlock_auth_key.exists(), "no unlock_auth_key left");
+        assert!(!paths.device_keys.exists(), "no plain keys left");
         assert!(
             TrustStore::load_from(&paths.trust)
                 .unwrap()
@@ -1775,13 +1891,14 @@ mod ceremony_tests {
         let paths = KeyPaths::in_dir(dir.path());
         let unlocked = test_agent(&paths);
         let fake = FakeAstation::new();
-        let (certificate, _) = verified_device(
+        let (certificate, outcome) = verified_device(
             &paths,
             &unlocked,
             &fake,
             EncryptionMode::On,
             Some("0123abcd"),
         );
+        escrow_first(&unlocked, &fake, &certificate, outcome);
         let grant = seal_k_grant(
             &fake,
             "acct",
@@ -1826,6 +1943,7 @@ mod ceremony_tests {
                     .unlock_auth_key()
                     .save_to(&self.paths.unlock_auth_key)
                     .unwrap();
+                self.other.save_to(&self.paths.device_keys).unwrap();
                 // device_keys.sealed is written through device_keys.tmp.
                 let blocker = self.paths.device_keys_sealed.with_extension("tmp");
                 std::fs::create_dir_all(blocker.join("x")).unwrap();
@@ -1839,7 +1957,7 @@ mod ceremony_tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = KeyPaths::in_dir(dir.path());
         let other = DeviceKeys::generate();
-        let other_unlock_auth = other.unlock_auth_pub();
+        let (other_unlock_auth, other_sign) = (other.unlock_auth_pub(), other.device_sign_pub());
         let agent = RacedByAnotherRun {
             agent: test_agent(&paths),
             paths: paths.clone(),
@@ -1872,6 +1990,13 @@ mod ceremony_tests {
                 .expect("the other run's unlock_auth_key stays")
                 .public(),
             other_unlock_auth
+        );
+        assert_eq!(
+            DeviceKeys::load_from(&paths.device_keys)
+                .unwrap()
+                .expect("the other run's plain keys stay")
+                .device_sign_pub(),
+            other_sign
         );
         assert!(!agent.status().unwrap().unlocked, "this run's keys are dropped");
     }

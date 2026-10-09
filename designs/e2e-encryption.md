@@ -402,18 +402,21 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   Astation; grants from any verified Astation are opened by the unlocked
   agent.
 - **First sealing.** On the home Astation's first verification, `atem pair`
-  seals the fresh keys under a new storage key, hands the unlocked keys to
-  the agent, and in the same run sends the storage key to Astation
+  seals the fresh keys under a new storage key, also writes them to a plain
+  `device_keys` file (0600, atomically), hands the unlocked keys to the
+  agent, and in the same run sends the storage key to Astation
   (`storageKeyRotate` with an empty old `storage_kid`) and confirms it.
-  Until Astation holds it the agent refuses `atem cred lock` (except while
-  a step-1 plain `device_keys` file still exists, which is re-sealed at the
-  next start). A plain
-  `device_keys` file from build step 1 is sealed under a fresh storage key
-  each time the agent starts while that file exists (never reusing the
-  kid of the sealed file it overwrites); the key goes to
+  Plain keys exist until the first escrow: a fresh device follows the same
+  rule as a build-step-1 device. A plain `device_keys` file is sealed under
+  a fresh storage key each time the agent starts while that file exists
+  (never reusing the kid of the sealed file it overwrites); the key goes to
   Astation at the next `atem pair` or `atem cred unlock`, and the plain file
   is deleted only once Astation is known to hold the key (a confirmed
-  escrow, or an unlock that opened the current sealed file).
+  escrow, or an unlock that opened the current sealed file). So an agent
+  that stops before the escrow (a reboot, a crash, `atem cred lock`, which
+  is always allowed) loses nothing, and atem needs no Astation with step
+  2a: against an older Astation the escrow just doesn't complete and the
+  device keeps its plain keys, as in step 1.
 - **`escrowed_storage_kid`** in `cred_state.json` is the last storage kid
   Astation is known to hold (set at every confirmed escrow or rotation and
   by an unlock that opened the current file). `atem cred status` uses it to
@@ -915,6 +918,10 @@ A plain credential value is never written to disk anywhere.
 **atem (`~/.config/atem/`, all 0600):**
 - `device_keys.sealed`: the device key and device signing key, encrypted
   with the current storage key.
+- `device_keys`: the same keys in plain, only until the home Astation is
+  known to hold the first storage key (a build-step-1 device, or a fresh
+  device between `atem pair` and its confirmed escrow, normally the same
+  run).
 - `device_keys.sealed.next`: exists only between rotation phases 1 and 3;
   `device_keys.sealed.prev`: the file a rotation replaced, kept until an
   unlock proves Astation holds the current key.
@@ -1164,7 +1171,10 @@ characters.
 
 ### Astation work for step 2a
 
-atem can't unlock against a real Astation until these land.
+atem can't unlock against a real Astation until these land. atem doesn't
+need them to ship first: against an Astation without them, verification
+works as in step 1, the first escrow doesn't complete, and the device keeps
+its plain `device_keys` file (re-sealed at each agent start) until it does.
 `src/memory/fake_astation.rs` (test-only) implements the same rules and is
 the reference behaviour.
 
@@ -1267,9 +1277,8 @@ the reference behaviour.
    can stall a first escrow: drop acks, or replay a captured first rotate
    so that you hold a pending key the device no longer has, which costs an
    abandon round each time. It can't lose keys: until you are known to hold
-   the storage key, a step-1 device keeps its plain `device_keys` file and
-   re-seals from it, and a freshly verified device keeps its keys in the
-   unlocked agent, which refuses `atem cred lock`. The implicit confirm by
+   the storage key, a device (step-1 or freshly verified) keeps its plain
+   `device_keys` file and re-seals from it. The implicit confirm by
    an unlock naming the pending kid (item 3) lets such a device settle its
    first escrow at the next unlock.
 9. Keep `reason` texts short and plain; atem shows them sanitized and cut
@@ -1288,8 +1297,8 @@ Nothing new is stored.
 ### Reset (start over)
 
 If this device's keys can't be unlocked (the sealed file or
-`unlock_auth_key` is damaged or missing, the agent stopped before Astation
-held the storage key, or Astation lost it), `atem cred status` and
+`unlock_auth_key` is damaged or missing, or Astation lost the storage key),
+`atem cred status` and
 `atem cred unlock` print:
 
 > To start over: delete ~/.config/atem/device_keys, device_keys.sealed,

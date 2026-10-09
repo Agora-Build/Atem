@@ -31,8 +31,6 @@ pub const PROTOCOL_VERSION: u64 = 1;
 
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 
-pub const LOCK_BEFORE_ESCROW: &str = "this device's storage key isn't with Astation yet; finish `atem pair` or run `atem cred unlock` first";
-
 /// Appended to key-file errors, which never stop the agent (it starts locked).
 pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`.";
 
@@ -306,8 +304,9 @@ impl KeyAgent {
                 astation_id,
                 storage_kid,
             } => self.abandon_pending(&astation_id, &storage_kid),
+            // Always allowed: until Astation holds the storage key, the plain
+            // device_keys file stays on disk and is re-sealed at the next start.
             Request::Lock => {
-                self.refuse_lock_before_escrow()?;
                 self.wipe();
                 Ok(Reply::Done)
             }
@@ -319,28 +318,6 @@ impl KeyAgent {
         self.unlocked = None;
         self.pending_unlock = None;
         self.pending_rotation = None;
-    }
-
-    /// Locking would wipe the only copy of a storage key that seals the keys
-    /// on disk while Astation doesn't hold it yet (a fresh device before its
-    /// first escrow): those keys could never be unlocked again. A plain
-    /// step-1 file still on disk makes locking safe (it is re-sealed).
-    fn refuse_lock_before_escrow(&self) -> Result<()> {
-        let Some(unlocked) = &self.unlocked else {
-            return Ok(());
-        };
-        if unlocked.escrowed || self.paths.device_keys.exists() {
-            return Ok(());
-        }
-        // An unreadable current file counts as sealed under this key: keep it.
-        let sealed_here = SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)
-            .map_or(true, |sealed| {
-                sealed.is_some_and(|sealed| sealed.storage_kid == unlocked.storage_kid)
-            });
-        if sealed_here {
-            bail!(LOCK_BEFORE_ESCROW);
-        }
-        Ok(())
     }
 
     fn unlocked(&self) -> Result<&Unlocked> {
@@ -787,11 +764,14 @@ impl KeyAgent {
         bail!("no sealed keys on disk match the storage key Astation released ({storage_kid})")
     }
 
-    /// A plain step-1 `device_keys` is authoritative whenever it exists (it stays until the first escrow is confirmed): seal
-    /// it under a new storage key (overwriting any earlier sealed file, e.g.
-    /// from a crashed migration), split out the unlock-auth key, record the
-    /// home Astation. The keys stay unlocked here until
-    /// the CLI sends the storage key to the home Astation (`atem cred unlock`).
+    /// A plain `device_keys` file (a step-1 device's, or a fresh device's
+    /// before its first escrow) is authoritative whenever it exists: it stays
+    /// until Astation is known to hold the storage key. Seal it under a new
+    /// storage key (overwriting any earlier sealed file, e.g. from a crashed
+    /// migration or an agent that stopped before the escrow), split out the
+    /// unlock-auth key, record the home Astation. The keys stay unlocked here
+    /// until the CLI sends the storage key to the home Astation (`atem pair`
+    /// or `atem cred unlock`).
     fn migrate_plain_keys(&mut self) -> Result<()> {
         self.migrate_inner()
             .map_err(|error| anyhow!("{error:#}. {RESET}"))
@@ -1215,12 +1195,13 @@ mod tests {
     }
 
     #[test]
-    fn lock_is_refused_while_the_sealed_keys_storage_key_is_not_with_astation() {
+    fn lock_is_always_allowed_even_before_the_first_escrow() {
+        // A fresh device keeps its plain device_keys file until the first
+        // escrow is confirmed, so locking never loses the only copy.
         let dir = tempfile::tempdir().unwrap();
         let paths = KeyPaths::in_dir(dir.path());
         let keys = DeviceKeys::generate();
-        let astation = FakeAstation::new();
-        pin(&paths, &astation, &keys, true);
+        pin(&paths, &FakeAstation::new(), &keys, true);
         let storage_key = new_storage_key();
         SealedDeviceKeys::seal(&keys, DEVICE_ID, "0a1b2c3d", &storage_key)
             .unwrap()
@@ -1230,26 +1211,7 @@ mod tests {
         agent
             .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &storage_key)
             .unwrap();
-        let error = error_of(agent.lock_keys());
-        assert!(
-            error.contains("storage key isn't with Astation yet"),
-            "{error}"
-        );
-        assert!(agent.status().unwrap().unlocked, "the keys stay");
-
-        let mut server = FakeKeyServer {
-            astation,
-            device_sign_pub: keys.device_sign_pub(),
-            unlock_auth_pub: keys.unlock_auth_pub(),
-            storage_keys: Default::default(),
-            pending: None,
-            pending_statement: None,
-            acked: Default::default(),
-        };
-        let ack = server
-            .accept_rotation(&agent.begin_rotation(ASTATION_ID).unwrap())
-            .unwrap();
-        agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert!(!agent.status().unwrap().escrowed);
         agent.lock_keys().unwrap();
         assert!(!agent.status().unwrap().unlocked);
     }

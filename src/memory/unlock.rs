@@ -492,7 +492,7 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
 /// What `atem pair` prints when the first escrow didn't complete.
 pub fn escrow_failure_message(error: &anyhow::Error) -> String {
     format!(
-        "Astation doesn't hold this device's storage key yet ({error:#}). Run `atem cred unlock` now to hand it over; until then `atem cred lock` is refused. If the key agent stops before that (a restart or crash), this device's keys can't be unlocked. {RESET}"
+        "Astation doesn't hold this device's storage key yet ({error:#}). Until it does, this device keeps its keys in the plain ~/.config/atem/device_keys file (re-sealed whenever the key agent starts); run `atem cred unlock` to hand the key over, which deletes that file."
     )
 }
 
@@ -550,8 +550,8 @@ pub fn status_report(
 ) -> String {
     let (agent_line, storage_kid, waiting) = match agent {
         // Without the agent, only cred_state.json tells whether Astation
-        // confirmed holding the sealed file's key (R24: until it does, the
-        // keys can't be unlocked once the agent is gone).
+        // confirmed holding the sealed file's key (until it does, the plain
+        // device_keys file stays and the next agent re-seals it).
         AgentState::NotRunning => (
             "not running (starts with 'atem cred unlock')".to_string(),
             sealed_kid.map(str::to_string),
@@ -591,8 +591,7 @@ pub fn status_report(
     report
 }
 
-/// `atem cred lock`: what happened, or why the agent refused (its storage
-/// key isn't with Astation yet).
+/// `atem cred lock`: what happened, or why the agent couldn't be reached.
 pub fn lock_keys_message(agent: Option<&dyn KeyAgentApi>) -> Result<String> {
     match agent {
         None => Ok("The key agent isn't running; this device's keys are locked.".into()),
@@ -1437,7 +1436,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (paths, server, agent) = fresh_device(dir.path());
         let escrow = agent.begin_rotation(ASTATION_ID).unwrap();
-        assert!(error_of(lock_keys_message(Some(agent.as_ref()))).contains("isn't with Astation"));
         let mut link = ScriptedLink::new(server);
         assert_eq!(
             pair_escrow(&mut link, &agent, &paths, ASTATION_ID, Some(escrow))
@@ -1597,8 +1595,12 @@ mod tests {
         let message = escrow_failure_message(&anyhow!("timed out"));
         assert!(message.contains("timed out"), "{message}");
         assert!(message.contains("atem cred unlock"), "{message}");
-        assert!(message.contains("`atem cred lock` is refused"), "{message}");
-        assert!(message.contains(RESET), "{message}");
+        assert!(message.contains("plain"), "{message}");
+        assert!(
+            !message.contains("refused"),
+            "locking is always allowed: {message}"
+        );
+        assert!(!message.contains(RESET), "nothing needs a reset: {message}");
     }
 
     #[test]

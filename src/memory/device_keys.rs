@@ -59,12 +59,20 @@ impl PublicKeys for DeviceKeys {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct StoredDeviceKeys {
     version: u8,
-    device: String,
-    device_sign: String,
-    unlock_auth: String,
+    device: Zeroizing<String>,
+    device_sign: Zeroizing<String>,
+    unlock_auth: Zeroizing<String>,
+}
+
+#[derive(Serialize)]
+struct StoredDeviceKeysRef<'a> {
+    version: u8,
+    device: &'a str,
+    device_sign: &'a str,
+    unlock_auth: &'a str,
 }
 
 /// Decodes a base64 32-byte secret; the buffers are wiped when dropped.
@@ -177,7 +185,7 @@ impl DeviceKeys {
 
     pub fn load_from(path: &Path) -> Result<Option<Self>> {
         let raw = match std::fs::read(path) {
-            Ok(raw) => raw,
+            Ok(raw) => Zeroizing::new(raw),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
@@ -199,17 +207,24 @@ impl DeviceKeys {
         }))
     }
 
-    /// The plain step-1 format. Only tests write it now; the key agent seals
-    /// such a file when it starts (key_agent.rs).
-    #[cfg(test)]
+    /// The plain `device_keys` file (0600, written atomically): a fresh
+    /// device's keys until Astation is known to hold the storage key, like a
+    /// step-1 device's. The key agent re-seals it at each start while it
+    /// exists and deletes it at the first confirmed escrow (key_agent.rs).
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        let stored = StoredDeviceKeys {
+        let (device, device_sign, unlock_auth) = self.secret_parts();
+        let (device, device_sign, unlock_auth) = (
+            Zeroizing::new(STANDARD.encode(&device[..])),
+            Zeroizing::new(STANDARD.encode(&device_sign[..])),
+            Zeroizing::new(STANDARD.encode(&unlock_auth[..])),
+        );
+        let bytes = Zeroizing::new(serde_json::to_vec(&StoredDeviceKeysRef {
             version: 1,
-            device: STANDARD.encode(self.device.to_bytes()),
-            device_sign: STANDARD.encode(self.device_sign.to_bytes()),
-            unlock_auth: STANDARD.encode(self.unlock_auth.to_bytes()),
-        };
-        crate::memory::crypto::write_private(path, &serde_json::to_vec(&stored)?)
+            device: &device,
+            device_sign: &device_sign,
+            unlock_auth: &unlock_auth,
+        })?);
+        crate::memory::crypto::write_private(path, &bytes)
     }
 }
 

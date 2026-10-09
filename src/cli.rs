@@ -1673,8 +1673,8 @@ async fn run_device_verification(
                         .await?
                     };
                     println!("✅ Device verified with Astation (safety code {code}).");
-                    // The first escrow: Astation must hold the storage key
-                    // before this run ends, or the keys can't be unlocked later.
+                    // The first escrow, in this run. Until Astation holds the
+                    // storage key the plain device_keys file stays on disk.
                     let escrowed = crate::memory::unlock::pair_escrow(
                         &mut *client,
                         &agent,

@@ -501,6 +501,7 @@ pub(crate) fn verify_device(sign_pub: &[u8; 32], signed: &SignedWire) -> Result<
 /// Test stand-in for Astation: a P-256 key that signs statements the way
 /// Astation's Secure Enclave key does (64-byte r‖s, low-S).
 #[cfg(test)]
+#[derive(Clone)]
 pub(crate) struct FakeAstation {
     key: p256::ecdsa::SigningKey,
     enc: x25519_dalek::StaticSecret,
