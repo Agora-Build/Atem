@@ -65,7 +65,14 @@ fn shown(text: &str) -> String {
     text.chars()
         .filter(|&c| {
             !c.is_control()
-                && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                && !matches!(
+                    c,
+                    '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{2069}'
+                        | '\u{feff}'
+                )
         })
         .take(200)
         .collect()
@@ -444,10 +451,21 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
 ) -> Result<PairEscrow> {
     let Some(rotation) = escrow else {
         // Only the home Astation holds the storage key: pairing with another
-        // one has nothing to hand over.
+        // one has nothing to hand over, unless the home doesn't hold the
+        // agent's key yet, which only the home Astation can fix.
         let trust = TrustStore::load_from(&paths.trust)?;
         if let Some(home) = trust.home().filter(|home| *home != astation_id) {
-            return Ok(PairEscrow::HeldByHome(home.to_string()));
+            let home = home.to_string();
+            let (status, pending) = {
+                let agent = agent.clone();
+                blocking(move || Ok((agent.status()?, agent.pending_rotation()?))).await?
+            };
+            if pending.is_some() || (status.unlocked && !status.escrowed) {
+                bail!(
+                    "this device's storage key goes only to its home Astation {home}, not to {astation_id}; run `atem cred unlock` to hand it to {home}"
+                );
+            }
+            return Ok(PairEscrow::HeldByHome(home));
         }
         return Ok(
             match escrow_if_needed(link, agent, paths, astation_id).await? {
@@ -1464,8 +1482,19 @@ mod tests {
     #[tokio::test]
     async fn pairing_with_another_astation_leaves_the_escrow_to_the_home_one() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, server, agent) = fresh_device(dir.path());
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
         let mut link = ScriptedLink::new(server);
+        // Locked, nothing pending: the home Astation holds the key.
+        let outcome = pair_escrow(&mut link, &agent, &paths, "astation-2", None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, PairEscrow::HeldByHome(ASTATION_ID.into()));
+        // Unlocked through the home Astation, so escrowed: still nothing to do.
+        unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert!(agent.status().unwrap().escrowed);
         let outcome = pair_escrow(&mut link, &agent, &paths, "astation-2", None)
             .await
             .unwrap();
@@ -1473,10 +1502,28 @@ mod tests {
         assert_eq!(link.rotates, 0);
     }
 
+    #[tokio::test]
+    async fn pairing_with_another_astation_while_the_home_lacks_the_key_says_to_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unlocked with a storage key the home Astation doesn't hold yet.
+        let (paths, server, agent) = fresh_device(dir.path());
+        let mut link = ScriptedLink::new(server);
+        let error = error_of(pair_escrow(&mut link, &agent, &paths, "astation-2", None).await);
+        assert!(error.contains("atem cred unlock"), "{error}");
+        assert!(error.contains(ASTATION_ID), "{error}");
+        // A rotation pending in the agent needs the home Astation too.
+        agent.begin_rotation(ASTATION_ID).unwrap();
+        let error = error_of(pair_escrow(&mut link, &agent, &paths, "astation-2", None).await);
+        assert!(error.contains("atem cred unlock"), "{error}");
+        assert_eq!(link.rotates, 0);
+    }
+
     #[test]
     fn shown_text_drops_bidi_and_format_characters() {
         let text = "a\u{200b}b\u{200f}c\u{202a}d\u{202e}e\u{2066}f\u{2069}g";
         assert_eq!(shown(text), "abcdefg");
+        let text = "a\u{061c}b\u{2060}c\u{2064}d\u{2065}e\u{feff}f";
+        assert_eq!(shown(text), "abcdef");
     }
 
     #[test]

@@ -71,7 +71,15 @@ pub fn open_grant(
         &ciphertext,
         &statement.info(),
     )
-    .map_err(|_| anyhow!("key grant could not be opened"))?;
+    .map_err(|error| {
+        // Only the final open failure becomes the grant-level message; a
+        // malformed key or encapsulation keeps its own cause.
+        if error.is::<HpkeOpenFailed>() {
+            anyhow!("key grant could not be opened")
+        } else {
+            error
+        }
+    })?;
     let key: [u8; 32] = plain
         .as_slice()
         .try_into()
@@ -124,8 +132,21 @@ pub(crate) fn hpke_open(
         b"",
     )
     .map(zeroize::Zeroizing::new)
-    .map_err(|_| anyhow!("sealed key could not be opened"))
+    .map_err(|_| HpkeOpenFailed.into())
 }
+
+/// The seal itself didn't open (wrong key, info or tampered ciphertext), as
+/// opposed to an unusable key or encapsulation.
+#[derive(Debug)]
+pub(crate) struct HpkeOpenFailed;
+
+impl std::fmt::Display for HpkeOpenFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sealed key could not be opened")
+    }
+}
+
+impl std::error::Error for HpkeOpenFailed {}
 
 /// Test stand-in for Astation sealing `K` to a device.
 #[cfg(test)]
@@ -347,6 +368,41 @@ mod tests {
             .expect("must be rejected")
             .to_string();
         assert!(error.contains("different device"), "{error}");
+    }
+
+    #[test]
+    fn grant_errors_keep_their_cause() {
+        let (fake, keys) = (FakeAstation::new(), DeviceKeys::generate());
+        let trust = verified(&fake, &keys);
+        // A short encapsulation that Astation really signed: the error names it
+        // instead of the generic "could not be opened".
+        let mut statement = k_statement(keys.device_pub());
+        let (encapped, ciphertext) = (vec![1u8; 31], vec![2u8; 48]);
+        statement.sealed_hash = sealed_hash(&encapped, &ciphertext);
+        let malformed = GrantWire {
+            signed: fake.sign(&statement.encode()),
+            encapped_key: STANDARD.encode(&encapped),
+            ciphertext: STANDARD.encode(&ciphertext),
+        };
+        let error = format!("{:#}", open_grant(&trust, &keys, &malformed).err().unwrap());
+        assert!(error.contains("encapsulation is malformed"), "{error}");
+        // A well-formed seal that doesn't open keeps the grant-level message.
+        let mut wrong = k_statement(keys.device_pub());
+        wrong.kid = "0123abce".into();
+        let sealed = grant_with(&fake, k_statement(keys.device_pub()), keys.device_pub());
+        let mut statement = wrong;
+        let encapped = STANDARD.decode(&sealed.encapped_key).unwrap();
+        let ciphertext = STANDARD.decode(&sealed.ciphertext).unwrap();
+        statement.sealed_hash = sealed_hash(&encapped, &ciphertext);
+        let unopenable = GrantWire {
+            signed: fake.sign(&statement.encode()),
+            ..sealed
+        };
+        let error = open_grant(&trust, &keys, &unopenable)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(error, "key grant could not be opened");
     }
 
     #[test]

@@ -41,8 +41,10 @@ pub struct TrustStore {
     /// one. Unlock and storage-key rotation go only through it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     home_astation: Option<String>,
-    /// The storage key id Astation confirmed holding at the first escrow. Lets
-    /// a restart tell an escrowed sealed file from a freshly migrated one.
+    /// The last storage key id Astation is known to hold (set at every
+    /// confirmed escrow or rotation, and by an unlock that opened the current
+    /// file). Lets a restart tell an escrowed sealed file from a freshly
+    /// migrated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     escrowed_storage_kid: Option<String>,
     /// Every storage key id this device signed an abandon for. A replayed
@@ -136,12 +138,12 @@ impl TrustStore {
         self.abandoned_kids.contains(storage_kid)
     }
 
-    /// A new storage key id from `next` that is neither `current` nor one
-    /// this device ever abandoned.
+    /// A new storage key id from `next` that is neither `current`, the last
+    /// one Astation is known to hold, nor one this device ever abandoned.
     pub fn pick_storage_kid(&self, current: &str, mut next: impl FnMut() -> String) -> String {
         loop {
             let kid = next();
-            if kid != current && !self.was_abandoned(&kid) {
+            if kid != current && self.escrowed_kid() != Some(&kid) && !self.was_abandoned(&kid) {
                 return kid;
             }
         }
@@ -599,6 +601,17 @@ mod tests {
                     &fake.sign(&state(EncryptionMode::Off, 9).encode())
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn the_escrowed_storage_kid_is_never_picked_again() {
+        let mut store = TrustStore::default();
+        store.set_escrowed_kid("cccccccc");
+        let mut offered = ["cccccccc", "dddddddd"].into_iter().map(String::from);
+        assert_eq!(
+            store.pick_storage_kid("", || offered.next().unwrap()),
+            "dddddddd"
         );
     }
 
