@@ -92,16 +92,23 @@ impl TrustStore {
             .filter(|id| self.astations.contains_key(*id))
     }
 
+    /// Records the home Astation. Never overwrites: the home is the first
+    /// one, for the life of the device's keys.
     pub fn set_home(&mut self, astation_id: &str) {
-        self.home_astation = Some(astation_id.into());
+        if self.home_astation.is_none() {
+            self.home_astation = Some(astation_id.into());
+        }
     }
 
-    /// The home Astation, or, for a step-1 store that has none, the first
-    /// verified Astation by id (used once, to migrate a plain `device_keys`).
+    /// The home Astation, or, for a step-1 store whose home was never set,
+    /// the first verified Astation by id (used once, to migrate a plain
+    /// `device_keys`). A home that is set but no longer verified gives
+    /// `None`: fail closed rather than escrow to another Astation.
     pub fn home_or_first_verified(&self) -> Option<String> {
-        self.home()
-            .map(str::to_string)
-            .or_else(|| self.astations.keys().min().cloned())
+        match &self.home_astation {
+            Some(_) => self.home().map(str::to_string),
+            None => self.astations.keys().min().cloned(),
+        }
     }
 
     pub fn set_pending(
@@ -303,6 +310,43 @@ mod tests {
             kid: Some("0123abcd".into()),
             epoch,
         }
+    }
+
+    fn two_verified() -> TrustStore {
+        let fake = FakeAstation::new();
+        let (mut store, keys) = pending(&fake);
+        store
+            .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
+            .unwrap();
+        let entry = store.verified(ASTATION).unwrap().clone();
+        store.astations.insert("astation-0".into(), entry);
+        store
+    }
+
+    #[test]
+    fn an_unset_home_falls_back_to_the_smallest_verified_id() {
+        let store = two_verified();
+        assert_eq!(store.home(), None);
+        assert_eq!(
+            store.home_or_first_verified().as_deref(),
+            Some("astation-0")
+        );
+    }
+
+    #[test]
+    fn a_set_but_unverified_home_gives_none() {
+        let mut store = two_verified();
+        store.set_home("astation-gone");
+        assert_eq!(store.home_or_first_verified(), None);
+    }
+
+    #[test]
+    fn set_home_never_overwrites() {
+        let mut store = two_verified();
+        store.set_home(ASTATION);
+        store.set_home("astation-0");
+        assert_eq!(store.home(), Some(ASTATION));
+        assert_eq!(store.home_or_first_verified().as_deref(), Some(ASTATION));
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod verification;
 pub mod trust;
 pub mod grant;
 pub mod storage_key;
+pub mod key_agent;
 
 #[cfg(test)]
 mod e2e_tests;

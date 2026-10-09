@@ -49,7 +49,7 @@ pulldown-cmark = { version = "0.10", default-features = false, features = ["html
 p256 = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 
 [features]
 real_rtm = []
