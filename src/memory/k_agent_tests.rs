@@ -1,23 +1,19 @@
 //! The key agent holding `K` (build step 2b): installed from signed grants,
 //! kept sealed, used only through `Crypt`, retired by signed states.
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::sync::Mutex;
 
 use crate::memory::account_keys::CryptOp;
 use crate::memory::crypto::{EncryptionMode, fail_writes_to};
-use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
+use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::fake_astation::{
-    ACCOUNT, ASTATION_ID, DEVICE_ID, FakeKeyServer, UnlockedDevice, pin, sealed_account_keys,
-    sealed_device, set_state, unlock_with,
+    ACCOUNT, ASTATION_ID, DEVICE_ID, UnlockedDevice, migrated_device, pin_as, sealed_account_keys,
+    sealed_device, set_state, set_state_as, unlock_with,
 };
 use crate::memory::grant::seal_k_grant;
-use crate::memory::key_agent::{
-    KeyAgent, KeyAgentApi, build_unlock_request, error_of, holds_k, test_agent,
-};
+use crate::memory::key_agent::{KeyAgentApi, build_unlock_request, error_of, holds_k, test_agent};
 use crate::memory::statements::FakeAstation;
 use crate::memory::storage_key::{SealedDeviceKeys, new_storage_key};
 use crate::memory::trust::TrustStore;
-use crate::memory::verification::KeyPaths;
 
 const A: &str = "0123abcd";
 const B: &str = "89abcdef";
@@ -366,29 +362,6 @@ fn unlocked_via_the_previous_file_k_goes_there_and_never_into_a_foreign_file() {
     assert_eq!(prev.current_kid(ACCOUNT), Some(A));
 }
 
-/// A step-1 device whose agent migrated the plain file at start (unlocked,
-/// not escrowed), and the server for its pinned Astation.
-fn migrated_device(
-    dir: &std::path::Path,
-) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>) {
-    let paths = KeyPaths::in_dir(dir);
-    let keys = DeviceKeys::generate();
-    keys.save_to(&paths.device_keys).unwrap();
-    let astation = FakeAstation::new();
-    pin(&paths, &astation, &keys, false);
-    let agent = test_agent(&paths);
-    let server = FakeKeyServer {
-        astation,
-        device_sign_pub: keys.device_sign_pub(),
-        unlock_auth_pub: keys.unlock_auth_pub(),
-        storage_keys: Default::default(),
-        pending: None,
-        pending_statement: None,
-        acked: Default::default(),
-    };
-    (paths, server, keys, agent)
-}
-
 #[test]
 fn the_first_escrow_and_a_crash_after_it_keep_k() {
     let dir = tempfile::tempdir().unwrap();
@@ -423,4 +396,112 @@ fn the_first_escrow_and_a_crash_after_it_keep_k() {
     assert!(!paths.device_keys.exists());
     unlock_with(&agent, &server, &paths).unwrap();
     assert!(holds_k(&agent, ASTATION_ID));
+}
+
+#[test]
+fn a_grant_a_newer_signed_state_retired_at_once_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.state(EncryptionMode::On, Some(A));
+    // A second verified Astation names the same account: its newer signed
+    // state turned encryption off.
+    let other = FakeAstation::new();
+    pin_as(&device.paths, "astation-2", &other, &device.keys, false);
+    set_state_as(
+        &device.paths,
+        "astation-2",
+        &other,
+        EncryptionMode::Off,
+        None,
+        9,
+    );
+    let before = std::fs::read(&device.paths.device_keys_sealed).unwrap();
+    let error = error_of(
+        device
+            .agent
+            .install_grant(ASTATION_ID, &device.grant(A, [42; 32])),
+    );
+    assert!(
+        error.contains("a newer signed state retired this key"),
+        "{error}"
+    );
+    assert!(!holds_k(device.agent.as_ref(), ASTATION_ID));
+    assert_eq!(device.agent.held_kid(ASTATION_ID).unwrap(), None);
+    assert_eq!(
+        std::fs::read(&device.paths.device_keys_sealed).unwrap(),
+        before,
+        "nothing is sealed for a key that is dropped at once"
+    );
+}
+
+#[test]
+fn a_failed_prune_write_is_logged_once_until_it_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::Enabling, A, [1; 32]);
+    device.set_key(EncryptionMode::Enabling, B, [2; 32]);
+    device.state(EncryptionMode::On, Some(B));
+    let logged = |device: &UnlockedDevice| device.agent.lock().unwrap().prune_failures_logged;
+    {
+        let _failing = fail_writes_to(&device.paths.device_keys_sealed);
+        for _ in 0..3 {
+            device.agent.held_kid(ASTATION_ID).unwrap();
+            seal(&device, b"fact");
+        }
+        assert_eq!(logged(&device), 1, "logged when the keys first go unsaved");
+    }
+    device.agent.held_kid(ASTATION_ID).unwrap();
+    assert_eq!(logged(&device), 1);
+    assert!(device.sealed_accounts().previous_kids(ACCOUNT).is_empty());
+    // A later failure is a new one: logged again.
+    device.set_key(EncryptionMode::Enabling, A, [3; 32]);
+    device.state(EncryptionMode::Off, None);
+    {
+        let _failing = fail_writes_to(&device.paths.device_keys_sealed);
+        device.agent.held_kid(ASTATION_ID).unwrap();
+        device.agent.held_kid(ASTATION_ID).unwrap();
+    }
+    assert_eq!(logged(&device), 2);
+}
+
+#[test]
+fn a_failed_current_file_write_mid_rotation_installs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.state(EncryptionMode::On, Some(A));
+    let rotation = device.agent.begin_rotation(ASTATION_ID).unwrap();
+    let before = std::fs::read(&device.paths.device_keys_sealed).unwrap();
+    {
+        // .next is written first and succeeds; the current file fails.
+        let _failing = fail_writes_to(&device.paths.device_keys_sealed);
+        assert!(
+            device
+                .agent
+                .install_grant(ASTATION_ID, &device.grant(A, [42; 32]))
+                .is_err()
+        );
+    }
+    assert!(
+        !holds_k(device.agent.as_ref(), ASTATION_ID),
+        "memory has no K"
+    );
+    assert_eq!(
+        std::fs::read(&device.paths.device_keys_sealed).unwrap(),
+        before,
+        "the current file is unchanged"
+    );
+    let ack = device.server.accept_rotation(&rotation).unwrap();
+    let (_, confirm) = device.agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+    device.server.confirm(&confirm).unwrap();
+    assert_eq!(device.agent.held_kid(ASTATION_ID).unwrap(), None);
+    // .next was written before the current file failed: the promoted file
+    // already carries K (harmless: the signed state names it).
+    assert_eq!(device.sealed_accounts().current_kid(ACCOUNT), Some(A));
+    // The grant comes again (keyRequest) and installs.
+    device
+        .agent
+        .install_grant(ASTATION_ID, &device.grant(A, [42; 32]))
+        .unwrap();
+    assert!(holds_k(device.agent.as_ref(), ASTATION_ID));
+    assert_eq!(device.sealed_accounts().current_kid(ACCOUNT), Some(A));
 }

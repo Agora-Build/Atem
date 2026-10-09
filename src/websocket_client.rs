@@ -850,7 +850,7 @@ impl AstationClient {
         &self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
-        use crate::memory::key_agent::{blocking, default_agent, LOCKED};
+        use crate::memory::key_agent::{blocking, default_agent, running_agent, LOCKED};
         use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied, KeyPaths};
 
         if !matches!(message, AstationMessage::EncryptionMode { .. } | AstationMessage::KeyGrant { .. }) {
@@ -884,19 +884,36 @@ impl AstationClient {
             self.send_message(AstationMessage::KeyRequest { public_key }).await?;
             Ok::<_, anyhow::Error>(Some("Encryption key requested from Astation".to_string()))
         };
+        // Asks the agent whether K for the signed kid is held (blocking socket I/O).
+        let needs_key = || {
+            let (paths, astation_id) = (paths.clone(), astation_id.clone());
+            blocking(move || key_needed(&paths, default_agent().as_ref(), &astation_id))
+        };
         match applied {
             Applied::Ignored(reason) => Ok(Some(format!("Ignored {reason}"))),
             Applied::Locked => Ok(Some(format!("Ignored a key grant: {LOCKED}"))),
             Applied::Unchanged => {
                 // A repeat of the stored state still asks for K if it is missing
                 // (e.g. a keyRequest or grant was lost earlier).
-                if key_needed(&paths, &astation_id)? {
+                if needs_key().await? {
                     return request_key().await;
                 }
                 Ok(Some("Account encryption state unchanged".into()))
             }
             Applied::ModeChanged(state) => {
-                if key_needed(&paths, &astation_id)? {
+                if !state.mode.requires_key() {
+                    // A running, unlocked agent drops the account's keys now; a
+                    // locked one does at its next unlock.
+                    let astation = astation_id.clone();
+                    blocking(move || {
+                        if let Some(agent) = running_agent() {
+                            let _ = agent.held_kid(&astation);
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                }
+                if needs_key().await? {
                     return request_key().await;
                 }
                 self.finish_encryption_migration(&astation_id, state.kid).await

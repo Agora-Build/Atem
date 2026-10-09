@@ -31,6 +31,17 @@ pub(crate) const DEVICE_ID: &str = "dev-1";
 /// Pins `astation` for `keys` in `paths.trust`, as a finished verification
 /// does; `home` also makes it the home Astation.
 pub(crate) fn pin(paths: &KeyPaths, astation: &FakeAstation, keys: &DeviceKeys, home: bool) {
+    pin_as(paths, ASTATION_ID, astation, keys, home);
+}
+
+/// [`pin`] under another Astation id (same account and device).
+pub(crate) fn pin_as(
+    paths: &KeyPaths,
+    astation_id: &str,
+    astation: &FakeAstation,
+    keys: &DeviceKeys,
+    home: bool,
+) {
     let pinned = AstationKeys {
         sign_pub: astation.sign_pub(),
         enc_pub: astation.enc_pub(),
@@ -39,7 +50,7 @@ pub(crate) fn pin(paths: &KeyPaths, astation: &FakeAstation, keys: &DeviceKeys, 
     };
     let mut trust = TrustStore::load_from(&paths.trust).unwrap();
     trust.set_pending(
-        ASTATION_ID,
+        astation_id,
         DEVICE_ID,
         keys,
         &pinned,
@@ -57,10 +68,10 @@ pub(crate) fn pin(paths: &KeyPaths, astation: &FakeAstation, keys: &DeviceKeys, 
         epoch: 1,
     };
     trust
-        .confirm(ASTATION_ID, &astation.sign(&certificate.encode()))
+        .confirm(astation_id, &astation.sign(&certificate.encode()))
         .unwrap();
     if home {
-        trust.set_home(ASTATION_ID);
+        trust.set_home(astation_id);
     }
     trust.save_to(&paths.trust).unwrap();
 }
@@ -401,6 +412,30 @@ impl FakeKeyServer {
     }
 }
 
+/// A step-1 device whose agent migrated the plain file at start: plain
+/// file, sealed file, an agent holding the new storage key (not escrowed),
+/// and a server speaking for the Astation that was pinned.
+pub(crate) fn migrated_device(
+    dir: &Path,
+) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>) {
+    let paths = KeyPaths::in_dir(dir);
+    let keys = DeviceKeys::generate();
+    keys.save_to(&paths.device_keys).unwrap();
+    let astation = FakeAstation::new();
+    pin(&paths, &astation, &keys, false);
+    let agent = test_agent(&paths);
+    let server = FakeKeyServer {
+        astation,
+        device_sign_pub: keys.device_sign_pub(),
+        unlock_auth_pub: keys.unlock_auth_pub(),
+        storage_keys: Default::default(),
+        pending: None,
+        pending_statement: None,
+        acked: Default::default(),
+    };
+    (paths, server, keys, agent)
+}
+
 /// What `atem cred unlock` does with `agent`, against `server`.
 pub(crate) fn unlock_with(
     agent: &dyn KeyAgentApi,
@@ -424,6 +459,18 @@ pub(crate) fn set_state(
     kid: Option<&str>,
     epoch: u64,
 ) {
+    set_state_as(paths, ASTATION_ID, astation, mode, kid, epoch);
+}
+
+/// [`set_state`] for the Astation pinned as `astation_id`.
+pub(crate) fn set_state_as(
+    paths: &KeyPaths,
+    astation_id: &str,
+    astation: &FakeAstation,
+    mode: EncryptionMode,
+    kid: Option<&str>,
+    epoch: u64,
+) {
     let signed = astation.sign(
         &AccountState {
             account: ACCOUNT.into(),
@@ -435,7 +482,7 @@ pub(crate) fn set_state(
         .encode(),
     );
     TrustStore::update(&paths.trust, |trust| {
-        trust.accept_account_state(ASTATION_ID, &signed)?;
+        trust.accept_account_state(astation_id, &signed)?;
         Ok(())
     })
     .unwrap();

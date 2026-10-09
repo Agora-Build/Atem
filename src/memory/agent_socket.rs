@@ -240,24 +240,7 @@ struct ResponseHead {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
-    reply: Option<ReplyKind>,
-}
-
-#[derive(Deserialize)]
-struct ReplyKind {
-    kind: String,
-}
-
-/// The grant reply carries `K`: parsed straight from the line.
-#[derive(Deserialize)]
-struct GrantResponse {
-    reply: GrantReply,
-}
-
-#[derive(Deserialize)]
-struct GrantReply {
-    kid: String,
-    key: Zeroizing<String>,
+    reply: Option<serde::de::IgnoredAny>,
 }
 
 pub(crate) fn decode_response(line: &str) -> Result<Reply> {
@@ -277,17 +260,8 @@ pub(crate) fn decode_response(line: &str) -> Result<Reply> {
                 .unwrap_or_else(|| "the key agent refused the request".into())
         );
     }
-    let kind = head
-        .reply
-        .ok_or_else(|| anyhow!("the key agent sent an empty reply"))?
-        .kind;
-    if kind == "grant" {
-        let grant: GrantResponse =
-            serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
-        return Ok(Reply::Grant {
-            kid: grant.reply.kid,
-            key: grant.reply.key,
-        });
+    if head.reply.is_none() {
+        bail!("the key agent sent an empty reply");
     }
     let response: Response =
         serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
@@ -1549,22 +1523,22 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_reply_with_k_decodes_without_the_tagged_enum() {
-        match decode_response(
-            r#"{"v":1,"ok":true,"reply":{"kind":"grant","kid":"ab12cd34","key":"AAAA"}}"#,
-        )
-        .unwrap()
-        {
-            Reply::Grant { kid, key } => {
-                assert_eq!(kid, "ab12cd34");
-                assert_eq!(&**key, "AAAA");
-            }
-            _ => panic!("expected a grant"),
-        }
+    fn replies_decode_through_their_kind() {
+        assert!(matches!(
+            decode_response(r#"{"v":1,"ok":true,"reply":{"kind":"grant_installed","kid":"ab12cd34"}}"#).unwrap(),
+            Reply::GrantInstalled { kid } if kid == "ab12cd34"
+        ));
         assert!(matches!(
             decode_response(r#"{"v":1,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false}}"#).unwrap(),
             Reply::Status { unlocked: false, .. }
         ));
+        // No reply carries K any more.
+        assert!(
+            decode_response(
+                r#"{"v":1,"ok":true,"reply":{"kind":"grant","kid":"ab12cd34","key":"AAAA"}}"#
+            )
+            .is_err()
+        );
     }
 
     /// Requests that carry secrets, grants (with and without trust) and an unlock answer.
@@ -1607,15 +1581,13 @@ mod tests {
                 storage_kid: "abcd1234".into(),
                 storage_key: Zeroizing::new("a2V5".into()),
             },
-            Request::OpenGrant {
+            Request::InstallGrant {
                 astation_id: "a".into(),
                 grant: grant(),
-                trust: None,
             },
-            Request::OpenGrant {
-                astation_id: "a".into(),
+            Request::CheckGrant {
                 grant: grant(),
-                trust: Some(trust),
+                trust,
             },
             Request::FinishUnlock {
                 astation_id: "a".into(),

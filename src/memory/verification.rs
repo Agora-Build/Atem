@@ -277,16 +277,9 @@ pub fn apply_account_state(
     let Some(state) = trust.accept_account_state(astation_id, signed)? else {
         return Ok(Applied::Unchanged);
     };
-    // Checked before anything is saved: a bad kid leaves the trust store and
-    // data_keys untouched.
+    // Checked before anything is saved: a bad kid leaves the trust store
+    // untouched. The signed state is the only record of mode and kid.
     check_state(&state)?;
-    EncryptionContext::update_mode_at(
-        &paths.data_keys,
-        astation_id,
-        &state.account,
-        state.mode,
-        state.kid.as_deref(),
-    )?;
     trust.save_to(&paths.trust)?;
     Ok(Applied::ModeChanged(state))
 }
@@ -352,8 +345,8 @@ pub fn account_mode(trust_path: &Path, astation_id: &str) -> Result<AccountMode>
     })
 }
 
-/// Installs a signed `K` grant for this verified device. The grant is opened
-/// only inside the unlocked key agent; there is no plain-key fallback.
+/// Installs a signed `K` grant for this verified device. The key agent opens
+/// it and keeps `K` sealed; nothing returns `K` to this process.
 pub fn apply_grant(
     paths: &KeyPaths,
     agent: &dyn KeyAgentApi,
@@ -364,28 +357,20 @@ pub fn apply_grant(
         return Ok(Applied::Ignored("an unsigned key grant from the relay"));
     };
     let trust = TrustStore::load_from(&paths.trust)?;
-    let Some(entry) = trust.verified(astation_id) else {
+    if trust.verified(astation_id).is_none() {
         return Ok(Applied::Ignored(
             "a key grant for a device that isn't verified",
         ));
-    };
+    }
     if !agent.status()?.unlocked {
         return Ok(Applied::Locked);
     }
-    let opened = match agent.open_grant(astation_id, grant, None) {
-        Ok(opened) => opened,
+    match agent.install_grant(astation_id, grant) {
+        Ok(kid) => Ok(Applied::KeyInstalled(kid)),
         // Locked between the two calls.
-        Err(error) if format!("{error:#}").contains(LOCKED) => return Ok(Applied::Locked),
-        Err(error) => return Err(error),
-    };
-    EncryptionContext::install_grant_at(
-        &paths.data_keys,
-        astation_id,
-        &entry.data_account,
-        &opened.kid,
-        *opened.key,
-    )?;
-    Ok(Applied::KeyInstalled(opened.kid))
+        Err(error) if format!("{error:#}").contains(LOCKED) => Ok(Applied::Locked),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,9 +394,10 @@ pub struct VerificationOutcome {
 /// Astation the home: they are sealed under a new storage key and handed to
 /// the key agent before anything is written, so if the agent can't take
 /// them nothing is saved. Then the sealed keys (and, for fresh keys, a
-/// plain `device_keys` kept until the first escrow is confirmed), the state
-/// and grants, the pins and the home are written and the legacy plain key
-/// deleted. On any failure before that point nothing is written.
+/// plain `device_keys` kept until the first escrow is confirmed), the state,
+/// the pins and the home are written and the legacy plain key deleted. On
+/// any failure before that point nothing is written. Then the key agent
+/// installs the grants; a failure there is a warning (`K` is asked for again).
 ///
 /// For fresh keys the outcome carries the storage key for the home Astation
 /// (the first escrow), prepared by the agent once the home is saved.
@@ -466,17 +452,21 @@ pub fn complete_verification(
             }
         }
     }
-    let opened = grants
+    // Every grant is checked before anything is written. Fresh keys are in
+    // this process anyway, so their grants are opened here and `K` dropped at
+    // once; sealed keys' grants are checked in the agent, which drops `K`.
+    // The agent installs `K` below, once the pins it checks against are saved.
+    let granted_kids = grants
         .iter()
         .map(|grant| match &keys {
-            VerificationKeys::Fresh(fresh) => open_grant(&entry, fresh, grant),
+            VerificationKeys::Fresh(fresh) => open_grant(&entry, fresh, grant).map(|opened| opened.kid),
             // The staged pins: they aren't saved until everything holds.
-            VerificationKeys::Sealed(_) => agent.open_grant(astation_id, grant, Some(&entry)),
+            VerificationKeys::Sealed(_) => agent.check_grant(grant, &entry),
         })
         .collect::<Result<Vec<_>>>()?;
-    if opened
+    if granted_kids
         .iter()
-        .any(|grant| Some(grant.kid.as_str()) != state.kid.as_deref())
+        .any(|kid| Some(kid.as_str()) != state.kid.as_deref())
     {
         bail!("a key grant names a different key id than the signed account state");
     }
@@ -492,7 +482,8 @@ pub fn complete_verification(
         }
         VerificationKeys::Sealed(_) => None,
     };
-    let write = || -> Result<()> {
+    // Returns the kid whose grants the agent installs afterwards.
+    let write = || -> Result<Option<String>> {
         // Fresh keys: no key file exists (checked above). The plain file
         // stays until Astation confirms it holds the storage key (the agent
         // deletes it then), so an agent that stops before that re-seals the
@@ -503,10 +494,9 @@ pub fn complete_verification(
             fresh.save_to(&paths.device_keys)?;
         }
         // The staged changes again, on the store as it is now, under its
-        // lock (never held across an agent call), before data_keys is
-        // touched: another process's changes since `staged` was loaded
-        // aren't lost, and a newer signed state it applied meanwhile is kept
-        // (with the data_keys mode it wrote), never rolled back.
+        // lock (never held across an agent call): another process's changes
+        // since `staged` was loaded aren't lost, and a newer signed state it
+        // applied meanwhile is kept, never rolled back.
         let _trust_lock = TrustStore::lock(&paths.trust)?;
         let mut current = TrustStore::load_from(&paths.trust)?;
         let first = current.verified(astation_id).is_none();
@@ -527,84 +517,79 @@ pub fn complete_verification(
             current.set_home(astation_id);
         }
         if first {
-            // Whatever the unauthenticated path stored for this Astation (mode,
-            // K, rotation history, project names) is dropped, not trusted.
+            // Whatever the unauthenticated path stored for this Astation (K,
+            // rotation history, project names) is dropped, not trusted.
             EncryptionContext::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
+            crate::memory::project_names::forget_account_at(&paths.project_names, &state.account)?;
         }
-        // A newer state is already in data_keys: written with it.
-        if newer.is_none() {
-            EncryptionContext::update_mode_at(
-                &paths.data_keys,
-                astation_id,
-                &state.account,
-                state.mode,
-                state.kid.as_deref(),
-            )?;
-        }
+        current.save_to(&paths.trust)?;
         // Grants are for this verification's state's kid: installed unless
         // the newer state moved to another key (its own grant brings that).
-        let installed_kid = newer.as_ref().map_or(&state.kid, |newer| &newer.kid);
-        for grant in opened {
-            if Some(&grant.kid) != installed_kid.as_ref() {
-                continue;
-            }
-            EncryptionContext::install_grant_at(
-                &paths.data_keys,
-                astation_id,
-                &entry.data_account,
-                &grant.kid,
-                *grant.key,
-            )?;
-        }
-        current.save_to(&paths.trust)
+        Ok(newer.map_or(state.kid.clone(), |newer| newer.kid))
     };
-    if let Err(error) = write() {
-        if let (Some((written, unlock_auth)), VerificationKeys::Fresh(fresh)) = (&sealed, &keys) {
-            // Undo the fresh keys entirely: no sealed file without its
-            // verification, and no agent holding keys that aren't on disk.
-            // Only files this call wrote go: a concurrent pairing run's stay.
-            // With the files gone the agent accepts the lock.
-            if SealedDeviceKeys::load_from(&paths.device_keys_sealed)
-                .is_ok_and(|file| file.is_some_and(|file| file.storage_kid == written.storage_kid))
-            {
-                let _ = remove_if_exists(&paths.device_keys_sealed);
+    let install_kid = match write() {
+        Ok(kid) => kid,
+        Err(error) => {
+            if let (Some((written, unlock_auth)), VerificationKeys::Fresh(fresh)) = (&sealed, &keys) {
+                // Undo the fresh keys entirely: no sealed file without its
+                // verification, and no agent holding keys that aren't on disk.
+                // Only files this call wrote go: a concurrent pairing run's stay.
+                // With the files gone the agent accepts the lock.
+                if SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                    .is_ok_and(|file| file.is_some_and(|file| file.storage_kid == written.storage_kid))
+                {
+                    let _ = remove_if_exists(&paths.device_keys_sealed);
+                }
+                if UnlockAuthKey::load_from(&paths.unlock_auth_key)
+                    .is_ok_and(|file| file.is_some_and(|file| file.public() == unlock_auth.public()))
+                {
+                    let _ = remove_if_exists(&paths.unlock_auth_key);
+                }
+                if DeviceKeys::load_from(&paths.device_keys).is_ok_and(|file| {
+                    file.is_some_and(|file| file.device_sign_pub() == fresh.device_sign_pub())
+                }) {
+                    let _ = remove_if_exists(&paths.device_keys);
+                }
+                if agent
+                    .public_keys()
+                    .is_ok_and(|held| held == (fresh.device_pub(), fresh.device_sign_pub()))
+                {
+                    let _ = agent.lock_keys();
+                }
             }
-            if UnlockAuthKey::load_from(&paths.unlock_auth_key)
-                .is_ok_and(|file| file.is_some_and(|file| file.public() == unlock_auth.public()))
-            {
-                let _ = remove_if_exists(&paths.unlock_auth_key);
-            }
-            if DeviceKeys::load_from(&paths.device_keys).is_ok_and(|file| {
-                file.is_some_and(|file| file.device_sign_pub() == fresh.device_sign_pub())
-            }) {
-                let _ = remove_if_exists(&paths.device_keys);
-            }
-            if agent
-                .public_keys()
-                .is_ok_and(|held| held == (fresh.device_pub(), fresh.device_sign_pub()))
-            {
-                let _ = agent.lock_keys();
-            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     remove_if_exists(&paths.legacy_device_key)?;
-    let (escrow, warning) = match sealed {
+    let mut warnings = Vec::new();
+    // The verification is saved: a K that can't be stored now is asked for
+    // again (key_needed below), never a reason to fail.
+    for (grant, kid) in grants.iter().zip(&granted_kids) {
+        if Some(kid) != install_kid.as_ref() {
+            continue;
+        }
+        if let Err(error) = agent.install_grant(astation_id, grant) {
+            warnings.push(format!(
+                "the encryption key couldn't be stored in the key agent ({error:#}); atem asks Astation for it again"
+            ));
+        }
+    }
+    let escrow = match sealed {
         Some(_) => match agent.begin_rotation(astation_id) {
-            Ok(rotation) => (Some(rotation), None),
-            Err(error) => (
-                None,
-                Some(format!(
+            Ok(rotation) => Some(rotation),
+            Err(error) => {
+                warnings.push(format!(
                     "this device's storage key couldn't be prepared for Astation ({error:#}); run `atem cred unlock` before this machine restarts"
-                )),
-            ),
+                ));
+                None
+            }
         },
-        None => (None, None),
+        None => None,
     };
     Ok(VerificationOutcome {
-        key_needed: key_needed(paths, astation_id)?,
+        key_needed: key_needed(paths, agent, astation_id)?,
         escrow,
-        warning,
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
 }
 
@@ -617,8 +602,10 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 }
 
 /// Whether this device is verified with `astation_id`, its signed state
-/// needs `K`, and no usable `K` is stored: then it should send `keyRequest`.
-pub fn key_needed(paths: &KeyPaths, astation_id: &str) -> Result<bool> {
+/// needs `K`, and the key agent doesn't hold that `K` (a locked agent counts
+/// as not holding it): then it should send `keyRequest`. Blocking: from
+/// async code call it inside `key_agent::blocking`.
+pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) -> Result<bool> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let Some(entry) = trust.verified(astation_id) else {
         return Ok(false);
@@ -626,8 +613,14 @@ pub fn key_needed(paths: &KeyPaths, astation_id: &str) -> Result<bool> {
     let Some(state) = stored_state(entry)? else {
         return Ok(false);
     };
-    Ok(state.mode.requires_key()
-        && EncryptionContext::for_astation_at(astation_id, &paths.data_keys).is_err())
+    if !state.mode.requires_key() {
+        return Ok(false);
+    }
+    match agent.held_kid(astation_id) {
+        Ok(held) => Ok(held != state.kid),
+        Err(error) if format!("{error:#}").contains(LOCKED) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether this device has keys on disk: a plain step-1 file, or any sealed
@@ -849,9 +842,9 @@ mod tests {
         assert!(rest(key.to_encoded_point(true).as_bytes()).is_err());
     }
 
-    use crate::memory::crypto::{EncryptionContext, EncryptionMode};
+    use crate::memory::crypto::EncryptionMode;
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::key_agent::{KeyAgent, test_agent};
+    use crate::memory::key_agent::{KeyAgent, holds_k, test_agent};
     use crate::memory::statements::{AccountState, DeviceVerified, FakeAstation};
     use crate::memory::trust::TrustStore;
 
@@ -990,9 +983,8 @@ mod tests {
     fn verification_installs_signed_state_and_key() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::On);
-        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
-        assert_eq!(context.mode, EncryptionMode::On);
-        assert!(context.seal("mem-1", "content", b"x").is_ok());
+        assert_eq!(account_mode(&paths.trust, ASTATION_ID).unwrap().mode, EncryptionMode::On);
+        assert!(holds_k(&agent, ASTATION_ID));
         assert!(
             !paths.legacy_device_key.exists(),
             "old plain device_key must be deleted"
@@ -1008,15 +1000,19 @@ mod tests {
     #[test]
     fn unsigned_or_forged_mode_changes_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, _, _, _) = verify(dir.path(), EncryptionMode::On);
+        let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::On);
         assert!(matches!(
             apply_account_state(&paths, ASTATION_ID, None).unwrap(),
             Applied::Ignored(_)
         ));
         let forged = signed_state(&FakeAstation::new(), EncryptionMode::Off, 9);
         assert!(apply_account_state(&paths, ASTATION_ID, Some(&forged)).is_err());
-        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
-        assert_eq!(context.mode, EncryptionMode::On, "K and mode must survive");
+        assert_eq!(
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
+            EncryptionMode::On,
+            "the mode must survive"
+        );
+        assert!(holds_k(&agent, ASTATION_ID), "K must survive");
     }
 
     #[test]
@@ -1029,9 +1025,7 @@ mod tests {
             Applied::ModeChanged(_)
         ));
         assert_eq!(
-            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
-                .unwrap()
-                .mode,
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
             EncryptionMode::Disabling
         );
     }
@@ -1052,9 +1046,7 @@ mod tests {
         );
         assert!(apply_account_state(&paths, ASTATION_ID, Some(&bad)).is_err());
         assert_eq!(
-            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
-                .unwrap()
-                .mode,
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
             EncryptionMode::On
         );
         let trust = TrustStore::load_from(&paths.trust).unwrap();
@@ -1079,9 +1071,7 @@ mod tests {
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert_eq!(trust.verified(ASTATION_ID).unwrap().account_epoch, 1);
         assert_eq!(
-            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
-                .unwrap()
-                .mode,
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
             EncryptionMode::On
         );
     }
@@ -1107,9 +1097,7 @@ mod tests {
             Applied::Ignored(_)
         ));
         assert_eq!(
-            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
-                .unwrap()
-                .mode,
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
             EncryptionMode::Off
         );
     }
@@ -1126,7 +1114,7 @@ mod tests {
         std::fs::write(&paths.trust, raw).unwrap();
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(trust.verified(ASTATION_ID).unwrap().account_state.is_none());
-        let error = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
+        let error = account_mode(&paths.trust, ASTATION_ID)
             .unwrap_err()
             .to_string();
         assert!(error.contains("signed encryption state"), "{error}");
@@ -1139,7 +1127,7 @@ mod ceremony_tests {
     use crate::memory::crypto::{EncryptionContext, EncryptionMode};
     use crate::memory::fake_astation::FakeKeyServer;
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::key_agent::{error_of, test_agent};
+    use crate::memory::key_agent::{error_of, holds_k, test_agent};
     use crate::memory::statements::{DeviceVerified, FakeAstation, StorageRotate, verify_device};
 
     const ASTATION_ID: &str = "astation-1";
@@ -1245,12 +1233,8 @@ mod ceremony_tests {
         );
         assert!(result.is_err(), "a replayed certificate must be rejected");
 
-        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
-        assert_eq!(context.mode, EncryptionMode::On);
-        assert!(
-            context.seal("mem", "content", b"x").is_ok(),
-            "K must survive"
-        );
+        assert_eq!(account_mode(&paths.trust, ASTATION_ID).unwrap().mode, EncryptionMode::On);
+        assert!(holds_k(&agent, ASTATION_ID), "K must survive");
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert_eq!(trust.verified(ASTATION_ID).unwrap().account_epoch, 2);
     }
@@ -1292,12 +1276,8 @@ mod ceremony_tests {
         )
         .unwrap();
 
-        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
-        assert_eq!(context.mode, EncryptionMode::On);
-        assert!(
-            context.seal("mem", "content", b"x").is_ok(),
-            "K must survive"
-        );
+        assert_eq!(account_mode(&paths.trust, ASTATION_ID).unwrap().mode, EncryptionMode::On);
+        assert!(holds_k(&agent, ASTATION_ID), "K must survive");
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         let entry = trust.verified(ASTATION_ID).unwrap();
         assert_eq!((entry.epoch_floor, entry.account_epoch), (3, 4));
@@ -1319,6 +1299,7 @@ mod ceremony_tests {
             "unlock_auth_key must not be written"
         );
         assert!(!paths.data_keys.exists(), "data_keys must not be written");
+        assert!(!paths.project_names.exists(), "project_names.json must not be written");
         assert!(
             paths.legacy_device_key.exists(),
             "the old device_key must not be deleted"
@@ -1462,7 +1443,7 @@ mod ceremony_tests {
         result.unwrap();
         assert_eq!(
             stored_summary_at(&paths.data_keys, ASTATION_ID, "acct"),
-            (Some(Some("89abcdef".into())), None, vec![], 0),
+            (None, None, vec![], 0),
             "the old K and its history must be gone"
         );
     }
@@ -1470,14 +1451,13 @@ mod ceremony_tests {
     #[test]
     fn outcome_says_when_k_is_still_needed() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+        let (_, result) = first_verification(dir.path(), 1, |fake, _| {
             (state(fake, EncryptionMode::On, Some("0123abcd"), 2), vec![])
         });
         assert!(result.unwrap().key_needed);
-        assert!(key_needed(&paths, ASTATION_ID).unwrap());
 
         let dir = tempfile::tempdir().unwrap();
-        let (paths, result) = first_verification(dir.path(), 1, |fake, device_pub| {
+        let (_, result) = first_verification(dir.path(), 1, |fake, device_pub| {
             (
                 state(fake, EncryptionMode::On, Some("0123abcd"), 2),
                 vec![seal_k_grant(
@@ -1486,15 +1466,16 @@ mod ceremony_tests {
             )
         });
         assert!(!result.unwrap().key_needed);
-        assert!(!key_needed(&paths, ASTATION_ID).unwrap());
 
         let dir = tempfile::tempdir().unwrap();
         let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
             (state(fake, EncryptionMode::Off, None, 2), vec![])
         });
         assert!(!result.unwrap().key_needed);
-        assert!(!key_needed(&paths, ASTATION_ID).unwrap());
-        assert!(!key_needed(&paths, "never-verified").unwrap());
+        let empty = tempfile::tempdir().unwrap();
+        let locked = test_agent(&KeyPaths::in_dir(empty.path()));
+        assert!(!key_needed(&paths, &locked, ASTATION_ID).unwrap(), "off needs no K");
+        assert!(!key_needed(&paths, &locked, "never-verified").unwrap());
     }
 
     /// A first verification of fresh keys with `fake` (certificate epoch 1,
@@ -1715,8 +1696,7 @@ mod ceremony_tests {
         .unwrap();
         assert!(!outcome.key_needed);
         assert!(outcome.escrow.is_none(), "the storage key isn't new");
-        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
-        assert!(context.seal("mem", "content", b"x").is_ok());
+        assert!(holds_k(&agent, ASTATION_ID));
     }
 
     #[test]
@@ -1860,11 +1840,13 @@ mod ceremony_tests {
             apply_grant(&paths, &locked, ASTATION_ID, Some(&grant)).unwrap(),
             Applied::Locked
         ));
-        assert!(key_needed(&paths, ASTATION_ID).unwrap());
+        assert!(key_needed(&paths, &locked, ASTATION_ID).unwrap());
         assert!(matches!(
             apply_grant(&paths, &agent, ASTATION_ID, Some(&grant)).unwrap(),
             Applied::KeyInstalled(_)
         ));
+        assert!(!key_needed(&paths, &agent, ASTATION_ID).unwrap());
+        assert!(holds_k(&agent, ASTATION_ID));
     }
 
     /// Answers `Status` from one agent and everything else from another
@@ -2179,7 +2161,7 @@ mod ceremony_tests {
             &self,
             request: crate::memory::key_agent::Request,
         ) -> Result<crate::memory::key_agent::Reply> {
-            let open = matches!(request, crate::memory::key_agent::Request::OpenGrant { .. });
+            let open = matches!(request, crate::memory::key_agent::Request::CheckGrant { .. });
             let reply = self.agent.call(request)?;
             if open && let Some(newer) = self.newer.lock().unwrap().take() {
                 assert!(matches!(
@@ -2239,7 +2221,7 @@ mod ceremony_tests {
             "the new certificate is recorded (the floor rises to the newer state) and that state kept"
         );
         assert!(outcome.key_needed, "K for the newer kid is still to come");
-        // data_keys still announces the newer kid: its grant installs.
+        // The signed state names the newer kid: its grant installs.
         let newer_grant = seal_k_grant(
             &fake,
             "acct",
@@ -2252,12 +2234,9 @@ mod ceremony_tests {
             apply_grant(&paths, &agent, ASTATION_ID, Some(&newer_grant)).unwrap(),
             Applied::KeyInstalled(_)
         ));
-        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
-        assert_eq!(context.mode, EncryptionMode::On);
-        assert_eq!(
-            context.kid.as_deref(),
-            Some("89abcdef"),
-            "data_keys isn't downgraded to the older state"
-        );
+        let mode = account_mode(&paths.trust, ASTATION_ID).unwrap();
+        assert_eq!(mode.mode, EncryptionMode::On);
+        assert_eq!(mode.kid.as_deref(), Some("89abcdef"), "the older state isn't re-applied");
+        assert_eq!(agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some("89abcdef"));
     }
 }

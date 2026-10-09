@@ -14,9 +14,7 @@ use crate::memory::account_keys::{AccountKeys, CryptOp, CryptOut, SignedModes};
 use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::encoding::dec;
-use crate::memory::grant::{
-    GrantWire, OpenedGrant, hpke_open, hpke_seal, open_grant as open_sealed_grant,
-};
+use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, open_grant as open_sealed_grant};
 use crate::memory::statements::{
     SignedWire, StorageAbandon, StorageConfirm, StorageRotate, UnlockRequest, sealed_hash,
     storage_key_info, unlock_info,
@@ -57,15 +55,6 @@ pub enum Request {
         unlock_auth: Zeroizing<String>,
         storage_kid: String,
         storage_key: Zeroizing<String>,
-    },
-    /// Opens a key grant with the device key. `trust` is set only during
-    /// verification, before the pins are saved; otherwise the agent uses the
-    /// verified entry in cred_state.json.
-    OpenGrant {
-        astation_id: String,
-        grant: GrantWire,
-        #[serde(default)]
-        trust: Option<AstationTrust>,
     },
     /// Opens a `K` grant from a verified Astation and stores `K` in the
     /// sealed file (it is never handed back). The grant must name the kid
@@ -132,12 +121,6 @@ pub enum Reply {
     PublicKeys {
         device_pub: String,
         device_sign_pub: String,
-    },
-    /// `K` goes back to the caller until build step 2b moves data_keys.enc
-    /// behind the agent.
-    Grant {
-        kid: String,
-        key: Zeroizing<String>,
     },
     GrantInstalled {
         kid: String,
@@ -260,6 +243,9 @@ pub struct KeyAgent {
     unlocked: Option<Unlocked>,
     pending_unlock: Option<PendingUnlock>,
     pending_rotation: Option<PendingRotation>,
+    /// How often a failed prune re-seal was logged.
+    #[cfg(test)]
+    pub(crate) prune_failures_logged: usize,
 }
 
 /// Opens a sealed device-keys file only when its header names the device and
@@ -307,6 +293,8 @@ impl KeyAgent {
             unlocked: None,
             pending_unlock: None,
             pending_rotation: None,
+            #[cfg(test)]
+            prune_failures_logged: 0,
         };
         if let Err(error) = agent.migrate_plain_keys() {
             eprintln!("key agent: {error:#}");
@@ -340,11 +328,6 @@ impl KeyAgent {
                 storage_kid,
                 &storage_key,
             ),
-            Request::OpenGrant {
-                astation_id,
-                grant,
-                trust,
-            } => self.open_grant(&astation_id, &grant, trust),
             Request::InstallGrant { astation_id, grant } => {
                 self.install_grant(&astation_id, &grant)
             }
@@ -450,28 +433,6 @@ impl KeyAgent {
         Ok(Reply::Done)
     }
 
-    fn open_grant(
-        &self,
-        astation_id: &str,
-        grant: &GrantWire,
-        trust: Option<AstationTrust>,
-    ) -> Result<Reply> {
-        let unlocked = self.unlocked()?;
-        let entry = match trust {
-            Some(entry) => entry,
-            None => TrustStore::load_from(&self.paths.trust)?
-                .verified(astation_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))?,
-        };
-        let opened = open_sealed_grant(&entry, &unlocked.keys, grant)?;
-        let key = Zeroizing::new(STANDARD.encode(&opened.key[..]));
-        Ok(Reply::Grant {
-            kid: opened.kid,
-            key,
-        })
-    }
-
     fn install_grant(&mut self, astation_id: &str, grant: &GrantWire) -> Result<Reply> {
         let unlocked = self.unlocked()?;
         let trust = TrustStore::load_from(&self.paths.trust)?;
@@ -491,6 +452,11 @@ impl KeyAgent {
         let mut accounts = unlocked.accounts.clone();
         accounts.install(&entry.data_account, &kid, opened.key);
         accounts.reconcile(&self.signed_modes()?);
+        // Another verified Astation naming this account may have signed a
+        // newer state: a key it retires is never reported as installed.
+        if accounts.current_kid(&entry.data_account) != Some(kid.as_str()) {
+            bail!("a newer signed state retired this key");
+        }
         // Saved before it is used: K is in memory only once it is on disk.
         self.persist(&accounts)?;
         let unlocked = self.unlocked.as_mut().expect("unlocked above");
@@ -558,10 +524,25 @@ impl KeyAgent {
     /// Drops the account keys the signed states retired (`off`, or previous
     /// keys once `on` names the current kid). Best effort: they go from
     /// memory at once (the signed state already forbids them), and a failed
-    /// re-seal is logged and retried at the next call, never failing it.
+    /// re-seal is retried at the next call, never failing it. It is logged
+    /// once, when the keys first go unsaved, not at every retry.
     fn prune_retired(&mut self) {
+        let was_unsaved = self
+            .unlocked
+            .as_ref()
+            .is_some_and(|unlocked| unlocked.unsaved);
         if let Err(error) = self.try_prune() {
-            eprintln!("key agent: could not re-seal the account keys: {error:#}");
+            let unsaved = self
+                .unlocked
+                .as_ref()
+                .is_some_and(|unlocked| unlocked.unsaved);
+            if unsaved && !was_unsaved {
+                eprintln!("key agent: could not re-seal the account keys: {error:#}");
+                #[cfg(test)]
+                {
+                    self.prune_failures_logged += 1;
+                }
+            }
         }
     }
 
@@ -1302,26 +1283,6 @@ pub trait KeyAgentApi: Send + Sync {
         }
     }
 
-    fn open_grant(
-        &self,
-        astation_id: &str,
-        grant: &GrantWire,
-        trust: Option<&AstationTrust>,
-    ) -> Result<OpenedGrant> {
-        let request = Request::OpenGrant {
-            astation_id: astation_id.into(),
-            grant: grant.clone(),
-            trust: trust.cloned(),
-        };
-        match self.call(request)? {
-            Reply::Grant { kid, key } => Ok(OpenedGrant {
-                kid,
-                key: decode32(&key, "granted key")?,
-            }),
-            _ => unexpected(),
-        }
-    }
-
     /// Installs a granted `K` in the agent; returns its kid.
     fn install_grant(&self, astation_id: &str, grant: &GrantWire) -> Result<String> {
         match self.call(Request::InstallGrant {
@@ -1521,25 +1482,34 @@ mod tests {
             "0123abcd",
             [42; 32],
         );
-        assert!(error_of(agent.open_grant(ASTATION_ID, &grant, None)).contains("atem cred unlock"));
+        assert!(error_of(agent.install_grant(ASTATION_ID, &grant)).contains("atem cred unlock"));
     }
 
     #[test]
-    fn loaded_keys_open_grants_until_locked() {
+    fn loaded_keys_install_grants_until_locked() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
         let agent = agent(&paths);
-        // Under a storage key that seals nothing on disk, so it may be locked
-        // before Astation holds it.
         agent
-            .load_unlocked(DEVICE_ID, &keys, "1a2b3c4d", &[9; 32])
+            .load_unlocked(
+                DEVICE_ID,
+                &keys,
+                "0a1b2c3d",
+                &server.storage_keys["0a1b2c3d"],
+            )
             .unwrap();
         let status = agent.status().unwrap();
         assert!(status.unlocked && !status.escrowed);
-        assert_eq!(status.storage_kid.as_deref(), Some("1a2b3c4d"));
         assert_eq!(
             agent.public_keys().unwrap(),
             (keys.device_pub(), keys.device_sign_pub())
+        );
+        crate::memory::fake_astation::set_state(
+            &paths,
+            &server.astation,
+            crate::memory::crypto::EncryptionMode::On,
+            Some("0123abcd"),
+            2,
         );
         let grant = seal_k_grant(
             &server.astation,
@@ -1549,11 +1519,14 @@ mod tests {
             "0123abcd",
             [42; 32],
         );
-        let opened = agent.open_grant(ASTATION_ID, &grant, None).unwrap();
-        assert_eq!((opened.kid.as_str(), *opened.key), ("0123abcd", [42; 32]));
+        assert_eq!(
+            agent.install_grant(ASTATION_ID, &grant).unwrap(),
+            "0123abcd"
+        );
+        assert!(holds_k(&agent, ASTATION_ID));
         agent.lock_keys().unwrap();
         assert!(!agent.status().unwrap().unlocked);
-        assert!(error_of(agent.open_grant(ASTATION_ID, &grant, None)).contains("locked"));
+        assert!(error_of(agent.install_grant(ASTATION_ID, &grant)).contains("locked"));
     }
 
     #[test]
@@ -1616,7 +1589,7 @@ mod tests {
             "0123abcd",
             [42; 32],
         );
-        assert!(error_of(agent.open_grant("astation-2", &grant, None)).contains("isn't verified"));
+        assert!(error_of(agent.install_grant("astation-2", &grant)).contains("isn't verified"));
     }
 
     #[test]
@@ -2227,28 +2200,7 @@ mod tests {
         assert!(error_of(agent.begin_rotation("astation-2")).contains("home Astation"));
     }
 
-    /// A migrated step-1 device: plain file, sealed file, an agent holding
-    /// the new key, and a server speaking for the Astation that was pinned.
-    fn migrated_device(
-        dir: &std::path::Path,
-    ) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>) {
-        let paths = KeyPaths::in_dir(dir);
-        let keys = DeviceKeys::generate();
-        keys.save_to(&paths.device_keys).unwrap();
-        let astation = FakeAstation::new();
-        pin(&paths, &astation, &keys, false);
-        let agent = agent(&paths);
-        let server = FakeKeyServer {
-            astation,
-            device_sign_pub: keys.device_sign_pub(),
-            unlock_auth_pub: keys.unlock_auth_pub(),
-            storage_keys: Default::default(),
-            pending: None,
-            pending_statement: None,
-            acked: Default::default(),
-        };
-        (paths, server, keys, agent)
-    }
+    use crate::memory::fake_astation::migrated_device;
 
     #[test]
     fn the_plain_file_goes_only_after_astation_confirms_the_first_escrow() {

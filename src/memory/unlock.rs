@@ -749,7 +749,11 @@ async fn unlock_command(paths: &KeyPaths) -> Result<()> {
     }
     let mut client = connect_home(&home).await?;
     unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
-    if key_needed(paths, &home)? {
+    let missing = {
+        let (agent, paths, home) = (agent.clone(), paths.clone(), home.clone());
+        blocking(move || key_needed(&paths, agent.as_ref(), &home)).await?
+    };
+    if missing {
         request_missing_key(&mut client, &trust, &home).await?;
     }
     Ok(())
@@ -767,7 +771,7 @@ fn already_unlocked(
     if !status.unlocked
         || !status.escrowed
         || agent.pending_rotation()?.is_some()
-        || key_needed(paths, home)?
+        || key_needed(paths, agent, home)?
     {
         return Ok(None);
     }
