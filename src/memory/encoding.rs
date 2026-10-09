@@ -29,8 +29,7 @@ pub fn dec(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(fields)
 }
 
-/// Encodes a number field; atem only reads statements, so tests alone write.
-#[cfg(test)]
+/// Encodes a number field (8 bytes, big-endian).
 pub fn u64_field(value: u64) -> [u8; 8] {
     value.to_be_bytes()
 }

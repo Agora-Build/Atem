@@ -25,3 +25,5 @@ pub mod storage_key;
 mod e2e_tests;
 #[cfg(test)]
 mod kat_tests;
+#[cfg(test)]
+mod fake_astation;

@@ -200,6 +200,11 @@ statement whose `sign_gen` isn't their pinned generation.
 | `atem-cred-manifest-v1` | signing key | account, sign_gen, scope_hmac, kid, counter, epoch, [(name_hmac, version, ct_hash)] | Every credential in a scope; counter is monotonic across `kid` rotations. |
 | `atem-revoked-v1` | signing key | account, sign_gen, epoch, [device_id] | Devices whose writes are rejected and whose grants are void. |
 | `atem-mem-write-v1` | device signing key | account, device_id, record id, kind, scope, project_hmac, version or entry number, validity (valid_at, invalid_at, superseded_by), SHA-256(each encrypted field) | One memory, skill or vault write, including invalidations. |
+| `atem-unlock-request-v1` | unlock-auth key | account, device_id, boot_id, ticket (empty until auto-unlock), e_pub, nonce, time (Unix seconds), storage_kid | Asks the home Astation to release this device's storage key, sealed to the single-use `e_pub`. |
+| `atem-unlock-grant-v1` | signing key | account, sign_gen, device_id, storage_kid, SHA-256(request statement bytes), SHA-256(sealed storage key) | Astation's answer to exactly one unlock request; the device opens the seal only if it matches. |
+| `atem-storage-rotate-v1` | device signing key | account, device_id, old_storage_kid (empty at first sealing), new_storage_kid, SHA-256(sealed new storage key) | Hands Astation the next storage key (sealed to `astation_enc_pub`) while it keeps the old one. |
+| `atem-storage-ack-v1` | signing key | account, sign_gen, device_id, new_storage_kid | Astation stored the new storage key as pending. |
+| `atem-storage-confirm-v1` | device signing key | account, device_id, new_storage_kid | The device switched to the new storage key; Astation may drop the old one. |
 | `atem-sign-rotate-v1` | recovery signing key | account, old sign pub, new sign pub, new_gen, new recovery sign pub, not_before | Replaces the signing key after a recovery; valid only after `not_before` (72 hours). |
 | `atem-sign-veto-v1` | current signing key | account, sign_gen, vetoed new_gen | Cancels a pending replacement from the current Mac. |
 
@@ -857,7 +862,9 @@ project `…/a/bc` + name `d`).
 | Credential value | `c1.<scope_kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 | `enc("atem-cred-v1", account, scope_hmac, kid, name_hmac, version)` |
 | Credential display name | same, under the scope key | `enc("atem-cred-name-v1", account, scope_hmac, name_hmac)` |
 | Key grants (`K`, index, scope) and storage key to Astation | HPKE RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 | `info = enc("atem-grant-info-v1", account, type, device_id, device_pub, kid, scope_hmac)`; the signed `atem-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) (storage-key rotation: its own statement) |
-| Unlock reply | same HPKE to the request's `E_pub` | `info` = SHA-256(signed unlock request) |
+| Unlock reply (storage key) | same HPKE to the request's `e_pub`, empty AAD | `info = enc("atem-unlock-info-v1", account, device_id, storage_kid, SHA-256(request statement bytes))`; the signed `atem-unlock-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
+| Storage key to Astation (rotation) | same HPKE to the pinned `astation_enc_pub`, empty AAD | `info = enc("atem-storage-key-info-v1", account, device_id, new_storage_kid)`; the signed `atem-storage-rotate-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
+| `device_keys.sealed` | JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`; XChaCha20-Poly1305 under the 32-byte storage key; plaintext is the device key and device signing key only (the unlock-auth key lives in its own 0600 file `unlock_auth_key`) | AAD `enc("atem-device-keys-v1", device_id, storage_kid)` |
 | Credential names | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
 | Credential scopes | `HMAC-SHA256(I_scope, project_key)` | — |
 | Memory projects | `HMAC-SHA256(K_project, project_key)` | — |

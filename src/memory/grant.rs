@@ -65,26 +65,65 @@ pub fn open_grant(
     if sealed_hash(&encapped, &ciphertext) != statement.sealed_hash {
         bail!("key grant does not match what Astation signed");
     }
-    let secret = <Kem as KemTrait>::PrivateKey::from_bytes(&keys.device_secret_bytes())
-        .map_err(|error| anyhow!("device key is unusable for HPKE: {error:?}"))?;
-    let encapped = <Kem as KemTrait>::EncappedKey::from_bytes(&encapped)
-        .map_err(|error| anyhow!("grant key encapsulation is malformed: {error:?}"))?;
-    let plain = hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, Kem>(
-        &OpModeR::Base,
-        &secret,
+    let plain = hpke_open(
+        &keys.device_secret_bytes(),
         &encapped,
-        &statement.info(),
         &ciphertext,
-        b"",
+        &statement.info(),
     )
     .map_err(|_| anyhow!("key grant could not be opened"))?;
     let key: [u8; 32] = plain
+        .as_slice()
         .try_into()
         .map_err(|_| anyhow!("granted key has the wrong length"))?;
     Ok(OpenedGrant {
         kid: statement.kid,
         key,
     })
+}
+
+/// RFC 9180 base-mode seal with this module's suite and empty AAD.
+pub(crate) fn hpke_seal(
+    recipient: &[u8; 32],
+    info: &[u8],
+    plain: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    use hpke::{OpModeS, Serializable};
+    let public = <Kem as KemTrait>::PublicKey::from_bytes(recipient)
+        .map_err(|error| anyhow!("recipient key is unusable for HPKE: {error:?}"))?;
+    let (encapped, ciphertext) = hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, Kem, _>(
+        &OpModeS::Base,
+        &public,
+        info,
+        plain,
+        b"",
+        &mut rand::rngs::OsRng,
+    )
+    .map_err(|error| anyhow!("HPKE seal failed: {error:?}"))?;
+    Ok((encapped.to_bytes().to_vec(), ciphertext))
+}
+
+/// The matching open; the plain text is wiped when dropped.
+pub(crate) fn hpke_open(
+    secret: &[u8; 32],
+    encapped: &[u8],
+    ciphertext: &[u8],
+    info: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let secret = <Kem as KemTrait>::PrivateKey::from_bytes(secret)
+        .map_err(|error| anyhow!("key is unusable for HPKE: {error:?}"))?;
+    let encapped = <Kem as KemTrait>::EncappedKey::from_bytes(encapped)
+        .map_err(|error| anyhow!("key encapsulation is malformed: {error:?}"))?;
+    hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, Kem>(
+        &OpModeR::Base,
+        &secret,
+        &encapped,
+        info,
+        ciphertext,
+        b"",
+    )
+    .map(zeroize::Zeroizing::new)
+    .map_err(|_| anyhow!("sealed key could not be opened"))
 }
 
 /// Test stand-in for Astation sealing `K` to a device.
@@ -307,5 +346,15 @@ mod tests {
             .expect("must be rejected")
             .to_string();
         assert!(error.contains("different device"), "{error}");
+    }
+
+    #[test]
+    fn hpke_helpers_round_trip_and_bind_info() {
+        let recipient = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = x25519_dalek::PublicKey::from(&recipient).to_bytes();
+        let (encapped, ciphertext) = hpke_seal(&public, b"info", b"secret").unwrap();
+        let plain = hpke_open(&recipient.to_bytes(), &encapped, &ciphertext, b"info").unwrap();
+        assert_eq!(plain.as_slice(), b"secret");
+        assert!(hpke_open(&recipient.to_bytes(), &encapped, &ciphertext, b"other").is_err());
     }
 }
