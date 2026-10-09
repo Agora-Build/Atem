@@ -264,6 +264,20 @@ impl TrustStore {
     /// rejected, the epoch floor only rises, and the stored signed state is
     /// kept until a newer one arrives.
     pub fn confirm(&mut self, astation_id: &str, signed: &SignedWire) -> Result<DeviceVerified> {
+        self.confirm_since(astation_id, signed, u64::MAX)
+    }
+
+    /// `confirm`, for a certificate already checked against a store whose
+    /// applied account state had epoch `checked_epoch`: a state applied
+    /// since then (signed, and accepted under the store's lock) is newer
+    /// than this ceremony, not a sign of a replayed certificate, so the
+    /// certificate is compared with at most `checked_epoch`.
+    pub fn confirm_since(
+        &mut self,
+        astation_id: &str,
+        signed: &SignedWire,
+        checked_epoch: u64,
+    ) -> Result<DeviceVerified> {
         let entry = self
             .pending
             .get(astation_id)
@@ -290,7 +304,7 @@ impl TrustStore {
                 && previous.astation_sign_pub == entry.astation_sign_pub
         });
         if let Some(previous) = previous
-            && certificate.epoch < previous.account_epoch
+            && certificate.epoch < previous.account_epoch.min(checked_epoch)
         {
             bail!(
                 "Astation's device certificate is older than the state this device already applied"

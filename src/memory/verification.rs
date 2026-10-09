@@ -387,7 +387,10 @@ pub fn complete_verification(
     grants: &[GrantWire],
 ) -> Result<VerificationOutcome> {
     let mut staged = TrustStore::load_from(&paths.trust)?;
-    let first = staged.verified(astation_id).is_none();
+    // The account state epoch the certificate is checked against here.
+    let checked_epoch = staged
+        .verified(astation_id)
+        .map_or(0, |previous| previous.account_epoch);
     staged.confirm(astation_id, device_verified)?;
     let changed = staged.accept_account_state(astation_id, account_state)?;
     let entry = staged
@@ -461,19 +464,53 @@ pub fn complete_verification(
             unlock_auth.save_to(&paths.unlock_auth_key)?;
             fresh.save_to(&paths.device_keys)?;
         }
+        // The staged changes again, on the store as it is now, under its
+        // lock (never held across an agent call), before data_keys is
+        // touched: another process's changes since `staged` was loaded
+        // aren't lost, and a newer signed state it applied meanwhile is kept
+        // (with the data_keys mode it wrote), never rolled back.
+        let _trust_lock = TrustStore::lock(&paths.trust)?;
+        let mut current = TrustStore::load_from(&paths.trust)?;
+        let first = current.verified(astation_id).is_none();
+        current.confirm_since(astation_id, device_verified, checked_epoch)?;
+        let newer = current
+            .verified(astation_id)
+            .filter(|entry| entry.account_state.is_some() && entry.account_epoch > state.epoch)
+            .map(stored_state)
+            .transpose()?
+            .flatten();
+        if newer.is_none() {
+            current.accept_account_state(astation_id, account_state)?;
+        }
+        if sealed.is_some() {
+            if current.home_is_set() && current.recorded_home() != Some(astation_id) {
+                bail!("another run made a different Astation this device's home");
+            }
+            current.set_home(astation_id);
+        }
         if first {
             // Whatever the unauthenticated path stored for this Astation (mode,
             // K, rotation history, project names) is dropped, not trusted.
             EncryptionContext::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
         }
-        EncryptionContext::update_mode_at(
-            &paths.data_keys,
-            astation_id,
-            &state.account,
-            state.mode,
-            state.kid.as_deref(),
-        )?;
+        match &newer {
+            None => EncryptionContext::update_mode_at(
+                &paths.data_keys,
+                astation_id,
+                &state.account,
+                state.mode,
+                state.kid.as_deref(),
+            )?,
+            // Already in data_keys: written with the newer state.
+            Some(_) => {}
+        }
+        // Grants are for this verification's state's kid: installed unless
+        // the newer state moved to another key (its own grant brings that).
+        let installed_kid = newer.as_ref().map_or(&state.kid, |newer| &newer.kid);
         for grant in opened {
+            if Some(&grant.kid) != installed_kid.as_ref() {
+                continue;
+            }
             EncryptionContext::install_grant_at(
                 &paths.data_keys,
                 astation_id,
@@ -481,19 +518,6 @@ pub fn complete_verification(
                 &grant.kid,
                 *grant.key,
             )?;
-        }
-        // The staged changes again, on the store as it is now, under its
-        // lock (never held across an agent call): another process's changes
-        // since `staged` was loaded aren't lost.
-        let _trust_lock = TrustStore::lock(&paths.trust)?;
-        let mut current = TrustStore::load_from(&paths.trust)?;
-        current.confirm(astation_id, device_verified)?;
-        current.accept_account_state(astation_id, account_state)?;
-        if sealed.is_some() {
-            if current.home_is_set() && current.recorded_home() != Some(astation_id) {
-                bail!("another run made a different Astation this device's home");
-            }
-            current.set_home(astation_id);
         }
         current.save_to(&paths.trust)
     };
@@ -2054,5 +2078,101 @@ mod ceremony_tests {
             other_sign
         );
         assert!(!agent.status().unwrap().unlocked, "this run's keys are dropped");
+    }
+
+    /// Forwards to `agent`; right after it first opens a grant, another
+    /// atem process (the TUI's Astation link) applies `newer`, a later
+    /// signed account state, as `apply_account_state` does.
+    struct NewerStateMeanwhile {
+        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        paths: KeyPaths,
+        newer: std::sync::Mutex<Option<SignedWire>>,
+    }
+
+    impl KeyAgentApi for NewerStateMeanwhile {
+        fn call(
+            &self,
+            request: crate::memory::key_agent::Request,
+        ) -> Result<crate::memory::key_agent::Reply> {
+            let open = matches!(request, crate::memory::key_agent::Request::OpenGrant { .. });
+            let reply = self.agent.call(request)?;
+            if open && let Some(newer) = self.newer.lock().unwrap().take() {
+                assert!(matches!(
+                    apply_account_state(&self.paths, ASTATION_ID, Some(&newer))?,
+                    Applied::ModeChanged(_)
+                ));
+            }
+            Ok(reply)
+        }
+    }
+
+    #[test]
+    fn a_newer_state_applied_during_re_verification_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let fake = FakeAstation::new();
+        let agent = NewerStateMeanwhile {
+            agent: test_agent(&paths),
+            paths: paths.clone(),
+            newer: std::sync::Mutex::new(Some(state(
+                &fake,
+                EncryptionMode::On,
+                Some("89abcdef"),
+                5,
+            ))),
+        };
+        verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+
+        // Re-verification with state epoch 4 (kid 0123abcd) and its grant;
+        // while it runs, Astation's epoch-5 state (a rotated K) arrives.
+        let keys = device_keys_for_verification(&paths, &agent).unwrap();
+        let (handshake, certificate) = start(&paths, &fake, keys, 8, 3);
+        let grant = seal_k_grant(
+            &fake,
+            "acct",
+            "dev-1",
+            certificate.device_pub,
+            "0123abcd",
+            [42; 32],
+        );
+        let outcome = complete_verification(
+            &paths,
+            &agent,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(&fake, EncryptionMode::On, Some("0123abcd"), 4),
+            &[grant],
+        )
+        .expect("a newer state applied meanwhile doesn't fail the verification");
+
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        let entry = trust.verified(ASTATION_ID).unwrap();
+        assert_eq!(
+            (entry.epoch_floor, entry.account_epoch),
+            (5, 5),
+            "the new certificate is recorded (the floor rises to the newer state) and that state kept"
+        );
+        assert!(outcome.key_needed, "K for the newer kid is still to come");
+        // data_keys still announces the newer kid: its grant installs.
+        let newer_grant = seal_k_grant(
+            &fake,
+            "acct",
+            "dev-1",
+            certificate.device_pub,
+            "89abcdef",
+            [43; 32],
+        );
+        assert!(matches!(
+            apply_grant(&paths, &agent, ASTATION_ID, Some(&newer_grant)).unwrap(),
+            Applied::KeyInstalled(_)
+        ));
+        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
+        assert_eq!(context.mode, EncryptionMode::On);
+        assert_eq!(
+            context.kid.as_deref(),
+            Some("89abcdef"),
+            "data_keys isn't downgraded to the older state"
+        );
     }
 }
