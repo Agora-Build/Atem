@@ -154,6 +154,25 @@ fn set_mode_600(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_mode_600(_path: &Path) -> Result<()> { Ok(()) }
 
+/// Writes `bytes` to `path` as a 0600 file: temp file, fsync, rename.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    let temp = path.with_extension("tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temp, path)?;
+    set_mode_600(path)
+}
+
 pub struct DeviceKey {
     secret: StaticSecret,
 }

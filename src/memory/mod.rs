@@ -15,6 +15,7 @@ pub mod cmd;
 pub mod crypto;
 pub mod encoding;
 pub mod statements;
+pub mod device_keys;
 
 #[cfg(test)]
 mod e2e_tests;
