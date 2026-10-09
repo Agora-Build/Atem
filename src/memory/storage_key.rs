@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroizing;
 
+use crate::memory::account_keys::AccountKeys;
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
 use crate::memory::encoding::{dec, enc};
 use crate::memory::statements::{
@@ -63,12 +64,30 @@ impl SealedDeviceKeys {
         storage_kid: &str,
         storage_key: &[u8; 32],
     ) -> Result<Self> {
+        Self::seal_with(
+            keys,
+            &AccountKeys::default(),
+            device_id,
+            storage_kid,
+            storage_key,
+        )
+    }
+
+    /// Seals the device keys and the account keys (build step 2b) under
+    /// `storage_key`.
+    pub fn seal_with(
+        keys: &DeviceKeys,
+        accounts: &AccountKeys,
+        device_id: &str,
+        storage_kid: &str,
+        storage_key: &[u8; 32],
+    ) -> Result<Self> {
         if !crate::memory::crypto::valid_kid(storage_kid) {
             bail!("storage key id must be 8 lowercase hex characters");
         }
         let cipher = XChaCha20Poly1305::new(Key::from_slice(storage_key));
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let plain = keys.sealed_plaintext()?;
+        let plain = keys.sealed_plaintext_with(accounts)?;
         let ciphertext = cipher
             .encrypt(
                 &nonce,
@@ -88,6 +107,16 @@ impl SealedDeviceKeys {
     }
 
     pub fn open(&self, storage_key: &[u8; 32], unlock_auth: UnlockAuthKey) -> Result<DeviceKeys> {
+        self.open_with_accounts(storage_key, unlock_auth)
+            .map(|(keys, _)| keys)
+    }
+
+    /// The device keys and the account keys the file carries.
+    pub fn open_with_accounts(
+        &self,
+        storage_key: &[u8; 32],
+        unlock_auth: UnlockAuthKey,
+    ) -> Result<(DeviceKeys, AccountKeys)> {
         if self.version != 1 {
             bail!("unsupported device_keys.sealed version {}", self.version);
         }
@@ -116,7 +145,7 @@ impl SealedDeviceKeys {
                     )
                 })?,
         );
-        DeviceKeys::from_sealed_plaintext(&plain, unlock_auth)
+        DeviceKeys::from_sealed_plaintext_with(&plain, unlock_auth)
     }
 
     pub fn load_from(path: &Path) -> Result<Option<Self>> {
@@ -251,6 +280,41 @@ mod tests {
 
     fn sealed(keys: &DeviceKeys, key: &[u8; 32]) -> SealedDeviceKeys {
         SealedDeviceKeys::seal(keys, "dev-1", "0a1b2c3d", key).unwrap()
+    }
+
+    #[test]
+    fn account_keys_ride_in_the_sealed_file() {
+        use crate::memory::account_keys::AccountKeys;
+        let keys = DeviceKeys::generate();
+        let storage_key = new_storage_key();
+        let mut accounts = AccountKeys::default();
+        accounts.install("acct", "0123abcd", Zeroizing::new([1; 32]));
+        accounts.install("acct", "89abcdef", Zeroizing::new([2; 32]));
+        let file = SealedDeviceKeys::seal_with(&keys, &accounts, "dev-1", "0a1b2c3d", &storage_key)
+            .unwrap();
+        let (opened, held) = file
+            .open_with_accounts(&storage_key, keys.unlock_auth_key())
+            .unwrap();
+        assert_eq!(opened.device_pub(), keys.device_pub());
+        assert_eq!(held.current_kid("acct"), Some("89abcdef"));
+        assert_eq!(held.previous_kids("acct"), vec!["0123abcd".to_string()]);
+        assert_eq!(
+            file.open(&storage_key, keys.unlock_auth_key())
+                .unwrap()
+                .device_sign_pub(),
+            keys.device_sign_pub()
+        );
+    }
+
+    #[test]
+    fn a_step_2a_file_holds_no_account_keys() {
+        let keys = DeviceKeys::generate();
+        let storage_key = new_storage_key();
+        let file = sealed(&keys, &storage_key);
+        let (_, held) = file
+            .open_with_accounts(&storage_key, keys.unlock_auth_key())
+            .unwrap();
+        assert!(held.is_empty());
     }
 
     #[test]

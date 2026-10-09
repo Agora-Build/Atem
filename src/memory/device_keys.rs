@@ -12,6 +12,7 @@ use std::path::Path;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+use crate::memory::account_keys::{AccountKeys, AccountKeysWire};
 use crate::memory::statements::SignedWire;
 
 pub struct DeviceKeys {
@@ -158,31 +159,60 @@ impl DeviceKeys {
 
     /// The device key and device signing key, serialized for
     /// `device_keys.sealed`. The unlock-auth key is not included.
+    #[cfg(test)]
     pub fn sealed_plaintext(&self) -> Result<Zeroizing<Vec<u8>>> {
+        self.sealed_plaintext_with(&AccountKeys::default())
+    }
+
+    /// Like `sealed_plaintext`, plus the account keys (`K` and the keys it
+    /// replaced, build step 2b). With none the bytes are exactly step 2a's
+    /// (version 1); with keys the payload is version 2, so a step-2a binary
+    /// refuses the file instead of silently dropping the keys.
+    pub fn sealed_plaintext_with(&self, accounts: &AccountKeys) -> Result<Zeroizing<Vec<u8>>> {
         let device = Zeroizing::new(STANDARD.encode(self.device.to_bytes()));
         let device_sign = Zeroizing::new(STANDARD.encode(self.device_sign.to_bytes()));
+        let account_keys = (!accounts.is_empty()).then(|| accounts.to_wire());
         Ok(Zeroizing::new(serde_json::to_vec(&SealedPlainRef {
-            version: 1,
+            version: if account_keys.is_some() { 2 } else { 1 },
             device: &device,
             device_sign: &device_sign,
+            account_keys: account_keys.as_ref(),
         })?))
     }
 
+    #[cfg(test)]
     pub fn from_sealed_plaintext(plain: &[u8], unlock_auth: UnlockAuthKey) -> Result<Self> {
+        Self::from_sealed_plaintext_with(plain, unlock_auth).map(|(keys, _)| keys)
+    }
+
+    /// The device keys and the account keys of a sealed payload (none in a
+    /// step-2a file).
+    pub fn from_sealed_plaintext_with(
+        plain: &[u8],
+        unlock_auth: UnlockAuthKey,
+    ) -> Result<(Self, AccountKeys)> {
         let SealedPlain {
             version,
             device,
             device_sign,
+            account_keys,
         } = serde_json::from_slice(plain).context("sealed device keys are unreadable")?;
         let (device, device_sign) = (Zeroizing::new(device), Zeroizing::new(device_sign));
-        if version != 1 {
+        if version != 1 && version != 2 {
             bail!("unsupported sealed device keys version {version}");
         }
-        Ok(Self {
-            device: StaticSecret::from(*decode32(&device, "device key")?),
-            device_sign: SigningKey::from_bytes(&*decode32(&device_sign, "device signing key")?),
-            unlock_auth: unlock_auth.key,
-        })
+        let accounts = AccountKeys::from_wire(account_keys)?;
+        Ok((
+            Self {
+                device: StaticSecret::from(*decode32(&device, "device key")?),
+                device_sign: SigningKey::from_bytes(&*decode32(
+                    &device_sign,
+                    "device signing key",
+                )?),
+                unlock_auth: unlock_auth.key,
+            },
+            accounts,
+        ))
     }
 
     pub fn load_from(path: &Path) -> Result<Option<Self>> {
@@ -235,6 +265,8 @@ struct SealedPlainRef<'a> {
     version: u8,
     device: &'a str,
     device_sign: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_keys: Option<&'a AccountKeysWire>,
 }
 
 #[derive(Deserialize)]
@@ -242,6 +274,8 @@ struct SealedPlain {
     version: u8,
     device: String,
     device_sign: String,
+    #[serde(default)]
+    account_keys: AccountKeysWire,
 }
 
 /// Signs `statement` with an Ed25519 key; carried like Astation's statements.
@@ -335,6 +369,39 @@ mod tests {
             DeviceKeys::generate().device_pub(),
             DeviceKeys::generate().device_pub()
         );
+    }
+
+    #[test]
+    fn account_keys_add_one_field_to_the_sealed_plaintext() {
+        use crate::memory::account_keys::AccountKeys;
+        let keys = DeviceKeys::generate();
+        let mut accounts = AccountKeys::default();
+        accounts.install("acct", "0123abcd", Zeroizing::new([1; 32]));
+        let plain = keys.sealed_plaintext_with(&accounts).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        let mut fields: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort();
+        assert_eq!(fields, ["account_keys", "device", "device_sign", "version"]);
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["account_keys"]["acct"]["kid"], "0123abcd");
+        let (back, held) =
+            DeviceKeys::from_sealed_plaintext_with(&plain, keys.unlock_auth_key()).unwrap();
+        assert_eq!(back.device_pub(), keys.device_pub());
+        assert_eq!(held.current_kid("acct"), Some("0123abcd"));
+        // No account keys: exactly the bytes of step 2a (version 1).
+        let none = keys.sealed_plaintext_with(&AccountKeys::default()).unwrap();
+        assert_eq!(*none, *keys.sealed_plaintext().unwrap());
+        let json: serde_json::Value = serde_json::from_slice(&none).unwrap();
+        assert_eq!(json["version"], 1);
+        // A v1 file opens with no account keys.
+        let (_, held) =
+            DeviceKeys::from_sealed_plaintext_with(&none, keys.unlock_auth_key()).unwrap();
+        assert!(held.is_empty());
     }
 
     #[test]
