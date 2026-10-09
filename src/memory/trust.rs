@@ -37,6 +37,10 @@ pub struct AstationTrust {
 pub struct TrustStore {
     #[serde(default = "store_version")]
     version: u8,
+    /// The Astation that holds this device's storage key: its first verified
+    /// one. Unlock and storage-key rotation go only through it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_astation: Option<String>,
     #[serde(default)]
     astations: HashMap<String, AstationTrust>,
     #[serde(default)]
@@ -79,6 +83,25 @@ impl TrustStore {
 
     pub fn verified(&self, astation_id: &str) -> Option<&AstationTrust> {
         self.astations.get(astation_id)
+    }
+
+    /// The home Astation, once it is verified.
+    pub fn home(&self) -> Option<&str> {
+        self.home_astation
+            .as_deref()
+            .filter(|id| self.astations.contains_key(*id))
+    }
+
+    pub fn set_home(&mut self, astation_id: &str) {
+        self.home_astation = Some(astation_id.into());
+    }
+
+    /// The home Astation, or, for a step-1 store that has none, the first
+    /// verified Astation by id (used once, to migrate a plain `device_keys`).
+    pub fn home_or_first_verified(&self) -> Option<String> {
+        self.home()
+            .map(str::to_string)
+            .or_else(|| self.astations.keys().min().cloned())
     }
 
     pub fn set_pending(
@@ -508,5 +531,40 @@ mod tests {
             "Verified: no  (run 'atem pair' to verify this device)"
         );
         assert_eq!(trust_path_for(&dir.path().join("data_keys.enc")), path);
+    }
+
+    #[test]
+    fn home_is_the_verified_astation_it_was_set_to() {
+        let fake = FakeAstation::new();
+        let (mut store, keys) = pending(&fake);
+        assert_eq!(store.home(), None);
+        store.set_home(ASTATION);
+        assert_eq!(store.home(), None, "a pending Astation is not a home");
+        store
+            .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
+            .unwrap();
+        assert_eq!(store.home(), Some(ASTATION));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred_state.json");
+        store.save_to(&path).unwrap();
+        assert_eq!(TrustStore::load_from(&path).unwrap().home(), Some(ASTATION));
+    }
+
+    #[test]
+    fn a_step_one_store_falls_back_to_its_first_verified_astation() {
+        let fake = FakeAstation::new();
+        let (mut store, keys) = pending(&fake);
+        assert_eq!(store.home_or_first_verified(), None);
+        store
+            .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred_state.json");
+        store.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("home_astation"), "no home is not written");
+        let loaded = TrustStore::load_from(&path).unwrap();
+        assert_eq!(loaded.home(), None);
+        assert_eq!(loaded.home_or_first_verified().as_deref(), Some(ASTATION));
     }
 }

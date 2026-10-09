@@ -149,11 +149,19 @@ impl Handshake {
     }
 }
 
-/// Every file verification reads or writes. Tests point these at a temp dir.
+/// Every file verification and the key agent read or write. Tests point
+/// these at a temp dir.
+#[derive(Debug, Clone)]
 pub struct KeyPaths {
     pub data_keys: PathBuf,
     pub trust: PathBuf,
+    /// The plain step-1 file; the key agent seals it into
+    /// `device_keys_sealed` and deletes it.
     pub device_keys: PathBuf,
+    pub device_keys_sealed: PathBuf,
+    /// Written in rotation phase 1, renamed over `device_keys_sealed` in phase 3.
+    pub device_keys_next: PathBuf,
+    pub unlock_auth_key: PathBuf,
     /// The plain X25519 key from #36; deleted once a device is verified.
     pub legacy_device_key: PathBuf,
 }
@@ -168,6 +176,9 @@ impl KeyPaths {
             data_keys: dir.join("data_keys.enc"),
             trust: dir.join("cred_state.json"),
             device_keys: dir.join("device_keys"),
+            device_keys_sealed: dir.join("device_keys.sealed"),
+            device_keys_next: dir.join("device_keys.sealed.next"),
+            unlock_auth_key: dir.join("unlock_auth_key"),
             legacy_device_key: dir.join("device_key"),
         }
     }
@@ -467,6 +478,15 @@ mod tests {
             recovery_sign_pub: [6; 32],
             nonce_s: [7; 32],
         }
+    }
+
+    #[test]
+    fn key_paths_name_every_key_file() {
+        let paths = KeyPaths::in_dir(std::path::Path::new("/x"));
+        assert_eq!(paths.device_keys, std::path::Path::new("/x/device_keys"));
+        assert_eq!(paths.device_keys_sealed, std::path::Path::new("/x/device_keys.sealed"));
+        assert_eq!(paths.device_keys_next, std::path::Path::new("/x/device_keys.sealed.next"));
+        assert_eq!(paths.unlock_auth_key, std::path::Path::new("/x/unlock_auth_key"));
     }
 
     #[test]
