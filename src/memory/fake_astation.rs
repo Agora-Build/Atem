@@ -91,6 +91,44 @@ pub(crate) fn sealed_device(dir: &Path, kid: &str) -> (KeyPaths, FakeKeyServer, 
     (paths, server, keys)
 }
 
+/// `storageKeyRejected { reason, pending_kid }`: `pending_kid` is set only
+/// when the rotate was refused because Astation holds that pending key.
+#[derive(Debug)]
+pub(crate) struct Rejected {
+    pub reason: String,
+    pub pending_kid: Option<String>,
+}
+
+impl Rejected {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            pending_kid: None,
+        }
+    }
+
+    fn pending(reason: impl Into<String>, pending_kid: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            pending_kid: Some(pending_kid.into()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for Rejected {
+    fn from(error: anyhow::Error) -> Self {
+        Self::new(format!("{error:#}"))
+    }
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
 pub(crate) struct FakeKeyServer {
     pub astation: FakeAstation,
     pub device_sign_pub: [u8; 32],
@@ -218,23 +256,28 @@ impl FakeKeyServer {
     /// pending (keeping the current one) and acks. An acked pending key is a
     /// commitment: another rotate is refused until it is confirmed, except
     /// a byte-identical resend of the acked rotate or a rotate from the pending key
-    /// itself (an implicit confirm).
-    pub fn accept_rotation(&mut self, rotation: &StorageRotation) -> Result<SignedWire> {
+    /// itself (an implicit confirm). A refusal is `storageKeyRejected`: it
+    /// names the pending kid only when that pending key is why.
+    pub fn accept_rotation(&mut self, rotation: &StorageRotation) -> Result<SignedWire, Rejected> {
         let rotate =
             StorageRotate::parse(&verify_device(&self.device_sign_pub, &rotation.rotate)?)?;
         if rotate.account != ACCOUNT || rotate.device_id != DEVICE_ID {
-            bail!("rotation for another account or device");
+            return Err(Rejected::new("rotation for another account or device"));
         }
         if !crate::memory::crypto::valid_kid(&rotate.new_storage_kid) {
-            bail!("rotation has an invalid new storage key id");
+            return Err(Rejected::new("rotation has an invalid new storage key id"));
         }
         if rotate.new_storage_kid == rotate.old_storage_kid {
-            bail!("rotation to the same storage key id");
+            return Err(Rejected::new("rotation to the same storage key id"));
         }
-        let encapped = STANDARD.decode(&rotation.encapped_key)?;
-        let ciphertext = STANDARD.decode(&rotation.ciphertext)?;
+        let encapped = STANDARD
+            .decode(&rotation.encapped_key)
+            .map_err(anyhow::Error::from)?;
+        let ciphertext = STANDARD
+            .decode(&rotation.ciphertext)
+            .map_err(anyhow::Error::from)?;
         if sealed_hash(&encapped, &ciphertext) != rotate.sealed_hash {
-            bail!("rotation seal doesn't match its signature");
+            return Err(Rejected::new("rotation seal doesn't match its signature"));
         }
         let same_kid = self
             .pending
@@ -246,36 +289,49 @@ impl FakeKeyServer {
         let resend = same_kid
             && self.pending_statement.as_deref() == Some(rotation.rotate.statement.as_str());
         if same_kid && !resend {
-            bail!(
-                "a rotation to storage key {} is pending with another key; it must be confirmed first",
-                rotate.new_storage_kid
-            );
+            return Err(Rejected::pending(
+                format!(
+                    "a rotation to storage key {} is pending with another key; it must be confirmed first",
+                    rotate.new_storage_kid
+                ),
+                &rotate.new_storage_kid,
+            ));
         }
         if !resend {
             if let Some((pending, _)) = &self.pending {
                 if *pending == rotate.old_storage_kid {
                     self.promote_pending();
                 } else {
-                    bail!(
-                        "a rotation to storage key {pending} is pending; it must be confirmed first"
-                    );
+                    return Err(Rejected::pending(
+                        format!(
+                            "a rotation to storage key {pending} is pending; it must be confirmed first"
+                        ),
+                        pending,
+                    ));
                 }
             }
             if self.acked.contains(&rotate.new_storage_kid) {
-                bail!("storage key {} was acked before", rotate.new_storage_kid);
+                return Err(Rejected::new(format!(
+                    "storage key {} was acked before",
+                    rotate.new_storage_kid
+                )));
             }
             if self.storage_keys.contains_key(&rotate.new_storage_kid) {
-                bail!(
+                return Err(Rejected::new(format!(
                     "Astation already holds storage key {}",
                     rotate.new_storage_kid
-                );
+                )));
             }
             if rotate.old_storage_kid.is_empty() {
                 if !self.storage_keys.is_empty() {
-                    bail!("first-sealing rotation, but Astation already holds a storage key");
+                    return Err(Rejected::new(
+                        "first-sealing rotation, but Astation already holds a storage key",
+                    ));
                 }
             } else if !self.storage_keys.contains_key(&rotate.old_storage_kid) {
-                bail!("rotation from a storage key Astation doesn't hold");
+                return Err(Rejected::new(
+                    "rotation from a storage key Astation doesn't hold",
+                ));
             }
         }
         let plain = hpke_open(
@@ -287,7 +343,7 @@ impl FakeKeyServer {
         let key: [u8; 32] = plain
             .as_slice()
             .try_into()
-            .map_err(|_| anyhow!("storage key has the wrong length"))?;
+            .map_err(|_| Rejected::new("storage key has the wrong length"))?;
         if !resend {
             self.pending = Some((rotate.new_storage_kid.clone(), key));
             self.pending_statement = Some(rotation.rotate.statement.clone());
@@ -434,6 +490,44 @@ mod tests {
             .encode(),
         );
         assert!(server.accept_abandon(&forged).is_err());
+    }
+
+    #[test]
+    fn a_refusal_names_the_pending_kid_only_when_the_pending_key_is_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap();
+        // Refused for its own shape: no pending kid, although one is pending.
+        let bad = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "0a1b2c3d"))
+            .unwrap_err();
+        assert_eq!(bad.pending_kid, None, "{bad}");
+        // Refused because of the pending key: it is named.
+        let committed = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "5f6a7b8c"))
+            .unwrap_err();
+        assert_eq!(
+            committed.pending_kid.as_deref(),
+            Some("4e5f6a7b"),
+            "{committed}"
+        );
+        let same_kid = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap_err();
+        assert_eq!(
+            same_kid.pending_kid.as_deref(),
+            Some("4e5f6a7b"),
+            "{same_kid}"
+        );
+        // A replay of an acked kid, once nothing is pending: no pending kid.
+        server.pending = None;
+        let replay = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap_err();
+        assert_eq!(replay.pending_kid, None, "{replay}");
+        assert!(replay.reason.contains("acked before"), "{replay}");
     }
 
     #[test]

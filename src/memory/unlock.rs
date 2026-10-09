@@ -851,7 +851,9 @@ mod tests {
                                     &request,
                                     kid,
                                 )?,
-                                (None, None) => self.server.grant_unlock(&request)?,
+                                // As Astation does: a request naming the
+                                // pending key confirms it (implicit confirm).
+                                (None, None) => self.server.grant_unlock_confirming(&request)?,
                             };
                             AstationMessage::UnlockGrant {
                                 grant: grant.grant,
@@ -880,14 +882,10 @@ mod tests {
                             ciphertext,
                         }) {
                             Ok(ack) => AstationMessage::StorageKeyAck { ack },
-                            // Astation names the pending key it is committed to.
-                            Err(error) => AstationMessage::StorageKeyRejected {
-                                reason: error.to_string(),
-                                pending_kid: self
-                                    .server
-                                    .pending
-                                    .as_ref()
-                                    .map(|(kid, _)| kid.clone()),
+                            // Astation names the pending key only when it is why.
+                            Err(rejected) => AstationMessage::StorageKeyRejected {
+                                reason: rejected.reason,
+                                pending_kid: rejected.pending_kid,
                             },
                         }
                     };
@@ -1271,8 +1269,26 @@ mod tests {
         // Astation still holds it as pending: the next unlock settles it.
         assert_eq!(
             link.server.pending.as_ref().map(|(kid, _)| kid.clone()),
-            Some(new_kid)
+            Some(new_kid.clone())
         );
+        agent.lock_keys().unwrap();
+        link.fail_confirm = false;
+        assert_eq!(
+            unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+                .await
+                .unwrap(),
+            new_kid
+        );
+        assert!(link.server.pending.is_none(), "the unlock confirmed it");
+        assert_eq!(
+            link.server.storage_keys.keys().cloned().collect::<Vec<_>>(),
+            vec![new_kid.clone()]
+        );
+        // And the next rotation goes from it without a refusal.
+        rotate_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(link.abandons, 0);
     }
 
     #[test]
