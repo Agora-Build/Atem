@@ -255,7 +255,7 @@ fn wrap_aad(data_account: &str, kid: &str) -> Vec<u8> {
     format!("{WRAP_DOMAIN}\n{data_account}\n{kid}").into_bytes()
 }
 
-fn valid_kid(kid: &str) -> bool {
+pub(crate) fn valid_kid(kid: &str) -> bool {
     kid.len() == 8 && kid.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
