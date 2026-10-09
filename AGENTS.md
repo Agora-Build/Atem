@@ -204,7 +204,7 @@ Key methods:
 **SSO auth** (`sso_auth.rs`):
 - `atem login` — OAuth 2.0 + PKCE browser flow against `sso2.agora.io`; writes an `sso` entry to `credentials.enc`
 - `atem logout` — removes the `sso` entry from `credentials.enc`
-- `atem pair [--save]` — connect to Astation, send `PairSavePreference`, wait for `SsoTokenSync`, write paired entry
+- `atem pair [--save]` — connect to Astation, send `PairSavePreference`, wait for `SsoTokenSync`, write paired entry, then verify the device: commit-then-reveal (`verifyCommit` → `verifyKeys` → `verifyReveal`), both sides show a 12-character safety code, the user answers `codes match? [y/N]` and confirms on Astation with Touch ID, and atem applies the signed `deviceVerified` atomically (pins, device keys, signed state, grants; nothing on failure). If `K` is needed but missing it sends `keyRequest`. Astations that don't answer within 15s leave the device as it was (see `designs/e2e-encryption.md`)
 - `atem unpair` — remove all paired entries
 - `valid_token(connected_astation_id, sso_url)` — resolves via priority chain and returns an access token. Within 60s of expiry, an `sso` entry refreshes itself; a paired entry never does (Agora rotates refresh tokens, so it would invalidate Astation's copy): atem connects to Astation, which sends a fresh `credentialSync` on connect.
 
@@ -217,11 +217,21 @@ Key methods:
 ```
 SSO:      logged in  (52a4f560...)
 Paired:   astation-<uuid>  (SSO: 52a4f560...)  [save: yes]
+          Verified: yes  (safety code MN3H-A74N-FJE4)
 ```
+An unverified pairing shows `Verified: no  (run 'atem pair' to verify this device)`.
 
 **WebSocket messages** (`websocket_client.rs`):
 - `SsoTokenSync { access_token, refresh_token, expires_at, login_id, astation_id, save_credentials }` — Astation → Atem, after pair or on Astation-side refresh
 - `PairSavePreference { save_credentials }` — Atem → Astation during `atem pair`, communicates user's save choice
+- `VerifyCommit { device_id, commitment }` — Atem → Astation, starts device verification with a commitment to unrevealed keys
+- `VerifyKeys { sign_pub, enc_pub, recovery_sign_pub, nonce }` — Astation → Atem; `sign_pub` is the 65-byte uncompressed P-256 point
+- `VerifyReveal { device_pub, device_sign_pub, unlock_auth_pub, nonce }` — Atem → Astation, the keys and nonce behind the commitment
+- `DeviceVerified { device_verified, account_state, grants }` — Astation → Atem after Touch ID: signed certificate (bound to the ceremony transcript), signed account state, signed HPKE grants
+- `VerifyAbort { reason }` — either side cancels verification
+- `EncryptionMode { account_state }` — Astation → Atem, a signed `atem-account-state-v1`; ignored when unsigned or when the device isn't verified
+- `KeyRequest { public_key }` — Atem → Astation, a verified device asks for `K`
+- `KeyGrant { grant }` — Astation → Atem, `K` sealed to this device with a signed grant; ignored when unsigned or unverified
 
 **Active project resolution** (`ActiveProject::resolve_app_id/resolve_app_certificate`):
 1. CLI flag (`--app-id`)

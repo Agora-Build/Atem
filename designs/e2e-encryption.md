@@ -1,9 +1,13 @@
 # End-to-end encryption: memory, skills, vault and credentials
 
-Status: memory, skills and vault encryption implemented on the atem side in
-#36 (`src/memory/crypto.rs`); the Astation key manager isn't built yet.
-Credentials (`atem cred`), verified devices, the sealed `device_key`, unlock,
-device signing and the recovery secret: design approved for planning
+Status: build steps 0–1 are built on the atem side (2026-10-09): signed
+account state and plain-text rejection (fixes to #36), and device
+verification (commit-then-reveal safety code, signed device certificate,
+signed account state, signed RFC 9180 HPKE grants for `K`). The Astation
+side of steps 0–1 is pending (see "Astation work for steps 0–1"); until it
+lands, atems stay unverified and keep plain-text sync. Credentials
+(`atem cred`), the sealed `device_key`, unlock, device-signed writes and
+the recovery secret (steps 2–8): design approved for planning
 (2026-10-09), hardened after an independent security review the same day
 (see "Review findings"). Not built.
 Owner: Brent G
@@ -174,8 +178,10 @@ an SSH key would silently cut off access. And the public half is published
 at `github.com/<user>.keys`.
 
 **One device key for every grant** is safe because each seal is real HPKE
-with its own `info` (the signed grant statement), so a seal made for one
-purpose can't be opened as another.
+with its own `info` (`atem-grant-info-v1`: account, type, device, kid and
+scope), and Astation signs a statement over the same fields plus a hash of
+the seal's output, so a seal made for one purpose can't be opened as
+another.
 
 ## Signed statements
 
@@ -187,7 +193,7 @@ statement whose `sign_gen` isn't their pinned generation.
 | Statement | Signed by | Fields | Purpose |
 |---|---|---|---|
 | `atem-account-state-v1` | signing key | account, sign_gen, mode, kid, epoch | Memory encryption mode. atem keeps the highest epoch and never moves toward plain text without one. |
-| `atem-device-verified-v1` | signing key | account, sign_gen, device_id, device_pub, device_sign_pub, unlock_auth_pub, epoch | Certifies a device after the safety code; gives the device its first epoch floor. |
+| `atem-device-verified-v1` | signing key | account, sign_gen, device_id, device_pub, device_sign_pub, unlock_auth_pub, transcript, epoch | Certifies a device after the safety code; gives the device its first epoch floor. `transcript` binds it to one ceremony (see "Verification"). |
 | `atem-grant-v1` | signing key | account, sign_gen, type (`K` / `index` / `scope`), device_id, device_pub, kid, scope_hmac, SHA-256(sealed key) | Proves Astation, not the relay, sealed a key to this device. |
 | `atem-scope-directory-v1` | signing key | account, sign_gen, epoch, [scope_hmac] | Every credential scope that exists, so a missing project scope can't be faked. |
 | `atem-cred-row-v1` | signing key | account, sign_gen, scope_hmac, kid, name_hmac, version, SHA-256(ciphertext), SHA-256(encrypted display name) | One credential version. |
@@ -224,12 +230,39 @@ for two key sets that produce the same short code: it gets one guess with a
 6. Until both confirmations are in, atem's pins are **pending** and it
    fails closed: no grant is used and nothing syncs. They become final when
    atem has answered `y` **and** received an `atem-device-verified-v1`
-   statement for exactly the keys it revealed.
+   statement for exactly the keys it revealed **and this ceremony**: the
+   certificate carries
+   `transcript = SHA-256(enc("atem-verify-transcript-v1", C, nonce_a, nonce_s))`,
+   and atem rejects one whose transcript differs from its own. A device
+   that verifies again with the same keys can't be handed a recorded
+   certificate from an earlier ceremony.
 7. Astation pins the device's three public keys (in the Keychain, never on
    the relay) and sends the current `atem-account-state-v1`,
    `atem-scope-directory-v1`, `atem-revoked-v1`, and signed grants: `K`, the
    index key, and each ticked scope key. The device seals its first storage
    key to Astation's encryption key (see "Keys on disk").
+8. **Epochs.** Astation signs the certificate at epoch `E` and then
+   re-signs the current account state at a later epoch (`E+1`), so in
+   `deviceVerified` the account state's epoch is always `>=` the
+   certificate's. atem rejects a state older than the certificate. The
+   certificate's epoch becomes the device's floor.
+9. atem checks everything in `deviceVerified` (certificate, account state,
+   kid, every grant) before writing anything. If any check fails, nothing
+   is saved: no pin, no device keys, no key, no mode.
+10. On a device's **first** verification with an Astation, atem drops what
+    the old unauthenticated path stored for it: that Astation's mode entry
+    and the account's `K`, rotation history and project names. Only what
+    arrives signed is kept.
+11. If the signed state needs `K` and none arrived (or none is stored),
+    atem sends `keyRequest` right after verification. It does the same
+    when an `encryptionMode` repeats the stored state while `K` is still
+    missing.
+
+**Re-verification.** Verifying again with an Astation this device already
+trusts never moves it backwards: a certificate older than the account
+state already applied is rejected, the epoch floor only rises
+(`max(old floor, old state epoch, certificate epoch)`), and the stored
+signed state is kept until a newer one arrives.
 
 ```mermaid
 sequenceDiagram
@@ -269,23 +302,26 @@ trust-on-first-use flow get nothing new until they verify, and their writes
 are dropped by verified devices because they have no certified signing key.
 `K` is rotated once verification ships (see "Migration").
 
-Today's fingerprint (`websocket_client.rs:647`) is `SHA-256(device_pub)`
-cut to 8 bytes, covers only the device key, and is computed without
-commitments. The safety code replaces it.
+The #36 fingerprint (`SHA-256(device_pub)` cut to 8 bytes, covering only
+the device key, computed without commitments) has been replaced by the
+safety code.
 
 ### Sealing a key to a device
 
 Every key travels as **HPKE (RFC 9180)**, base mode, DHKEM(X25519,
-HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, which binds the ephemeral and
-recipient public keys into the key schedule. The HPKE `info` is `enc("atem-grant-info-v1", account, type, device_id,
-device_pub, kid, scope_hmac)`, and Astation signs the `atem-grant-v1`
-statement, which adds `SHA-256(enc(encapped_key, ciphertext))`. (The info
-can't contain a hash of the seal's own output.) atem opens a grant only if the signature
-verifies, `device_id`/`device_pub` are its own, and `sign_gen` is pinned.
-The relay can carry grants but can't make one.
+HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, which binds the ephemeral
+and recipient public keys into the key schedule. The HPKE `info` is
+`enc("atem-grant-info-v1", account, type, device_id, device_pub, kid,
+scope_hmac)`, and Astation signs the `atem-grant-v1` statement, which adds
+`SHA-256(enc(encapped_key, ciphertext))`. (The info can't contain a hash
+of the seal's own output.) atem opens a grant only if the signature
+verifies, `device_id` and `device_pub` are its own and equal its pinned
+device key, `sign_gen` is pinned, and a `K` grant names no scope. The
+relay can carry grants but can't make one.
 
-The current wrap (`crypto.rs:226`: no salt, no device id, no signature) is
-replaced, and `keyGrant` gains the signed statement.
+The #36 wrap (no salt, no device id, no signature) has been replaced by
+this, and `keyGrant` carries the signed statement; `keyGrant` messages
+without one are ignored.
 
 ### Keys on disk (atem)
 
@@ -827,7 +863,9 @@ project `…/a/bc` + name `d`).
 | Memory projects | `HMAC-SHA256(K_project, project_key)` | — |
 | Astation signatures | P-256 ECDSA (Secure Enclave), SHA-256, carried as fixed 64-byte `r ‖ s`; Astation converts from the Enclave's DER and normalizes to low-S; atem rejects high-S | the statement's encoding |
 | Device and recovery signatures | Ed25519 | the statement's encoding |
-| Safety code | `base32(SHA-256(enc("atem-safety-code-v1", device_pub, device_sign_pub, unlock_auth_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, nonce_a, nonce_s)))[:12]` after commit-then-reveal | — |
+| Safety code | `base32(SHA-256(enc("atem-safety-code-v1", device_pub, device_sign_pub, unlock_auth_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, nonce_a, nonce_s)))[:12]` after commit-then-reveal; `astation_sign_pub` is the 65-byte uncompressed point | — |
+| Commitment | `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a))` | — |
+| Verification transcript | `SHA-256(enc("atem-verify-transcript-v1", commitment, nonce_a, nonce_s))`, carried in `atem-device-verified-v1` | — |
 
 New atem crates: `p256` (verify), `ed25519-dalek`, `hpke`, `zeroize`.
 `chacha20poly1305`, `x25519-dalek`, `hkdf` and `hmac` already ship with
@@ -882,13 +920,13 @@ binary values are base64. `SignedWire` is `{statement, signature}`;
 | Type | Direction | Data |
 |---|---|---|
 | `verifyCommit` | atem → Astation | `device_id`, `commitment` |
-| `verifyKeys` | Astation → atem | `sign_pub` (65-byte SEC1), `enc_pub`, `recovery_sign_pub`, `nonce` |
+| `verifyKeys` | Astation → atem | `sign_pub` (65-byte uncompressed SEC1 point, CryptoKit `x963Representation`), `enc_pub`, `recovery_sign_pub`, `nonce` |
 | `verifyReveal` | atem → Astation | `device_pub`, `device_sign_pub`, `unlock_auth_pub`, `nonce` |
 | `deviceVerified` | Astation → atem | `device_verified: SignedWire`, `account_state: SignedWire`, `grants: [GrantWire]` |
 | `verifyAbort` | either | `reason` |
 | `encryptionMode` | Astation → atem | `account_state: SignedWire` (messages without it are ignored) |
-| `keyRequest` | atem → Astation | `public_key` (the verified device key) |
-| `keyGrant` | Astation → atem | `grant: GrantWire` |
+| `keyRequest` | atem → Astation | `public_key` (the verified device key); sent after verification, or on a repeated `encryptionMode`, when the signed state needs `K` and atem doesn't hold it |
+| `keyGrant` | Astation → atem | `grant: GrantWire` (messages without it are ignored) |
 | `encryptionMigrationComplete` | atem → Astation | unchanged |
 
 Until Astation supports verification, atems stay unverified: they keep
@@ -912,18 +950,78 @@ atem can't complete verification against a real Astation until these land.
    - encryption key: X25519 (`Curve25519.KeyAgreement.PrivateKey`), sealed by a Secure Enclave key;
    - recovery secret `R` (32 random bytes) and the recovery signing key, Ed25519 from `HKDF-SHA256(R, info: "atem-recovery-sign-v1")`; the kit gains the `Recovery key:` line and must be saved before the first device is verified;
    - an account `epoch` counter (u64) that increases on every signed account-state, certificate or grant.
+   - the signing key's public half goes on the wire (`verifyKeys.sign_pub`) and into the safety-code hash as `publicKey.x963Representation` (65 bytes, `0x04 ‖ x ‖ y`), never `rawRepresentation` (64 bytes). atem rejects anything else.
 2. Encoding: `enc` exactly as in "Formats" (4-byte big-endian length per field, label first). Statements as in "Signed statements".
 3. Signatures: `signature.rawRepresentation` (64-byte `r ‖ s`). CryptoKit may return high-S; normalize to low-S (`s = n − s` when `s > n/2`) before sending. atem rejects high-S.
 4. Verification:
    - on `verifyCommit`, store `{device_id, commitment}` and reply `verifyKeys` with a fresh 32-byte nonce;
    - on `verifyReveal`, check `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a)) == commitment`, else send `verifyAbort`;
-   - compute the safety code (Global Constraints) and show it with the device name; Approve needs Touch ID; Deny sends `verifyAbort`;
-   - on approve, pin the three device keys, then send `deviceVerified` with a signed `atem-device-verified-v1`, the current signed `atem-account-state-v1` (mode `off` if encryption was never turned on), and a signed `K` grant if `K` exists;
+   - compute the safety code (see "Formats") and show it with the device name; Approve needs Touch ID; Deny sends `verifyAbort`;
+   - compute `transcript = SHA-256(enc("atem-verify-transcript-v1", commitment, nonce_a, nonce_s))` for this attempt;
+   - on approve, pin the three device keys, then send `deviceVerified` with a signed `atem-device-verified-v1` (including `transcript`, at epoch `E`), the current account state re-signed as `atem-account-state-v1` at epoch `E+1` (mode `off` if encryption was never turned on; its epoch must be `>=` the certificate's), and a signed `K` grant if `K` exists;
    - on an incoming `verifyAbort`, discard the attempt.
 5. Grants: HPKE on the atem side is RFC 9180 base mode with X25519 / HKDF-SHA256 / ChaCha20-Poly1305, which is CryptoKit `.Curve25519_SHA256_ChachaPoly`: `HPKE.Sender(recipientKey:ciphersuite: .Curve25519_SHA256_ChachaPoly, info:)` (macOS 14+), with `info = enc("atem-grant-info-v1", account, "K", device_id, device_pub, kid, "")`, empty AAD; send `encapped_key` and `ciphertext`; sign `atem-grant-v1` including `SHA-256(enc(encapped_key, ciphertext))`.
-6. `encryptionMode` always carries a signed account state; `keyRequest` is answered only when `public_key` equals the pinned device key.
+6. `encryptionMode` always carries a signed account state; `keyRequest` is answered only when `public_key` equals the pinned device key. atem sends `keyRequest` right after `deviceVerified` when the state needs `K` and no grant came with it.
+7. Check the Swift implementation against "Test vectors" below.
 
 **Relay:** forward the five new message types (`verifyCommit`, `verifyKeys`, `verifyReveal`, `deviceVerified`, `verifyAbort`) between an atem and its Astation exactly like existing message types. If the relay filters by type, add them to the list. Nothing new is stored in steps 0–1.
+
+### Test vectors
+
+`src/memory/kat_tests.rs` checks these on every `cargo test`; Astation's
+Swift must reproduce them byte for byte. All values are hex unless quoted.
+
+Inputs:
+
+| Input | Value |
+|---|---|
+| device key (X25519 secret) | 32 × `11` |
+| device signing key (Ed25519 seed) | 32 × `22` |
+| unlock-auth key (Ed25519 seed) | 32 × `33` |
+| `nonce_a` | 32 × `44` |
+| Astation signing key (P-256 scalar) | 32 × `55` |
+| Astation encryption key (X25519 secret) | 32 × `66` |
+| recovery signing key (Ed25519 seed) | 32 × `77` |
+| `nonce_s` | 32 × `88` |
+| account, device_id, kid | `"acct-1"`, `"dev-1"`, `"0123abcd"` |
+| account state | sign_gen 1, mode `"on"`, kid `"0123abcd"`, epoch 2 |
+| device certificate | sign_gen 1, epoch 1, transcript below |
+| `K` | 32 × `99` |
+
+Derived public keys:
+
+| Key | Value |
+|---|---|
+| `device_pub` | `7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13` |
+| `device_sign_pub` | `a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0` |
+| `unlock_auth_pub` | `17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce` |
+| `sign_pub` (x963, 65 bytes) | `0457e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34c5ab3770ba573bdff5414065640ffb5b346dfa84dec4db4d68e5f59cc471c2ec` |
+| `enc_pub` | `219e4d800da968d2a5fcb009c784f4746c7138edb9ee4844b739e830b05cf424` |
+| `recovery_sign_pub` | `c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7` |
+
+Outputs:
+
+| Value | Result |
+|---|---|
+| `enc("atem", "", 01 02)` | `000000046174656d00000000000000020102` |
+| commitment | `24763549320fde4498bc72c2cf8b6bb6deb3df3911e611a762d912d0c5a8be05` |
+| safety code | `MN3H-A74N-FJE4` |
+| transcript | `101b660209618c9130060c9cb737e9647b8ec0ab826684009427bd9cbabcec5f` |
+| `atem-account-state-v1` | `000000156174656d2d6163636f756e742d73746174652d763100000006616363742d31000000080000000000000001000000026f6e000000083031323361626364000000080000000000000002` |
+| `atem-device-verified-v1` | `000000176174656d2d6465766963652d76657269666965642d763100000006616363742d31000000080000000000000001000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00000002017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce00000020101b660209618c9130060c9cb737e9647b8ec0ab826684009427bd9cbabcec5f000000080000000000000001` |
+| grant `info` | `000000126174656d2d6772616e742d696e666f2d763100000006616363742d31000000014b000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000008303132336162636400000000` |
+| `encapped_key` | `b5aad53eeb4319e1d910ec0440f849d19e0a3aa9fe3bcb91342bd80e48835755` |
+| `ciphertext` | `c3f37d28128d3516989f0a41d3c087f40ef8b17cbaa114ab928e4f5ae764136eba6d809254b08bd347694a94c6510500` |
+| `sealed_hash` | `5373b5bb2fa7696625db127b4a17bcd30e87ce858fee861f85ddcf7c41dcfc7c` |
+| `atem-grant-v1` | `0000000d6174656d2d6772616e742d763100000006616363742d31000000080000000000000001000000014b000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000008303132336162636400000000000000205373b5bb2fa7696625db127b4a17bcd30e87ce858fee861f85ddcf7c41dcfc7c` |
+| certificate signature (`r ‖ s`) | `fff634a2bd4621e42ec788123d0222e3bbda96705baf2ac0d210fcd76e0b05d930d0781c1d133ae5b99a0aeaad5546c4e5c53502a1557c2cc295594be900bf9f` |
+| grant signature (`r ‖ s`) | `01848754ec7cdc93c706a49cd176b683575115a9f838c3f23a092710703b90ae02f746331708f148a01b2e774472bf48851f8ad1f5ee33e430cd5925e48fc0e6` |
+
+The HPKE seal is randomized; `encapped_key` and `ciphertext` above came
+from a seeded RNG, and atem must open them to `K` with the device key. The
+two signatures are RFC 6979 (deterministic); CryptoKit's signatures are
+randomized, so Swift checks that they verify against `sign_pub` rather
+than comparing bytes. Everything else must match exactly.
 
 ## Where the work lands
 
