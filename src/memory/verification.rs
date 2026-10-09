@@ -975,6 +975,18 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_device_without_a_signed_state_has_no_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _, _, _) = verify(dir.path(), EncryptionMode::Off);
+        let raw = std::fs::read_to_string(&paths.trust)
+            .unwrap()
+            .replace("\"account_state\": {", "\"account_state_was\": {");
+        std::fs::write(&paths.trust, raw).unwrap();
+        let error = format!("{:#}", account_mode(&paths.trust, ASTATION_ID).unwrap_err());
+        assert!(error.contains("waiting for Astation's signed encryption state"), "{error}");
+    }
+
+    #[test]
     fn verification_installs_signed_state_and_key() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::On);

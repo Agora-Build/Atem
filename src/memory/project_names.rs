@@ -40,6 +40,34 @@ impl ProjectNames {
         Ok(names)
     }
 
+    /// For the writers: a file that doesn't parse holds only names (no
+    /// secrets), so it is moved aside and the writer starts empty. A version
+    /// other than 1 stays an error (downgrade guard).
+    fn load_for_write(path: &Path) -> Result<Self> {
+        match Self::load_from(path) {
+            Ok(names) => Ok(names),
+            Err(error) if error.to_string().contains("is unreadable") => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(format!(".corrupt-{stamp}"));
+                std::fs::rename(path, &aside)
+                    .with_context(|| format!("moving {} aside", path.display()))?;
+                eprintln!(
+                    "{} was unreadable; moved it to {}",
+                    path.display(),
+                    Path::new(&aside).display()
+                );
+                Ok(Self {
+                    version: 1,
+                    ..Self::default()
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn save_to(&mut self, path: &Path) -> Result<()> {
         self.version = 1;
         crate::memory::crypto::write_private(path, &serde_json::to_vec_pretty(self)?)
@@ -72,7 +100,7 @@ pub fn remember(
         return Ok(());
     }
     let _lock = crate::memory::trust::TrustStore::lock(path)?;
-    let mut names = ProjectNames::load_from(path)?;
+    let mut names = ProjectNames::load_for_write(path)?;
     let entry = names.accounts.entry(account.into()).or_default();
     let mut changed = false;
     for (hash, name) in pairs {
@@ -90,11 +118,13 @@ pub fn remember(
 /// Forgets every name of `account` (a first verification drops what the
 /// unauthenticated path may have stored). A missing file stays missing.
 pub fn forget_account_at(path: &Path, account: &str) -> Result<()> {
-    if path.symlink_metadata().is_err() {
-        return Ok(());
-    }
     let _lock = crate::memory::trust::TrustStore::lock(path)?;
-    let mut names = ProjectNames::load_from(path)?;
+    match path.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut names = ProjectNames::load_for_write(path)?;
     if names.accounts.remove(account).is_some() {
         names.save_to(path)?;
     }
@@ -164,12 +194,41 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_file_is_an_error_naming_it() {
+    fn an_unreadable_file_is_an_error_naming_it_for_direct_readers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("project_names.json");
         std::fs::write(&path, b"not json").unwrap();
         let error = format!("{:#}", ProjectNames::load_from(&path).err().unwrap());
         assert!(error.contains("project_names.json"), "{error}");
+    }
+
+    #[test]
+    fn a_corrupt_file_is_moved_aside_by_the_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_names.json");
+        std::fs::write(&path, b"not json").unwrap();
+        remember(&path, "acct", [pair("h1.x.aa", "a")]).unwrap();
+        let names = ProjectNames::load_from(&path).unwrap();
+        assert_eq!(names.len("acct"), 1);
+        assert_eq!(names.name("acct", "h1.x.aa"), Some("a"));
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("project_names.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        std::fs::write(&path, b"not json").unwrap();
+        forget_account_at(&path, "acct").unwrap();
+        assert!(ProjectNames::load_from(&path).is_ok());
+    }
+
+    #[test]
+    fn a_newer_version_stays_an_error_for_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_names.json");
+        std::fs::write(&path, br#"{"version":2,"accounts":{}}"#).unwrap();
+        assert!(remember(&path, "acct", [pair("h1.x.aa", "a")]).is_err());
+        assert!(path.exists());
     }
 
     #[test]
