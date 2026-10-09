@@ -397,9 +397,12 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   seals the fresh keys under a new storage key, hands the unlocked keys to
   the agent, and in the same run sends the storage key to Astation
   (`storageKeyRotate` with an empty old `storage_kid`) and confirms it.
-  Until Astation holds it the agent refuses `atem cred lock`. A plain
+  Until Astation holds it the agent refuses `atem cred lock` (except while
+  a step-1 plain `device_keys` file still exists, which is re-sealed at the
+  next start). A plain
   `device_keys` file from build step 1 is sealed under a fresh storage key
-  each time the agent starts while that file exists; the key goes to
+  each time the agent starts while that file exists (never reusing the
+  kid of the sealed file it overwrites); the key goes to
   Astation at the next `atem pair` or `atem cred unlock`, and the plain file
   is deleted only once Astation is known to hold the key (a confirmed
   escrow, or an unlock that opened the current sealed file).
@@ -1159,7 +1162,8 @@ the reference behaviour.
 1. **Storage keys.** Per verified device keep, in the Keychain
    (`WhenUnlockedThisDeviceOnly`), keyed by `(device_id, device_pub)`: at
    most one current storage key and at most one pending key, each with its
-   `storage_kid`, plus the set of every `storage_kid` you ever acked for
+   `storage_kid` (the pending one also with the exact rotate statement bytes
+   it was acked for), plus the set of every `storage_kid` you ever acked for
    that device. Keep the acked set permanently; it is what makes a replayed
    rotate harmless. Keying by `device_pub` too means a device that verifies
    again with new device keys (see "Reset") starts with nothing held, so its
@@ -1194,13 +1198,19 @@ the reference behaviour.
 4. **`storageKeyRotate`.** No Touch ID: the device signature is the
    authorization. Verify `rotate.signature` with the device's pinned device
    signing key (Ed25519); parse `atem-storage-rotate-v1`; check account and
-   device_id; check `SHA-256(enc(encapped_key, ciphertext))` against the
-   statement. Then, in this order:
+   that `device_id` is a verified, unrevoked device; check
+   `SHA-256(enc(encapped_key, ciphertext))` against the statement. Then, in
+   this order:
    - Reject (`storageKeyRejected { reason }`) a `new_storage_kid` that isn't
      8 lowercase hex characters, or equals `old_storage_kid`.
-   - **Identical resend.** If `new_storage_kid` is the pending kid, atem is
-     resending a rotate whose ack it lost: send the same `storageKeyAck`
-     again and change nothing (never replace the pending key).
+   - **Identical resend.** If `new_storage_kid` is the pending kid and the
+     rotate statement is byte-identical to the one you acked (so the seal
+     hash matches too), atem is resending a rotate whose ack it lost: send
+     the same `storageKeyAck` again and change nothing. Any other rotate to
+     the pending kid gets `storageKeyRejected { reason, pending_kid }` and
+     the pending key stays as it is. (atem never reuses the kid of a sealed
+     file it re-seals over; any other collision of a random 32-bit kid,
+     about 2⁻³², is caught by this rule.)
    - **Implicit confirm.** If a key is pending and `old_storage_kid` names
      it, the device switched to it: make it current, delete the old one,
      and continue.
@@ -1220,15 +1230,17 @@ the reference behaviour.
      bytes. Store it as **pending**, keep the current key, add the kid to the
      acked set, and reply `storageKeyAck` with a signed `atem-storage-ack-v1`
      = `enc(label, account, sign_gen, device_id, new_storage_kid)`.
-5. **`storageKeyConfirm`.** Verify with the pinned device signing key and
+5. **`storageKeyConfirm`.** Verify with the pinned device signing key,
    parse `atem-storage-confirm-v1` = `enc(label, account, device_id,
-   storage_kid)` before changing anything. If its kid is the pending one,
+   storage_kid)`, and check account and that `device_id` is a verified,
+   unrevoked device, all before changing anything. If its kid is the pending one,
    make it current and delete the old key. If nothing is pending and it
    names the current key, it was already settled: do nothing. Ignore
    anything else. No reply.
 6. **`storageKeyAbandon`.** Verify with the pinned device signing key and
    parse `atem-storage-abandon-v1` = `enc(label, account, device_id,
-   storage_kid)`; check account and device_id. Drop the pending key only if
+   storage_kid)`; check account and that `device_id` is a verified,
+   unrevoked device. Drop the pending key only if
    its kid equals `storage_kid` exactly; the kid stays in the acked set, so
    it can never be acked again. Never touch the current key. No pending key,
    another kid, or a replay: do nothing. No reply. atem sends it just

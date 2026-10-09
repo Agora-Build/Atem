@@ -85,6 +85,7 @@ pub(crate) fn sealed_device(dir: &Path, kid: &str) -> (KeyPaths, FakeKeyServer, 
         unlock_auth_pub: keys.unlock_auth_pub(),
         storage_keys: HashMap::from([(kid.to_string(), *storage_key)]),
         pending: None,
+        pending_statement: None,
         acked: Default::default(),
     };
     (paths, server, keys)
@@ -98,6 +99,9 @@ pub(crate) struct FakeKeyServer {
     pub storage_keys: HashMap<String, [u8; 32]>,
     /// A rotated key stored as pending until the device confirms it.
     pub pending: Option<(String, [u8; 32])>,
+    /// The signed rotate statement (base64) that `pending` was acked for:
+    /// only a byte-identical resend is acked again.
+    pub pending_statement: Option<String>,
     /// Every storage key id Astation ever acked: a replayed rotate to one is refused.
     pub acked: std::collections::HashSet<String>,
 }
@@ -213,7 +217,7 @@ impl FakeKeyServer {
     /// Phase 2: checks the device signature and the seal, stores the key as
     /// pending (keeping the current one) and acks. An acked pending key is a
     /// commitment: another rotate is refused until it is confirmed, except
-    /// an idempotent resend of the same key or a rotate from the pending key
+    /// a byte-identical resend of the acked rotate or a rotate from the pending key
     /// itself (an implicit confirm).
     pub fn accept_rotation(&mut self, rotation: &StorageRotation) -> Result<SignedWire> {
         let rotate =
@@ -232,10 +236,21 @@ impl FakeKeyServer {
         if sealed_hash(&encapped, &ciphertext) != rotate.sealed_hash {
             bail!("rotation seal doesn't match its signature");
         }
-        let resend = self
+        let same_kid = self
             .pending
             .as_ref()
             .is_some_and(|(kid, _)| *kid == rotate.new_storage_kid);
+        // A resend after a lost ack is the identical signed statement (which
+        // includes the seal's hash); any other rotate to the pending kid is
+        // refused and leaves the committed key alone.
+        let resend = same_kid
+            && self.pending_statement.as_deref() == Some(rotation.rotate.statement.as_str());
+        if same_kid && !resend {
+            bail!(
+                "a rotation to storage key {} is pending with another key; it must be confirmed first",
+                rotate.new_storage_kid
+            );
+        }
         if !resend {
             if let Some((pending, _)) = &self.pending {
                 if *pending == rotate.old_storage_kid {
@@ -275,6 +290,7 @@ impl FakeKeyServer {
             .map_err(|_| anyhow!("storage key has the wrong length"))?;
         if !resend {
             self.pending = Some((rotate.new_storage_kid.clone(), key));
+            self.pending_statement = Some(rotation.rotate.statement.clone());
             self.acked.insert(rotate.new_storage_kid.clone());
         }
         Ok(self.astation.sign(
@@ -418,5 +434,22 @@ mod tests {
             .encode(),
         );
         assert!(server.accept_abandon(&forged).is_err());
+    }
+
+    #[test]
+    fn only_a_byte_identical_resend_of_the_pending_rotate_is_re_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let first = rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b");
+        server.accept_rotation(&first).unwrap();
+        let pending = server.pending.clone();
+        // Same kid, another key: refused, the committed key stays.
+        let other = rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b");
+        let error = server.accept_rotation(&other).unwrap_err().to_string();
+        assert!(error.contains("pending"), "{error}");
+        assert_eq!(server.pending, pending);
+        // The identical rotate (a resend after a lost ack) is acked again.
+        server.accept_rotation(&first).unwrap();
+        assert_eq!(server.pending, pending);
     }
 }

@@ -460,7 +460,13 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
                 let agent = agent.clone();
                 blocking(move || Ok((agent.status()?, agent.pending_rotation()?))).await?
             };
-            if pending.is_some() || (status.unlocked && !status.escrowed) {
+            // A locked agent can't vouch for escrow itself: its sealed file's
+            // kid must be the one Astation is known to hold.
+            let held = status.escrowed
+                || (!status.unlocked
+                    && status.storage_kid.is_some()
+                    && status.storage_kid.as_deref() == trust.escrowed_kid());
+            if pending.is_some() || !held {
                 bail!(
                     "this device's storage key goes only to its home Astation {home}, not to {astation_id}; run `atem cred unlock` to hand it to {home}"
                 );
@@ -1499,6 +1505,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, PairEscrow::HeldByHome(ASTATION_ID.into()));
+        assert_eq!(link.rotates, 0);
+    }
+
+    #[tokio::test]
+    async fn pairing_with_another_astation_checks_a_locked_agent_against_the_escrowed_kid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        // The sealed file's key isn't the one Astation is known to hold.
+        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+        trust.set_escrowed_kid("ffffffff");
+        trust.save_to(&paths.trust).unwrap();
+        let agent = agent(&paths);
+        assert!(!agent.status().unwrap().unlocked);
+        let mut link = ScriptedLink::new(server);
+        let error = error_of(pair_escrow(&mut link, &agent, &paths, "astation-2", None).await);
+        assert!(error.contains("atem cred unlock"), "{error}");
         assert_eq!(link.rotates, 0);
     }
 

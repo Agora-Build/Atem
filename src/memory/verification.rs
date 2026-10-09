@@ -1432,6 +1432,7 @@ mod ceremony_tests {
             unlock_auth_pub: certificate.unlock_auth_pub,
             storage_keys: Default::default(),
             pending: None,
+            pending_statement: None,
             acked: Default::default(),
         };
         let ack = server.accept_rotation(&escrow).unwrap();

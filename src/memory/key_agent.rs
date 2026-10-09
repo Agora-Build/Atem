@@ -832,7 +832,14 @@ impl KeyAgent {
             bail!("device_keys doesn't hold the keys pinned for Astation {home}");
         }
         let storage_key = new_storage_key();
-        let storage_kid = trust.pick_storage_kid("", new_storage_kid);
+        // The sealed file this overwrites may be from an earlier start whose
+        // key went to Astation unsettled: never reuse its kid.
+        let earlier = SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)
+            .ok()
+            .flatten()
+            .map(|sealed| sealed.storage_kid)
+            .unwrap_or_default();
+        let storage_kid = trust.pick_storage_kid(&earlier, new_storage_kid);
         SealedDeviceKeys::seal(&keys, &entry.device_id, &storage_kid, &storage_key)?
             .save_to(&self.paths.device_keys_sealed)?;
         keys.unlock_auth_key()
@@ -1237,6 +1244,7 @@ mod tests {
             unlock_auth_pub: keys.unlock_auth_pub(),
             storage_keys: Default::default(),
             pending: None,
+            pending_statement: None,
             acked: Default::default(),
         };
         let ack = server
@@ -1900,6 +1908,7 @@ mod tests {
             unlock_auth_pub: keys.unlock_auth_pub(),
             storage_keys: Default::default(),
             pending: None,
+            pending_statement: None,
             acked: Default::default(),
         };
         (paths, server, keys, agent)

@@ -387,10 +387,10 @@ mod tests {
         let error = format!("{:#}", open_grant(&trust, &keys, &malformed).err().unwrap());
         assert!(error.contains("encapsulation is malformed"), "{error}");
         // A well-formed seal that doesn't open keeps the grant-level message.
-        let mut wrong = k_statement(keys.device_pub());
-        wrong.kid = "0123abce".into();
         let sealed = grant_with(&fake, k_statement(keys.device_pub()), keys.device_pub());
-        let mut statement = wrong;
+        // Signed for another kid, so the seal's info doesn't match.
+        let mut statement = k_statement(keys.device_pub());
+        statement.kid = "0123abce".into();
         let encapped = STANDARD.decode(&sealed.encapped_key).unwrap();
         let ciphertext = STANDARD.decode(&sealed.ciphertext).unwrap();
         statement.sealed_hash = sealed_hash(&encapped, &ciphertext);
