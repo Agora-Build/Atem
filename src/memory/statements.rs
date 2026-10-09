@@ -234,6 +234,21 @@ impl FakeAstation {
             signature: STANDARD.encode(signature.to_bytes()),
         }
     }
+
+    /// Like `sign`, but with a fresh random nonce per call, as CryptoKit's
+    /// signatures are: same statement, different signature bytes.
+    pub fn sign_randomized(&self, statement: &[u8]) -> SignedWire {
+        use p256::ecdsa::signature::RandomizedSigner;
+        let signature: Signature = self
+            .key
+            .try_sign_with_rng(&mut rand::rngs::OsRng, statement)
+            .expect("OsRng signing");
+        let signature = signature.normalize_s().unwrap_or(signature);
+        SignedWire {
+            statement: STANDARD.encode(statement),
+            signature: STANDARD.encode(signature.to_bytes()),
+        }
+    }
 }
 
 #[cfg(test)]

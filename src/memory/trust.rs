@@ -160,7 +160,13 @@ impl TrustStore {
                 bail!("account state is older than the one already applied");
             }
             if state.epoch == entry.account_epoch {
-                if entry.account_state.as_ref() == Some(signed) {
+                // Same statement bytes, possibly a fresh signature (CryptoKit
+                // signatures are randomized): a repeat, so keep the stored one.
+                let stored = entry
+                    .account_state
+                    .as_ref()
+                    .map(|stored| stored.statement.as_str());
+                if stored == Some(signed.statement.as_str()) {
                     return Ok(None);
                 }
                 bail!("two different account states share epoch {}", state.epoch);
@@ -317,6 +323,36 @@ mod tests {
             store
                 .accept_account_state(ASTATION, &fake.sign(&wrong_gen.encode()))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn re_signed_same_state_at_same_epoch_is_a_repeat() {
+        let fake = FakeAstation::new();
+        let (mut store, keys) = pending(&fake);
+        store
+            .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
+            .unwrap();
+        let statement = state(EncryptionMode::On, 6).encode();
+        let first = fake.sign(&statement);
+        let second = fake.sign_randomized(&statement);
+        assert_eq!(first.statement, second.statement);
+        assert_ne!(first.signature, second.signature);
+        assert!(
+            store
+                .accept_account_state(ASTATION, &first)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .accept_account_state(ASTATION, &second)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.verified(ASTATION).unwrap().account_state.as_ref(),
+            Some(&first)
         );
     }
 
