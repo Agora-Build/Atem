@@ -1342,11 +1342,11 @@ async fn handle_vault_command(command: VaultCommands) -> Result<()> {
     Ok(())
 }
 
-/// Prompt "Save credentials? ... [y/N]" on stdin. Defaults to false on empty / non-tty.
-fn prompt_save_credentials() -> bool {
+/// Prompt a yes/no question on stdin. Defaults to false on empty / non-tty.
+fn prompt_yes_no(question: &str) -> bool {
     use std::io::{self, BufRead, Write};
 
-    print!("Save credentials so they keep working when Astation disconnects? [y/N]: ");
+    print!("{question}");
     let _ = io::stdout().flush();
 
     let stdin = io::stdin();
@@ -1354,10 +1354,11 @@ fn prompt_save_credentials() -> bool {
     if stdin.lock().read_line(&mut line).is_err() {
         return false;
     }
-    matches!(
-        line.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    )
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn prompt_save_credentials() -> bool {
+    prompt_yes_no("Save credentials so they keep working when Astation disconnects? [y/N]: ")
 }
 
 /// `atem pair [--save]` — connect to Astation, send PairSavePreference, wait for CredentialSync.
@@ -1446,7 +1447,8 @@ async fn run_pair(save: bool) -> Result<()> {
             astation_id,
             _server_save_credentials,
         ))) => {
-            if result != "local" {
+            let verify_astation_id = astation_id.clone();
+            let mut active_client = if result != "local" {
                 println!("Establishing an authenticated relay session...");
                 drop(client);
                 let mut identity_client = crate::websocket_client::AstationClient::new();
@@ -1459,7 +1461,10 @@ async fn run_pair(save: bool) -> Result<()> {
                             error
                         )
                     })?;
-            }
+                identity_client
+            } else {
+                client
+            };
             crate::config::AtemConfig::store_astation_relay_code(&astation_id);
             let mut store = crate::credentials::CredentialStore::load();
             let now = crate::credentials::CredentialEntry::now_secs();
@@ -1482,6 +1487,12 @@ async fn run_pair(save: bool) -> Result<()> {
             } else {
                 println!("Credentials are session-only (5 min grace period after disconnect).");
             }
+            if let Err(error) =
+                run_device_verification(&mut active_client, &verify_astation_id).await
+            {
+                eprintln!("⚠️  {error}");
+                eprintln!("Pairing is saved. Run 'atem pair' again to verify this device.");
+            }
             Ok(())
         }
         Ok(Err(e)) => Err(e),
@@ -1489,6 +1500,138 @@ async fn run_pair(save: bool) -> Result<()> {
             "Pairing timed out waiting for credentials. \
              (Astation may not yet support SSO token sync — check Astation version.)"
         ),
+    }
+}
+
+/// Waits for the next device-verification message, skipping unrelated traffic.
+async fn next_verify_message(
+    client: &mut crate::websocket_client::AstationClient,
+) -> Result<crate::websocket_client::AstationMessage> {
+    use crate::websocket_client::AstationMessage;
+    loop {
+        match client.recv_message_async().await {
+            Some(
+                message @ (AstationMessage::VerifyKeys { .. }
+                | AstationMessage::DeviceVerified { .. }
+                | AstationMessage::VerifyAbort { .. }),
+            ) => return Ok(message),
+            Some(_) => continue,
+            None => anyhow::bail!("Astation connection closed during device verification"),
+        }
+    }
+}
+
+/// Verifies this device with Astation: commit, receive Astation's keys,
+/// reveal, compare the safety code on both sides, then wait for Astation's
+/// signed certificate. Nothing is trusted unless both sides confirm.
+async fn run_device_verification(
+    client: &mut crate::websocket_client::AstationClient,
+    astation_id: &str,
+) -> Result<()> {
+    use crate::memory::device_keys::DeviceKeys;
+    use crate::memory::trust::TrustStore;
+    use crate::memory::verification::{AstationKeys, Handshake, KeyPaths, complete_verification};
+    use crate::websocket_client::AstationMessage;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use tokio::time::{Duration, timeout};
+
+    let paths = KeyPaths::default_paths();
+    let device_id = crate::config::AtemConfig::ensure_instance_id();
+    let handshake = Handshake::start(DeviceKeys::generate());
+    client
+        .send_message(AstationMessage::VerifyCommit {
+            device_id: device_id.clone(),
+            commitment: STANDARD.encode(handshake.commitment()),
+        })
+        .await?;
+
+    let astation = match timeout(Duration::from_secs(15), next_verify_message(client)).await {
+        Err(_) => {
+            println!(
+                "This Astation doesn't support device verification yet. Pairing is saved; encrypted sync stays off on this device."
+            );
+            return Ok(());
+        }
+        Ok(result) => match result? {
+            AstationMessage::VerifyKeys {
+                sign_pub,
+                enc_pub,
+                recovery_sign_pub,
+                nonce,
+            } => AstationKeys::from_wire(&sign_pub, &enc_pub, &recovery_sign_pub, &nonce)?,
+            AstationMessage::VerifyAbort { reason } => {
+                anyhow::bail!("Astation stopped device verification: {reason}")
+            }
+            _ => anyhow::bail!("unexpected message during device verification"),
+        },
+    };
+
+    let reveal = handshake.reveal();
+    client
+        .send_message(AstationMessage::VerifyReveal {
+            device_pub: STANDARD.encode(reveal.device_pub),
+            device_sign_pub: STANDARD.encode(reveal.device_sign_pub),
+            unlock_auth_pub: STANDARD.encode(reveal.unlock_auth_pub),
+            nonce: STANDARD.encode(reveal.nonce_a),
+        })
+        .await?;
+    let code = handshake.safety_code(&astation);
+
+    let mut trust = TrustStore::load_from(&paths.trust)?;
+    trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code);
+    trust.save_to(&paths.trust)?;
+    let abandon = |trust: &mut TrustStore| -> Result<()> {
+        trust.remove_pending(astation_id);
+        trust.save_to(&paths.trust)
+    };
+
+    println!();
+    println!("Safety code:  {code}");
+    println!("Astation shows a code too. They must match exactly.");
+    if !prompt_yes_no("Do the codes match? [y/N]: ") {
+        client
+            .send_message(AstationMessage::VerifyAbort {
+                reason: "the codes didn't match on atem".into(),
+            })
+            .await?;
+        abandon(&mut trust)?;
+        anyhow::bail!(
+            "Device verification cancelled: the codes didn't match, so nothing was trusted."
+        );
+    }
+
+    println!("Confirm on your Mac with Touch ID…");
+    match timeout(Duration::from_secs(300), next_verify_message(client)).await {
+        Err(_) => {
+            abandon(&mut trust)?;
+            anyhow::bail!("Timed out waiting for Astation to confirm this device.")
+        }
+        Ok(result) => match result? {
+            AstationMessage::DeviceVerified {
+                device_verified,
+                account_state,
+                grants,
+            } => {
+                complete_verification(
+                    &paths,
+                    astation_id,
+                    handshake.into_keys(),
+                    &device_verified,
+                    &account_state,
+                    &grants,
+                )?;
+                println!("✅ Device verified with Astation (safety code {code}).");
+                Ok(())
+            }
+            AstationMessage::VerifyAbort { reason } => {
+                abandon(&mut trust)?;
+                anyhow::bail!("Astation declined device verification: {reason}")
+            }
+            _ => {
+                abandon(&mut trust)?;
+                anyhow::bail!("unexpected message during device verification")
+            }
+        },
     }
 }
 
