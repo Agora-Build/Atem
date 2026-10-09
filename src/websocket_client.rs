@@ -256,24 +256,53 @@ pub enum AstationMessage {
         save_credentials: bool,
     },
 
+    /// Astation → Atem: the account's encryption mode, as a signed
+    /// `atem-account-state-v1` statement. Messages without one are ignored.
     #[serde(rename = "encryptionMode")]
     EncryptionMode {
-        mode: String,
         #[serde(default)]
-        kid: Option<String>,
-        data_account: String,
-        astation_id: String,
+        account_state: Option<crate::memory::statements::SignedWire>,
     },
 
+    /// Atem → Astation: a verified device asks for `K`; `public_key` is its
+    /// base64 X25519 device key, which Astation checks against its pin.
     #[serde(rename = "keyRequest")]
     KeyRequest { public_key: String },
 
+    /// Astation → Atem: `K` sealed to this device with a signed grant.
     #[serde(rename = "keyGrant")]
     KeyGrant {
-        kid: String,
-        wrapped_key: String,
-        data_account: String,
+        #[serde(default)]
+        grant: Option<crate::memory::grant::GrantWire>,
     },
+
+    /// Atem → Astation: start device verification with a commitment to keys
+    /// atem hasn't revealed yet. All values base64.
+    #[serde(rename = "verifyCommit")]
+    VerifyCommit { device_id: String, commitment: String },
+
+    /// Astation → Atem: Astation's public keys and nonce, sent only after it
+    /// stored the commitment. `sign_pub` is a 65-byte SEC1 P-256 point.
+    #[serde(rename = "verifyKeys")]
+    VerifyKeys { sign_pub: String, enc_pub: String, recovery_sign_pub: String, nonce: String },
+
+    /// Atem → Astation: the keys and nonce behind the commitment.
+    #[serde(rename = "verifyReveal")]
+    VerifyReveal { device_pub: String, device_sign_pub: String, unlock_auth_pub: String, nonce: String },
+
+    /// Astation → Atem: after Touch ID, the signed device certificate, the
+    /// signed account state, and signed grants (`K` when it exists).
+    #[serde(rename = "deviceVerified")]
+    DeviceVerified {
+        device_verified: crate::memory::statements::SignedWire,
+        account_state: crate::memory::statements::SignedWire,
+        #[serde(default)]
+        grants: Vec<crate::memory::grant::GrantWire>,
+    },
+
+    /// Either side: verification was cancelled; discard everything from it.
+    #[serde(rename = "verifyAbort")]
+    VerifyAbort { reason: String },
 
     #[serde(rename = "encryptionMigrationComplete")]
     EncryptionMigrationComplete { mode: String, kid: String },
@@ -643,10 +672,6 @@ impl AstationClient {
 
         println!("🔐 Pairing with Astation...");
         println!("   Code: {}", pairing_code);
-        match crate::memory::crypto::DeviceKey::load_or_create() {
-            Ok(key) => println!("   Encryption fingerprint: {}", key.fingerprint()),
-            Err(error) => println!("   Encryption fingerprint unavailable: {error}"),
-        }
         println!("   Waiting for approval...");
 
         // Send pairing auth
@@ -776,48 +801,45 @@ impl AstationClient {
         &self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
-        use crate::memory::crypto::{DeviceKey, EncryptionContext, EncryptionMode};
-        match message {
-            AstationMessage::EncryptionMode { mode, kid, data_account, astation_id } => {
-                let mode = EncryptionMode::parse(mode)?;
-                EncryptionContext::update_mode(astation_id, data_account, mode, kid.as_deref())?;
-                if mode.requires_key() && EncryptionContext::for_astation(astation_id).is_err() {
-                    let device = DeviceKey::load_or_create()?;
-                    self.send_message(AstationMessage::KeyRequest {
-                        public_key: device.public_key_base64(),
-                    }).await?;
-                    return Ok(Some(format!(
-                        "Encryption key requested from Astation; verify fingerprint {}",
-                        device.fingerprint()
-                    )));
-                }
-                if let Some(target) = crate::memory::crypto::migrate_account(astation_id).await? {
-                    let kid = kid.clone().ok_or_else(|| anyhow!("encryption migration has no key id"))?;
-                    self.send_message(AstationMessage::EncryptionMigrationComplete {
-                        mode: target.to_string(),
-                        kid,
-                    }).await?;
-                    return Ok(Some(format!("Encryption migration complete; requesting {target}")));
-                }
-                Ok(Some(format!("Account encryption mode: {mode:?}")))
-            }
-            AstationMessage::KeyGrant { kid, wrapped_key, data_account } => {
-                let astation_id = self.connected_astation_id.as_deref()
-                    .ok_or_else(|| anyhow!("received an encryption key before Astation identity was known"))?;
-                let device = DeviceKey::load_or_create()?;
-                let key = device.open_grant(data_account, kid, wrapped_key)?;
-                EncryptionContext::install_grant(astation_id, data_account, kid, key)?;
-                if let Some(target) = crate::memory::crypto::migrate_account(astation_id).await? {
-                    self.send_message(AstationMessage::EncryptionMigrationComplete {
-                        mode: target.to_string(),
-                        kid: kid.clone(),
-                    }).await?;
-                    return Ok(Some(format!("Encryption key {kid} installed; migration complete")));
-                }
-                Ok(Some(format!("End-to-end encryption key {kid} installed")))
-            }
-            _ => Ok(None),
+        use crate::memory::crypto::EncryptionContext;
+        use crate::memory::verification::{apply_account_state, apply_grant, Applied, KeyPaths};
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        if !matches!(message, AstationMessage::EncryptionMode { .. } | AstationMessage::KeyGrant { .. }) {
+            return Ok(None);
         }
+        let Some(astation_id) = self.connected_astation_id.clone() else {
+            return Ok(Some("Ignored an encryption message that arrived before Astation's identity".into()));
+        };
+        let paths = KeyPaths::default_paths();
+        let applied = match message {
+            AstationMessage::EncryptionMode { account_state } => apply_account_state(&paths, &astation_id, account_state.as_ref())?,
+            AstationMessage::KeyGrant { grant } => apply_grant(&paths, &astation_id, grant.as_ref())?,
+            _ => unreachable!("filtered above"),
+        };
+        match applied {
+            Applied::Ignored(reason) => Ok(Some(format!("Ignored {reason}"))),
+            Applied::Unchanged => Ok(Some("Account encryption state unchanged".into())),
+            Applied::ModeChanged(state) => {
+                if state.mode.requires_key() && EncryptionContext::for_astation(&astation_id).is_err() {
+                    let keys = crate::memory::device_keys::DeviceKeys::load_from(&paths.device_keys)?
+                        .ok_or_else(|| anyhow!("this device's keys are missing; run 'atem pair' to verify it again"))?;
+                    self.send_message(AstationMessage::KeyRequest { public_key: STANDARD.encode(keys.device_pub()) }).await?;
+                    return Ok(Some("Encryption key requested from Astation".into()));
+                }
+                self.finish_encryption_migration(&astation_id, state.kid).await
+            }
+            Applied::KeyInstalled(kid) => self.finish_encryption_migration(&astation_id, Some(kid)).await,
+        }
+    }
+
+    async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {
+        if let Some(target) = crate::memory::crypto::migrate_account(astation_id).await? {
+            let kid = kid.ok_or_else(|| anyhow!("encryption migration has no key id"))?;
+            self.send_message(AstationMessage::EncryptionMigrationComplete { mode: target.to_string(), kid }).await?;
+            return Ok(Some(format!("Encryption migration complete; requesting {target}")));
+        }
+        Ok(Some("Account encryption state updated".into()))
     }
 
     /// Non-blocking: returns a message if one is already queued, None otherwise.
@@ -3083,6 +3105,20 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn unsigned_encryption_mode_from_old_astation_still_parses() {
+        let json = r#"{"type":"encryptionMode","data":{"mode":"off","data_account":"a","astation_id":"b"}}"#;
+        let parsed: AstationMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(parsed, AstationMessage::EncryptionMode { account_state: None }));
+    }
+
+    #[test]
+    fn verify_messages_round_trip() {
+        let message = AstationMessage::VerifyCommit { device_id: "d".into(), commitment: "c".into() };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(json, r#"{"type":"verifyCommit","data":{"device_id":"d","commitment":"c"}}"#);
     }
 
     // --- atem_id shape + charset + uniqueness ---

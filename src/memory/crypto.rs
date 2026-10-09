@@ -5,21 +5,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, Payload},
-    ChaCha20Poly1305, XChaCha20Poly1305,
+    XChaCha20Poly1305,
 };
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::memory::model::{content_hash, skill_hash, Memory, Skill};
-
-const WRAP_DOMAIN: &str = "astation-data-key-wrap-v1";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -140,10 +136,6 @@ fn key_store_path() -> PathBuf {
     crate::config::AtemConfig::config_dir().join("data_keys.enc")
 }
 
-fn device_key_path() -> PathBuf {
-    crate::config::AtemConfig::config_dir().join("device_key")
-}
-
 #[cfg(unix)]
 fn set_mode_600(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -173,88 +165,6 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     set_mode_600(path)
 }
 
-pub struct DeviceKey {
-    secret: StaticSecret,
-}
-
-impl DeviceKey {
-    pub fn load_or_create() -> Result<Self> {
-        Self::load_or_create_at(&device_key_path())
-    }
-
-    fn load_or_create_at(path: &Path) -> Result<Self> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-                let secret = StaticSecret::random_from_rng(OsRng);
-                let bytes = secret.to_bytes();
-                use std::io::Write;
-                let mut options = fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                match options.open(path) {
-                    Ok(mut file) => {
-                        file.write_all(&bytes)?;
-                        file.sync_all()?;
-                        bytes.to_vec()
-                    }
-                    Err(race) if race.kind() == std::io::ErrorKind::AlreadyExists => fs::read(path)?,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if bytes.len() != 32 { bail!("device_key is unreadable; expected 32 bytes"); }
-        set_mode_600(path)?;
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&bytes);
-        Ok(Self { secret: StaticSecret::from(raw) })
-    }
-
-    pub fn public_key_base64(&self) -> String {
-        STANDARD.encode(PublicKey::from(&self.secret).as_bytes())
-    }
-
-    pub fn fingerprint(&self) -> String {
-        let digest = Sha256::digest(PublicKey::from(&self.secret).as_bytes());
-        let hex = digest[..8].iter().map(|byte| format!("{byte:02X}")).collect::<String>();
-        (0..hex.len())
-            .step_by(4)
-            .map(|offset| &hex[offset..offset + 4])
-            .collect::<Vec<_>>()
-            .join("-")
-    }
-
-    pub fn open_grant(&self, data_account: &str, kid: &str, wrapped: &str) -> Result<[u8; 32]> {
-        if !valid_kid(kid) { bail!("invalid encryption kid"); }
-        let raw = STANDARD.decode(wrapped).context("invalid wrapped key encoding")?;
-        if raw.len() < 32 + 12 + 16 { bail!("wrapped key is too short"); }
-        let mut ephemeral = [0u8; 32];
-        ephemeral.copy_from_slice(&raw[..32]);
-        let shared = self.secret.diffie_hellman(&PublicKey::from(ephemeral));
-        let aad = wrap_aad(data_account, kid);
-        let hkdf = Hkdf::<Sha256>::new(None, shared.as_bytes());
-        let mut wrapping_key = [0u8; 32];
-        hkdf.expand(&aad, &mut wrapping_key).map_err(|_| anyhow!("key grant HKDF failed"))?;
-        let plain = ChaCha20Poly1305::new((&wrapping_key).into())
-            .decrypt((&raw[32..44]).into(), Payload { msg: &raw[44..], aad: &aad })
-            .map_err(|_| anyhow!("key grant authentication failed"))?;
-        if plain.len() != 32 { bail!("wrapped account key has the wrong length"); }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&plain);
-        Ok(key)
-    }
-}
-
-fn wrap_aad(data_account: &str, kid: &str) -> Vec<u8> {
-    format!("{WRAP_DOMAIN}\n{data_account}\n{kid}").into_bytes()
-}
-
 pub(crate) fn valid_kid(kid: &str) -> bool {
     kid.len() == 8 && kid.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
@@ -275,6 +185,10 @@ impl EncryptionContext {
     }
 
     pub(crate) fn for_astation_at(astation_id: &str, path: &Path) -> Result<Self> {
+        let trust = crate::memory::trust::TrustStore::load_from(&crate::memory::trust::trust_path_for(path))?;
+        if trust.verified(astation_id).is_some_and(|entry| entry.account_state.is_none()) {
+            bail!("waiting for Astation's signed encryption state; reconnect to Astation");
+        }
         let store = StoredKeys::load_from(path)?;
         let Some(mode) = store.astations.get(astation_id) else {
             return Ok(Self {
@@ -582,19 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn device_key_is_stable_and_private() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("device_key");
-        let first = DeviceKey::load_or_create_at(&path).unwrap();
-        let second = DeviceKey::load_or_create_at(&path).unwrap();
-        assert_eq!(first.public_key_base64(), second.public_key_base64());
-        #[cfg(unix)] {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
-    }
-
-    #[test]
     fn envelope_round_trip_and_tamper_failure() {
         let context = context();
         let sealed = context.seal("mem-1", "content", b"hello").unwrap();
@@ -603,39 +504,6 @@ mod tests {
         let mut bad = sealed.into_bytes();
         *bad.last_mut().unwrap() = if *bad.last().unwrap() == b'A' { b'B' } else { b'A' };
         assert!(context.open("mem-1", "content", std::str::from_utf8(&bad).unwrap()).is_err());
-    }
-
-    #[test]
-    fn fingerprint_is_stable() {
-        let secret = StaticSecret::from([3u8; 32]);
-        let key = DeviceKey { secret };
-        assert_eq!(key.fingerprint(), key.fingerprint());
-        assert_eq!(key.fingerprint().len(), 19);
-    }
-
-    #[test]
-    fn wrapped_key_round_trip_matches_wire_format() {
-        let device = DeviceKey { secret: StaticSecret::from([3u8; 32]) };
-        let ephemeral = StaticSecret::from([4u8; 32]);
-        let shared = ephemeral.diffie_hellman(&PublicKey::from(&device.secret));
-        let aad = wrap_aad("account", "0123abcd");
-        let hkdf = Hkdf::<Sha256>::new(None, shared.as_bytes());
-        let mut wrapping_key = [0u8; 32];
-        hkdf.expand(&aad, &mut wrapping_key).unwrap();
-        let nonce = [9u8; 12];
-        let account_key = [7u8; 32];
-        let ciphertext = ChaCha20Poly1305::new((&wrapping_key).into())
-            .encrypt((&nonce).into(), Payload { msg: &account_key, aad: &aad })
-            .unwrap();
-        let mut wrapped = PublicKey::from(&ephemeral).as_bytes().to_vec();
-        wrapped.extend_from_slice(&nonce);
-        wrapped.extend_from_slice(&ciphertext);
-        assert_eq!(
-            device
-                .open_grant("account", "0123abcd", &STANDARD.encode(wrapped))
-                .unwrap(),
-            account_key
-        );
     }
 
     #[test]

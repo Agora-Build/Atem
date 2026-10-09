@@ -1398,60 +1398,30 @@ async fn run_pair(save: bool) -> Result<()> {
 
     // Wait up to 60s for CredentialSync.
     let received = timeout(Duration::from_secs(60), async {
-        let mut encryption_mode_seen = false;
-        let mut pending_credentials: Option<(
-            String,
-            String,
-            u64,
-            Option<String>,
-            String,
-            bool,
-        )> = None;
         loop {
             match client.recv_message_async().await {
                 Some(message) => {
-                    if matches!(&message, crate::websocket_client::AstationMessage::EncryptionMode { .. }) {
-                        encryption_mode_seen = true;
-                    }
                     if let Some(status) = client.handle_encryption_message(&message).await? {
                         println!("{status}");
-                        if let Some(credentials) = pending_credentials.take() {
-                            let astation_id = &credentials.4;
-                            if encryption_mode_seen
-                                && crate::memory::crypto::EncryptionContext::for_astation(astation_id).is_ok()
-                            {
-                                return Ok::<_, anyhow::Error>(credentials);
-                            }
-                            pending_credentials = Some(credentials);
-                        }
                         continue;
                     }
-                    match message {
-                        crate::websocket_client::AstationMessage::CredentialSync {
+                    if let crate::websocket_client::AstationMessage::CredentialSync {
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                        login_id,
+                        astation_id,
+                        save_credentials: server_save_credentials,
+                    } = message
+                    {
+                        return Ok::<_, anyhow::Error>((
                             access_token,
                             refresh_token,
                             expires_at,
                             login_id,
                             astation_id,
-                            save_credentials: server_save_credentials,
-                        } => {
-                            let credentials = (
-                                access_token,
-                                refresh_token,
-                                expires_at,
-                                login_id,
-                                astation_id,
-                                server_save_credentials,
-                            );
-                            if encryption_mode_seen
-                                && crate::memory::crypto::EncryptionContext::for_astation(&credentials.4).is_ok()
-                            {
-                                return Ok::<_, anyhow::Error>(credentials);
-                            }
-                            println!("Waiting for Astation encryption state and key…");
-                            pending_credentials = Some(credentials);
-                        }
-                        _ => continue,
+                            server_save_credentials,
+                        ));
                     }
                 }
                 None => anyhow::bail!("Astation connection closed before sending credentials."),
