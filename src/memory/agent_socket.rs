@@ -96,6 +96,13 @@ fn prepare_socket_dir(dir: &Path, uid: u32) -> Result<()> {
             if meta.uid() != uid {
                 bail!("{} is owned by another user", dir.display());
             }
+            if meta.mode() & 0o022 != 0 {
+                // Others could already have planted entries in it.
+                bail!(
+                    "{} can be written by other users; refusing to use it (make it private with `chmod 700` after checking its contents)",
+                    dir.display()
+                );
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = dir.parent() {
@@ -330,8 +337,14 @@ fn lock_agent(socket: &Path) -> Result<std::fs::File> {
         .truncate(false)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&lock_path)
-        .with_context(|| format!("could not open {}", lock_path.display()))?;
+        .with_context(|| {
+            format!(
+                "could not open {} (a symlink there is refused)",
+                lock_path.display()
+            )
+        })?;
     for attempt in 0..30 {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);
@@ -583,6 +596,8 @@ type Launcher = Box<dyn Fn() -> Result<()> + Send + Sync>;
 pub struct KeyAgentClient {
     socket: PathBuf,
     launcher: Option<Launcher>,
+    /// Where a started agent writes; named when it doesn't come up.
+    log: PathBuf,
     /// The user the listener must run as (this user; settable in tests).
     expected_uid: u32,
 }
@@ -593,6 +608,7 @@ impl KeyAgentClient {
         Self {
             socket,
             launcher: None,
+            log: agent_log_path(),
             expected_uid: own_uid(),
         }
     }
@@ -604,6 +620,7 @@ impl KeyAgentClient {
             launcher: Some(Box::new(|| {
                 spawn_agent(&std::env::current_exe()?, &agent_log_path(), &[]).map(|_| ())
             })),
+            log: agent_log_path(),
             expected_uid: own_uid(),
         }
     }
@@ -614,8 +631,16 @@ impl KeyAgentClient {
         Self {
             socket,
             launcher: Some(launcher),
+            log: agent_log_path(),
             expected_uid: own_uid(),
         }
+    }
+
+    /// Names `log` when an agent doesn't come up.
+    #[cfg(test)]
+    pub(crate) fn logging_to(mut self, log: PathBuf) -> Self {
+        self.log = log;
+        self
     }
 
     /// Expects the listener to run as `uid` instead of this user.
@@ -661,10 +686,7 @@ impl KeyAgentClient {
                         return checked;
                     }
                 }
-                bail!(
-                    "the key agent didn't start; see {}",
-                    agent_log_path().display()
-                )
+                bail!("the key agent didn't start; see {}", self.log.display())
             }
             Err(error) => Err(anyhow!(error).context(format!(
                 "the key agent isn't running at {}",
@@ -731,6 +753,14 @@ mod tests {
 
     fn own_uid() -> u32 {
         unsafe { libc::getuid() }
+    }
+
+    /// Creates `path` private, whatever the umask: the agent refuses a socket
+    /// directory others can write to.
+    fn make_private(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
     }
 
     /// Serves an agent for the key files in `dir` on its own thread.
@@ -858,7 +888,7 @@ mod tests {
             let live = bind(&socket).err().unwrap();
             assert!(format!("{live:#}").contains("already running"));
             let stale = dir.path().join("stale").join("agent.sock");
-            std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+            make_private(stale.parent().unwrap());
             drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
             assert!(stale.exists());
             bind(&stale).unwrap();
@@ -977,7 +1007,7 @@ mod tests {
             .join("atem");
         assert!(
             exe.exists(),
-            "build the atem binary first: {}",
+            "atem binary missing or stale at {}: run `cargo build` first",
             exe.display()
         );
         let socket = runtime.join("atem").join("agent.sock");
@@ -1008,7 +1038,8 @@ mod tests {
             }
         }
         let _kill = Kill(pid.clone());
-        let client = KeyAgentClient::with_launcher(socket.clone(), launcher);
+        let client = KeyAgentClient::with_launcher(socket.clone(), launcher)
+            .logging_to(dir.path().join("agent.log"));
         assert!(!client.is_running());
         let status = client.status().unwrap();
         assert!(!status.unlocked);
@@ -1038,7 +1069,7 @@ mod tests {
     fn bind_does_not_delete_a_file_that_is_not_a_socket() {
         let dir = short_dir();
         let socket = dir.path().join("run").join("agent.sock");
-        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        make_private(socket.parent().unwrap());
         std::fs::write(&socket, b"precious").unwrap();
         let error = bind(&socket).err().unwrap();
         assert!(format!("{error:#}").contains("not a socket"), "{error:#}");
@@ -1224,5 +1255,36 @@ mod tests {
             assert_eq!(wire_error, local_error);
             assert!(!wire_error.contains("malformed"), "{wire_error}");
         }
+    }
+
+    #[test]
+    fn a_socket_directory_others_can_write_is_refused_not_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = short_dir();
+        let open = dir.path().join("atem");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = bind(&open.join("agent.sock")).err().unwrap();
+        let text = format!("{error:#}");
+        assert!(text.contains("written by other users"), "{text}");
+        assert!(text.contains(open.to_str().unwrap()), "{text}");
+        assert_eq!(
+            std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
+    }
+
+    #[test]
+    fn a_symlinked_lock_file_is_refused() {
+        let dir = short_dir();
+        let run = dir.path().join("run");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, run.join("agent.lock")).unwrap();
+        let _ = std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        let error = bind(&run.join("agent.sock")).err().unwrap();
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 }
