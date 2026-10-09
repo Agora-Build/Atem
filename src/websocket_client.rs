@@ -801,8 +801,8 @@ impl AstationClient {
         &self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
+        use crate::memory::key_agent::{blocking, default_agent, LOCKED};
         use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied, KeyPaths};
-        use base64::{engine::general_purpose::STANDARD, Engine};
 
         if !matches!(message, AstationMessage::EncryptionMode { .. } | AstationMessage::KeyGrant { .. }) {
             return Ok(None);
@@ -813,17 +813,27 @@ impl AstationClient {
         let paths = KeyPaths::default_paths();
         let applied = match message {
             AstationMessage::EncryptionMode { account_state } => apply_account_state(&paths, &astation_id, account_state.as_ref())?,
-            AstationMessage::KeyGrant { grant } => apply_grant(&paths, &astation_id, grant.as_ref())?,
+            AstationMessage::KeyGrant { grant } => {
+                // Grants are opened only inside the key agent (blocking socket I/O).
+                let (paths, astation_id, grant) = (paths.clone(), astation_id.clone(), grant.clone());
+                blocking(move || apply_grant(&paths, default_agent().as_ref(), &astation_id, grant.as_ref())).await?
+            }
             _ => unreachable!("filtered above"),
         };
         let request_key = || async {
-            let keys = crate::memory::device_keys::DeviceKeys::load_from(&paths.device_keys)?
-                .ok_or_else(|| anyhow!("this device's keys are missing; run 'atem pair' to verify it again"))?;
-            self.send_message(AstationMessage::KeyRequest { public_key: STANDARD.encode(keys.device_pub()) }).await?;
+            // Astation answers only for the device key it pinned, so ask with exactly that one.
+            let trust = crate::memory::trust::TrustStore::load_from(&paths.trust)?;
+            let public_key = trust
+                .verified(&astation_id)
+                .ok_or_else(|| anyhow!("this device isn't verified with this Astation"))?
+                .device_pub
+                .clone();
+            self.send_message(AstationMessage::KeyRequest { public_key }).await?;
             Ok::<_, anyhow::Error>(Some("Encryption key requested from Astation".to_string()))
         };
         match applied {
             Applied::Ignored(reason) => Ok(Some(format!("Ignored {reason}"))),
+            Applied::Locked => Ok(Some(format!("Ignored a key grant: {LOCKED}"))),
             Applied::Unchanged => {
                 // A repeat of the stored state still asks for K if it is missing
                 // (e.g. a keyRequest or grant was lost earlier).

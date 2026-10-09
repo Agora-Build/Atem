@@ -9,10 +9,14 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::memory::crypto::EncryptionContext;
-use crate::memory::device_keys::DeviceKeys;
+use crate::memory::device_keys::{DeviceKeys, DevicePublics, PublicKeys, UnlockAuthKey};
 use crate::memory::encoding::{base32_prefix, dec, enc};
 use crate::memory::grant::{GrantWire, open_grant};
+use crate::memory::key_agent::{KeyAgentApi, LOCKED};
 use crate::memory::statements::{AccountState, SignedWire};
+use crate::memory::storage_key::{
+    SealedDeviceKeys, StorageRotation, new_storage_key, new_storage_kid,
+};
 use crate::memory::trust::{AstationTrust, TrustStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,16 +111,55 @@ pub fn transcript_for(commitment: &[u8; 32], nonce_a: &[u8; 32], nonce_s: &[u8; 
     .into()
 }
 
+/// The keys a verification reveals: fresh ones (first verification, secrets
+/// in hand), or this device's sealed keys, which only the key agent opens.
+// One short-lived value per verification: boxing the larger variant buys nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum VerificationKeys {
+    Fresh(DeviceKeys),
+    Sealed(DevicePublics),
+}
+
+impl From<DeviceKeys> for VerificationKeys {
+    fn from(keys: DeviceKeys) -> Self {
+        Self::Fresh(keys)
+    }
+}
+
+impl PublicKeys for VerificationKeys {
+    fn device_pub(&self) -> [u8; 32] {
+        match self {
+            Self::Fresh(keys) => keys.device_pub(),
+            Self::Sealed(publics) => publics.device_pub,
+        }
+    }
+    fn device_sign_pub(&self) -> [u8; 32] {
+        match self {
+            Self::Fresh(keys) => keys.device_sign_pub(),
+            Self::Sealed(publics) => publics.device_sign_pub,
+        }
+    }
+    fn unlock_auth_pub(&self) -> [u8; 32] {
+        match self {
+            Self::Fresh(keys) => keys.unlock_auth_pub(),
+            Self::Sealed(publics) => publics.unlock_auth_pub,
+        }
+    }
+}
+
 pub struct Handshake {
-    keys: DeviceKeys,
+    keys: VerificationKeys,
     nonce_a: [u8; 32],
 }
 
 impl Handshake {
-    pub fn start(keys: DeviceKeys) -> Self {
+    pub fn start(keys: impl Into<VerificationKeys>) -> Self {
         let mut nonce_a = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce_a);
-        Self { keys, nonce_a }
+        Self {
+            keys: keys.into(),
+            nonce_a,
+        }
     }
 
     pub fn reveal(&self) -> Reveal {
@@ -140,11 +183,11 @@ impl Handshake {
         transcript_for(&self.commitment(), &self.nonce_a, &astation.nonce_s)
     }
 
-    pub fn keys(&self) -> &DeviceKeys {
+    pub fn keys(&self) -> &VerificationKeys {
         &self.keys
     }
 
-    pub fn into_keys(self) -> DeviceKeys {
+    pub fn into_keys(self) -> VerificationKeys {
         self.keys
     }
 }
@@ -194,6 +237,9 @@ pub enum Applied {
     Unchanged,
     ModeChanged(AccountState),
     KeyInstalled(String),
+    /// A key grant arrived while the key agent is locked. After
+    /// `atem cred unlock`, atem asks for the key again.
+    Locked,
 }
 
 /// Applies a signed account state from a verified Astation. Unsigned states,
@@ -260,9 +306,11 @@ fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>> {
         .transpose()
 }
 
-/// Installs a signed `K` grant for this verified device.
+/// Installs a signed `K` grant for this verified device. The grant is opened
+/// only inside the unlocked key agent; there is no plain-key fallback.
 pub fn apply_grant(
     paths: &KeyPaths,
+    agent: &dyn KeyAgentApi,
     astation_id: &str,
     grant: Option<&GrantWire>,
 ) -> Result<Applied> {
@@ -275,10 +323,10 @@ pub fn apply_grant(
             "a key grant for a device that isn't verified",
         ));
     };
-    let keys = DeviceKeys::load_from(&paths.device_keys)?.ok_or_else(|| {
-        anyhow!("this device's keys are missing; run 'atem pair' to verify it again")
-    })?;
-    let opened = open_grant(entry, &keys, grant)?;
+    if !agent.status()?.unlocked {
+        return Ok(Applied::Locked);
+    }
+    let opened = agent.open_grant(astation_id, grant, None)?;
     EncryptionContext::install_grant_at(
         &paths.data_keys,
         astation_id,
@@ -289,23 +337,35 @@ pub fn apply_grant(
     Ok(Applied::KeyInstalled(opened.kid))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationOutcome {
     /// The signed mode needs `K` and this device doesn't hold it yet.
     pub key_needed: bool,
+    /// After the home Astation's first verification: the new storage key for
+    /// Astation (`storageKeyRotate` from old kid `""`), which the CLI must
+    /// send, then confirm with the agent once Astation acks it.
+    pub escrow: Option<StorageRotation>,
 }
 
 /// Finishes verification once the user confirmed the code on this device and
 /// Astation sent its signed certificate.
 ///
 /// Everything is checked in memory first: the certificate, the signed state
-/// and every grant. Only when all of it holds are the device keys saved, the
-/// state and grants applied, the pins made final and the old plain key
-/// deleted. On any failure nothing is written.
+/// and every grant, and that sealed keys are still the ones the unlocked key
+/// agent holds. Fresh keys (a device's first verification) make this
+/// Astation the home: they are sealed under a new storage key and handed to
+/// the key agent before anything is written, so if the agent can't take
+/// them nothing is saved. Then the sealed keys, the state and grants, the
+/// pins and the home are written and the old plain files deleted. On any
+/// failure before that point nothing is written.
+///
+/// For fresh keys the outcome carries the storage key for the home Astation
+/// (the first escrow), prepared by the agent once the home is saved.
 pub fn complete_verification(
     paths: &KeyPaths,
+    agent: &dyn KeyAgentApi,
     astation_id: &str,
-    keys: DeviceKeys,
+    keys: VerificationKeys,
     device_verified: &SignedWire,
     account_state: &SignedWire,
     grants: &[GrantWire],
@@ -323,9 +383,34 @@ pub fn complete_verification(
         None => stored_state(&entry)?.ok_or_else(|| anyhow!("no signed account state"))?,
     };
     check_state(&state)?;
+    match &keys {
+        // New keys become the home Astation's to hold: never under another
+        // home (R12: the home never moves), which could never unlock them.
+        VerificationKeys::Fresh(_) => {
+            if staged.home_is_set() && staged.home() != Some(astation_id) {
+                bail!(
+                    "this device's home Astation is {}; verify with it, or start over (delete ~/.config/atem/cred_state.json too)",
+                    staged.recorded_home().unwrap_or_default()
+                );
+            }
+        }
+        // Sealed keys never leave the agent: it must hold exactly these.
+        VerificationKeys::Sealed(publics) => {
+            if !agent.status()?.unlocked {
+                bail!("{LOCKED}, then `atem pair` again");
+            }
+            if agent.public_keys()? != (publics.device_pub, publics.device_sign_pub) {
+                bail!("the key agent holds other device keys than this verification revealed");
+            }
+        }
+    }
     let opened = grants
         .iter()
-        .map(|grant| open_grant(&entry, &keys, grant))
+        .map(|grant| match &keys {
+            VerificationKeys::Fresh(fresh) => open_grant(&entry, fresh, grant),
+            // The staged pins: they aren't saved until everything holds.
+            VerificationKeys::Sealed(_) => agent.open_grant(astation_id, grant, Some(&entry)),
+        })
         .collect::<Result<Vec<_>>>()?;
     if opened
         .iter()
@@ -334,37 +419,75 @@ pub fn complete_verification(
         bail!("a key grant names a different key id than the signed account state");
     }
 
-    keys.save_to(&paths.device_keys)?;
-    if first {
-        // Whatever the unauthenticated path stored for this Astation (mode,
-        // K, rotation history, project names) is dropped, not trusted.
-        EncryptionContext::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
-    }
-    EncryptionContext::update_mode_at(
-        &paths.data_keys,
-        astation_id,
-        &state.account,
-        state.mode,
-        state.kid.as_deref(),
-    )?;
-    for grant in opened {
-        EncryptionContext::install_grant_at(
+    let sealed = match &keys {
+        VerificationKeys::Fresh(fresh) => {
+            let storage_key = new_storage_key();
+            let storage_kid = new_storage_kid();
+            let sealed =
+                SealedDeviceKeys::seal(fresh, &entry.device_id, &storage_kid, &storage_key)?;
+            agent.load_unlocked(&entry.device_id, fresh, &storage_kid, &storage_key)?;
+            staged.set_home(astation_id);
+            Some((sealed, fresh.unlock_auth_key()))
+        }
+        VerificationKeys::Sealed(_) => None,
+    };
+    let write = || -> Result<()> {
+        if let Some((sealed, unlock_auth)) = &sealed {
+            sealed.save_to(&paths.device_keys_sealed)?;
+            unlock_auth.save_to(&paths.unlock_auth_key)?;
+            // Spares of earlier keys (none on a first verification) can't stay.
+            remove_if_exists(&paths.device_keys_next)?;
+            remove_if_exists(&paths.device_keys_prev)?;
+            remove_if_exists(&paths.device_keys)?;
+        }
+        if first {
+            // Whatever the unauthenticated path stored for this Astation (mode,
+            // K, rotation history, project names) is dropped, not trusted.
+            EncryptionContext::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
+        }
+        EncryptionContext::update_mode_at(
             &paths.data_keys,
             astation_id,
-            &entry.data_account,
-            &grant.kid,
-            *grant.key,
+            &state.account,
+            state.mode,
+            state.kid.as_deref(),
         )?;
+        for grant in opened {
+            EncryptionContext::install_grant_at(
+                &paths.data_keys,
+                astation_id,
+                &entry.data_account,
+                &grant.kid,
+                *grant.key,
+            )?;
+        }
+        staged.save_to(&paths.trust)
+    };
+    let written = write();
+    if written.is_err() && sealed.is_some() {
+        // The agent must not hold keys whose sealed file isn't on disk.
+        let _ = agent.lock_keys();
     }
-    staged.save_to(&paths.trust)?;
-    match std::fs::remove_file(&paths.legacy_device_key) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    written?;
+    remove_if_exists(&paths.legacy_device_key)?;
+    let escrow = match sealed {
+        Some(_) => Some(agent.begin_rotation(astation_id).context(
+            "the device is verified, but its storage key couldn't be prepared for Astation",
+        )?),
+        None => None,
+    };
     Ok(VerificationOutcome {
         key_needed: key_needed(paths, astation_id)?,
+        escrow,
     })
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Whether this device is verified with `astation_id`, its signed state
@@ -381,14 +504,32 @@ pub fn key_needed(paths: &KeyPaths, astation_id: &str) -> Result<bool> {
         && EncryptionContext::for_astation_at(astation_id, &paths.data_keys).is_err())
 }
 
-/// The device keys to verify with: the saved ones when this machine already
-/// verified with an Astation (so earlier Astations' grants keep working),
-/// fresh ones otherwise.
-pub fn device_keys_for_verification(paths: &KeyPaths) -> Result<DeviceKeys> {
-    Ok(match DeviceKeys::load_from(&paths.device_keys)? {
-        Some(keys) => keys,
-        None => DeviceKeys::generate(),
-    })
+/// The keys to verify with: this device's sealed keys when it has them (so
+/// every Astation pins the same device key), fresh ones otherwise. Sealed
+/// keys are revealed only while the key agent holds them unlocked; starting
+/// the agent also seals a plain step-1 `device_keys` file.
+pub fn device_keys_for_verification(
+    paths: &KeyPaths,
+    agent: &dyn KeyAgentApi,
+) -> Result<VerificationKeys> {
+    if !paths.device_keys_sealed.exists() && !paths.device_keys.exists() {
+        return Ok(VerificationKeys::Fresh(DeviceKeys::generate()));
+    }
+    if !agent.status()?.unlocked {
+        bail!("{LOCKED}, then `atem pair` again");
+    }
+    let (device_pub, device_sign_pub) = agent.public_keys()?;
+    let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?.ok_or_else(|| {
+        anyhow!(
+            "unlock_auth_key is missing. {}",
+            crate::memory::key_agent::RESET
+        )
+    })?;
+    Ok(VerificationKeys::Sealed(DevicePublics {
+        device_pub,
+        device_sign_pub,
+        unlock_auth_pub: unlock_auth.public(),
+    }))
 }
 
 /// Test stand-in for a verified device: pins a fake Astation next to
@@ -494,15 +635,20 @@ mod tests {
     }
 
     #[test]
-    fn verification_reuses_saved_device_keys() {
+    fn verification_reuses_the_sealed_device_keys() {
+        let empty = tempfile::tempdir().unwrap();
+        let empty_paths = KeyPaths::in_dir(empty.path());
+        let fresh_agent = test_agent(&empty_paths);
+        assert!(matches!(
+            device_keys_for_verification(&empty_paths, &fresh_agent).unwrap(),
+            VerificationKeys::Fresh(_)
+        ));
+
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
-        let first = device_keys_for_verification(&paths).unwrap();
-        first.save_to(&paths.device_keys).unwrap();
-        let second = device_keys_for_verification(&paths).unwrap();
-        assert_eq!(first.device_pub(), second.device_pub());
-        assert_eq!(first.device_sign_pub(), second.device_sign_pub());
-        assert_eq!(first.unlock_auth_pub(), second.unlock_auth_pub());
+        let (paths, agent, _, device_pub) = verify(dir.path(), EncryptionMode::Off);
+        let keys = device_keys_for_verification(&paths, &agent).unwrap();
+        assert!(matches!(keys, VerificationKeys::Sealed(_)));
+        assert_eq!(keys.device_pub(), device_pub);
     }
 
     #[test]
@@ -565,6 +711,7 @@ mod tests {
 
     use crate::memory::crypto::{EncryptionContext, EncryptionMode};
     use crate::memory::grant::seal_k_grant;
+    use crate::memory::key_agent::{KeyAgent, test_agent};
     use crate::memory::statements::{AccountState, DeviceVerified, FakeAstation};
     use crate::memory::trust::TrustStore;
 
@@ -588,9 +735,13 @@ mod tests {
     }
 
     /// Runs the atem side of verification against a fake Astation and returns
-    /// the paths, the fake, and the device public key.
-    fn verify(dir: &std::path::Path, mode: EncryptionMode) -> (KeyPaths, FakeAstation, [u8; 32]) {
+    /// the paths, the (unlocked) key agent, the fake, and the device public key.
+    fn verify(
+        dir: &std::path::Path,
+        mode: EncryptionMode,
+    ) -> (KeyPaths, std::sync::Mutex<KeyAgent>, FakeAstation, [u8; 32]) {
         let paths = KeyPaths::in_dir(dir);
+        let agent = test_agent(&paths);
         std::fs::write(&paths.legacy_device_key, [1u8; 32]).unwrap();
         let fake = FakeAstation::new();
         let handshake = Handshake::start(DeviceKeys::generate());
@@ -637,6 +788,7 @@ mod tests {
         };
         complete_verification(
             &paths,
+            &agent,
             ASTATION_ID,
             handshake.into_keys(),
             &fake.sign(&certificate.encode()),
@@ -644,13 +796,13 @@ mod tests {
             &grants,
         )
         .unwrap();
-        (paths, fake, reveal.device_pub)
+        (paths, agent, fake, reveal.device_pub)
     }
 
     #[test]
     fn verification_installs_signed_state_and_key() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, _, _) = verify(dir.path(), EncryptionMode::On);
+        let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::On);
         let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
         assert_eq!(context.mode, EncryptionMode::On);
         assert!(context.seal("mem-1", "content", b"x").is_ok());
@@ -658,13 +810,18 @@ mod tests {
             !paths.legacy_device_key.exists(),
             "old plain device_key must be deleted"
         );
-        assert!(DeviceKeys::load_from(&paths.device_keys).unwrap().is_some());
+        assert!(
+            !paths.device_keys.exists(),
+            "device keys are never written in plain"
+        );
+        assert!(paths.device_keys_sealed.exists() && paths.unlock_auth_key.exists());
+        assert!(agent.status().unwrap().unlocked);
     }
 
     #[test]
     fn unsigned_or_forged_mode_changes_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, _, _) = verify(dir.path(), EncryptionMode::On);
+        let (paths, _, _, _) = verify(dir.path(), EncryptionMode::On);
         assert!(matches!(
             apply_account_state(&paths, ASTATION_ID, None).unwrap(),
             Applied::Ignored(_)
@@ -678,7 +835,7 @@ mod tests {
     #[test]
     fn signed_newer_state_is_applied() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, fake, _) = verify(dir.path(), EncryptionMode::On);
+        let (paths, _, fake, _) = verify(dir.path(), EncryptionMode::On);
         let disabling = signed_state(&fake, EncryptionMode::Disabling, 2);
         assert!(matches!(
             apply_account_state(&paths, ASTATION_ID, Some(&disabling)).unwrap(),
@@ -695,7 +852,7 @@ mod tests {
     #[test]
     fn signed_state_with_invalid_kid_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, fake, _) = verify(dir.path(), EncryptionMode::On);
+        let (paths, _, fake, _) = verify(dir.path(), EncryptionMode::On);
         let bad = fake.sign(
             &AccountState {
                 account: "acct".into(),
@@ -720,7 +877,7 @@ mod tests {
     #[test]
     fn signed_state_needing_a_key_without_kid_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, fake, _) = verify(dir.path(), EncryptionMode::On);
+        let (paths, _, fake, _) = verify(dir.path(), EncryptionMode::On);
         let no_kid = fake.sign(
             &AccountState {
                 account: "acct".into(),
@@ -757,8 +914,9 @@ mod tests {
             Applied::Ignored(_)
         ));
         let grant = seal_k_grant(&fake, "acct", "dev-1", [9; 32], "0123abcd", [42; 32]);
+        let agent = test_agent(&paths);
         assert!(matches!(
-            apply_grant(&paths, ASTATION_ID, Some(&grant)).unwrap(),
+            apply_grant(&paths, &agent, ASTATION_ID, Some(&grant)).unwrap(),
             Applied::Ignored(_)
         ));
         assert_eq!(
@@ -772,7 +930,7 @@ mod tests {
     #[test]
     fn verified_device_without_a_state_refuses_to_build_a_context() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, _, _) = verify(dir.path(), EncryptionMode::Off);
+        let (paths, _, _, _) = verify(dir.path(), EncryptionMode::Off);
         // Simulate a verified entry that never received a state: an Option
         // field missing from the JSON deserializes as None.
         let raw = std::fs::read_to_string(&paths.trust)
@@ -792,8 +950,10 @@ mod tests {
 mod ceremony_tests {
     use super::*;
     use crate::memory::crypto::{EncryptionContext, EncryptionMode};
+    use crate::memory::fake_astation::FakeKeyServer;
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::statements::{DeviceVerified, FakeAstation};
+    use crate::memory::key_agent::{error_of, test_agent};
+    use crate::memory::statements::{DeviceVerified, FakeAstation, StorageRotate, verify_device};
 
     const ASTATION_ID: &str = "astation-1";
 
@@ -820,14 +980,14 @@ mod ceremony_tests {
     fn start(
         paths: &KeyPaths,
         fake: &FakeAstation,
-        keys: DeviceKeys,
+        keys: impl Into<VerificationKeys>,
         nonce_s: u8,
         epoch: u64,
     ) -> (Handshake, DeviceVerified) {
         let handshake = Handshake::start(keys);
         let astation = AstationKeys {
             sign_pub: fake.sign_pub(),
-            enc_pub: [5; 32],
+            enc_pub: fake.enc_pub(),
             recovery_sign_pub: [6; 32],
             nonce_s: [nonce_s; 32],
         };
@@ -861,12 +1021,14 @@ mod ceremony_tests {
     fn replayed_old_certificate_cannot_roll_a_verified_device_back() {
         let dir = tempfile::tempdir().unwrap();
         let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
         let old_certificate = fake.sign(&certificate.encode());
         let old_off = state(&fake, EncryptionMode::Off, None, 1);
         complete_verification(
             &paths,
+            &agent,
             ASTATION_ID,
             handshake.into_keys(),
             &old_certificate,
@@ -879,14 +1041,15 @@ mod ceremony_tests {
         let on = state(&fake, EncryptionMode::On, Some("0123abcd"), 2);
         apply_account_state(&paths, ASTATION_ID, Some(&on)).unwrap();
         let grant = seal_k_grant(&fake, "acct", "dev-1", device_pub, "0123abcd", [42; 32]);
-        apply_grant(&paths, ASTATION_ID, Some(&grant)).unwrap();
+        apply_grant(&paths, &agent, ASTATION_ID, Some(&grant)).unwrap();
 
         // Re-verification with the same saved keys; the relay withholds the
         // new certificate and replays the recorded old one with the old state.
-        let keys = device_keys_for_verification(&paths).unwrap();
+        let keys = device_keys_for_verification(&paths, &agent).unwrap();
         let (handshake, _) = start(&paths, &fake, keys, 8, 3);
         let result = complete_verification(
             &paths,
+            &agent,
             ASTATION_ID,
             handshake.into_keys(),
             &old_certificate,
@@ -909,6 +1072,7 @@ mod ceremony_tests {
     fn legitimate_re_verification_keeps_mode_and_key() {
         let dir = tempfile::tempdir().unwrap();
         let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
         let device_pub = certificate.device_pub;
@@ -916,6 +1080,7 @@ mod ceremony_tests {
         let grant = seal_k_grant(&fake, "acct", "dev-1", device_pub, "0123abcd", [42; 32]);
         complete_verification(
             &paths,
+            &agent,
             ASTATION_ID,
             handshake.into_keys(),
             &fake.sign(&certificate.encode()),
@@ -926,11 +1091,12 @@ mod ceremony_tests {
 
         // Astation signs the new certificate at epoch 3 and re-signs the
         // current state at 4; it sends no grant this time.
-        let keys = device_keys_for_verification(&paths).unwrap();
+        let keys = device_keys_for_verification(&paths, &agent).unwrap();
         let (handshake, certificate) = start(&paths, &fake, keys, 8, 3);
         let on_again = state(&fake, EncryptionMode::On, Some("0123abcd"), 4);
         complete_verification(
             &paths,
+            &agent,
             ASTATION_ID,
             handshake.into_keys(),
             &fake.sign(&certificate.encode()),
@@ -958,8 +1124,12 @@ mod ceremony_tests {
             "no verified entry may be saved"
         );
         assert!(
-            !paths.device_keys.exists(),
-            "device_keys must not be written"
+            !paths.device_keys.exists() && !paths.device_keys_sealed.exists(),
+            "device keys must not be written"
+        );
+        assert!(
+            !paths.unlock_auth_key.exists(),
+            "unlock_auth_key must not be written"
         );
         assert!(!paths.data_keys.exists(), "data_keys must not be written");
         assert!(
@@ -976,18 +1146,26 @@ mod ceremony_tests {
         make: impl FnOnce(&FakeAstation, [u8; 32]) -> (SignedWire, Vec<GrantWire>),
     ) -> (KeyPaths, Result<VerificationOutcome>) {
         let paths = KeyPaths::in_dir(dir);
+        let agent = test_agent(&paths);
         std::fs::write(&paths.legacy_device_key, [1u8; 32]).unwrap();
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, cert_epoch);
         let (account_state, grants) = make(&fake, certificate.device_pub);
         let result = complete_verification(
             &paths,
+            &agent,
             ASTATION_ID,
             handshake.into_keys(),
             &fake.sign(&certificate.encode()),
             &account_state,
             &grants,
         );
+        if result.is_err() {
+            assert!(
+                !agent.status().unwrap().unlocked,
+                "a failed verification must not hand keys to the agent"
+            );
+        }
         (paths, result)
     }
 
@@ -1130,5 +1308,269 @@ mod ceremony_tests {
         assert!(!result.unwrap().key_needed);
         assert!(!key_needed(&paths, ASTATION_ID).unwrap());
         assert!(!key_needed(&paths, "never-verified").unwrap());
+    }
+
+    /// A first verification of fresh keys with `fake` (certificate epoch 1,
+    /// state epoch 2, no grants); returns the certificate and the outcome.
+    fn verified_device(
+        paths: &KeyPaths,
+        agent: &dyn KeyAgentApi,
+        fake: &FakeAstation,
+        mode: EncryptionMode,
+        kid: Option<&str>,
+    ) -> (DeviceVerified, VerificationOutcome) {
+        let (handshake, certificate) = start(paths, fake, DeviceKeys::generate(), 7, 1);
+        let outcome = complete_verification(
+            paths,
+            agent,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(fake, mode, kid, 2),
+            &[],
+        )
+        .unwrap();
+        (certificate, outcome)
+    }
+
+    #[test]
+    fn first_verification_seals_the_keys_and_hands_them_to_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (certificate, outcome) =
+            verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        assert!(!paths.device_keys.exists(), "no plain device_keys any more");
+        let sealed = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed.device_id, "dev-1");
+        assert_eq!(
+            UnlockAuthKey::load_from(&paths.unlock_auth_key)
+                .unwrap()
+                .unwrap()
+                .public(),
+            certificate.unlock_auth_pub
+        );
+        let status = agent.status().unwrap();
+        assert!(
+            status.unlocked && !status.escrowed,
+            "Astation doesn't hold the storage key yet"
+        );
+        assert_eq!(status.storage_kid, Some(sealed.storage_kid.clone()));
+        assert_eq!(
+            agent.public_keys().unwrap(),
+            (certificate.device_pub, certificate.device_sign_pub)
+        );
+        assert_eq!(
+            TrustStore::load_from(&paths.trust).unwrap().home(),
+            Some(ASTATION_ID)
+        );
+
+        // The initial escrow: the current storage key, from no old key.
+        let escrow = outcome
+            .escrow
+            .expect("the first verification escrows the storage key");
+        let rotate = StorageRotate::parse(
+            &verify_device(&certificate.device_sign_pub, &escrow.rotate).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rotate.old_storage_kid, "");
+        assert_eq!(rotate.new_storage_kid, sealed.storage_kid);
+        let mut server = FakeKeyServer {
+            astation: fake,
+            device_sign_pub: certificate.device_sign_pub,
+            unlock_auth_pub: certificate.unlock_auth_pub,
+            storage_keys: Default::default(),
+            pending: None,
+            acked: Default::default(),
+        };
+        let ack = server.accept_rotation(&escrow).unwrap();
+        let (kid, confirm) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        server.confirm(&confirm).unwrap();
+        assert_eq!(kid, sealed.storage_kid);
+        assert!(server.storage_keys.contains_key(&kid));
+        assert!(agent.status().unwrap().escrowed);
+    }
+
+    #[test]
+    fn re_verification_with_sealed_keys_opens_grants_in_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+
+        let keys = device_keys_for_verification(&paths, &agent).unwrap();
+        assert!(matches!(keys, VerificationKeys::Sealed(_)));
+        let (handshake, certificate) = start(&paths, &fake, keys, 8, 3);
+        let grant = seal_k_grant(
+            &fake,
+            "acct",
+            "dev-1",
+            certificate.device_pub,
+            "0123abcd",
+            [42; 32],
+        );
+        let outcome = complete_verification(
+            &paths,
+            &agent,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(&fake, EncryptionMode::On, Some("0123abcd"), 4),
+            &[grant],
+        )
+        .unwrap();
+        assert!(!outcome.key_needed);
+        assert!(outcome.escrow.is_none(), "the storage key isn't new");
+        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
+        assert!(context.seal("mem", "content", b"x").is_ok());
+    }
+
+    #[test]
+    fn a_locked_agent_cannot_verify_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        // After a reboot the agent starts locked.
+        let rebooted = test_agent(&paths);
+        let error = error_of(device_keys_for_verification(&paths, &rebooted));
+        assert!(error.contains("atem cred unlock"), "{error}");
+
+        // Locked between the handshake and Astation's certificate: nothing changes.
+        let keys = device_keys_for_verification(&paths, &agent).unwrap();
+        let (handshake, certificate) = start(&paths, &fake, keys, 8, 3);
+        agent.lock_keys().unwrap();
+        let before = std::fs::read(&paths.trust).unwrap();
+        let error = error_of(complete_verification(
+            &paths,
+            &agent,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(&fake, EncryptionMode::Off, None, 4),
+            &[],
+        ));
+        assert!(error.contains("atem cred unlock"), "{error}");
+        assert_eq!(
+            std::fs::read(&paths.trust).unwrap(),
+            before,
+            "nothing saved"
+        );
+    }
+
+    #[test]
+    fn a_second_astation_does_not_move_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (certificate, _) = verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        let sealed_before = std::fs::read(&paths.device_keys_sealed).unwrap();
+
+        let other = FakeAstation::new();
+        let handshake = Handshake::start(device_keys_for_verification(&paths, &agent).unwrap());
+        let astation = AstationKeys {
+            sign_pub: other.sign_pub(),
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [9; 32],
+        };
+        let transcript = handshake.transcript(&astation);
+        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+        trust.set_pending(
+            "astation-2",
+            "dev-1",
+            handshake.keys(),
+            &astation,
+            &handshake.safety_code(&astation),
+            &transcript,
+        );
+        trust.save_to(&paths.trust).unwrap();
+        let reveal = handshake.reveal();
+        let second = DeviceVerified {
+            account: "acct".into(),
+            sign_gen: 1,
+            device_id: "dev-1".into(),
+            device_pub: reveal.device_pub,
+            device_sign_pub: reveal.device_sign_pub,
+            unlock_auth_pub: reveal.unlock_auth_pub,
+            transcript,
+            epoch: 1,
+        };
+        let outcome = complete_verification(
+            &paths,
+            &agent,
+            "astation-2",
+            handshake.into_keys(),
+            &other.sign(&second.encode()),
+            &state(&other, EncryptionMode::Off, None, 2),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            outcome.escrow.is_none(),
+            "only the home holds the storage key"
+        );
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert_eq!(trust.home(), Some(ASTATION_ID));
+        assert!(trust.verified("astation-2").is_some());
+        assert_eq!(
+            second.device_pub, certificate.device_pub,
+            "one device key for both"
+        );
+        assert_eq!(
+            std::fs::read(&paths.device_keys_sealed).unwrap(),
+            sealed_before,
+            "the sealed keys are not re-sealed"
+        );
+    }
+
+    #[test]
+    fn fresh_keys_never_verify_under_another_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        // The key files were deleted, but this device's home is another Astation.
+        let mut trust = TrustStore::default();
+        trust.set_home("astation-0");
+        trust.save_to(&paths.trust).unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+            (state(fake, EncryptionMode::Off, None, 2), vec![])
+        });
+        let error = error_of(result);
+        assert!(error.contains("astation-0"), "{error}");
+        assert_nothing_written(&paths);
+    }
+
+    #[test]
+    fn grants_wait_while_the_agent_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (certificate, _) =
+            verified_device(&paths, &agent, &fake, EncryptionMode::On, Some("0123abcd"));
+        let grant = seal_k_grant(
+            &fake,
+            "acct",
+            "dev-1",
+            certificate.device_pub,
+            "0123abcd",
+            [42; 32],
+        );
+        let locked = test_agent(&paths);
+        assert!(matches!(
+            apply_grant(&paths, &locked, ASTATION_ID, Some(&grant)).unwrap(),
+            Applied::Locked
+        ));
+        assert!(key_needed(&paths, ASTATION_ID).unwrap());
+        assert!(matches!(
+            apply_grant(&paths, &agent, ASTATION_ID, Some(&grant)).unwrap(),
+            Applied::KeyInstalled(_)
+        ));
     }
 }

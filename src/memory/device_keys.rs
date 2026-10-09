@@ -20,6 +20,45 @@ pub struct DeviceKeys {
     unlock_auth: SigningKey,
 }
 
+/// The three public keys a device reveals at verification.
+pub trait PublicKeys {
+    fn device_pub(&self) -> [u8; 32];
+    fn device_sign_pub(&self) -> [u8; 32];
+    fn unlock_auth_pub(&self) -> [u8; 32];
+}
+
+/// Public keys of a device whose secrets stay sealed (or in the key agent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevicePublics {
+    pub device_pub: [u8; 32],
+    pub device_sign_pub: [u8; 32],
+    pub unlock_auth_pub: [u8; 32],
+}
+
+impl PublicKeys for DevicePublics {
+    fn device_pub(&self) -> [u8; 32] {
+        self.device_pub
+    }
+    fn device_sign_pub(&self) -> [u8; 32] {
+        self.device_sign_pub
+    }
+    fn unlock_auth_pub(&self) -> [u8; 32] {
+        self.unlock_auth_pub
+    }
+}
+
+impl PublicKeys for DeviceKeys {
+    fn device_pub(&self) -> [u8; 32] {
+        DeviceKeys::device_pub(self)
+    }
+    fn device_sign_pub(&self) -> [u8; 32] {
+        DeviceKeys::device_sign_pub(self)
+    }
+    fn unlock_auth_pub(&self) -> [u8; 32] {
+        DeviceKeys::unlock_auth_pub(self)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredDeviceKeys {
     version: u8,
@@ -153,10 +192,16 @@ impl DeviceKeys {
                 &stored.device_sign,
                 "device signing key",
             )?),
-            unlock_auth: SigningKey::from_bytes(&*decode32(&stored.unlock_auth, "unlock-auth key")?),
+            unlock_auth: SigningKey::from_bytes(&*decode32(
+                &stored.unlock_auth,
+                "unlock-auth key",
+            )?),
         }))
     }
 
+    /// The plain step-1 format. Only tests write it now; the key agent seals
+    /// such a file when it starts (key_agent.rs).
+    #[cfg(test)]
     pub fn save_to(&self, path: &Path) -> Result<()> {
         let stored = StoredDeviceKeys {
             version: 1,

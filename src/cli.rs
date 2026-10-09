@@ -1545,13 +1545,21 @@ async fn run_device_verification(
     use crate::memory::verification::{
         AstationKeys, Handshake, KeyPaths, complete_verification, device_keys_for_verification,
     };
+    use crate::memory::key_agent::blocking;
     use crate::websocket_client::AstationMessage;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use tokio::time::{Duration, timeout};
 
     let paths = KeyPaths::default_paths();
     let device_id = crate::config::AtemConfig::ensure_instance_id();
-    let handshake = Handshake::start(device_keys_for_verification(&paths)?);
+    // The agent client blocks (socket I/O, autostart): call it off the runtime.
+    let agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> =
+        std::sync::Arc::from(crate::memory::key_agent::default_agent());
+    let keys = {
+        let (paths, agent) = (paths.clone(), agent.clone());
+        blocking(move || device_keys_for_verification(&paths, agent.as_ref())).await?
+    };
+    let handshake = Handshake::start(keys);
     client
         .send_message(AstationMessage::VerifyCommit {
             device_id: device_id.clone(),
@@ -1630,14 +1638,24 @@ async fn run_device_verification(
                     account_state,
                     grants,
                 } => {
-                    let outcome = complete_verification(
-                        &paths,
-                        astation_id,
-                        handshake.into_keys(),
-                        &device_verified,
-                        &account_state,
-                        &grants,
-                    )?;
+                    let outcome = {
+                        let (paths, agent) = (paths.clone(), agent.clone());
+                        let astation_id = astation_id.to_string();
+                        let keys = handshake.into_keys();
+                        blocking(move || {
+                            complete_verification(
+                                &paths,
+                                agent.as_ref(),
+                                &astation_id,
+                                keys,
+                                &device_verified,
+                                &account_state,
+                                &grants,
+                            )
+                        })
+                        .await?
+                    };
+                    // outcome.escrow (the first storageKeyRotate) is sent and confirmed by Task 10.
                     println!("✅ Device verified with Astation (safety code {code}).");
                     if outcome.key_needed {
                         client

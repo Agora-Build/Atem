@@ -1041,8 +1041,6 @@ impl KeyAgentApi for std::sync::Mutex<KeyAgent> {
 
 /// This user's agent, started on first use (lazily: nothing connects until
 /// a request is made).
-// Used by Tasks 8-10; remove the allow then.
-#[allow(dead_code)]
 pub fn default_agent() -> Box<dyn KeyAgentApi> {
     #[cfg(unix)]
     {
@@ -1052,6 +1050,16 @@ pub fn default_agent() -> Box<dyn KeyAgentApi> {
     {
         Box::new(NoAgent)
     }
+}
+
+/// Runs agent work from async code on a blocking thread: the client's
+/// socket I/O and autostart wait must not stall the runtime (or the TUI).
+pub async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| anyhow!("the key agent call didn't finish: {error}"))?
 }
 
 /// The running agent, without starting one.

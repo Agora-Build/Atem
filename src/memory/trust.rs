@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::memory::device_keys::DeviceKeys;
+use crate::memory::device_keys::PublicKeys;
 use crate::memory::statements::{AccountState, DeviceVerified, SignedWire, verify_astation};
 use crate::memory::verification::AstationKeys;
 
@@ -96,6 +96,11 @@ impl TrustStore {
             .filter(|id| self.astations.contains_key(*id))
     }
 
+    /// The home Astation as recorded, verified or not (for messages).
+    pub fn recorded_home(&self) -> Option<&str> {
+        self.home_astation.as_deref()
+    }
+
     /// Whether a home Astation was ever recorded (it may no longer be verified).
     pub fn home_is_set(&self) -> bool {
         self.home_astation.is_some()
@@ -132,7 +137,7 @@ impl TrustStore {
         &mut self,
         astation_id: &str,
         device_id: &str,
-        keys: &DeviceKeys,
+        keys: &impl PublicKeys,
         astation: &AstationKeys,
         code: &str,
         transcript: &[u8; 32],
@@ -281,6 +286,7 @@ impl TrustStore {
 mod tests {
     use super::*;
     use crate::memory::crypto::EncryptionMode;
+    use crate::memory::device_keys::DeviceKeys;
     use crate::memory::statements::FakeAstation;
 
     const ASTATION: &str = "astation-1";
