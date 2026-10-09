@@ -454,7 +454,9 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   by an unlock that opened the current file). `atem cred status` uses it to
   flag a sealed file Astation may not hold, and new storage kids never
   reuse it, the current kid, or any kid the device ever abandoned
-  (`abandoned_kids`).
+  (`abandoned_kids`). `escrow_unanswered` records that the home Astation
+  never answered the first escrow (cleared by the first confirmed one), so
+  `atem cred status` can say the key goes over once Astation supports it.
 - **Rotation at every unlock, crash-safe in three phases.** (1) The agent
   writes `device_keys.sealed.next` under a new storage key and atem sends
   `storageKeyRotate`. (2) Astation stores the new key as pending, keeps the
