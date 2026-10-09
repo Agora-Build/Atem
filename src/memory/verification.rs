@@ -493,16 +493,15 @@ pub fn complete_verification(
             // K, rotation history, project names) is dropped, not trusted.
             EncryptionContext::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
         }
-        match &newer {
-            None => EncryptionContext::update_mode_at(
+        // A newer state is already in data_keys: written with it.
+        if newer.is_none() {
+            EncryptionContext::update_mode_at(
                 &paths.data_keys,
                 astation_id,
                 &state.account,
                 state.mode,
                 state.kid.as_deref(),
-            )?,
-            // Already in data_keys: written with the newer state.
-            Some(_) => {}
+            )?;
         }
         // Grants are for this verification's state's kid: installed unless
         // the newer state moved to another key (its own grant brings that).
