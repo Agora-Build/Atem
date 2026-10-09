@@ -1,21 +1,26 @@
-//! The CLI side of unlock and storage-key rotation: carries the key agent's
-//! requests to the home Astation and Astation's answers back. The storage
-//! key never passes through here in plain form. Every agent call runs on a
-//! blocking thread (`key_agent::blocking`): the client's socket I/O must not
-//! stall the runtime.
+//! The CLI side of unlock and storage-key rotation (`atem cred …`, and the
+//! first escrow in `atem pair`): carries the key agent's requests to the home
+//! Astation and Astation's answers back. The storage key never passes
+//! through here in plain form. Every agent call runs on a blocking thread
+//! (`key_agent::blocking`): the client's socket I/O must not stall the runtime.
 //! See designs/e2e-encryption.md "Unlock policy" and "Keys on disk (atem)".
-// Task 10 wires these into `atem cred unlock` and `atem pair`; remove then.
-#![allow(dead_code)]
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::device_keys::UnlockAuthKey;
-use crate::memory::key_agent::{KeyAgentApi, blocking, build_unlock_request};
-use crate::memory::statements::SignedWire;
+use crate::memory::encoding::dec;
+use crate::memory::key_agent::{
+    AgentStatus, KeyAgentApi, RESET, blocking, build_unlock_request, default_agent, running_agent,
+};
+use crate::memory::statements::{
+    SignedWire, StorageAck, StorageRotate, UnlockGrant, sealed_hash, unlock_request_hash,
+    verify_astation,
+};
 use crate::memory::storage_key::{SealedDeviceKeys, StorageRotation, UnlockGrantWire};
-use crate::memory::trust::TrustStore;
-use crate::memory::verification::KeyPaths;
+use crate::memory::trust::{AstationTrust, TrustStore};
+use crate::memory::verification::{KeyPaths, key_needed};
 use crate::websocket_client::{AstationClient, AstationMessage};
 
 /// Touch ID may take a while: the user may have to walk to the Mac.
@@ -53,12 +58,19 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// The next message `wanted` accepts within `wait`, skipping unrelated traffic.
+/// Astation-supplied text as it may be shown: without control characters
+/// (a relay could otherwise rewrite the terminal), at most 200 characters.
+fn shown(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(200).collect()
+}
+
+/// The next message `wanted` accepts within `wait`, skipping unrelated
+/// traffic and replies `wanted` rejects (stale or forged ones).
 async fn next_reply<L: AstationLink>(
     link: &mut L,
     wait: Duration,
     waiting_for: &str,
-    wanted: fn(&AstationMessage) -> bool,
+    mut wanted: impl FnMut(&AstationMessage) -> bool,
 ) -> Result<AstationMessage> {
     let next = async {
         loop {
@@ -74,6 +86,82 @@ async fn next_reply<L: AstationLink>(
         .map_err(|_| anyhow!("timed out waiting for Astation {waiting_for}"))?
 }
 
+/// The pins of `astation_id` (blocking: file read).
+fn home_pins(paths: &KeyPaths, astation_id: &str) -> Result<AstationTrust> {
+    TrustStore::load_from(&paths.trust)?
+        .verified(astation_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))
+}
+
+/// Whether `grant` is the pinned Astation's answer to `request` (the
+/// statement this run sent). Anything else is skipped, not handed to the
+/// agent: its single-use key would be spent on a stale or forged reply.
+/// The agent checks everything again.
+fn grant_answers(home: &AstationTrust, request: &str, grant: &UnlockGrantWire) -> bool {
+    let check = || -> Result<bool> {
+        let sign_pub = STANDARD.decode(&home.astation_sign_pub)?;
+        let granted = UnlockGrant::parse(&verify_astation(&sign_pub, &grant.grant)?)?;
+        let encapped = STANDARD.decode(&grant.encapped_key)?;
+        let ciphertext = STANDARD.decode(&grant.ciphertext)?;
+        Ok(granted.account == home.data_account
+            && granted.sign_gen == home.sign_gen
+            && granted.device_id == home.device_id
+            && granted.request_hash == unlock_request_hash(&STANDARD.decode(request)?)
+            && granted.sealed_hash == sealed_hash(&encapped, &ciphertext))
+    };
+    check().unwrap_or(false)
+}
+
+/// Whether `ack` is the pinned Astation's acknowledgement of `storage_kid`.
+fn ack_answers(home: &AstationTrust, storage_kid: &str, ack: &SignedWire) -> bool {
+    let check = || -> Result<bool> {
+        let sign_pub = STANDARD.decode(&home.astation_sign_pub)?;
+        let acked = StorageAck::parse(&verify_astation(&sign_pub, ack)?)?;
+        Ok(acked.account == home.data_account
+            && acked.sign_gen == home.sign_gen
+            && acked.device_id == home.device_id
+            && acked.storage_kid == storage_kid)
+    };
+    check().unwrap_or(false)
+}
+
+/// The new storage key id a rotation carries.
+fn rotation_kid(rotation: &StorageRotation) -> Result<String> {
+    let statement = STANDARD.decode(&rotation.rotate.statement)?;
+    Ok(StorageRotate::parse(&dec(&statement)?)?.new_storage_kid)
+}
+
+/// What is wrong with this device's key files, when it has a verified home
+/// Astation and they can't be unlocked as they are (the fix is the reset).
+/// A plain step-1 `device_keys` is fine: the agent seals it when it starts.
+pub fn key_file_problem(paths: &KeyPaths, trust: &TrustStore) -> Option<String> {
+    trust.home()?;
+    if paths.device_keys.exists() {
+        return None;
+    }
+    let current = match SealedDeviceKeys::load_from(&paths.device_keys_sealed) {
+        Ok(current) => current,
+        Err(error) => return Some(format!("device_keys.sealed is unreadable ({error:#})")),
+    };
+    if current.is_none() {
+        // Only when the current file is absent may a spare one stand in.
+        let spares = [&paths.device_keys_next, &paths.device_keys_prev]
+            .map(|path| SealedDeviceKeys::load_from(path));
+        if !spares.iter().any(|spare| matches!(spare, Ok(Some(_)))) {
+            return Some(match spares.into_iter().find_map(Result::err) {
+                Some(error) => format!("the spare sealed key files are unreadable ({error:#})"),
+                None => "no sealed keys on disk".into(),
+            });
+        }
+    }
+    match UnlockAuthKey::load_from(&paths.unlock_auth_key) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some("unlock_auth_key is missing".into()),
+        Err(error) => Some(format!("unlock_auth_key is unreadable ({error:#})")),
+    }
+}
+
 /// The agent's challenge as an `atem-unlock-request-v1` signed by the
 /// unlock-auth key (blocking: agent call and file read).
 fn signed_request(
@@ -82,9 +170,8 @@ fn signed_request(
     astation_id: &str,
 ) -> Result<SignedWire> {
     let challenge = agent.begin_unlock(astation_id)?;
-    let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?.ok_or_else(|| {
-        anyhow!("unlock_auth_key is missing; run `atem pair` to verify this device again")
-    })?;
+    let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?
+        .ok_or_else(|| anyhow!("unlock_auth_key is missing. {RESET}"))?;
     Ok(build_unlock_request(
         &challenge,
         &boot_id(),
@@ -95,7 +182,8 @@ fn signed_request(
 
 /// Unlocks the agent through `astation_id` (the home Astation): the agent's
 /// single-use key goes out in a request signed by the unlock-auth key, and
-/// Astation's sealed, signed answer goes straight back to the agent.
+/// Astation's sealed, signed answer goes straight back to the agent. A grant
+/// that doesn't answer this request is skipped (until `wait` runs out).
 /// Returns the storage key id Astation released.
 pub(crate) async fn unlock_via<L: AstationLink>(
     link: &mut L,
@@ -104,21 +192,45 @@ pub(crate) async fn unlock_via<L: AstationLink>(
     astation_id: &str,
     wait: Duration,
 ) -> Result<String> {
-    let request = {
+    let (request, home) = {
         let (agent, paths, astation_id) = (agent.clone(), paths.clone(), astation_id.to_string());
-        blocking(move || signed_request(agent.as_ref(), &paths, &astation_id)).await?
+        blocking(move || {
+            let trust = TrustStore::load_from(&paths.trust)?;
+            if let Some(problem) = key_file_problem(&paths, &trust) {
+                bail!("this device's keys can't be unlocked: {problem}. {RESET}");
+            }
+            let home = home_pins(&paths, &astation_id)?;
+            Ok((signed_request(agent.as_ref(), &paths, &astation_id)?, home))
+        })
+        .await?
     };
     link.send(AstationMessage::UnlockRequest {
         request: request.statement.clone(),
         signature: request.signature,
     })
     .await?;
-    let reply = next_reply(link, wait, "to approve the unlock", |message| {
-        matches!(
-            message,
-            AstationMessage::UnlockGrant { .. } | AstationMessage::UnlockDenied { .. }
-        )
-    })
+    let reply = next_reply(
+        link,
+        wait,
+        "to approve the unlock",
+        |message| match message {
+            AstationMessage::UnlockGrant {
+                grant,
+                encapped_key,
+                ciphertext,
+            } => grant_answers(
+                &home,
+                &request.statement,
+                &UnlockGrantWire {
+                    grant: grant.clone(),
+                    encapped_key: encapped_key.clone(),
+                    ciphertext: ciphertext.clone(),
+                },
+            ),
+            AstationMessage::UnlockDenied { .. } => true,
+            _ => false,
+        },
+    )
     .await?;
     match reply {
         AstationMessage::UnlockGrant {
@@ -132,9 +244,19 @@ pub(crate) async fn unlock_via<L: AstationLink>(
                 encapped_key,
                 ciphertext,
             };
-            blocking(move || agent.finish_unlock(&astation_id, &request.statement, &grant)).await
+            // The grant is Astation's answer to this request: what fails now
+            // is this device's key files.
+            blocking(move || agent.finish_unlock(&astation_id, &request.statement, &grant))
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "Astation released the storage key, but this device's keys didn't open: {error:#}. If this keeps happening: {RESET}"
+                    )
+                })
         }
-        AstationMessage::UnlockDenied { reason } => bail!("Astation denied the unlock: {reason}"),
+        AstationMessage::UnlockDenied { reason } => {
+            bail!("Astation denied the unlock: {}", shown(&reason))
+        }
         _ => unreachable!("filtered by next_reply"),
     }
 }
@@ -150,14 +272,19 @@ pub(crate) async fn rotate_via<L: AstationLink>(
     astation_id: &str,
     wait: Duration,
 ) -> Result<String> {
-    let (pending, stale_next) = {
-        let (agent, paths) = (agent.clone(), paths.clone());
-        blocking(move || match agent.pending_rotation()? {
-            Some(rotation) => Ok((Some(rotation), None)),
-            None => Ok((
-                None,
-                SealedDeviceKeys::load_from(&paths.device_keys_next)?.map(|next| next.storage_kid),
-            )),
+    let (home, pending, stale_next) = {
+        let (agent, paths, astation_id) = (agent.clone(), paths.clone(), astation_id.to_string());
+        blocking(move || {
+            let home = home_pins(&paths, &astation_id)?;
+            match agent.pending_rotation()? {
+                Some(rotation) => Ok((home, Some(rotation), None)),
+                None => Ok((
+                    home,
+                    None,
+                    SealedDeviceKeys::load_from(&paths.device_keys_next)?
+                        .map(|next| next.storage_kid),
+                )),
+            }
         })
         .await?
     };
@@ -174,7 +301,7 @@ pub(crate) async fn rotate_via<L: AstationLink>(
             blocking(move || agent.begin_rotation(&astation_id)).await?
         }
     };
-    send_rotation(link, agent, astation_id, rotation, wait).await
+    send_rotation(link, agent, astation_id, &home, rotation, wait).await
 }
 
 async fn abandon_via_agent(
@@ -190,21 +317,27 @@ async fn abandon_via_agent(
     blocking(move || agent.abandon_pending(&astation_id, &kid))
         .await
         .with_context(|| {
-            format!("Astation holds a pending storage key {storage_kid} this device can't give up")
+            format!(
+                "Astation holds a pending storage key {} this device can't give up",
+                shown(storage_kid)
+            )
         })
 }
 
 /// Phases 2 and 3 for `rotation`: send it, and on Astation's ack let the
-/// agent promote the new key and send its confirmation. When Astation is
-/// committed to another pending key, the agent abandons that key (only if
-/// no file of its own still needs it) and the same rotation is sent once more.
+/// agent promote the new key and send its confirmation. An ack for another
+/// key (stale or forged) is skipped. When Astation is committed to another
+/// pending key, the agent abandons that key (only if no file of its own
+/// still needs it) and the same rotation is sent once more.
 async fn send_rotation<L: AstationLink>(
     link: &mut L,
     agent: &Arc<dyn KeyAgentApi>,
     astation_id: &str,
+    home: &AstationTrust,
     rotation: StorageRotation,
     wait: Duration,
 ) -> Result<String> {
+    let new_kid = rotation_kid(&rotation)?;
     let mut abandoned = false;
     loop {
         link.send(AstationMessage::StorageKeyRotate {
@@ -213,20 +346,32 @@ async fn send_rotation<L: AstationLink>(
             ciphertext: rotation.ciphertext.clone(),
         })
         .await?;
-        let reply = next_reply(link, wait, "to store the new storage key", |message| {
-            matches!(
-                message,
-                AstationMessage::StorageKeyAck { .. } | AstationMessage::StorageKeyRejected { .. }
-            )
-        })
+        let reply = next_reply(
+            link,
+            wait,
+            "to store the new storage key",
+            |message| match message {
+                AstationMessage::StorageKeyAck { ack } => ack_answers(home, &new_kid, ack),
+                AstationMessage::StorageKeyRejected { .. } => true,
+                _ => false,
+            },
+        )
         .await?;
         match reply {
             AstationMessage::StorageKeyAck { ack } => {
                 let (agent, astation_id) = (agent.clone(), astation_id.to_string());
                 let (storage_kid, confirm) =
                     blocking(move || agent.confirm_rotation(&astation_id, &ack)).await?;
-                link.send(AstationMessage::StorageKeyConfirm { confirm })
-                    .await?;
+                // The new key is in place here and Astation holds it as
+                // pending, which the next unlock (naming it) settles.
+                if let Err(error) = link
+                    .send(AstationMessage::StorageKeyConfirm { confirm })
+                    .await
+                {
+                    eprintln!(
+                        "⚠️  The storage key was rotated ({storage_kid}), but the confirmation didn't reach Astation ({error:#}); Astation settles it at the next unlock."
+                    );
+                }
                 return Ok(storage_kid);
             }
             AstationMessage::StorageKeyRejected {
@@ -235,7 +380,9 @@ async fn send_rotation<L: AstationLink>(
             } if !abandoned => {
                 let abandon = abandon_via_agent(agent, astation_id, &pending_kid)
                     .await
-                    .with_context(|| format!("Astation refused the new storage key: {reason}"))?;
+                    .with_context(|| {
+                        format!("Astation refused the new storage key: {}", shown(&reason))
+                    })?;
                 link.send(AstationMessage::StorageKeyAbandon { abandon })
                     .await?;
                 abandoned = true;
@@ -244,10 +391,12 @@ async fn send_rotation<L: AstationLink>(
                 reason,
                 pending_kid,
             } => match pending_kid {
-                Some(kid) => {
-                    bail!("Astation refused the new storage key (pending key {kid}): {reason}")
-                }
-                None => bail!("Astation refused the new storage key: {reason}"),
+                Some(kid) => bail!(
+                    "Astation refused the new storage key (pending key {}): {}",
+                    shown(&kid),
+                    shown(&reason)
+                ),
+                None => bail!("Astation refused the new storage key: {}", shown(&reason)),
             },
             _ => unreachable!("filtered by next_reply"),
         }
@@ -280,14 +429,275 @@ pub(crate) async fn escrow_if_needed<L: AstationLink>(
         .map(Some)
 }
 
+/// `atem pair`'s first escrow, in the same run: sends `escrow` (the
+/// verification's `outcome.escrow`, already begun in the agent) and confirms
+/// it; without one, hands over any storage key Astation doesn't hold yet.
+pub(crate) async fn pair_escrow<L: AstationLink>(
+    link: &mut L,
+    agent: &Arc<dyn KeyAgentApi>,
+    paths: &KeyPaths,
+    astation_id: &str,
+    escrow: Option<StorageRotation>,
+) -> Result<Option<String>> {
+    let Some(rotation) = escrow else {
+        return escrow_if_needed(link, agent, paths, astation_id).await;
+    };
+    let home = {
+        let (paths, astation_id) = (paths.clone(), astation_id.to_string());
+        blocking(move || home_pins(&paths, &astation_id)).await?
+    };
+    send_rotation(link, agent, astation_id, &home, rotation, ROTATION_TIMEOUT)
+        .await
+        .map(Some)
+}
+
+/// What `atem pair` prints when the first escrow didn't complete.
+pub fn escrow_failure_message(error: &anyhow::Error) -> String {
+    format!(
+        "Astation doesn't hold this device's storage key yet ({error:#}). Run `atem cred unlock` now to hand it over; until then `atem cred lock` is refused. If the key agent stops before that (a restart or crash), this device's keys can't be unlocked. {RESET}"
+    )
+}
+
+/// `atem cred unlock` once connected to the home Astation: unlock (Touch ID
+/// on the Mac) and rotate the storage key, or, when the agent is already
+/// unlocked, hand Astation any storage key it doesn't hold yet.
+pub(crate) async fn unlock_and_rotate<L: AstationLink>(
+    link: &mut L,
+    agent: &Arc<dyn KeyAgentApi>,
+    paths: &KeyPaths,
+    home: &str,
+    wait: Duration,
+) -> Result<()> {
+    let status = {
+        let agent = agent.clone();
+        blocking(move || agent.status()).await?
+    };
+    if status.unlocked {
+        match escrow_if_needed(link, agent, paths, home).await? {
+            Some(kid) => println!("Astation now holds this device's storage key ({kid})."),
+            None => println!(
+                "Already unlocked (storage key {}).",
+                status.storage_kid.unwrap_or_default()
+            ),
+        }
+        return Ok(());
+    }
+    println!("Approve on your Mac with Touch ID…");
+    let kid = unlock_via(link, agent, paths, home, wait).await?;
+    println!("✅ Unlocked (storage key {kid}).");
+    match rotate_via(link, agent, paths, home, ROTATION_TIMEOUT).await {
+        Ok(kid) => println!("Storage key rotated ({kid})."),
+        Err(error) => eprintln!(
+            "⚠️  The storage key wasn't rotated ({error:#}); it rotates at the next unlock."
+        ),
+    }
+    Ok(())
+}
+
+/// What `atem cred status` learned about the key agent.
+pub enum AgentState {
+    NotRunning,
+    Running(AgentStatus),
+    Unreachable(String),
+}
+
+/// `atem cred status`, for the paired Astation `astation_id`. `key_problem`
+/// (from `key_file_problem`) adds the reset instructions.
+pub fn status_report(
+    trust: &TrustStore,
+    astation_id: &str,
+    agent: &AgentState,
+    sealed_kid: Option<&str>,
+    key_problem: Option<&str>,
+) -> String {
+    let (agent_line, storage_kid, waiting) = match agent {
+        AgentState::NotRunning => (
+            "not running (starts with 'atem cred unlock')".to_string(),
+            sealed_kid.map(str::to_string),
+            false,
+        ),
+        AgentState::Unreachable(error) => (
+            format!("not answering ({error})"),
+            sealed_kid.map(str::to_string),
+            false,
+        ),
+        AgentState::Running(status) if status.unlocked => (
+            "unlocked".to_string(),
+            status.storage_kid.clone(),
+            !status.escrowed,
+        ),
+        AgentState::Running(status) => (
+            "locked (run 'atem cred unlock')".to_string(),
+            status.storage_kid.clone(),
+            false,
+        ),
+    };
+    let storage_line = match (storage_kid, waiting) {
+        (Some(kid), true) => {
+            format!("Storage key: {kid}  (not yet held by Astation; run 'atem cred unlock')")
+        }
+        (Some(kid), false) => format!("Storage key: {kid}"),
+        (None, _) => "Storage key: none".to_string(),
+    };
+    let mut report = format!(
+        "{}\nHome Astation: {}\nKey agent: {agent_line}\n{storage_line}\n",
+        trust.verification_line(astation_id),
+        trust.home().unwrap_or("none (verify with 'atem pair')"),
+    );
+    if let Some(problem) = key_problem {
+        report.push_str(&format!("Key files: {problem}\n{RESET}\n"));
+    }
+    report
+}
+
+/// `atem cred lock`: what happened, or why the agent refused (its storage
+/// key isn't with Astation yet).
+pub fn lock_keys_message(agent: Option<&dyn KeyAgentApi>) -> Result<String> {
+    match agent {
+        None => Ok("The key agent isn't running; this device's keys are locked.".into()),
+        Some(agent) => {
+            agent
+                .lock_keys()
+                .map_err(|error| anyhow!("Not locked: {error:#}"))?;
+            Ok("Locked: the key agent wiped this device's keys from memory.".into())
+        }
+    }
+}
+
+/// `atem cred …` (tier 2: needs a pairing with Astation).
+pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
+    use crate::cli::CredCommands;
+    let paired = crate::auth::require_pairing("atem cred")?;
+    let paths = KeyPaths::default_paths();
+    match command {
+        CredCommands::Status => {
+            let report = blocking(move || {
+                let trust = TrustStore::load_from(&paths.trust)?;
+                let sealed_kid = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
+                    .ok()
+                    .flatten()
+                    .map(|sealed| sealed.storage_kid);
+                let problem = key_file_problem(&paths, &trust);
+                let agent = match running_agent() {
+                    None => AgentState::NotRunning,
+                    Some(agent) => match agent.status() {
+                        Ok(status) => AgentState::Running(status),
+                        Err(error) => AgentState::Unreachable(format!("{error:#}")),
+                    },
+                };
+                Ok(status_report(
+                    &trust,
+                    &paired.astation_id,
+                    &agent,
+                    sealed_kid.as_deref(),
+                    problem.as_deref(),
+                ))
+            })
+            .await?;
+            print!("{report}");
+            Ok(())
+        }
+        CredCommands::Unlock => unlock_command(&paths).await,
+        CredCommands::Lock => {
+            let message = blocking(|| lock_keys_message(running_agent().as_deref())).await?;
+            println!("{message}");
+            Ok(())
+        }
+    }
+}
+
+/// Connects to the home Astation without pairing: locally when the local
+/// Astation is the home one, else through its relay identity room.
+async fn connect_home(home: &str) -> Result<AstationClient> {
+    let config = crate::config::AtemConfig::load()?;
+    let mut local = AstationClient::new();
+    if local
+        .connect_without_pairing(config.astation_ws())
+        .await
+        .is_ok()
+        && local.connected_astation_id() == Some(home)
+    {
+        return Ok(local);
+    }
+    drop(local);
+    let mut client = AstationClient::new();
+    client
+        .connect_relay_identity_without_pairing(config.astation_relay_url(), home)
+        .await
+        .with_context(|| format!("couldn't reach this device's home Astation ({home})"))?;
+    if client.connected_astation_id() != Some(home) {
+        bail!("connected to a different Astation than this device's home ({home})");
+    }
+    Ok(client)
+}
+
+async fn unlock_command(paths: &KeyPaths) -> Result<()> {
+    let trust = TrustStore::load_from(&paths.trust)?;
+    let home = match (trust.home(), trust.recorded_home()) {
+        (Some(home), _) => home.to_string(),
+        (None, Some(stale)) => bail!(
+            "This device's home Astation ({stale}) no longer verifies it, so its keys can't be unlocked. {RESET}"
+        ),
+        (None, None) => bail!("This device isn't verified yet. Run `atem pair` first."),
+    };
+    let agent: Arc<dyn KeyAgentApi> = Arc::from(default_agent());
+    let mut client = connect_home(&home).await?;
+    unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
+    if key_needed(paths, &home)? {
+        request_missing_key(&mut client, &trust, &home).await?;
+    }
+    Ok(())
+}
+
+/// A grant that arrived while the keys were locked was ignored: ask again,
+/// with the device key Astation pinned.
+async fn request_missing_key(
+    client: &mut AstationClient,
+    trust: &TrustStore,
+    home: &str,
+) -> Result<()> {
+    let public_key = trust
+        .verified(home)
+        .ok_or_else(|| anyhow!("this device isn't verified with its home Astation"))?
+        .device_pub
+        .clone();
+    client
+        .send_message(AstationMessage::KeyRequest { public_key })
+        .await?;
+    println!("Encryption key requested from Astation…");
+    let waited = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match client.recv_message_async().await {
+                Some(message @ AstationMessage::KeyGrant { .. }) => {
+                    return client.handle_encryption_message(&message).await;
+                }
+                Some(_) => continue,
+                None => bail!("Astation closed the connection"),
+            }
+        }
+    })
+    .await;
+    match waited {
+        Ok(Ok(Some(status))) => println!("{}", shown(&status)),
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => eprintln!("⚠️  {}", shown(&format!("{error:#}"))),
+        Err(_) => {
+            eprintln!("⚠️  Astation didn't send the key yet; it arrives on a later connection.")
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::fake_astation::ACCOUNT;
     use crate::memory::fake_astation::{
         ASTATION_ID, DEVICE_ID, FakeKeyServer, captured_rotation, sealed_device,
     };
+    use crate::memory::key_agent::{AgentStatus, RESET};
     use crate::memory::key_agent::{error_of, test_agent};
-    use crate::memory::statements::SignedWire;
+    use crate::memory::statements::{FakeAstation, SignedWire, StorageAck};
     use crate::memory::storage_key::{SealedDeviceKeys, StorageRotation, new_storage_key};
     use std::collections::VecDeque;
 
@@ -302,6 +712,14 @@ mod tests {
         /// Refuses the next rotate with this reason and pending kid.
         reject: Option<(String, Option<String>)>,
         silent: bool,
+        /// With nothing queued, `recv` waits forever (a link that never answers).
+        hang: bool,
+        /// Queued just before the next answer: a stale or replayed reply.
+        stale: Option<AstationMessage>,
+        /// Grants are signed by this impostor instead of the pinned Astation.
+        forger: Option<FakeAstation>,
+        /// Sending the confirmation fails (the connection dropped).
+        fail_confirm: bool,
         abandons: usize,
         rotates: usize,
     }
@@ -314,6 +732,10 @@ mod tests {
                 deny: None,
                 reject: None,
                 silent: false,
+                hang: false,
+                stale: None,
+                forger: None,
+                fail_confirm: false,
                 abandons: 0,
                 rotates: 0,
             }
@@ -328,6 +750,9 @@ mod tests {
             self.inbox.push_back(AstationMessage::EncryptionMode {
                 account_state: None,
             });
+            if let Some(stale) = self.stale.take() {
+                self.inbox.push_back(stale);
+            }
             match message {
                 AstationMessage::UnlockRequest { request, signature } => {
                     let reply = match &self.deny {
@@ -335,10 +760,16 @@ mod tests {
                             reason: reason.clone(),
                         },
                         None => {
-                            let grant = self.server.grant_unlock(&SignedWire {
+                            let request = SignedWire {
                                 statement: request,
                                 signature,
-                            })?;
+                            };
+                            let grant = match &self.forger {
+                                Some(forger) => {
+                                    self.server.unlock_grant(forger, &request, "0a1b2c3d")?
+                                }
+                                None => self.server.grant_unlock(&request)?,
+                            };
                             AstationMessage::UnlockGrant {
                                 grant: grant.grant,
                                 encapped_key: grant.encapped_key,
@@ -379,6 +810,9 @@ mod tests {
                     };
                     self.inbox.push_back(reply);
                 }
+                AstationMessage::StorageKeyConfirm { .. } if self.fail_confirm => {
+                    bail!("the connection dropped")
+                }
                 AstationMessage::StorageKeyConfirm { confirm } => self.server.confirm(&confirm)?,
                 AstationMessage::StorageKeyAbandon { abandon } => {
                     self.abandons += 1;
@@ -390,7 +824,11 @@ mod tests {
         }
 
         async fn recv(&mut self) -> Option<AstationMessage> {
-            self.inbox.pop_front()
+            match self.inbox.pop_front() {
+                Some(message) => Some(message),
+                None if self.hang => std::future::pending().await,
+                None => None,
+            }
         }
     }
 
@@ -619,6 +1057,362 @@ mod tests {
         let status = agent.status().unwrap();
         assert!(status.escrowed);
         assert_eq!(agent.pending_rotation().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_astation_that_never_answers_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        link.silent = true;
+        link.hang = true;
+        let wait = Duration::from_millis(50);
+        let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, wait).await);
+        assert!(
+            error.contains("timed out waiting for Astation to approve the unlock"),
+            "{error}"
+        );
+        assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn a_grant_for_an_earlier_request_is_skipped_and_the_real_one_unlocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        // Astation's answer to an earlier attempt, replayed by a relay.
+        let earlier = signed_request(agent.as_ref(), &paths, ASTATION_ID).unwrap();
+        let old = link.server.grant_unlock(&earlier).unwrap();
+        link.stale = Some(AstationMessage::UnlockGrant {
+            grant: old.grant,
+            encapped_key: old.encapped_key,
+            ciphertext: old.ciphertext,
+        });
+        let kid = unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(kid, "0a1b2c3d");
+        assert!(agent.status().unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn a_grant_signed_by_anyone_else_is_skipped_until_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        link.forger = Some(FakeAstation::new());
+        link.hang = true;
+        let wait = Duration::from_millis(200);
+        let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, wait).await);
+        assert!(error.contains("timed out"), "{error}");
+        assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn an_ack_for_another_key_is_skipped_and_the_real_one_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        // A genuine ack for an older rotation, replayed.
+        let old = StorageAck {
+            account: ACCOUNT.into(),
+            sign_gen: 1,
+            device_id: DEVICE_ID.into(),
+            storage_kid: "ffffffff".into(),
+        };
+        link.stale = Some(AstationMessage::StorageKeyAck {
+            ack: link.server.astation.sign(&old.encode()),
+        });
+        let new_kid = rotate_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(sealed_kid(&paths.device_keys_sealed), new_kid);
+        assert!(link.server.pending.is_none());
+        assert_eq!(agent.status().unwrap().storage_kid, Some(new_kid));
+    }
+
+    #[tokio::test]
+    async fn astation_text_is_shown_without_control_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        link.reject = Some(("busy\u{1b}[2J\u{7}\nnow".into(), None));
+        let error = error_of(rotate_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+        assert!(error.contains("busy[2Jnow"), "{error}");
+
+        agent.lock_keys().unwrap();
+        std::fs::remove_file(&paths.device_keys_next).unwrap();
+        unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        link.reject = Some(("pending".into(), Some("\u{1b}]0;x\u{7}".into())));
+        let error = error_of(rotate_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+
+        let other = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(other.path(), "0a1b2c3d");
+        let agent = super::tests::agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        link.deny = Some("no\u{1b}[31m\rway".into());
+        let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+        assert!(error.contains("no[31mway"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_confirmation_after_the_promotion_is_only_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        link.fail_confirm = true;
+        let new_kid = rotate_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(sealed_kid(&paths.device_keys_sealed), new_kid);
+        // Astation still holds it as pending: the next unlock settles it.
+        assert_eq!(
+            link.server.pending.as_ref().map(|(kid, _)| kid.clone()),
+            Some(new_kid)
+        );
+    }
+
+    #[test]
+    fn status_report_shows_each_agent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert_eq!(
+            status_report(
+                &trust,
+                ASTATION_ID,
+                &AgentState::NotRunning,
+                Some("0a1b2c3d"),
+                None
+            ),
+            "Verified: yes  (safety code AAAA-BBBB-CCCC)\n\
+             Home Astation: astation-1\n\
+             Key agent: not running (starts with 'atem cred unlock')\n\
+             Storage key: 0a1b2c3d\n"
+        );
+        let waiting = AgentState::Running(AgentStatus {
+            unlocked: true,
+            storage_kid: Some("4e5f6a7b".into()),
+            escrowed: false,
+        });
+        let report = status_report(&trust, ASTATION_ID, &waiting, None, None);
+        assert!(report.contains("Key agent: unlocked\n"), "{report}");
+        assert!(
+            report.contains(
+                "Storage key: 4e5f6a7b  (not yet held by Astation; run 'atem cred unlock')"
+            ),
+            "{report}"
+        );
+        let locked = AgentState::Running(AgentStatus {
+            unlocked: false,
+            storage_kid: Some("0a1b2c3d".into()),
+            escrowed: false,
+        });
+        assert!(
+            status_report(&trust, ASTATION_ID, &locked, None, None)
+                .contains("Key agent: locked (run 'atem cred unlock')")
+        );
+        let broken = AgentState::Unreachable("protocol v2".into());
+        assert!(
+            status_report(&trust, ASTATION_ID, &broken, Some("0a1b2c3d"), None)
+                .contains("Key agent: not answering (protocol v2)")
+        );
+        let report = status_report(
+            &TrustStore::default(),
+            ASTATION_ID,
+            &AgentState::NotRunning,
+            None,
+            None,
+        );
+        assert!(report.starts_with("Verified: no"), "{report}");
+        assert!(report.contains("Home Astation: none (verify with 'atem pair')"));
+        assert!(report.contains("Storage key: none"));
+        let report = status_report(
+            &trust,
+            ASTATION_ID,
+            &AgentState::NotRunning,
+            None,
+            Some("unlock_auth_key is missing"),
+        );
+        assert!(
+            report.ends_with(&format!("Key files: unlock_auth_key is missing\n{RESET}\n")),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn the_reset_names_every_key_file_and_the_trust_state() {
+        assert_eq!(
+            RESET,
+            "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`."
+        );
+    }
+
+    #[test]
+    fn key_file_problems_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert_eq!(key_file_problem(&paths, &trust), None);
+        std::fs::remove_file(&paths.unlock_auth_key).unwrap();
+        let problem = key_file_problem(&paths, &trust).unwrap();
+        assert!(problem.contains("unlock_auth_key"), "{problem}");
+        std::fs::write(&paths.device_keys_sealed, b"junk").unwrap();
+        let problem = key_file_problem(&paths, &trust).unwrap();
+        assert!(problem.contains("device_keys.sealed"), "{problem}");
+        std::fs::remove_file(&paths.device_keys_sealed).unwrap();
+        let problem = key_file_problem(&paths, &trust).unwrap();
+        assert!(problem.contains("no sealed keys"), "{problem}");
+        // A device that was never verified has nothing to fix.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            key_file_problem(&KeyPaths::in_dir(empty.path()), &TrustStore::default()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unlock_failing_on_the_key_files_shows_the_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        std::fs::remove_file(&paths.unlock_auth_key).unwrap();
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
+        assert!(error.contains(RESET), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_unlock_command_unlocks_rotates_and_then_has_nothing_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        unlock_and_rotate(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        let status = agent.status().unwrap();
+        assert!(status.unlocked && status.escrowed);
+        assert_ne!(status.storage_kid.as_deref(), Some("0a1b2c3d"), "rotated");
+        assert_eq!(link.rotates, 1);
+        unlock_and_rotate(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(link.rotates, 1, "already unlocked and escrowed");
+    }
+
+    #[tokio::test]
+    async fn a_refused_rotation_after_the_unlock_is_only_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        link.reject = Some(("not now".into(), None));
+        unlock_and_rotate(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        let status = agent.status().unwrap();
+        assert!(status.unlocked);
+        assert_eq!(status.storage_kid.as_deref(), Some("0a1b2c3d"));
+    }
+
+    /// A freshly verified device: unlocked, sealed under a key Astation
+    /// doesn't hold yet, the first escrow begun (outcome.escrow).
+    fn fresh_device(dir: &std::path::Path) -> (KeyPaths, FakeKeyServer, Arc<dyn KeyAgentApi>) {
+        let (paths, mut server, keys) = sealed_device(dir, "0a1b2c3d");
+        let storage_key = [9u8; 32];
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "0a1b2c3d", &storage_key)
+            .unwrap()
+            .save_to(&paths.device_keys_sealed)
+            .unwrap();
+        server.storage_keys.clear();
+        let agent = agent(&paths);
+        agent
+            .load_unlocked(DEVICE_ID, &keys, "0a1b2c3d", &storage_key)
+            .unwrap();
+        (paths, server, agent)
+    }
+
+    #[tokio::test]
+    async fn pairing_sends_the_escrow_it_began_and_confirms_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, agent) = fresh_device(dir.path());
+        let escrow = agent.begin_rotation(ASTATION_ID).unwrap();
+        assert!(error_of(lock_keys_message(Some(agent.as_ref()))).contains("isn't with Astation"));
+        let mut link = ScriptedLink::new(server);
+        assert_eq!(
+            pair_escrow(&mut link, &agent, &paths, ASTATION_ID, Some(escrow))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0a1b2c3d")
+        );
+        assert_eq!(link.rotates, 1);
+        assert_eq!(link.server.storage_keys.get("0a1b2c3d"), Some(&[9u8; 32]));
+        assert!(agent.status().unwrap().escrowed);
+        assert_eq!(agent.pending_rotation().unwrap(), None);
+        assert!(
+            lock_keys_message(Some(agent.as_ref()))
+                .unwrap()
+                .contains("Locked")
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_without_a_prepared_escrow_still_hands_over_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, agent) = fresh_device(dir.path());
+        let mut link = ScriptedLink::new(server);
+        assert_eq!(
+            pair_escrow(&mut link, &agent, &paths, ASTATION_ID, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0a1b2c3d")
+        );
+        assert!(agent.status().unwrap().escrowed);
+    }
+
+    #[test]
+    fn a_failed_escrow_says_what_to_do() {
+        let message = escrow_failure_message(&anyhow!("timed out"));
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("atem cred unlock"), "{message}");
+        assert!(message.contains("`atem cred lock` is refused"), "{message}");
+        assert!(message.contains(RESET), "{message}");
+    }
+
+    #[test]
+    fn lock_reports_what_it_did() {
+        assert!(lock_keys_message(None).unwrap().contains("isn't running"));
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        assert!(
+            lock_keys_message(Some(agent.as_ref()))
+                .unwrap()
+                .contains("Locked")
+        );
     }
 
     #[test]

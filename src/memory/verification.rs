@@ -434,7 +434,7 @@ pub fn complete_verification(
     let sealed = match &keys {
         VerificationKeys::Fresh(fresh) => {
             let storage_key = new_storage_key();
-            let storage_kid = new_storage_kid();
+            let storage_kid = staged.pick_storage_kid("", new_storage_kid);
             let sealed =
                 SealedDeviceKeys::seal(fresh, &entry.device_id, &storage_kid, &storage_key)?;
             agent.load_unlocked(&entry.device_id, fresh, &storage_kid, &storage_key)?;

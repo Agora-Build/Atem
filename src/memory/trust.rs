@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::memory::device_keys::PublicKeys;
@@ -45,6 +45,11 @@ pub struct TrustStore {
     /// a restart tell an escrowed sealed file from a freshly migrated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     escrowed_storage_kid: Option<String>,
+    /// Every storage key id this device signed an abandon for. A replayed
+    /// abandon would drop a pending key with that id at Astation, so no new
+    /// storage key may ever use one.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    abandoned_kids: BTreeSet<String>,
     #[serde(default)]
     astations: HashMap<String, AstationTrust>,
     #[serde(default)]
@@ -120,6 +125,26 @@ impl TrustStore {
 
     pub fn set_escrowed_kid(&mut self, storage_kid: &str) {
         self.escrowed_storage_kid = Some(storage_kid.into());
+    }
+
+    /// Records a storage key id this device signed an abandon for.
+    pub fn record_abandoned(&mut self, storage_kid: &str) {
+        self.abandoned_kids.insert(storage_kid.into());
+    }
+
+    pub fn was_abandoned(&self, storage_kid: &str) -> bool {
+        self.abandoned_kids.contains(storage_kid)
+    }
+
+    /// A new storage key id from `next` that is neither `current` nor one
+    /// this device ever abandoned.
+    pub fn pick_storage_kid(&self, current: &str, mut next: impl FnMut() -> String) -> String {
+        loop {
+            let kid = next();
+            if kid != current && !self.was_abandoned(&kid) {
+                return kid;
+            }
+        }
     }
 
     /// The home Astation, or, for a step-1 store whose home was never set,
@@ -574,6 +599,25 @@ mod tests {
                     &fake.sign(&state(EncryptionMode::Off, 9).encode())
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn abandoned_storage_kids_are_kept_and_never_picked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred_state.json");
+        let mut store = TrustStore::default();
+        store.record_abandoned("aaaaaaaa");
+        store.save_to(&path).unwrap();
+        let loaded = TrustStore::load_from(&path).unwrap();
+        assert!(loaded.was_abandoned("aaaaaaaa"));
+        assert!(!loaded.was_abandoned("bbbbbbbb"));
+        let mut offered = ["aaaaaaaa", "0a1b2c3d", "bbbbbbbb"]
+            .into_iter()
+            .map(String::from);
+        assert_eq!(
+            loaded.pick_storage_kid("0a1b2c3d", || offered.next().unwrap()),
+            "bbbbbbbb"
         );
     }
 

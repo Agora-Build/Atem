@@ -364,8 +364,8 @@ impl StorageRotate {
         ])
     }
 
-    /// Astation's side: atem only encodes, so tests alone parse.
-    #[cfg(test)]
+    /// Astation parses it; atem reads its own rotate back to learn which
+    /// storage key Astation's ack must name.
     pub fn parse(fields: &[Vec<u8>]) -> Result<Self> {
         expect(fields, Self::LABEL, 6)?;
         Ok(Self {

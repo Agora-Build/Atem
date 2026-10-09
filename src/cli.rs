@@ -82,6 +82,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+    /// This device's keys: unlock with Touch ID on your Mac, lock, status (see designs/e2e-encryption.md)
+    Cred {
+        #[command(subcommand)]
+        command: CredCommands,
+    },
     /// Runs the key agent (started automatically when keys are needed)
     #[command(hide = true)]
     KeyAgent,
@@ -427,6 +432,16 @@ pub enum ServCommands {
         #[arg(long)]
         no_browser: bool,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum CredCommands {
+    /// Show whether this device is verified, its home Astation and its key agent
+    Status,
+    /// Unlock this device's keys (approve with Touch ID on your Mac)
+    Unlock,
+    /// Wipe the unlocked keys from the key agent's memory
+    Lock,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -1293,6 +1308,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Sync { no_harvest, allow_tracked } => crate::memory::cmd::handle_sync(no_harvest, allow_tracked).await,
         Commands::Memory { command } => crate::memory::cmd::handle_memory(command).await,
         Commands::Skill { command } => crate::memory::cmd::handle_skill(command).await,
+        Commands::Cred { command } => crate::memory::unlock::handle_cred(command).await,
         Commands::KeyAgent => {
             #[cfg(unix)]
             {
@@ -1655,10 +1671,30 @@ async fn run_device_verification(
                         })
                         .await?
                     };
-                    // outcome.escrow (the first storageKeyRotate) is sent and confirmed by Task 10.
                     println!("✅ Device verified with Astation (safety code {code}).");
-                    if let Some(warning) = &outcome.warning {
-                        eprintln!("⚠️  {warning}");
+                    // The first escrow: Astation must hold the storage key
+                    // before this run ends, or the keys can't be unlocked later.
+                    let escrowed = crate::memory::unlock::pair_escrow(
+                        &mut *client,
+                        &agent,
+                        &paths,
+                        astation_id,
+                        outcome.escrow,
+                    )
+                    .await;
+                    match escrowed {
+                        Ok(Some(storage_kid)) => {
+                            println!("Astation holds this device's storage key ({storage_kid}).")
+                        }
+                        Ok(None) => {
+                            if let Some(warning) = &outcome.warning {
+                                eprintln!("⚠️  {warning}");
+                            }
+                        }
+                        Err(error) => eprintln!(
+                            "⚠️  {}",
+                            crate::memory::unlock::escrow_failure_message(&error)
+                        ),
                     }
                     if outcome.key_needed {
                         client
@@ -2453,6 +2489,17 @@ mod tests {
         assert!(matches!(cli.command, Some(Commands::KeyAgent)));
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("key-agent"), "{help}");
+    }
+
+    #[test]
+    fn cred_commands_parse() {
+        for (arg, expected) in [("status", "Status"), ("unlock", "Unlock"), ("lock", "Lock")] {
+            let cli = Cli::try_parse_from(["atem", "cred", arg]).unwrap();
+            match cli.command {
+                Some(Commands::Cred { command }) => assert_eq!(format!("{command:?}"), expected),
+                _ => panic!("expected atem cred {arg}"),
+            }
+        }
     }
 
     #[test]

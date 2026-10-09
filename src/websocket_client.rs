@@ -406,6 +406,11 @@ impl AstationClient {
         }
     }
 
+    /// The Astation this client authenticated with, once it said who it is.
+    pub fn connected_astation_id(&self) -> Option<&str> {
+        self.connected_astation_id.as_deref()
+    }
+
     #[cfg(test)]
     fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
         let mut client = Self::new();

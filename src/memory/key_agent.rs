@@ -35,7 +35,7 @@ pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`"
 pub const LOCK_BEFORE_ESCROW: &str = "this device's storage key isn't with Astation yet; finish `atem pair` or run `atem cred unlock` first";
 
 /// Appended to key-file errors, which never stop the agent (it starts locked).
-pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys (if present), device_keys.sealed and unlock_auth_key, then run `atem pair` to verify this device again.";
+pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`.";
 
 /// What the agent serves. Only the same user can reach it (agent_socket.rs).
 /// Fields that carry secrets are `Zeroizing`.
@@ -570,10 +570,8 @@ impl KeyAgent {
         );
         drop(plain);
         let (sealed, source) = self.sealed_with_kid(&granted.storage_kid)?;
-        let unlock_auth =
-            UnlockAuthKey::load_from(&self.paths.unlock_auth_key)?.ok_or_else(|| {
-                anyhow!("unlock_auth_key is missing; run `atem pair` to verify this device again")
-            })?;
+        let unlock_auth = UnlockAuthKey::load_from(&self.paths.unlock_auth_key)?
+            .ok_or_else(|| anyhow!("unlock_auth_key is missing. {RESET}"))?;
         let keys = open_sealed_checked(
             &sealed,
             &trust.device_id,
@@ -649,10 +647,9 @@ impl KeyAgent {
                 unlocked.storage_key.clone(),
             )
         } else {
-            let mut kid = new_storage_kid();
-            while kid == unlocked.storage_kid {
-                kid = new_storage_kid();
-            }
+            // Never a kid this device abandoned: a replayed abandon could drop it.
+            let kid = TrustStore::load_from(&self.paths.trust)?
+                .pick_storage_kid(&unlocked.storage_kid, new_storage_kid);
             let key = new_storage_key();
             // Phase 1: the re-sealed file waits beside the current one.
             SealedDeviceKeys::seal(&unlocked.keys, &unlocked.device_id, &kid, &key)?
@@ -785,6 +782,10 @@ impl KeyAgent {
                 bail!("a sealed file still carries storage key {storage_kid}");
             }
         }
+        // Recorded before it is signed, so the kid is never picked again.
+        let mut store = TrustStore::load_from(&self.paths.trust)?;
+        store.record_abandoned(storage_kid);
+        store.save_to(&self.paths.trust)?;
         let abandon = unlocked.keys.sign_statement(
             &StorageAbandon {
                 account: trust.data_account,
@@ -860,7 +861,7 @@ impl KeyAgent {
             bail!("device_keys doesn't hold the keys pinned for Astation {home}");
         }
         let storage_key = new_storage_key();
-        let storage_kid = new_storage_kid();
+        let storage_kid = trust.pick_storage_kid("", new_storage_kid);
         SealedDeviceKeys::seal(&keys, &entry.device_id, &storage_kid, &storage_key)?
             .save_to(&self.paths.device_keys_sealed)?;
         keys.unlock_auth_key()
@@ -1113,8 +1114,6 @@ pub async fn blocking<T: Send + 'static>(
 }
 
 /// The running agent, without starting one.
-// Used by Tasks 8-10; remove the allow then.
-#[allow(dead_code)]
 pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
     #[cfg(unix)]
     {
@@ -2309,6 +2308,24 @@ mod tests {
         assert_eq!(server.pending, pending);
         // The abandoned kid can never come back.
         assert!(server.acked.contains(&stale));
+    }
+
+    #[test]
+    fn every_abandoned_kid_is_recorded_so_it_is_never_picked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _, agent, stale) = device_with_a_stale_rotation(dir.path());
+        agent.abandon_pending(ASTATION_ID, &stale).unwrap();
+        agent.abandon_pending(ASTATION_ID, "ffffffff").unwrap();
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert!(trust.was_abandoned(&stale));
+        assert!(trust.was_abandoned("ffffffff"));
+        // A refused abandon records nothing.
+        let _ = agent.abandon_pending(ASTATION_ID, "0a1b2c3d");
+        assert!(
+            !TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .was_abandoned("0a1b2c3d")
+        );
     }
 
     #[test]

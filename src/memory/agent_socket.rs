@@ -13,8 +13,6 @@
 //! `Zeroizing` buffers that are dropped right after use. Nothing here goes
 //! through a `serde_json::Value`, a `BufReader`, or serde's internally tagged
 //! enum buffering for a message that carries a secret.
-// Used by Tasks 8-10 (cred commands, grant opening); remove then.
-#![allow(dead_code)]
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
