@@ -13,6 +13,7 @@ pub mod api;
 pub mod sync;
 pub mod cmd;
 pub mod crypto;
+pub mod encoding;
 
 #[cfg(test)]
 mod e2e_tests;
