@@ -277,9 +277,10 @@ commitments. The safety code replaces it.
 
 Every key travels as **HPKE (RFC 9180)**, base mode, DHKEM(X25519,
 HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, which binds the ephemeral and
-recipient public keys into the key schedule. The HPKE `info` is the
-encoded `atem-grant-v1` statement, and that statement is signed by Astation
-over `SHA-256(sealed key)`. atem opens a grant only if the signature
+recipient public keys into the key schedule. The HPKE `info` is `enc("atem-grant-info-v1", account, type, device_id,
+device_pub, kid, scope_hmac)`, and Astation signs the `atem-grant-v1`
+statement, which adds `SHA-256(enc(encapped_key, ciphertext))`. (The info
+can't contain a hash of the seal's own output.) atem opens a grant only if the signature
 verifies, `device_id`/`device_pub` are its own, and `sign_gen` is pinned.
 The relay can carry grants but can't make one.
 
@@ -819,7 +820,7 @@ project `…/a/bc` + name `d`).
 | Memory write signature | Ed25519, device signing key | `atem-mem-write-v1` |
 | Credential value | `c1.<scope_kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 | `enc("atem-cred-v1", account, scope_hmac, kid, name_hmac, version)` |
 | Credential display name | same, under the scope key | `enc("atem-cred-name-v1", account, scope_hmac, name_hmac)` |
-| Key grants (`K`, index, scope) and storage key to Astation | HPKE RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 | `info` = encoded `atem-grant-v1` statement (or the storage-key rotation statement) |
+| Key grants (`K`, index, scope) and storage key to Astation | HPKE RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 | `info = enc("atem-grant-info-v1", account, type, device_id, device_pub, kid, scope_hmac)`; the signed `atem-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) (storage-key rotation: its own statement) |
 | Unlock reply | same HPKE to the request's `E_pub` | `info` = SHA-256(signed unlock request) |
 | Credential names | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
 | Credential scopes | `HMAC-SHA256(I_scope, project_key)` | — |
@@ -871,6 +872,58 @@ and in the shipped #36 code; the design above includes every fix.
 Findings 1, 4 and 5 affect code already shipped in #36. No account is
 encrypted in practice yet, because Astation's key manager isn't built, but
 they must be fixed before it ships (build step 0).
+
+## Wire messages (build steps 0–1)
+
+All are `{"type": …, "data": {…}}` on the existing Astation WebSocket;
+binary values are base64. `SignedWire` is `{statement, signature}`;
+`GrantWire` is `{signed, encapped_key, ciphertext}`.
+
+| Type | Direction | Data |
+|---|---|---|
+| `verifyCommit` | atem → Astation | `device_id`, `commitment` |
+| `verifyKeys` | Astation → atem | `sign_pub` (65-byte SEC1), `enc_pub`, `recovery_sign_pub`, `nonce` |
+| `verifyReveal` | atem → Astation | `device_pub`, `device_sign_pub`, `unlock_auth_pub`, `nonce` |
+| `deviceVerified` | Astation → atem | `device_verified: SignedWire`, `account_state: SignedWire`, `grants: [GrantWire]` |
+| `verifyAbort` | either | `reason` |
+| `encryptionMode` | Astation → atem | `account_state: SignedWire` (messages without it are ignored) |
+| `keyRequest` | atem → Astation | `public_key` (the verified device key) |
+| `keyGrant` | Astation → atem | `grant: GrantWire` |
+| `encryptionMigrationComplete` | atem → Astation | unchanged |
+
+Until Astation supports verification, atems stay unverified: they keep
+plain-text sync and ignore `encryptionMode` and `keyGrant` (decided
+2026-10-09, option A). Details:
+
+- An unverified atem ignores any encryption mode or key stored before this
+  change and syncs plain text.
+- A verified atem refuses to build an encryption context if its local
+  mode/kid doesn't match Astation's latest signed account state.
+- A device keeps one set of device keys across Astations: verification
+  reuses `device_keys` if present and generates only when absent.
+
+### Astation work for steps 0–1
+
+atem can't complete verification against a real Astation until these land.
+
+**Astation (macOS):**
+1. Keys, created on first need and kept in the Keychain (`WhenUnlockedThisDeviceOnly`):
+   - signing key: Secure Enclave P-256 (`SecureEnclave.P256.Signing.PrivateKey`), `sign_gen = 1`;
+   - encryption key: X25519 (`Curve25519.KeyAgreement.PrivateKey`), sealed by a Secure Enclave key;
+   - recovery secret `R` (32 random bytes) and the recovery signing key, Ed25519 from `HKDF-SHA256(R, info: "atem-recovery-sign-v1")`; the kit gains the `Recovery key:` line and must be saved before the first device is verified;
+   - an account `epoch` counter (u64) that increases on every signed account-state, certificate or grant.
+2. Encoding: `enc` exactly as in "Formats" (4-byte big-endian length per field, label first). Statements as in "Signed statements".
+3. Signatures: `signature.rawRepresentation` (64-byte `r ‖ s`). CryptoKit may return high-S; normalize to low-S (`s = n − s` when `s > n/2`) before sending. atem rejects high-S.
+4. Verification:
+   - on `verifyCommit`, store `{device_id, commitment}` and reply `verifyKeys` with a fresh 32-byte nonce;
+   - on `verifyReveal`, check `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a)) == commitment`, else send `verifyAbort`;
+   - compute the safety code (Global Constraints) and show it with the device name; Approve needs Touch ID; Deny sends `verifyAbort`;
+   - on approve, pin the three device keys, then send `deviceVerified` with a signed `atem-device-verified-v1`, the current signed `atem-account-state-v1` (mode `off` if encryption was never turned on), and a signed `K` grant if `K` exists;
+   - on an incoming `verifyAbort`, discard the attempt.
+5. Grants: HPKE on the atem side is RFC 9180 base mode with X25519 / HKDF-SHA256 / ChaCha20-Poly1305, which is CryptoKit `.Curve25519_SHA256_ChachaPoly`: `HPKE.Sender(recipientKey:ciphersuite: .Curve25519_SHA256_ChachaPoly, info:)` (macOS 14+), with `info = enc("atem-grant-info-v1", account, "K", device_id, device_pub, kid, "")`, empty AAD; send `encapped_key` and `ciphertext`; sign `atem-grant-v1` including `SHA-256(enc(encapped_key, ciphertext))`.
+6. `encryptionMode` always carries a signed account state; `keyRequest` is answered only when `public_key` equals the pinned device key.
+
+**Relay:** forward the five new message types (`verifyCommit`, `verifyKeys`, `verifyReveal`, `deviceVerified`, `verifyAbort`) between an atem and its Astation exactly like existing message types. If the relay filters by type, add them to the list. Nothing new is stored in steps 0–1.
 
 ## Where the work lands
 

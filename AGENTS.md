@@ -82,6 +82,12 @@ src/
 │   ├── adapters.rs      #   Claude/Codex targets + apply report
 │   ├── api.rs           #   relay /api/memory, /api/skills client
 │   ├── sync.rs          #   harvest → push → pull → apply
+│   ├── encoding.rs      #   length-prefixed fields for signed/bound inputs, base32
+│   ├── statements.rs    #   Astation-signed statements (P-256 verify)
+│   ├── device_keys.rs   #   device X25519 + Ed25519 signing + unlock-auth keys
+│   ├── verification.rs  #   commit-then-reveal safety code; apply signed state/grants
+│   ├── trust.rs         #   cred_state.json: pinned Astation keys, epochs
+│   ├── grant.rs         #   signed RFC 9180 HPKE key grants
 │   └── cmd.rs           #   CLI handlers
 └── tui/
     ├── mod.rs           # Main event loop, rendering dispatch
@@ -178,6 +184,8 @@ Key methods:
 | `project_cache.enc` | All projects + `current_app_id` (selected project reference) | AES-256-GCM (machine-bound) |
 | `sessions.json` | Per-Astation device session IDs and tokens | None (chmod 0600) |
 | `knowledge.db` | Atem Memory local store: memories (with `deleted_at`/`valid_at`/`invalid_at`/`superseded_by`), the `memories_fts` FTS5 trigram search index, skills, harvest map, local `replacements`, and the pending-sync queue (SQLite, mode 0600; holds no secrets — credentials are refused before storing; migrated in place on open) | None |
+| `device_keys` | This device's X25519, Ed25519 signing and unlock-auth keys (created by `atem pair` verification; sealed in build step 2) | None (chmod 0600) |
+| `cred_state.json` | Verified Astation pins (signing, encryption, recovery keys), safety code, epoch floor, latest signed account state | None (chmod 0600; no secrets) |
 
 **Identity** (`config.rs`, `websocket_client.rs`):
 - `instance_id` — persistent UUID v4, the canonical atem identity (and the vault `client_id`). Generated once by `ensure_instance_id()`, stored in `config.toml`.

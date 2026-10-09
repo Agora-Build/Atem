@@ -414,3 +414,21 @@ async fn missing_encryption_key_keeps_sync_operations_queued() {
     );
     assert_eq!(store.pending_count().unwrap(), 1);
 }
+
+#[tokio::test]
+async fn relay_injected_plain_text_is_rejected_while_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("data_keys.enc");
+    let mut verified =
+        crate::memory::verification::VerifiedForTest::new(&store_path, ASTATION, ACCOUNT);
+    set_key(&mut verified, &store_path, EncryptionMode::On, OLD_KID, [7; 32]);
+    let state = Arc::new(Mutex::new(RelayState::seeded()));
+    let base = stub_relay(state.clone()).await;
+    let (knowledge, vault) = clients(&base, &store_path);
+
+    let error = knowledge.pull_memories(0).await.unwrap_err().to_string();
+    assert!(error.contains("plain-text"), "{error}");
+
+    let vault_error = vault.list().await.unwrap_err().to_string();
+    assert!(vault_error.contains("plain-text"), "{vault_error}");
+}
