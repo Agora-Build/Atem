@@ -21,6 +21,8 @@ pub mod trust;
 pub mod grant;
 pub mod storage_key;
 pub mod key_agent;
+#[cfg(unix)]
+pub mod agent_socket;
 
 #[cfg(test)]
 mod e2e_tests;

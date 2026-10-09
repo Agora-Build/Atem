@@ -1040,6 +1040,42 @@ impl KeyAgentApi for std::sync::Mutex<KeyAgent> {
 }
 
 /// The error text of a result that must fail (works for any `T`, Debug or not).
+/// This user's agent, started on first use (lazily: nothing connects until
+/// a request is made).
+pub fn default_agent() -> Box<dyn KeyAgentApi> {
+    #[cfg(unix)]
+    {
+        Box::new(crate::memory::agent_socket::KeyAgentClient::autostart())
+    }
+    #[cfg(not(unix))]
+    {
+        Box::new(NoAgent)
+    }
+}
+
+/// The running agent, without starting one.
+pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
+    #[cfg(unix)]
+    {
+        use crate::memory::agent_socket::{KeyAgentClient, agent_socket_path};
+        let client = KeyAgentClient::at(agent_socket_path());
+        if client.is_running() {
+            return Some(Box::new(client));
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+struct NoAgent;
+
+#[cfg(not(unix))]
+impl KeyAgentApi for NoAgent {
+    fn call(&self, _request: Request) -> Result<Reply> {
+        bail!("the key agent needs a Unix system")
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn error_of<T>(result: Result<T>) -> String {
     match result {

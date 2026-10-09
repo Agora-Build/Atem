@@ -82,6 +82,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+    /// Runs the key agent (started automatically when keys are needed)
+    #[command(hide = true)]
+    KeyAgent,
 }
 
 #[derive(Subcommand)]
@@ -1290,6 +1293,16 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Sync { no_harvest, allow_tracked } => crate::memory::cmd::handle_sync(no_harvest, allow_tracked).await,
         Commands::Memory { command } => crate::memory::cmd::handle_memory(command).await,
         Commands::Skill { command } => crate::memory::cmd::handle_skill(command).await,
+        Commands::KeyAgent => {
+            #[cfg(unix)]
+            {
+                crate::memory::agent_socket::run_key_agent().await
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!("the key agent needs a Unix system")
+            }
+        }
     }
 }
 
@@ -2410,6 +2423,15 @@ mod tests {
             Some(Commands::Pair { save }) => assert!(save),
             _ => panic!("expected Pair command with --save"),
         }
+    }
+
+    #[test]
+    fn key_agent_is_a_hidden_subcommand() {
+        use clap::CommandFactory;
+        let cli = Cli::try_parse_from(["atem", "key-agent"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::KeyAgent)));
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("key-agent"), "{help}");
     }
 
     #[test]
