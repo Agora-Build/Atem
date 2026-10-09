@@ -163,6 +163,11 @@ impl TrustStore {
         self.astations.get(astation_id)
     }
 
+    /// Every verified Astation's entry.
+    pub fn verified_entries(&self) -> impl Iterator<Item = &AstationTrust> {
+        self.astations.values()
+    }
+
     /// The home Astation, once it is verified.
     pub fn home(&self) -> Option<&str> {
         self.home_astation

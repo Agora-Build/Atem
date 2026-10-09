@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use crate::memory::crypto::EncryptionContext;
+use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 use crate::memory::device_keys::{DeviceKeys, DevicePublics, PublicKeys, UnlockAuthKey};
 use crate::memory::encoding::{base32_prefix, dec, enc};
 use crate::memory::grant::{GrantWire, open_grant};
@@ -196,7 +196,12 @@ impl Handshake {
 /// these at a temp dir.
 #[derive(Debug, Clone)]
 pub struct KeyPaths {
+    /// `data_keys.enc` from build steps 0–2a (`K`, project names, under the
+    /// machine-bound key). The key agent moves it into `device_keys_sealed`
+    /// and `project_names` at the first unlock and deletes it.
     pub data_keys: PathBuf,
+    /// `project_names.json`: `h1.` project hash → readable project key.
+    pub project_names: PathBuf,
     pub trust: PathBuf,
     /// The plain step-1 file; the key agent seals it into
     /// `device_keys_sealed` and deletes it.
@@ -225,6 +230,7 @@ impl KeyPaths {
     pub fn in_dir(dir: &Path) -> Self {
         Self {
             data_keys: dir.join("data_keys.enc"),
+            project_names: dir.join("project_names.json"),
             trust: dir.join("cred_state.json"),
             device_keys: dir.join("device_keys"),
             device_keys_sealed: dir.join("device_keys.sealed"),
@@ -301,7 +307,7 @@ fn check_state(state: &AccountState) -> Result<()> {
 
 /// The account state stored for a verified Astation (already checked against
 /// its signature when it was accepted).
-fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>> {
+pub(crate) fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>> {
     entry
         .account_state
         .as_ref()
@@ -312,6 +318,38 @@ fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>> {
             AccountState::parse(&dec(&bytes)?)
         })
         .transpose()
+}
+
+/// What the latest signed account state says for this device and
+/// `astation_id`: the one source of the encryption mode and kid (build
+/// step 2b). `data_account` is the Astation id when it isn't verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMode {
+    pub mode: EncryptionMode,
+    pub data_account: String,
+    pub kid: Option<String>,
+}
+
+/// Unverified devices are `off`: they never obey stored state, which may
+/// come from the old unauthenticated path. A verified device without a
+/// signed state yet must not guess: that is an error.
+pub fn account_mode(trust_path: &Path, astation_id: &str) -> Result<AccountMode> {
+    let trust = TrustStore::load_from(trust_path)?;
+    let Some(entry) = trust.verified(astation_id) else {
+        return Ok(AccountMode {
+            mode: EncryptionMode::Off,
+            data_account: astation_id.into(),
+            kid: None,
+        });
+    };
+    let state = stored_state(entry)?.ok_or_else(|| {
+        anyhow!("waiting for Astation's signed encryption state; reconnect to Astation")
+    })?;
+    Ok(AccountMode {
+        mode: state.mode,
+        data_account: state.account,
+        kid: state.kid,
+    })
 }
 
 /// Installs a signed `K` grant for this verified device. The grant is opened
@@ -733,6 +771,7 @@ mod tests {
         assert_eq!(paths.device_keys_sealed, std::path::Path::new("/x/device_keys.sealed"));
         assert_eq!(paths.device_keys_next, std::path::Path::new("/x/device_keys.sealed.next"));
         assert_eq!(paths.unlock_auth_key, std::path::Path::new("/x/unlock_auth_key"));
+        assert_eq!(paths.project_names, std::path::Path::new("/x/project_names.json"));
     }
 
     #[test]
@@ -898,6 +937,41 @@ mod tests {
         )
         .unwrap();
         (paths, agent, fake, reveal.device_pub)
+    }
+
+    #[test]
+    fn the_mode_comes_from_the_signed_state_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _, fake, _) = verify(dir.path(), EncryptionMode::On);
+        assert_eq!(
+            account_mode(&paths.trust, ASTATION_ID).unwrap(),
+            AccountMode {
+                mode: EncryptionMode::On,
+                data_account: "acct".into(),
+                kid: Some("0123abcd".into()),
+            }
+        );
+        apply_account_state(
+            &paths,
+            ASTATION_ID,
+            Some(&signed_state(&fake, EncryptionMode::Disabling, 2)),
+        )
+        .unwrap();
+        assert_eq!(
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
+            EncryptionMode::Disabling
+        );
+        // Unverified: off, whatever any file says.
+        assert_eq!(
+            account_mode(&paths.trust, "astation-2").unwrap(),
+            AccountMode {
+                mode: EncryptionMode::Off,
+                data_account: "astation-2".into(),
+                kid: None,
+            }
+        );
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert_eq!(trust.verified_entries().count(), 1);
     }
 
     #[test]

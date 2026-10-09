@@ -22,6 +22,7 @@ pub mod grant;
 pub mod storage_key;
 pub mod key_agent;
 pub mod account_keys;
+pub mod project_names;
 pub mod unlock;
 #[cfg(unix)]
 pub mod agent_socket;
