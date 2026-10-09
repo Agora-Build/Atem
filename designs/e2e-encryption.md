@@ -954,7 +954,9 @@ A plain credential value is never written to disk anywhere.
   per scope, highest `blob_version` seen, the current unlock ticket, the
   latest signed account state, scope directory and revocation list, the
   home Astation that holds the storage key, the last storage kid it is
-  known to hold, and every storage kid the device abandoned.
+  known to hold, and every storage kid the device abandoned. Every
+  read-modify-write of it holds an `flock` on `cred_state.lock`, so the key
+  agent and other atem commands never drop each other's changes.
 - `key-agent.log`; the agent socket `agent.sock` and its `agent.lock` (in
   `$XDG_RUNTIME_DIR/atem/` when set, else here); `key_agent.lock`, which
   the one agent serving these key files holds (`flock`) for its life, and
