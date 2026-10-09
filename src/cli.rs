@@ -1579,7 +1579,8 @@ async fn run_device_verification(
     let code = handshake.safety_code(&astation);
 
     let mut trust = TrustStore::load_from(&paths.trust)?;
-    trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code);
+    let transcript = handshake.transcript(&astation);
+    trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code, &transcript);
     trust.save_to(&paths.trust)?;
 
     let outcome: Result<()> = async {

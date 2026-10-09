@@ -89,6 +89,18 @@ pub fn safety_code(reveal: &Reveal, astation: &AstationKeys) -> String {
     format!("{}-{}-{}", &raw[..4], &raw[4..8], &raw[8..])
 }
 
+/// Binds a device certificate to one ceremony:
+/// `SHA-256(enc("atem-verify-transcript-v1", commitment, nonce_a, nonce_s))`.
+pub fn transcript_for(commitment: &[u8; 32], nonce_a: &[u8; 32], nonce_s: &[u8; 32]) -> [u8; 32] {
+    Sha256::digest(enc(&[
+        b"atem-verify-transcript-v1",
+        commitment,
+        nonce_a,
+        nonce_s,
+    ]))
+    .into()
+}
+
 pub struct Handshake {
     keys: DeviceKeys,
     nonce_a: [u8; 32],
@@ -116,6 +128,10 @@ impl Handshake {
 
     pub fn safety_code(&self, astation: &AstationKeys) -> String {
         safety_code(&self.reveal(), astation)
+    }
+
+    pub fn transcript(&self, astation: &AstationKeys) -> [u8; 32] {
+        transcript_for(&self.commitment(), &self.nonce_a, &astation.nonce_s)
     }
 
     pub fn keys(&self) -> &DeviceKeys {
@@ -290,8 +306,16 @@ impl VerifiedForTest {
         };
         let code = handshake.safety_code(&astation);
         let trust_path = crate::memory::trust::trust_path_for(data_keys_path);
+        let transcript = handshake.transcript(&astation);
         let mut trust = TrustStore::default();
-        trust.set_pending(astation_id, "dev-1", handshake.keys(), &astation, &code);
+        trust.set_pending(
+            astation_id,
+            "dev-1",
+            handshake.keys(),
+            &astation,
+            &code,
+            &transcript,
+        );
         let reveal = handshake.reveal();
         let certificate = DeviceVerified {
             account: account.into(),
@@ -300,6 +324,7 @@ impl VerifiedForTest {
             device_pub: reveal.device_pub,
             device_sign_pub: reveal.device_sign_pub,
             unlock_auth_pub: reveal.unlock_auth_pub,
+            transcript,
             epoch: 1,
         };
         trust
@@ -442,8 +467,16 @@ mod tests {
             nonce_s: [7; 32],
         };
         let code = handshake.safety_code(&astation);
+        let transcript = handshake.transcript(&astation);
         let mut trust = TrustStore::default();
-        trust.set_pending(ASTATION_ID, "dev-1", handshake.keys(), &astation, &code);
+        trust.set_pending(
+            ASTATION_ID,
+            "dev-1",
+            handshake.keys(),
+            &astation,
+            &code,
+            &transcript,
+        );
         trust.save_to(&paths.trust).unwrap();
         let reveal = handshake.reveal();
         let certificate = DeviceVerified {
@@ -453,6 +486,7 @@ mod tests {
             device_pub: reveal.device_pub,
             device_sign_pub: reveal.device_sign_pub,
             unlock_auth_pub: reveal.unlock_auth_pub,
+            transcript,
             epoch: 1,
         };
         let grants = if mode.requires_key() {
@@ -592,5 +626,168 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("signed encryption state"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::memory::crypto::{EncryptionContext, EncryptionMode};
+    use crate::memory::grant::seal_k_grant;
+    use crate::memory::statements::{DeviceVerified, FakeAstation};
+
+    const ASTATION_ID: &str = "astation-1";
+
+    fn state(
+        fake: &FakeAstation,
+        mode: EncryptionMode,
+        kid: Option<&str>,
+        epoch: u64,
+    ) -> SignedWire {
+        fake.sign(
+            &AccountState {
+                account: "acct".into(),
+                sign_gen: 1,
+                mode,
+                kid: kid.map(str::to_string),
+                epoch,
+            }
+            .encode(),
+        )
+    }
+
+    /// Starts a ceremony with `keys` and leaves its pending pin in the trust
+    /// store; returns the handshake and the certificate Astation would sign.
+    fn start(
+        paths: &KeyPaths,
+        fake: &FakeAstation,
+        keys: DeviceKeys,
+        nonce_s: u8,
+        epoch: u64,
+    ) -> (Handshake, DeviceVerified) {
+        let handshake = Handshake::start(keys);
+        let astation = AstationKeys {
+            sign_pub: fake.sign_pub(),
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [nonce_s; 32],
+        };
+        let code = handshake.safety_code(&astation);
+        let transcript = handshake.transcript(&astation);
+        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+        trust.set_pending(
+            ASTATION_ID,
+            "dev-1",
+            handshake.keys(),
+            &astation,
+            &code,
+            &transcript,
+        );
+        trust.save_to(&paths.trust).unwrap();
+        let reveal = handshake.reveal();
+        let certificate = DeviceVerified {
+            account: "acct".into(),
+            sign_gen: 1,
+            device_id: "dev-1".into(),
+            device_pub: reveal.device_pub,
+            device_sign_pub: reveal.device_sign_pub,
+            unlock_auth_pub: reveal.unlock_auth_pub,
+            transcript,
+            epoch,
+        };
+        (handshake, certificate)
+    }
+
+    #[test]
+    fn replayed_old_certificate_cannot_roll_a_verified_device_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
+        let old_certificate = fake.sign(&certificate.encode());
+        let old_off = state(&fake, EncryptionMode::Off, None, 1);
+        complete_verification(
+            &paths,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &old_certificate,
+            &old_off,
+            &[],
+        )
+        .unwrap();
+        // Later Astation turns encryption on and grants K.
+        let device_pub = certificate.device_pub;
+        let on = state(&fake, EncryptionMode::On, Some("0123abcd"), 2);
+        apply_account_state(&paths, ASTATION_ID, Some(&on)).unwrap();
+        let grant = seal_k_grant(&fake, "acct", "dev-1", device_pub, "0123abcd", [42; 32]);
+        apply_grant(&paths, ASTATION_ID, Some(&grant)).unwrap();
+
+        // Re-verification with the same saved keys; the relay withholds the
+        // new certificate and replays the recorded old one with the old state.
+        let keys = device_keys_for_verification(&paths).unwrap();
+        let (handshake, _) = start(&paths, &fake, keys, 8, 3);
+        let result = complete_verification(
+            &paths,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &old_certificate,
+            &old_off,
+            &[],
+        );
+        assert!(result.is_err(), "a replayed certificate must be rejected");
+
+        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
+        assert_eq!(context.mode, EncryptionMode::On);
+        assert!(
+            context.seal("mem", "content", b"x").is_ok(),
+            "K must survive"
+        );
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert_eq!(trust.verified(ASTATION_ID).unwrap().account_epoch, 2);
+    }
+
+    #[test]
+    fn legitimate_re_verification_keeps_mode_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
+        let device_pub = certificate.device_pub;
+        let on = state(&fake, EncryptionMode::On, Some("0123abcd"), 2);
+        let grant = seal_k_grant(&fake, "acct", "dev-1", device_pub, "0123abcd", [42; 32]);
+        complete_verification(
+            &paths,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &on,
+            &[grant],
+        )
+        .unwrap();
+
+        // Astation signs the new certificate at epoch 3 and re-signs the
+        // current state at 4; it sends no grant this time.
+        let keys = device_keys_for_verification(&paths).unwrap();
+        let (handshake, certificate) = start(&paths, &fake, keys, 8, 3);
+        let on_again = state(&fake, EncryptionMode::On, Some("0123abcd"), 4);
+        complete_verification(
+            &paths,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &on_again,
+            &[],
+        )
+        .unwrap();
+
+        let context = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys).unwrap();
+        assert_eq!(context.mode, EncryptionMode::On);
+        assert!(
+            context.seal("mem", "content", b"x").is_ok(),
+            "K must survive"
+        );
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        let entry = trust.verified(ASTATION_ID).unwrap();
+        assert_eq!((entry.epoch_floor, entry.account_epoch), (3, 4));
     }
 }

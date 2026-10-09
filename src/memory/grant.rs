@@ -136,7 +136,14 @@ mod tests {
             nonce_s: [7; 32],
         };
         let mut store = TrustStore::default();
-        store.set_pending("astation-1", "dev-1", keys, &astation, "AAAA-BBBB-CCCC");
+        store.set_pending(
+            "astation-1",
+            "dev-1",
+            keys,
+            &astation,
+            "AAAA-BBBB-CCCC",
+            &[8; 32],
+        );
         let certificate = DeviceVerified {
             account: "acct".into(),
             sign_gen: 1,
@@ -144,6 +151,7 @@ mod tests {
             device_pub: keys.device_pub(),
             device_sign_pub: keys.device_sign_pub(),
             unlock_auth_pub: keys.unlock_auth_pub(),
+            transcript: [8; 32],
             epoch: 1,
         };
         store

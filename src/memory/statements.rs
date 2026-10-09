@@ -105,6 +105,10 @@ pub struct DeviceVerified {
     pub device_pub: [u8; 32],
     pub device_sign_pub: [u8; 32],
     pub unlock_auth_pub: [u8; 32],
+    /// `transcript_for(commitment, nonce_a, nonce_s)` of the ceremony this
+    /// certificate answers, so a recorded certificate can't be replayed into
+    /// a later ceremony that reuses the same device keys.
+    pub transcript: [u8; 32],
     pub epoch: u64,
 }
 
@@ -120,12 +124,13 @@ impl DeviceVerified {
             &self.device_pub,
             &self.device_sign_pub,
             &self.unlock_auth_pub,
+            &self.transcript,
             &u64_field(self.epoch),
         ])
     }
 
     pub fn parse(fields: &[Vec<u8>]) -> Result<Self> {
-        expect(fields, Self::LABEL, 8)?;
+        expect(fields, Self::LABEL, 9)?;
         Ok(Self {
             account: text(&fields[1])?,
             sign_gen: read_u64(&fields[2])?,
@@ -133,7 +138,8 @@ impl DeviceVerified {
             device_pub: key32(&fields[4])?,
             device_sign_pub: key32(&fields[5])?,
             unlock_auth_pub: key32(&fields[6])?,
-            epoch: read_u64(&fields[7])?,
+            transcript: key32(&fields[7])?,
+            epoch: read_u64(&fields[8])?,
         })
     }
 }
@@ -314,12 +320,15 @@ mod tests {
             device_pub: [1; 32],
             device_sign_pub: [2; 32],
             unlock_auth_pub: [3; 32],
+            transcript: [4; 32],
             epoch: 9,
         };
         let fields = dec(&verified.encode()).unwrap();
+        assert_eq!(fields.len(), 9);
+        assert_eq!(fields[7], vec![4; 32]);
         assert!(AccountState::parse(&fields).is_err());
         assert_eq!(DeviceVerified::parse(&fields).unwrap(), verified);
-        assert!(DeviceVerified::parse(&fields[..7]).is_err());
+        assert!(DeviceVerified::parse(&fields[..8]).is_err());
     }
 
     #[test]

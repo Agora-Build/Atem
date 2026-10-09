@@ -24,12 +24,16 @@ pub struct AstationTrust {
     pub device_sign_pub: String,
     pub unlock_auth_pub: String,
     pub safety_code: String,
+    /// Base64 `transcript_for(commitment, nonce_a, nonce_s)` of the ceremony
+    /// that produced this entry; the certificate must carry the same value.
+    #[serde(default)]
+    pub transcript: String,
     pub epoch_floor: u64,
     pub account_state: Option<SignedWire>,
     pub account_epoch: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrustStore {
     #[serde(default = "store_version")]
     version: u8,
@@ -84,6 +88,7 @@ impl TrustStore {
         keys: &DeviceKeys,
         astation: &AstationKeys,
         code: &str,
+        transcript: &[u8; 32],
     ) {
         self.pending.insert(
             astation_id.into(),
@@ -98,6 +103,7 @@ impl TrustStore {
                 device_sign_pub: STANDARD.encode(keys.device_sign_pub()),
                 unlock_auth_pub: STANDARD.encode(keys.unlock_auth_pub()),
                 safety_code: code.into(),
+                transcript: STANDARD.encode(transcript),
                 epoch_floor: 0,
                 account_state: None,
                 account_epoch: 0,
@@ -110,7 +116,12 @@ impl TrustStore {
     }
 
     /// Promotes the pending entry once Astation's signed certificate names
-    /// exactly the keys this device revealed.
+    /// exactly the keys this device revealed, in this ceremony.
+    ///
+    /// Re-verifying an Astation this device already trusts never moves it
+    /// backwards: a certificate older than the applied account state is
+    /// rejected, the epoch floor only rises, and the stored signed state is
+    /// kept until a newer one arrives.
     pub fn confirm(&mut self, astation_id: &str, signed: &SignedWire) -> Result<DeviceVerified> {
         let entry = self
             .pending
@@ -125,10 +136,44 @@ impl TrustStore {
         {
             bail!("Astation's device certificate names different keys than this device revealed");
         }
+        if entry.transcript.is_empty()
+            || STANDARD.encode(certificate.transcript) != entry.transcript
+        {
+            bail!("Astation's device certificate is for a different verification attempt");
+        }
+        // The earlier verification with this Astation, when its epochs are
+        // comparable with the new certificate's (same account and signer).
+        let previous = self.astations.get(astation_id).filter(|previous| {
+            previous.data_account == certificate.account
+                && previous.sign_gen == certificate.sign_gen
+                && previous.astation_sign_pub == entry.astation_sign_pub
+        });
+        if let Some(previous) = previous
+            && certificate.epoch < previous.account_epoch
+        {
+            bail!(
+                "Astation's device certificate is older than the state this device already applied"
+            );
+        }
+        let kept = previous.map(|previous| {
+            (
+                previous
+                    .epoch_floor
+                    .max(previous.account_epoch)
+                    .max(certificate.epoch),
+                previous.account_state.clone(),
+                previous.account_epoch,
+            )
+        });
         let mut entry = self.pending.remove(astation_id).expect("checked above");
         entry.data_account = certificate.account.clone();
         entry.sign_gen = certificate.sign_gen;
         entry.epoch_floor = certificate.epoch;
+        if let Some((floor, state, epoch)) = kept {
+            entry.epoch_floor = floor;
+            entry.account_state = state;
+            entry.account_epoch = epoch;
+        }
         self.astations.insert(astation_id.into(), entry);
         Ok(certificate)
     }
@@ -192,6 +237,7 @@ mod tests {
     use crate::memory::statements::FakeAstation;
 
     const ASTATION: &str = "astation-1";
+    const TRANSCRIPT: [u8; 32] = [8; 32];
 
     fn pending(fake: &FakeAstation) -> (TrustStore, DeviceKeys) {
         let keys = DeviceKeys::generate();
@@ -202,7 +248,14 @@ mod tests {
             nonce_s: [7; 32],
         };
         let mut store = TrustStore::default();
-        store.set_pending(ASTATION, "dev-1", &keys, &astation, "AAAA-BBBB-CCCC");
+        store.set_pending(
+            ASTATION,
+            "dev-1",
+            &keys,
+            &astation,
+            "AAAA-BBBB-CCCC",
+            &TRANSCRIPT,
+        );
         (store, keys)
     }
 
@@ -214,6 +267,7 @@ mod tests {
             device_pub: keys.device_pub(),
             device_sign_pub: keys.device_sign_pub(),
             unlock_auth_pub: keys.unlock_auth_pub(),
+            transcript: TRANSCRIPT,
             epoch,
         }
     }
@@ -353,6 +407,83 @@ mod tests {
         assert_eq!(
             store.verified(ASTATION).unwrap().account_state.as_ref(),
             Some(&first)
+        );
+    }
+
+    #[test]
+    fn certificate_from_another_ceremony_is_rejected() {
+        let fake = FakeAstation::new();
+        let (mut store, keys) = pending(&fake);
+        let mut replayed = certificate(&keys, 5);
+        replayed.transcript = [9; 32];
+        let error = store
+            .confirm(ASTATION, &fake.sign(&replayed.encode()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different verification attempt"), "{error}");
+        assert!(store.verified(ASTATION).is_none());
+    }
+
+    /// Re-verifies `keys` with a fresh pending entry and a certificate at `epoch`.
+    fn reverify(
+        store: &mut TrustStore,
+        fake: &FakeAstation,
+        keys: &DeviceKeys,
+        epoch: u64,
+    ) -> Result<DeviceVerified> {
+        let astation = AstationKeys {
+            sign_pub: fake.sign_pub(),
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [7; 32],
+        };
+        store.set_pending(
+            ASTATION,
+            "dev-1",
+            keys,
+            &astation,
+            "DDDD-EEEE-FFFF",
+            &TRANSCRIPT,
+        );
+        store.confirm(ASTATION, &fake.sign(&certificate(keys, epoch).encode()))
+    }
+
+    #[test]
+    fn re_verification_never_lowers_the_floor_or_drops_the_state() {
+        let fake = FakeAstation::new();
+        let (mut store, keys) = pending(&fake);
+        store
+            .confirm(ASTATION, &fake.sign(&certificate(&keys, 1).encode()))
+            .unwrap();
+        let on = fake.sign(&state(EncryptionMode::On, 2).encode());
+        store.accept_account_state(ASTATION, &on).unwrap().unwrap();
+
+        // A certificate older than the applied state is refused outright.
+        assert!(reverify(&mut store, &fake, &keys, 1).is_err());
+        store.remove_pending(ASTATION);
+        let trust = store.verified(ASTATION).unwrap();
+        assert_eq!((trust.epoch_floor, trust.account_epoch), (1, 2));
+
+        reverify(&mut store, &fake, &keys, 10).unwrap();
+        let trust = store.verified(ASTATION).unwrap();
+        assert_eq!(trust.epoch_floor, 10);
+        assert_eq!(trust.account_state.as_ref(), Some(&on));
+        assert_eq!(trust.account_epoch, 2);
+        assert_eq!(trust.safety_code, "DDDD-EEEE-FFFF");
+
+        // A legitimate re-verification with an older certificate epoch.
+        reverify(&mut store, &fake, &keys, 5).unwrap();
+        let trust = store.verified(ASTATION).unwrap();
+        assert_eq!(trust.epoch_floor, 10, "the floor never goes down");
+        assert_eq!(trust.account_state.as_ref(), Some(&on));
+        assert_eq!(trust.account_epoch, 2);
+        assert!(
+            store
+                .accept_account_state(
+                    ASTATION,
+                    &fake.sign(&state(EncryptionMode::Off, 9).encode())
+                )
+                .is_err()
         );
     }
 
