@@ -1,7 +1,7 @@
 //! Device verification: commit-then-reveal, a 12-character safety code both
 //! sides show, then applying what a verified Astation sends.
 //! See designs/e2e-encryption.md "Devices → Verification".
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::path::{Path, PathBuf};
 
@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 
 use crate::memory::crypto::EncryptionContext;
 use crate::memory::device_keys::DeviceKeys;
-use crate::memory::encoding::{base32_prefix, enc};
+use crate::memory::encoding::{base32_prefix, dec, enc};
 use crate::memory::grant::{GrantWire, open_grant};
 use crate::memory::statements::{AccountState, SignedWire};
-use crate::memory::trust::TrustStore;
+use crate::memory::trust::{AstationTrust, TrustStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AstationKeys {
@@ -196,13 +196,9 @@ pub fn apply_account_state(
     let Some(state) = trust.accept_account_state(astation_id, signed)? else {
         return Ok(Applied::Unchanged);
     };
-    // Checked before anything is saved: an invalid kid leaves the trust store
-    // and data_keys untouched.
-    if let Some(kid) = state.kid.as_deref()
-        && !crate::memory::crypto::valid_kid(kid)
-    {
-        return Err(anyhow!("signed account state has an invalid key id"));
-    }
+    // Checked before anything is saved: a bad kid leaves the trust store and
+    // data_keys untouched.
+    check_state(&state)?;
     EncryptionContext::update_mode_at(
         &paths.data_keys,
         astation_id,
@@ -212,6 +208,35 @@ pub fn apply_account_state(
     )?;
     trust.save_to(&paths.trust)?;
     Ok(Applied::ModeChanged(state))
+}
+
+/// A signed state atem can apply: a well-formed kid, and one whenever the
+/// mode needs `K`.
+fn check_state(state: &AccountState) -> Result<()> {
+    if let Some(kid) = state.kid.as_deref()
+        && !crate::memory::crypto::valid_kid(kid)
+    {
+        bail!("signed account state has an invalid key id");
+    }
+    if state.mode.requires_key() && state.kid.is_none() {
+        bail!("signed account state needs an encryption key but names no key id");
+    }
+    Ok(())
+}
+
+/// The account state stored for a verified Astation (already checked against
+/// its signature when it was accepted).
+fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>> {
+    entry
+        .account_state
+        .as_ref()
+        .map(|signed| {
+            let bytes = STANDARD
+                .decode(&signed.statement)
+                .context("stored signed state is not base64")?;
+            AccountState::parse(&dec(&bytes)?)
+        })
+        .transpose()
 }
 
 /// Installs a signed `K` grant for this verified device.
@@ -243,10 +268,19 @@ pub fn apply_grant(
     Ok(Applied::KeyInstalled(opened.kid))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerificationOutcome {
+    /// The signed mode needs `K` and this device doesn't hold it yet.
+    pub key_needed: bool,
+}
+
 /// Finishes verification once the user confirmed the code on this device and
-/// Astation sent its signed certificate: pins become final, the fresh device
-/// keys are saved, the old plain key is deleted, and the signed state and
-/// grants are applied.
+/// Astation sent its signed certificate.
+///
+/// Everything is checked in memory first: the certificate, the signed state
+/// and every grant. Only when all of it holds are the device keys saved, the
+/// state and grants applied, the pins made final and the old plain key
+/// deleted. On any failure nothing is written.
 pub fn complete_verification(
     paths: &KeyPaths,
     astation_id: &str,
@@ -254,21 +288,54 @@ pub fn complete_verification(
     device_verified: &SignedWire,
     account_state: &SignedWire,
     grants: &[GrantWire],
-) -> Result<()> {
-    let mut trust = TrustStore::load_from(&paths.trust)?;
-    trust.confirm(astation_id, device_verified)?;
+) -> Result<VerificationOutcome> {
+    let mut staged = TrustStore::load_from(&paths.trust)?;
+    staged.confirm(astation_id, device_verified)?;
+    let changed = staged.accept_account_state(astation_id, account_state)?;
+    let entry = staged
+        .verified(astation_id)
+        .expect("confirmed above")
+        .clone();
+    let state = match changed {
+        Some(state) => state,
+        None => stored_state(&entry)?.ok_or_else(|| anyhow!("no signed account state"))?,
+    };
+    check_state(&state)?;
+    let opened = grants
+        .iter()
+        .map(|grant| open_grant(&entry, &keys, grant))
+        .collect::<Result<Vec<_>>>()?;
+    if opened
+        .iter()
+        .any(|grant| Some(grant.kid.as_str()) != state.kid.as_deref())
+    {
+        bail!("a key grant names a different key id than the signed account state");
+    }
+
     keys.save_to(&paths.device_keys)?;
-    trust.save_to(&paths.trust)?;
+    EncryptionContext::update_mode_at(
+        &paths.data_keys,
+        astation_id,
+        &state.account,
+        state.mode,
+        state.kid.as_deref(),
+    )?;
+    for grant in opened {
+        EncryptionContext::install_grant_at(
+            &paths.data_keys,
+            astation_id,
+            &entry.data_account,
+            &grant.kid,
+            grant.key,
+        )?;
+    }
+    staged.save_to(&paths.trust)?;
     match std::fs::remove_file(&paths.legacy_device_key) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    apply_account_state(paths, astation_id, Some(account_state))?;
-    for grant in grants {
-        apply_grant(paths, astation_id, Some(grant))?;
-    }
-    Ok(())
+    Ok(VerificationOutcome { key_needed: false })
 }
 
 /// The device keys to verify with: the saved ones when this machine already
@@ -584,6 +651,31 @@ mod tests {
     }
 
     #[test]
+    fn signed_state_needing_a_key_without_kid_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, fake, _) = verify(dir.path(), EncryptionMode::On);
+        let no_kid = fake.sign(
+            &AccountState {
+                account: "acct".into(),
+                sign_gen: 1,
+                mode: EncryptionMode::Disabling,
+                kid: None,
+                epoch: 2,
+            }
+            .encode(),
+        );
+        assert!(apply_account_state(&paths, ASTATION_ID, Some(&no_kid)).is_err());
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert_eq!(trust.verified(ASTATION_ID).unwrap().account_epoch, 1);
+        assert_eq!(
+            EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)
+                .unwrap()
+                .mode,
+            EncryptionMode::On
+        );
+    }
+
+    #[test]
     fn unverified_devices_ignore_everything() {
         let dir = tempfile::tempdir().unwrap();
         let paths = KeyPaths::in_dir(dir.path());
@@ -630,7 +722,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod replay_tests {
+mod ceremony_tests {
     use super::*;
     use crate::memory::crypto::{EncryptionContext, EncryptionMode};
     use crate::memory::grant::seal_k_grant;
@@ -789,5 +881,124 @@ mod replay_tests {
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         let entry = trust.verified(ASTATION_ID).unwrap();
         assert_eq!((entry.epoch_floor, entry.account_epoch), (3, 4));
+    }
+
+    /// What a first verification attempt may have left on disk.
+    fn assert_nothing_written(paths: &KeyPaths) {
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert!(
+            trust.verified(ASTATION_ID).is_none(),
+            "no verified entry may be saved"
+        );
+        assert!(
+            !paths.device_keys.exists(),
+            "device_keys must not be written"
+        );
+        assert!(!paths.data_keys.exists(), "data_keys must not be written");
+        assert!(
+            paths.legacy_device_key.exists(),
+            "the old device_key must not be deleted"
+        );
+    }
+
+    /// Runs a first verification with certificate epoch `cert_epoch`, the
+    /// given signed state and grants (built for this device).
+    fn first_verification(
+        dir: &Path,
+        cert_epoch: u64,
+        make: impl FnOnce(&FakeAstation, [u8; 32]) -> (SignedWire, Vec<GrantWire>),
+    ) -> (KeyPaths, Result<VerificationOutcome>) {
+        let paths = KeyPaths::in_dir(dir);
+        std::fs::write(&paths.legacy_device_key, [1u8; 32]).unwrap();
+        let fake = FakeAstation::new();
+        let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, cert_epoch);
+        let (account_state, grants) = make(&fake, certificate.device_pub);
+        let result = complete_verification(
+            &paths,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &account_state,
+            &grants,
+        );
+        (paths, result)
+    }
+
+    #[test]
+    fn account_state_may_follow_the_certificate_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 5, |fake, _| {
+            (state(fake, EncryptionMode::Off, None, 6), vec![])
+        });
+        result.unwrap();
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        let entry = trust.verified(ASTATION_ID).unwrap();
+        assert_eq!((entry.epoch_floor, entry.account_epoch), (5, 6));
+    }
+
+    #[test]
+    fn account_state_older_than_the_certificate_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 5, |fake, _| {
+            (state(fake, EncryptionMode::Off, None, 4), vec![])
+        });
+        assert!(result.is_err());
+        assert_nothing_written(&paths);
+    }
+
+    #[test]
+    fn invalid_kid_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+            (state(fake, EncryptionMode::On, Some("XYZ"), 2), vec![])
+        });
+        assert!(result.is_err());
+        assert_nothing_written(&paths);
+    }
+
+    #[test]
+    fn key_mode_without_kid_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+            (state(fake, EncryptionMode::On, None, 2), vec![])
+        });
+        assert!(result.is_err());
+        assert_nothing_written(&paths);
+    }
+
+    #[test]
+    fn bad_grant_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+            let other_device = DeviceKeys::generate().device_pub();
+            (
+                state(fake, EncryptionMode::On, Some("0123abcd"), 2),
+                vec![seal_k_grant(
+                    fake,
+                    "acct",
+                    "dev-1",
+                    other_device,
+                    "0123abcd",
+                    [42; 32],
+                )],
+            )
+        });
+        assert!(result.is_err());
+        assert_nothing_written(&paths);
+    }
+
+    #[test]
+    fn grant_for_another_kid_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, result) = first_verification(dir.path(), 1, |fake, device_pub| {
+            (
+                state(fake, EncryptionMode::On, Some("0123abcd"), 2),
+                vec![seal_k_grant(
+                    fake, "acct", "dev-1", device_pub, "89abcdef", [42; 32],
+                )],
+            )
+        });
+        assert!(result.is_err());
+        assert_nothing_written(&paths);
     }
 }
