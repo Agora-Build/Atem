@@ -1039,9 +1039,10 @@ impl KeyAgentApi for std::sync::Mutex<KeyAgent> {
     }
 }
 
-/// The error text of a result that must fail (works for any `T`, Debug or not).
 /// This user's agent, started on first use (lazily: nothing connects until
 /// a request is made).
+// Used by Tasks 8-10; remove the allow then.
+#[allow(dead_code)]
 pub fn default_agent() -> Box<dyn KeyAgentApi> {
     #[cfg(unix)]
     {
@@ -1054,6 +1055,8 @@ pub fn default_agent() -> Box<dyn KeyAgentApi> {
 }
 
 /// The running agent, without starting one.
+// Used by Tasks 8-10; remove the allow then.
+#[allow(dead_code)]
 pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
     #[cfg(unix)]
     {
@@ -1076,6 +1079,7 @@ impl KeyAgentApi for NoAgent {
     }
 }
 
+/// The error text of a result that must fail (works for any `T`, Debug or not).
 #[cfg(test)]
 pub(crate) fn error_of<T>(result: Result<T>) -> String {
     match result {

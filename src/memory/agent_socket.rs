@@ -3,14 +3,24 @@
 //! need keys connect, starting the agent when none is running.
 //! See designs/e2e-encryption.md "Keys on disk (atem)".
 //!
+//! Both sides check who is on the other end: the agent refuses peers that
+//! aren't its user, and the client refuses a socket whose listener isn't its
+//! user (a directory someone else can write to could hold a fake agent that
+//! collects keys). The socket's directories must be real (no symlinks), owned
+//! by this user and not writable by anyone else.
+//!
 //! Serialized requests and replies can carry secrets, so they live in
-//! `Zeroizing` buffers that are dropped right after use, and nothing here
-//! goes through a `serde_json::Value` or a `BufReader` (which would keep
-//! unzeroized copies).
+//! `Zeroizing` buffers that are dropped right after use. Nothing here goes
+//! through a `serde_json::Value`, a `BufReader`, or serde's internally tagged
+//! enum buffering for a message that carries a secret.
+// Used by Tasks 8-10 (cred commands, grant opening); remove then.
+#![allow(dead_code)]
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -21,14 +31,21 @@ use crate::memory::key_agent::{KeyAgent, KeyAgentApi, PROTOCOL_VERSION, Reply, R
 use crate::memory::verification::KeyPaths;
 
 /// No request or reply is anywhere near this; it only bounds a misbehaving peer.
-const MAX_LINE: usize = 16 << 20;
+const MAX_LINE: usize = 1 << 20;
+/// A connection that says nothing for this long is dropped.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// `$XDG_RUNTIME_DIR/atem/agent.sock`, else `~/.config/atem/agent.sock`.
+fn own_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+/// `$XDG_RUNTIME_DIR/atem/agent.sock` when that directory is safe, else
+/// `~/.config/atem/agent.sock`.
 pub fn agent_socket_path() -> PathBuf {
-    socket_path_from(
-        std::env::var_os("XDG_RUNTIME_DIR"),
-        &crate::config::AtemConfig::config_dir(),
-    )
+    let config = crate::config::AtemConfig::config_dir();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty() && check_parent_dir(Path::new(dir), own_uid()).is_ok());
+    socket_path_from(runtime, &config)
 }
 
 fn socket_path_from(runtime_dir: Option<OsString>, config_dir: &Path) -> PathBuf {
@@ -40,6 +57,57 @@ fn socket_path_from(runtime_dir: Option<OsString>, config_dir: &Path) -> PathBuf
 
 pub fn agent_log_path() -> PathBuf {
     crate::config::AtemConfig::config_dir().join("key-agent.log")
+}
+
+/// A directory the socket's directory lives in: a real directory (not a
+/// symlink) owned by `uid` that nobody else can write to.
+fn check_parent_dir(dir: &Path, uid: u32) -> Result<()> {
+    let meta = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("cannot inspect {}", dir.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("{} is a symlink", dir.display());
+    }
+    if !meta.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    if meta.uid() != uid {
+        bail!("{} is owned by another user", dir.display());
+    }
+    if meta.mode() & 0o022 != 0 {
+        bail!("{} can be written by other users", dir.display());
+    }
+    Ok(())
+}
+
+/// The socket's own directory: created if missing, never a symlink, owned by
+/// `uid`; then tightened to 0700.
+fn prepare_socket_dir(dir: &Path, uid: u32) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "{} is a symlink; refusing to put the key agent socket there",
+                    dir.display()
+                );
+            }
+            if !meta.is_dir() {
+                bail!("{} is not a directory", dir.display());
+            }
+            if meta.uid() != uid {
+                bail!("{} is owned by another user", dir.display());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::create_dir(dir)
+                .with_context(|| format!("could not create {}", dir.display()))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,62 +128,160 @@ struct Envelope<'a> {
     v: u64,
 }
 
-#[derive(Deserialize)]
-struct VersionOnly {
-    v: Option<u64>,
+/// A growing buffer that wipes what it outgrows (`Vec` would leave the old
+/// allocation behind unwiped).
+struct WipingBuf(Zeroizing<Vec<u8>>);
+
+impl WipingBuf {
+    fn new() -> Self {
+        Self(Zeroizing::new(Vec::with_capacity(4096)))
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        let needed = self.0.len() + data.len();
+        if needed > self.0.capacity() {
+            let mut bigger = Zeroizing::new(Vec::with_capacity(needed.max(self.0.capacity() * 2)));
+            bigger.extend_from_slice(&self.0);
+            self.0 = bigger;
+        }
+        self.0.extend_from_slice(data);
+    }
+}
+
+impl Write for WipingBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.append(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn to_wiping_json<T: Serialize>(value: &T) -> Result<WipingBuf> {
+    let mut buf = WipingBuf::new();
+    serde_json::to_writer(&mut buf, value)?;
+    buf.append(b"\n");
+    Ok(buf)
 }
 
 pub(crate) fn encode_request(request: &Request) -> Result<Zeroizing<String>> {
-    let mut bytes = Zeroizing::new(Vec::with_capacity(4096));
-    serde_json::to_writer(
-        &mut *bytes,
-        &Envelope {
-            request,
-            v: PROTOCOL_VERSION,
-        },
-    )?;
-    bytes.push(b'\n');
-    let text = String::from_utf8(std::mem::take(&mut *bytes))
+    let mut buf = to_wiping_json(&Envelope {
+        request,
+        v: PROTOCOL_VERSION,
+    })?;
+    let text = String::from_utf8(std::mem::take(&mut *buf.0))
         .map_err(|_| anyhow!("key agent request is not UTF-8"))?;
     Ok(Zeroizing::new(text))
 }
 
+#[derive(Deserialize)]
+struct RequestHead {
+    v: Option<u64>,
+    op: Option<String>,
+}
+
+/// `load_unlocked` carries the device secrets: parsed straight from the line
+/// (the tagged `Request` would buffer them in serde's unwiped `Content`).
+#[derive(Deserialize)]
+struct LoadUnlockedWire {
+    device_id: String,
+    device: Zeroizing<String>,
+    device_sign: Zeroizing<String>,
+    unlock_auth: Zeroizing<String>,
+    storage_kid: String,
+    storage_key: Zeroizing<String>,
+}
+
 pub(crate) fn decode_request(line: &str) -> Result<Request> {
-    let version: VersionOnly =
-        serde_json::from_str(line).context("key agent request is not JSON")?;
-    match version.v {
+    let head: RequestHead = serde_json::from_str(line).context("key agent request is not JSON")?;
+    match head.v {
         Some(PROTOCOL_VERSION) => {}
         other => bail!(
             "unsupported key agent protocol version {}; this agent speaks v{PROTOCOL_VERSION}",
             other.map_or_else(|| "(none)".to_string(), |v| v.to_string())
         ),
     }
+    if head.op.as_deref() == Some("load_unlocked") {
+        let wire: LoadUnlockedWire =
+            serde_json::from_str(line).context("key agent request is malformed")?;
+        return Ok(Request::LoadUnlocked {
+            device_id: wire.device_id,
+            device: wire.device,
+            device_sign: wire.device_sign,
+            unlock_auth: wire.unlock_auth,
+            storage_kid: wire.storage_kid,
+            storage_key: wire.storage_key,
+        });
+    }
     serde_json::from_str(line).context("key agent request is malformed")
 }
 
+#[derive(Deserialize)]
+struct ResponseHead {
+    v: u64,
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    reply: Option<ReplyKind>,
+}
+
+#[derive(Deserialize)]
+struct ReplyKind {
+    kind: String,
+}
+
+/// The grant reply carries `K`: parsed straight from the line.
+#[derive(Deserialize)]
+struct GrantResponse {
+    reply: GrantReply,
+}
+
+#[derive(Deserialize)]
+struct GrantReply {
+    kid: String,
+    key: Zeroizing<String>,
+}
+
 pub(crate) fn decode_response(line: &str) -> Result<Reply> {
-    let response: Response =
-        serde_json::from_str(line.trim()).context("the key agent sent an unreadable reply")?;
-    if response.v != PROTOCOL_VERSION {
+    let line = line.trim();
+    let head: ResponseHead =
+        serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
+    if head.v != PROTOCOL_VERSION {
         bail!(
             "the running key agent speaks protocol v{}, this atem speaks v{PROTOCOL_VERSION}; stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry",
-            response.v
+            head.v
         );
     }
-    if !response.ok {
+    if !head.ok {
         bail!(
             "{}",
-            response
-                .error
+            head.error
                 .unwrap_or_else(|| "the key agent refused the request".into())
         );
     }
+    let kind = head
+        .reply
+        .ok_or_else(|| anyhow!("the key agent sent an empty reply"))?
+        .kind;
+    if kind == "grant" {
+        let grant: GrantResponse =
+            serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
+        return Ok(Reply::Grant {
+            kid: grant.reply.kid,
+            key: grant.reply.key,
+        });
+    }
+    let response: Response =
+        serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
     response
         .reply
         .ok_or_else(|| anyhow!("the key agent sent an empty reply"))
 }
 
-fn respond(agent: &Mutex<KeyAgent>, line: &str) -> Zeroizing<Vec<u8>> {
+fn respond(agent: &Mutex<KeyAgent>, line: &str) -> WipingBuf {
     let response = match decode_request(line).and_then(|request| agent.call(request)) {
         Ok(reply) => Response {
             v: PROTOCOL_VERSION,
@@ -130,35 +296,92 @@ fn respond(agent: &Mutex<KeyAgent>, line: &str) -> Zeroizing<Vec<u8>> {
             reply: None,
         },
     };
-    let mut bytes = Zeroizing::new(Vec::with_capacity(4096));
-    if serde_json::to_writer(&mut *bytes, &response).is_err() {
-        bytes.clear();
-        bytes.extend_from_slice(
-            br#"{"v":1,"ok":false,"error":"the key agent could not encode its reply"}"#,
+    to_wiping_json(&response).unwrap_or_else(|_| {
+        let mut buf = WipingBuf::new();
+        buf.append(
+            b"{\"v\":1,\"ok\":false,\"error\":\"the key agent could not encode its reply\"}\n",
         );
+        buf
+    })
+}
+
+/// Another key agent holds the lock or answers on the socket.
+#[derive(Debug)]
+pub struct AlreadyRunning(PathBuf);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a key agent is already running at {}", self.0.display())
     }
-    bytes.push(b'\n');
-    bytes
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+/// Lock files of the agents this process serves; held until it exits.
+static HELD_LOCKS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+
+/// An exclusive lock on `agent.lock` beside the socket, so two agents starting
+/// together can't both replace the socket. Waits briefly for a starting agent.
+fn lock_agent(socket: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_path = socket.with_file_name("agent.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("could not open {}", lock_path.display()))?;
+    for attempt in 0..30 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        if UnixStream::connect(socket).is_ok() {
+            return Err(AlreadyRunning(socket.to_path_buf()).into());
+        }
+        if attempt < 29 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(AlreadyRunning(socket.to_path_buf()).into())
 }
 
 /// Listens on `socket`: directory 0700, socket 0600. A socket file nobody
-/// answers on is left by an agent that died, and is replaced.
+/// answers on is left by an agent that died, and is replaced; anything else
+/// at that path is left alone and refused. The lock stays held while the
+/// process lives.
 pub fn bind(socket: &Path) -> Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
+    bind_as(socket, own_uid())
+}
+
+fn bind_as(socket: &Path, uid: u32) -> Result<tokio::net::UnixListener> {
     let dir = socket
         .parent()
         .ok_or_else(|| anyhow!("the agent socket path has no directory"))?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    if socket.exists() {
-        if UnixStream::connect(socket).is_ok() {
-            bail!("a key agent is already running at {}", socket.display());
+    prepare_socket_dir(dir, uid)?;
+    let lock = lock_agent(socket)?;
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket() {
+                bail!(
+                    "{} exists and is not a socket; refusing to replace it",
+                    socket.display()
+                );
+            }
+            if UnixStream::connect(socket).is_ok() {
+                return Err(AlreadyRunning(socket.to_path_buf()).into());
+            }
+            std::fs::remove_file(socket)?;
         }
-        std::fs::remove_file(socket)?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let listener = tokio::net::UnixListener::bind(socket)
         .with_context(|| format!("could not listen on {}", socket.display()))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    if let Ok(mut held) = HELD_LOCKS.lock() {
+        held.push(lock);
+    }
     Ok(listener)
 }
 
@@ -169,7 +392,15 @@ pub async fn serve(
     allowed_uid: u32,
 ) -> Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                // e.g. out of file descriptors: keep serving once there is room.
+                eprintln!("key agent: accept failed: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let agent = agent.clone();
         tokio::spawn(async move {
             if let Err(error) = serve_connection(stream, &agent, allowed_uid).await {
@@ -190,25 +421,27 @@ async fn serve_connection(
         bail!("refused a connection from uid {peer}");
     }
     let (mut read, mut write) = stream.into_split();
-    let mut pending = Zeroizing::new(Vec::<u8>::with_capacity(8192));
+    let mut pending = WipingBuf::new();
     let mut chunk = Zeroizing::new([0u8; 4096]);
     loop {
-        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
-            let line = Zeroizing::new(pending.drain(..=end).collect::<Vec<u8>>());
+        while let Some(end) = pending.0.iter().position(|byte| *byte == b'\n') {
+            let line = Zeroizing::new(pending.0.drain(..=end).collect::<Vec<u8>>());
             let reply = match std::str::from_utf8(&line[..end]) {
                 Ok(text) => respond(agent, text),
                 Err(_) => respond(agent, ""),
             };
-            write.write_all(&reply).await?;
+            write.write_all(&reply.0).await?;
         }
-        if pending.len() > MAX_LINE {
+        if pending.0.len() > MAX_LINE {
             bail!("a request is too long");
         }
-        let n = read.read(&mut chunk[..]).await?;
+        let n = tokio::time::timeout(IDLE_TIMEOUT, read.read(&mut chunk[..]))
+            .await
+            .map_err(|_| anyhow!("closed an idle connection"))??;
         if n == 0 {
             return Ok(());
         }
-        pending.extend_from_slice(&chunk[..n]);
+        pending.append(&chunk[..n]);
     }
 }
 
@@ -247,7 +480,14 @@ fn harden_process() {
 pub async fn run_key_agent() -> Result<()> {
     harden_process();
     let socket = agent_socket_path();
-    let listener = bind(&socket)?;
+    let listener = match bind(&socket) {
+        Ok(listener) => listener,
+        Err(error) if error.downcast_ref::<AlreadyRunning>().is_some() => {
+            eprintln!("{error}; exiting");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     // A key-file error never stops the agent: it starts locked and says why
     // on `atem cred status` (see KeyAgent::new).
     let agent = KeyAgent::new(KeyPaths::default_paths())?;
@@ -255,10 +495,7 @@ pub async fn run_key_agent() -> Result<()> {
         "atem key agent (protocol v{PROTOCOL_VERSION}) listening on {}",
         socket.display()
     );
-    serve(listener, Arc::new(Mutex::new(agent)), unsafe {
-        libc::getuid()
-    })
-    .await
+    serve(listener, Arc::new(Mutex::new(agent)), own_uid()).await
 }
 
 /// Starts `exe key-agent` detached from this command and its terminal, with
@@ -274,6 +511,8 @@ fn spawn_agent(exe: &Path, log: &Path, envs: &[(&str, &Path)]) -> Result<u32> {
         .append(true)
         .mode(0o600)
         .open(log)?;
+    // `mode` only applies to a new file; tighten one that already existed.
+    log_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let mut command = std::process::Command::new(exe);
     command
         .arg("key-agent")
@@ -285,9 +524,13 @@ fn spawn_agent(exe: &Path, log: &Path, envs: &[(&str, &Path)]) -> Result<u32> {
         if unsafe { libc::setsid() } == -1 {
             return Err(std::io::Error::last_os_error());
         }
+        // Don't pin the directory the command was run from.
+        if unsafe { libc::chdir(c"/".as_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
         Ok(())
     };
-    // SAFETY: setsid is async-signal-safe, as pre_exec requires.
+    // SAFETY: setsid and chdir are async-signal-safe, as pre_exec requires.
     unsafe {
         command.pre_exec(detach);
     }
@@ -300,12 +543,48 @@ fn spawn_agent(exe: &Path, log: &Path, envs: &[(&str, &Path)]) -> Result<u32> {
     Ok(pid)
 }
 
+/// The user id of the process listening on the other end of `stream`.
+fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(cred.uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(uid)
+    }
+}
+
 /// How a client starts an agent when none answers.
 type Launcher = Box<dyn Fn() -> Result<()> + Send + Sync>;
 
 pub struct KeyAgentClient {
     socket: PathBuf,
     launcher: Option<Launcher>,
+    /// The user the listener must run as (this user; settable in tests).
+    expected_uid: u32,
 }
 
 impl KeyAgentClient {
@@ -314,6 +593,7 @@ impl KeyAgentClient {
         Self {
             socket,
             launcher: None,
+            expected_uid: own_uid(),
         }
     }
 
@@ -324,6 +604,7 @@ impl KeyAgentClient {
             launcher: Some(Box::new(|| {
                 spawn_agent(&std::env::current_exe()?, &agent_log_path(), &[]).map(|_| ())
             })),
+            expected_uid: own_uid(),
         }
     }
 
@@ -333,16 +614,37 @@ impl KeyAgentClient {
         Self {
             socket,
             launcher: Some(launcher),
+            expected_uid: own_uid(),
         }
     }
 
+    /// Expects the listener to run as `uid` instead of this user.
+    #[cfg(test)]
+    pub(crate) fn expecting_uid(mut self, uid: u32) -> Self {
+        self.expected_uid = uid;
+        self
+    }
+
+    /// Connects, and refuses a listener that isn't `expected_uid`.
+    fn dial(&self) -> std::io::Result<Result<UnixStream>> {
+        let stream = UnixStream::connect(&self.socket)?;
+        let peer = peer_uid(&stream)?;
+        if peer != self.expected_uid {
+            return Ok(Err(anyhow!(
+                "the socket at {} is served by another user (uid {peer}); refusing to talk to it",
+                self.socket.display()
+            )));
+        }
+        Ok(Ok(stream))
+    }
+
     pub fn is_running(&self) -> bool {
-        UnixStream::connect(&self.socket).is_ok()
+        matches!(self.dial(), Ok(Ok(_)))
     }
 
     fn connect(&self) -> Result<UnixStream> {
-        match UnixStream::connect(&self.socket) {
-            Ok(stream) => Ok(stream),
+        match self.dial() {
+            Ok(checked) => checked,
             Err(error)
                 if self.launcher.is_some()
                     && matches!(
@@ -355,8 +657,8 @@ impl KeyAgentClient {
                 }
                 for _ in 0..50 {
                     std::thread::sleep(Duration::from_millis(100));
-                    if let Ok(stream) = UnixStream::connect(&self.socket) {
-                        return Ok(stream);
+                    if let Ok(checked) = self.dial() {
+                        return checked;
                     }
                 }
                 bail!(
@@ -372,16 +674,16 @@ impl KeyAgentClient {
     }
 }
 
-/// Reads one reply line without a `BufReader`, so no unzeroized copy stays behind.
-fn read_reply(mut stream: &UnixStream) -> std::io::Result<Zeroizing<Vec<u8>>> {
-    let mut line = Zeroizing::new(Vec::<u8>::with_capacity(4096));
+/// Reads one reply line without a `BufReader`, so no unwiped copy stays behind.
+fn read_reply(mut stream: &UnixStream) -> std::io::Result<WipingBuf> {
+    let mut line = WipingBuf::new();
     let mut chunk = Zeroizing::new([0u8; 4096]);
     loop {
         let n = stream.read(&mut chunk[..])?;
-        if n == 0 || line.len() > MAX_LINE {
+        if n == 0 || line.0.len() > MAX_LINE {
             return Ok(line);
         }
-        line.extend_from_slice(&chunk[..n]);
+        line.append(&chunk[..n]);
         if chunk[..n].contains(&b'\n') {
             return Ok(line);
         }
@@ -399,13 +701,16 @@ impl KeyAgentApi for KeyAgentClient {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(closed)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(closed)?;
         (&stream).write_all(line.as_bytes()).map_err(closed)?;
         drop(line);
         let reply = read_reply(&stream).map_err(closed)?;
-        if reply.is_empty() {
+        if reply.0.is_empty() {
             bail!("the key agent closed the connection; is it running as another user?");
         }
-        let text = std::str::from_utf8(&reply)
+        let text = std::str::from_utf8(&reply.0)
             .map_err(|_| anyhow!("the key agent sent a non-UTF-8 reply"))?;
         decode_response(text)
     }
@@ -656,11 +961,14 @@ mod tests {
 
     #[test]
     fn a_client_starts_the_agent_when_none_answers() {
+        use std::os::unix::fs::PermissionsExt;
         // Starts the real binary (built because integration tests exist).
         let dir = short_dir();
         let home = dir.path().join("home");
         let runtime = dir.path().join("run");
         std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         let exe = std::env::current_exe()
             .unwrap()
             .parent()
@@ -707,6 +1015,214 @@ mod tests {
         assert!(client.is_running());
         assert!(pid.lock().unwrap().is_some());
         // A second client finds the same agent without starting another.
-        assert!(!KeyAgentClient::at(socket).status().unwrap().unlocked);
+        let second = KeyAgentClient::with_launcher(
+            socket,
+            Box::new(|| -> Result<()> { panic!("a second agent must not be started") }),
+        );
+        assert!(!second.status().unwrap().unlocked);
+    }
+
+    #[test]
+    fn bind_refuses_a_symlinked_socket_directory() {
+        let dir = short_dir();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("atem");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = bind(&link.join("agent.sock")).err().unwrap();
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert!(!real.join("agent.sock").exists());
+    }
+
+    #[test]
+    fn bind_does_not_delete_a_file_that_is_not_a_socket() {
+        let dir = short_dir();
+        let socket = dir.path().join("run").join("agent.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"precious").unwrap();
+        let error = bind(&socket).err().unwrap();
+        assert!(format!("{error:#}").contains("not a socket"), "{error:#}");
+        assert_eq!(std::fs::read(&socket).unwrap(), b"precious");
+    }
+
+    #[test]
+    fn an_endless_line_closes_the_connection() {
+        let dir = short_dir();
+        let socket = start_agent(dir.path(), own_uid());
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let chunk = vec![b'a'; 64 << 10];
+        // The agent hangs up once the line passes the cap; a write may fail then.
+        for _ in 0..(MAX_LINE / chunk.len() + 8) {
+            if stream.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        let mut byte = [0u8; 1];
+        let closed = match std::io::Read::read(&mut stream, &mut byte) {
+            Ok(0) => true,
+            Err(error) => !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            Ok(_) => false,
+        };
+        assert!(closed);
+        // The agent still serves others.
+        assert!(KeyAgentClient::at(socket).status().is_ok());
+    }
+
+    #[test]
+    fn a_listener_run_by_someone_else_is_not_trusted() {
+        let dir = short_dir();
+        let socket = start_agent(dir.path(), own_uid());
+        let client = KeyAgentClient::at(socket.clone()).expecting_uid(own_uid().wrapping_add(1));
+        assert!(!client.is_running());
+        let error = format!("{:#}", client.status().err().unwrap());
+        assert!(error.contains("served by another user"), "{error}");
+        // The same socket is fine for its own user.
+        assert!(KeyAgentClient::at(socket).is_running());
+    }
+
+    #[test]
+    fn socket_directories_must_be_private_and_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = short_dir();
+        let config = dir.path().join("config");
+        let open = dir.path().join("open");
+        let private = dir.path().join("private");
+        for (path, mode) in [(&open, 0o777), (&private, 0o700)] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let uid = own_uid();
+        assert!(check_parent_dir(&private, uid).is_ok());
+        assert!(format!("{:#}", check_parent_dir(&open, uid).unwrap_err()).contains("written"));
+        assert!(
+            format!("{:#}", check_parent_dir(&private, uid + 1).unwrap_err())
+                .contains("another user")
+        );
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert!(format!("{:#}", check_parent_dir(&link, uid).unwrap_err()).contains("symlink"));
+        assert!(check_parent_dir(&dir.path().join("missing"), uid).is_err());
+        // A socket directory owned by someone else is refused outright.
+        let error = prepare_socket_dir(&private, uid + 1).unwrap_err();
+        assert!(format!("{error:#}").contains("another user"));
+        // And the socket path falls back to the config dir for an unsafe runtime dir.
+        let pick = |runtime: &Path| {
+            let ok = check_parent_dir(runtime, uid).is_ok();
+            socket_path_from(ok.then(|| runtime.as_os_str().to_owned()), &config)
+        };
+        assert_eq!(pick(&private), private.join("atem").join("agent.sock"));
+        assert_eq!(pick(&open), config.join("agent.sock"));
+        assert_eq!(pick(&link), config.join("agent.sock"));
+    }
+
+    #[test]
+    fn a_grant_reply_with_k_decodes_without_the_tagged_enum() {
+        match decode_response(
+            r#"{"v":1,"ok":true,"reply":{"kind":"grant","kid":"ab12cd34","key":"AAAA"}}"#,
+        )
+        .unwrap()
+        {
+            Reply::Grant { kid, key } => {
+                assert_eq!(kid, "ab12cd34");
+                assert_eq!(&**key, "AAAA");
+            }
+            _ => panic!("expected a grant"),
+        }
+        assert!(matches!(
+            decode_response(r#"{"v":1,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false}}"#).unwrap(),
+            Reply::Status { unlocked: false, .. }
+        ));
+    }
+
+    /// Requests that carry secrets, grants (with and without trust) and an unlock answer.
+    fn rich_requests() -> Vec<Request> {
+        use crate::memory::grant::GrantWire;
+        use crate::memory::statements::SignedWire;
+        use crate::memory::storage_key::UnlockGrantWire;
+        use crate::memory::trust::AstationTrust;
+        let signed = || SignedWire {
+            statement: "AA==".into(),
+            signature: "AA==".into(),
+        };
+        let grant = || GrantWire {
+            signed: signed(),
+            encapped_key: "AA==".into(),
+            ciphertext: "AA==".into(),
+        };
+        let trust = AstationTrust {
+            device_id: "dev".into(),
+            data_account: "acct".into(),
+            sign_gen: 3,
+            astation_sign_pub: "AA==".into(),
+            astation_enc_pub: "AA==".into(),
+            recovery_sign_pub: "AA==".into(),
+            device_pub: "AA==".into(),
+            device_sign_pub: "AA==".into(),
+            unlock_auth_pub: "AA==".into(),
+            safety_code: "code".into(),
+            transcript: "t".into(),
+            epoch_floor: 1,
+            account_state: Some(signed()),
+            account_epoch: 2,
+        };
+        vec![
+            Request::LoadUnlocked {
+                device_id: "dev".into(),
+                device: Zeroizing::new("ZGV2".into()),
+                device_sign: Zeroizing::new("c2ln".into()),
+                unlock_auth: Zeroizing::new("dWE=".into()),
+                storage_kid: "abcd1234".into(),
+                storage_key: Zeroizing::new("a2V5".into()),
+            },
+            Request::OpenGrant {
+                astation_id: "a".into(),
+                grant: grant(),
+                trust: None,
+            },
+            Request::OpenGrant {
+                astation_id: "a".into(),
+                grant: grant(),
+                trust: Some(trust),
+            },
+            Request::FinishUnlock {
+                astation_id: "a".into(),
+                request: "AA==".into(),
+                grant: UnlockGrantWire {
+                    grant: signed(),
+                    encapped_key: "AA==".into(),
+                    ciphertext: "AA==".into(),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn secret_and_grant_requests_survive_encode_and_decode() {
+        for request in rich_requests() {
+            let line = encode_request(&request).unwrap();
+            let back = decode_request(line.trim()).unwrap();
+            assert_eq!(*line, *encode_request(&back).unwrap());
+        }
+    }
+
+    #[test]
+    fn secret_and_grant_requests_reach_the_agent_over_the_wire() {
+        use crate::memory::key_agent::{error_of, test_agent};
+        let dir = short_dir();
+        let socket = start_agent(dir.path(), own_uid());
+        let client = KeyAgentClient::at(socket);
+        let local = test_agent(&KeyPaths::in_dir(dir.path()));
+        for (over_wire, in_process) in rich_requests().into_iter().zip(rich_requests()) {
+            let wire_error = error_of(client.call(over_wire));
+            let local_error = error_of(local.call(in_process));
+            assert_eq!(wire_error, local_error);
+            assert!(!wire_error.contains("malformed"), "{wire_error}");
+        }
     }
 }

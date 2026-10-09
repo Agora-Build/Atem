@@ -24,6 +24,12 @@ fn the_real_agent_starts_locked_and_answers_on_its_socket() {
     let (home, runtime) = (dir.path().join("home"), dir.path().join("run"));
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&runtime).unwrap();
+    // The agent only uses a runtime dir that others can't write to.
+    std::fs::set_permissions(
+        &runtime,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let _agent = Agent(
         Command::new(env!("CARGO_BIN_EXE_atem"))
             .arg("key-agent")
