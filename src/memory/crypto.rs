@@ -38,6 +38,8 @@ impl EncryptionMode {
         }
     }
 
+    /// The statement spelling; atem only parses modes, so tests alone encode.
+    #[cfg(test)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -146,23 +148,45 @@ fn set_mode_600(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_mode_600(_path: &Path) -> Result<()> { Ok(()) }
 
-/// Writes `bytes` to `path` as a 0600 file: temp file, fsync, rename.
+/// Writes `bytes` to `path` as a 0600 file: a fresh temp file (never a
+/// stale one or a symlink), fsync, rename, then fsync the directory.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let temp = path.with_extension("tmp");
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temp, path)?;
-    set_mode_600(path)
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    set_mode_600(path)?;
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn valid_kid(kid: &str) -> bool {
@@ -272,7 +296,7 @@ impl EncryptionContext {
     }
 
     pub(crate) fn install_grant_at(path: &Path, astation_id: &str, data_account: &str, kid: &str, key: [u8; 32]) -> Result<()> {
-        let mut store = StoredKeys::load_from(&path)?;
+        let mut store = StoredKeys::load_from(path)?;
         let mode = store.astations.get(astation_id)
             .ok_or_else(|| anyhow!("received an encryption key before the account mode"))?;
         if mode.data_account != data_account || mode.kid.as_deref() != Some(kid) {
@@ -770,6 +794,22 @@ mod tests {
         let absent = dir.path().join("absent.enc");
         EncryptionContext::purge_unverified_at(&absent, "astation", "certified").unwrap();
         assert!(!absent.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_replaces_a_stale_temp_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred_state.json");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
+        write_private(&path, b"fresh").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"fresh");
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert!(!path.with_extension("tmp").exists());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

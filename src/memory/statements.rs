@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::memory::crypto::EncryptionMode;
-use crate::memory::encoding::{dec, enc, read_u64, u64_field};
+#[cfg(test)]
+use crate::memory::encoding::u64_field;
+use crate::memory::encoding::{dec, enc, read_u64};
 
 /// A statement as it travels: its exact encoded bytes and a 64-byte `r ‖ s`
 /// signature, both base64.
@@ -73,6 +75,8 @@ pub struct AccountState {
 impl AccountState {
     pub const LABEL: &'static str = "atem-account-state-v1";
 
+    /// Astation's side of the encoding: atem only parses, so tests alone encode.
+    #[cfg(test)]
     pub fn encode(&self) -> Vec<u8> {
         enc(&[
             Self::LABEL.as_bytes(),
@@ -115,6 +119,8 @@ pub struct DeviceVerified {
 impl DeviceVerified {
     pub const LABEL: &'static str = "atem-device-verified-v1";
 
+    /// Astation's side of the encoding: atem only parses, so tests alone encode.
+    #[cfg(test)]
     pub fn encode(&self) -> Vec<u8> {
         enc(&[
             Self::LABEL.as_bytes(),
@@ -162,6 +168,8 @@ pub struct GrantStatement {
 impl GrantStatement {
     pub const LABEL: &'static str = "atem-grant-v1";
 
+    /// Astation's side of the encoding: atem only parses, so tests alone encode.
+    #[cfg(test)]
     pub fn encode(&self) -> Vec<u8> {
         enc(&[
             Self::LABEL.as_bytes(),

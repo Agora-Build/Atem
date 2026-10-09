@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct DeviceKeys {
@@ -22,10 +22,6 @@ struct StoredDeviceKeys {
     device: String,
     device_sign: String,
     unlock_auth: String,
-}
-
-pub fn device_keys_path() -> PathBuf {
-    crate::config::AtemConfig::config_dir().join("device_keys")
 }
 
 fn decode32(value: &str, what: &str) -> Result<[u8; 32]> {

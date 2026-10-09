@@ -43,7 +43,13 @@ pub fn open_grant(
     if statement.kind != "K" {
         bail!("unsupported key grant type {:?}", statement.kind);
     }
-    if statement.device_id != trust.device_id || statement.device_pub != keys.device_pub() {
+    if !statement.scope_hmac.is_empty() {
+        bail!("a K grant must not name a credential scope");
+    }
+    if statement.device_id != trust.device_id
+        || STANDARD.encode(statement.device_pub) != trust.device_pub
+        || statement.device_pub != keys.device_pub()
+    {
         bail!("key grant is for a different device");
     }
     if !crate::memory::crypto::valid_kid(&statement.kid) {
@@ -230,5 +236,76 @@ mod tests {
         assert!(open_grant(&trust, &keys, &wrong_account).is_err());
         let bad_kid = seal_k_grant(&fake, "acct", "dev-1", keys.device_pub(), "XYZ", [42; 32]);
         assert!(open_grant(&trust, &keys, &bad_kid).is_err());
+    }
+
+    /// Signs `statement` around a real seal of `key` to `recipient`.
+    fn grant_with(
+        fake: &FakeAstation,
+        mut statement: GrantStatement,
+        recipient: [u8; 32],
+    ) -> GrantWire {
+        use hpke::{OpModeS, Serializable};
+        let public = <Kem as KemTrait>::PublicKey::from_bytes(&recipient).unwrap();
+        let (encapped, ciphertext) =
+            hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, Kem, _>(
+                &OpModeS::Base,
+                &public,
+                &statement.info(),
+                &[42; 32],
+                b"",
+                &mut rand::rngs::OsRng,
+            )
+            .unwrap();
+        let encapped = encapped.to_bytes().to_vec();
+        statement.sealed_hash = sealed_hash(&encapped, &ciphertext);
+        GrantWire {
+            signed: fake.sign(&statement.encode()),
+            encapped_key: STANDARD.encode(encapped),
+            ciphertext: STANDARD.encode(ciphertext),
+        }
+    }
+
+    fn k_statement(device_pub: [u8; 32]) -> GrantStatement {
+        GrantStatement {
+            account: "acct".into(),
+            sign_gen: 1,
+            kind: "K".into(),
+            device_id: "dev-1".into(),
+            device_pub,
+            kid: "0123abcd".into(),
+            scope_hmac: String::new(),
+            sealed_hash: [0; 32],
+        }
+    }
+
+    #[test]
+    fn k_grant_with_a_scope_is_rejected() {
+        let (fake, keys) = (FakeAstation::new(), DeviceKeys::generate());
+        let trust = verified(&fake, &keys);
+        let mut statement = k_statement(keys.device_pub());
+        statement.scope_hmac = "scope".into();
+        let grant = grant_with(&fake, statement, keys.device_pub());
+        assert!(open_grant(&trust, &keys, &grant).is_err());
+        let plain = grant_with(&fake, k_statement(keys.device_pub()), keys.device_pub());
+        assert!(open_grant(&trust, &keys, &plain).is_ok());
+    }
+
+    #[test]
+    fn grant_must_name_the_pinned_device_key() {
+        let (fake, pinned) = (FakeAstation::new(), DeviceKeys::generate());
+        let trust = verified(&fake, &pinned);
+        // Keys on disk that differ from the pin (e.g. a swapped device_keys
+        // file): a grant sealed to them must not open.
+        let swapped = DeviceKeys::generate();
+        let grant = grant_with(
+            &fake,
+            k_statement(swapped.device_pub()),
+            swapped.device_pub(),
+        );
+        let error = open_grant(&trust, &swapped, &grant)
+            .err()
+            .expect("must be rejected")
+            .to_string();
+        assert!(error.contains("different device"), "{error}");
     }
 }

@@ -1548,9 +1548,15 @@ async fn run_device_verification(
 
     let astation = match timeout(Duration::from_secs(15), next_verify_message(client)).await {
         Err(_) => {
-            println!(
-                "This Astation doesn't support device verification yet. Pairing is saved; encrypted sync stays off on this device."
-            );
+            if TrustStore::load_from(&paths.trust)?.verified(astation_id).is_some() {
+                println!(
+                    "This Astation doesn't support device verification yet. Pairing is saved; this device stays verified with its existing keys."
+                );
+            } else {
+                println!(
+                    "This Astation doesn't support device verification yet. Pairing is saved; encrypted sync stays off on this device."
+                );
+            }
             return Ok(());
         }
         Ok(result) => match result? {

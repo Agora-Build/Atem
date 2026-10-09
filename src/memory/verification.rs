@@ -42,8 +42,14 @@ impl AstationKeys {
         let sign_pub = STANDARD
             .decode(sign_pub)
             .context("Astation signing key is not base64")?;
-        if sign_pub.len() != 65 {
-            return Err(anyhow!("Astation signing key must be a 65-byte SEC1 point"));
+        // CryptoKit's x963Representation: an uncompressed SEC1 point, 0x04 ‖ x ‖ y.
+        if sign_pub.len() != 65
+            || sign_pub[0] != 0x04
+            || p256::ecdsa::VerifyingKey::from_sec1_bytes(&sign_pub).is_err()
+        {
+            return Err(anyhow!(
+                "Astation signing key must be an uncompressed 65-byte P-256 point"
+            ));
         }
         Ok(Self {
             sign_pub,
@@ -508,7 +514,7 @@ mod tests {
     fn astation_keys_parse_from_base64() {
         use base64::{Engine, engine::general_purpose::STANDARD};
         let keys = AstationKeys::from_wire(
-            &STANDARD.encode([4u8; 65]),
+            &STANDARD.encode(FakeAstation::new().sign_pub()),
             &STANDARD.encode([5u8; 32]),
             &STANDARD.encode([6u8; 32]),
             &STANDARD.encode([7u8; 32]),
@@ -516,6 +522,21 @@ mod tests {
         .unwrap();
         assert_eq!(keys.enc_pub, [5; 32]);
         assert!(AstationKeys::from_wire("", &STANDARD.encode([5u8; 31]), "", "").is_err());
+        let rest = |sign_pub: &[u8]| {
+            AstationKeys::from_wire(
+                &STANDARD.encode(sign_pub),
+                &STANDARD.encode([5u8; 32]),
+                &STANDARD.encode([6u8; 32]),
+                &STANDARD.encode([7u8; 32]),
+            )
+        };
+        // 65 bytes but not a point on the curve.
+        assert!(rest(&[4u8; 65]).is_err());
+        // A real key, but compressed (33 bytes): the wire carries x963 only.
+        let fake = FakeAstation::new();
+        let point = fake.sign_pub();
+        let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).unwrap();
+        assert!(rest(key.to_encoded_point(true).as_bytes()).is_err());
     }
 
     use crate::memory::crypto::{EncryptionContext, EncryptionMode};
