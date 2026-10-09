@@ -280,7 +280,7 @@ pub fn apply_grant(
         astation_id,
         &entry.data_account,
         &opened.kid,
-        opened.key,
+        *opened.key,
     )?;
     Ok(Applied::KeyInstalled(opened.kid))
 }
@@ -349,7 +349,7 @@ pub fn complete_verification(
             astation_id,
             &entry.data_account,
             &grant.kid,
-            grant.key,
+            *grant.key,
         )?;
     }
     staged.save_to(&paths.trust)?;

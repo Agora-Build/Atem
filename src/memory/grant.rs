@@ -24,7 +24,7 @@ pub struct GrantWire {
 
 pub struct OpenedGrant {
     pub kid: String,
-    pub key: [u8; 32],
+    pub key: zeroize::Zeroizing<[u8; 32]>,
 }
 
 pub fn open_grant(
@@ -76,6 +76,7 @@ pub fn open_grant(
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("granted key has the wrong length"))?;
+    let key = zeroize::Zeroizing::new(key);
     Ok(OpenedGrant {
         kid: statement.kid,
         key,
@@ -218,7 +219,7 @@ mod tests {
             [42; 32],
         );
         let opened = open_grant(&trust, &keys, &grant).unwrap();
-        assert_eq!((opened.kid.as_str(), opened.key), ("0123abcd", [42; 32]));
+        assert_eq!((opened.kid.as_str(), *opened.key), ("0123abcd", [42; 32]));
     }
 
     #[test]

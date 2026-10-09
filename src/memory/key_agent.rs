@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
+use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::grant::{GrantWire, OpenedGrant, open_grant as open_sealed_grant};
 use crate::memory::storage_key::{SealedDeviceKeys, StorageKey, new_storage_key, new_storage_kid};
 use crate::memory::trust::{AstationTrust, TrustStore};
@@ -20,7 +20,7 @@ pub const PROTOCOL_VERSION: u64 = 1;
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 
 /// Appended to key-file errors, which never stop the agent (it starts locked).
-pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys.sealed and unlock_auth_key, then run `atem pair` to verify this device again.";
+pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys (if present), device_keys.sealed and unlock_auth_key, then run `atem pair` to verify this device again.";
 
 /// What the agent serves. Only the same user can reach it (agent_socket.rs).
 /// Fields that carry secrets are `Zeroizing`.
@@ -94,19 +94,6 @@ struct Unlocked {
 pub struct KeyAgent {
     paths: KeyPaths,
     unlocked: Option<Unlocked>,
-}
-
-pub(crate) fn decode32(value: &str, what: &str) -> Result<Zeroizing<[u8; 32]>> {
-    let raw = Zeroizing::new(
-        STANDARD
-            .decode(value)
-            .with_context(|| format!("{what} is not base64"))?,
-    );
-    let bytes: [u8; 32] = raw
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("{what} has the wrong length"))?;
-    Ok(Zeroizing::new(bytes))
 }
 
 /// Opens a sealed device-keys file only when its header names the device and
@@ -255,17 +242,17 @@ impl KeyAgent {
                 .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))?,
         };
         let opened = open_sealed_grant(&entry, &unlocked.keys, grant)?;
-        let key = Zeroizing::new(STANDARD.encode(opened.key));
+        let key = Zeroizing::new(STANDARD.encode(&opened.key[..]));
         Ok(Reply::Grant {
             kid: opened.kid,
             key,
         })
     }
 
-    /// A plain step-1 `device_keys` is authoritative whenever it exists: seal
+    /// A plain step-1 `device_keys` is authoritative whenever it exists (it stays until the first escrow is confirmed): seal
     /// it under a new storage key (overwriting any earlier sealed file, e.g.
     /// from a crashed migration), split out the unlock-auth key, record the
-    /// home Astation, delete the plain file. The keys stay unlocked here until
+    /// home Astation. The keys stay unlocked here until
     /// the CLI sends the storage key to the home Astation (`atem cred unlock`).
     fn migrate_plain_keys(&mut self) -> Result<()> {
         self.migrate_inner()
@@ -278,7 +265,13 @@ impl KeyAgent {
         };
         let mut trust = TrustStore::load_from(&self.paths.trust)?;
         let Some(home) = trust.home_or_first_verified() else {
-            eprintln!("key agent: device_keys belongs to no verified Astation; left as it is");
+            if trust.home_is_set() {
+                eprintln!(
+                    "key agent: the home Astation is no longer verified; device_keys left as it is"
+                );
+            } else {
+                eprintln!("key agent: device_keys belongs to no verified Astation; left as it is");
+            }
             return Ok(());
         };
         let entry = trust
@@ -299,7 +292,7 @@ impl KeyAgent {
             .save_to(&self.paths.unlock_auth_key)?;
         trust.set_home(&home);
         trust.save_to(&self.paths.trust)?;
-        std::fs::remove_file(&self.paths.device_keys)?;
+        // The plain file stays until Astation confirms the first escrow (Task 6).
         eprintln!(
             "key agent: sealed device_keys under storage key {storage_kid}; run `atem cred unlock` to hand it to Astation {home}"
         );
@@ -384,7 +377,7 @@ pub trait KeyAgentApi: Send + Sync {
         match self.call(request)? {
             Reply::Grant { kid, key } => Ok(OpenedGrant {
                 kid,
-                key: *decode32(&key, "granted key")?,
+                key: decode32(&key, "granted key")?,
             }),
             _ => unexpected(),
         }
@@ -482,7 +475,7 @@ mod tests {
             [42; 32],
         );
         let opened = agent.open_grant(ASTATION_ID, &grant, None).unwrap();
-        assert_eq!((opened.kid.as_str(), opened.key), ("0123abcd", [42; 32]));
+        assert_eq!((opened.kid.as_str(), *opened.key), ("0123abcd", [42; 32]));
         agent.lock_keys().unwrap();
         assert!(!agent.status().unwrap().unlocked);
         assert!(error_of(agent.open_grant(ASTATION_ID, &grant, None)).contains("locked"));
@@ -520,7 +513,10 @@ mod tests {
             status.unlocked && !status.escrowed,
             "migrated keys wait for their first escrow"
         );
-        assert!(!paths.device_keys.exists(), "the plain file is deleted");
+        assert!(
+            paths.device_keys.exists(),
+            "the plain file stays until the first escrow is confirmed"
+        );
         let sealed = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
             .unwrap()
             .unwrap();
@@ -558,7 +554,7 @@ mod tests {
         let agent = agent(&paths);
         let status = agent.status().unwrap();
         assert!(status.unlocked);
-        assert!(!paths.device_keys.exists());
+        assert!(paths.device_keys.exists());
         let sealed = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
             .unwrap()
             .unwrap();

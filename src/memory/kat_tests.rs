@@ -255,5 +255,5 @@ fn atem_opens_the_fixed_grant() {
         ciphertext: STANDARD.encode(unhex(CIPHERTEXT)),
     };
     let opened = open_grant(trust.verified("astation-1").unwrap(), &keys, &grant).unwrap();
-    assert_eq!((opened.kid.as_str(), opened.key), (KID, K));
+    assert_eq!((opened.kid.as_str(), *opened.key), (KID, K));
 }

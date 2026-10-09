@@ -92,6 +92,11 @@ impl TrustStore {
             .filter(|id| self.astations.contains_key(*id))
     }
 
+    /// Whether a home Astation was ever recorded (it may no longer be verified).
+    pub fn home_is_set(&self) -> bool {
+        self.home_astation.is_some()
+    }
+
     /// Records the home Astation. Never overwrites: the home is the first
     /// one, for the life of the device's keys.
     pub fn set_home(&mut self, astation_id: &str) {

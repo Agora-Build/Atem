@@ -28,12 +28,18 @@ struct StoredDeviceKeys {
     unlock_auth: String,
 }
 
-fn decode32(value: &str, what: &str) -> Result<[u8; 32]> {
-    STANDARD
-        .decode(value)
-        .with_context(|| format!("{what} is not base64"))?
+/// Decodes a base64 32-byte secret; the buffers are wiped when dropped.
+pub(crate) fn decode32(value: &str, what: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let raw = Zeroizing::new(
+        STANDARD
+            .decode(value)
+            .with_context(|| format!("{what} is not base64"))?,
+    );
+    let bytes: [u8; 32] = raw
+        .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("{what} has the wrong length"))
+        .map_err(|_| anyhow::anyhow!("{what} has the wrong length"))?;
+    Ok(Zeroizing::new(bytes))
 }
 
 impl DeviceKeys {
@@ -124,8 +130,8 @@ impl DeviceKeys {
             bail!("unsupported sealed device keys version {version}");
         }
         Ok(Self {
-            device: StaticSecret::from(decode32(&device, "device key")?),
-            device_sign: SigningKey::from_bytes(&decode32(&device_sign, "device signing key")?),
+            device: StaticSecret::from(*decode32(&device, "device key")?),
+            device_sign: SigningKey::from_bytes(&*decode32(&device_sign, "device signing key")?),
             unlock_auth: unlock_auth.key,
         })
     }
@@ -142,12 +148,12 @@ impl DeviceKeys {
             bail!("unsupported device_keys version {}", stored.version);
         }
         Ok(Some(Self {
-            device: StaticSecret::from(decode32(&stored.device, "device key")?),
-            device_sign: SigningKey::from_bytes(&decode32(
+            device: StaticSecret::from(*decode32(&stored.device, "device key")?),
+            device_sign: SigningKey::from_bytes(&*decode32(
                 &stored.device_sign,
                 "device signing key",
             )?),
-            unlock_auth: SigningKey::from_bytes(&decode32(&stored.unlock_auth, "unlock-auth key")?),
+            unlock_auth: SigningKey::from_bytes(&*decode32(&stored.unlock_auth, "unlock-auth key")?),
         }))
     }
 
@@ -218,7 +224,7 @@ impl UnlockAuthKey {
         if stored.version != 1 {
             bail!("unsupported unlock_auth_key version {}", stored.version);
         }
-        let secret = Zeroizing::new(decode32(&encoded, "unlock-auth key")?);
+        let secret = decode32(&encoded, "unlock-auth key")?;
         Ok(Some(Self {
             key: SigningKey::from_bytes(&secret),
         }))
