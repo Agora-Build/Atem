@@ -8,11 +8,15 @@ use p256::ecdsa::SigningKey;
 use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::DeviceKeys;
 use crate::memory::encoding::enc;
+use crate::memory::grant::hpke_open;
 use crate::memory::grant::{GrantWire, open_grant};
 use crate::memory::statements::{
-    AccountState, DeviceVerified, GrantStatement, SignedWire, sealed_hash,
+    AccountState, DeviceVerified, GrantStatement, SignedWire, StorageAbandon, StorageAck,
+    StorageConfirm, StorageRotate, UnlockGrant, UnlockRequest, sealed_hash, storage_key_info,
+    unlock_info, unlock_request_hash, verify_device,
 };
-use crate::memory::trust::TrustStore;
+use crate::memory::storage_key::{UnlockGrantWire, check_unlock_grant, device_keys_aad};
+use crate::memory::trust::{AstationTrust, TrustStore};
 use crate::memory::verification::{
     AstationKeys, Reveal, commitment_for, safety_code, transcript_for,
 };
@@ -228,16 +232,14 @@ fn seeded_seal_reproduces_the_fixed_grant() {
     assert_eq!(hex(&ciphertext), CIPHERTEXT);
 }
 
-#[test]
-fn atem_opens_the_fixed_grant() {
-    let keys = device_keys();
-    let astation = astation();
+/// The pins atem holds after verifying with the fixed Astation.
+fn verified_trust() -> AstationTrust {
     let mut trust = TrustStore::default();
     trust.set_pending(
         "astation-1",
         DEVICE_ID,
-        &keys,
-        &astation,
+        &device_keys(),
+        &astation(),
         SAFETY_CODE,
         &unhex(TRANSCRIPT).try_into().unwrap(),
     );
@@ -246,6 +248,12 @@ fn atem_opens_the_fixed_grant() {
         signature: STANDARD.encode(unhex(DEVICE_VERIFIED_SIGNATURE)),
     };
     trust.confirm("astation-1", &certificate).unwrap();
+    trust.verified("astation-1").unwrap().clone()
+}
+
+#[test]
+fn atem_opens_the_fixed_grant() {
+    let keys = device_keys();
     let grant = GrantWire {
         signed: SignedWire {
             statement: STANDARD.encode(unhex(GRANT_STATEMENT)),
@@ -254,6 +262,253 @@ fn atem_opens_the_fixed_grant() {
         encapped_key: STANDARD.encode(unhex(ENCAPPED_KEY)),
         ciphertext: STANDARD.encode(unhex(CIPHERTEXT)),
     };
-    let opened = open_grant(trust.verified("astation-1").unwrap(), &keys, &grant).unwrap();
+    let opened = open_grant(&verified_trust(), &keys, &grant).unwrap();
     assert_eq!((opened.kid.as_str(), *opened.key), (KID, K));
+}
+
+// Build step 2a. Extra inputs: X25519 secret `E` = 32 × aa, unlock nonce =
+// 32 × bb, boot_id "boot-1", ticket "", time 1760000000, old storage_kid
+// "0a1b2c3d", new storage_kid "4e5f6a7b", unlock-grant sealed_hash = 32 × cc,
+// rotation sealed_hash = 32 × dd, storage key = 32 × ee.
+const OLD_STORAGE_KID: &str = "0a1b2c3d";
+const NEW_STORAGE_KID: &str = "4e5f6a7b";
+const E_SECRET: [u8; 32] = [0xaa; 32];
+const STORAGE_KEY: [u8; 32] = [0xee; 32];
+const E_PUB: &str = "14ca9e4d387bccf35746e0407daaacc6b28a4f8445ef5a5158894db983e24070";
+const UNLOCK_REQUEST: &str = "000000166174656d2d756e6c6f636b2d726571756573742d763100000006616363742d31000000056465762d3100000006626f6f742d31000000000000002014ca9e4d387bccf35746e0407daaacc6b28a4f8445ef5a5158894db983e2407000000020bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000080000000068e77800000000083061316232633364";
+const UNLOCK_REQUEST_HASH: &str =
+    "1301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d";
+const UNLOCK_REQUEST_SIGNATURE: &str = "e82afd604b8697c54433e33fc7f2f1cf168ad248e0c620edb2c2e470d7908a2cf71362934c8c33f2c9449f27f52d4de6076ad7e2fa16fa87c274192ca3b58008";
+const UNLOCK_INFO: &str = "000000136174656d2d756e6c6f636b2d696e666f2d763100000006616363742d31000000056465762d31000000083061316232633364000000201301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d";
+const UNLOCK_GRANT: &str = "000000146174656d2d756e6c6f636b2d6772616e742d763100000006616363742d31000000080000000000000001000000056465762d31000000083061316232633364000000201301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d00000020cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const DEVICE_KEYS_AAD: &str =
+    "000000136174656d2d6465766963652d6b6579732d7631000000056465762d31000000083061316232633364";
+const STORAGE_KEY_INFO: &str = "000000186174656d2d73746f726167652d6b65792d696e666f2d763100000006616363742d31000000056465762d31000000083465356636613762";
+const STORAGE_ROTATE: &str = "000000166174656d2d73746f726167652d726f746174652d763100000006616363742d31000000056465762d3100000008306131623263336400000008346535663661376200000020dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const STORAGE_ROTATE_SIGNATURE: &str = "2041a1670126328aa40f7bb9cf4d35146cd45cc447ecef1c904c5b970876242a7c37f59dc117a5486e8e37d0b39b958f00806c0cf00d9c52e4d3fd90818e4408";
+const FIRST_STORAGE_ROTATE: &str = "000000166174656d2d73746f726167652d726f746174652d763100000006616363742d31000000056465762d310000000000000008306131623263336400000020dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const STORAGE_ACK: &str = "000000136174656d2d73746f726167652d61636b2d763100000006616363742d31000000080000000000000001000000056465762d31000000083465356636613762";
+const STORAGE_CONFIRM: &str = "000000176174656d2d73746f726167652d636f6e6669726d2d763100000006616363742d31000000056465762d31000000083465356636613762";
+const STORAGE_CONFIRM_SIGNATURE: &str = "6a7c7961862d5ef7d3028b3d6c511434f5a5e8e4fd1f0541de1ca3a6db9aca2b32d5f3aec90aa750948a46faa61078dee3339490cd873e58e5639ec36167db0d";
+const STORAGE_ABANDON: &str = "000000176174656d2d73746f726167652d6162616e646f6e2d763100000006616363742d31000000056465762d31000000083465356636613762";
+const STORAGE_ABANDON_SIGNATURE: &str = "4cecaeeda1ba12cce89797ca065ee9c04b050407c05c06e784501b01034a3e0df4f00fac0d35591ec710fc3c316a395c66bd70630f6cd7ba2f72a78e97e15b01";
+// The storage key released to `E_PUB` (seeded seal, StdRng seed 8).
+const UNLOCK_ENCAPPED_KEY: &str =
+    "8e5c2c633c06326dfba94d9a717724ca1542bd07e800b99e1f12dd9efb95c341";
+const UNLOCK_CIPHERTEXT: &str = "4eccc2f528b4d5cf884cd9049545cb96d804ddca7c2e943fe101ced564bff96d8a7150a4fdfa3fad8b11d9697da64109";
+const UNLOCK_SEALED_HASH: &str = "5222490f82b684dbfb043d64c9d213e4e4c38b048d083744f78437455a165be5";
+const SEALED_UNLOCK_GRANT: &str = "000000146174656d2d756e6c6f636b2d6772616e742d763100000006616363742d31000000080000000000000001000000056465762d31000000083061316232633364000000201301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d000000205222490f82b684dbfb043d64c9d213e4e4c38b048d083744f78437455a165be5";
+const SEALED_UNLOCK_GRANT_SIGNATURE: &str = "ac2e60b3834f1f0907a8eb22a04f5b15b86f5388d16e074b1fd694e2c646088f74ac5f849c1c9ad9c20647164d8e0f8b9efb730058ec9d42c78e54306a58746d";
+// The new storage key sealed to Astation's encryption key (StdRng seed 9).
+const ROTATE_ENCAPPED_KEY: &str =
+    "3fe8a9052458c90d03badd8cbe52b2a0b38f8a0212023ed63013d457aad1e67f";
+const ROTATE_CIPHERTEXT: &str = "2c6ab9033b8dbbdae43bd691a2f590455984416dc70989de638b99a78821d2d78523ffbc9827815e0fe00f4b2a9ad4e8";
+const ROTATE_SEALED_HASH: &str = "db1a3c8e614277746e1e437077664041860372fbfbf80a0cb7ee930f98608e17";
+const SEALED_STORAGE_ROTATE: &str = "000000166174656d2d73746f726167652d726f746174652d763100000006616363742d31000000056465762d3100000008306131623263336400000008346535663661376200000020db1a3c8e614277746e1e437077664041860372fbfbf80a0cb7ee930f98608e17";
+const SEALED_STORAGE_ROTATE_SIGNATURE: &str = "35d7a8f51c36b1d70bc699360556c47293c47100fd3c3fd96e84fd128557ab505d26834de38235b194ddef76883b2cfc5b882b7e4e3b0b7872f7d5e2c998d800";
+
+fn signature_hex(signed: &SignedWire) -> String {
+    hex(&STANDARD.decode(&signed.signature).unwrap())
+}
+
+fn unlock_request() -> UnlockRequest {
+    UnlockRequest {
+        account: ACCOUNT.into(),
+        device_id: DEVICE_ID.into(),
+        boot_id: "boot-1".into(),
+        ticket: String::new(),
+        e_pub: x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(E_SECRET))
+            .to_bytes(),
+        nonce: [0xbb; 32],
+        time: 1_760_000_000,
+        storage_kid: OLD_STORAGE_KID.into(),
+    }
+}
+
+fn unlock_grant(sealed_hash: [u8; 32]) -> UnlockGrant {
+    UnlockGrant {
+        account: ACCOUNT.into(),
+        sign_gen: 1,
+        device_id: DEVICE_ID.into(),
+        storage_kid: OLD_STORAGE_KID.into(),
+        request_hash: unhex(UNLOCK_REQUEST_HASH).try_into().unwrap(),
+        sealed_hash,
+    }
+}
+
+fn rotate(old: &str, new: &str, sealed_hash: [u8; 32]) -> StorageRotate {
+    StorageRotate {
+        account: ACCOUNT.into(),
+        device_id: DEVICE_ID.into(),
+        old_storage_kid: old.into(),
+        new_storage_kid: new.into(),
+        sealed_hash,
+    }
+}
+
+/// A base-mode seal of `STORAGE_KEY` from a seeded RNG, so the output is fixed.
+fn seeded_seal(recipient: &[u8], info: &[u8], seed: u64) -> (Vec<u8>, Vec<u8>) {
+    use hpke::{
+        Deserializable, OpModeS, Serializable, aead::ChaCha20Poly1305, kdf::HkdfSha256,
+        kem::X25519HkdfSha256,
+    };
+    use rand::SeedableRng;
+    let recipient = <X25519HkdfSha256 as hpke::Kem>::PublicKey::from_bytes(recipient).unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let (encapped, ciphertext) =
+        hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256, _>(
+            &OpModeS::Base,
+            &recipient,
+            info,
+            &STORAGE_KEY,
+            b"",
+            &mut rng,
+        )
+        .unwrap();
+    (encapped.to_bytes().to_vec(), ciphertext)
+}
+
+#[test]
+fn unlock_vectors() {
+    let request = unlock_request();
+    assert_eq!(hex(&request.e_pub), E_PUB);
+    let request = request.encode();
+    assert_eq!(hex(&request), UNLOCK_REQUEST);
+    let request_hash = unlock_request_hash(&request);
+    assert_eq!(hex(&request_hash), UNLOCK_REQUEST_HASH);
+    // Ed25519 is deterministic, so the unlock-auth signature is fixed too.
+    let signed = device_keys().unlock_auth_key().sign_statement(&request);
+    assert_eq!(signature_hex(&signed), UNLOCK_REQUEST_SIGNATURE);
+    verify_device(&unhex(UNLOCK_AUTH_PUB).try_into().unwrap(), &signed).unwrap();
+    assert_eq!(
+        hex(&unlock_info(
+            ACCOUNT,
+            DEVICE_ID,
+            OLD_STORAGE_KID,
+            &request_hash
+        )),
+        UNLOCK_INFO
+    );
+    assert_eq!(hex(&unlock_grant([0xcc; 32]).encode()), UNLOCK_GRANT);
+}
+
+#[test]
+fn storage_key_vectors() {
+    assert_eq!(
+        hex(&device_keys_aad(DEVICE_ID, OLD_STORAGE_KID)),
+        DEVICE_KEYS_AAD
+    );
+    assert_eq!(
+        hex(&storage_key_info(ACCOUNT, DEVICE_ID, NEW_STORAGE_KID)),
+        STORAGE_KEY_INFO
+    );
+    let rotation = rotate(OLD_STORAGE_KID, NEW_STORAGE_KID, [0xdd; 32]).encode();
+    assert_eq!(hex(&rotation), STORAGE_ROTATE);
+    assert_eq!(
+        signature_hex(&device_keys().sign_statement(&rotation)),
+        STORAGE_ROTATE_SIGNATURE
+    );
+    assert_eq!(
+        hex(&rotate("", OLD_STORAGE_KID, [0xdd; 32]).encode()),
+        FIRST_STORAGE_ROTATE
+    );
+    let ack = StorageAck {
+        account: ACCOUNT.into(),
+        sign_gen: 1,
+        device_id: DEVICE_ID.into(),
+        storage_kid: NEW_STORAGE_KID.into(),
+    };
+    assert_eq!(hex(&ack.encode()), STORAGE_ACK);
+    let confirm = StorageConfirm {
+        account: ACCOUNT.into(),
+        device_id: DEVICE_ID.into(),
+        storage_kid: NEW_STORAGE_KID.into(),
+    }
+    .encode();
+    assert_eq!(hex(&confirm), STORAGE_CONFIRM);
+    assert_eq!(
+        signature_hex(&device_keys().sign_statement(&confirm)),
+        STORAGE_CONFIRM_SIGNATURE
+    );
+    let abandon = StorageAbandon {
+        account: ACCOUNT.into(),
+        device_id: DEVICE_ID.into(),
+        storage_kid: NEW_STORAGE_KID.into(),
+    }
+    .encode();
+    assert_eq!(hex(&abandon), STORAGE_ABANDON);
+    assert_eq!(
+        signature_hex(&device_keys().sign_statement(&abandon)),
+        STORAGE_ABANDON_SIGNATURE
+    );
+}
+
+#[test]
+fn seeded_seals_reproduce_the_fixed_storage_key_seals() {
+    let (encapped, ciphertext) = seeded_seal(&unhex(E_PUB), &unhex(UNLOCK_INFO), 8);
+    assert_eq!(
+        (hex(&encapped), hex(&ciphertext)),
+        (UNLOCK_ENCAPPED_KEY.into(), UNLOCK_CIPHERTEXT.into())
+    );
+    assert_eq!(
+        hex(&sealed_hash(&encapped, &ciphertext)),
+        UNLOCK_SEALED_HASH
+    );
+    let (encapped, ciphertext) = seeded_seal(&unhex(ENC_PUB), &unhex(STORAGE_KEY_INFO), 9);
+    assert_eq!(
+        (hex(&encapped), hex(&ciphertext)),
+        (ROTATE_ENCAPPED_KEY.into(), ROTATE_CIPHERTEXT.into())
+    );
+    assert_eq!(
+        hex(&sealed_hash(&encapped, &ciphertext)),
+        ROTATE_SEALED_HASH
+    );
+}
+
+#[test]
+fn atem_opens_the_fixed_unlock_grant() {
+    let sealed: [u8; 32] = unhex(UNLOCK_SEALED_HASH).try_into().unwrap();
+    let statement = unlock_grant(sealed).encode();
+    assert_eq!(hex(&statement), SEALED_UNLOCK_GRANT);
+    let signed = sign(&statement);
+    assert_eq!(signature_hex(&signed), SEALED_UNLOCK_GRANT_SIGNATURE);
+    let wire = UnlockGrantWire {
+        grant: SignedWire {
+            statement: STANDARD.encode(unhex(SEALED_UNLOCK_GRANT)),
+            signature: STANDARD.encode(unhex(SEALED_UNLOCK_GRANT_SIGNATURE)),
+        },
+        encapped_key: STANDARD.encode(unhex(UNLOCK_ENCAPPED_KEY)),
+        ciphertext: STANDARD.encode(unhex(UNLOCK_CIPHERTEXT)),
+    };
+    // The key agent's checks and open, with the fixed single-use key.
+    let checked = check_unlock_grant(&verified_trust(), &unhex(UNLOCK_REQUEST), &wire).unwrap();
+    assert_eq!(checked.grant.storage_kid, OLD_STORAGE_KID);
+    let info = unlock_info(
+        ACCOUNT,
+        DEVICE_ID,
+        &checked.grant.storage_kid,
+        &checked.request_hash,
+    );
+    let key = hpke_open(&E_SECRET, &checked.encapped, &checked.ciphertext, &info).unwrap();
+    assert_eq!(key.as_slice(), STORAGE_KEY);
+}
+
+#[test]
+fn astation_opens_the_fixed_storage_rotate() {
+    let sealed: [u8; 32] = unhex(ROTATE_SEALED_HASH).try_into().unwrap();
+    let statement = rotate(OLD_STORAGE_KID, NEW_STORAGE_KID, sealed).encode();
+    assert_eq!(hex(&statement), SEALED_STORAGE_ROTATE);
+    let signed = device_keys().sign_statement(&statement);
+    assert_eq!(signature_hex(&signed), SEALED_STORAGE_ROTATE_SIGNATURE);
+    // Astation's side: the device signature verifies and the seal opens with
+    // its encryption key (secret 32 × 66).
+    verify_device(&unhex(DEVICE_SIGN_PUB).try_into().unwrap(), &signed).unwrap();
+    let key = hpke_open(
+        &[0x66; 32],
+        &unhex(ROTATE_ENCAPPED_KEY),
+        &unhex(ROTATE_CIPHERTEXT),
+        &unhex(STORAGE_KEY_INFO),
+    )
+    .unwrap();
+    assert_eq!(key.as_slice(), STORAGE_KEY);
 }
