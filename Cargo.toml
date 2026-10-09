@@ -29,7 +29,7 @@ sha2 = "0.10"
 rand = "0.8"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 hkdf = "0.12"
 flate2 = "1.0"
 rustyline = "14.0"
@@ -47,8 +47,9 @@ agora_token = { git = "https://github.com/AgoraIO/Tools.git", subdirectory = "Dy
 urlencoding = "2"
 pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
+zeroize = "1"
 
 [features]
 real_rtm = []

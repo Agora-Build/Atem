@@ -196,6 +196,7 @@ dependencies = [
  "vt100",
  "vte",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

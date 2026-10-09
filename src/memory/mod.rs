@@ -19,6 +19,7 @@ pub mod device_keys;
 pub mod verification;
 pub mod trust;
 pub mod grant;
+pub mod storage_key;
 
 #[cfg(test)]
 mod e2e_tests;
