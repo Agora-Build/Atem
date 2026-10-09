@@ -397,19 +397,30 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
 - **Agent lifetime.** The agent is detached with `setsid` but still runs
   in the user's login session. Where systemd-logind has
   `KillUserProcesses=yes` (some distributions' default), it is killed when
-  that session ends, and `$XDG_RUNTIME_DIR` is removed after the user's
-  last session; the next command then starts a locked agent and
-  `atem cred unlock` asks Astation again. `loginctl enable-linger <user>`
-  keeps it running across logouts. Nothing is lost when it is killed: the
-  keys stay sealed on disk (or in the plain file before the first escrow).
+  that session ends. Where it isn't, the agent can outlive the user's last
+  session, but logind still removes `$XDG_RUNTIME_DIR` (and the agent's
+  socket with it) then: nobody could reach the agent any more. So every
+  5 seconds the agent checks that its socket file is still the one it
+  bound (same inode) and that `agent.socket` still names it; if not, it
+  wipes its keys and exits, freeing the key directory's lock. Either way
+  the next command starts a locked agent and `atem cred unlock` asks
+  Astation again. `loginctl enable-linger <user>` keeps the runtime dir,
+  and so the agent, across logouts. Nothing is lost when the agent stops:
+  the keys stay sealed on disk (or in the plain file before the first
+  escrow).
 - **One agent per key directory.** The agent takes an exclusive `flock` on
   `~/.config/atem/key_agent.lock` for its whole life and exits if another
   agent holds it, so two login sessions with different `$XDG_RUNTIME_DIR`s
   never run two agents over one set of key files (each would rotate the
   storage key and strand the other's sealed files). It records its socket
-  path in `~/.config/atem/agent.socket` (0600, written atomically);
-  clients try that path first, then their own session's, and still refuse
-  a listener that isn't their user.
+  path in `~/.config/atem/agent.socket` (0600, written atomically) and its
+  pid in the lock file; clients try that path first, then their own
+  session's, and still refuse a listener that isn't their user. A starting
+  agent that finds the lock held waits up to 8 seconds for the holder to
+  answer on its recorded socket (then it exits: one is running) or to go
+  away (an orphaned agent exits by itself, see above). If neither happens,
+  the starting agent and the client that started it print an error naming
+  the holder's pid and the `kill <pid>` that stops it.
 - **Home Astation.** One storage key per device, held by the device's first
   verified Astation and recorded as `home_astation` in `cred_state.json`;
   the home never moves. Unlock and rotation go only through the home

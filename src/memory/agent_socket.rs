@@ -371,17 +371,69 @@ fn lock_agent(socket: &Path) -> Result<std::fs::File> {
     Err(AlreadyRunning::at(socket).into())
 }
 
+/// How long a starting agent waits for the key directory's lock when the
+/// agent holding it answers on no socket: an orphaned agent notices within
+/// `ORPHAN_CHECK` and exits.
+const CLAIM_WAIT: Duration = Duration::from_secs(8);
+/// How often a running agent checks that clients can still reach it.
+const ORPHAN_CHECK: Duration = Duration::from_secs(5);
+/// How long a client waits for an agent it started.
+const START_WAIT: Duration = Duration::from_secs(10);
+
+/// Another agent holds the key directory's lock but answers on no socket
+/// (e.g. its runtime dir was removed while it kept running).
+#[derive(Debug)]
+pub struct StuckAgent(String);
+
+impl std::fmt::Display for StuckAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StuckAgent {}
+
+/// The pid recorded in the key directory's lock file by the agent holding
+/// it, if that process is alive.
+fn lock_holder(lock_path: &Path) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(lock_path)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let alive = pid > 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    alive.then_some(pid)
+}
+
+/// What to say when the key files' agent can't be reached: names the
+/// holder's pid and how to stop it.
+fn stuck_message(lock_path: &Path) -> String {
+    let dir = lock_path.parent().unwrap_or(Path::new(".")).display();
+    match lock_holder(lock_path) {
+        Some(pid) => format!(
+            "a key agent (pid {pid}) holds the key files in {dir} but answers on no socket (its runtime dir may have been removed); stop it with `kill {pid}` and retry (its keys stay sealed on disk)"
+        ),
+        None => format!(
+            "a key agent holds the key files in {dir} but answers on no socket; stop it with `pkill -u \"$USER\" -f 'atem key-agent'` and retry (its keys stay sealed on disk)"
+        ),
+    }
+}
+
 /// An exclusive lock on `paths.agent_lock`, so one agent serves a key
 /// directory whatever runtime dir (and so socket path) it was started with:
 /// two agents rotating one storage key could each strand the other's files.
+/// The holder writes its pid into the lock file. When another agent holds
+/// it, this is `AlreadyRunning` as soon as that agent answers on its
+/// recorded socket, and `StuckAgent` if it still doesn't after `wait` (an
+/// orphaned agent exits by itself well within that, freeing the lock).
 /// Held by the returned file until it is dropped or the process exits.
-fn lock_key_dir(paths: &KeyPaths) -> Result<std::fs::File> {
+fn lock_key_dir(paths: &KeyPaths, wait: Duration) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let lock_path = &paths.agent_lock;
     if let Some(dir) = lock_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
@@ -394,17 +446,28 @@ fn lock_key_dir(paths: &KeyPaths) -> Result<std::fs::File> {
                 lock_path.display()
             )
         })?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let deadline = std::time::Instant::now() + wait;
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(anyhow!(error).context(format!("could not lock {}", lock_path.display())));
+        }
+        if recorded_socket(&paths.agent_socket)
+            .is_some_and(|socket| UnixStream::connect(socket).is_ok())
+        {
             return Err(AlreadyRunning(format!(
                 "for the key files in {}",
                 lock_path.parent().unwrap_or(Path::new(".")).display()
             ))
             .into());
         }
-        return Err(anyhow!(error).context(format!("could not lock {}", lock_path.display())));
+        if std::time::Instant::now() >= deadline {
+            return Err(StuckAgent(stuck_message(lock_path)).into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
+    file.set_len(0)?;
+    file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
     Ok(file)
 }
 
@@ -412,13 +475,75 @@ fn lock_key_dir(paths: &KeyPaths) -> Result<std::fs::File> {
 /// records `socket` in `paths.agent_socket` (0600, atomic) for clients that
 /// would look elsewhere. The returned lock must live as long as the agent.
 pub fn claim(paths: &KeyPaths, socket: &Path) -> Result<(std::fs::File, tokio::net::UnixListener)> {
-    let lock = lock_key_dir(paths)?;
+    claim_waiting(paths, socket, CLAIM_WAIT)
+}
+
+fn claim_waiting(
+    paths: &KeyPaths,
+    socket: &Path,
+    wait: Duration,
+) -> Result<(std::fs::File, tokio::net::UnixListener)> {
+    let lock = lock_key_dir(paths, wait)?;
     let listener = bind(socket)?;
     {
         use std::os::unix::ffi::OsStrExt;
         crate::memory::crypto::write_private(&paths.agent_socket, socket.as_os_str().as_bytes())?;
     }
     Ok((lock, listener))
+}
+
+/// What a running agent checks to know clients can still reach it: its
+/// socket file is still the one it bound (same inode), and `agent.socket`
+/// still names it. When either stops holding (the runtime dir was removed
+/// at logout, or the socket replaced), the agent is orphaned: nobody can
+/// reach it, and its lock would keep every later agent out.
+pub(crate) struct Watch {
+    socket: PathBuf,
+    record: PathBuf,
+    identity: (u64, u64),
+    every: Duration,
+}
+
+impl Watch {
+    /// Watches `socket` (just bound) and the record `record`, every `every`.
+    pub(crate) fn new(socket: &Path, record: &Path, every: Duration) -> Result<Self> {
+        let meta = std::fs::symlink_metadata(socket)
+            .with_context(|| format!("cannot inspect {}", socket.display()))?;
+        Ok(Self {
+            socket: socket.to_path_buf(),
+            record: record.to_path_buf(),
+            identity: (meta.dev(), meta.ino()),
+            every,
+        })
+    }
+
+    /// Why the agent can no longer be reached, if it can't.
+    fn orphaned(&self) -> Option<String> {
+        match std::fs::symlink_metadata(&self.socket) {
+            Ok(meta) if (meta.dev(), meta.ino()) == self.identity => {}
+            Ok(_) => return Some(format!("{} was replaced", self.socket.display())),
+            Err(error) => return Some(format!("{} is gone ({error})", self.socket.display())),
+        }
+        if recorded_socket(&self.record).as_deref() != Some(self.socket.as_path()) {
+            return Some(format!(
+                "{} no longer names {}",
+                self.record.display(),
+                self.socket.display()
+            ));
+        }
+        None
+    }
+
+    /// Removes the record if it still names this agent's socket and nothing
+    /// else listens there now (the lock is still held, so no other agent
+    /// can have written it).
+    fn clean_up(&self) {
+        let replaced = std::fs::symlink_metadata(&self.socket)
+            .is_ok_and(|meta| (meta.dev(), meta.ino()) != self.identity);
+        if !replaced && recorded_socket(&self.record).as_deref() == Some(self.socket.as_path()) {
+            let _ = std::fs::remove_file(&self.record);
+        }
+    }
 }
 
 /// The socket path recorded in `record` by the running agent, if any.
@@ -469,13 +594,47 @@ fn bind_as(socket: &Path, uid: u32) -> Result<tokio::net::UnixListener> {
 }
 
 /// Serves `agent` to peers running as `allowed_uid`; others are dropped.
+#[cfg(test)]
 pub async fn serve(
     listener: tokio::net::UnixListener,
     agent: Arc<Mutex<KeyAgent>>,
     allowed_uid: u32,
 ) -> Result<()> {
+    serve_watched(listener, agent, allowed_uid, None).await
+}
+
+/// `serve`, and with a `watch`, checks every `watch.every` that clients can
+/// still reach the agent; once they can't, wipes its keys and returns.
+pub(crate) async fn serve_watched(
+    listener: tokio::net::UnixListener,
+    agent: Arc<Mutex<KeyAgent>>,
+    allowed_uid: u32,
+    watch: Option<Watch>,
+) -> Result<()> {
+    let mut checks = tokio::time::interval(
+        watch
+            .as_ref()
+            .map_or(Duration::from_secs(3600), |w| w.every),
+    );
+    checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let stream = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = checks.tick(), if watch.is_some() => {
+                if let Some(watch) = &watch
+                    && let Some(why) = watch.orphaned()
+                {
+                    eprintln!("key agent: {why}; no client can reach this agent, so it wipes its keys and exits");
+                    if let Ok(mut agent) = agent.lock() {
+                        let _ = agent.handle(Request::Lock);
+                    }
+                    watch.clean_up();
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let stream = match accepted {
             Ok((stream, _)) => stream,
             Err(error) => {
                 // e.g. out of file descriptors: keep serving once there is room.
@@ -573,14 +732,22 @@ pub async fn run_key_agent() -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    let watch = Watch::new(&socket, &paths.agent_socket, ORPHAN_CHECK)?;
     // A key-file error never stops the agent: it starts locked and says why
     // on `atem cred status` (see KeyAgent::new).
     let agent = KeyAgent::new(paths)?;
     eprintln!(
-        "atem key agent (protocol v{PROTOCOL_VERSION}) listening on {}",
+        "atem key agent (protocol v{PROTOCOL_VERSION}, pid {}) listening on {}",
+        std::process::id(),
         socket.display()
     );
-    serve(listener, Arc::new(Mutex::new(agent)), own_uid()).await
+    serve_watched(
+        listener,
+        Arc::new(Mutex::new(agent)),
+        own_uid(),
+        Some(watch),
+    )
+    .await
 }
 
 /// Starts `exe key-agent` detached from this command and its terminal, with
@@ -674,6 +841,11 @@ pub struct KeyAgentClient {
     launcher: Option<Launcher>,
     /// Where a started agent writes; named when it doesn't come up.
     log: PathBuf,
+    /// The key directory's lock: when an agent holds it but answers on no
+    /// socket, the error names that agent's pid.
+    lock: Option<PathBuf>,
+    /// How long to wait for an agent this client started.
+    start_wait: Duration,
     /// The user the listener must run as (this user; settable in tests).
     expected_uid: u32,
 }
@@ -687,6 +859,8 @@ impl KeyAgentClient {
             record: None,
             launcher: None,
             log: agent_log_path(),
+            lock: None,
+            start_wait: START_WAIT,
             expected_uid: own_uid(),
         }
     }
@@ -724,6 +898,8 @@ impl KeyAgentClient {
             record: Some(config_dir.join("agent.socket")),
             launcher,
             log: config_dir.join("key-agent.log"),
+            lock: Some(config_dir.join("key_agent.lock")),
+            start_wait: START_WAIT,
             expected_uid: own_uid(),
         }
     }
@@ -736,6 +912,8 @@ impl KeyAgentClient {
             record: None,
             launcher: Some(launcher),
             log: agent_log_path(),
+            lock: None,
+            start_wait: START_WAIT,
             expected_uid: own_uid(),
         }
     }
@@ -744,6 +922,13 @@ impl KeyAgentClient {
     #[cfg(test)]
     pub(crate) fn logging_to(mut self, log: PathBuf) -> Self {
         self.log = log;
+        self
+    }
+
+    /// Waits `wait` for an agent this client started.
+    #[cfg(test)]
+    pub(crate) fn waiting(mut self, wait: Duration) -> Self {
+        self.start_wait = wait;
         self
     }
 
@@ -795,11 +980,18 @@ impl KeyAgentClient {
                 if let Some(launch) = &self.launcher {
                     launch()?;
                 }
-                for _ in 0..50 {
+                let deadline = std::time::Instant::now() + self.start_wait;
+                while std::time::Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(100));
                     if let Ok(checked) = self.dial() {
                         return checked;
                     }
+                }
+                // An agent nobody can reach still holds the key files.
+                if let Some(lock) = self.lock.as_deref()
+                    && lock_holder(lock).is_some()
+                {
+                    return Err(StuckAgent(stuck_message(lock)).into());
                 }
                 bail!("the key agent didn't start; see {}", self.log.display())
             }
@@ -868,6 +1060,19 @@ mod tests {
 
     fn own_uid() -> u32 {
         unsafe { libc::getuid() }
+    }
+
+    /// `attempt`'s value, retried for up to three seconds: a child that
+    /// another test is forking holds copies of this process's descriptors
+    /// (a dropped listener, a released lock) until it execs.
+    fn retrying<T>(mut attempt: impl FnMut() -> Result<T>) -> T {
+        for _ in 0..30 {
+            if let Ok(value) = attempt() {
+                return value;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        attempt().unwrap()
     }
 
     /// Creates `path` private, whatever the umask: the agent refuses a socket
@@ -1012,7 +1217,7 @@ mod tests {
             make_private(stale.parent().unwrap());
             drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
             assert!(stale.exists());
-            bind(&stale).unwrap();
+            retrying(|| bind(&stale));
         });
     }
 
@@ -1502,7 +1707,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let socket_a = run_a.join("atem").join("agent.sock");
-            let (lock, _listener) = claim(&paths, &socket_a).unwrap();
+            let (lock, listener) = claim(&paths, &socket_a).unwrap();
             assert_eq!(recorded_socket(&paths.agent_socket), Some(socket_a.clone()));
             assert_eq!(
                 std::fs::metadata(&paths.agent_socket)
@@ -1522,8 +1727,8 @@ mod tests {
             assert!(!run_b.join("atem").join("agent.sock").exists());
             assert_eq!(recorded_socket(&paths.agent_socket), Some(socket_a));
             // Once the first agent is gone, another may take the directory.
-            drop(lock);
-            claim(&paths, &run_b.join("atem").join("agent.sock")).unwrap();
+            drop((lock, listener));
+            retrying(|| claim(&paths, &run_b.join("atem").join("agent.sock")));
         });
     }
 
@@ -1534,7 +1739,7 @@ mod tests {
         let target = dir.path().join("target");
         std::fs::write(&target, b"keep").unwrap();
         std::os::unix::fs::symlink(&target, &paths.agent_lock).unwrap();
-        let error = lock_key_dir(&paths).err().unwrap();
+        let error = lock_key_dir(&paths, Duration::ZERO).err().unwrap();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
@@ -1551,5 +1756,156 @@ mod tests {
         let error = bind(&run.join("agent.sock")).err().unwrap();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    /// An agent that holds keys (a migrated plain step-1 file), claimed and
+    /// served on its own thread with `watch` checks every 50 ms. Returns the
+    /// socket, the agent and a receiver that fires when serving stops.
+    fn watched_agent(
+        dir: &Path,
+    ) -> (
+        PathBuf,
+        KeyPaths,
+        Arc<Mutex<KeyAgent>>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        use crate::memory::device_keys::DeviceKeys;
+        use crate::memory::statements::FakeAstation;
+        let paths = KeyPaths::in_dir(&dir.join("config"));
+        let keys = DeviceKeys::generate();
+        crate::memory::fake_astation::pin(&paths, &FakeAstation::new(), &keys, true);
+        keys.save_to(&paths.device_keys).unwrap();
+        let agent = Arc::new(Mutex::new(KeyAgent::new(paths.clone()).unwrap()));
+        assert!(
+            agent.status().unwrap().unlocked,
+            "the plain keys were migrated"
+        );
+        let socket = dir.join("run").join("atem").join("agent.sock");
+        make_private(&dir.join("run"));
+        let (ready, started) = std::sync::mpsc::channel();
+        let (done, stopped) = std::sync::mpsc::channel();
+        let (path, served, claim_paths) = (socket.clone(), agent.clone(), paths.clone());
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let (_lock, listener) = claim(&claim_paths, &path).unwrap();
+                let watch = Watch::new(&path, &claim_paths.agent_socket, Duration::from_millis(50))
+                    .unwrap();
+                ready.send(()).unwrap();
+                let _ = serve_watched(listener, served, own_uid(), Some(watch)).await;
+                let _ = done.send(());
+            });
+        });
+        started.recv().unwrap();
+        (socket, paths, agent, stopped)
+    }
+
+    #[test]
+    fn an_agent_whose_socket_is_removed_wipes_its_keys_and_stops() {
+        let dir = short_dir();
+        let (socket, paths, agent, stopped) = watched_agent(dir.path());
+        assert!(KeyAgentClient::at(socket.clone()).is_running());
+        // Still reachable: it keeps serving.
+        assert!(stopped.recv_timeout(Duration::from_millis(300)).is_err());
+        // logind removes the runtime dir after the last session ends.
+        std::fs::remove_dir_all(dir.path().join("run")).unwrap();
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the orphaned agent kept serving");
+        assert!(!agent.status().unwrap().unlocked, "its keys are wiped");
+        assert!(
+            !paths.agent_socket.exists(),
+            "its record (naming the removed socket) is gone"
+        );
+    }
+
+    #[test]
+    fn an_agent_whose_socket_is_replaced_stops() {
+        let dir = short_dir();
+        let (socket, paths, agent, stopped) = watched_agent(dir.path());
+        std::fs::remove_file(&socket).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an agent whose socket was replaced kept serving");
+        assert!(!agent.status().unwrap().unlocked);
+        // Another listener owns that path now: the record is left alone.
+        assert_eq!(recorded_socket(&paths.agent_socket), Some(socket));
+    }
+
+    #[test]
+    fn an_agent_whose_record_names_another_socket_stops_and_leaves_it() {
+        let dir = short_dir();
+        let (_socket, paths, agent, stopped) = watched_agent(dir.path());
+        let elsewhere = dir.path().join("elsewhere.sock");
+        {
+            use std::os::unix::ffi::OsStrExt;
+            crate::memory::crypto::write_private(
+                &paths.agent_socket,
+                elsewhere.as_os_str().as_bytes(),
+            )
+            .unwrap();
+        }
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an agent clients no longer find kept serving");
+        assert!(!agent.status().unwrap().unlocked);
+        assert_eq!(recorded_socket(&paths.agent_socket), Some(elsewhere));
+    }
+
+    #[test]
+    fn a_claim_on_key_files_held_by_an_unreachable_agent_names_its_pid() {
+        let dir = short_dir();
+        let paths = KeyPaths::in_dir(&dir.path().join("config"));
+        make_private(&dir.path().join("rb"));
+        // The holder (this process) records its pid in the lock file and
+        // answers on no socket.
+        let _held = lock_key_dir(&paths, Duration::ZERO).unwrap();
+        let pid = std::process::id();
+        assert_eq!(
+            std::fs::read_to_string(&paths.agent_lock).unwrap().trim(),
+            pid.to_string()
+        );
+        let socket = dir.path().join("rb").join("atem").join("agent.sock");
+        let started = std::time::Instant::now();
+        let error = claim_waiting(&paths, &socket, Duration::from_millis(300))
+            .err()
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
+        assert!(error.downcast_ref::<StuckAgent>().is_some(), "{error:#}");
+        let text = format!("{error:#}");
+        assert!(text.contains(&format!("pid {pid}")), "{text}");
+        assert!(text.contains(&format!("`kill {pid}`")), "{text}");
+        assert!(!text.contains("already running"), "{text}");
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn a_client_names_the_unreachable_agent_that_holds_the_key_files() {
+        let dir = short_dir();
+        let config = dir.path().join("config");
+        let paths = KeyPaths::in_dir(&config);
+        let runtime = dir.path().join("rb");
+        make_private(&runtime);
+        let _held = lock_key_dir(&paths, Duration::ZERO).unwrap();
+        let pid = std::process::id();
+        let client = KeyAgentClient::finding(
+            &config,
+            Some(runtime.into_os_string()),
+            Some(Box::new(|| -> Result<()> { Ok(()) })),
+        )
+        .waiting(Duration::from_millis(300));
+        let text = format!("{:#}", client.status().err().unwrap());
+        assert!(text.contains(&format!("pid {pid}")), "{text}");
+        assert!(text.contains(&format!("`kill {pid}`")), "{text}");
+        assert!(!text.contains("didn't start"), "{text}");
+        // Without a live holder it is the usual "didn't start".
+        drop(_held);
+        std::fs::write(&paths.agent_lock, b"").unwrap();
+        let text = format!("{:#}", client.status().err().unwrap());
+        assert!(text.contains("didn't start"), "{text}");
     }
 }
