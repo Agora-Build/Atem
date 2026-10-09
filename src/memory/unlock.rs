@@ -43,7 +43,8 @@ impl AstationLink for AstationClient {
     }
 }
 
-/// `/proc/sys/kernel/random/boot_id`; empty where the OS has none.
+/// `/proc/sys/kernel/random/boot_id`; empty where the OS has none (macOS
+/// for now: `sysctl kern.bootsessionuuid` could fill it in a later step).
 pub fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|id| id.trim().to_string())

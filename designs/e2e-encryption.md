@@ -360,11 +360,13 @@ Properties:
   scope keys) live only in a small **key agent**, like ssh-agent: a Unix
   socket at `$XDG_RUNTIME_DIR/atem/agent.sock` (falling back to
   `~/.config/atem/agent.sock`, never `/tmp`), 0600 with the caller's UID
-  checked, `mlock`ed memory, `zeroize`, no core dumps
-  (`PR_SET_DUMPABLE=0`). The agent never hands out raw keys: callers ask it
-  to decrypt, sign or compute an HMAC, and get only the result. It stays
-  unlocked until reboot or `atem cred lock`, and survives atem upgrades so
-  prompts come only after real reboots.
+  checked, `mlock`ed memory where the limit allows (see below), `zeroize`,
+  no core dumps (`PR_SET_DUMPABLE=0`). The agent never hands out raw keys:
+  callers ask it to decrypt, sign or compute an HMAC, and get only the
+  result. It stays unlocked until it exits (a reboot, or the end of the
+  user's login if the system kills user processes then) or `atem cred
+  lock`, and survives atem upgrades so prompts come only after real
+  reboots.
 
 The OS keychain isn't used: Secret Service needs a desktop session and the
 macOS login keychain is locked in SSH sessions, and most atems run over SSH.
@@ -383,11 +385,23 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   request carries `"v": 1` and any other version gets an error (an old agent
   left running after an upgrade says so; stop it and the next command starts
   the new one). It refuses peers whose UID isn't its own, sets
-  `PR_SET_DUMPABLE=0`, and locks its memory with `mlockall` when
-  `RLIMIT_MEMLOCK` leaves room (Linux). It never talks to the network: the
+  `PR_SET_DUMPABLE=0`, and locks its memory with `mlockall` only when
+  `RLIMIT_MEMLOCK` is unlimited or at least 512 MiB (Linux): with
+  `MCL_FUTURE` every allocation past the limit would fail, and the usual
+  default (8 MiB, or 64 KiB on older systems) is far too small, so on most
+  machines it logs that it skipped the lock and keys could reach swap (use
+  encrypted swap, or raise the limit for the user). It never talks to the network: the
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
+- **Agent lifetime.** The agent is detached with `setsid` but still runs
+  in the user's login session. Where systemd-logind has
+  `KillUserProcesses=yes` (some distributions' default), it is killed when
+  that session ends, and `$XDG_RUNTIME_DIR` is removed after the user's
+  last session; the next command then starts a locked agent and
+  `atem cred unlock` asks Astation again. `loginctl enable-linger <user>`
+  keeps it running across logouts. Nothing is lost when it is killed: the
+  keys stay sealed on disk (or in the plain file before the first escrow).
 - **One agent per key directory.** The agent takes an exclusive `flock` on
   `~/.config/atem/key_agent.lock` for its whole life and exits if another
   agent holds it, so two login sessions with different `$XDG_RUNTIME_DIR`s
@@ -462,7 +476,10 @@ The unlock request is signed by the unlock-auth key and bound to its reply:
    device_id, boot_id, ticket, E_pub, nonce, time, storage_kid), signed by
    the unlock-auth key. `storage_kid` names the key that opens the sealed
    file on disk; `ticket` is empty until auto-unlock (build step 7);
-   `time` is Unix seconds.
+   `time` is Unix seconds. `boot_id` is Linux's
+   `/proc/sys/kernel/random/boot_id`; on macOS it is empty for now (a later
+   step can send `sysctl kern.bootsessionuuid`), so Astation can't tell a
+   Mac's reboots apart by it.
 2. Astation checks the signature against the pinned unlock-auth key and
    `time` against its clock, then applies the policy below.
 3. If it releases, it seals the storage key named by `storage_kid` (current
@@ -1286,7 +1303,12 @@ the reference behaviour.
    first escrow at the next unlock.
 9. Keep `reason` texts short and plain; atem shows them sanitized and cut
    to 200 characters.
-10. Check the Swift code against "Test vectors (step 2a)": encodings, infos
+10. **Connections.** Send every reply (`unlockGrant`, `unlockDenied`,
+    `storageKeyAck`, `storageKeyRejected`) on the connection the request
+    came in on, never to another connection of the same atem. Two live
+    connections from one atem identity at once are worth recording: a later
+    step uses that as a live-twin (clone) signal.
+11. Check the Swift code against "Test vectors (step 2a)": encodings, infos
     and AAD must match byte for byte; atem's Ed25519 signatures must verify;
     the fixed unlock grant must open with `E`, and the fixed rotate seal with
     the Astation encryption key.
