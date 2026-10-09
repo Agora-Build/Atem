@@ -10,9 +10,9 @@ use crate::memory::device_keys::DeviceKeys;
 use crate::memory::encoding::dec;
 use crate::memory::grant::{hpke_open, hpke_seal};
 use crate::memory::statements::{
-    DeviceVerified, FakeAstation, SignedWire, StorageAck, StorageConfirm, StorageRotate,
-    UnlockGrant, UnlockRequest, sealed_hash, storage_key_info, unlock_info, unlock_request_hash,
-    verify_device,
+    DeviceVerified, FakeAstation, SignedWire, StorageAbandon, StorageAck, StorageConfirm,
+    StorageRotate, UnlockGrant, UnlockRequest, sealed_hash, storage_key_info, unlock_info,
+    unlock_request_hash, verify_device,
 };
 use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, UnlockGrantWire, new_storage_key,
@@ -285,6 +285,24 @@ impl FakeKeyServer {
         ))
     }
 
+    /// The device gives up a pending key. Only an exact match is dropped, the
+    /// kid stays in `acked`, and a replay finds nothing to drop.
+    pub fn accept_abandon(&mut self, abandon: &SignedWire) -> Result<()> {
+        let fields = verify_device(&self.device_sign_pub, abandon)?;
+        let abandoned = StorageAbandon::parse(&fields)?;
+        if abandoned.account != ACCOUNT || abandoned.device_id != DEVICE_ID {
+            bail!("abandon for another account or device");
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(kid, _)| *kid == abandoned.storage_kid)
+        {
+            self.pending = None;
+        }
+        Ok(())
+    }
+
     /// Phase 3: the device switched; only the new key is kept. Everything is
     /// checked before anything is dropped, so a stray confirm changes nothing.
     pub fn confirm(&mut self, confirm: &SignedWire) -> Result<()> {
@@ -358,5 +376,44 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("already holds"), "{error}");
         assert!(server.pending.is_none());
+    }
+
+    #[test]
+    fn an_abandon_drops_only_the_exact_pending_kid_and_keeps_it_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let abandon = |kid: &str| {
+            keys.sign_statement(
+                &StorageAbandon {
+                    account: ACCOUNT.into(),
+                    device_id: DEVICE_ID.into(),
+                    storage_kid: kid.into(),
+                }
+                .encode(),
+            )
+        };
+        server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap();
+        server.accept_abandon(&abandon("ffffffff")).unwrap();
+        assert!(server.pending.is_some(), "another kid changes nothing");
+        server.accept_abandon(&abandon("0a1b2c3d")).unwrap();
+        assert!(server.pending.is_some() && server.storage_keys.contains_key("0a1b2c3d"));
+        server.accept_abandon(&abandon("4e5f6a7b")).unwrap();
+        assert!(server.pending.is_none());
+        assert!(server.acked.contains("4e5f6a7b"));
+        server.accept_abandon(&abandon("4e5f6a7b")).unwrap(); // replay: no-op
+        let again = server.accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"));
+        assert!(again.is_err(), "an abandoned kid is not reusable");
+        // A forged abandon is refused.
+        let forged = FakeAstation::new().sign(
+            &StorageAbandon {
+                account: ACCOUNT.into(),
+                device_id: DEVICE_ID.into(),
+                storage_kid: "4e5f6a7b".into(),
+            }
+            .encode(),
+        );
+        assert!(server.accept_abandon(&forged).is_err());
     }
 }

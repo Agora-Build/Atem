@@ -15,8 +15,9 @@ use crate::memory::grant::{
     GrantWire, OpenedGrant, hpke_open, hpke_seal, open_grant as open_sealed_grant,
 };
 use crate::memory::statements::{
-    SignedWire, StorageAck, StorageConfirm, StorageRotate, UnlockGrant, UnlockRequest, sealed_hash,
-    storage_key_info, unlock_info, unlock_request_hash, verify_astation,
+    SignedWire, StorageAbandon, StorageAck, StorageConfirm, StorageRotate, UnlockGrant,
+    UnlockRequest, sealed_hash, storage_key_info, unlock_info, unlock_request_hash,
+    verify_astation,
 };
 use crate::memory::storage_key::{
     SealedDeviceKeys, StorageKey, StorageRotation, UnlockGrantWire, new_storage_key,
@@ -79,6 +80,12 @@ pub enum Request {
         astation_id: String,
         ack: SignedWire,
     },
+    /// Gives up a pending key Astation holds for a rotation this device no
+    /// longer has a file for.
+    AbandonPending {
+        astation_id: String,
+        storage_kid: String,
+    },
     Lock,
 }
 
@@ -117,6 +124,9 @@ pub enum Reply {
         storage_kid: String,
         confirm: SignedWire,
     },
+    Abandoned {
+        abandon: SignedWire,
+    },
     Done,
 }
 
@@ -135,6 +145,9 @@ struct Unlocked {
     storage_kid: String,
     storage_key: StorageKey,
     escrowed: bool,
+    /// Opened with the `.prev` file: Astation may not hold the current key,
+    /// so no rotation until an unlock opens the current file.
+    via_prev: bool,
 }
 
 /// The single-use key of an unlock in progress. `StaticSecret` zeroizes on drop.
@@ -274,6 +287,10 @@ impl KeyAgent {
             Request::ConfirmRotation { astation_id, ack } => {
                 self.confirm_rotation(&astation_id, &ack)
             }
+            Request::AbandonPending {
+                astation_id,
+                storage_kid,
+            } => self.abandon_pending(&astation_id, &storage_kid),
             Request::Lock => {
                 self.wipe();
                 Ok(Reply::Done)
@@ -301,9 +318,10 @@ impl KeyAgent {
             },
             None => Reply::Status {
                 unlocked: false,
-                storage_kid: SealedDeviceKeys::load_from(&self.paths.device_keys_sealed)
-                    .ok()
-                    .flatten()
+                // The current file is missing only between a promotion's renames.
+                storage_kid: [&self.paths.device_keys_sealed, &self.paths.device_keys_next]
+                    .into_iter()
+                    .find_map(|path| SealedDeviceKeys::load_from(path).ok().flatten())
                     .map(|sealed| sealed.storage_kid),
                 escrowed: false,
             },
@@ -336,6 +354,7 @@ impl KeyAgent {
             storage_kid,
             storage_key,
             escrowed: false,
+            via_prev: false,
         });
         Ok(Reply::Done)
     }
@@ -384,18 +403,30 @@ impl KeyAgent {
             bail!("this device's keys are already unlocked");
         }
         let trust = self.home(astation_id)?;
-        // The current file is missing only between a promotion's two renames.
+        // Stop at the first readable file; a damaged spare must not matter.
         let mut sealed = None;
+        let mut first_error = None;
         for path in [
             &self.paths.device_keys_sealed,
             &self.paths.device_keys_next,
             &self.paths.device_keys_prev,
         ] {
-            sealed = sealed.or(SealedDeviceKeys::load_from(path)?);
+            match SealedDeviceKeys::load_from(path) {
+                Ok(Some(file)) => {
+                    sealed = Some(file);
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => first_error = first_error.or(Some(error)),
+            }
         }
-        let sealed = sealed.ok_or_else(|| {
-            anyhow!("this device has no sealed keys; run `atem pair` to verify it")
-        })?;
+        let sealed = match (sealed, first_error) {
+            (Some(file), _) => file,
+            (None, Some(error)) => return Err(error),
+            (None, None) => {
+                bail!("this device has no sealed keys; run `atem pair` to verify it")
+            }
+        };
         if sealed.device_id != trust.device_id {
             bail!("device_keys.sealed belongs to another device id");
         }
@@ -518,12 +549,22 @@ impl KeyAgent {
             // Astation released the key a crashed rotation left pending.
             SealedFile::Next => promote_keeping_prev(&self.paths)?,
             // Astation holds the current key, so the file it replaced can go.
-            SealedFile::Current => match std::fs::remove_file(&self.paths.device_keys_prev) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error.into());
+            SealedFile::Current => {
+                match std::fs::remove_file(&self.paths.device_keys_prev) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error.into());
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+                // The unlock proves Astation holds the current key: a
+                // pending first escrow is settled, so the plain file goes.
+                if self.paths.device_keys.exists() {
+                    let mut store = TrustStore::load_from(&self.paths.trust)?;
+                    store.set_escrowed_kid(&granted.storage_kid);
+                    store.save_to(&self.paths.trust)?;
+                    remove_plain_keys(&self.paths)?;
+                }
+            }
             SealedFile::Prev => {}
         }
         self.unlocked = Some(Unlocked {
@@ -532,6 +573,7 @@ impl KeyAgent {
             storage_kid: granted.storage_kid.clone(),
             storage_key,
             escrowed: true,
+            via_prev: source == SealedFile::Prev,
         });
         Ok(Reply::Unlocked {
             storage_kid: granted.storage_kid,
@@ -546,6 +588,17 @@ impl KeyAgent {
         let trust = self.home(astation_id)?;
         if unlocked.device_id != trust.device_id {
             bail!("the unlocked keys belong to another device id");
+        }
+        if unlocked.via_prev {
+            bail!("unlocked with the previous storage key; lock and unlock again before rotating");
+        }
+        // A .next with no rotation in memory is a rotation that died after
+        // Astation may have stored its key: that pending key must be abandoned first.
+        if let Some(stale) = SealedDeviceKeys::load_from(&self.paths.device_keys_next)? {
+            bail!(
+                "an interrupted rotation to storage key {} may be pending at Astation; abandon it first",
+                stale.storage_kid
+            );
         }
         let initial = !unlocked.escrowed;
         let (old_kid, new_kid, new_key) = if initial {
@@ -650,6 +703,59 @@ impl KeyAgent {
         })
     }
 
+    /// Signs `atem-storage-abandon-v1` for a pending key Astation may hold.
+    /// Only when no rotation in memory and no sealed file carries that kid:
+    /// otherwise the device could strand itself. A stale `.next` with that
+    /// kid is deleted durably first.
+    fn abandon_pending(&mut self, astation_id: &str, storage_kid: &str) -> Result<Reply> {
+        let unlocked = self.unlocked.as_ref().ok_or_else(|| anyhow!(LOCKED))?;
+        let trust = self.home(astation_id)?;
+        if !crate::memory::crypto::valid_kid(storage_kid) {
+            bail!("storage key id must be 8 lowercase hex characters");
+        }
+        if let Some(rotation) = &self.pending_rotation
+            && rotation.storage_kid == storage_kid
+        {
+            bail!("a rotation to storage key {storage_kid} is in progress here");
+        }
+        let next = SealedDeviceKeys::load_from(&self.paths.device_keys_next)?;
+        if let Some(next) = &next
+            && next.storage_kid == storage_kid
+            && self.pending_rotation.is_none()
+        {
+            std::fs::remove_file(&self.paths.device_keys_next)?;
+            #[cfg(unix)]
+            std::fs::File::open(
+                self.paths
+                    .device_keys_next
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new(".")),
+            )?
+            .sync_all()?;
+        }
+        for path in [
+            &self.paths.device_keys_sealed,
+            &self.paths.device_keys_next,
+            &self.paths.device_keys_prev,
+        ] {
+            if let Some(sealed) = SealedDeviceKeys::load_from(path)?
+                && sealed.storage_kid == storage_kid
+            {
+                bail!("a sealed file still carries storage key {storage_kid}");
+            }
+        }
+        let abandon = unlocked.keys.sign_statement(
+            &StorageAbandon {
+                account: trust.data_account,
+                device_id: trust.device_id,
+                storage_kid: storage_kid.into(),
+            }
+            .encode(),
+        );
+        Ok(Reply::Abandoned { abandon })
+    }
+
     /// The sealed file the released key belongs to: the current one, the
     /// `.next` a rotation left when it crashed after Astation stored the key,
     /// or the `.prev` a promotion kept when Astation turned out to hold only
@@ -731,6 +837,7 @@ impl KeyAgent {
             storage_kid,
             storage_key,
             escrowed: false,
+            via_prev: false,
         });
         Ok(())
     }
@@ -838,6 +945,17 @@ pub trait KeyAgentApi: Send + Sync {
             astation_id: astation_id.into(),
         })? {
             Reply::Rotation { rotation } => Ok(rotation),
+            _ => unexpected(),
+        }
+    }
+
+    /// The signed abandon for a pending key id (see `KeyAgent::abandon_pending`).
+    fn abandon_pending(&self, astation_id: &str, storage_kid: &str) -> Result<SignedWire> {
+        match self.call(Request::AbandonPending {
+            astation_id: astation_id.into(),
+            storage_kid: storage_kid.into(),
+        })? {
+            Reply::Abandoned { abandon } => Ok(abandon),
             _ => unexpected(),
         }
     }
@@ -1764,6 +1882,7 @@ mod tests {
             storage_kid: "0a1b2c3d".into(),
             storage_key: Zeroizing::new([9; 32]),
             escrowed: false,
+            via_prev: false,
         });
         let message = error_of(agent.finish_unlock(ASTATION_ID, &signed.statement, &grant));
         assert!(message.contains("already unlocked"), "{message}");
@@ -1956,5 +2075,192 @@ mod tests {
             kid
         );
         assert!(!paths.device_keys_prev.exists());
+    }
+
+    /// A device whose rotation C was acked by Astation and then lost: the
+    /// agent restarted and unlocked on the still-current file A.
+    fn device_with_a_stale_rotation(
+        dir: &std::path::Path,
+    ) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>, String) {
+        let (paths, mut server, keys) = sealed_device(dir, "0a1b2c3d");
+        let stale = {
+            let agent = agent(&paths);
+            unlock(&agent, &server, &paths).unwrap();
+            let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+            server.accept_rotation(&rotation).unwrap();
+            // The process dies here: Astation holds C pending, the agent never promoted.
+            server.pending.as_ref().unwrap().0.clone()
+        };
+        let restarted = agent(&paths);
+        unlock(&restarted, &server, &paths).unwrap();
+        (paths, server, keys, restarted, stale)
+    }
+
+    #[test]
+    fn an_abandon_clears_a_stale_pending_key_so_a_new_rotation_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _, agent, stale) = device_with_a_stale_rotation(dir.path());
+        let message = error_of(agent.begin_rotation(ASTATION_ID));
+        assert!(
+            message.contains("abandon") && message.contains(&stale),
+            "{message}"
+        );
+        assert!(
+            paths.device_keys_next.exists(),
+            "begin_rotation deletes nothing"
+        );
+
+        let abandon = agent.abandon_pending(ASTATION_ID, &stale).unwrap();
+        assert!(
+            !paths.device_keys_next.exists(),
+            "the stale .next is deleted first"
+        );
+        server.accept_abandon(&abandon).unwrap();
+        assert!(server.pending.is_none());
+
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        let (kid, confirm) = agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert_ne!(kid, stale);
+        server.confirm(&confirm).unwrap();
+        // A replayed abandon is a no-op, even against a later pending key.
+        let again = agent.begin_rotation(ASTATION_ID).unwrap();
+        server.accept_rotation(&again).unwrap();
+        let pending = server.pending.clone();
+        server.accept_abandon(&abandon).unwrap();
+        assert_eq!(server.pending, pending);
+        // The abandoned kid can never come back.
+        assert!(server.acked.contains(&stale));
+    }
+
+    #[test]
+    fn the_agent_refuses_to_abandon_a_kid_it_still_has_a_file_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        // The current file.
+        assert!(error_of(agent.abandon_pending(ASTATION_ID, "0a1b2c3d")).contains("sealed file"));
+        // A rotation in memory.
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let next = SealedDeviceKeys::load_from(&paths.device_keys_next)
+            .unwrap()
+            .unwrap()
+            .storage_kid;
+        assert!(error_of(agent.abandon_pending(ASTATION_ID, &next)).contains("in progress"));
+        // The .prev a promotion kept.
+        let ack = server.accept_rotation(&rotation).unwrap();
+        agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert!(paths.device_keys_prev.exists());
+        assert!(error_of(agent.abandon_pending(ASTATION_ID, "0a1b2c3d")).contains("sealed file"));
+        assert!(error_of(agent.abandon_pending(ASTATION_ID, &next)).contains("sealed file"));
+        assert!(error_of(agent.abandon_pending(ASTATION_ID, "NOPE")).contains("lowercase hex"));
+        assert!(
+            error_of(agent.abandon_pending("astation-2", "ffffffff")).contains("home Astation")
+        );
+    }
+
+    #[test]
+    fn an_unlock_on_the_current_file_settles_the_first_escrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _, agent) = migrated_device(dir.path());
+        let kid = agent.status().unwrap().storage_kid.unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        server.accept_rotation(&rotation).unwrap();
+        // The agent never sees the ack (a lost reply); Astation holds the key pending.
+        agent.lock_keys().unwrap();
+        assert!(paths.device_keys.exists());
+        let (_, request) = request(&agent, &paths, 3);
+        let grant = server.grant_unlock_confirming(&request).unwrap();
+        assert_eq!(
+            agent
+                .finish_unlock(ASTATION_ID, &request.statement, &grant)
+                .unwrap(),
+            kid
+        );
+        assert_eq!(
+            TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
+            Some(kid.as_str())
+        );
+        assert!(
+            !paths.device_keys.exists(),
+            "the unlock proves Astation holds the key"
+        );
+    }
+
+    #[test]
+    fn a_first_escrow_lost_before_the_trust_save_is_abandoned_and_redone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _, first) = migrated_device(dir.path());
+        let k0 = first.status().unwrap().storage_kid.unwrap();
+        let rotation = first.begin_rotation(ASTATION_ID).unwrap();
+        server.accept_rotation(&rotation).unwrap();
+        drop(first); // crash before the ack was handled: nothing recorded
+
+        let restarted = agent(&paths);
+        let k1 = restarted.status().unwrap().storage_kid.unwrap();
+        assert_ne!(k0, k1, "the re-seal used a fresh key");
+        let rotation = restarted.begin_rotation(ASTATION_ID).unwrap();
+        assert!(
+            server.accept_rotation(&rotation).is_err(),
+            "k0 is still pending"
+        );
+        // No file carries k0 any more, so the agent can give it up (the
+        // in-memory rotation is for k1).
+        let abandon = restarted.abandon_pending(ASTATION_ID, &k0).unwrap();
+        server.accept_abandon(&abandon).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        let (kid, confirm) = restarted.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        assert_eq!(kid, k1);
+        server.confirm(&confirm).unwrap();
+        assert!(!paths.device_keys.exists());
+    }
+
+    #[test]
+    fn an_unlock_that_opened_the_previous_file_blocks_rotation_until_the_current_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, mut server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        unlock(&agent, &server, &paths).unwrap();
+        let rotation = agent.begin_rotation(ASTATION_ID).unwrap();
+        let ack = server.accept_rotation(&rotation).unwrap();
+        agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+        agent.lock_keys().unwrap();
+        let (_, request) = request(&agent, &paths, 1);
+        let grant = server
+            .unlock_grant(&server.astation, &request, "0a1b2c3d")
+            .unwrap();
+        agent
+            .finish_unlock(ASTATION_ID, &request.statement, &grant)
+            .unwrap();
+        assert!(error_of(agent.begin_rotation(ASTATION_ID)).contains("previous"));
+    }
+
+    #[test]
+    fn a_missing_current_file_or_a_damaged_spare_does_not_stop_unlock_or_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        std::fs::write(&paths.device_keys_next, b"not json").unwrap();
+        std::fs::write(&paths.device_keys_prev, b"not json").unwrap();
+        let agent = agent(&paths);
+        assert!(
+            agent.begin_unlock(ASTATION_ID).is_ok(),
+            "stops at the readable current file"
+        );
+        assert_eq!(unlock(&agent, &server, &paths).unwrap(), "0a1b2c3d");
+
+        // Between a promotion's two renames the current file is missing.
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        std::fs::remove_file(&paths.device_keys_sealed).unwrap();
+        SealedDeviceKeys::seal(&keys, DEVICE_ID, "4e5f6a7b", &new_storage_key())
+            .unwrap()
+            .save_to(&paths.device_keys_next)
+            .unwrap();
+        let agent = self::agent(&paths);
+        assert_eq!(
+            agent.status().unwrap().storage_kid.as_deref(),
+            Some("4e5f6a7b")
+        );
     }
 }

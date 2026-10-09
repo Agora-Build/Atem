@@ -446,6 +446,40 @@ impl StorageConfirm {
     }
 }
 
+/// The device gives up a storage key Astation holds as pending (its sealed
+/// file is gone). Signed by the device signing key; Astation drops a pending
+/// key only if it equals `storage_kid` exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageAbandon {
+    pub account: String,
+    pub device_id: String,
+    pub storage_kid: String,
+}
+
+impl StorageAbandon {
+    pub const LABEL: &'static str = "atem-storage-abandon-v1";
+
+    pub fn encode(&self) -> Vec<u8> {
+        enc(&[
+            Self::LABEL.as_bytes(),
+            self.account.as_bytes(),
+            self.device_id.as_bytes(),
+            self.storage_kid.as_bytes(),
+        ])
+    }
+
+    /// Astation's side: atem only encodes, so tests alone parse.
+    #[cfg(test)]
+    pub fn parse(fields: &[Vec<u8>]) -> Result<Self> {
+        expect(fields, Self::LABEL, 4)?;
+        Ok(Self {
+            account: text(&fields[1])?,
+            device_id: text(&fields[2])?,
+            storage_kid: text(&fields[3])?,
+        })
+    }
+}
+
 /// Astation's check of a device (or unlock-auth) Ed25519 signature.
 #[cfg(test)]
 pub(crate) fn verify_device(sign_pub: &[u8; 32], signed: &SignedWire) -> Result<Vec<Vec<u8>>> {
@@ -696,6 +730,16 @@ mod tests {
             confirm
         );
         assert!(StorageAck::parse(&dec(&confirm.encode()).unwrap()).is_err());
+        let abandon = StorageAbandon {
+            account: "acct".into(),
+            device_id: "dev".into(),
+            storage_kid: "0a1b2c3d".into(),
+        };
+        assert_eq!(
+            StorageAbandon::parse(&dec(&abandon.encode()).unwrap()).unwrap(),
+            abandon
+        );
+        assert!(StorageConfirm::parse(&dec(&abandon.encode()).unwrap()).is_err());
         assert_ne!(
             storage_key_info("acct", "dev", "0a1b2c3d"),
             storage_key_info("acct", "dev", "4e5f6a7b")
