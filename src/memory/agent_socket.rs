@@ -26,6 +26,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use crate::memory::account_keys::{CryptOp, CryptOut};
+use crate::memory::encoding::WipingBuf;
 use crate::memory::key_agent::{KeyAgent, KeyAgentApi, PROTOCOL_VERSION, Reply, Request};
 use crate::memory::verification::KeyPaths;
 
@@ -144,37 +145,6 @@ struct Envelope<'a> {
     #[serde(flatten)]
     request: &'a Request,
     v: u64,
-}
-
-/// A growing buffer that wipes what it outgrows (`Vec` would leave the old
-/// allocation behind unwiped).
-struct WipingBuf(Zeroizing<Vec<u8>>);
-
-impl WipingBuf {
-    fn new() -> Self {
-        Self(Zeroizing::new(Vec::with_capacity(4096)))
-    }
-
-    fn append(&mut self, data: &[u8]) {
-        let needed = self.0.len() + data.len();
-        if needed > self.0.capacity() {
-            let mut bigger = Zeroizing::new(Vec::with_capacity(needed.max(self.0.capacity() * 2)));
-            bigger.extend_from_slice(&self.0);
-            self.0 = bigger;
-        }
-        self.0.extend_from_slice(data);
-    }
-}
-
-impl Write for WipingBuf {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.append(data);
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 fn to_wiping_json<T: Serialize>(value: &T) -> Result<WipingBuf> {

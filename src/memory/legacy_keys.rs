@@ -162,8 +162,13 @@ impl LegacyKeys {
         names
     }
 
+    /// Pre-sized and wiped: the store carries `K` and its previous keys.
+    fn plaintext(&self) -> Result<Zeroizing<Vec<u8>>> {
+        crate::memory::encoding::to_presized_json(self)
+    }
+
     fn save_to(&self, path: &Path) -> Result<()> {
-        let plain = Zeroizing::new(serde_json::to_vec(self)?);
+        let plain = self.plaintext()?;
         let encrypted = crate::credentials::encrypt_machine_bound(&plain)?;
         crate::memory::crypto::write_private(path, &encrypted)
     }
@@ -423,6 +428,26 @@ mod tests {
             summary_at(&path, "shared"),
             (Some("0123abcd".into()), vec![], 1)
         );
+    }
+
+    #[test]
+    fn the_plaintext_is_written_into_one_exact_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data_keys.enc");
+        for account in ["a", "b", "c", "d"] {
+            write_for_test(
+                &path,
+                account,
+                account,
+                &[("0123abcd", [1; 32]), ("11112222", [2; 32])],
+                &[("h1.x.aa", "p")],
+            );
+        }
+        let Legacy::Keys(store) = read(&path).unwrap() else {
+            panic!("readable");
+        };
+        let plain = store.plaintext().unwrap();
+        assert_eq!(plain.capacity(), plain.len());
     }
 
     fn kids(keys: &[AccountKey]) -> Vec<&str> {

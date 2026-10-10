@@ -172,12 +172,13 @@ impl DeviceKeys {
         let device = Zeroizing::new(STANDARD.encode(self.device.to_bytes()));
         let device_sign = Zeroizing::new(STANDARD.encode(self.device_sign.to_bytes()));
         let account_keys = (!accounts.is_empty()).then(|| accounts.to_wire());
-        Ok(Zeroizing::new(serde_json::to_vec(&SealedPlainRef {
+        // Pre-sized and wiped: the payload carries every key of the device.
+        crate::memory::encoding::to_presized_json(&SealedPlainRef {
             version: if account_keys.is_some() { 2 } else { 1 },
             device: &device,
             device_sign: &device_sign,
             account_keys: account_keys.as_ref(),
-        })?))
+        })
     }
 
     #[cfg(test)]
@@ -254,12 +255,12 @@ impl DeviceKeys {
             Zeroizing::new(STANDARD.encode(&device_sign[..])),
             Zeroizing::new(STANDARD.encode(&unlock_auth[..])),
         );
-        let bytes = Zeroizing::new(serde_json::to_vec(&StoredDeviceKeysRef {
+        let bytes = crate::memory::encoding::to_presized_json(&StoredDeviceKeysRef {
             version: 1,
             device: &device,
             device_sign: &device_sign,
             unlock_auth: &unlock_auth,
-        })?);
+        })?;
         crate::memory::crypto::write_private(path, &bytes)
     }
 }
@@ -373,6 +374,24 @@ mod tests {
             DeviceKeys::generate().device_pub(),
             DeviceKeys::generate().device_pub()
         );
+    }
+
+    #[test]
+    fn the_sealed_payload_is_written_into_one_exact_allocation() {
+        use crate::memory::account_keys::AccountKeys;
+        let keys = DeviceKeys::generate();
+        let mut accounts = AccountKeys::default();
+        for (index, account) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            for kid in ["0123abcd", "11112222", "33334444"] {
+                accounts.install(account, kid, Zeroizing::new([index as u8; 32]));
+            }
+        }
+        // Pre-sized: serializing never grew (and so never left a copy of
+        // the keys in a freed, unwiped allocation).
+        for accounts in [AccountKeys::default(), accounts] {
+            let plain = keys.sealed_plaintext_with(&accounts).unwrap();
+            assert_eq!(plain.capacity(), plain.len());
+        }
     }
 
     #[test]
