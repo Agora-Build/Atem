@@ -1400,7 +1400,7 @@ fn prompt_codes_match() -> bool {
     }
     let stdin = io::stdin();
     loop {
-        print!("Do the codes match? Type y or n: ");
+        print!("Does the code on your Mac match? Type y or n: ");
         let _ = io::stdout().flush();
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
@@ -1662,7 +1662,8 @@ async fn run_device_verification(
     let outcome: Result<()> = async {
         println!();
         println!("Safety code:  {code}");
-        println!("Astation shows a code too. They must match exactly.");
+        println!("Your Mac shows a code too. They must match exactly.");
+        println!("Confirm on both, in either order: type y here, and approve on your Mac with Touch ID.");
         if !prompt_codes_match() {
             // Drop the pending pin first so it goes even if the send fails.
             TrustStore::update(&paths.trust, |t| {
@@ -1679,7 +1680,7 @@ async fn run_device_verification(
             );
         }
 
-        println!("Confirm on your Mac with Touch ID…");
+        println!("Waiting for your Mac (approve with Touch ID if you haven't yet)…");
         match timeout(Duration::from_secs(300), next_verify_message(client)).await {
             Err(_) => anyhow::bail!("Timed out waiting for Astation to confirm this device."),
             Ok(result) => match result? {
