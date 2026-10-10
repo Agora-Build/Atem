@@ -34,7 +34,7 @@ pub const PROTOCOL_VERSION: u64 = 2;
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 
 /// Appended to key-file errors, which never stop the agent (it starts locked).
-pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`.";
+pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back.";
 
 /// What the agent serves. Only the same user can reach it (agent_socket.rs).
 /// Fields that carry secrets are `Zeroizing`.

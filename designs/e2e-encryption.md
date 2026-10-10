@@ -544,7 +544,10 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   site (a pull page, a push chunk, a migration chunk) into as few requests as
   a 2 MiB / 1024-op budget allows, always from a blocking thread
   (`key_agent::blocking`); one field whose wire size is over 6 MiB fails with
-  "a field is too large to encrypt", below the line limit. A client that
+  "a field is too large to encrypt (N bytes)" (N is the field's own size),
+  below the line limit. The sealed payload and the plaintext of
+  `data_keys.enc` are serialized into one exactly sized, wiped buffer, so
+  no unwiped reallocation copy of `K` or the device keys is left behind. A client that
   gets a hang-up from a running v1 agent (for example while writing a large
   first request) reports the stop-and-retry hint, and `atem cred status`
   against a v1 agent prints the version-mismatch line and the same hint
@@ -553,7 +556,11 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   `cred_state.json`; there is no stored mode and no "local state doesn't
   match" check. When several verified Astations name one account the newest
   signed state wins; on an equal epoch the lexicographically smallest
-  Astation id wins, so every caller agrees. Unverified devices are `off`; an
+  Astation id wins. One helper (`effective_state`) applies that rule for
+  the agent's grant install (the grant's kid must be the newest state's
+  kid, whichever Astation carried it) and `Crypt`, and for the CLI's
+  `account_mode` and `key_needed`, so every caller agrees and a stale
+  Astation can't demote a newer `K`. Unverified devices are `off`; an
   `off` (or unverified) context never contacts the agent. A locked agent, or
   one without `K`, makes sync keep its changes queued and say
   `atem cred unlock` or that the account requires encryption. `keyRequest`
@@ -577,15 +584,24 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   confirmed escrow) the agent merges `data_keys.enc` (verified accounts only)
   into the sealed payload and `project_names.json`, then deletes it once the
   home Astation is known to hold the storage key of that sealed file (and
-  the agent didn't unlock via `.prev`). A crash at any point leaves
-  `data_keys.enc`, and the next unlock repeats the merge. An unreadable
-  `data_keys.enc` is never deleted (its key may be recoverable): it is renamed
-  aside to `data_keys.enc.corrupt-<stamp>`. An unverified device's is deleted
-  when the agent starts (an unreadable one is moved aside) (it only holds what the unauthenticated #36 path
-  stored). A device's first verification with an Astation purges what the
-  #36 path stored for that Astation, except accounts another verified
-  Astation also names (this covers `data_keys.enc` and the forgetting of
-  project names).
+  the agent didn't unlock via `.prev`), and only when every entry of every
+  verified account parsed: a malformed entry keeps the file (logged at each
+  unlock), while the account's valid keys still move (with a malformed or
+  missing current entry, its valid previous keys too). A crash at any point
+  leaves `data_keys.enc`, and the next unlock repeats the merge. An
+  unreadable `data_keys.enc` is never deleted (its key may be recoverable):
+  it is renamed aside to `data_keys.enc.corrupt-<stamp>`. An unverified
+  device's is deleted when the agent starts, since it only holds what the
+  unauthenticated #36 path stored; an unreadable one is moved aside there
+  too. A device's first verification with an Astation purges what the #36
+  path stored for that Astation, except accounts another verified Astation
+  also names (this covers `data_keys.enc` and the forgetting of project
+  names). That purge runs in the `atem pair` process: it decrypts
+  `data_keys.enc` and writes it back, so on a device upgraded from step 2a
+  the legacy `K` and its previous keys pass through the CLI's memory a
+  second time (besides the fresh-key verification below). Accepted: it
+  only happens while that legacy file still exists, the CLI runs as the
+  same user, and the buffers are wiped.
 - **Fresh-key verification.** A freshly verified device has no agent-held
   storage key yet, so `atem pair` opens the `K` grant inside its own process
   (it holds the fresh device key anyway) with the usual checks, drops `K`
@@ -601,9 +617,14 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
     file still exists.
   - An unlock that opened the sealed file via `.prev` keeps `data_keys.enc`
     until a later unlock proves the home Astation holds the current key.
-  - A step-2a binary refuses a v2 `device_keys.sealed` (see above), so
-    downgrading after a `K` was installed needs the reset steps shown by `atem cred status` or a
-    fresh grant.
+  - A `K` installed while the agent held keys opened from `.prev`, or one
+    that reached only a `.next` later discarded, is lost when that file is
+    replaced or deleted before the `K` reaches the current file. Only the current kid is
+    asked for again (`keyRequest`); previous keys held only there may not
+    be re-grantable.
+  - A step-2a binary refuses a v2 `device_keys.sealed` (see above). To
+    downgrade after a `K` was installed, follow the reset steps that
+    `atem cred status` prints, or wait for a fresh grant.
   - A key agent left running across the upgrade speaks protocol v1; the
     new atem tells you to stop it. After the upgrade a verified device needs
     `atem cred unlock` once (protocol v2 agent starts locked) before sync
@@ -1483,7 +1504,9 @@ If this device's keys can't be unlocked (the sealed file or
 
 > To start over: delete ~/.config/atem/device_keys, device_keys.sealed,
 > device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and
-> cred_state.json, then run `atem pair`.
+> cred_state.json, then run `atem pair`. device_keys.sealed also holds the
+> memory encryption key and its older keys: Astation grants the current key
+> again, older keys may not come back.
 
 An Astation rolled back or restored from a backup to an older storage key
 counts as having lost it: the storage key rotates at every unlock, so the

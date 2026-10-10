@@ -315,8 +315,10 @@ pub(crate) fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>
 
 /// The newest signed state of every account a verified Astation names: the
 /// highest epoch when two name one account (on equal epochs, the state of
-/// the smallest Astation id), `None` while none of them has a signed state. The one rule for which `K` an account needs, shared by the
-/// key agent (which keys it keeps) and `key_needed` (which it asks for).
+/// the smallest Astation id), `None` while none of them has a signed state.
+/// The one rule for which `K` an account needs, shared by the key agent
+/// (which keys it keeps and uses) and `key_needed` (which it asks for);
+/// `effective_state` reads it for one Astation.
 pub(crate) fn newest_states(
     trust: &TrustStore,
 ) -> Result<std::collections::BTreeMap<String, Option<AccountState>>> {
