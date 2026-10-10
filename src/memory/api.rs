@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::store::PendingOp;
-use crate::memory::crypto::EncryptionContext;
+use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 
 pub const PULL_LIMIT: u32 = 200;
 const MEMORY_MIGRATION_CHUNK: usize = 64;
@@ -185,7 +185,36 @@ pub struct KnowledgeClient {
     astation_id: String,
     http: reqwest::Client,
     #[cfg(test)]
-    encryption_store: Option<std::path::PathBuf>,
+    encryption_with: Option<(crate::memory::verification::KeyPaths, std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>)>,
+}
+
+/// The wire form of `ops`, encrypted when the account is: every memory,
+/// skill and project hash of the batch in a few key-agent round trips.
+fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<Value>> {
+    if !encryption.should_encrypt() {
+        return Ok(ops.iter().map(op_to_wire).collect());
+    }
+    let memories = encryption.encrypt_memories(ops.iter().filter_map(|op| match op {
+        PendingOp::AddMemory { memory } => Some(memory.clone()),
+        _ => None,
+    }).collect())?;
+    let skills = encryption.encrypt_skills(ops.iter().filter_map(|op| match op {
+        PendingOp::PushSkill { skill, .. } => Some(skill.clone()),
+        _ => None,
+    }).collect())?;
+    let projects = encryption.wire_projects(&ops.iter().filter_map(|op| match op {
+        PendingOp::DeleteSkill { project, .. } | PendingOp::PurgeSkill { project, .. } => Some(project.clone()),
+        _ => None,
+    }).collect::<Vec<_>>())?;
+    let (mut memories, mut skills, mut projects) = (memories.into_iter(), skills.into_iter(), projects.into_iter());
+    let missing = || anyhow::anyhow!("an encrypted field of the batch is missing");
+    ops.iter().map(|op| Ok(match op {
+        PendingOp::AddMemory { .. } => json!({"op": "add", "memory": memories.next().ok_or_else(missing)?}),
+        PendingOp::PushSkill { base_version, .. } => json!({"op": "push", "skill": skills.next().ok_or_else(missing)?, "base_version": base_version}),
+        PendingOp::DeleteSkill { scope, name, .. } => json!({"op": "delete", "scope": scope, "project": projects.next().ok_or_else(missing)?, "name": name}),
+        PendingOp::PurgeSkill { scope, name, versions, .. } => json!({"op": "purge", "scope": scope, "project": projects.next().ok_or_else(missing)?, "name": name, "versions": versions}),
+        _ => op_to_wire(op),
+    })).collect()
 }
 
 impl KnowledgeClient {
@@ -200,13 +229,13 @@ impl KnowledgeClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             #[cfg(test)]
-            encryption_store: None,
+            encryption_with: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_encryption_store(mut self, path: std::path::PathBuf) -> Self {
-        self.encryption_store = Some(path);
+    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::KeyPaths, agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>) -> Self {
+        self.encryption_with = Some((paths, agent));
         self
     }
 
@@ -236,50 +265,19 @@ impl KnowledgeClient {
 
     fn encryption(&self) -> Result<EncryptionContext, ApiError> {
         #[cfg(test)]
-        if let Some(path) = &self.encryption_store {
-            return EncryptionContext::for_astation_at(&self.astation_id, path)
+        if let Some((paths, agent)) = &self.encryption_with {
+            return EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone())
                 .map_err(|error| ApiError::Encryption(error.to_string()));
         }
         EncryptionContext::for_astation(&self.astation_id)
             .map_err(|error| ApiError::Encryption(error.to_string()))
     }
 
-    fn encrypted_op(&self, op: &PendingOp, encryption: &EncryptionContext) -> Result<Value, ApiError> {
-        let value = match op {
-            PendingOp::AddMemory { memory } => json!({
-                "op": "add",
-                "memory": encryption.encrypt_memory(memory.clone())
-                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
-            }),
-            PendingOp::PushSkill { skill, base_version } => json!({
-                "op": "push",
-                "skill": encryption.encrypt_skill(skill.clone())
-                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
-                "base_version": base_version,
-            }),
-            PendingOp::DeleteSkill { scope, project, name } => json!({
-                "op": "delete", "scope": scope,
-                "project": encryption.wire_project(project)
-                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
-                "name": name,
-            }),
-            PendingOp::PurgeSkill { scope, project, name, versions } => json!({
-                "op": "purge", "scope": scope,
-                "project": encryption.wire_project(project)
-                    .map_err(|error| ApiError::Encryption(error.to_string()))?,
-                "name": name, "versions": versions,
-            }),
-            _ => op_to_wire(op),
-        };
-        Ok(value)
-    }
-
     pub async fn push(&self, ops: &[&PendingOp], memory: bool) -> Result<Vec<OpResult>, ApiError> {
         let encryption = self.encryption()?;
         let kind = if memory { "memory" } else { "skills" };
-        let wire = ops.iter()
-            .map(|op| self.encrypted_op(op, &encryption))
-            .collect::<Result<Vec<_>, _>>()?;
+        let owned: Vec<PendingOp> = ops.iter().map(|op| (*op).clone()).collect();
+        let wire = encryption.blocking(move |encryption| encrypted_ops(encryption, &owned)).await?;
         let req = ApiRequest {
             method: "POST",
             url: format!("{}/api/{kind}/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
@@ -293,26 +291,21 @@ impl KnowledgeClient {
         let req = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: MemoryPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         let encryption = self.encryption()?;
-        page.memories.into_iter()
-            .map(|memory| encryption.decrypt_memory(memory)
-                .map_err(|error| ApiError::Encryption(error.to_string())))
-            .collect()
+        encryption.blocking(move |encryption| encryption.decrypt_memories(page.memories)).await.map_err(ApiError::from)
     }
 
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let req = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         let encryption = self.encryption()?;
-        page.skills.into_iter()
-            .map(|skill| encryption.decrypt_skill(skill)
-                .map_err(|error| ApiError::Encryption(error.to_string())))
-            .collect()
+        encryption.blocking(move |encryption| encryption.decrypt_skills(page.skills)).await.map_err(ApiError::from)
     }
 
     /// A skill's history, newest first (no files).
     pub async fn skill_versions(&self, scope: Scope, project: &str, name: &str) -> Result<Vec<SkillVersionInfo>, ApiError> {
-        let project = self.encryption()?.wire_project(project)
-            .map_err(|error| ApiError::Encryption(error.to_string()))?;
+        let encryption = self.encryption()?;
+        let project = project.to_string();
+        let project = encryption.blocking(move |encryption| encryption.wire_project(&project)).await.map_err(ApiError::from)?;
         let req = skill_versions_request(&self.base, &self.client_id, scope, &project, name);
         let page: VersionsPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(page.versions)
@@ -321,19 +314,17 @@ impl KnowledgeClient {
     /// One version with its files. 404 unknown, 410 purged (as `ApiError::Http`).
     pub async fn skill_version(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<Skill, ApiError> {
         let encryption = self.encryption()?;
-        let project = encryption.wire_project(project)
-            .map_err(|error| ApiError::Encryption(error.to_string()))?;
+        let project = project.to_string();
+        let project = encryption.blocking(move |encryption| encryption.wire_project(&project)).await.map_err(ApiError::from)?;
         let req = skill_version_request(&self.base, &self.client_id, scope, &project, name, version);
         let page: VersionPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        encryption.decrypt_skill(page.skill)
-            .map_err(|error| ApiError::Encryption(error.to_string()))
+        encryption.blocking(move |encryption| encryption.decrypt_skill(page.skill)).await.map_err(ApiError::from)
     }
 
     /// Snapshot every historical row before rewriting any of them. Rewrites
     /// allocate fresh sequence values, so interleaving pull and rewrite could
     /// otherwise keep rediscovering our own migration writes.
     pub async fn migrate_encryption(&self) -> Result<(), ApiError> {
-        use crate::memory::crypto::EncryptionMode;
         let encryption = self.encryption()?;
         if !matches!(encryption.mode, EncryptionMode::Enabling | EncryptionMode::Disabling) {
             return Ok(());
@@ -366,23 +357,18 @@ impl KnowledgeClient {
         }
 
         for chunk in memories.chunks(MEMORY_MIGRATION_CHUNK) {
-            let mut ops = Vec::with_capacity(chunk.len());
-            for raw in chunk {
-                let old = raw.clone();
-                let plain = encryption.decrypt_memory(raw.clone())?;
-                let desired = if encryption.mode == EncryptionMode::Enabling {
-                    encryption.encrypt_memory(plain)?
-                } else {
-                    plain
-                };
-                ops.push(json!({
+            let raw = chunk.to_vec();
+            let ops = encryption.blocking(move |encryption| {
+                let plain = encryption.decrypt_memories(raw.clone())?;
+                let desired = if encryption.mode == EncryptionMode::Enabling { encryption.encrypt_memories(plain)? } else { plain };
+                Ok(raw.iter().zip(desired).map(|(old, desired)| json!({
                     "op": "rewrite",
                     "id": old.id,
                     "project": desired.project,
                     "content": desired.content,
                     "content_hash": desired.content_hash,
-                }));
-            }
+                })).collect::<Vec<_>>())
+            }).await?;
             let response: BatchResponse = self.send(ApiRequest {
                 method: "POST",
                 url: format!("{}/api/memory/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
@@ -394,26 +380,21 @@ impl KnowledgeClient {
         }
 
         for chunk in skills.chunks(SKILL_MIGRATION_CHUNK) {
-            let mut ops = Vec::with_capacity(chunk.len());
-            for raw in chunk {
-                let old_project = raw.project.clone();
-                let plain = encryption.decrypt_skill(raw.clone())?;
-                let desired = if encryption.mode == EncryptionMode::Enabling {
-                    encryption.encrypt_skill(plain)?
-                } else {
-                    plain
-                };
-                ops.push(json!({
+            let raw = chunk.to_vec();
+            let ops = encryption.blocking(move |encryption| {
+                let plain = encryption.decrypt_skills(raw.clone())?;
+                let desired = if encryption.mode == EncryptionMode::Enabling { encryption.encrypt_skills(plain)? } else { plain };
+                Ok(raw.iter().zip(desired).map(|(old, desired)| json!({
                     "op": "rewrite",
                     "scope": desired.scope,
-                    "old_project": old_project,
+                    "old_project": old.project,
                     "name": desired.name,
                     "version": desired.version,
                     "project": desired.project,
                     "files": desired.files,
                     "content_hash": desired.content_hash,
-                }));
-            }
+                })).collect::<Vec<_>>())
+            }).await?;
             let response: BatchResponse = self.send(ApiRequest {
                 method: "POST",
                 url: format!("{}/api/skills/batch?id={}", base_trim(&self.base), enc(&self.client_id)),

@@ -77,11 +77,6 @@ pub fn trust_path() -> PathBuf {
     crate::config::AtemConfig::config_dir().join("cred_state.json")
 }
 
-/// The trust store that sits next to a given `data_keys.enc`.
-pub fn trust_path_for(data_keys_path: &Path) -> PathBuf {
-    data_keys_path.with_file_name("cred_state.json")
-}
-
 impl TrustStore {
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = match std::fs::read(path) {
@@ -792,7 +787,6 @@ mod tests {
             loaded.verification_line("other"),
             "Verified: no  (run 'atem pair' to verify this device)"
         );
-        assert_eq!(trust_path_for(&dir.path().join("data_keys.enc")), path);
     }
 
     #[test]

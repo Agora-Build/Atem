@@ -1,21 +1,20 @@
 //! End-to-end encryption for relay-backed memory, skills, and vaults.
 //! Local knowledge.db remains plaintext; transforms happen only at HTTP edges.
+//! `K` lives only in the key agent (build step 2b): `EncryptionContext` reads
+//! the mode from the signed account state and asks the agent to seal, open
+//! and hash. Also: private atomic file writes for every key file.
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, Payload},
-    XChaCha20Poly1305,
-};
-use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::memory::account_keys::{CryptOp, CryptOut};
+use crate::memory::key_agent::KeyAgentApi;
 use crate::memory::model::{content_hash, skill_hash, Memory, Skill};
+use crate::memory::verification::KeyPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,89 +53,6 @@ impl EncryptionMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredMode {
-    data_account: String,
-    mode: EncryptionMode,
-    kid: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredKey {
-    kid: String,
-    key: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct StoredKeys {
-    #[serde(default = "store_version")]
-    version: u8,
-    #[serde(default)]
-    astations: HashMap<String, StoredMode>,
-    #[serde(default)]
-    accounts: HashMap<String, StoredKey>,
-    #[serde(default)]
-    previous_keys: HashMap<String, Vec<StoredKey>>,
-    #[serde(default)]
-    project_names: HashMap<String, HashMap<String, String>>,
-}
-
-fn store_version() -> u8 { 1 }
-
-impl StoredKeys {
-    fn load_from(path: &Path) -> Result<Self> {
-        let raw = match fs::read(path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self { version: 1, ..Self::default() });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let plain = crate::credentials::decrypt_machine_bound(&raw)
-            .context("data_keys.enc cannot be decrypted on this machine")?;
-        let store: Self = serde_json::from_slice(&plain).context("data_keys.enc is unreadable")?;
-        if store.version != 1 {
-            bail!("unsupported data_keys.enc version {}", store.version);
-        }
-        Ok(store)
-    }
-
-    fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-        let encrypted = crate::credentials::encrypt_machine_bound(&serde_json::to_vec(self)?)?;
-        let temp = path.with_extension("enc.tmp");
-        fs::write(&temp, encrypted)?;
-        set_mode_600(&temp)?;
-        fs::rename(temp, path)?;
-        set_mode_600(path)
-    }
-
-    fn load_or_recover_from(path: &Path) -> Result<Self> {
-        match Self::load_from(path) {
-            Ok(store) => Ok(store),
-            Err(load_error) if path.exists() => {
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("data_keys.enc");
-                let backup = path.with_file_name(format!("{name}.corrupt-{stamp}"));
-                fs::rename(path, &backup).with_context(|| {
-                    format!(
-                        "data_keys.enc is unreadable ({load_error}) and could not be preserved as {}",
-                        backup.display()
-                    )
-                })?;
-                Ok(Self { version: 1, ..Self::default() })
-            }
-            Err(error) => Err(error),
-        }
-    }
-}
-
-fn key_store_path() -> PathBuf {
-    crate::config::AtemConfig::config_dir().join("data_keys.enc")
-}
 
 #[cfg(unix)]
 fn set_mode_600(path: &Path) -> Result<()> {
@@ -285,152 +201,107 @@ pub(crate) fn valid_kid(kid: &str) -> bool {
     kid.len() == 8 && kid.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-#[derive(Debug, Clone)]
+/// Most bytes and operations one `Crypt` request carries; bigger batches are
+/// split. One skill (at most `MAX_SKILL_BYTES`, 1 MiB) always fits.
+const CRYPT_BATCH_BYTES: usize = 2 << 20;
+const CRYPT_BATCH_OPS: usize = 1024;
+
+const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
+
+/// One Astation's encryption mode, and a handle on the key agent, which
+/// holds `K` and does every seal, open and keyed hash: this process never
+/// sees `K`. Mode and kid come from the latest signed account state; off
+/// (and unverified) contexts never touch the agent. Methods that reach the
+/// agent block on its socket: from async code run them inside `blocking`.
+#[derive(Clone)]
 pub struct EncryptionContext {
     pub mode: EncryptionMode,
     pub data_account: String,
     pub kid: Option<String>,
-    key: Option<[u8; 32]>,
-    previous_keys: HashMap<String, [u8; 32]>,
-    store_path: PathBuf,
+    astation_id: String,
+    /// `None` while encryption is off.
+    agent: Option<Arc<dyn KeyAgentApi>>,
+    names_path: PathBuf,
+}
+
+impl std::fmt::Debug for EncryptionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionContext")
+            .field("mode", &self.mode)
+            .field("data_account", &self.data_account)
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
+fn next_text(results: &mut impl Iterator<Item = CryptOut>) -> Result<String> {
+    results.next().ok_or_else(|| anyhow!("the key agent answered too few operations"))?.into_text()
+}
+
+fn next_plain(results: &mut impl Iterator<Item = CryptOut>) -> Result<Vec<u8>> {
+    Ok(results.next().ok_or_else(|| anyhow!("the key agent answered too few operations"))?.into_plain()?.to_vec())
+}
+
+#[cfg(test)]
+fn one<T>(items: Vec<T>) -> Result<T> {
+    items.into_iter().next().ok_or_else(|| anyhow!("encryption returned nothing"))
 }
 
 impl EncryptionContext {
     pub fn for_astation(astation_id: &str) -> Result<Self> {
-        Self::for_astation_at(astation_id, &key_store_path())
+        Self::for_astation_with(
+            astation_id,
+            &KeyPaths::default_paths(),
+            Arc::from(crate::memory::key_agent::default_agent()),
+        )
     }
 
-    pub(crate) fn for_astation_at(astation_id: &str, path: &Path) -> Result<Self> {
-        let trust = crate::memory::trust::TrustStore::load_from(&crate::memory::trust::trust_path_for(path))?;
-        let off = || Self {
-            mode: EncryptionMode::Off,
-            data_account: astation_id.into(),
-            kid: None,
-            key: None,
-            previous_keys: HashMap::new(),
-            store_path: path.to_path_buf(),
-        };
-        // Unverified devices never obey stored state: it may come from the
-        // old unauthenticated path. The file is left untouched.
-        let Some(verified) = trust.verified(astation_id) else {
-            return Ok(off());
-        };
-        let Some(signed) = verified.account_state.as_ref() else {
-            bail!("waiting for Astation's signed encryption state; reconnect to Astation");
-        };
-        let store = StoredKeys::load_from(path)?;
-        let signed_state = STANDARD
-            .decode(&signed.statement)
-            .context("stored signed state is not base64")
-            .and_then(|bytes| crate::memory::encoding::dec(&bytes))
-            .and_then(|fields| crate::memory::statements::AccountState::parse(&fields))?;
-        let mismatch = || anyhow!("local encryption state doesn't match Astation's signed state; reconnect to Astation");
-        let Some(mode) = store.astations.get(astation_id) else {
-            if signed_state.mode == EncryptionMode::Off {
-                return Ok(off());
-            }
-            return Err(mismatch());
-        };
-        if mode.mode != signed_state.mode || mode.kid != signed_state.kid {
-            return Err(mismatch());
-        }
-        let key = (mode.mode != EncryptionMode::Off).then(|| store.accounts.get(&mode.data_account)).flatten().map(|stored| {
-            let bytes = STANDARD.decode(&stored.key).context("invalid stored account key")?;
-            if bytes.len() != 32 { bail!("stored account key has the wrong length"); }
-            if mode.kid.as_deref() != Some(&stored.kid) { bail!("stored account key id does not match relay mode"); }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            Ok(key)
-        }).transpose()?;
-        if mode.mode.requires_key() && key.is_none() {
-            bail!("this account requires encryption; connect to Astation to receive the encryption key");
-        }
-        let previous_keys = (mode.mode != EncryptionMode::Off)
-            .then(|| store.previous_keys.get(&mode.data_account))
-            .flatten()
-            .into_iter()
-            .flatten()
-            .map(|stored| {
-                let bytes = STANDARD.decode(&stored.key).context("invalid previous account key")?;
-                if bytes.len() != 32 { bail!("previous account key has the wrong length"); }
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                Ok((stored.kid.clone(), key))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
+    pub(crate) fn for_astation_with(astation_id: &str, paths: &KeyPaths, agent: Arc<dyn KeyAgentApi>) -> Result<Self> {
+        let state = crate::memory::verification::account_mode(&paths.trust, astation_id)?;
         Ok(Self {
-            mode: mode.mode,
-            data_account: mode.data_account.clone(),
-            kid: mode.kid.clone(),
-            key,
-            previous_keys,
-            store_path: path.to_path_buf(),
+            mode: state.mode,
+            data_account: state.data_account,
+            kid: state.kid,
+            astation_id: astation_id.into(),
+            agent: state.mode.requires_key().then_some(agent),
+            names_path: paths.project_names.clone(),
         })
     }
 
-    pub(crate) fn update_mode_at(path: &Path, astation_id: &str, data_account: &str, mode: EncryptionMode, kid: Option<&str>) -> Result<()> {
-        let mut store = StoredKeys::load_or_recover_from(path)?;
-        if mode == EncryptionMode::Off {
-            store.accounts.remove(data_account);
-            store.previous_keys.remove(data_account);
-            store.project_names.remove(data_account);
-        } else if mode == EncryptionMode::On
-            && store.accounts.get(data_account).is_some_and(|stored| Some(stored.kid.as_str()) == kid)
-        {
-            // Once the relay reports `on`, every stored field has the current
-            // kid and rotation history is no longer needed for decryption.
-            store.previous_keys.remove(data_account);
+    /// Runs `work` on a blocking thread when it may reach the key agent
+    /// (R7: socket I/O and autostart must not stall the runtime); inline
+    /// when encryption is off.
+    pub async fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        if self.agent.is_none() {
+            return work(self);
         }
-        store.astations.insert(astation_id.into(), StoredMode {
-            data_account: data_account.into(), mode, kid: kid.map(str::to_string),
-        });
-        store.save_to(path)
+        let context = self.clone();
+        crate::memory::key_agent::blocking(move || work(&context)).await
     }
 
-    pub(crate) fn install_grant_at(path: &Path, astation_id: &str, data_account: &str, kid: &str, key: [u8; 32]) -> Result<()> {
-        let mut store = StoredKeys::load_from(path)?;
-        let mode = store.astations.get(astation_id)
-            .ok_or_else(|| anyhow!("received an encryption key before the account mode"))?;
-        if mode.data_account != data_account || mode.kid.as_deref() != Some(kid) {
-            bail!("encryption key grant does not match the announced account mode");
+    /// `ops` in as few `Crypt` requests as the budget allows, results in order.
+    fn run(&self, ops: Vec<CryptOp>) -> Result<Vec<CryptOut>> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
         }
-        let replacement = StoredKey { kid: kid.into(), key: STANDARD.encode(key) };
-        if let Some(previous) = store.accounts.insert(data_account.into(), replacement)
-            && previous.kid != kid {
-            let history = store.previous_keys.entry(data_account.into()).or_default();
-            history.retain(|item| item.kid != previous.kid);
-            history.push(previous);
+        let agent = self.agent.as_deref().ok_or_else(|| anyhow!("encryption is off for this account"))?;
+        let mut results = Vec::with_capacity(ops.len());
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        for op in ops {
+            let size = op.wire_len();
+            if !batch.is_empty() && (bytes + size > CRYPT_BATCH_BYTES || batch.len() >= CRYPT_BATCH_OPS) {
+                results.extend(agent.crypt(&self.astation_id, std::mem::take(&mut batch))?);
+                bytes = 0;
+            }
+            bytes += size;
+            batch.push(op);
         }
-        if mode.mode == EncryptionMode::On {
-            store.previous_keys.remove(data_account);
-        }
-        store.save_to(path)
-    }
-
-    /// Removes what the unauthenticated #36 path may have stored for this
-    /// Astation: its mode entry, and the keys, rotation history and project
-    /// names of `data_account` and of the account that entry named. Called on
-    /// a device's first verification with this Astation, before the signed
-    /// state is applied.
-    pub(crate) fn purge_unverified_at(path: &Path, astation_id: &str, data_account: &str) -> Result<()> {
-        if !path.exists() { return Ok(()); }
-        let mut store = StoredKeys::load_or_recover_from(path)?;
-        let mut accounts = vec![data_account.to_string()];
-        if let Some(legacy) = store.astations.remove(astation_id) && legacy.data_account != data_account {
-            accounts.push(legacy.data_account);
-        }
-        for account in &accounts {
-            store.accounts.remove(account);
-            store.previous_keys.remove(account);
-            store.project_names.remove(account);
-        }
-        store.save_to(path)
-    }
-
-    fn key(&self) -> Result<&[u8; 32]> {
-        self.key.as_ref().ok_or_else(|| anyhow!(
-            "this account requires encryption; connect to Astation to receive the encryption key"
-        ))
+        results.extend(agent.crypt(&self.astation_id, batch)?);
+        Ok(results)
     }
 
     pub fn should_encrypt(&self) -> bool {
@@ -439,62 +310,111 @@ impl EncryptionContext {
 
     pub fn wire_project(&self, project: &str) -> Result<String> {
         if project.is_empty() || !self.should_encrypt() { return Ok(project.to_string()); }
-        remember_project(self, project)?;
-        self.keyed_hash(project.as_bytes())
+        Ok(self.wire_projects(&[project.to_string()])?.remove(0))
+    }
+
+    /// Project keys as the relay sees them (`h1.` hashes while encrypting),
+    /// remembered in project_names.json. Empty stays empty.
+    pub fn wire_projects(&self, projects: &[String]) -> Result<Vec<String>> {
+        if !self.should_encrypt() { return Ok(projects.to_vec()); }
+        let ops = projects.iter()
+            .filter(|project| !project.is_empty())
+            .map(|project| CryptOp::keyed_hash(project.as_bytes()))
+            .collect();
+        let mut results = self.run(ops)?.into_iter();
+        let mut names = Vec::new();
+        let wire = projects.iter()
+            .map(|project| {
+                if project.is_empty() { return Ok(String::new()); }
+                let hash = next_text(&mut results)?;
+                names.push((hash.clone(), project.clone()));
+                Ok(hash)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.remember(names)?;
+        Ok(wire)
     }
 
     pub fn seal(&self, record: &str, field: &str, plain: &[u8]) -> Result<String> {
-        if plain.is_empty() { return Ok(String::new()); }
-        let kid = self.kid.as_deref().ok_or_else(|| anyhow!("encryption key id is missing"))?;
-        let cipher = XChaCha20Poly1305::new(self.key()?.into());
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let aad = field_aad(record, field);
-        let ciphertext = cipher.encrypt(&nonce, Payload { msg: plain, aad: &aad })
-            .map_err(|_| anyhow!("field encryption failed"))?;
-        let mut payload = nonce.to_vec();
-        payload.extend_from_slice(&ciphertext);
-        Ok(format!("e1.{kid}.{}", STANDARD.encode(payload)))
+        Ok(self.seal_many(&[(record, field, plain)])?.remove(0))
     }
 
+    /// `e1.` fields for `(record, field, plain)`; empty plain text stays empty.
+    pub fn seal_many(&self, items: &[(&str, &str, &[u8])]) -> Result<Vec<String>> {
+        let ops = items.iter()
+            .filter(|(_, _, plain)| !plain.is_empty())
+            .map(|(record, field, plain)| CryptOp::seal(record, field, plain))
+            .collect();
+        let mut results = self.run(ops)?.into_iter();
+        items.iter()
+            .map(|(_, _, plain)| if plain.is_empty() { Ok(String::new()) } else { next_text(&mut results) })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn open(&self, record: &str, field: &str, value: &str) -> Result<Vec<u8>> {
-        if value.is_empty() { return Ok(Vec::new()); }
-        let rest = value.strip_prefix("e1.").ok_or_else(|| anyhow!("encrypted field is malformed"))?;
-        let (kid, encoded) = rest.split_once('.').ok_or_else(|| anyhow!("encrypted field is malformed"))?;
-        let key = if self.kid.as_deref() == Some(kid) {
-            self.key()?
-        } else {
-            self.previous_keys.get(kid)
-                .ok_or_else(|| anyhow!("encrypted field uses an unavailable key id"))?
-        };
-        let payload = STANDARD.decode(encoded).context("invalid encrypted field")?;
-        if payload.len() < 40 { bail!("encrypted field is too short"); }
-        let cipher = XChaCha20Poly1305::new(key.into());
-        cipher.decrypt((&payload[..24]).into(), Payload { msg: &payload[24..], aad: &field_aad(record, field) })
-            .map_err(|_| anyhow!("encrypted field authentication failed"))
+        Ok(self.open_many(&[(record, field, value)])?.remove(0))
     }
 
+    /// The bytes of `(record, field, e1. value)`; an empty value stays empty.
+    pub fn open_many(&self, items: &[(&str, &str, &str)]) -> Result<Vec<Vec<u8>>> {
+        let ops = items.iter()
+            .filter(|(_, _, value)| !value.is_empty())
+            .map(|(record, field, value)| CryptOp::open(record, field, value))
+            .collect();
+        let mut results = self.run(ops)?.into_iter();
+        items.iter()
+            .map(|(_, _, value)| if value.is_empty() { Ok(Vec::new()) } else { next_plain(&mut results) })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn keyed_hash(&self, value: &[u8]) -> Result<String> {
-        let kid = self.kid.as_deref().ok_or_else(|| anyhow!("encryption key id is missing"))?;
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.key()?).expect("HMAC accepts 32 bytes");
-        mac.update(value);
-        let digest = mac.finalize().into_bytes().iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        Ok(format!("h1.{kid}.{digest}"))
+        let mut results = self.run(vec![CryptOp::keyed_hash(value)])?.into_iter();
+        next_text(&mut results)
     }
 
-    pub fn encrypt_memory(&self, mut memory: Memory) -> Result<Memory> {
-        if !self.should_encrypt() { return Ok(memory); }
-        remember_project(self, &memory.project)?;
-        memory.project = if memory.project.is_empty() { String::new() } else { self.keyed_hash(memory.project.as_bytes())? };
-        memory.content_hash = if memory.content.is_empty() { String::new() } else { self.keyed_hash(memory.content.as_bytes())? };
-        memory.content = self.seal(&memory.id, "content", memory.content.as_bytes())?;
-        Ok(memory)
+    #[cfg(test)]
+    pub fn encrypt_memory(&self, memory: Memory) -> Result<Memory> {
+        one(self.encrypt_memories(vec![memory])?)
+    }
+
+    /// Every memory's project and content hash and sealed content, in one
+    /// batch of agent requests.
+    pub fn encrypt_memories(&self, memories: Vec<Memory>) -> Result<Vec<Memory>> {
+        if !self.should_encrypt() { return Ok(memories); }
+        let mut ops = Vec::new();
+        for memory in &memories {
+            if !memory.project.is_empty() { ops.push(CryptOp::keyed_hash(memory.project.as_bytes())); }
+            if !memory.content.is_empty() {
+                ops.push(CryptOp::keyed_hash(memory.content.as_bytes()));
+                ops.push(CryptOp::seal(&memory.id, "content", memory.content.as_bytes()));
+            }
+        }
+        let mut results = self.run(ops)?.into_iter();
+        let mut names = Vec::new();
+        let mut encrypted = Vec::with_capacity(memories.len());
+        for mut memory in memories {
+            if !memory.project.is_empty() {
+                let hash = next_text(&mut results)?;
+                names.push((hash.clone(), std::mem::replace(&mut memory.project, hash)));
+            }
+            if memory.content.is_empty() {
+                memory.content_hash = String::new();
+            } else {
+                memory.content_hash = next_text(&mut results)?;
+                memory.content = next_text(&mut results)?;
+            }
+            encrypted.push(memory);
+        }
+        self.remember(names)?;
+        Ok(encrypted)
     }
 
     /// While encryption is on, every non-empty field from the relay must be
     /// sealed (`e1.`) or keyed (`h1.`). Plain text would let the relay inject
-    /// instructions into the managed blocks agents read.
+    /// instructions into the managed blocks agents read. Checked before any
+    /// agent call.
     pub fn require_sealed(&self, value: &str, prefix: &str, what: &str) -> Result<()> {
         if self.mode == EncryptionMode::On && !value.is_empty() && !value.starts_with(prefix) {
             bail!("relay sent plain-text {what} while encryption is on; refusing it");
@@ -502,95 +422,163 @@ impl EncryptionContext {
         Ok(())
     }
 
-    pub fn decrypt_memory(&self, mut memory: Memory) -> Result<Memory> {
-        if self.mode == EncryptionMode::Off {
-            return Ok(memory);
-        }
-        self.require_sealed(&memory.content, "e1.", "memory content")?;
-        self.require_sealed(&memory.project, "h1.", "memory project")?;
-        if memory.project.starts_with("h1.") {
-            memory.project = resolve_project(self, &memory.project)?;
-        }
-        if memory.content.starts_with("e1.") {
-            memory.content = String::from_utf8(self.open(&memory.id, "content", &memory.content)?)
-                .context("memory content is not UTF-8")?;
-        }
-        if memory.content_hash.starts_with("h1.") {
-            memory.content_hash = content_hash(&memory.content);
-        }
-        Ok(memory)
+    #[cfg(test)]
+    pub fn decrypt_memory(&self, memory: Memory) -> Result<Memory> {
+        one(self.decrypt_memories(vec![memory])?)
     }
 
-    pub fn encrypt_skill(&self, mut skill: Skill) -> Result<Skill> {
-        if !self.should_encrypt() { return Ok(skill); }
-        remember_project(self, &skill.project)?;
-        let record = skill_record(&skill);
-        let mut encrypted = std::collections::BTreeMap::new();
-        for (path, bytes) in &skill.files {
-            let encrypted_path = self.seal(&record, "path", path.as_bytes())?;
-            let encrypted_bytes = self.seal(&record, &format!("file:{encrypted_path}"), bytes)?;
-            encrypted.insert(encrypted_path, encrypted_bytes.into_bytes());
+    pub fn decrypt_memories(&self, memories: Vec<Memory>) -> Result<Vec<Memory>> {
+        if self.mode == EncryptionMode::Off { return Ok(memories); }
+        for memory in &memories {
+            self.require_sealed(&memory.content, "e1.", "memory content")?;
+            self.require_sealed(&memory.project, "h1.", "memory project")?;
         }
-        skill.project = if skill.project.is_empty() { String::new() } else { self.keyed_hash(skill.project.as_bytes())? };
-        skill.content_hash = self.keyed_hash(skill_hash(&skill.files).as_bytes())?;
-        skill.files = encrypted;
-        Ok(skill)
+        let names = if memories.iter().any(|memory| memory.project.starts_with("h1.")) { Some(self.names()?) } else { None };
+        let ops = memories.iter()
+            .filter(|memory| memory.content.starts_with("e1."))
+            .map(|memory| CryptOp::open(&memory.id, "content", &memory.content))
+            .collect();
+        let mut results = self.run(ops)?.into_iter();
+        memories.into_iter()
+            .map(|mut memory| {
+                if memory.project.starts_with("h1.") {
+                    memory.project = names.as_ref()
+                        .and_then(|names| names.name(&self.data_account, &memory.project))
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow!(UNKNOWN_PROJECT))?;
+                }
+                if memory.content.starts_with("e1.") {
+                    memory.content = String::from_utf8(next_plain(&mut results)?)
+                        .context("memory content is not UTF-8")?;
+                }
+                if memory.content_hash.starts_with("h1.") {
+                    memory.content_hash = content_hash(&memory.content);
+                }
+                Ok(memory)
+            })
+            .collect()
     }
 
-    pub fn decrypt_skill(&self, mut skill: Skill) -> Result<Skill> {
-        if self.mode == EncryptionMode::Off {
-            return Ok(skill);
+    #[cfg(test)]
+    pub fn encrypt_skill(&self, skill: Skill) -> Result<Skill> {
+        one(self.encrypt_skills(vec![skill])?)
+    }
+
+    /// Two batches: every file path with the project and content hashes,
+    /// then every file's bytes bound to its encrypted path.
+    pub fn encrypt_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
+        if !self.should_encrypt() { return Ok(skills); }
+        let mut ops = Vec::new();
+        for skill in &skills {
+            let record = skill_record(skill);
+            for path in skill.files.keys() {
+                if !path.is_empty() { ops.push(CryptOp::seal(&record, "path", path.as_bytes())); }
+            }
+            if !skill.project.is_empty() { ops.push(CryptOp::keyed_hash(skill.project.as_bytes())); }
+            ops.push(CryptOp::keyed_hash(skill_hash(&skill.files).as_bytes()));
         }
-        self.require_sealed(&skill.project, "h1.", "skill project")?;
-        for path in skill.files.keys() {
-            self.require_sealed(path, "e1.", "skill file path")?;
+        let mut results = self.run(ops)?.into_iter();
+        let mut names = Vec::new();
+        let mut staged = Vec::with_capacity(skills.len());
+        for skill in skills {
+            let paths = skill.files.keys()
+                .map(|path| if path.is_empty() { Ok(String::new()) } else { next_text(&mut results) })
+                .collect::<Result<Vec<_>>>()?;
+            let project = if skill.project.is_empty() {
+                String::new()
+            } else {
+                let hash = next_text(&mut results)?;
+                names.push((hash.clone(), skill.project.clone()));
+                hash
+            };
+            let hash = next_text(&mut results)?;
+            staged.push((skill, paths, project, hash));
         }
-        if skill.project.starts_with("h1.") {
-            skill.project = resolve_project(self, &skill.project)?;
+        let mut ops = Vec::new();
+        for (skill, paths, _, _) in &staged {
+            let record = skill_record(skill);
+            for ((_, bytes), path) in skill.files.iter().zip(paths) {
+                if !bytes.is_empty() { ops.push(CryptOp::seal(&record, &format!("file:{path}"), bytes)); }
+            }
         }
-        if skill.files.keys().any(|path| path.starts_with("e1.")) {
-            let record = skill_record(&skill);
+        let mut results = self.run(ops)?.into_iter();
+        let mut encrypted = Vec::with_capacity(staged.len());
+        for (mut skill, paths, project, hash) in staged {
             let mut files = std::collections::BTreeMap::new();
-            for (encrypted_path, encrypted_bytes) in &skill.files {
-                let path = String::from_utf8(self.open(&record, "path", encrypted_path)?)
-                    .context("skill path is not UTF-8")?;
-                let envelope = std::str::from_utf8(encrypted_bytes).context("skill ciphertext is not UTF-8")?;
-                let bytes = self.open(&record, &format!("file:{encrypted_path}"), envelope)?;
-                files.insert(path, bytes);
+            for ((_, bytes), path) in skill.files.iter().zip(paths) {
+                let sealed = if bytes.is_empty() { String::new() } else { next_text(&mut results)? };
+                files.insert(path, sealed.into_bytes());
             }
             skill.files = files;
+            skill.project = project;
+            skill.content_hash = hash;
+            encrypted.push(skill);
         }
-        if skill.content_hash.starts_with("h1.") {
-            skill.content_hash = skill_hash(&skill.files);
-        }
-        Ok(skill)
+        self.remember(names)?;
+        Ok(encrypted)
     }
-}
 
-fn field_aad(record: &str, field: &str) -> Vec<u8> {
-    format!("{record}\n{field}").into_bytes()
+    pub fn decrypt_skill(&self, skill: Skill) -> Result<Skill> {
+        self.decrypt_skills(vec![skill])?.into_iter().next().ok_or_else(|| anyhow!("decryption returned nothing"))
+    }
+
+    pub fn decrypt_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
+        if self.mode == EncryptionMode::Off { return Ok(skills); }
+        for skill in &skills {
+            self.require_sealed(&skill.project, "h1.", "skill project")?;
+            for path in skill.files.keys() {
+                self.require_sealed(path, "e1.", "skill file path")?;
+            }
+        }
+        let names = if skills.iter().any(|skill| skill.project.starts_with("h1.")) { Some(self.names()?) } else { None };
+        let sealed = |skill: &Skill| skill.files.keys().any(|path| path.starts_with("e1."));
+        let mut ops = Vec::new();
+        for skill in skills.iter().filter(|skill| sealed(skill)) {
+            let record = skill_record(skill);
+            for (path, bytes) in &skill.files {
+                if !path.is_empty() { ops.push(CryptOp::open(&record, "path", path)); }
+                let envelope = std::str::from_utf8(bytes).context("skill ciphertext is not UTF-8")?;
+                if !envelope.is_empty() { ops.push(CryptOp::open(&record, &format!("file:{path}"), envelope)); }
+            }
+        }
+        let mut results = self.run(ops)?.into_iter();
+        skills.into_iter()
+            .map(|mut skill| {
+                if skill.project.starts_with("h1.") {
+                    skill.project = names.as_ref()
+                        .and_then(|names| names.name(&self.data_account, &skill.project))
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow!(UNKNOWN_PROJECT))?;
+                }
+                if sealed(&skill) {
+                    let mut files = std::collections::BTreeMap::new();
+                    for (path, bytes) in &skill.files {
+                        let plain_path = if path.is_empty() { Vec::new() } else { next_plain(&mut results)? };
+                        let plain_path = String::from_utf8(plain_path).context("skill path is not UTF-8")?;
+                        let plain = if bytes.is_empty() { Vec::new() } else { next_plain(&mut results)? };
+                        files.insert(plain_path, plain);
+                    }
+                    skill.files = files;
+                }
+                if skill.content_hash.starts_with("h1.") {
+                    skill.content_hash = skill_hash(&skill.files);
+                }
+                Ok(skill)
+            })
+            .collect()
+    }
+
+    fn remember(&self, names: Vec<(String, String)>) -> Result<()> {
+        crate::memory::project_names::remember(&self.names_path, &self.data_account, names)
+    }
+
+    fn names(&self) -> Result<crate::memory::project_names::ProjectNames> {
+        crate::memory::project_names::ProjectNames::load_from(&self.names_path)
+    }
 }
 
 fn skill_record(skill: &Skill) -> String {
     format!("{}:{}:{}", skill.scope.as_str(), skill.name, skill.version)
-}
-
-fn remember_project(context: &EncryptionContext, project: &str) -> Result<()> {
-    if project.is_empty() { return Ok(()); }
-    let hash = context.keyed_hash(project.as_bytes())?;
-    let mut store = StoredKeys::load_from(&context.store_path)?;
-    store.project_names.entry(context.data_account.clone()).or_default().insert(hash, project.into());
-    store.save_to(&context.store_path)
-}
-
-fn resolve_project(context: &EncryptionContext, project_hash: &str) -> Result<String> {
-    if project_hash.is_empty() { return Ok(String::new()); }
-    StoredKeys::load_from(&context.store_path)?
-        .project_names
-        .get(&context.data_account)
-        .and_then(|projects| projects.get(project_hash))
-        .cloned()
-        .ok_or_else(|| anyhow!("encrypted project name is unknown on this Atem; sync from a device that used it first"))
 }
 
 pub async fn migrate_account(astation_id: &str) -> Result<Option<&'static str>> {
@@ -623,67 +611,75 @@ pub async fn migrate_account(astation_id: &str) -> Result<Option<&'static str>> 
     Ok(Some(target))
 }
 
-/// Test view of `data_keys.enc`: (mode entry's kid, current key's kid,
-/// previous kids, number of remembered project names) for an account.
-#[cfg(test)]
-pub(crate) fn stored_summary_at(path: &Path, astation_id: &str, data_account: &str) -> (Option<Option<String>>, Option<String>, Vec<String>, usize) {
-    let store = StoredKeys::load_from(path).unwrap();
-    (
-        store.astations.get(astation_id).map(|mode| mode.kid.clone()),
-        store.accounts.get(data_account).map(|key| key.kid.clone()),
-        store.previous_keys.get(data_account).map(|keys| keys.iter().map(|key| key.kid.clone()).collect()).unwrap_or_default(),
-        store.project_names.get(data_account).map(HashMap::len).unwrap_or(0),
-    )
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use crate::memory::fake_astation::{ASTATION_ID, UnlockedDevice};
+    use crate::memory::key_agent::{Reply, Request};
 
-    fn context() -> EncryptionContext {
-        EncryptionContext {
-            mode: EncryptionMode::On,
-            data_account: "account".into(),
-            kid: Some("0123abcd".into()),
-            key: Some([7; 32]),
-            previous_keys: HashMap::new(),
-            store_path: key_store_path(),
+    /// An agent an off context must never reach.
+    struct NoAgent;
+
+    impl KeyAgentApi for NoAgent {
+        fn call(&self, _request: Request) -> Result<Reply> {
+            panic!("an off or unverified context must not call the key agent")
         }
     }
 
-    #[test]
-    fn envelope_round_trip_and_tamper_failure() {
-        let context = context();
-        let sealed = context.seal("mem-1", "content", b"hello").unwrap();
-        assert_eq!(context.open("mem-1", "content", &sealed).unwrap(), b"hello");
-        assert!(context.open("mem-2", "content", &sealed).is_err());
-        let mut bad = sealed.into_bytes();
-        *bad.last_mut().unwrap() = if *bad.last().unwrap() == b'A' { b'B' } else { b'A' };
-        assert!(context.open("mem-1", "content", std::str::from_utf8(&bad).unwrap()).is_err());
+    /// An unlocked device holding K = [7; 32] (kid 0123abcd) in `mode`.
+    fn device(dir: &Path, mode: EncryptionMode) -> (UnlockedDevice, EncryptionContext) {
+        let mut device = UnlockedDevice::new(dir);
+        device.set_key(mode, "0123abcd", [7; 32]);
+        let context = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, device.agent.clone()).unwrap();
+        (device, context)
     }
 
-    #[test]
-    fn memory_and_binary_skill_round_trip() {
-        let context = context();
-        let memory = Memory {
-            id: "mem-1".into(),
-            scope: crate::memory::model::Scope::Global,
-            content: "use port 27183".into(),
-            content_hash: content_hash("use port 27183"),
+    fn memory(id: &str, project: &str, content: &str) -> Memory {
+        Memory {
+            id: id.into(),
+            scope: crate::memory::model::Scope::Project,
+            project: project.into(),
+            content: content.into(),
+            content_hash: content_hash(content),
             confidence: "high".into(),
             source_agent: "test".into(),
             source_machine: "mac".into(),
             created_at: 1,
             ..Memory::default()
-        };
-        let encrypted = context.encrypt_memory(memory.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn envelope_round_trip_and_tamper_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_device, context) = device(dir.path(), EncryptionMode::On);
+        let sealed = context.seal("mem-1", "content", b"hello").unwrap();
+        assert!(sealed.starts_with("e1.0123abcd."));
+        assert_eq!(context.open("mem-1", "content", &sealed).unwrap(), b"hello");
+        assert!(context.open("mem-2", "content", &sealed).is_err());
+        let mut bad = sealed.into_bytes();
+        let last = bad.len() - 2;
+        bad[last] = if bad[last] == b'A' { b'B' } else { b'A' };
+        assert!(context.open("mem-1", "content", std::str::from_utf8(&bad).unwrap()).is_err());
+        assert!(context.keyed_hash(b"x").unwrap().starts_with("h1.0123abcd."));
+    }
+
+    #[test]
+    fn memory_and_binary_skill_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_device, context) = device(dir.path(), EncryptionMode::On);
+        let plain = memory("mem-1", "github.com/agora/atem", "use port 27183");
+        let encrypted = context.encrypt_memory(plain.clone()).unwrap();
         assert!(encrypted.content.starts_with("e1.0123abcd."));
-        assert_eq!(context.decrypt_memory(encrypted).unwrap(), memory);
+        assert!(encrypted.project.starts_with("h1.0123abcd."));
+        assert_eq!(context.decrypt_memory(encrypted).unwrap(), plain);
 
         let files = BTreeMap::from([
             ("SKILL.md".to_string(), b"hello".to_vec()),
             ("asset.bin".to_string(), vec![0, 159, 146, 150]),
+            ("empty.txt".to_string(), Vec::new()),
         ]);
         let skill = Skill {
             scope: crate::memory::model::Scope::Global,
@@ -704,142 +700,69 @@ mod tests {
     }
 
     #[test]
-    fn rotation_keeps_old_key_until_migration_and_off_removes_keys() {
+    fn batches_keep_order_and_empty_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
-        let mut verified = crate::memory::verification::VerifiedForTest::new(&path, "astation", "account");
-        EncryptionContext::update_mode_at(
-            &path,
-            "astation",
-            "account",
-            EncryptionMode::Enabling,
-            Some("0123abcd"),
-        )
-        .unwrap();
-        verified.state(EncryptionMode::Enabling, Some("0123abcd"));
-        EncryptionContext::install_grant_at(
-            &path,
-            "astation",
-            "account",
-            "0123abcd",
-            [7; 32],
-        )
-        .unwrap();
-        let old = EncryptionContext::for_astation_at("astation", &path)
-            .unwrap()
-            .seal("mem", "content", b"old")
-            .unwrap();
+        let (_device, context) = device(dir.path(), EncryptionMode::On);
+        let plain = vec![
+            memory("mem-1", "github.com/agora/atem", "first"),
+            Memory { content_hash: String::new(), ..memory("mem-2", "", "") },
+            memory("mem-3", "github.com/agora/dialf", "third"),
+        ];
+        let encrypted = context.encrypt_memories(plain.clone()).unwrap();
+        assert_eq!(encrypted[1].content, "");
+        assert_eq!(encrypted[1].content_hash, "");
+        assert_eq!(encrypted[1].project, "");
+        assert_eq!(context.decrypt_memories(encrypted).unwrap(), plain);
+        let sealed = context.seal_many(&[("v", "summary", b"s"), ("v", "content", b""), ("v", "content", b"c")]).unwrap();
+        assert_eq!(sealed[1], "");
+        let items: Vec<(&str, &str, &str)> = vec![("v", "summary", &sealed[0]), ("v", "content", &sealed[1]), ("v", "content", &sealed[2])];
+        assert_eq!(context.open_many(&items).unwrap(), vec![b"s".to_vec(), Vec::new(), b"c".to_vec()]);
+    }
 
-        EncryptionContext::update_mode_at(
-            &path,
-            "astation",
-            "account",
-            EncryptionMode::Enabling,
-            Some("89abcdef"),
-        )
-        .unwrap();
-        verified.state(EncryptionMode::Enabling, Some("89abcdef"));
-        assert!(EncryptionContext::for_astation_at("astation", &path).is_err());
-        EncryptionContext::install_grant_at(
-            &path,
-            "astation",
-            "account",
-            "89abcdef",
-            [8; 32],
-        )
-        .unwrap();
-        let rotated = EncryptionContext::for_astation_at("astation", &path).unwrap();
-        assert_eq!(rotated.open("mem", "content", &old).unwrap(), b"old");
+    #[test]
+    fn project_names_are_remembered_locally_and_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device, context) = device(dir.path(), EncryptionMode::On);
+        let wire = context.wire_project("github.com/agora/atem").unwrap();
+        let names = crate::memory::project_names::ProjectNames::load_from(&device.paths.project_names).unwrap();
+        assert_eq!(names.name("acct", &wire), Some("github.com/agora/atem"));
+        let unknown = Memory { id: "mem-9".into(), project: "h1.0123abcd.ff".into(), ..Memory::default() };
+        let error = context.decrypt_memory(unknown).unwrap_err().to_string();
+        assert!(error.contains("unknown on this Atem"), "{error}");
+    }
 
-        EncryptionContext::update_mode_at(
-            &path,
-            "astation",
-            "account",
-            EncryptionMode::On,
-            Some("89abcdef"),
-        )
-        .unwrap();
-        verified.state(EncryptionMode::On, Some("89abcdef"));
-        let completed = EncryptionContext::for_astation_at("astation", &path).unwrap();
-        assert!(completed.previous_keys.is_empty());
-        assert!(completed.open("mem", "content", &old).is_err());
-
-        EncryptionContext::update_mode_at(
-            &path,
-            "astation",
-            "account",
-            EncryptionMode::Off,
-            None,
-        )
-        .unwrap();
-        verified.state(EncryptionMode::Off, None);
-        let off = EncryptionContext::for_astation_at("astation", &path).unwrap();
+    #[test]
+    fn off_and_unverified_contexts_never_touch_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let unverified = EncryptionContext::for_astation_with(ASTATION_ID, &paths, Arc::new(NoAgent)).unwrap();
+        assert_eq!(unverified.mode, EncryptionMode::Off);
+        let plain = memory("mem-1", "github.com/agora/atem", "fact");
+        assert_eq!(unverified.encrypt_memories(vec![plain.clone()]).unwrap(), vec![plain.clone()]);
+        assert_eq!(unverified.decrypt_memories(vec![plain.clone()]).unwrap(), vec![plain.clone()]);
+        assert_eq!(unverified.wire_project("github.com/agora/atem").unwrap(), "github.com/agora/atem");
+        let mut device = UnlockedDevice::new(dir.path());
+        device.state(EncryptionMode::Off, None);
+        let off = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, Arc::new(NoAgent)).unwrap();
         assert_eq!(off.mode, EncryptionMode::Off);
-        assert!(off.key.is_none());
-        assert!(off.previous_keys.is_empty());
+        assert_eq!(off.decrypt_memories(vec![plain.clone()]).unwrap(), vec![plain]);
+        assert!(!device.paths.project_names.exists());
     }
 
     #[test]
-    fn unverified_astation_ignores_stored_mode_and_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
-        EncryptionContext::update_mode_at(&path, "astation", "account", EncryptionMode::On, Some("0123abcd")).unwrap();
-        EncryptionContext::install_grant_at(&path, "astation", "account", "0123abcd", [7; 32]).unwrap();
-        let context = EncryptionContext::for_astation_at("astation", &path).unwrap();
-        assert_eq!(context.mode, EncryptionMode::Off);
-        assert!(path.exists(), "stored state is left on disk");
-    }
-
-    #[test]
-    fn verified_signed_on_with_missing_key_store_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
-        let mut verified = crate::memory::verification::VerifiedForTest::new(&path, "astation", "account");
-        verified.state(EncryptionMode::On, Some("0123abcd"));
-        let error = EncryptionContext::for_astation_at("astation", &path).unwrap_err().to_string();
-        assert!(error.contains("doesn't match"), "{error}");
-        verified.state(EncryptionMode::Off, None);
-        assert_eq!(EncryptionContext::for_astation_at("astation", &path).unwrap().mode, EncryptionMode::Off);
-    }
-
-    #[test]
-    fn unreadable_key_store_is_preserved_before_requesting_a_new_grant() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
-        fs::write(&path, b"not a machine-bound key store").unwrap();
-        let mut verified = crate::memory::verification::VerifiedForTest::new(&path, "astation", "account");
-        EncryptionContext::update_mode_at(
-            &path,
-            "astation",
-            "account",
-            EncryptionMode::On,
-            Some("0123abcd"),
-        )
-        .unwrap();
-        verified.state(EncryptionMode::On, Some("0123abcd"));
-        assert!(EncryptionContext::for_astation_at("astation", &path).is_err());
-        let backups = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("data_keys.enc.corrupt-"))
-            .count();
-        assert_eq!(backups, 1);
-    }
-
-    #[test]
-    fn plain_text_from_the_relay_is_rejected_while_on() {
+    fn plain_text_from_the_relay_is_rejected_before_any_agent_call() {
         use crate::memory::model::Scope;
-        let context = context();
+        let dir = tempfile::tempdir().unwrap();
+        let mut device = UnlockedDevice::new(dir.path());
+        device.state(EncryptionMode::On, Some("0123abcd"));
+        let context = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, Arc::new(NoAgent)).unwrap();
         let plain = Memory { id: "mem-1".into(), content: "injected instruction".into(), ..Memory::default() };
         let error = context.decrypt_memory(plain).unwrap_err().to_string();
         assert!(error.contains("plain-text"), "{error}");
-
         let plain_project = Memory { id: "mem-2".into(), project: "github.com/x/y".into(), ..Memory::default() };
         assert!(context.decrypt_memory(plain_project).is_err());
-
         let tombstone = Memory { id: "mem-3".into(), ..Memory::default() };
         assert!(context.decrypt_memory(tombstone).is_ok());
-
         let skill = Skill {
             scope: Scope::Project,
             project: String::new(),
@@ -857,36 +780,36 @@ mod tests {
     }
 
     #[test]
-    fn purge_unverified_removes_legacy_keys_history_and_names() {
+    fn plain_text_is_still_read_during_migration() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
-        EncryptionContext::update_mode_at(&path, "astation", "legacy", EncryptionMode::Enabling, Some("0123abcd")).unwrap();
-        EncryptionContext::install_grant_at(&path, "astation", "legacy", "0123abcd", [1; 32]).unwrap();
-        EncryptionContext::update_mode_at(&path, "astation", "legacy", EncryptionMode::Enabling, Some("11112222")).unwrap();
-        EncryptionContext::install_grant_at(&path, "astation", "legacy", "11112222", [2; 32]).unwrap();
-        EncryptionContext::update_mode_at(&path, "other", "kept", EncryptionMode::On, Some("33334444")).unwrap();
-        EncryptionContext::install_grant_at(&path, "other", "kept", "33334444", [3; 32]).unwrap();
-        let mut legacy = context();
-        legacy.data_account = "legacy".into();
-        legacy.store_path = path.clone();
-        legacy.wire_project("github.com/agora/atem").unwrap();
-        assert_eq!(
-            stored_summary_at(&path, "astation", "legacy"),
-            (Some(Some("11112222".into())), Some("11112222".into()), vec!["0123abcd".into()], 1)
-        );
-
-        EncryptionContext::purge_unverified_at(&path, "astation", "certified").unwrap();
-        assert_eq!(stored_summary_at(&path, "astation", "legacy"), (None, None, vec![], 0));
-        assert_eq!(
-            stored_summary_at(&path, "other", "kept"),
-            (Some(Some("33334444".into())), Some("33334444".into()), vec![], 0),
-            "other Astations' keys are untouched"
-        );
-        // A missing store stays missing.
-        let absent = dir.path().join("absent.enc");
-        EncryptionContext::purge_unverified_at(&absent, "astation", "certified").unwrap();
-        assert!(!absent.exists());
+        let (_device, context) = device(dir.path(), EncryptionMode::Enabling);
+        let plain = Memory { id: "mem-1".into(), content: "legacy".into(), ..Memory::default() };
+        assert_eq!(context.decrypt_memory(plain).unwrap().content, "legacy");
     }
+
+    #[test]
+    fn rotation_keeps_the_old_key_until_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut device, context) = device(dir.path(), EncryptionMode::Enabling);
+        let old = context.seal("mem", "content", b"old").unwrap();
+        device.set_key(EncryptionMode::Enabling, "89abcdef", [8; 32]);
+        let rotated = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, device.agent.clone()).unwrap();
+        assert_eq!(rotated.kid.as_deref(), Some("89abcdef"));
+        assert_eq!(rotated.open("mem", "content", &old).unwrap(), b"old");
+        device.state(EncryptionMode::On, Some("89abcdef"));
+        let completed = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, device.agent.clone()).unwrap();
+        assert!(completed.open("mem", "content", &old).is_err());
+    }
+
+    #[test]
+    fn a_locked_agent_asks_for_an_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device, context) = device(dir.path(), EncryptionMode::On);
+        device.agent.lock_keys().unwrap();
+        let error = format!("{:#}", context.seal("mem", "content", b"x").unwrap_err());
+        assert!(error.contains("atem cred unlock"), "{error}");
+    }
+
 
     #[test]
     fn concurrent_private_writes_to_one_file_never_collide() {
@@ -958,13 +881,5 @@ mod tests {
         assert_eq!(fs::read(&victim).unwrap(), b"untouched");
         assert!(live.exists(), "a live writer's temp is left alone");
         assert!(other.exists() && unlike.exists(), "other files' temps are left alone");
-    }
-
-    #[test]
-    fn plain_text_is_still_read_during_migration() {
-        let mut context = context();
-        context.mode = EncryptionMode::Enabling;
-        let plain = Memory { id: "mem-1".into(), content: "legacy".into(), ..Memory::default() };
-        assert_eq!(context.decrypt_memory(plain).unwrap().content, "legacy");
     }
 }

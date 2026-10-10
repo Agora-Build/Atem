@@ -279,15 +279,19 @@ struct CryptedReply {
     results: Vec<CryptOut>,
 }
 
+/// What to do about a running agent of another protocol version.
+fn version_mismatch(version: u64) -> anyhow::Error {
+    anyhow!(
+        "the running key agent speaks protocol v{version}, this atem speaks v{PROTOCOL_VERSION}; check `atem cred status` first (a storage key not yet held by Astation needs `atem cred unlock` from the atem that started the agent), then stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry"
+    )
+}
+
 pub(crate) fn decode_response(line: &str) -> Result<Reply> {
     let line = line.trim();
     let head: ResponseHead =
         serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
     if head.v != PROTOCOL_VERSION {
-        bail!(
-            "the running key agent speaks protocol v{}, this atem speaks v{PROTOCOL_VERSION}; check `atem cred status` first (a storage key not yet held by Astation needs `atem cred unlock` from the atem that started the agent), then stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry",
-            head.v
-        );
+        return Err(version_mismatch(head.v));
     }
     if !head.ok {
         bail!(
@@ -1111,14 +1115,48 @@ fn read_reply(mut stream: &UnixStream) -> std::io::Result<WipingBuf> {
     }
 }
 
+impl KeyAgentClient {
+    /// Why the agent hung up. An agent of an older atem closes the
+    /// connection on a request it can't read (a step-2a agent reads at most
+    /// 1 MiB), so a short `status` asks for its version first.
+    fn closed(&self, error: Option<std::io::Error>) -> anyhow::Error {
+        if let Some(version) = self.probe_version()
+            && version != PROTOCOL_VERSION
+        {
+            return version_mismatch(version);
+        }
+        match error {
+            Some(error) => anyhow!(
+                "the key agent closed the connection ({error}); is it running as another user?"
+            ),
+            None => anyhow!("the key agent closed the connection; is it running as another user?"),
+        }
+    }
+
+    /// The protocol version the running agent answers a `status` in (no
+    /// autostart); `None` when it doesn't answer.
+    fn probe_version(&self) -> Option<u64> {
+        let stream = self.dial().ok()?.ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
+        let line = encode_request(&Request::Status).ok()?;
+        (&stream).write_all(line.as_bytes()).ok()?;
+        let reply = read_reply(&stream).ok()?;
+        let text = std::str::from_utf8(&reply.0).ok()?;
+        serde_json::from_str::<ResponseHead>(text.trim())
+            .ok()
+            .map(|head| head.v)
+    }
+}
+
 impl KeyAgentApi for KeyAgentClient {
     fn call(&self, request: Request) -> Result<Reply> {
         let line = encode_request(&request)?;
         drop(request);
         let stream = self.connect()?;
-        let closed = |error: std::io::Error| {
-            anyhow!("the key agent closed the connection ({error}); is it running as another user?")
-        };
+        let closed = |error: std::io::Error| self.closed(Some(error));
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(closed)?;
@@ -1129,7 +1167,7 @@ impl KeyAgentApi for KeyAgentClient {
         drop(line);
         let reply = read_reply(&stream).map_err(closed)?;
         if reply.0.is_empty() {
-            bail!("the key agent closed the connection; is it running as another user?");
+            return Err(self.closed(None));
         }
         let text = std::str::from_utf8(&reply.0)
             .map_err(|_| anyhow!("the key agent sent a non-UTF-8 reply"))?;
@@ -1669,23 +1707,79 @@ mod tests {
         ]
     }
 
-    /// A step-2a (v1) agent left running: answers every line in v1.
+    /// A step-2a (v1) agent left running: answers a line in v1 and, like
+    /// it, closes the connection unanswered on a request over 1 MiB.
     fn start_v1_agent(dir: &Path) -> PathBuf {
         let socket = dir.join("run").join("agent.sock");
         make_private(socket.parent().unwrap());
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { return };
-                let mut line = String::new();
-                if BufReader::new(&stream).read_line(&mut line).is_ok() {
-                    let _ = (&stream).write_all(
-                        b"{\"v\":1,\"ok\":true,\"reply\":{\"kind\":\"status\",\"unlocked\":true,\"storage_kid\":null,\"escrowed\":true}}\n",
-                    );
+                let Ok(mut stream) = stream else { return };
+                let mut pending = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    if pending.contains(&b'\n') {
+                        let _ = stream.write_all(
+                            b"{\"v\":1,\"ok\":true,\"reply\":{\"kind\":\"status\",\"unlocked\":true,\"storage_kid\":null,\"escrowed\":true}}\n",
+                        );
+                        break;
+                    }
+                    if pending.len() > 1 << 20 {
+                        break;
+                    }
+                    match std::io::Read::read(&mut stream, &mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                    }
                 }
             }
         });
         socket
+    }
+
+    #[test]
+    fn a_big_first_request_to_an_old_agent_says_to_stop_it() {
+        use crate::memory::account_keys::CryptOp;
+        let dir = short_dir();
+        let client = KeyAgentClient::at(start_v1_agent(dir.path()));
+        // Over the step-2a agent's 1 MiB line limit: it hangs up unanswered.
+        let big = vec![7u8; 3 << 19];
+        let error = format!(
+            "{:#}",
+            client
+                .crypt("astation-1", vec![CryptOp::seal("r", "f", &big)])
+                .err()
+                .unwrap()
+        );
+        assert!(error.contains("speaks protocol v1"), "{error}");
+        assert!(error.contains("pkill"), "{error}");
+        assert!(!error.contains("another user"), "{error}");
+    }
+
+    #[test]
+    fn pipelined_requests_get_one_reply_each() {
+        let dir = short_dir();
+        let socket = start_agent(dir.path(), own_uid());
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let one = encode_request(&Request::Status).unwrap();
+        let two = encode_request(&Request::Lock).unwrap();
+        stream
+            .write_all(format!("{}{}", one.as_str(), two.as_str()).as_bytes())
+            .unwrap();
+        let mut reader = BufReader::new(&stream);
+        let mut first = String::new();
+        let mut second = String::new();
+        reader.read_line(&mut first).unwrap();
+        reader.read_line(&mut second).unwrap();
+        assert!(matches!(
+            decode_response(&first).unwrap(),
+            Reply::Status {
+                unlocked: false,
+                ..
+            }
+        ));
+        assert!(matches!(decode_response(&second).unwrap(), Reply::Done));
     }
 
     #[test]

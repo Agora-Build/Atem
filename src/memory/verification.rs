@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use crate::memory::crypto::{EncryptionContext, EncryptionMode};
+use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::{DeviceKeys, DevicePublics, PublicKeys, UnlockAuthKey};
 use crate::memory::encoding::{base32_prefix, dec, enc};
 use crate::memory::grant::{GrantWire, open_grant};
@@ -542,7 +542,7 @@ pub fn complete_verification(
         if first {
             // Whatever the unauthenticated path stored for this Astation (K,
             // rotation history, project names) is dropped, not trusted.
-            EncryptionContext::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
+            crate::memory::legacy_keys::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
             crate::memory::project_names::forget_account_at(&paths.project_names, &state.account)?;
         }
         current.save_to(&paths.trust)?;
@@ -697,86 +697,6 @@ pub fn device_keys_for_verification(
         device_sign_pub,
         unlock_auth_pub: unlock_auth.public(),
     }))
-}
-
-/// Test stand-in for a verified device: pins a fake Astation next to
-/// `data_keys_path` and signs successive account states for it.
-#[cfg(test)]
-pub(crate) struct VerifiedForTest {
-    fake: crate::memory::statements::FakeAstation,
-    trust_path: PathBuf,
-    astation_id: String,
-    account: String,
-    epoch: u64,
-}
-
-#[cfg(test)]
-impl VerifiedForTest {
-    pub(crate) fn new(data_keys_path: &Path, astation_id: &str, account: &str) -> Self {
-        use crate::memory::statements::{DeviceVerified, FakeAstation};
-        let fake = FakeAstation::new();
-        let handshake = Handshake::start(DeviceKeys::generate());
-        let astation = AstationKeys {
-            sign_pub: fake.sign_pub(),
-            enc_pub: [5; 32],
-            recovery_sign_pub: [6; 32],
-            nonce_s: [7; 32],
-        };
-        let code = handshake.safety_code(&astation);
-        let trust_path = crate::memory::trust::trust_path_for(data_keys_path);
-        let transcript = handshake.transcript(&astation);
-        let mut trust = TrustStore::default();
-        trust.set_pending(
-            astation_id,
-            "dev-1",
-            handshake.keys(),
-            &astation,
-            &code,
-            &transcript,
-        );
-        let reveal = handshake.reveal();
-        let certificate = DeviceVerified {
-            account: account.into(),
-            sign_gen: 1,
-            device_id: "dev-1".into(),
-            device_pub: reveal.device_pub,
-            device_sign_pub: reveal.device_sign_pub,
-            unlock_auth_pub: reveal.unlock_auth_pub,
-            transcript,
-            epoch: 1,
-        };
-        trust
-            .confirm(astation_id, &fake.sign(&certificate.encode()))
-            .unwrap();
-        trust.save_to(&trust_path).unwrap();
-        Self {
-            fake,
-            trust_path,
-            astation_id: astation_id.into(),
-            account: account.into(),
-            epoch: 0,
-        }
-    }
-
-    /// Signs and accepts a newer account state with this mode and kid.
-    pub(crate) fn state(&mut self, mode: crate::memory::crypto::EncryptionMode, kid: Option<&str>) {
-        self.epoch += 1;
-        let signed = self.fake.sign(
-            &AccountState {
-                account: self.account.clone(),
-                sign_gen: 1,
-                mode,
-                kid: kid.map(str::to_string),
-                epoch: self.epoch,
-            }
-            .encode(),
-        );
-        let mut trust = TrustStore::load_from(&self.trust_path).unwrap();
-        trust
-            .accept_account_state(&self.astation_id, &signed)
-            .unwrap();
-        trust.save_to(&self.trust_path).unwrap();
-    }
 }
 
 #[cfg(test)]
@@ -1159,7 +1079,7 @@ mod tests {
 #[cfg(test)]
 mod ceremony_tests {
     use super::*;
-    use crate::memory::crypto::{EncryptionContext, EncryptionMode};
+    use crate::memory::crypto::EncryptionMode;
     use crate::memory::fake_astation::FakeKeyServer;
     use crate::memory::grant::seal_k_grant;
     use crate::memory::key_agent::{error_of, holds_k, test_agent};
@@ -1452,35 +1372,18 @@ mod ceremony_tests {
 
     #[test]
     fn first_verification_purges_legacy_keys() {
-        use crate::memory::crypto::stored_summary_at;
+        use crate::memory::legacy_keys::{summary_at, write_for_test};
         let dir = tempfile::tempdir().unwrap();
-        let data_keys = KeyPaths::in_dir(dir.path()).data_keys;
-        // K and its rotation history from the unauthenticated #36 path.
-        for (kid, key) in [("0123abcd", [1; 32]), ("11112222", [2; 32])] {
-            EncryptionContext::update_mode_at(
-                &data_keys,
-                ASTATION_ID,
-                "acct",
-                EncryptionMode::Enabling,
-                Some(kid),
-            )
-            .unwrap();
-            EncryptionContext::install_grant_at(&data_keys, ASTATION_ID, "acct", kid, key).unwrap();
-        }
-        assert_eq!(
-            stored_summary_at(&data_keys, ASTATION_ID, "acct").2,
-            vec!["0123abcd".to_string()]
-        );
-
+        let legacy = KeyPaths::in_dir(dir.path());
+        // K, its rotation history and a project name from the unauthenticated #36 path.
+        write_for_test(&legacy.data_keys, ASTATION_ID, "acct", &[("0123abcd", [1; 32]), ("11112222", [2; 32])], &[("h1.11112222.aa", "github.com/agora/atem")]);
+        crate::memory::project_names::remember(&legacy.project_names, "acct", [("h1.11112222.aa".to_string(), "github.com/agora/atem".to_string())]).unwrap();
         let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
             (state(fake, EncryptionMode::On, Some("89abcdef"), 2), vec![])
         });
         result.unwrap();
-        assert_eq!(
-            stored_summary_at(&paths.data_keys, ASTATION_ID, "acct"),
-            (None, None, vec![], 0),
-            "the old K and its history must be gone"
-        );
+        assert_eq!(summary_at(&paths.data_keys, "acct"), (None, vec![], 0), "the old K and its history must be gone");
+        assert_eq!(crate::memory::project_names::ProjectNames::load_from(&paths.project_names).unwrap().len("acct"), 0);
     }
 
     #[test]

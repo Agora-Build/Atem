@@ -185,7 +185,7 @@ pub struct VaultClient {
     astation_id: String,
     http: reqwest::Client,
     #[cfg(test)]
-    encryption_store: Option<std::path::PathBuf>,
+    encryption_with: Option<(crate::memory::verification::KeyPaths, std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>)>,
 }
 
 impl VaultClient {
@@ -200,20 +200,20 @@ impl VaultClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             #[cfg(test)]
-            encryption_store: None,
+            encryption_with: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_encryption_store(mut self, path: std::path::PathBuf) -> Self {
-        self.encryption_store = Some(path);
+    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::KeyPaths, agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>) -> Self {
+        self.encryption_with = Some((paths, agent));
         self
     }
 
     fn encryption(&self) -> Result<EncryptionContext> {
         #[cfg(test)]
-        if let Some(path) = &self.encryption_store {
-            return EncryptionContext::for_astation_at(&self.astation_id, path);
+        if let Some((paths, agent)) = &self.encryption_with {
+            return EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone());
         }
         EncryptionContext::for_astation(&self.astation_id)
     }
@@ -250,39 +250,23 @@ impl VaultClient {
     pub async fn list(&self) -> Result<Vec<VaultListItem>> {
         let req = list_vaults_request(&self.base, &self.client_id);
         let encryption = self.encryption()?;
-        let mut items: Vec<VaultListItem> = self.send(req).await?.json().await?;
-        for item in &mut items {
-            encryption.require_sealed(&item.summary, "e1.", "vault summary")?;
-            if item.summary.starts_with("e1.") {
-                item.summary = String::from_utf8(
-                    encryption.open(&item.vault_id, "summary", &item.summary)?
-                ).context("vault summary is not UTF-8")?;
-            }
-        }
-        Ok(items)
+        let items: Vec<VaultListItem> = self.send(req).await?.json().await?;
+        encryption.blocking(move |encryption| open_summaries(encryption, items)).await
     }
 
     pub async fn read(&self, vault_id: &str, since: Option<u64>, history: bool) -> Result<Vec<VaultEntry>> {
         let req = read_vault_request(&self.base, &self.client_id, vault_id, since, history);
         let encryption = self.encryption()?;
-        let mut entries: Vec<VaultEntry> = self.send(req).await?.json().await?;
-        for entry in &mut entries {
-            encryption.require_sealed(&entry.content, "e1.", "vault entry")?;
-            if entry.content.starts_with("e1.") {
-                entry.content = String::from_utf8(encryption.open(
-                    vault_id,
-                    "content",
-                    &entry.content,
-                )?).context("vault entry is not UTF-8")?;
-            }
-        }
-        Ok(entries)
+        let entries: Vec<VaultEntry> = self.send(req).await?.json().await?;
+        let vault_id = vault_id.to_string();
+        encryption.blocking(move |encryption| open_entries(encryption, &vault_id, entries)).await
     }
 
     pub async fn write(&self, vault_id: &str, text: &str, entry_id: Option<u32>) -> Result<WriteResult> {
         let encryption = self.encryption()?;
         let text = if encryption.should_encrypt() {
-            encryption.seal(vault_id, "content", text.as_bytes())?
+            let (id, plain) = (vault_id.to_string(), text.to_string());
+            encryption.blocking(move |encryption| encryption.seal(&id, "content", plain.as_bytes())).await?
         } else { text.to_string() };
         let req = write_vault_request(&self.base, &self.client_id, vault_id, &text, entry_id);
         Ok(self.send(req).await?.json().await?)
@@ -291,7 +275,8 @@ impl VaultClient {
     pub async fn set_summary(&self, vault_id: &str, text: &str) -> Result<()> {
         let encryption = self.encryption()?;
         let text = if encryption.should_encrypt() {
-            encryption.seal(vault_id, "summary", text.as_bytes())?
+            let (id, plain) = (vault_id.to_string(), text.to_string());
+            encryption.blocking(move |encryption| encryption.seal(&id, "summary", plain.as_bytes())).await?
         } else { text.to_string() };
         let req = set_summary_request(&self.base, &self.client_id, vault_id, &text);
         self.send(req).await?;
@@ -327,49 +312,110 @@ impl VaultClient {
         }
 
         for (item, entries) in snapshot {
-            let plain_summary = if item.summary.starts_with("e1.") {
-                String::from_utf8(encryption.open(&item.vault_id, "summary", &item.summary)?)
-                    .context("vault summary is not UTF-8")?
-            } else {
-                item.summary
-            };
-            let summary = if encryption.mode == EncryptionMode::Enabling {
-                encryption.seal(&item.vault_id, "summary", plain_summary.as_bytes())?
-            } else {
-                plain_summary
-            };
-            let mut rewritten = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let plain = if entry.content.starts_with("e1.") {
-                    String::from_utf8(encryption.open(&item.vault_id, "content", &entry.content)?)
-                        .context("vault entry is not UTF-8")?
-                } else {
-                    entry.content
-                };
-                let content = if encryption.mode == EncryptionMode::Enabling {
-                    encryption.seal(&item.vault_id, "content", plain.as_bytes())?
-                } else {
-                    plain
-                };
-                rewritten.push(json!({
-                    "entry_no": entry.entry_no,
-                    "version": entry.version,
-                    "content": content,
-                }));
-            }
+            let vault_id = item.vault_id.clone();
+            let body = encryption.blocking(move |encryption| migrated_vault(encryption, &item, &entries)).await?;
             self.send(VaultRequest {
                 method: "POST",
                 url: format!(
                     "{}/api/vault/{}/encryption?id={}",
                     base_trim(&self.base),
-                    enc(&item.vault_id),
+                    enc(&vault_id),
                     enc(&self.client_id),
                 ),
-                body: Some(json!({"summary": summary, "entries": rewritten})),
+                body: Some(body),
             }).await?;
         }
         Ok(())
     }
+}
+
+/// Opens every sealed summary in one key-agent round trip; plain text is
+/// refused while encryption is on.
+fn open_summaries(encryption: &EncryptionContext, mut items: Vec<VaultListItem>) -> Result<Vec<VaultListItem>> {
+    for item in &items {
+        encryption.require_sealed(&item.summary, "e1.", "vault summary")?;
+    }
+    let opened = {
+        let sealed: Vec<(&str, &str, &str)> = items.iter()
+            .filter(|item| item.summary.starts_with("e1."))
+            .map(|item| (item.vault_id.as_str(), "summary", item.summary.as_str()))
+            .collect();
+        encryption.open_many(&sealed)?
+    };
+    let mut opened = opened.into_iter();
+    for item in &mut items {
+        if item.summary.starts_with("e1.") {
+            let plain = opened.next().ok_or_else(|| anyhow!("a vault summary was not opened"))?;
+            item.summary = String::from_utf8(plain).context("vault summary is not UTF-8")?;
+        }
+    }
+    Ok(items)
+}
+
+/// Opens every sealed entry of `vault_id` in one key-agent round trip.
+fn open_entries(encryption: &EncryptionContext, vault_id: &str, mut entries: Vec<VaultEntry>) -> Result<Vec<VaultEntry>> {
+    for entry in &entries {
+        encryption.require_sealed(&entry.content, "e1.", "vault entry")?;
+    }
+    let opened = {
+        let sealed: Vec<(&str, &str, &str)> = entries.iter()
+            .filter(|entry| entry.content.starts_with("e1."))
+            .map(|entry| (vault_id, "content", entry.content.as_str()))
+            .collect();
+        encryption.open_many(&sealed)?
+    };
+    let mut opened = opened.into_iter();
+    for entry in &mut entries {
+        if entry.content.starts_with("e1.") {
+            let plain = opened.next().ok_or_else(|| anyhow!("a vault entry was not opened"))?;
+            entry.content = String::from_utf8(plain).context("vault entry is not UTF-8")?;
+        }
+    }
+    Ok(entries)
+}
+
+/// One vault's summary and every entry version, re-sealed under the current
+/// key (`enabling`) or opened to plain text (`disabling`): the body of
+/// `POST /api/vault/{id}/encryption`, in one or two key-agent round trips.
+fn migrated_vault(encryption: &EncryptionContext, item: &VaultListItem, entries: &[VaultEntry]) -> Result<Value> {
+    use crate::memory::crypto::EncryptionMode;
+    let id = item.vault_id.as_str();
+    let mut sealed: Vec<(&str, &str, &str)> = Vec::new();
+    if item.summary.starts_with("e1.") {
+        sealed.push((id, "summary", item.summary.as_str()));
+    }
+    sealed.extend(entries.iter()
+        .filter(|entry| entry.content.starts_with("e1."))
+        .map(|entry| (id, "content", entry.content.as_str())));
+    let mut opened = encryption.open_many(&sealed)?.into_iter();
+    let mut plain = |value: &str, what: &'static str| -> Result<String> {
+        if !value.starts_with("e1.") {
+            return Ok(value.to_string());
+        }
+        let bytes = opened.next().ok_or_else(|| anyhow!("a vault field was not opened"))?;
+        String::from_utf8(bytes).context(what)
+    };
+    let summary = plain(&item.summary, "vault summary is not UTF-8")?;
+    let contents = entries.iter()
+        .map(|entry| plain(&entry.content, "vault entry is not UTF-8"))
+        .collect::<Result<Vec<_>>>()?;
+    let (summary, contents) = if encryption.mode == EncryptionMode::Enabling {
+        let mut fields: Vec<(&str, &str, &[u8])> = vec![(id, "summary", summary.as_bytes())];
+        fields.extend(contents.iter().map(|content| (id, "content", content.as_bytes())));
+        let mut resealed = encryption.seal_many(&fields)?.into_iter();
+        let summary = resealed.next().unwrap_or_default();
+        (summary, resealed.collect::<Vec<_>>())
+    } else {
+        (summary, contents)
+    };
+    let rewritten: Vec<Value> = entries.iter().zip(contents)
+        .map(|(entry, content)| json!({
+            "entry_no": entry.entry_no,
+            "version": entry.version,
+            "content": content,
+        }))
+        .collect();
+    Ok(json!({"summary": summary, "entries": rewritten}))
 }
 
 #[cfg(test)]
