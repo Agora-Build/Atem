@@ -337,6 +337,11 @@ impl AtemConfig {
                     "Paired:   {}  (SSO: {})  [save: {}]",
                     aid, login, saved
                 ));
+                let trust = crate::memory::trust::TrustStore::load_from(
+                    &crate::memory::trust::trust_path(),
+                )
+                .unwrap_or_default();
+                lines.push(format!("          {}", trust.verification_line(aid)));
             }
         }
 

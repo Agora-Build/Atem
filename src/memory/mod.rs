@@ -13,6 +13,26 @@ pub mod api;
 pub mod sync;
 pub mod cmd;
 pub mod crypto;
+pub mod encoding;
+pub mod statements;
+pub mod device_keys;
+pub mod verification;
+pub mod trust;
+pub mod grant;
+pub mod storage_key;
+pub mod key_agent;
+pub mod account_keys;
+pub mod project_names;
+pub mod legacy_keys;
+pub mod unlock;
+#[cfg(unix)]
+pub mod agent_socket;
 
 #[cfg(test)]
 mod e2e_tests;
+#[cfg(test)]
+mod kat_tests;
+#[cfg(test)]
+mod fake_astation;
+#[cfg(test)]
+mod k_agent_tests;

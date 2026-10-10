@@ -1,0 +1,737 @@
+//! Test stand-in for Astation's side of unlock and storage-key rotation:
+//! the pins it keeps, the storage keys it holds, the grants and acks it
+//! signs. Mirrors "Astation work for step 2a" in designs/e2e-encryption.md.
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use crate::memory::account_keys::AccountKeys;
+use crate::memory::crypto::EncryptionMode;
+use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
+use crate::memory::encoding::dec;
+use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, seal_k_grant};
+use crate::memory::key_agent::{KeyAgent, KeyAgentApi, build_unlock_request, test_agent};
+use crate::memory::statements::{
+    AccountState, DeviceVerified, FakeAstation, SignedWire, StorageAbandon, StorageAck,
+    StorageConfirm, StorageRotate, UnlockGrant, UnlockRequest, sealed_hash, storage_key_info,
+    unlock_info, unlock_request_hash, verify_device,
+};
+use crate::memory::storage_key::{
+    SealedDeviceKeys, StorageRotation, UnlockGrantWire, new_storage_key,
+};
+use crate::memory::trust::TrustStore;
+use crate::memory::verification::{AstationKeys, KeyPaths};
+
+pub(crate) const ASTATION_ID: &str = "astation-1";
+pub(crate) const ACCOUNT: &str = "acct";
+pub(crate) const DEVICE_ID: &str = "dev-1";
+
+/// Pins `astation` for `keys` in `paths.trust`, as a finished verification
+/// does; `home` also makes it the home Astation.
+pub(crate) fn pin(paths: &KeyPaths, astation: &FakeAstation, keys: &DeviceKeys, home: bool) {
+    pin_as(paths, ASTATION_ID, astation, keys, home);
+}
+
+/// [`pin`] under another Astation id (same account and device).
+pub(crate) fn pin_as(
+    paths: &KeyPaths,
+    astation_id: &str,
+    astation: &FakeAstation,
+    keys: &DeviceKeys,
+    home: bool,
+) {
+    pin_for_account(paths, astation_id, astation, keys, home, ACCOUNT);
+}
+
+/// [`pin_as`] for another data account.
+pub(crate) fn pin_for_account(
+    paths: &KeyPaths,
+    astation_id: &str,
+    astation: &FakeAstation,
+    keys: &DeviceKeys,
+    home: bool,
+    account: &str,
+) {
+    let pinned = AstationKeys {
+        sign_pub: astation.sign_pub(),
+        enc_pub: astation.enc_pub(),
+        recovery_sign_pub: [6; 32],
+        nonce_s: [7; 32],
+    };
+    let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+    trust.set_pending(
+        astation_id,
+        DEVICE_ID,
+        keys,
+        &pinned,
+        "AAAA-BBBB-CCCC",
+        &[8; 32],
+    );
+    let certificate = DeviceVerified {
+        account: account.into(),
+        sign_gen: 1,
+        device_id: DEVICE_ID.into(),
+        device_pub: keys.device_pub(),
+        device_sign_pub: keys.device_sign_pub(),
+        unlock_auth_pub: keys.unlock_auth_pub(),
+        transcript: [8; 32],
+        epoch: 1,
+    };
+    trust
+        .confirm(astation_id, &astation.sign(&certificate.encode()))
+        .unwrap();
+    if home {
+        trust.set_home(astation_id);
+    }
+    trust.save_to(&paths.trust).unwrap();
+}
+
+/// A verified device in `dir`: home Astation pinned, keys sealed under a
+/// storage key with id `kid` that Astation holds, unlock-auth key on disk.
+pub(crate) fn sealed_device(dir: &Path, kid: &str) -> (KeyPaths, FakeKeyServer, DeviceKeys) {
+    let paths = KeyPaths::in_dir(dir);
+    let keys = DeviceKeys::generate();
+    let astation = FakeAstation::new();
+    pin(&paths, &astation, &keys, true);
+    let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+    trust.set_escrowed_kid(kid);
+    trust.save_to(&paths.trust).unwrap();
+    let storage_key = new_storage_key();
+    SealedDeviceKeys::seal(&keys, DEVICE_ID, kid, &storage_key)
+        .unwrap()
+        .save_to(&paths.device_keys_sealed)
+        .unwrap();
+    keys.unlock_auth_key()
+        .save_to(&paths.unlock_auth_key)
+        .unwrap();
+    let server = FakeKeyServer {
+        astation,
+        device_sign_pub: keys.device_sign_pub(),
+        unlock_auth_pub: keys.unlock_auth_pub(),
+        storage_keys: HashMap::from([(kid.to_string(), *storage_key)]),
+        pending: None,
+        pending_statement: None,
+        acked: Default::default(),
+    };
+    (paths, server, keys)
+}
+
+/// `storageKeyRejected { reason, pending_kid }`: `pending_kid` is set only
+/// when the rotate was refused because Astation holds that pending key.
+#[derive(Debug)]
+pub(crate) struct Rejected {
+    pub reason: String,
+    pub pending_kid: Option<String>,
+}
+
+impl Rejected {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            pending_kid: None,
+        }
+    }
+
+    fn pending(reason: impl Into<String>, pending_kid: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            pending_kid: Some(pending_kid.into()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for Rejected {
+    fn from(error: anyhow::Error) -> Self {
+        Self::new(format!("{error:#}"))
+    }
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+pub(crate) struct FakeKeyServer {
+    pub astation: FakeAstation,
+    pub device_sign_pub: [u8; 32],
+    pub unlock_auth_pub: [u8; 32],
+    /// Storage keys Astation holds for this device, by storage_kid.
+    pub storage_keys: HashMap<String, [u8; 32]>,
+    /// A rotated key stored as pending until the device confirms it.
+    pub pending: Option<(String, [u8; 32])>,
+    /// The signed rotate statement (base64) that `pending` was acked for:
+    /// only a byte-identical resend is acked again.
+    pub pending_statement: Option<String>,
+    /// Every storage key id Astation ever acked: a replayed rotate to one is refused.
+    pub acked: std::collections::HashSet<String>,
+}
+
+/// A device-signed rotate from `old` to `new` with a fresh key, as a relay
+/// could have captured earlier and replay later.
+#[cfg(test)]
+pub(crate) fn captured_rotation(
+    server: &FakeKeyServer,
+    keys: &DeviceKeys,
+    old: &str,
+    new: &str,
+) -> StorageRotation {
+    let key = new_storage_key();
+    let (encapped, ciphertext) = hpke_seal(
+        &server.astation.enc_pub(),
+        &storage_key_info(ACCOUNT, DEVICE_ID, new),
+        &*key,
+    )
+    .unwrap();
+    let rotate = StorageRotate {
+        account: ACCOUNT.into(),
+        device_id: DEVICE_ID.into(),
+        old_storage_kid: old.into(),
+        new_storage_kid: new.into(),
+        sealed_hash: sealed_hash(&encapped, &ciphertext),
+    };
+    StorageRotation {
+        rotate: keys.sign_statement(&rotate.encode()),
+        encapped_key: STANDARD.encode(encapped),
+        ciphertext: STANDARD.encode(ciphertext),
+    }
+}
+
+impl FakeKeyServer {
+    /// "Touch ID approved": releases the storage key the request names.
+    pub fn grant_unlock(&self, request: &SignedWire) -> Result<UnlockGrantWire> {
+        let bytes = STANDARD.decode(&request.statement)?;
+        let kid = UnlockRequest::parse(&dec(&bytes)?)?.storage_kid;
+        self.unlock_grant(&self.astation, request, &kid)
+    }
+
+    /// Like `grant_unlock`, but a request naming the pending key confirms it first.
+    pub fn grant_unlock_confirming(&mut self, request: &SignedWire) -> Result<UnlockGrantWire> {
+        let bytes = STANDARD.decode(&request.statement)?;
+        let kid = UnlockRequest::parse(&dec(&bytes)?)?.storage_kid;
+        // Only a request the unlock-auth key signed may settle a rotation.
+        verify_device(&self.unlock_auth_pub, request).context("unlock-auth signature")?;
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == kid)
+        {
+            self.promote_pending();
+        }
+        self.grant_unlock(request)
+    }
+
+    /// Releases storage key `kid` (current or pending) for `request`, with
+    /// the grant signed by `signer`.
+    pub fn unlock_grant(
+        &self,
+        signer: &FakeAstation,
+        request: &SignedWire,
+        kid: &str,
+    ) -> Result<UnlockGrantWire> {
+        let fields =
+            verify_device(&self.unlock_auth_pub, request).context("unlock-auth signature")?;
+        let parsed = UnlockRequest::parse(&fields)?;
+        if parsed.account != ACCOUNT || parsed.device_id != DEVICE_ID {
+            bail!("unlock request for another account or device");
+        }
+        let key = self
+            .storage_keys
+            .get(kid)
+            .copied()
+            .or_else(|| {
+                self.pending
+                    .as_ref()
+                    .filter(|(pending, _)| pending == kid)
+                    .map(|(_, key)| *key)
+            })
+            .ok_or_else(|| anyhow!("Astation holds no storage key {kid}"))?;
+        let request_hash = unlock_request_hash(&STANDARD.decode(&request.statement)?);
+        let (encapped, ciphertext) = hpke_seal(
+            &parsed.e_pub,
+            &unlock_info(ACCOUNT, DEVICE_ID, kid, &request_hash),
+            &key,
+        )?;
+        let statement = UnlockGrant {
+            account: ACCOUNT.into(),
+            sign_gen: 1,
+            device_id: DEVICE_ID.into(),
+            storage_kid: kid.into(),
+            request_hash,
+            sealed_hash: sealed_hash(&encapped, &ciphertext),
+        };
+        Ok(UnlockGrantWire {
+            grant: signer.sign(&statement.encode()),
+            encapped_key: STANDARD.encode(encapped),
+            ciphertext: STANDARD.encode(ciphertext),
+        })
+    }
+
+    /// Promotes the pending key to the only current one.
+    fn promote_pending(&mut self) {
+        if let Some((kid, key)) = self.pending.take() {
+            self.storage_keys.clear();
+            self.storage_keys.insert(kid, key);
+        }
+    }
+
+    /// Phase 2: checks the device signature and the seal, stores the key as
+    /// pending (keeping the current one) and acks. An acked pending key is a
+    /// commitment: another rotate is refused until it is confirmed, except
+    /// a byte-identical resend of the acked rotate or a rotate from the pending key
+    /// itself (an implicit confirm). A refusal is `storageKeyRejected`: it
+    /// names the pending kid only when that pending key is why.
+    pub fn accept_rotation(&mut self, rotation: &StorageRotation) -> Result<SignedWire, Rejected> {
+        let rotate =
+            StorageRotate::parse(&verify_device(&self.device_sign_pub, &rotation.rotate)?)?;
+        if rotate.account != ACCOUNT || rotate.device_id != DEVICE_ID {
+            return Err(Rejected::new("rotation for another account or device"));
+        }
+        if !crate::memory::crypto::valid_kid(&rotate.new_storage_kid) {
+            return Err(Rejected::new("rotation has an invalid new storage key id"));
+        }
+        if rotate.new_storage_kid == rotate.old_storage_kid {
+            return Err(Rejected::new("rotation to the same storage key id"));
+        }
+        let encapped = STANDARD
+            .decode(&rotation.encapped_key)
+            .map_err(anyhow::Error::from)?;
+        let ciphertext = STANDARD
+            .decode(&rotation.ciphertext)
+            .map_err(anyhow::Error::from)?;
+        if sealed_hash(&encapped, &ciphertext) != rotate.sealed_hash {
+            return Err(Rejected::new("rotation seal doesn't match its signature"));
+        }
+        let same_kid = self
+            .pending
+            .as_ref()
+            .is_some_and(|(kid, _)| *kid == rotate.new_storage_kid);
+        // A resend after a lost ack is the identical signed statement (which
+        // includes the seal's hash); any other rotate to the pending kid is
+        // refused and leaves the committed key alone.
+        let resend = same_kid
+            && self.pending_statement.as_deref() == Some(rotation.rotate.statement.as_str());
+        if same_kid && !resend {
+            return Err(Rejected::pending(
+                format!(
+                    "a rotation to storage key {} is pending with another key; it must be confirmed first",
+                    rotate.new_storage_kid
+                ),
+                &rotate.new_storage_kid,
+            ));
+        }
+        if !resend {
+            if let Some((pending, _)) = &self.pending {
+                if *pending == rotate.old_storage_kid {
+                    self.promote_pending();
+                } else {
+                    return Err(Rejected::pending(
+                        format!(
+                            "a rotation to storage key {pending} is pending; it must be confirmed first"
+                        ),
+                        pending,
+                    ));
+                }
+            }
+            if self.acked.contains(&rotate.new_storage_kid) {
+                return Err(Rejected::new(format!(
+                    "storage key {} was acked before",
+                    rotate.new_storage_kid
+                )));
+            }
+            if self.storage_keys.contains_key(&rotate.new_storage_kid) {
+                return Err(Rejected::new(format!(
+                    "Astation already holds storage key {}",
+                    rotate.new_storage_kid
+                )));
+            }
+            if rotate.old_storage_kid.is_empty() {
+                if !self.storage_keys.is_empty() {
+                    return Err(Rejected::new(
+                        "first-sealing rotation, but Astation already holds a storage key",
+                    ));
+                }
+            } else if !self.storage_keys.contains_key(&rotate.old_storage_kid) {
+                return Err(Rejected::new(
+                    "rotation from a storage key Astation doesn't hold",
+                ));
+            }
+        }
+        let plain = hpke_open(
+            &self.astation.enc_secret_bytes(),
+            &encapped,
+            &ciphertext,
+            &storage_key_info(ACCOUNT, DEVICE_ID, &rotate.new_storage_kid),
+        )?;
+        let key: [u8; 32] = plain
+            .as_slice()
+            .try_into()
+            .map_err(|_| Rejected::new("storage key has the wrong length"))?;
+        if !resend {
+            self.pending = Some((rotate.new_storage_kid.clone(), key));
+            self.pending_statement = Some(rotation.rotate.statement.clone());
+            self.acked.insert(rotate.new_storage_kid.clone());
+        }
+        Ok(self.astation.sign(
+            &StorageAck {
+                account: ACCOUNT.into(),
+                sign_gen: 1,
+                device_id: DEVICE_ID.into(),
+                storage_kid: rotate.new_storage_kid,
+            }
+            .encode(),
+        ))
+    }
+
+    /// The device gives up a pending key. Only an exact match is dropped, the
+    /// kid stays in `acked`, and a replay finds nothing to drop.
+    pub fn accept_abandon(&mut self, abandon: &SignedWire) -> Result<()> {
+        let fields = verify_device(&self.device_sign_pub, abandon)?;
+        let abandoned = StorageAbandon::parse(&fields)?;
+        if abandoned.account != ACCOUNT || abandoned.device_id != DEVICE_ID {
+            bail!("abandon for another account or device");
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(kid, _)| *kid == abandoned.storage_kid)
+        {
+            self.pending = None;
+        }
+        Ok(())
+    }
+
+    /// Phase 3: the device switched; only the new key is kept. Everything is
+    /// checked before anything is dropped, so a stray confirm changes nothing.
+    pub fn confirm(&mut self, confirm: &SignedWire) -> Result<()> {
+        let confirmed = StorageConfirm::parse(&verify_device(&self.device_sign_pub, confirm)?)?;
+        if confirmed.account != ACCOUNT || confirmed.device_id != DEVICE_ID {
+            bail!("confirmation for another account or device");
+        }
+        match &self.pending {
+            Some((kid, _)) if *kid == confirmed.storage_kid => {
+                self.promote_pending();
+                Ok(())
+            }
+            // Already settled by an unlock or a later rotate.
+            None if self.storage_keys.contains_key(&confirmed.storage_kid) => Ok(()),
+            _ => bail!("confirmation for another storage key"),
+        }
+    }
+}
+
+/// A step-1 device whose agent migrated the plain file at start: plain
+/// file, sealed file, an agent holding the new storage key (not escrowed),
+/// and a server speaking for the Astation that was pinned.
+pub(crate) fn migrated_device(
+    dir: &Path,
+) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>) {
+    let paths = KeyPaths::in_dir(dir);
+    let keys = DeviceKeys::generate();
+    keys.save_to(&paths.device_keys).unwrap();
+    let astation = FakeAstation::new();
+    pin(&paths, &astation, &keys, false);
+    let agent = test_agent(&paths);
+    let server = FakeKeyServer {
+        astation,
+        device_sign_pub: keys.device_sign_pub(),
+        unlock_auth_pub: keys.unlock_auth_pub(),
+        storage_keys: Default::default(),
+        pending: None,
+        pending_statement: None,
+        acked: Default::default(),
+    };
+    (paths, server, keys, agent)
+}
+
+/// What `atem cred unlock` does with `agent`, against `server`.
+pub(crate) fn unlock_with(
+    agent: &dyn KeyAgentApi,
+    server: &FakeKeyServer,
+    paths: &KeyPaths,
+) -> Result<String> {
+    let challenge = agent.begin_unlock(ASTATION_ID)?;
+    let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?
+        .ok_or_else(|| anyhow!("unlock_auth_key is missing"))?;
+    let request = build_unlock_request(&challenge, "boot-1", 1_760_000_000, &unlock_auth);
+    let grant = server.grant_unlock(&request)?;
+    agent.finish_unlock(ASTATION_ID, &request.statement, &grant)
+}
+
+/// Signs `mode`/`kid` at `epoch` as `astation` and accepts it into
+/// `paths.trust`, as `apply_account_state` does.
+pub(crate) fn set_state(
+    paths: &KeyPaths,
+    astation: &FakeAstation,
+    mode: EncryptionMode,
+    kid: Option<&str>,
+    epoch: u64,
+) {
+    set_state_as(paths, ASTATION_ID, astation, mode, kid, epoch);
+}
+
+/// [`set_state`] for the Astation pinned as `astation_id`.
+pub(crate) fn set_state_as(
+    paths: &KeyPaths,
+    astation_id: &str,
+    astation: &FakeAstation,
+    mode: EncryptionMode,
+    kid: Option<&str>,
+    epoch: u64,
+) {
+    let signed = astation.sign(
+        &AccountState {
+            account: ACCOUNT.into(),
+            sign_gen: 1,
+            mode,
+            kid: kid.map(str::to_string),
+            epoch,
+        }
+        .encode(),
+    );
+    TrustStore::update(&paths.trust, |trust| {
+        trust.accept_account_state(astation_id, &signed)?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The account keys in `path`, opened directly with the storage key
+/// `server` holds for it (not through an agent).
+pub(crate) fn sealed_account_keys(
+    server: &FakeKeyServer,
+    paths: &KeyPaths,
+    path: &Path,
+) -> AccountKeys {
+    let sealed = SealedDeviceKeys::load_from(path).unwrap().unwrap();
+    let storage_key = server
+        .storage_keys
+        .get(&sealed.storage_kid)
+        .copied()
+        .or_else(|| {
+            server
+                .pending
+                .as_ref()
+                .filter(|(kid, _)| *kid == sealed.storage_kid)
+                .map(|(_, key)| *key)
+        })
+        .expect("Astation holds the storage key of the sealed file");
+    let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)
+        .unwrap()
+        .unwrap();
+    sealed
+        .open_with_accounts(&storage_key, unlock_auth)
+        .unwrap()
+        .1
+}
+
+/// A verified device with its home Astation, unlocked through the
+/// in-process agent (shared, so contexts and clients can hold it).
+pub(crate) struct UnlockedDevice {
+    pub paths: KeyPaths,
+    pub server: FakeKeyServer,
+    pub keys: DeviceKeys,
+    pub agent: Arc<Mutex<KeyAgent>>,
+    epoch: u64,
+}
+
+impl UnlockedDevice {
+    pub(crate) fn new(dir: &Path) -> Self {
+        let (paths, server, keys) = sealed_device(dir, "0a1b2c3d");
+        let agent = Arc::new(test_agent(&paths));
+        unlock_with(agent.as_ref(), &server, &paths).unwrap();
+        Self {
+            paths,
+            server,
+            keys,
+            agent,
+            epoch: 1,
+        }
+    }
+
+    /// Signs and applies the next account state.
+    pub(crate) fn state(&mut self, mode: EncryptionMode, kid: Option<&str>) {
+        self.epoch += 1;
+        set_state(&self.paths, &self.server.astation, mode, kid, self.epoch);
+    }
+
+    /// A signed `K` grant for this device.
+    pub(crate) fn grant(&self, kid: &str, key: [u8; 32]) -> GrantWire {
+        seal_k_grant(
+            &self.server.astation,
+            ACCOUNT,
+            DEVICE_ID,
+            self.keys.device_pub(),
+            kid,
+            key,
+        )
+    }
+
+    /// A new state with `kid`, and its grant installed by the agent.
+    pub(crate) fn set_key(&mut self, mode: EncryptionMode, kid: &str, key: [u8; 32]) {
+        self.state(mode, Some(kid));
+        self.agent
+            .install_grant(ASTATION_ID, &self.grant(kid, key))
+            .unwrap();
+    }
+
+    /// The account keys in the current sealed file, opened directly.
+    pub(crate) fn sealed_accounts(&self) -> AccountKeys {
+        sealed_account_keys(&self.server, &self.paths, &self.paths.device_keys_sealed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::captured_rotation as rotation;
+
+    #[test]
+    fn rotation_with_empty_old_kid_is_rejected_when_a_key_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let error = server
+            .accept_rotation(&rotation(&server, &keys, "", "4e5f6a7b"))
+            .unwrap_err();
+        assert!(error.to_string().contains("already holds"), "{error}");
+        assert!(server.pending.is_none());
+        // A rotation naming the held key is accepted, then confirmed.
+        let ack = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap();
+        assert!(server.pending.is_some());
+        let _ = ack;
+    }
+
+    #[test]
+    fn first_sealing_with_empty_old_kid_is_accepted_when_nothing_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        server.storage_keys.clear();
+        server
+            .accept_rotation(&rotation(&server, &keys, "", "4e5f6a7b"))
+            .unwrap();
+    }
+
+    #[test]
+    fn rotation_rejects_a_bad_new_kid_an_unchanged_kid_or_a_held_kid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        for (old, new, expected) in [
+            ("0a1b2c3d", "NOPE", "invalid"),
+            ("0a1b2c3d", "0a1b2c3d", "same"),
+        ] {
+            let error = server
+                .accept_rotation(&rotation(&server, &keys, old, new))
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{new}: {error}");
+            assert!(server.pending.is_none());
+        }
+        // A kid Astation already holds (here: a second one it keeps).
+        server.storage_keys.insert("4e5f6a7b".into(), [3; 32]);
+        let error = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap_err();
+        assert!(error.to_string().contains("already holds"), "{error}");
+        assert!(server.pending.is_none());
+    }
+
+    #[test]
+    fn an_abandon_drops_only_the_exact_pending_kid_and_keeps_it_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let abandon = |kid: &str| {
+            keys.sign_statement(
+                &StorageAbandon {
+                    account: ACCOUNT.into(),
+                    device_id: DEVICE_ID.into(),
+                    storage_kid: kid.into(),
+                }
+                .encode(),
+            )
+        };
+        server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap();
+        server.accept_abandon(&abandon("ffffffff")).unwrap();
+        assert!(server.pending.is_some(), "another kid changes nothing");
+        server.accept_abandon(&abandon("0a1b2c3d")).unwrap();
+        assert!(server.pending.is_some() && server.storage_keys.contains_key("0a1b2c3d"));
+        server.accept_abandon(&abandon("4e5f6a7b")).unwrap();
+        assert!(server.pending.is_none());
+        assert!(server.acked.contains("4e5f6a7b"));
+        server.accept_abandon(&abandon("4e5f6a7b")).unwrap(); // replay: no-op
+        let again = server.accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"));
+        assert!(again.is_err(), "an abandoned kid is not reusable");
+        // A forged abandon is refused.
+        let forged = FakeAstation::new().sign(
+            &StorageAbandon {
+                account: ACCOUNT.into(),
+                device_id: DEVICE_ID.into(),
+                storage_kid: "4e5f6a7b".into(),
+            }
+            .encode(),
+        );
+        assert!(server.accept_abandon(&forged).is_err());
+    }
+
+    #[test]
+    fn a_refusal_names_the_pending_kid_only_when_the_pending_key_is_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap();
+        // Refused for its own shape: no pending kid, although one is pending.
+        let bad = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "0a1b2c3d"))
+            .unwrap_err();
+        assert_eq!(bad.pending_kid, None, "{bad}");
+        // Refused because of the pending key: it is named.
+        let committed = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "5f6a7b8c"))
+            .unwrap_err();
+        assert_eq!(
+            committed.pending_kid.as_deref(),
+            Some("4e5f6a7b"),
+            "{committed}"
+        );
+        let same_kid = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap_err();
+        assert_eq!(
+            same_kid.pending_kid.as_deref(),
+            Some("4e5f6a7b"),
+            "{same_kid}"
+        );
+        // A replay of an acked kid, once nothing is pending: no pending kid.
+        server.pending = None;
+        let replay = server
+            .accept_rotation(&rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b"))
+            .unwrap_err();
+        assert_eq!(replay.pending_kid, None, "{replay}");
+        assert!(replay.reason.contains("acked before"), "{replay}");
+    }
+
+    #[test]
+    fn only_a_byte_identical_resend_of_the_pending_rotate_is_re_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_paths, mut server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let first = rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b");
+        server.accept_rotation(&first).unwrap();
+        let pending = server.pending.clone();
+        // Same kid, another key: refused, the committed key stays.
+        let other = rotation(&server, &keys, "0a1b2c3d", "4e5f6a7b");
+        let error = server.accept_rotation(&other).unwrap_err().to_string();
+        assert!(error.contains("pending"), "{error}");
+        assert_eq!(server.pending, pending);
+        // The identical rotate (a resend after a lost ack) is acked again.
+        server.accept_rotation(&first).unwrap();
+        assert_eq!(server.pending, pending);
+    }
+}

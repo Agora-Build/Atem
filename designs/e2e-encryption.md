@@ -1,11 +1,24 @@
 # End-to-end encryption: memory, skills, vault and credentials
 
-Status: memory, skills and vault encryption implemented on the atem side in
-#36 (`src/memory/crypto.rs`); the Astation key manager isn't built yet.
-Credentials (`atem cred`), verified devices, the sealed `device_key`, unlock,
-device signing and the recovery secret: design approved for planning
-(2026-10-09), hardened after an independent security review the same day
-(see "Review findings"). Not built.
+Status: build steps 0–1 are built on the atem side (2026-10-09): signed
+account state and plain-text rejection (fixes to #36), and device
+verification (commit-then-reveal safety code, signed device certificate,
+signed account state, signed RFC 9180 HPKE grants for `K`). Build step 2a
+is built on the atem side (2026-10-10): `device_keys.sealed` under a
+storage key held by the home Astation, the key agent (`atem key-agent`),
+Touch ID unlock through Astation, storage-key rotation at every unlock,
+and `atem cred unlock|lock|status`. The Astation side of steps 0–2a is
+pending (see "Astation work for steps 0–1" and "Astation work for step
+2a"); until it lands, atems stay unverified and keep plain-text sync.
+Build step 2b is built on the atem side (2026-10-11): `K` and its previous
+keys live in the sealed payload of `device_keys.sealed`, only the key agent
+uses them (batched `Crypt` requests), the mode and kid come from the signed
+account state alone, project names live in `project_names.json`, and
+`data_keys.enc` is moved in at the first unlock and deleted. 2b needs nothing
+new from Astation. Device-signed writes (3), the recovery
+secret (4), credentials (5–6, 8) and auto-unlock (7): design approved for
+planning (2026-10-09), hardened after an independent security review the
+same day (see "Review findings"). Not built.
 Owner: Brent G
 
 ## Goal
@@ -56,7 +69,7 @@ device key, unlock policy and recovery kit, described once below.
 | Relay hides an invalidation or a recent memory write | partial | atem never accepts an older state of a record it already has, but a device that never saw the newer write can be shown the older one. This is withholding, not forgery. |
 | Valid pairing session on an unverified device | protected | Astation seals keys only to verified device keys, and other devices drop writes without a certified device signature. |
 | Another non-root user on the box | protected | Files are 0600. The key agent socket is 0600 and checks the caller's UID (`SO_PEERCRED`). |
-| Copied disk, VM snapshot or backup of a box | protected with Touch ID unlock; mostly protected with auto-unlock | `device_key` is sealed by a storage key only Astation holds, and the storage key changes at every unlock, so copies older than the last unlock can't be opened. See "Unlock policy". |
+| Copied disk, VM snapshot or backup of a box | protected with Touch ID unlock; mostly protected with auto-unlock | The device keys are sealed (`device_keys.sealed`) by a storage key only Astation holds, and the storage key changes at every unlock, so copies older than the last unlock can't be opened. See "Unlock policy". |
 | Revoked device | partial | Its pairing session is killed; `K`, the index key and its scope keys are rotated; its writes are rejected by every device. It keeps what it already read. Every value in its scopes is listed for rotation at the provider. |
 | Root or malware on a granted device | exposed | Out of scope. Limited to what that device was granted. |
 | Stolen Mac | protected | Keys are in the Keychain and Secure Enclave behind Touch ID. Restore on a new Mac from the recovery kit. |
@@ -76,7 +89,7 @@ device key, unlock policy and recovery kit, described once below.
 | Signing key | Secure Enclave P-256. It can't be extracted, and each signature needs Touch ID. |
 | Device verification | Required once per device, before any sync: commit-then-reveal safety code, confirmed on **both** sides (`atem pair` asks `codes match? [y/N]`, Astation asks for Touch ID). |
 | One rule for every key | No key of any kind (`K`, scope keys, index key, storage key) goes to an unverified device. Every grant is signed. |
-| Keys on disk (atem) | `device_key` is sealed by a storage key held only by Astation, rotated at every unlock. No passphrase. |
+| Keys on disk (atem) | The device keys are sealed (`device_keys.sealed`) by a storage key held only by Astation, rotated at every unlock. No passphrase. |
 | Unlock after reboot | Touch ID by default. Auto-unlock is a per-device opt-in, guarded by checks. Unlock requests are signed by a per-device unlock-auth key. |
 | Device key | atem's own X25519 key, generated fresh at verification, never the system SSH keys. |
 | Credential names | `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. Spelling kept for display; unique and looked up case-insensitively. |
@@ -99,10 +112,10 @@ holding `K` never opens a credential.
 | Index key | 256-bit random | HMACs credential names and project keys, so the relay can look up rows without learning names | Astation Keychain; every verified device, sealed |
 | Signing key | P-256, Secure Enclave, generation `sign_gen` | Signs every grant, mode change, device certificate, revocation list, credential row and manifest | Astation only; atems pin the public half |
 | Astation encryption key | X25519 | Receives keys sealed *to* Astation (storage keys) | Astation Keychain, sealed by the Secure Enclave; public half certified by the signing key and covered by the safety code |
-| Device key | X25519, generated on the device | Opens keys sealed to this device | The device only, inside `device_key.sealed` |
-| Device signing key | Ed25519, generated on the device | Signs this device's memory, skill and vault writes, ticket rolls and storage-key rotations | The device only, inside `device_key.sealed`; public half certified by Astation |
+| Device key | X25519, generated on the device | Opens keys sealed to this device | The device only, inside `device_keys.sealed` |
+| Device signing key | Ed25519, generated on the device | Signs this device's memory, skill and vault writes, ticket rolls and storage-key rotations | The device only, inside `device_keys.sealed`; public half certified by Astation |
 | Unlock-auth key | Ed25519, generated on the device | Signs unlock requests while the device key is still locked | The device, **unsealed** on disk (0600); public half pinned by Astation |
-| Storage key | 256-bit random, one per device, replaced at every unlock | Seals `device_key.sealed` on disk | Astation Keychain only; agent memory while unlocked |
+| Storage key | 256-bit random, one per device, replaced at every unlock | Seals `device_keys.sealed` on disk | Astation Keychain only; agent memory while unlocked |
 | Recovery secret `R` | 256-bit random | Root of recovery. See "Recovery kit" | The recovery kit only |
 
 Subkeys, so no key is used for two jobs:
@@ -134,7 +147,7 @@ flowchart TB
     BK["Backup blob<br/>sealed with recovery seal key"]
   end
   subgraph DEV["atem device"]
-    DKS["device_key.sealed<br/>device key + device signing key"]
+    DKS["device_keys.sealed<br/>device key + device signing key"]
     UA["Unlock-auth key"]
     PIN["Pinned signing, encryption,<br/>recovery signing pubkeys"]
     AG["Key agent<br/>unlocked keys in memory"]
@@ -174,8 +187,10 @@ an SSH key would silently cut off access. And the public half is published
 at `github.com/<user>.keys`.
 
 **One device key for every grant** is safe because each seal is real HPKE
-with its own `info` (the signed grant statement), so a seal made for one
-purpose can't be opened as another.
+with its own `info` (`atem-grant-info-v1`: account, type, device, kid and
+scope), and Astation signs a statement over the same fields plus a hash of
+the seal's output, so a seal made for one purpose can't be opened as
+another.
 
 ## Signed statements
 
@@ -187,13 +202,19 @@ statement whose `sign_gen` isn't their pinned generation.
 | Statement | Signed by | Fields | Purpose |
 |---|---|---|---|
 | `atem-account-state-v1` | signing key | account, sign_gen, mode, kid, epoch | Memory encryption mode. atem keeps the highest epoch and never moves toward plain text without one. |
-| `atem-device-verified-v1` | signing key | account, sign_gen, device_id, device_pub, device_sign_pub, unlock_auth_pub, epoch | Certifies a device after the safety code; gives the device its first epoch floor. |
+| `atem-device-verified-v1` | signing key | account, sign_gen, device_id, device_pub, device_sign_pub, unlock_auth_pub, transcript, epoch | Certifies a device after the safety code; gives the device its first epoch floor. `transcript` binds it to one ceremony (see "Verification"). |
 | `atem-grant-v1` | signing key | account, sign_gen, type (`K` / `index` / `scope`), device_id, device_pub, kid, scope_hmac, SHA-256(sealed key) | Proves Astation, not the relay, sealed a key to this device. |
 | `atem-scope-directory-v1` | signing key | account, sign_gen, epoch, [scope_hmac] | Every credential scope that exists, so a missing project scope can't be faked. |
 | `atem-cred-row-v1` | signing key | account, sign_gen, scope_hmac, kid, name_hmac, version, SHA-256(ciphertext), SHA-256(encrypted display name) | One credential version. |
 | `atem-cred-manifest-v1` | signing key | account, sign_gen, scope_hmac, kid, counter, epoch, [(name_hmac, version, ct_hash)] | Every credential in a scope; counter is monotonic across `kid` rotations. |
 | `atem-revoked-v1` | signing key | account, sign_gen, epoch, [device_id] | Devices whose writes are rejected and whose grants are void. |
 | `atem-mem-write-v1` | device signing key | account, device_id, record id, kind, scope, project_hmac, version or entry number, validity (valid_at, invalid_at, superseded_by), SHA-256(each encrypted field) | One memory, skill or vault write, including invalidations. |
+| `atem-unlock-request-v1` | unlock-auth key | account, device_id, boot_id, ticket (empty until auto-unlock), e_pub, nonce, time (Unix seconds), storage_kid | Asks the home Astation to release this device's storage key, sealed to the single-use `e_pub`. |
+| `atem-unlock-grant-v1` | signing key | account, sign_gen, device_id, storage_kid, SHA-256(request statement bytes), SHA-256(sealed storage key) | Astation's answer to exactly one unlock request; the device opens the seal only if it matches. |
+| `atem-storage-rotate-v1` | device signing key | account, device_id, old_storage_kid (empty at first sealing), new_storage_kid, SHA-256(sealed new storage key) | Hands Astation the next storage key (sealed to `astation_enc_pub`) while it keeps the old one. |
+| `atem-storage-ack-v1` | signing key | account, sign_gen, device_id, new_storage_kid | Astation stored the new storage key as pending. |
+| `atem-storage-confirm-v1` | device signing key | account, device_id, new_storage_kid | The device switched to the new storage key; Astation may drop the old one. |
+| `atem-storage-abandon-v1` | device signing key | account, device_id, storage_kid | The device gives up a pending storage key it holds no file for; Astation drops its pending key only if it is exactly this one. |
 | `atem-sign-rotate-v1` | recovery signing key | account, old sign pub, new sign pub, new_gen, new recovery sign pub, not_before | Replaces the signing key after a recovery; valid only after `not_before` (72 hours). |
 | `atem-sign-veto-v1` | current signing key | account, sign_gen, vetoed new_gen | Cancels a pending replacement from the current Mac. |
 
@@ -224,12 +245,39 @@ for two key sets that produce the same short code: it gets one guess with a
 6. Until both confirmations are in, atem's pins are **pending** and it
    fails closed: no grant is used and nothing syncs. They become final when
    atem has answered `y` **and** received an `atem-device-verified-v1`
-   statement for exactly the keys it revealed.
+   statement for exactly the keys it revealed **and this ceremony**: the
+   certificate carries
+   `transcript = SHA-256(enc("atem-verify-transcript-v1", C, nonce_a, nonce_s))`,
+   and atem rejects one whose transcript differs from its own. A device
+   that verifies again with the same keys can't be handed a recorded
+   certificate from an earlier ceremony.
 7. Astation pins the device's three public keys (in the Keychain, never on
    the relay) and sends the current `atem-account-state-v1`,
    `atem-scope-directory-v1`, `atem-revoked-v1`, and signed grants: `K`, the
    index key, and each ticked scope key. The device seals its first storage
    key to Astation's encryption key (see "Keys on disk").
+8. **Epochs.** Astation signs the certificate at epoch `E` and then
+   re-signs the current account state at a later epoch (`E+1`), so in
+   `deviceVerified` the account state's epoch is always `>=` the
+   certificate's. atem rejects a state older than the certificate. The
+   certificate's epoch becomes the device's floor.
+9. atem checks everything in `deviceVerified` (certificate, account state,
+   kid, every grant) before writing anything. If any check fails, nothing
+   is saved: no pin, no device keys, no key, no mode.
+10. On a device's **first** verification with an Astation, atem drops what
+    the old unauthenticated path stored for it: that Astation's mode entry
+    and the account's `K`, rotation history and project names. Only what
+    arrives signed is kept.
+11. If the signed state needs `K` and none arrived (or none is stored),
+    atem sends `keyRequest` right after verification. It does the same
+    when an `encryptionMode` repeats the stored state while `K` is still
+    missing.
+
+**Re-verification.** Verifying again with an Astation this device already
+trusts never moves it backwards: a certificate older than the account
+state already applied is rejected, the epoch floor only rises
+(`max(old floor, old state epoch, certificate epoch)`), and the stored
+signed state is kept until a newer one arrives.
 
 ```mermaid
 sequenceDiagram
@@ -269,29 +317,35 @@ trust-on-first-use flow get nothing new until they verify, and their writes
 are dropped by verified devices because they have no certified signing key.
 `K` is rotated once verification ships (see "Migration").
 
-Today's fingerprint (`websocket_client.rs:647`) is `SHA-256(device_pub)`
-cut to 8 bytes, covers only the device key, and is computed without
-commitments. The safety code replaces it.
+The #36 fingerprint (`SHA-256(device_pub)` cut to 8 bytes, covering only
+the device key, computed without commitments) has been replaced by the
+safety code.
 
 ### Sealing a key to a device
 
 Every key travels as **HPKE (RFC 9180)**, base mode, DHKEM(X25519,
-HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, which binds the ephemeral and
-recipient public keys into the key schedule. The HPKE `info` is the
-encoded `atem-grant-v1` statement, and that statement is signed by Astation
-over `SHA-256(sealed key)`. atem opens a grant only if the signature
-verifies, `device_id`/`device_pub` are its own, and `sign_gen` is pinned.
-The relay can carry grants but can't make one.
+HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, which binds the ephemeral
+and recipient public keys into the key schedule. The HPKE `info` is
+`enc("atem-grant-info-v1", account, type, device_id, device_pub, kid,
+scope_hmac)`, and Astation signs the `atem-grant-v1` statement, which adds
+`SHA-256(enc(encapped_key, ciphertext))`. (The info can't contain a hash
+of the seal's own output.) atem opens a grant only if the signature
+verifies, `device_id` and `device_pub` are its own and equal its pinned
+device key, `sign_gen` is pinned, and a `K` grant names no scope. The
+relay can carry grants but can't make one.
 
-The current wrap (`crypto.rs:226`: no salt, no device id, no signature) is
-replaced, and `keyGrant` gains the signed statement.
+The #36 wrap (no salt, no device id, no signature) has been replaced by
+this, and `keyGrant` carries the signed statement; `keyGrant` messages
+without one are ignored.
 
 ### Keys on disk (atem)
 
-`device_key` today is the raw 32-byte X25519 private key, protected only by
-mode 0600, so a copied disk can use it. It is replaced by:
+Build step 1 kept the device keys in a plain `device_keys` file, protected
+only by mode 0600, so a copied disk could use them. Build step 2a replaces
+it with:
 
-- `device_key.sealed`: the device key and device signing key, encrypted
+- `device_keys.sealed`: the device key, the device signing key and (step 2b)
+  the account keys, encrypted
   with the **storage key**, whose only job is to protect that file.
 - `unlock_auth_key`: an Ed25519 key, unsealed (0600). It can only *ask* for
   an unlock; Astation still decides. A disk copy has it (accepted); the
@@ -302,7 +356,7 @@ Properties:
 - The device keys never leave the box. Astation holds only a key that opens
   one file on one machine.
 - **The storage key rotates at every unlock.** After unlocking, the agent
-  generates a new storage key, re-seals `device_key.sealed` (write to a
+  generates a new storage key, re-seals `device_keys.sealed` (write to a
   temp file, fsync, rename), and sends the new storage key sealed to
   Astation's encryption key, signed by the device signing key. Astation
   keeps the old storage key until it gets the confirmation, then deletes it.
@@ -312,28 +366,295 @@ Properties:
   scope keys) live only in a small **key agent**, like ssh-agent: a Unix
   socket at `$XDG_RUNTIME_DIR/atem/agent.sock` (falling back to
   `~/.config/atem/agent.sock`, never `/tmp`), 0600 with the caller's UID
-  checked, `mlock`ed memory, `zeroize`, no core dumps
-  (`PR_SET_DUMPABLE=0`). The agent never hands out raw keys: callers ask it
-  to decrypt, sign or compute an HMAC, and get only the result. It stays
-  unlocked until reboot or `atem cred lock`, and survives atem upgrades so
-  prompts come only after real reboots.
+  checked, `mlock`ed memory where the limit allows (see below), `zeroize`,
+  no core dumps (`PR_SET_DUMPABLE=0`). The agent never hands out raw keys:
+  callers ask it to decrypt, sign or compute an HMAC, and get only the
+  result. It stays unlocked until it exits (a reboot, or the end of the
+  user's login if the system kills user processes then) or `atem cred
+  lock`, and survives atem upgrades so prompts come only after real
+  reboots.
 
 The OS keychain isn't used: Secret Service needs a desktop session and the
 macOS login keychain is locked in SSH sessions, and most atems run over SSH.
+
+**How build step 2a builds it.**
+
+- `device_keys.sealed` is JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`:
+  XChaCha20-Poly1305 under the storage key, associated data
+  `enc("atem-device-keys-v1", device_id, storage_kid)`. `storage_kid` is 8
+  lowercase hex characters, new at every rotation. After opening a file
+  the agent requires its header `device_id` to be the pinned one and its
+  `storage_kid` to be the one Astation released.
+- The agent is the same binary, `atem key-agent` (hidden), started on demand
+  by the first command that needs keys and detached with `setsid`; it logs
+  to `~/.config/atem/key-agent.log`. It speaks newline-delimited JSON; every
+  request carries `"v": 2` (v1 until step 2b) and any other version gets an error (an old agent
+  left running after an upgrade says so; stop it and the next command starts
+  the new one). It refuses peers whose UID isn't its own, sets
+  `PR_SET_DUMPABLE=0`, and locks its memory with `mlockall` only when
+  `RLIMIT_MEMLOCK` is unlimited or at least 512 MiB (Linux): with
+  `MCL_FUTURE` every allocation past the limit would fail, and the usual
+  default (8 MiB, or 64 KiB on older systems) is far too small, so on most
+  machines it logs that it skipped the lock and keys could reach swap (use
+  encrypted swap, or raise the limit for the user). It never talks to the network: the
+  CLI carries its messages to Astation, and the storage key never passes
+  through the CLI in plain form. A key-file error never stops it from
+  starting: it starts locked and logs the error.
+- **Private writes.** Every key file and `cred_state.json` is written to a
+  temp file with a name of its own (`.<name>.<pid>.<counter>.<random>.tmp`,
+  0600, `O_NOFOLLOW`), fsynced and renamed. A writer that crashes leaves
+  its temp behind, possibly holding key bytes, so each write first deletes
+  this user's temps of the same file whose writer process is gone (or that
+  are over an hour old), and the agent sweeps all its files' temps when it
+  starts.
+- **Agent lifetime.** The agent is detached with `setsid` but still runs
+  in the user's login session. Where systemd-logind has
+  `KillUserProcesses=yes` (some distributions' default), it is killed when
+  that session ends. Where it isn't, the agent can outlive the user's last
+  session, but logind still removes `$XDG_RUNTIME_DIR` (and the agent's
+  socket with it) then: nobody could reach the agent any more. So every
+  5 seconds the agent checks that its socket file is still the one it
+  bound (same inode) and that `agent.socket` still names it; if not, it
+  wipes its keys and exits, freeing the key directory's lock. Either way
+  the next command starts a locked agent and `atem cred unlock` asks
+  Astation again. `loginctl enable-linger <user>` keeps the runtime dir,
+  and so the agent, across logouts. Nothing is lost when the agent stops:
+  the keys stay sealed on disk (or in the plain file before the first
+  escrow).
+- **One agent per key directory.** The agent takes an exclusive `flock` on
+  `~/.config/atem/key_agent.lock` for its whole life and exits if another
+  agent holds it, so two login sessions with different `$XDG_RUNTIME_DIR`s
+  never run two agents over one set of key files (each would rotate the
+  storage key and strand the other's sealed files). It records its socket
+  path in `~/.config/atem/agent.socket` (0600, written atomically) and its
+  pid in the lock file; clients try that path first, then their own
+  session's, and still refuse a listener that isn't their user. A starting
+  agent that finds the lock held waits up to 8 seconds for the holder to
+  answer on its recorded socket (then it exits: one is running) or to go
+  away (an orphaned agent exits by itself, see above). If neither happens,
+  the starting agent and the client that started it print an error naming
+  the holder's pid and the `kill <pid>` that stops it, but only when the
+  lock is really held and (Linux) that pid's command line is `atem
+  key-agent` (the pid stays in the file after a crash and across reboots,
+  so it could name an unrelated process); otherwise the error gives the
+  `pgrep`/`pkill` lines. A clean agent exit clears the pid. The agent
+  counts as orphaned only when its socket or `agent.socket` is gone
+  (NotFound), the socket is another file, or `agent.socket` names another
+  path; other errors (out of file descriptors, permissions) prove nothing.
+  A relative `$XDG_RUNTIME_DIR` is ignored (treated as unset).
+- **Home Astation.** One storage key per device, held by the device's first
+  verified Astation and recorded as `home_astation` in `cred_state.json`;
+  the home never moves. Unlock and rotation go only through the home
+  Astation; grants from any verified Astation are opened by the unlocked
+  agent.
+- **First sealing.** On the home Astation's first verification, `atem pair`
+  seals the fresh keys under a new storage key, also writes them to a plain
+  `device_keys` file (0600, atomically), hands the unlocked keys to the
+  agent, and in the same run sends the storage key to Astation
+  (`storageKeyRotate` with an empty old `storage_kid`) and confirms it.
+  Plain keys exist until the first escrow: a fresh device follows the same
+  rule as a build-step-1 device. A plain `device_keys` file is sealed under
+  a fresh storage key each time the agent starts while that file exists
+  (never reusing the kid of the sealed file it overwrites); the key goes to
+  Astation at the next `atem pair` or `atem cred unlock`, and the plain file
+  is deleted only once Astation is known to hold the key (a confirmed
+  escrow, or an unlock that opened the current sealed file). So an agent
+  that stops before the escrow (a reboot, a crash, `atem cred lock`, which
+  is always allowed) loses nothing, and atem needs no Astation with step
+  2a: against an older Astation the escrow just doesn't complete and the
+  device keeps its plain keys, as in step 1.
+- **`escrowed_storage_kid`** in `cred_state.json` is the last storage kid
+  Astation is known to hold (set at every confirmed escrow or rotation and
+  by an unlock that opened the current file). `atem cred status` uses it to
+  flag a sealed file Astation may not hold, and new storage kids never
+  reuse it, the current kid, or any kid the device ever abandoned
+  (`abandoned_kids`). `escrow_unanswered` records that the home Astation
+  never answered the first escrow (cleared by the first confirmed one), so
+  `atem cred status` can say the key goes over once Astation supports it.
+- **Rotation at every unlock, crash-safe in three phases.** (1) The agent
+  writes `device_keys.sealed.next` under a new storage key and atem sends
+  `storageKeyRotate`. (2) Astation stores the new key as pending, keeps the
+  current one, and replies `storageKeyAck`. (3) The agent checks the ack,
+  renames `device_keys.sealed` to `device_keys.sealed.prev` and `.next` over
+  `device_keys.sealed`, and atem sends `storageKeyConfirm`; Astation makes
+  the pending key current and deletes the old one. Only one rotation is
+  pending at a time. Until it is confirmed Astation releases whichever key a
+  request names. An unlock request names the current file's kid, or the
+  `.next` or `.prev` file's only when the current file is missing (an
+  unreadable current file fails closed); the grant must release exactly
+  the `storage_kid` the request names, and the agent opens the file that
+  carries it. A released `.next` is promoted then, and a lone `.prev` (no
+  current file) becomes the current file again. `.prev` is deleted after an
+  unlock that releases the current file's kid, which proves Astation holds
+  it; if a current file appears while an unlock that named `.prev` is in
+  flight, it is kept and no rotation starts until an unlock opens it. A lost
+  confirmation is settled at the next unlock or rotation, which names the
+  new kid. A failed rotation after an unlock is a warning: the keys stay
+  unlocked and the key rotates at the next unlock.
+- **Abandon.** If Astation holds a pending key the device has no file for
+  (a crash after the ack, before the rename), the device signs
+  `atem-storage-abandon-v1` for that kid and rotates again. The agent signs
+  one only when no sealed file (current, `.next`, `.prev`) and no rotation
+  in progress carries that kid (a stale `.next` is deleted first), and
+  records the kid so it is never used again.
+- Until build step 2b, the agent opened `K` grants and handed `K` back to
+  the caller for `data_keys.enc`; grants that arrive while it is locked are
+  ignored and requested again after `atem cred unlock`.
+
+**How build step 2b builds it.**
+
+- **`K` in the sealed payload.** The encrypted payload of
+  `device_keys.sealed` gains `account_keys`: per account, the current `kid`
+  and key and the keys it replaced (`previous`). The field is omitted when
+  empty, so a file without keys reads as "no keys". A file that carries
+  `account_keys` is written with payload `version: 2` (a file without them
+  stays payload `version: 1`; the file envelope is always `version: 1`), and
+  the reader is strict: v2 requires non-empty `account_keys`, v1 must not
+  contain them, any other version is rejected.
+  A step-2a binary therefore refuses a v2 file instead of silently dropping
+  the keys. Every path that re-seals the file (rotation phase 1, a `.next`
+  promotion, the first escrow, a migration, a lone-`.prev` promotion) carries
+  the account keys.
+- **Installing `K`.** `InstallGrant` (protocol v2) opens a signed grant with
+  the unchanged checks, requires its kid to be the kid of the latest signed
+  account state, and re-seals the file the agent holds the storage key for
+  (and a pending rotation's `.next`) under the same storage key: temp file,
+  fsync, rename. `K` is used only once it is on disk. With a pending rotation
+  the `.next` is written first and the current file second; if the second
+  write fails the install errors and memory holds no `K`. After the
+  re-seal the agent reconciles retired keys; if a newer signed state
+  already retired this key ("a newer signed state retired this key"), the
+  install fails instead of reporting a key that was dropped at once. The old
+  and the new file open with the same storage key, so no crash leaves a key
+  only in a file nothing can open; at worst a newly installed `K` is
+  missing, and atem asks for it again (`keyRequest`), since a `K` always
+  arrives as a signed grant. A re-seal refuses a file whose storage kid isn't
+  the one the agent holds. Kids are validated before install.
+- **The agent never hands out `K`.** No reply carries it: `OpenGrant` and its
+  reply are gone, replaced by `InstallGrant` (installs, returns the kid) and
+  `CheckGrant` (verification staging, returns the kid, stores nothing).
+  Callers send `Crypt { astation_id, ops }` with `seal` / `open` /
+  `keyed_hash` ops and get the results in order, in exactly the `e1.`/`h1.`
+  formats and associated data of steps 0-2a. `Crypt` names the Astation, not
+  the account: the agent derives the account and the signed state from that
+  one `cred_state.json` entry, so a caller can't pair one Astation's state
+  with another account's key. Plain text on the socket is parsed straight
+  into wiped buffers. Requests may be pipelined (two requests in one write
+  get two replies). `MAX_LINE` is 8 MiB. `EncryptionContext` batches a call
+  site (a pull page, a push chunk, a migration chunk) into as few requests as
+  a 2 MiB / 1024-op budget allows, always from a blocking thread
+  (`key_agent::blocking`); one field whose wire size is over 6 MiB fails with
+  "a field is too large to encrypt (N bytes)" (N is the field's own size),
+  below the line limit. The sealed payload and the plaintext of
+  `data_keys.enc` are serialized into one exactly sized, wiped buffer, so
+  no unwiped reallocation copy of `K` or the device keys is left behind. A client that
+  gets a hang-up from a running v1 agent (for example while writing a large
+  first request) reports the stop-and-retry hint, and `atem cred status`
+  against a v1 agent prints the version-mismatch line and the same hint
+  instead of failing.
+- **Mode and kid** come only from the latest signed account state in
+  `cred_state.json`; there is no stored mode and no "local state doesn't
+  match" check. When several verified Astations name one account the newest
+  signed state wins; on an equal epoch the lexicographically smallest
+  Astation id wins. One helper (`effective_state`) applies that rule for
+  the agent's grant install (the grant's kid must be the newest state's
+  kid, whichever Astation carried it) and `Crypt`, and for the CLI's
+  `account_mode` and `key_needed`, so every caller agrees and a stale
+  Astation can't demote a newer `K`. Unverified devices are `off`; an
+  `off` (or unverified) context never contacts the agent. A locked agent, or
+  one without `K`, makes sync keep its changes queued and say
+  `atem cred unlock` or that the account requires encryption. `keyRequest`
+  logic (`key_needed`) uses the same rule as the agent (the expected kid is
+  the one in the newest signed state across all verified Astations naming
+  the account, and a locked agent counts as "K missing"), so a stale
+  Astation never loops key requests.
+- **Retired keys.** An `off` state drops the account's keys; `on` with the
+  current kid drops the previous keys. The agent applies this at its next
+  request for that account (a failed prune re-seal is logged once and does
+  not fail the request), when a running agent is told of a new `off` state,
+  and at every unlock.
+- **Project names** (`h1.` hash -> project key) live in `project_names.json`
+  (0600, no secrets); the hash itself is computed by the agent. Writes hold
+  an `flock` on `project_names.lock`; lock order is `cred_state` / trust lock
+  first, then `project_names.lock`, never the reverse. A corrupt file is
+  renamed aside and reset (it holds no secrets); a version mismatch is an
+  error.
+- **Migration from `data_keys.enc`.** At every unlock (and at the start of an
+  agent that starts unlocked from a plain `device_keys`, and at the first
+  confirmed escrow) the agent merges `data_keys.enc` (verified accounts only)
+  into the sealed payload and `project_names.json`, then deletes it once the
+  home Astation is known to hold the storage key of that sealed file (and
+  the agent didn't unlock via `.prev`), and only when every entry of every
+  verified account parsed: a malformed entry keeps the file (logged at each
+  unlock), while the account's valid keys still move (with a malformed or
+  missing current entry, its valid previous keys too). A crash at any point
+  leaves `data_keys.enc`, and the next unlock repeats the merge. An
+  unreadable `data_keys.enc` is never deleted (its key may be recoverable):
+  it is renamed aside to `data_keys.enc.corrupt-<stamp>`. An unverified
+  device's is deleted when the agent starts, since it only holds what the
+  unauthenticated #36 path stored; an unreadable one is moved aside there
+  too. A device's first verification with an Astation purges what the #36
+  path stored for that Astation, except accounts another verified Astation
+  also names (this covers `data_keys.enc` and the forgetting of project
+  names). That purge runs in the `atem pair` process: it decrypts
+  `data_keys.enc` and writes it back, so on a device upgraded from step 2a
+  the legacy `K` and its previous keys pass through the CLI's memory a
+  second time (besides the fresh-key verification below). Accepted: it
+  only happens while that legacy file still exists, the CLI runs as the
+  same user, and the buffers are wiped.
+- **Fresh-key verification.** A freshly verified device has no agent-held
+  storage key yet, so `atem pair` opens the `K` grant inside its own process
+  (it holds the fresh device key anyway) with the usual checks, drops `K`
+  at once, saves the pins, and only then has the agent
+  install the grant. An install failure after a saved verification is a
+  warning, not an error.
+- **Accepted costs.**
+  - Before the first escrow a restarted agent re-seals the plain
+    `device_keys` under a new storage key and can't open the earlier sealed
+    file, so a `K` installed after step 2b, and any previous keys, are lost
+    and asked for again (`keyRequest`); older rotation history may not be
+    re-grantable. Pre-2b history comes back from `data_keys.enc` while that
+    file still exists.
+  - An unlock that opened the sealed file via `.prev` keeps `data_keys.enc`
+    until a later unlock proves the home Astation holds the current key.
+  - A `K` installed while the agent held keys opened from `.prev`, or one
+    that reached only a `.next` later discarded, is lost when that file is
+    replaced or deleted before the `K` reaches the current file. Only the current kid is
+    asked for again (`keyRequest`); previous keys held only there may not
+    be re-grantable.
+  - A step-2a binary refuses a v2 `device_keys.sealed` (see above). To
+    downgrade after a `K` was installed, follow the reset steps that
+    `atem cred status` prints, or wait for a fresh grant.
+  - A key agent left running across the upgrade speaks protocol v1; the
+    new atem tells you to stop it. After the upgrade a verified device needs
+    `atem cred unlock` once (protocol v2 agent starts locked) before sync
+    can use `K` again.
 
 ### Unlock policy
 
 The unlock request is signed by the unlock-auth key and bound to its reply:
 
-1. The agent sends `unlockRequest { device_id, boot_id, ticket, E_pub, nonce, time }`,
-   signed by the unlock-auth key. `E_pub` is a fresh X25519 key for this
-   request.
-2. Astation checks the signature against the pinned unlock-auth key, then
-   applies the policy below.
-3. If it releases, it seals the current storage key with HPKE to `E_pub`,
-   with `info = SHA-256(signed request)`, and signs the reply. A relay that
-   swaps `E_pub` breaks the signature; a replayed reply doesn't match a new
-   request.
+1. The agent creates a single-use X25519 key `E` and a nonce. atem sends
+   `unlockRequest` with the statement `atem-unlock-request-v1` (account,
+   device_id, boot_id, ticket, E_pub, nonce, time, storage_kid), signed by
+   the unlock-auth key. `storage_kid` names the key that opens the sealed
+   file on disk; `ticket` is empty until auto-unlock (build step 7);
+   `time` is Unix seconds. `boot_id` is Linux's
+   `/proc/sys/kernel/random/boot_id`; on macOS it is empty for now (a later
+   step can send `sysctl kern.bootsessionuuid`), so Astation can't tell a
+   Mac's reboots apart by it.
+2. Astation checks the signature against the pinned unlock-auth key and
+   `time` against its clock, then applies the policy below.
+3. If it releases, it seals the storage key named by `storage_kid` (current
+   or pending) with HPKE to `E_pub`, `info = enc("atem-unlock-info-v1",
+   account, device_id, storage_kid, SHA-256(request statement bytes))`,
+   empty AAD, and signs `atem-unlock-grant-v1` (account, sign_gen,
+   device_id, storage_kid, SHA-256(request statement bytes),
+   SHA-256(enc(encapped_key, ciphertext))). The agent opens it only if the
+   request carries its own `E_pub`, nonce and storage_kid, the hashes match
+   and the signature is the pinned home Astation's; `E` is used once. A
+   relay that swaps `E_pub` breaks the unlock-auth signature; a replayed
+   reply doesn't match a new request.
 
 Policy:
 
@@ -767,8 +1088,9 @@ A plain credential value is never written to disk anywhere.
 
 **Astation (Mac):**
 - Signing key: Secure Enclave, can't be extracted.
-- Encryption key, `K`, scope keys, index key, storage keys, recovery seal
-  key: Keychain items, `WhenUnlockedThisDeviceOnly` (never synced to
+- Encryption key, `K`, scope keys, index key, storage keys (per device,
+  keyed by `(device_id, device_pub)`: one current, at most one pending, and
+  every storage kid ever acked), recovery seal key: Keychain items, `WhenUnlockedThisDeviceOnly` (never synced to
   iCloud), each sealed by a Secure Enclave key so a copied Keychain is
   useless on another Mac.
 - Pinned device keys (device, device signing, unlock-auth), revocation list,
@@ -776,19 +1098,39 @@ A plain credential value is never written to disk anywhere.
 - Credential values: only in memory while writing or rotating.
 
 **atem (`~/.config/atem/`, all 0600):**
-- `device_key.sealed`: the device key and device signing key, encrypted
-  with the current storage key.
+- `device_keys.sealed`: the device key, the device signing key and the
+  account keys (`K` and its previous keys, step 2b), encrypted with the
+  current storage key.
+- `device_keys`: the same keys in plain, only until the home Astation is
+  known to hold the first storage key (a build-step-1 device, or a fresh
+  device between `atem pair` and its confirmed escrow, normally the same
+  run).
+- `device_keys.sealed.next`: exists only between rotation phases 1 and 3;
+  `device_keys.sealed.prev`: the file a rotation replaced, kept until an
+  unlock proves Astation holds the current key.
 - `unlock_auth_key`: unsealed Ed25519 key that can only ask for an unlock.
-- `data_keys.enc`: `K` and its previous keys, sealed to the device key.
-  (Today it's encrypted with the machine-bound key derived from
-  `/etc/machine-id`, which a copied disk includes.)
+- `project_names.json`: the readable project key of each `h1.` project
+  hash, per account. No secrets.
+- `data_keys.enc`: gone in step 2b. Steps 0-2a kept `K`, its previous keys
+  and the project names there under the machine-bound key (derived from
+  `/etc/machine-id`, which a copied disk includes); the key agent moves it
+  into `device_keys.sealed` and `project_names.json` at the first unlock and
+  deletes it.
 - Grants cache: signed grant rows, keys still sealed to the device key.
 - `cred_state`: pinned Astation keys and generation (and a pending
   replacement, if any), the account epoch floor, highest manifest counter
   per scope, highest `blob_version` seen, the current unlock ticket, the
-  latest signed account state, scope directory and revocation list.
-- Key agent memory: the unsealed device keys, `K` subkeys, index subkeys and
-  scope keys.
+  latest signed account state, scope directory and revocation list, the
+  home Astation that holds the storage key, the last storage kid it is
+  known to hold, and every storage kid the device abandoned. Every
+  read-modify-write of it holds an `flock` on `cred_state.lock`, so the key
+  agent and other atem commands never drop each other's changes.
+- `key-agent.log`; the agent socket `agent.sock` and its `agent.lock` (in
+  `$XDG_RUNTIME_DIR/atem/` when set, else here); `key_agent.lock`, which
+  the one agent serving these key files holds (`flock`) for its life, and
+  `agent.socket`, the socket path it records for clients.
+- Key agent memory: the unsealed device keys, `K` and its previous keys,
+  index subkeys and scope keys.
 - Credential values: never cached. `knowledge.db` holds plain memory and
   keeps refusing credentials.
 
@@ -819,14 +1161,18 @@ project `…/a/bc` + name `d`).
 | Memory write signature | Ed25519, device signing key | `atem-mem-write-v1` |
 | Credential value | `c1.<scope_kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 | `enc("atem-cred-v1", account, scope_hmac, kid, name_hmac, version)` |
 | Credential display name | same, under the scope key | `enc("atem-cred-name-v1", account, scope_hmac, name_hmac)` |
-| Key grants (`K`, index, scope) and storage key to Astation | HPKE RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 | `info` = encoded `atem-grant-v1` statement (or the storage-key rotation statement) |
-| Unlock reply | same HPKE to the request's `E_pub` | `info` = SHA-256(signed unlock request) |
+| Key grants (`K`, index, scope) | HPKE RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD | `info = enc("atem-grant-info-v1", account, type, device_id, device_pub, kid, scope_hmac)`; the signed `atem-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
+| Unlock reply (storage key) | same HPKE to the request's `e_pub`, empty AAD | `info = enc("atem-unlock-info-v1", account, device_id, storage_kid, SHA-256(request statement bytes))`; the signed `atem-unlock-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
+| Storage key to Astation (rotation) | same HPKE to the pinned `astation_enc_pub`, empty AAD | `info = enc("atem-storage-key-info-v1", account, device_id, new_storage_kid)`; the signed `atem-storage-rotate-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
+| `device_keys.sealed` | JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`; XChaCha20-Poly1305 under the 32-byte storage key; plaintext is the device key, the device signing key and (step 2b) `account_keys`, per account the current kid and key and the previous keys; the payload `version` is 2 when `account_keys` is present, else 1 (the unlock-auth key lives in its own 0600 file `unlock_auth_key`) | AAD `enc("atem-device-keys-v1", device_id, storage_kid)` |
 | Credential names | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
 | Credential scopes | `HMAC-SHA256(I_scope, project_key)` | — |
 | Memory projects | `HMAC-SHA256(K_project, project_key)` | — |
 | Astation signatures | P-256 ECDSA (Secure Enclave), SHA-256, carried as fixed 64-byte `r ‖ s`; Astation converts from the Enclave's DER and normalizes to low-S; atem rejects high-S | the statement's encoding |
-| Device and recovery signatures | Ed25519 | the statement's encoding |
-| Safety code | `base32(SHA-256(enc("atem-safety-code-v1", device_pub, device_sign_pub, unlock_auth_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, nonce_a, nonce_s)))[:12]` after commit-then-reveal | — |
+| Device, unlock-auth and recovery signatures | Ed25519, 64 bytes | the statement's encoding |
+| Safety code | `base32(SHA-256(enc("atem-safety-code-v1", device_pub, device_sign_pub, unlock_auth_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, nonce_a, nonce_s)))[:12]` after commit-then-reveal; `astation_sign_pub` is the 65-byte uncompressed point | — |
+| Commitment | `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a))` | — |
+| Verification transcript | `SHA-256(enc("atem-verify-transcript-v1", commitment, nonce_a, nonce_s))`, carried in `atem-device-verified-v1` | — |
 
 New atem crates: `p256` (verify), `ed25519-dalek`, `hpke`, `zeroize`.
 `chacha20poly1305`, `x25519-dalek`, `hkdf` and `hmac` already ship with
@@ -840,8 +1186,9 @@ New atem crates: `p256` (verify), `ed25519-dalek`, `hpke`, `zeroize`.
 - **`K` from the earlier flow** may have come from a relay that swapped the
   device key, so once verification ships Astation rotates `K` for every
   account that has it, granting the new `K` only to verified devices.
-- **`data_keys.enc`** moves from the machine-bound key to being sealed to the
-  new device key.
+- **`data_keys.enc`** (built, step 2b): the key agent moves `K`, its previous
+  keys and the project names into `device_keys.sealed` and
+  `project_names.json` at the first unlock, then deletes the file.
 - **Recovery kit.** Turning on memory encryption or credentials creates `R`
   and asks you to save the new kit. The separate recovery key from the
   earlier version of this design is not built; `R` replaces it.
@@ -872,11 +1219,370 @@ Findings 1, 4 and 5 affect code already shipped in #36. No account is
 encrypted in practice yet, because Astation's key manager isn't built, but
 they must be fixed before it ships (build step 0).
 
+## Wire messages (build steps 0–1)
+
+All are `{"type": …, "data": {…}}` on the existing Astation WebSocket;
+binary values are base64. `SignedWire` is `{statement, signature}`;
+`GrantWire` is `{signed, encapped_key, ciphertext}`.
+
+| Type | Direction | Data |
+|---|---|---|
+| `verifyCommit` | atem → Astation | `device_id`, `commitment` |
+| `verifyKeys` | Astation → atem | `sign_pub` (65-byte uncompressed SEC1 point, CryptoKit `x963Representation`), `enc_pub`, `recovery_sign_pub`, `nonce` |
+| `verifyReveal` | atem → Astation | `device_pub`, `device_sign_pub`, `unlock_auth_pub`, `nonce` |
+| `deviceVerified` | Astation → atem | `device_verified: SignedWire`, `account_state: SignedWire`, `grants: [GrantWire]` |
+| `verifyAbort` | either | `reason` |
+| `encryptionMode` | Astation → atem | `account_state: SignedWire` (messages without it are ignored) |
+| `keyRequest` | atem → Astation | `public_key` (the verified device key); sent after verification, or on a repeated `encryptionMode`, when the signed state needs `K` and atem doesn't hold it |
+| `keyGrant` | Astation → atem | `grant: GrantWire` (messages without it are ignored) |
+| `encryptionMigrationComplete` | atem → Astation | unchanged |
+
+Until Astation supports verification, atems stay unverified: they keep
+plain-text sync and ignore `encryptionMode` and `keyGrant` (decided
+2026-10-09, option A). Details:
+
+- An unverified atem ignores any encryption mode or key stored before this
+  change and syncs plain text.
+- A verified atem refuses to build an encryption context if its local
+  mode/kid doesn't match Astation's latest signed account state.
+- A device keeps one set of device keys across Astations: verification
+  reuses the device's existing keys if present (from the unlocked key
+  agent since step 2a) and generates only when absent.
+
+### Astation work for steps 0–1
+
+atem can't complete verification against a real Astation until these land.
+
+**Astation (macOS):**
+1. Keys, created on first need and kept in the Keychain (`WhenUnlockedThisDeviceOnly`):
+   - signing key: Secure Enclave P-256 (`SecureEnclave.P256.Signing.PrivateKey`), `sign_gen = 1`;
+   - encryption key: X25519 (`Curve25519.KeyAgreement.PrivateKey`), sealed by a Secure Enclave key;
+   - recovery secret `R` (32 random bytes) and the recovery signing key, Ed25519 from `HKDF-SHA256(R, info: "atem-recovery-sign-v1")`; the kit gains the `Recovery key:` line and must be saved before the first device is verified;
+   - an account `epoch` counter (u64) that increases on every signed account-state, certificate or grant.
+   - the signing key's public half goes on the wire (`verifyKeys.sign_pub`) and into the safety-code hash as `publicKey.x963Representation` (65 bytes, `0x04 ‖ x ‖ y`), never `rawRepresentation` (64 bytes). atem rejects anything else.
+2. Encoding: `enc` exactly as in "Formats" (4-byte big-endian length per field, label first). Statements as in "Signed statements".
+3. Signatures: `signature.rawRepresentation` (64-byte `r ‖ s`). CryptoKit may return high-S; normalize to low-S (`s = n − s` when `s > n/2`) before sending. atem rejects high-S.
+4. Verification:
+   - on `verifyCommit`, store `{device_id, commitment}` and reply `verifyKeys` with a fresh 32-byte nonce;
+   - on `verifyReveal`, check `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a)) == commitment`, else send `verifyAbort`;
+   - compute the safety code (see "Formats") and show it with the device name; Approve needs Touch ID; Deny sends `verifyAbort`;
+   - compute `transcript = SHA-256(enc("atem-verify-transcript-v1", commitment, nonce_a, nonce_s))` for this attempt;
+   - on approve, pin the three device keys, then send `deviceVerified` with a signed `atem-device-verified-v1` (including `transcript`, at epoch `E`), the current account state re-signed as `atem-account-state-v1` at epoch `E+1` (mode `off` if encryption was never turned on; its epoch must be `>=` the certificate's), and a signed `K` grant if `K` exists;
+   - on an incoming `verifyAbort`, discard the attempt.
+5. Grants: HPKE on the atem side is RFC 9180 base mode with X25519 / HKDF-SHA256 / ChaCha20-Poly1305, which is CryptoKit `.Curve25519_SHA256_ChachaPoly`: `HPKE.Sender(recipientKey:ciphersuite: .Curve25519_SHA256_ChachaPoly, info:)` (macOS 14+), with `info = enc("atem-grant-info-v1", account, "K", device_id, device_pub, kid, "")`, empty AAD; send `encapped_key` and `ciphertext`; sign `atem-grant-v1` including `SHA-256(enc(encapped_key, ciphertext))`.
+6. `encryptionMode` always carries a signed account state; `keyRequest` is answered only when `public_key` equals the pinned device key. atem sends `keyRequest` right after `deviceVerified` when the state needs `K` and no grant came with it.
+7. Check the Swift implementation against "Test vectors" below.
+
+**Relay:** forward the five new message types (`verifyCommit`, `verifyKeys`, `verifyReveal`, `deviceVerified`, `verifyAbort`) between an atem and its Astation exactly like existing message types. If the relay filters by type, add them to the list. Nothing new is stored in steps 0–1.
+
+### Test vectors
+
+`src/memory/kat_tests.rs` checks these on every `cargo test`; Astation's
+Swift must reproduce them byte for byte. All values are hex unless quoted.
+
+Inputs:
+
+| Input | Value |
+|---|---|
+| device key (X25519 secret) | 32 × `11` |
+| device signing key (Ed25519 seed) | 32 × `22` |
+| unlock-auth key (Ed25519 seed) | 32 × `33` |
+| `nonce_a` | 32 × `44` |
+| Astation signing key (P-256 scalar) | 32 × `55` |
+| Astation encryption key (X25519 secret) | 32 × `66` |
+| recovery signing key (Ed25519 seed) | 32 × `77` |
+| `nonce_s` | 32 × `88` |
+| account, device_id, kid | `"acct-1"`, `"dev-1"`, `"0123abcd"` |
+| account state | sign_gen 1, mode `"on"`, kid `"0123abcd"`, epoch 2 |
+| device certificate | sign_gen 1, epoch 1, transcript below |
+| `K` | 32 × `99` |
+
+Derived public keys:
+
+| Key | Value |
+|---|---|
+| `device_pub` | `7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13` |
+| `device_sign_pub` | `a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0` |
+| `unlock_auth_pub` | `17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce` |
+| `sign_pub` (x963, 65 bytes) | `0457e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34c5ab3770ba573bdff5414065640ffb5b346dfa84dec4db4d68e5f59cc471c2ec` |
+| `enc_pub` | `219e4d800da968d2a5fcb009c784f4746c7138edb9ee4844b739e830b05cf424` |
+| `recovery_sign_pub` | `c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7` |
+
+Outputs:
+
+| Value | Result |
+|---|---|
+| `enc("atem", "", 01 02)` | `000000046174656d00000000000000020102` |
+| commitment | `24763549320fde4498bc72c2cf8b6bb6deb3df3911e611a762d912d0c5a8be05` |
+| safety code | `MN3H-A74N-FJE4` |
+| transcript | `101b660209618c9130060c9cb737e9647b8ec0ab826684009427bd9cbabcec5f` |
+| `atem-account-state-v1` | `000000156174656d2d6163636f756e742d73746174652d763100000006616363742d31000000080000000000000001000000026f6e000000083031323361626364000000080000000000000002` |
+| `atem-device-verified-v1` | `000000176174656d2d6465766963652d76657269666965642d763100000006616363742d31000000080000000000000001000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00000002017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce00000020101b660209618c9130060c9cb737e9647b8ec0ab826684009427bd9cbabcec5f000000080000000000000001` |
+| grant `info` | `000000126174656d2d6772616e742d696e666f2d763100000006616363742d31000000014b000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000008303132336162636400000000` |
+| `encapped_key` | `b5aad53eeb4319e1d910ec0440f849d19e0a3aa9fe3bcb91342bd80e48835755` |
+| `ciphertext` | `c3f37d28128d3516989f0a41d3c087f40ef8b17cbaa114ab928e4f5ae764136eba6d809254b08bd347694a94c6510500` |
+| `sealed_hash` | `5373b5bb2fa7696625db127b4a17bcd30e87ce858fee861f85ddcf7c41dcfc7c` |
+| `atem-grant-v1` | `0000000d6174656d2d6772616e742d763100000006616363742d31000000080000000000000001000000014b000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000008303132336162636400000000000000205373b5bb2fa7696625db127b4a17bcd30e87ce858fee861f85ddcf7c41dcfc7c` |
+| certificate signature (`r ‖ s`) | `fff634a2bd4621e42ec788123d0222e3bbda96705baf2ac0d210fcd76e0b05d930d0781c1d133ae5b99a0aeaad5546c4e5c53502a1557c2cc295594be900bf9f` |
+| grant signature (`r ‖ s`) | `01848754ec7cdc93c706a49cd176b683575115a9f838c3f23a092710703b90ae02f746331708f148a01b2e774472bf48851f8ad1f5ee33e430cd5925e48fc0e6` |
+
+The HPKE seal is randomized; `encapped_key` and `ciphertext` above came
+from a seeded RNG, and atem must open them to `K` with the device key. The
+two signatures are RFC 6979 (deterministic); CryptoKit's signatures are
+randomized, so Swift checks that they verify against `sign_pub` rather
+than comparing bytes. Everything else must match exactly.
+
+## Wire messages (build step 2a)
+
+Same envelope as steps 0–1 (`{"type": …, "data": {…}}`, snake_case
+fields, base64 binary; `SignedWire` is `{statement, signature}`). atem sends
+all of them to, and accepts them only from, its home Astation.
+
+| Type | Direction | Data |
+|---|---|---|
+| `unlockRequest` | atem → Astation | `request` (the `atem-unlock-request-v1` statement bytes), `signature` (Ed25519 by the unlock-auth key, 64 bytes) |
+| `unlockGrant` | Astation → atem | `grant: SignedWire` (`atem-unlock-grant-v1`), `encapped_key`, `ciphertext` (the storage key sealed to the request's `e_pub`) |
+| `unlockDenied` | Astation → atem | `reason` |
+| `storageKeyRotate` | atem → Astation | `rotate: SignedWire` (`atem-storage-rotate-v1`, Ed25519 by the device signing key), `encapped_key`, `ciphertext` (the new storage key sealed to Astation's encryption key) |
+| `storageKeyAck` | Astation → atem | `ack: SignedWire` (`atem-storage-ack-v1`) |
+| `storageKeyRejected` | Astation → atem | `reason`, optional `pending_kid` (set only when the rotate was refused because Astation holds that pending key) |
+| `storageKeyConfirm` | atem → Astation | `confirm: SignedWire` (`atem-storage-confirm-v1`, Ed25519 by the device signing key); no reply |
+| `storageKeyAbandon` | atem → Astation | `abandon: SignedWire` (`atem-storage-abandon-v1`, Ed25519 by the device signing key); no reply |
+
+`unlockDenied` and `storageKeyRejected` are unsigned. That costs only
+liveness (a relay that can forge one can as well drop every reply): neither
+unlocks, rotates or abandons anything by itself, and atem gives up a pending
+key named by `pending_kid` only if no file of its own uses that key. atem
+skips any `unlockGrant` or `storageKeyAck` that doesn't verify against the
+request in flight (a stale or replayed reply) and keeps waiting, up to 300 s
+for an unlock and 60 s for a rotation. It strips control, bidi and invisible
+format characters from `reason` and `pending_kid` and shows at most 200
+characters.
+
+### Astation work for step 2a
+
+atem can't unlock against a real Astation until these land. atem doesn't
+need them to ship first: against an Astation without them, verification
+works as in step 1, the first escrow doesn't complete, and the device keeps
+its plain `device_keys` file (re-sealed at each agent start) until it does.
+Such an Astation drops the new message types without a word, so atem
+can't tell it from a slow one: each escrow attempt waits the full 60 s.
+atem then records that the first escrow went unanswered, and `atem cred
+status` says the key is handed over (at the next `atem pair` or `atem cred
+unlock`) once Astation supports it.
+`src/memory/fake_astation.rs` (test-only) implements the same rules and is
+the reference behaviour.
+
+**Astation (macOS):**
+1. **Storage keys.** Per verified device keep, in the Keychain
+   (`WhenUnlockedThisDeviceOnly`), keyed by `(device_id, device_pub)`: at
+   most one current storage key and at most one pending key, each with its
+   `storage_kid` (the pending one also with the exact rotate statement bytes
+   it was acked for), plus the set of every `storage_kid` you ever acked for
+   that device. Keep the acked set permanently; it is what makes a replayed
+   rotate harmless. Keying by `device_pub` too means a device that verifies
+   again with new device keys (see "Reset") starts with nothing held, so its
+   first rotate with an empty old kid is accepted, and nothing held for its
+   old keys is ever released to it.
+2. **`unlockRequest`.** Decode `request` and `signature`; verify the
+   signature over the exact `request` bytes with Ed25519
+   (`Curve25519.Signing.PublicKey(rawRepresentation:)`) and the device's
+   pinned unlock-auth key; parse `atem-unlock-request-v1`; check the
+   account, that `device_id` is a verified, unrevoked device, and that
+   `storage_kid` is 8 lowercase hex characters. Require `ticket` to be empty
+   until build step 7. Require `time` (Unix seconds) to be within a window of
+   your clock, checked on arrival before any prompt (suggested: 5 minutes
+   either way). Anything failing → `unlockDenied { reason }`, no prompt.
+   Otherwise show the Touch ID prompt (device name, boot ID, request time,
+   last unlock) with Approve, Deny, and Deny and revoke; on deny send
+   `unlockDenied { reason }`.
+3. **On approve,** take the storage key whose kid equals the request's
+   `storage_kid`: the current key or the pending one. No such key →
+   `unlockDenied`; never release another key (atem refuses a grant whose
+   `storage_kid` isn't the request's). If it is the pending key, the device has switched to it:
+   make it current and delete the old current key (an implicit confirm;
+   this also applies to a first escrow, where there is no current key yet).
+   If it is the current key, release it and keep any pending key: a pending
+   key is held until it is confirmed, explicitly or implicitly, or
+   abandoned. Seal it with `HPKE.Sender(recipientKey: E_pub, ciphersuite:
+   .Curve25519_SHA256_ChachaPoly, info: enc("atem-unlock-info-v1", account,
+   device_id, storage_kid, SHA-256(request bytes)))`, empty AAD. Sign
+   `atem-unlock-grant-v1` = `enc(label, account, sign_gen, device_id,
+   storage_kid, SHA-256(request bytes), SHA-256(enc(encapped_key,
+   ciphertext)))` with the Secure Enclave key (64-byte `r ‖ s`, low-S). Send
+   `unlockGrant { grant, encapped_key, ciphertext }`.
+4. **`storageKeyRotate`.** No Touch ID: the device signature is the
+   authorization. Verify `rotate.signature` with the device's pinned device
+   signing key (Ed25519); parse `atem-storage-rotate-v1`; check account and
+   that `device_id` is a verified, unrevoked device; check
+   `SHA-256(enc(encapped_key, ciphertext))` against the statement. Then, in
+   this order:
+   - Reject (`storageKeyRejected { reason }`) a `new_storage_kid` that isn't
+     8 lowercase hex characters, or equals `old_storage_kid`.
+   - **Identical resend.** If `new_storage_kid` is the pending kid and the
+     rotate statement is byte-identical to the one you acked (so the seal
+     hash matches too), atem is resending a rotate whose ack it lost: send
+     the same `storageKeyAck` again and change nothing. Any other rotate to
+     the pending kid gets `storageKeyRejected { reason, pending_kid }` and
+     the pending key stays as it is. (atem never reuses the kid of a sealed
+     file it re-seals over; any other collision of a random 32-bit kid,
+     about 2⁻³², is caught by this rule.)
+   - **Implicit confirm.** If a key is pending and `old_storage_kid` names
+     it, the device switched to it: make it current, delete the old one,
+     and continue.
+   - **Commitment.** If a key is still pending, an acked pending key is a
+     commitment: refuse with `storageKeyRejected { reason, pending_kid }`
+     naming it. (atem then sends `storageKeyAbandon` for it if no file of
+     its own uses it, and the same rotate again.)
+   - Reject (`storageKeyRejected { reason }`, no `pending_kid`) a
+     `new_storage_kid` you hold or ever acked (a replay); an empty
+     `old_storage_kid` while you hold a current key for this
+     `(device_id, device_pub)`; and a non-empty `old_storage_kid` that isn't
+     the current key's kid.
+   - Open with `HPKE.Recipient(privateKey: <Astation encryption key>,
+     ciphersuite: .Curve25519_SHA256_ChachaPoly, info:
+     enc("atem-storage-key-info-v1", account, device_id, new_storage_kid),
+     encapsulatedKey: encapped_key)`, empty AAD; the plaintext must be 32
+     bytes. Store it as **pending**, keep the current key, add the kid to the
+     acked set, and reply `storageKeyAck` with a signed `atem-storage-ack-v1`
+     = `enc(label, account, sign_gen, device_id, new_storage_kid)`.
+5. **`storageKeyConfirm`.** Verify with the pinned device signing key,
+   parse `atem-storage-confirm-v1` = `enc(label, account, device_id,
+   storage_kid)`, and check account and that `device_id` is a verified,
+   unrevoked device, all before changing anything. If its kid is the pending one,
+   make it current and delete the old key. If nothing is pending and it
+   names the current key, it was already settled: do nothing. Ignore
+   anything else. No reply.
+6. **`storageKeyAbandon`.** Verify with the pinned device signing key and
+   parse `atem-storage-abandon-v1` = `enc(label, account, device_id,
+   storage_kid)`; check account and that `device_id` is a verified,
+   unrevoked device. Drop the pending key only if
+   its kid equals `storage_kid` exactly; the kid stays in the acked set, so
+   it can never be acked again. Never touch the current key. No pending key,
+   another kid, or a replay: do nothing. No reply. atem sends it just
+   before a rotate, so handle one atem's messages in the order they arrive.
+   Don't treat an unlock that names the current kid as an abandon: a relay
+   that withholds messages could then strand the device.
+7. **Home rule.** atem sends these messages only to its home Astation (the
+   first one it verified with). Another Astation holds no storage key for
+   the device, so it answers an `unlockRequest` with `unlockDenied` and a
+   rotate from a kid it doesn't hold with `storageKeyRejected`.
+8. **First escrow.** `atem pair` sends the first rotate (empty old kid)
+   in the same run as verification and confirms it; a step-1 device sends
+   its first rotate at the next `atem pair` or `atem cred unlock`. A relay
+   can stall a first escrow: drop acks, or replay a captured first rotate
+   so that you hold a pending key the device no longer has, which costs an
+   abandon round each time. It can't lose keys: until you are known to hold
+   the storage key, a device (step-1 or freshly verified) keeps its plain
+   `device_keys` file and re-seals from it. The implicit confirm by
+   an unlock naming the pending kid (item 3) lets such a device settle its
+   first escrow at the next unlock.
+9. Keep `reason` texts short and plain; atem shows them sanitized and cut
+   to 200 characters.
+10. **Connections.** Send every reply (`unlockGrant`, `unlockDenied`,
+    `storageKeyAck`, `storageKeyRejected`) on the connection the request
+    came in on, never to another connection of the same atem. Two live
+    connections from one atem identity at once are worth recording: a later
+    step uses that as a live-twin (clone) signal.
+11. Check the Swift code against "Test vectors (step 2a)": encodings, infos
+    and AAD must match byte for byte; atem's Ed25519 signatures must verify;
+    the fixed unlock grant must open with `E`, and the fixed rotate seal with
+    the Astation encryption key.
+
+**Relay:** forward `unlockRequest`, `unlockGrant`, `unlockDenied`,
+`storageKeyRotate`, `storageKeyAck`, `storageKeyRejected`,
+`storageKeyConfirm` and `storageKeyAbandon` between an atem and its Astation
+exactly like the step 0–1 types (add them to any type allowlist), in order.
+Nothing new is stored.
+
+### Reset (start over)
+
+If this device's keys can't be unlocked (the sealed file or
+`unlock_auth_key` is damaged or missing, or Astation lost the storage key),
+`atem cred status` and
+`atem cred unlock` print:
+
+> To start over: delete ~/.config/atem/device_keys, device_keys.sealed,
+> device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and
+> cred_state.json, then run `atem pair`. device_keys.sealed also holds the
+> memory encryption key and its older keys: Astation grants the current key
+> again, older keys may not come back.
+
+An Astation rolled back or restored from a backup to an older storage key
+counts as having lost it: the storage key rotates at every unlock, so the
+restored key only opens a sealed file this device has since replaced (and
+deleted once an unlock proved Astation held the newer key). Astation can't
+release the kid the device asks for and answers `unlockDenied`; start over
+as above.
+
+`atem pair` then verifies the device again with fresh keys. Astation keys
+storage keys by `(device_id, device_pub)`, so the new keys start a fresh
+escrow (empty old kid) and nothing held for the old keys is released.
+Synced data stays on the relay; `K` arrives again with the new
+verification's grant.
+
+### Test vectors (step 2a)
+
+`src/memory/kat_tests.rs` checks these too. Inputs are the step 0–1 inputs
+plus: X25519 secret `E` = 32 × `aa`, unlock nonce = 32 × `bb`, boot_id
+`"boot-1"`, ticket `""`, time 1760000000, old storage_kid `"0a1b2c3d"`, new
+storage_kid `"4e5f6a7b"`, unlock-grant sealed_hash = 32 × `cc`, rotation
+sealed_hash = 32 × `dd`, storage key = 32 × `ee`. Ed25519 signatures are
+deterministic, so atem's must match; CryptoKit's own Ed25519 signatures are
+randomized, which is fine because Astation only verifies device signatures.
+The two HPKE seals came from a seeded RNG; Swift opens them rather than
+reproducing them. The encodings, hashes and Ed25519 signatures were also
+computed independently in Python (`hashlib`, `struct`, `cryptography`), the
+P-256 signature verified there, and both seals opened there with a separate
+RFC 9180 implementation.
+
+| Value | Result |
+|---|---|
+| `E_pub` | `14ca9e4d387bccf35746e0407daaacc6b28a4f8445ef5a5158894db983e24070` |
+| `atem-unlock-request-v1` | `000000166174656d2d756e6c6f636b2d726571756573742d763100000006616363742d31000000056465762d3100000006626f6f742d31000000000000002014ca9e4d387bccf35746e0407daaacc6b28a4f8445ef5a5158894db983e2407000000020bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000080000000068e77800000000083061316232633364` |
+| SHA-256(request) | `1301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d` |
+| request signature (unlock-auth key) | `e82afd604b8697c54433e33fc7f2f1cf168ad248e0c620edb2c2e470d7908a2cf71362934c8c33f2c9449f27f52d4de6076ad7e2fa16fa87c274192ca3b58008` |
+| unlock `info` | `000000136174656d2d756e6c6f636b2d696e666f2d763100000006616363742d31000000056465762d31000000083061316232633364000000201301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d` |
+| `atem-unlock-grant-v1` (sealed_hash 32 × `cc`) | `000000146174656d2d756e6c6f636b2d6772616e742d763100000006616363742d31000000080000000000000001000000056465762d31000000083061316232633364000000201301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d00000020cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc` |
+| sealed-file AAD (old kid) | `000000136174656d2d6465766963652d6b6579732d7631000000056465762d31000000083061316232633364` |
+| storage-key `info` (new kid) | `000000186174656d2d73746f726167652d6b65792d696e666f2d763100000006616363742d31000000056465762d31000000083465356636613762` |
+| `atem-storage-rotate-v1` (sealed_hash 32 × `dd`) | `000000166174656d2d73746f726167652d726f746174652d763100000006616363742d31000000056465762d3100000008306131623263336400000008346535663661376200000020dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd` |
+| rotate signature (device signing key) | `2041a1670126328aa40f7bb9cf4d35146cd45cc447ecef1c904c5b970876242a7c37f59dc117a5486e8e37d0b39b958f00806c0cf00d9c52e4d3fd90818e4408` |
+| first `atem-storage-rotate-v1` (old `""`, new `0a1b2c3d`) | `000000166174656d2d73746f726167652d726f746174652d763100000006616363742d31000000056465762d310000000000000008306131623263336400000020dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd` |
+| `atem-storage-ack-v1` | `000000136174656d2d73746f726167652d61636b2d763100000006616363742d31000000080000000000000001000000056465762d31000000083465356636613762` |
+| `atem-storage-confirm-v1` | `000000176174656d2d73746f726167652d636f6e6669726d2d763100000006616363742d31000000056465762d31000000083465356636613762` |
+| confirm signature (device signing key) | `6a7c7961862d5ef7d3028b3d6c511434f5a5e8e4fd1f0541de1ca3a6db9aca2b32d5f3aec90aa750948a46faa61078dee3339490cd873e58e5639ec36167db0d` |
+| `atem-storage-abandon-v1` (new kid) | `000000176174656d2d73746f726167652d6162616e646f6e2d763100000006616363742d31000000056465762d31000000083465356636613762` |
+| abandon signature (device signing key) | `4cecaeeda1ba12cce89797ca065ee9c04b050407c05c06e784501b01034a3e0df4f00fac0d35591ec710fc3c316a395c66bd70630f6cd7ba2f72a78e97e15b01` |
+
+A fixed unlock grant atem must open: the storage key (32 × `ee`) sealed to
+`E_pub` with the unlock `info` above; atem opens it with `E`.
+
+| Value | Result |
+|---|---|
+| `encapped_key` | `8e5c2c633c06326dfba94d9a717724ca1542bd07e800b99e1f12dd9efb95c341` |
+| `ciphertext` | `4eccc2f528b4d5cf884cd9049545cb96d804ddca7c2e943fe101ced564bff96d8a7150a4fdfa3fad8b11d9697da64109` |
+| `sealed_hash` | `5222490f82b684dbfb043d64c9d213e4e4c38b048d083744f78437455a165be5` |
+| `atem-unlock-grant-v1` | `000000146174656d2d756e6c6f636b2d6772616e742d763100000006616363742d31000000080000000000000001000000056465762d31000000083061316232633364000000201301ff47099849bf273dbf5b62df77365f305991efd763d2621b35670db65b9d000000205222490f82b684dbfb043d64c9d213e4e4c38b048d083744f78437455a165be5` |
+| grant signature (`r ‖ s`, RFC 6979) | `ac2e60b3834f1f0907a8eb22a04f5b15b86f5388d16e074b1fd694e2c646088f74ac5f849c1c9ad9c20647164d8e0f8b9efb730058ec9d42c78e54306a58746d` |
+
+A fixed rotate Astation must open: the new storage key (32 × `ee`) sealed
+to `enc_pub` with the storage-key `info` above; Astation opens it with its
+encryption key (32 × `66`) and verifies the device signature.
+
+| Value | Result |
+|---|---|
+| `encapped_key` | `3fe8a9052458c90d03badd8cbe52b2a0b38f8a0212023ed63013d457aad1e67f` |
+| `ciphertext` | `2c6ab9033b8dbbdae43bd691a2f590455984416dc70989de638b99a78821d2d78523ffbc9827815e0fe00f4b2a9ad4e8` |
+| `sealed_hash` | `db1a3c8e614277746e1e437077664041860372fbfbf80a0cb7ee930f98608e17` |
+| `atem-storage-rotate-v1` | `000000166174656d2d73746f726167652d726f746174652d763100000006616363742d31000000056465762d3100000008306131623263336400000008346535663661376200000020db1a3c8e614277746e1e437077664041860372fbfbf80a0cb7ee930f98608e17` |
+| rotate signature (device signing key) | `35d7a8f51c36b1d70bc699360556c47293c47100fd3c3fd96e84fd128557ab505d26834de38235b194ddef76883b2cfc5b882b7e4e3b0b7872f7d5e2c998d800` |
+
 ## Where the work lands
 
 | Component | Work |
 |---|---|
-| atem | Signed account state and plain-text rejection (fixes to #36); key agent (socket, `SO_PEERCRED`, `mlock`, `zeroize`); fresh device, device signing and unlock-auth keys; sealed `device_key` with storage-key rotation; commit-then-reveal safety code and `[y/N]` in `atem pair`; HPKE grants with signature checks; device-signed memory writes and verification; `atem cred` commands; scope directory, manifest and epoch checks; `cred_state`; ticket rolling; rotation delay and veto handling; device-reported checks (boot ID, TPM, cloud identity) |
+| atem | Signed account state and plain-text rejection (fixes to #36); key agent (socket, `SO_PEERCRED`, `mlock`, `zeroize`); fresh device, device signing and unlock-auth keys; `device_keys.sealed` with storage-key rotation (built, step 2a); commit-then-reveal safety code and `[y/N]` in `atem pair`; HPKE grants with signature checks; device-signed memory writes and verification; `atem cred` commands; scope directory, manifest and epoch checks; `cred_state`; ticket rolling; rotation delay and veto handling; device-reported checks (boot ID, TPM, cloud identity) |
 | Astation | Secure Enclave signing key and encryption key; signed account state, device certificates, grants, directory, revocations; key manager for `K`; scope, index and storage keys; Credentials and Devices tabs; verification dialog; unlock prompts, auto-unlock checks, tickets; recovery secret `R` in the kit, versioned backup blob, signing-key rotation with 72-hour delay and veto |
 | Relay | Store and serve signed statements; per-account plain-text refusal; `credentials`, `cred_manifests`, `cred_directory`, `cred_grants`, `cred_devices`, `cred_recovery`, `cred_fetch_log`; credential writes from the Astation session only; grant-scoped reads; device signatures on memory rows; live-twin and network observations forwarded to Astation |
 
@@ -889,8 +1595,10 @@ Suggested build order:
    as `off` for upload.
 1. Verification: fresh keys, commit-then-reveal safety code, signed device
    certificate, signed account state, HPKE signed grants (`K` first).
-2. Sealed `device_key`, key agent, signed unlock with storage-key rotation,
-   Touch ID unlock.
+2. Sealed device keys, key agent, signed unlock with storage-key rotation,
+   Touch ID unlock. Split: 2a (built on atem) seals the device keys and
+   opens grants in the agent; 2b (built on atem) moves `K` and `data_keys.enc` behind the
+   agent.
 3. Device-signed memory writes, bound associated data, revocation list,
    `K` subkeys; rotate `K`.
 4. Recovery secret `R`, versioned backup blob, Secure Enclave signing key,
