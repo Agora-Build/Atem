@@ -1386,6 +1386,35 @@ fn prompt_yes_no(question: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Asks whether the safety codes match. Keys typed earlier (an extra Enter after
+/// a previous prompt) are discarded first, and an empty answer asks again, so
+/// only a deliberate "y" trusts the device. End of input counts as "no".
+fn prompt_codes_match() -> bool {
+    use std::io::{self, BufRead, Write};
+
+    #[cfg(unix)]
+    unsafe {
+        if libc::isatty(0) == 1 {
+            libc::tcflush(0, libc::TCIFLUSH);
+        }
+    }
+    let stdin = io::stdin();
+    loop {
+        print!("Does the code on your Mac match? Type y or n: ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return true,
+            "n" | "no" => return false,
+            _ => continue,
+        }
+    }
+}
+
 fn prompt_save_credentials() -> bool {
     prompt_yes_no("Save credentials so they keep working when Astation disconnects? [y/N]: ")
 }
@@ -1562,19 +1591,30 @@ async fn run_device_verification(
     use crate::memory::unlock::PairEscrow;
     use crate::memory::verification::{
         AstationKeys, Handshake, KeyPaths, complete_verification, device_keys_for_verification,
+        set_aside_revoked_keys,
     };
     use crate::websocket_client::AstationMessage;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use tokio::time::{Duration, timeout};
 
     let paths = KeyPaths::default_paths();
-    let device_id = crate::config::AtemConfig::ensure_instance_id();
+    // The device id is this atem's relay identity (`atem_id`): Astation checks it
+    // equals the id the connection authenticated as.
+    let device_id = crate::websocket_client::resolved_atem_id(&crate::auth::get_hostname());
     // The agent client blocks (socket I/O, autostart): call it off the runtime.
     let agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> =
         std::sync::Arc::from(crate::memory::key_agent::default_agent());
     let keys = {
         let (paths, agent) = (paths.clone(), agent.clone());
-        blocking(move || device_keys_for_verification(&paths, agent.as_ref())).await?
+        blocking(move || {
+            // Revoked by the home Astation: the old keys can never unlock, so
+            // they are set aside and this device verifies with new ones.
+            if let Some(notice) = set_aside_revoked_keys(&paths, agent.as_ref())? {
+                println!("{notice}");
+            }
+            device_keys_for_verification(&paths, agent.as_ref())
+        })
+        .await?
     };
     let handshake = Handshake::start(keys);
     client
@@ -1631,8 +1671,9 @@ async fn run_device_verification(
     let outcome: Result<()> = async {
         println!();
         println!("Safety code:  {code}");
-        println!("Astation shows a code too. They must match exactly.");
-        if !prompt_yes_no("Do the codes match? [y/N]: ") {
+        println!("Your Mac shows a code too. They must match exactly.");
+        println!("Confirm on both, in either order: type y here, and approve on your Mac with Touch ID.");
+        if !prompt_codes_match() {
             // Drop the pending pin first so it goes even if the send fails.
             TrustStore::update(&paths.trust, |t| {
                 t.remove_pending(astation_id);
@@ -1648,7 +1689,7 @@ async fn run_device_verification(
             );
         }
 
-        println!("Confirm on your Mac with Touch ID…");
+        println!("Waiting for your Mac (approve with Touch ID if you haven't yet)…");
         match timeout(Duration::from_secs(300), next_verify_message(client)).await {
             Err(_) => anyhow::bail!("Timed out waiting for Astation to confirm this device."),
             Ok(result) => match result? {
