@@ -1386,6 +1386,35 @@ fn prompt_yes_no(question: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Asks whether the safety codes match. Keys typed earlier (an extra Enter after
+/// a previous prompt) are discarded first, and an empty answer asks again, so
+/// only a deliberate "y" trusts the device. End of input counts as "no".
+fn prompt_codes_match() -> bool {
+    use std::io::{self, BufRead, Write};
+
+    #[cfg(unix)]
+    unsafe {
+        if libc::isatty(0) == 1 {
+            libc::tcflush(0, libc::TCIFLUSH);
+        }
+    }
+    let stdin = io::stdin();
+    loop {
+        print!("Do the codes match? Type y or n: ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return true,
+            "n" | "no" => return false,
+            _ => continue,
+        }
+    }
+}
+
 fn prompt_save_credentials() -> bool {
     prompt_yes_no("Save credentials so they keep working when Astation disconnects? [y/N]: ")
 }
@@ -1634,7 +1663,7 @@ async fn run_device_verification(
         println!();
         println!("Safety code:  {code}");
         println!("Astation shows a code too. They must match exactly.");
-        if !prompt_yes_no("Do the codes match? [y/N]: ") {
+        if !prompt_codes_match() {
             // Drop the pending pin first so it goes even if the send fails.
             TrustStore::update(&paths.trust, |t| {
                 t.remove_pending(astation_id);
