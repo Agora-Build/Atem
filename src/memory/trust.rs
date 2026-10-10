@@ -57,10 +57,22 @@ pub struct TrustStore {
     /// confirmed escrow.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     escrow_unanswered: bool,
+    /// The home Astation answered an unlock with "denied and revoked": it
+    /// dropped this device's storage key, so these keys can never unlock
+    /// again. `atem pair` then sets them aside and verifies with new ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked: Option<RevokedBy>,
     #[serde(default)]
     astations: HashMap<String, AstationTrust>,
     #[serde(default)]
     pending: HashMap<String, AstationTrust>,
+}
+
+/// Who revoked this device, and when (Unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedBy {
+    pub astation_id: String,
+    pub at: u64,
 }
 
 /// Holds `cred_state.lock` (see `TrustStore::lock`) until dropped.
@@ -233,6 +245,35 @@ impl TrustStore {
         }
     }
 
+    /// Records that `astation_id` revoked this device at `at` (Unix seconds).
+    /// The signal is unsigned: see `verification::set_aside_revoked_keys`
+    /// for why acting on it is safe.
+    pub fn record_revoked(&mut self, astation_id: &str, at: u64) {
+        self.revoked = Some(RevokedBy {
+            astation_id: astation_id.into(),
+            at,
+        });
+    }
+
+    pub fn revoked(&self) -> Option<&RevokedBy> {
+        self.revoked.as_ref()
+    }
+
+    /// Forgets the revoking Astation's verification of the old keys: its
+    /// verified entry, the home, the escrowed storage kid, the unanswered
+    /// escrow note and the revocation itself. Abandoned kids stay (a replayed
+    /// abandon must still never hit a new key).
+    pub fn forget_revoked_keys(&mut self) -> Option<RevokedBy> {
+        let revoked = self.revoked.take()?;
+        self.astations.remove(&revoked.astation_id);
+        if self.home_astation.as_deref() == Some(revoked.astation_id.as_str()) {
+            self.home_astation = None;
+        }
+        self.escrowed_storage_kid = None;
+        self.escrow_unanswered = false;
+        Some(revoked)
+    }
+
     /// The home Astation, or, for a step-1 store whose home was never set,
     /// the first verified Astation by id (used once, to migrate a plain
     /// `device_keys`). A home that is set but no longer verified gives
@@ -352,6 +393,14 @@ impl TrustStore {
             entry.account_epoch = epoch;
         }
         self.astations.insert(astation_id.into(), entry);
+        // Verified again by the Astation that revoked it: no longer revoked.
+        if self
+            .revoked
+            .as_ref()
+            .is_some_and(|revoked| revoked.astation_id == astation_id)
+        {
+            self.revoked = None;
+        }
         Ok(certificate)
     }
 
@@ -400,6 +449,13 @@ impl TrustStore {
     }
 
     pub fn verification_line(&self, astation_id: &str) -> String {
+        if let Some(revoked) = &self.revoked {
+            return format!(
+                "Verified: revoked by Astation {} ({}); run 'atem pair' to verify this device again",
+                revoked.astation_id,
+                crate::config::format_unix_timestamp_hhmm_pub(revoked.at)
+            );
+        }
         match self.verified(astation_id) {
             Some(trust) => format!("Verified: yes  (safety code {})", trust.safety_code),
             None => "Verified: no  (run 'atem pair' to verify this device)".to_string(),

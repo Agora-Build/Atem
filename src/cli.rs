@@ -1591,6 +1591,7 @@ async fn run_device_verification(
     use crate::memory::unlock::PairEscrow;
     use crate::memory::verification::{
         AstationKeys, Handshake, KeyPaths, complete_verification, device_keys_for_verification,
+        set_aside_revoked_keys,
     };
     use crate::websocket_client::AstationMessage;
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -1605,7 +1606,15 @@ async fn run_device_verification(
         std::sync::Arc::from(crate::memory::key_agent::default_agent());
     let keys = {
         let (paths, agent) = (paths.clone(), agent.clone());
-        blocking(move || device_keys_for_verification(&paths, agent.as_ref())).await?
+        blocking(move || {
+            // Revoked by the home Astation: the old keys can never unlock, so
+            // they are set aside and this device verifies with new ones.
+            if let Some(notice) = set_aside_revoked_keys(&paths, agent.as_ref())? {
+                println!("{notice}");
+            }
+            device_keys_for_verification(&paths, agent.as_ref())
+        })
+        .await?
     };
     let handshake = Handshake::start(keys);
     client

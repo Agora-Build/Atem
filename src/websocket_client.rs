@@ -314,9 +314,14 @@ pub enum AstationMessage {
     #[serde(rename = "unlockGrant")]
     UnlockGrant { grant: crate::memory::statements::SignedWire, encapped_key: String, ciphertext: String },
 
-    /// Astation → Atem: the unlock was denied.
+    /// Astation → Atem: the unlock was denied. `revoked` is set when the
+    /// user chose Deny and revoke (older Astations only say so in `reason`).
     #[serde(rename = "unlockDenied")]
-    UnlockDenied { reason: String },
+    UnlockDenied {
+        reason: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        revoked: bool,
+    },
 
     /// Atem → Astation: a storage key sealed to Astation's encryption key,
     /// with a device-signed `atem-storage-rotate-v1`.
@@ -3211,6 +3216,22 @@ mod tests {
     }
 
     #[test]
+    fn unlock_denied_parses_with_and_without_revoked() {
+        let old: AstationMessage =
+            serde_json::from_str(r#"{"type":"unlockDenied","data":{"reason":"no"}}"#).unwrap();
+        assert!(matches!(old, AstationMessage::UnlockDenied { ref reason, revoked: false } if reason == "no"));
+        let new: AstationMessage = serde_json::from_str(
+            r#"{"type":"unlockDenied","data":{"reason":"no","revoked":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(new, AstationMessage::UnlockDenied { revoked: true, .. }));
+        assert_eq!(
+            serde_json::to_string(&AstationMessage::UnlockDenied { reason: "no".into(), revoked: true }).unwrap(),
+            r#"{"type":"unlockDenied","data":{"reason":"no","revoked":true}}"#
+        );
+    }
+
+    #[test]
     fn unlock_and_storage_messages_round_trip() {
         use crate::memory::statements::SignedWire;
         let signed = SignedWire { statement: "s".into(), signature: "g".into() };
@@ -3224,7 +3245,7 @@ mod tests {
                 r#"{"type":"unlockGrant","data":{"grant":{"statement":"s","signature":"g"},"encapped_key":"e","ciphertext":"c"}}"#,
             ),
             (
-                AstationMessage::UnlockDenied { reason: "no".into() },
+                AstationMessage::UnlockDenied { reason: "no".into(), revoked: false },
                 r#"{"type":"unlockDenied","data":{"reason":"no"}}"#,
             ),
             (

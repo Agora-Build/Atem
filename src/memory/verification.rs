@@ -695,6 +695,59 @@ fn has_device_keys(paths: &KeyPaths) -> bool {
     .any(|path| path.symlink_metadata().is_ok())
 }
 
+/// When the home Astation revoked this device (recorded by `atem cred
+/// unlock`) and the key agent is locked, its keys can never unlock again:
+/// renames every key file to `<name>.revoked-<stamp>` (never deletes),
+/// forgets that Astation's verification, the home and the escrow state, so
+/// `device_keys_for_verification` then gives fresh keys. Returns the line to
+/// print, or `None` when nothing was revoked (behaviour as before).
+///
+/// The revocation signal is unsigned (it arrives over the relay). Acting on
+/// it only renames the old files aside and re-verifies with a fresh safety
+/// code the user compares, so a forged "revoked" can cost a re-pair but
+/// never keys (the files stay on disk) or trust (nothing new is trusted
+/// without the ceremony). Blocking: call it inside `key_agent::blocking`.
+pub fn set_aside_revoked_keys(paths: &KeyPaths, agent: &dyn KeyAgentApi) -> Result<Option<String>> {
+    let trust = TrustStore::load_from(&paths.trust)?;
+    let Some(revoked) = trust.revoked() else {
+        return Ok(None);
+    };
+    if trust.recorded_home() != Some(revoked.astation_id.as_str()) || agent.status()?.unlocked {
+        return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut moved = Vec::new();
+    for path in [
+        &paths.device_keys_sealed,
+        &paths.device_keys_next,
+        &paths.device_keys_prev,
+        &paths.unlock_auth_key,
+        &paths.device_keys,
+    ] {
+        if path.symlink_metadata().is_err() {
+            continue;
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let aside = path.with_file_name(format!("{name}.revoked-{stamp}"));
+        if aside.symlink_metadata().is_ok() {
+            bail!("{} already exists; move it away and run `atem pair` again", aside.display());
+        }
+        std::fs::rename(path, &aside)
+            .with_context(|| format!("couldn't move {} aside", path.display()))?;
+        moved.push(name.into_owned());
+    }
+    let revoked = TrustStore::update(&paths.trust, |store| Ok(store.forget_revoked_keys()))?;
+    let by = revoked.map_or_else(String::new, |revoked| format!(" by Astation {}", revoked.astation_id));
+    let dir = paths.trust.parent().map(|dir| dir.display().to_string()).unwrap_or_default();
+    Ok(Some(format!(
+        "This device was revoked{by}: its old keys were moved aside ({} renamed to *.revoked-{stamp} in {dir}); verifying it with new keys.",
+        if moved.is_empty() { "no key files".to_string() } else { moved.join(", ") }
+    )))
+}
+
 /// The keys to verify with: this device's sealed keys when it has them (so
 /// every Astation pins the same device key), fresh ones otherwise. Sealed
 /// keys are revealed only while the key agent holds them unlocked; starting
@@ -1713,6 +1766,122 @@ mod ceremony_tests {
             before,
             "nothing saved"
         );
+    }
+
+    /// The entries of `dir` named `<name>.revoked-<stamp>`.
+    fn set_aside(dir: &std::path::Path, name: &str) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|file| {
+                file.strip_prefix(&format!("{name}.revoked-"))
+                    .is_some_and(|stamp| !stamp.is_empty() && stamp.chars().all(|c| c.is_ascii_digit()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_revoked_device_sets_its_old_keys_aside_and_verifies_with_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (certificate, outcome) =
+            verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        escrow_first(&agent, &fake, &certificate, outcome);
+        let sealed_before = std::fs::read(&paths.device_keys_sealed).unwrap();
+        // Leftovers of a rotation and a plain file: all set aside too.
+        for path in [&paths.device_keys_next, &paths.device_keys_prev, &paths.device_keys] {
+            std::fs::write(path, b"old").unwrap();
+        }
+        std::fs::write(&paths.project_names, b"{}").unwrap();
+        TrustStore::update(&paths.trust, |store| {
+            store.record_abandoned("0f0f0f0f");
+            store.record_escrow_unanswered();
+            store.record_revoked(ASTATION_ID, 1_700_000_000);
+            Ok(())
+        })
+        .unwrap();
+        // After a reboot the agent is locked, and Astation won't unlock it.
+        let rebooted = test_agent(&paths);
+        let notice = set_aside_revoked_keys(&paths, &rebooted)
+            .unwrap()
+            .expect("the old keys are moved aside");
+        assert!(notice.contains("moved aside"), "{notice}");
+        for name in [
+            "device_keys.sealed",
+            "device_keys.sealed.next",
+            "device_keys.sealed.prev",
+            "unlock_auth_key",
+            "device_keys",
+        ] {
+            assert!(!dir.path().join(name).exists(), "{name} is still there");
+            let aside = set_aside(dir.path(), name);
+            assert_eq!(aside.len(), 1, "{name}: {aside:?}");
+        }
+        let aside = set_aside(dir.path(), "device_keys.sealed");
+        assert_eq!(std::fs::read(dir.path().join(&aside[0])).unwrap(), sealed_before, "renamed, not rewritten");
+        assert_eq!(std::fs::read(&paths.project_names).unwrap(), b"{}");
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert!(trust.verified(ASTATION_ID).is_none());
+        assert!(!trust.home_is_set());
+        assert_eq!(trust.escrowed_kid(), None);
+        assert!(!trust.escrow_unanswered());
+        assert!(trust.revoked().is_none());
+        assert!(trust.was_abandoned("0f0f0f0f"), "abandoned kids are kept");
+
+        let keys = device_keys_for_verification(&paths, &rebooted).unwrap();
+        assert!(matches!(keys, VerificationKeys::Fresh(_)));
+        let (handshake, certificate) = start(&paths, &fake, keys, 8, 3);
+        let outcome = complete_verification(
+            &paths,
+            &rebooted,
+            ASTATION_ID,
+            handshake.into_keys(),
+            &fake.sign(&certificate.encode()),
+            &state(&fake, EncryptionMode::Off, None, 4),
+            &[],
+        )
+        .unwrap();
+        assert!(outcome.escrow.is_some(), "new keys go to Astation");
+        let trust = TrustStore::load_from(&paths.trust).unwrap();
+        assert_eq!(trust.home(), Some(ASTATION_ID));
+        assert!(paths.device_keys_sealed.exists());
+    }
+
+    #[test]
+    fn without_a_recorded_revocation_a_locked_agent_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        let (certificate, outcome) =
+            verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        escrow_first(&agent, &fake, &certificate, outcome);
+        let rebooted = test_agent(&paths);
+        assert_eq!(set_aside_revoked_keys(&paths, &rebooted).unwrap(), None);
+        let error = error_of(device_keys_for_verification(&paths, &rebooted));
+        assert!(error.contains("atem cred unlock"), "{error}");
+        // Revoked by an Astation that isn't the home: nothing moves either.
+        TrustStore::update(&paths.trust, |store| {
+            store.record_revoked("astation-2", 1_700_000_000);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(set_aside_revoked_keys(&paths, &rebooted).unwrap(), None);
+        // An unlocked agent verifies with the keys it holds, as before.
+        TrustStore::update(&paths.trust, |store| {
+            store.record_revoked(ASTATION_ID, 1_700_000_000);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(set_aside_revoked_keys(&paths, &agent).unwrap(), None);
+        assert!(matches!(
+            device_keys_for_verification(&paths, &agent).unwrap(),
+            VerificationKeys::Sealed(_)
+        ));
+        assert!(paths.device_keys_sealed.exists());
+        assert!(TrustStore::load_from(&paths.trust).unwrap().verified(ASTATION_ID).is_some());
     }
 
     #[test]

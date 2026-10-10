@@ -206,6 +206,13 @@ fn signed_request(
     ))
 }
 
+/// Whether an `unlockDenied` says the device was revoked: the `revoked`
+/// flag, or, from an Astation that doesn't send it yet, "revoked" in the
+/// reason.
+fn denial_revokes(reason: &str, revoked: bool) -> bool {
+    revoked || reason.to_lowercase().contains("revoked")
+}
+
 /// Unlocks the agent through `astation_id` (the home Astation): the agent's
 /// single-use key goes out in a request signed by the unlock-auth key, and
 /// Astation's sealed, signed answer goes straight back to the agent. A grant
@@ -280,8 +287,31 @@ pub(crate) async fn unlock_via<L: AstationLink>(
                     )
                 })
         }
-        AstationMessage::UnlockDenied { reason } => {
-            bail!("Astation denied the unlock: {}", shown(&reason))
+        AstationMessage::UnlockDenied { reason, revoked } => {
+            if !denial_revokes(&reason, revoked) {
+                bail!("Astation denied the unlock: {}", shown(&reason));
+            }
+            // Unsigned (it came over the relay), so all it may cause is a
+            // note in cred_state.json; `atem pair` then sets the old key files
+            // aside (renamed, never deleted) and verifies with new keys and a
+            // new safety code. A forged one costs a re-pair, never keys or trust.
+            let (path, astation_id, at) =
+                (paths.trust.clone(), astation_id.to_string(), now_secs());
+            let recorded = blocking(move || {
+                TrustStore::update(&path, |store| {
+                    store.record_revoked(&astation_id, at);
+                    Ok(())
+                })
+            })
+            .await;
+            let note = match recorded {
+                Ok(()) => String::new(),
+                Err(error) => format!(" (couldn't record it: {error:#})"),
+            };
+            bail!(
+                "Astation denied the unlock: {}; this device was revoked; run `atem pair` to verify it again{note}",
+                shown(&reason)
+            )
         }
         _ => unreachable!("filtered by next_reply"),
     }
@@ -875,6 +905,8 @@ mod tests {
         server: FakeKeyServer,
         inbox: VecDeque<AstationMessage>,
         deny: Option<String>,
+        /// The denial carries `revoked: true`.
+        deny_revoked: bool,
         /// Refuses the next rotate with this reason and pending kid.
         reject: Option<(String, Option<String>)>,
         silent: bool,
@@ -898,6 +930,7 @@ mod tests {
                 server,
                 inbox: VecDeque::new(),
                 deny: None,
+                deny_revoked: false,
                 reject: None,
                 silent: false,
                 hang: false,
@@ -927,6 +960,7 @@ mod tests {
                     let reply = match &self.deny {
                         Some(reason) => AstationMessage::UnlockDenied {
                             reason: reason.clone(),
+                            revoked: self.deny_revoked,
                         },
                         None => {
                             let request = SignedWire {
@@ -1058,6 +1092,70 @@ mod tests {
         let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
         assert!(error.contains("Denied on the Mac"), "{error}");
         assert!(!agent.status().unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_denial_is_recorded_and_says_to_pair_again() {
+        // With the flag, and from an Astation that only says so in the reason.
+        for (reason, flag) in [
+            ("Denied on the Mac", true),
+            (
+                "Unlock was denied and this device's verification was REVOKED.",
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+            let agent = agent(&paths);
+            let mut link = ScriptedLink::new(server);
+            link.deny = Some(reason.into());
+            link.deny_revoked = flag;
+            let before = now_secs();
+            let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
+            assert!(error.contains(reason), "{error}");
+            assert!(
+                error.contains("this device was revoked; run `atem pair` to verify it again"),
+                "{error}"
+            );
+            let trust = TrustStore::load_from(&paths.trust).unwrap();
+            let revoked = trust.revoked().expect("the revocation is recorded");
+            assert_eq!(revoked.astation_id, ASTATION_ID);
+            assert!(revoked.at >= before && revoked.at <= now_secs());
+            assert!(!agent.status().unwrap().unlocked);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_denial_records_no_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server);
+        link.deny = Some("Denied on the Mac".into());
+        let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
+        assert!(!error.contains("revoked"), "{error}");
+        assert!(
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .revoked()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn status_shows_a_recorded_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+        // 2025-04-01 08:50 UTC
+        trust.record_revoked(ASTATION_ID, 1743497400);
+        let report = status_report(&trust, ASTATION_ID, &AgentState::NotRunning, None, None);
+        assert!(
+            report.starts_with(
+                "Verified: revoked by Astation astation-1 (2025-04-01 08:50 UTC); run 'atem pair' to verify this device again\n"
+            ),
+            "{report}"
+        );
     }
 
     #[tokio::test]

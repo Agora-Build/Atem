@@ -1342,7 +1342,7 @@ all of them to, and accepts them only from, its home Astation.
 |---|---|---|
 | `unlockRequest` | atem → Astation | `request` (the `atem-unlock-request-v1` statement bytes), `signature` (Ed25519 by the unlock-auth key, 64 bytes) |
 | `unlockGrant` | Astation → atem | `grant: SignedWire` (`atem-unlock-grant-v1`), `encapped_key`, `ciphertext` (the storage key sealed to the request's `e_pub`) |
-| `unlockDenied` | Astation → atem | `reason` |
+| `unlockDenied` | Astation → atem | `reason`, optional `revoked` (true when the user chose Deny and revoke) |
 | `storageKeyRotate` | atem → Astation | `rotate: SignedWire` (`atem-storage-rotate-v1`, Ed25519 by the device signing key), `encapped_key`, `ciphertext` (the new storage key sealed to Astation's encryption key) |
 | `storageKeyAck` | Astation → atem | `ack: SignedWire` (`atem-storage-ack-v1`) |
 | `storageKeyRejected` | Astation → atem | `reason`, optional `pending_kid` (set only when the rotate was refused because Astation holds that pending key) |
@@ -1358,6 +1358,13 @@ request in flight (a stale or replayed reply) and keeps waiting, up to 300 s
 for an unlock and 60 s for a rotation. It strips control, bidi and invisible
 format characters from `reason` and `pending_kid` and shows at most 200
 characters.
+An `unlockDenied` with `revoked: true` (or, from an Astation that doesn't
+send the flag yet, "revoked" in `reason`) is recorded in `cred_state.json`;
+`atem cred status` shows it, and the next `atem pair` with the agent locked
+renames the old key files to `<name>.revoked-<stamp>` and verifies with new
+keys. The signal is unsigned too, but acting on it only renames old files
+aside and re-verifies with a fresh safety code, so a forged "revoked" can
+cost a re-pair but never keys or trust.
 
 ### Astation work for step 2a
 
@@ -1395,7 +1402,9 @@ the reference behaviour.
    either way). Anything failing → `unlockDenied { reason }`, no prompt.
    Otherwise show the Touch ID prompt (device name, boot ID, request time,
    last unlock) with Approve, Deny, and Deny and revoke; on deny send
-   `unlockDenied { reason }`.
+   `unlockDenied { reason }`, and on Deny and revoke
+   `unlockDenied { reason, revoked: true }` (atem then sets the device's
+   old keys aside at its next `atem pair`).
 3. **On approve,** take the storage key whose kid equals the request's
    `storage_kid`: the current key or the pending one. No such key →
    `unlockDenied`; never release another key (atem refuses a grant whose
