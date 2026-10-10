@@ -6,8 +6,8 @@ use crate::memory::account_keys::CryptOp;
 use crate::memory::crypto::{EncryptionMode, fail_writes_to};
 use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::fake_astation::{
-    ACCOUNT, ASTATION_ID, DEVICE_ID, UnlockedDevice, migrated_device, pin_as, sealed_account_keys,
-    sealed_device, set_state, set_state_as, unlock_with,
+    ACCOUNT, ASTATION_ID, DEVICE_ID, UnlockedDevice, migrated_device, pin_as, pin_for_account,
+    sealed_account_keys, sealed_device, set_state, set_state_as, unlock_with,
 };
 use crate::memory::grant::seal_k_grant;
 use crate::memory::key_agent::{KeyAgentApi, build_unlock_request, error_of, holds_k, test_agent};
@@ -1033,4 +1033,57 @@ fn server_grant(
         kid,
         key,
     )
+}
+
+#[test]
+fn a_verified_device_with_a_corrupt_cred_state_keeps_data_keys_enc_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, _, _) = sealed_device(dir.path(), "0a1b2c3d");
+    legacy(&paths, ACCOUNT);
+    let before = std::fs::read(&paths.data_keys).unwrap();
+    // cred_state.json can't be read: the agent can't tell the device is
+    // verified, so it must not take it for an unverified one.
+    std::fs::write(&paths.trust, b"not json").unwrap();
+    let _agent = test_agent(&paths);
+    assert_eq!(std::fs::read(&paths.data_keys).unwrap(), before);
+    assert!(moved_aside(&paths).is_empty());
+}
+
+#[test]
+fn two_verified_astations_migrate_their_accounts_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+    // A second verified Astation, for another account.
+    let other = FakeAstation::new();
+    pin_for_account(&paths, "astation-2", &other, &keys, false, "account-2");
+    legacy(&paths, ACCOUNT);
+    write_for_test(
+        &paths.data_keys,
+        "astation-2",
+        "account-2",
+        &[("44445555", [4; 32]), (B, [5; 32])],
+        &[("h1.89abcdef.bb", "github.com/agora/other")],
+    );
+    write_for_test(
+        &paths.data_keys,
+        "astation-3",
+        "unverified",
+        &[("66667777", [6; 32])],
+        &[("h1.66667777.cc", "github.com/agora/third")],
+    );
+    let agent = test_agent(&paths);
+    unlock_with(&agent, &server, &paths).unwrap();
+    assert!(!paths.data_keys.exists());
+    let sealed = sealed_account_keys(&server, &paths, &paths.device_keys_sealed);
+    assert_eq!(sealed.current_kid(ACCOUNT), Some(A));
+    assert_eq!(sealed.previous_kids(ACCOUNT), [OLD]);
+    assert_eq!(sealed.current_kid("account-2"), Some(B));
+    assert_eq!(sealed.previous_kids("account-2"), ["44445555"]);
+    assert_eq!(sealed.current_kid("unverified"), None);
+    let names = ProjectNames::load_from(&paths.project_names).unwrap();
+    assert_eq!(
+        names.name("account-2", "h1.89abcdef.bb"),
+        Some("github.com/agora/other")
+    );
+    assert_eq!(names.len("unverified"), 0);
 }

@@ -42,6 +42,18 @@ pub(crate) fn pin_as(
     keys: &DeviceKeys,
     home: bool,
 ) {
+    pin_for_account(paths, astation_id, astation, keys, home, ACCOUNT);
+}
+
+/// [`pin_as`] for another data account.
+pub(crate) fn pin_for_account(
+    paths: &KeyPaths,
+    astation_id: &str,
+    astation: &FakeAstation,
+    keys: &DeviceKeys,
+    home: bool,
+    account: &str,
+) {
     let pinned = AstationKeys {
         sign_pub: astation.sign_pub(),
         enc_pub: astation.enc_pub(),
@@ -58,7 +70,7 @@ pub(crate) fn pin_as(
         &[8; 32],
     );
     let certificate = DeviceVerified {
-        account: ACCOUNT.into(),
+        account: account.into(),
         sign_gen: 1,
         device_id: DEVICE_ID.into(),
         device_pub: keys.device_pub(),
