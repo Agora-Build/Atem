@@ -291,8 +291,8 @@ impl EncryptionContext {
             return Ok(Vec::new());
         }
         let agent = self.agent.as_deref().ok_or_else(|| anyhow!("encryption is off for this account"))?;
-        if let Some(size) = ops.iter().map(CryptOp::wire_len).find(|size| *size > CRYPT_OP_MAX_BYTES) {
-            bail!("a field is too large to encrypt ({size} bytes)");
+        if let Some(op) = ops.iter().find(|op| op.wire_len() > CRYPT_OP_MAX_BYTES) {
+            bail!("a field is too large to encrypt ({} bytes)", op.field_len());
         }
         let mut results = Vec::with_capacity(ops.len());
         let mut batch = Vec::new();

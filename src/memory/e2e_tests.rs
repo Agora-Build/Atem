@@ -540,7 +540,7 @@ fn a_field_too_big_for_one_agent_request_fails_before_any_request() {
         panic!("a 5 MiB field must be refused");
     };
     let error = format!("{error:#}");
-    assert!(error.contains("a field is too large to encrypt ("), "{error}");
+    assert!(error.contains(&format!("a field is too large to encrypt ({} bytes)", huge.len())), "{error}");
     assert_eq!(counting.crypts.load(Ordering::SeqCst), 0, "nothing is sent");
     // The largest skill still fits in one request.
     let skill = vec![2u8; crate::memory::skills_fs::MAX_SKILL_BYTES];

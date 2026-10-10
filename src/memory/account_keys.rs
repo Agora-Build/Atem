@@ -339,6 +339,20 @@ impl CryptOp {
         }
     }
 
+    /// The size of the field itself, in bytes (for error messages): the
+    /// plain text to seal or hash, or the `e1.` value to open.
+    pub fn field_len(&self) -> usize {
+        let decoded = |b64: &str| {
+            let padding = b64.bytes().rev().take_while(|byte| *byte == b'=').count();
+            (b64.len() / 4 * 3).saturating_sub(padding)
+        };
+        match self {
+            Self::Seal { plain, .. } => decoded(plain),
+            Self::Open { value, .. } => value.len(),
+            Self::KeyedHash { value } => decoded(value),
+        }
+    }
+
     /// Roughly what this op adds to a request line and its reply, for batching.
     pub fn wire_len(&self) -> usize {
         match self {
@@ -716,6 +730,16 @@ mod tests {
         assert!(AccountKeys::from_wire(serde_json::from_str(bad_kid).unwrap()).is_err());
         let short_key = r#"{"acct":{"kid":"0123abcd","key":"AAAA"}}"#;
         assert!(AccountKeys::from_wire(serde_json::from_str(short_key).unwrap()).is_err());
+    }
+
+    #[test]
+    fn field_len_is_the_size_of_the_field_itself() {
+        for len in [0, 1, 2, 3, 4, 5, 1000] {
+            let plain = vec![7u8; len];
+            assert_eq!(CryptOp::seal("r", "f", &plain).field_len(), len);
+            assert_eq!(CryptOp::keyed_hash(&plain).field_len(), len);
+        }
+        assert_eq!(CryptOp::open("r", "f", "e1.0123abcd.AAAA").field_len(), 16);
     }
 
     #[test]
