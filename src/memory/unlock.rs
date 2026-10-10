@@ -45,6 +45,9 @@ fn escrow_wait(paths: &KeyPaths) -> Duration {
 pub(crate) trait AstationLink {
     async fn send(&mut self, message: AstationMessage) -> Result<()>;
     async fn recv(&mut self) -> Option<AstationMessage>;
+    /// Applies a signed `encryptionMode` or `keyGrant` (checked against the
+    /// pinned keys) and returns its status line; `None` for other traffic.
+    async fn apply_encryption(&mut self, message: &AstationMessage) -> Result<Option<String>>;
 }
 
 impl AstationLink for AstationClient {
@@ -54,6 +57,10 @@ impl AstationLink for AstationClient {
 
     async fn recv(&mut self) -> Option<AstationMessage> {
         self.recv_message_async().await
+    }
+
+    async fn apply_encryption(&mut self, message: &AstationMessage) -> Result<Option<String>> {
+        self.handle_encryption_message(message).await
     }
 }
 
@@ -93,8 +100,25 @@ fn shown(text: &str) -> String {
         .collect()
 }
 
-/// The next message `wanted` accepts within `wait`, skipping unrelated
-/// traffic and replies `wanted` rejects (stale or forged ones).
+/// Applies an encryption message (`encryptionMode`, `keyGrant`) and prints
+/// what it did. Astation sends them right after connect, so they arrive while
+/// atem waits for something else; dropped, the device would keep a stale
+/// mode. A grant that arrives while the keys are locked is ignored and asked
+/// for again once they are unlocked (`request_missing_key`).
+async fn apply_encryption_message<L: AstationLink>(link: &mut L, message: &AstationMessage) {
+    match link.apply_encryption(message).await {
+        Ok(Some(status)) => println!("{}", shown(&status)),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "⚠️  Ignored an encryption message: {}",
+            shown(&format!("{error:#}"))
+        ),
+    }
+}
+
+/// The next message `wanted` accepts within `wait`, applying encryption
+/// messages on the way and skipping other unrelated traffic and replies
+/// `wanted` rejects (stale or forged ones).
 ///
 /// Unsigned refusals (`unlockDenied`, `storageKeyRejected`) are accepted and
 /// end the flow. They only cost liveness: a relay that can forge one can
@@ -110,7 +134,7 @@ async fn next_reply<L: AstationLink>(
         loop {
             match link.recv().await {
                 Some(message) if wanted(&message) => return Ok(message),
-                Some(_) => continue,
+                Some(message) => apply_encryption_message(link, &message).await,
                 None => bail!("Astation's connection closed before it answered"),
             }
         }
@@ -615,18 +639,18 @@ pub(crate) async fn unlock_and_rotate<L: AstationLink>(
                 status.storage_kid.unwrap_or_default()
             ),
         }
-        return Ok(());
+    } else {
+        println!("Approve on your Mac with Touch ID…");
+        let kid = unlock_via(link, agent, paths, home, wait).await?;
+        println!("✅ Unlocked (storage key {kid}).");
+        match rotate_via(link, agent, paths, home, ROTATION_TIMEOUT).await {
+            Ok(kid) => println!("Storage key rotated ({kid})."),
+            Err(error) => eprintln!(
+                "⚠️  The storage key wasn't rotated ({error:#}); it rotates at the next unlock."
+            ),
+        }
     }
-    println!("Approve on your Mac with Touch ID…");
-    let kid = unlock_via(link, agent, paths, home, wait).await?;
-    println!("✅ Unlocked (storage key {kid}).");
-    match rotate_via(link, agent, paths, home, ROTATION_TIMEOUT).await {
-        Ok(kid) => println!("Storage key rotated ({kid})."),
-        Err(error) => eprintln!(
-            "⚠️  The storage key wasn't rotated ({error:#}); it rotates at the next unlock."
-        ),
-    }
-    Ok(())
+    request_missing_key(link, agent, paths, home).await
 }
 
 /// What `atem cred status` learned about the key agent.
@@ -804,15 +828,7 @@ async fn unlock_command(paths: &KeyPaths) -> Result<()> {
         return Ok(());
     }
     let mut client = connect_home(&home).await?;
-    unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
-    let missing = {
-        let (agent, paths, home) = (agent.clone(), paths.clone(), home.clone());
-        blocking(move || key_needed(&paths, agent.as_ref(), &home)).await?
-    };
-    if missing {
-        request_missing_key(&mut client, &trust, &home).await?;
-    }
-    Ok(())
+    unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await
 }
 
 /// "Already unlocked" when `atem cred unlock` has nothing to ask Astation:
@@ -837,41 +853,53 @@ fn already_unlocked(
     )))
 }
 
-/// A grant that arrived while the keys were locked was ignored: ask again,
-/// with the device key Astation pinned.
-async fn request_missing_key(
-    client: &mut AstationClient,
-    trust: &TrustStore,
+/// How long to wait for `K` after a `keyRequest`.
+const KEY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// After an unlock: when the newest signed state needs `K` and the agent
+/// doesn't hold it (a grant that arrived while the keys were locked was
+/// ignored, or the state itself only arrived during the unlock), asks the
+/// home Astation for it with the device key it pinned and installs the
+/// grant. Nothing is asked when no signed state needs `K`.
+async fn request_missing_key<L: AstationLink>(
+    link: &mut L,
+    agent: &Arc<dyn KeyAgentApi>,
+    paths: &KeyPaths,
     home: &str,
 ) -> Result<()> {
-    let public_key = trust
-        .verified(home)
-        .ok_or_else(|| anyhow!("this device isn't verified with its home Astation"))?
-        .device_pub
-        .clone();
-    client
-        .send_message(AstationMessage::KeyRequest { public_key })
+    let public_key = {
+        let (agent, paths, home) = (agent.clone(), paths.clone(), home.to_string());
+        blocking(move || {
+            if !key_needed(&paths, agent.as_ref(), &home)? {
+                return Ok(None);
+            }
+            let trust = TrustStore::load_from(&paths.trust)?;
+            Ok(Some(
+                trust
+                    .verified(&home)
+                    .ok_or_else(|| anyhow!("this device isn't verified with its home Astation"))?
+                    .device_pub
+                    .clone(),
+            ))
+        })
+        .await?
+    };
+    let Some(public_key) = public_key else {
+        return Ok(());
+    };
+    link.send(AstationMessage::KeyRequest { public_key })
         .await?;
     println!("Encryption key requested from Astation…");
-    let waited = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match client.recv_message_async().await {
-                Some(message @ AstationMessage::KeyGrant { .. }) => {
-                    return client.handle_encryption_message(&message).await;
-                }
-                Some(_) => continue,
-                None => bail!("Astation closed the connection"),
-            }
-        }
+    let grant = next_reply(link, KEY_TIMEOUT, "to send the encryption key", |message| {
+        matches!(message, AstationMessage::KeyGrant { .. })
     })
     .await;
-    match waited {
-        Ok(Ok(Some(status))) => println!("{}", shown(&status)),
-        Ok(Ok(None)) => {}
-        Ok(Err(error)) => eprintln!("⚠️  {}", shown(&format!("{error:#}"))),
-        Err(_) => {
+    match grant {
+        Ok(grant) => apply_encryption_message(link, &grant).await,
+        Err(error) if error.downcast_ref::<NoAnswer>().is_some() => {
             eprintln!("⚠️  Astation didn't send the key yet; it arrives on a later connection.")
         }
+        Err(error) => eprintln!("⚠️  {}", shown(&format!("{error:#}"))),
     }
     Ok(())
 }
@@ -879,14 +907,19 @@ async fn request_missing_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::crypto::EncryptionMode;
+    use crate::memory::device_keys::DeviceKeys;
     use crate::memory::fake_astation::ACCOUNT;
     use crate::memory::fake_astation::{
-        ASTATION_ID, DEVICE_ID, FakeKeyServer, captured_rotation, sealed_device,
+        ASTATION_ID, DEVICE_ID, FakeKeyServer, captured_rotation, sealed_device, set_state,
     };
+    use crate::memory::grant::seal_k_grant;
     use crate::memory::key_agent::{AgentStatus, RESET};
     use crate::memory::key_agent::{error_of, test_agent};
+    use crate::memory::statements::AccountState;
     use crate::memory::statements::{FakeAstation, SignedWire, StorageAck};
     use crate::memory::storage_key::{SealedDeviceKeys, StorageRotation, new_storage_key};
+    use crate::memory::verification::account_mode;
     use std::collections::VecDeque;
 
     #[test]
@@ -926,6 +959,15 @@ mod tests {
         fail_confirm: bool,
         abandons: usize,
         rotates: usize,
+        /// Encryption messages are applied to these paths and this agent.
+        keys: Option<(KeyPaths, Arc<dyn KeyAgentApi>)>,
+        /// What each applied encryption message did (`Applied`, as Debug).
+        applied: Vec<String>,
+        /// Queued just before the answer to the next rotate.
+        on_rotate: Option<AstationMessage>,
+        /// Answers a `keyRequest` with this.
+        key_grant: Option<AstationMessage>,
+        key_requests: usize,
     }
 
     impl ScriptedLink {
@@ -944,7 +986,17 @@ mod tests {
                 fail_confirm: false,
                 abandons: 0,
                 rotates: 0,
+                keys: None,
+                applied: Vec::new(),
+                on_rotate: None,
+                key_grant: None,
+                key_requests: 0,
             }
+        }
+
+        fn with_keys(mut self, paths: &KeyPaths, agent: &Arc<dyn KeyAgentApi>) -> Self {
+            self.keys = Some((paths.clone(), agent.clone()));
+            self
         }
     }
 
@@ -999,6 +1051,9 @@ mod tests {
                     ciphertext,
                 } => {
                     self.rotates += 1;
+                    if let Some(message) = self.on_rotate.take() {
+                        self.inbox.push_back(message);
+                    }
                     let reply = if let Some((reason, pending_kid)) = self.reject.take() {
                         AstationMessage::StorageKeyRejected {
                             reason,
@@ -1028,6 +1083,12 @@ mod tests {
                     self.abandons += 1;
                     self.server.accept_abandon(&abandon)?;
                 }
+                AstationMessage::KeyRequest { .. } => {
+                    self.key_requests += 1;
+                    if let Some(grant) = self.key_grant.take() {
+                        self.inbox.push_back(grant);
+                    }
+                }
                 _ => {}
             }
             Ok(())
@@ -1040,6 +1101,130 @@ mod tests {
                 None => None,
             }
         }
+
+        async fn apply_encryption(&mut self, message: &AstationMessage) -> Result<Option<String>> {
+            use crate::memory::verification::{apply_account_state, apply_grant};
+            let Some((paths, agent)) = &self.keys else {
+                return Ok(None);
+            };
+            let applied = match message {
+                AstationMessage::EncryptionMode { account_state } => {
+                    apply_account_state(paths, ASTATION_ID, account_state.as_ref())?
+                }
+                AstationMessage::KeyGrant { grant } => {
+                    apply_grant(paths, agent.as_ref(), ASTATION_ID, grant.as_ref())?
+                }
+                _ => return Ok(None),
+            };
+            let applied = format!("{applied:?}");
+            self.applied.push(applied.clone());
+            Ok(Some(applied))
+        }
+    }
+
+    const K_KID: &str = "0123abcd";
+
+    /// `encryptionMode` signed by the pinned Astation.
+    fn signed_mode(server: &FakeKeyServer, mode: EncryptionMode, epoch: u64) -> AstationMessage {
+        let state = AccountState {
+            account: ACCOUNT.into(),
+            sign_gen: 1,
+            mode,
+            kid: mode.requires_key().then(|| K_KID.to_string()),
+            epoch,
+        };
+        AstationMessage::EncryptionMode {
+            account_state: Some(server.astation.sign(&state.encode())),
+        }
+    }
+
+    /// `keyGrant` of `K` (kid `K_KID`) for this device.
+    fn k_grant(server: &FakeKeyServer, keys: &DeviceKeys) -> AstationMessage {
+        AstationMessage::KeyGrant {
+            grant: Some(seal_k_grant(
+                &server.astation,
+                ACCOUNT,
+                DEVICE_ID,
+                keys.device_pub(),
+                K_KID,
+                [42; 32],
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_encryption_mode_that_arrives_during_the_unlock_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        set_state(&paths, &server.astation, EncryptionMode::Off, None, 58);
+        let mut link = ScriptedLink::new(server).with_keys(&paths, &agent);
+        let mode = signed_mode(&link.server, EncryptionMode::On, 59);
+        link.inbox.push_back(mode);
+        unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        let state = account_mode(&paths.trust, ASTATION_ID).unwrap();
+        assert_eq!(state.mode, EncryptionMode::On);
+        assert_eq!(state.kid.as_deref(), Some(K_KID));
+        assert!(
+            link.applied.iter().any(|a| a.starts_with("ModeChanged")),
+            "{:?}",
+            link.applied
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_grant_that_arrives_after_the_unlock_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server).with_keys(&paths, &agent);
+        let (mode, grant) = (
+            signed_mode(&link.server, EncryptionMode::On, 2),
+            k_grant(&link.server, &keys),
+        );
+        // A grant before the unlock can't be opened yet; the same grant
+        // during the rotation can.
+        link.inbox.extend([mode, grant.clone()]);
+        link.on_rotate = Some(grant);
+        unlock_and_rotate(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(link.applied[1], "Locked", "{:?}", link.applied);
+        assert_eq!(agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some(K_KID));
+        assert_eq!(link.key_requests, 0, "K arrived without asking");
+    }
+
+    #[tokio::test]
+    async fn a_key_still_needed_after_the_unlock_is_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        let mut link = ScriptedLink::new(server).with_keys(&paths, &agent);
+        let mode = signed_mode(&link.server, EncryptionMode::On, 2);
+        link.key_grant = Some(k_grant(&link.server, &keys));
+        link.inbox.push_back(mode);
+        unlock_and_rotate(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(link.key_requests, 1);
+        assert_eq!(agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some(K_KID));
+    }
+
+    #[tokio::test]
+    async fn an_unlock_without_an_encryption_mode_asks_for_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        set_state(&paths, &server.astation, EncryptionMode::Off, None, 58);
+        let mut link = ScriptedLink::new(server).with_keys(&paths, &agent);
+        unlock_and_rotate(&mut link, &agent, &paths, ASTATION_ID, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(link.key_requests, 0);
+        let state = account_mode(&paths.trust, ASTATION_ID).unwrap();
+        assert_eq!(state.mode, EncryptionMode::Off);
     }
 
     fn agent(paths: &KeyPaths) -> Arc<dyn KeyAgentApi> {
