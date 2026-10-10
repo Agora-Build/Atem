@@ -18,7 +18,7 @@ use crate::memory::trust::TrustStore;
 use crate::memory::account_keys::{AccountKey, seal_field};
 use crate::memory::device_keys::DeviceKeys;
 use crate::memory::fake_astation::{FakeKeyServer, pin};
-use crate::memory::legacy_keys::write_for_test;
+use crate::memory::legacy_keys::{Damage, damage_for_test, write_for_test};
 use crate::memory::project_names::ProjectNames;
 use crate::memory::verification::KeyPaths;
 
@@ -947,4 +947,90 @@ fn every_caller_follows_the_newest_state_when_two_astations_name_one_account() {
             "{astation_id}"
         );
     }
+}
+
+#[test]
+fn a_malformed_legacy_entry_keeps_data_keys_enc_and_the_valid_keys_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+    set_state(&paths, &server.astation, EncryptionMode::On, Some(A), 2);
+    legacy(&paths, ACCOUNT);
+    // The current entry can't be read; its previous key still can.
+    damage_for_test(&paths.data_keys, ACCOUNT, Damage::Current);
+    let agent = test_agent(&paths);
+    unlock_with(&agent, &server, &paths).unwrap();
+    assert!(
+        paths.data_keys.exists(),
+        "kept: an entry of a verified account didn't parse"
+    );
+    // The valid previous key moved: fields sealed under it still open.
+    let sealed = sealed_account_keys(&server, &paths, &paths.device_keys_sealed);
+    assert_eq!(sealed.current_kid(ACCOUNT), Some(OLD));
+    let opened = agent
+        .crypt(
+            ASTATION_ID,
+            vec![CryptOp::open("mem", "content", &sealed_under_old())],
+        )
+        .map(|mut out| out.remove(0).into_plain().unwrap().to_vec());
+    // `on` names A, which this device doesn't hold: K is missing.
+    assert!(error_of(opened).contains("requires encryption"));
+    // The grant for A arrives and installs; the file is still kept at the
+    // next unlock.
+    agent
+        .install_grant(ASTATION_ID, &server_grant(&server, &keys, A, [42; 32]))
+        .unwrap();
+    assert_eq!(agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some(A));
+    agent.lock_keys().unwrap();
+    unlock_with(&agent, &server, &paths).unwrap();
+    assert!(paths.data_keys.exists());
+}
+
+#[test]
+fn a_missing_current_legacy_entry_still_moves_the_previous_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, server, keys) = sealed_device(dir.path(), "0a1b2c3d");
+    set_state(
+        &paths,
+        &server.astation,
+        EncryptionMode::Enabling,
+        Some(A),
+        2,
+    );
+    legacy(&paths, ACCOUNT);
+    damage_for_test(&paths.data_keys, ACCOUNT, Damage::DropCurrent);
+    let agent = test_agent(&paths);
+    unlock_with(&agent, &server, &paths).unwrap();
+    // Everything that was there parsed: moved, then deleted.
+    assert!(!paths.data_keys.exists());
+    let sealed = sealed_account_keys(&server, &paths, &paths.device_keys_sealed);
+    assert_eq!(sealed.current_kid(ACCOUNT), Some(OLD));
+    agent
+        .install_grant(ASTATION_ID, &server_grant(&server, &keys, A, [42; 32]))
+        .unwrap();
+    let opened = agent
+        .crypt(
+            ASTATION_ID,
+            vec![CryptOp::open("mem", "content", &sealed_under_old())],
+        )
+        .unwrap();
+    assert_eq!(
+        &*opened.into_iter().next().unwrap().into_plain().unwrap(),
+        b"old"
+    );
+}
+
+fn server_grant(
+    server: &FakeKeyServer,
+    keys: &DeviceKeys,
+    kid: &str,
+    key: [u8; 32],
+) -> crate::memory::grant::GrantWire {
+    seal_k_grant(
+        &server.astation,
+        ACCOUNT,
+        DEVICE_ID,
+        keys.device_pub(),
+        kid,
+        key,
+    )
 }

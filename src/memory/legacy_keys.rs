@@ -4,7 +4,8 @@
 //! at each unlock the key agent moves the keys and names of every verified
 //! account into `device_keys.sealed` and `project_names.json`, and deletes
 //! the file once the home Astation holds the storage key of the sealed file
-//! (key_agent.rs `migrate_data_keys`). An agent on an unverified device
+//! and every entry of those accounts parsed (key_agent.rs
+//! `migrate_data_keys`; a malformed entry keeps the file). An agent on an unverified device
 //! deletes it at start. An unreadable one is moved aside (`move_aside`),
 //! never deleted. A first verification purges what the unauthenticated #36
 //! path stored in it, except accounts another verified Astation names.
@@ -48,6 +49,15 @@ fn version_one() -> u8 {
     1
 }
 
+/// The keys of the verified accounts in a step-2a store.
+pub struct LegacyKeySet {
+    /// Each account with its current key (`None` when that entry is missing
+    /// or malformed) and the valid keys it replaced, oldest first.
+    pub keys: Vec<(String, Option<AccountKey>, Vec<AccountKey>)>,
+    /// The accounts with an entry that didn't parse: the file is kept.
+    pub unreadable: BTreeSet<String>,
+}
+
 pub enum Legacy {
     Missing,
     /// It can never be read on this machine (another machine id, damage).
@@ -83,12 +93,12 @@ pub fn read(path: &Path) -> Result<Legacy> {
 
 impl LegacyKeys {
     /// Each account in `accounts` (the verified ones) with its current key
-    /// and the keys it replaced. Malformed entries are skipped: they could
-    /// never open anything.
-    pub fn keys_for(
-        &self,
-        accounts: &BTreeSet<String>,
-    ) -> Vec<(String, AccountKey, Vec<AccountKey>)> {
+    /// and the keys it replaced. A malformed entry could never open
+    /// anything: it is left out, and its account is reported in
+    /// `unreadable` (the caller keeps the file). The account's other valid
+    /// keys are still returned, also when its current entry is malformed or
+    /// missing.
+    pub fn keys_for(&self, accounts: &BTreeSet<String>) -> LegacyKeySet {
         let parse = |stored: &StoredKey| -> Option<AccountKey> {
             if !crate::memory::crypto::valid_kid(&stored.kid) {
                 return None;
@@ -98,24 +108,39 @@ impl LegacyKeys {
                 key: crate::memory::device_keys::decode32(&stored.key, "account key").ok()?,
             })
         };
-        let mut keys: Vec<_> = self
+        let named: BTreeSet<&String> = self
             .accounts
-            .iter()
-            .filter(|(account, _)| accounts.contains(*account))
-            .filter_map(|(account, stored)| {
-                let current = parse(stored)?;
-                let previous = self
-                    .previous_keys
-                    .get(account)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(parse)
-                    .collect();
-                Some((account.clone(), current, previous))
-            })
+            .keys()
+            .chain(self.previous_keys.keys())
+            .filter(|account| accounts.contains(*account))
             .collect();
-        keys.sort_by(|a, b| a.0.cmp(&b.0));
-        keys
+        let mut set = LegacyKeySet {
+            keys: Vec::new(),
+            unreadable: BTreeSet::new(),
+        };
+        for account in named {
+            let mut readable = true;
+            let mut parsed = |stored: &StoredKey| {
+                let key = parse(stored);
+                readable &= key.is_some();
+                key
+            };
+            let current = self.accounts.get(account).and_then(&mut parsed);
+            let previous: Vec<AccountKey> = self
+                .previous_keys
+                .get(account)
+                .into_iter()
+                .flatten()
+                .filter_map(&mut parsed)
+                .collect();
+            if !readable {
+                set.unreadable.insert(account.clone());
+            }
+            if current.is_some() || !previous.is_empty() {
+                set.keys.push((account.clone(), current, previous));
+            }
+        }
+        set
     }
 
     /// The project names (`h1.` hash → name) of each account in `accounts`.
@@ -240,6 +265,37 @@ pub(crate) fn write_for_test(
             .map(|(hash, name)| (hash.to_string(), name.to_string()))
             .collect(),
     );
+    store.save_to(path).unwrap();
+}
+
+/// How [`damage_for_test`] breaks one account's entries.
+#[cfg(test)]
+pub(crate) enum Damage {
+    /// The current key is not base64.
+    Current,
+    /// The previous key at this index is not base64.
+    Previous(usize),
+    /// The current entry is gone; the previous keys stay.
+    DropCurrent,
+}
+
+/// Test stand-in for a damaged step-2a store.
+#[cfg(test)]
+pub(crate) fn damage_for_test(path: &Path, account: &str, damage: Damage) {
+    let Legacy::Keys(mut store) = read(path).unwrap() else {
+        panic!("readable");
+    };
+    match damage {
+        Damage::Current => {
+            store.accounts.get_mut(account).unwrap().key = Zeroizing::new("%%%".into());
+        }
+        Damage::Previous(index) => {
+            store.previous_keys.get_mut(account).unwrap()[index].key = Zeroizing::new("%%%".into());
+        }
+        Damage::DropCurrent => {
+            store.accounts.remove(account);
+        }
+    }
     store.save_to(path).unwrap();
 }
 
@@ -369,6 +425,80 @@ mod tests {
         );
     }
 
+    fn kids(keys: &[AccountKey]) -> Vec<&str> {
+        keys.iter().map(|key| key.kid.as_str()).collect()
+    }
+
+    #[test]
+    fn malformed_entries_are_reported_and_the_valid_keys_still_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data_keys.enc");
+        write_for_test(
+            &path,
+            "astation",
+            "acct",
+            &[
+                ("0123abcd", [1; 32]),
+                ("11112222", [2; 32]),
+                ("33334444", [3; 32]),
+            ],
+            &[],
+        );
+        write_for_test(
+            &path,
+            "astation-2",
+            "no-current",
+            &[("44445555", [4; 32]), ("66667777", [5; 32])],
+            &[],
+        );
+        write_for_test(
+            &path,
+            "astation-3",
+            "bad-previous",
+            &[
+                ("88889999", [6; 32]),
+                ("aaaabbbb", [7; 32]),
+                ("ccccdddd", [8; 32]),
+            ],
+            &[],
+        );
+        damage_for_test(&path, "acct", Damage::Current);
+        damage_for_test(&path, "no-current", Damage::DropCurrent);
+        damage_for_test(&path, "bad-previous", Damage::Previous(0));
+        let Legacy::Keys(store) = read(&path).unwrap() else {
+            panic!("readable");
+        };
+        let accounts: BTreeSet<String> = ["acct", "no-current", "bad-previous"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let found = store.keys_for(&accounts);
+        assert_eq!(
+            found.unreadable,
+            BTreeSet::from(["acct".to_string(), "bad-previous".to_string()]),
+            "a missing current entry is not a parse failure"
+        );
+        let by_account: Vec<_> = found
+            .keys
+            .iter()
+            .map(|(account, current, previous)| {
+                (
+                    account.as_str(),
+                    current.as_ref().map(|key| key.kid.as_str()),
+                    kids(previous),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_account,
+            vec![
+                ("acct", None, vec!["0123abcd", "11112222"]),
+                ("bad-previous", Some("ccccdddd"), vec!["aaaabbbb"]),
+                ("no-current", None, vec!["44445555"]),
+            ]
+        );
+    }
+
     #[test]
     fn keys_and_names_are_read_for_the_given_accounts_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -385,9 +515,12 @@ mod tests {
             panic!("readable");
         };
         let accounts = BTreeSet::from(["acct".to_string()]);
-        let keys = store.keys_for(&accounts);
+        let found = store.keys_for(&accounts);
+        assert!(found.unreadable.is_empty());
+        let keys = found.keys;
         assert_eq!(keys.len(), 1);
         let (account, current, previous) = &keys[0];
+        let current = current.as_ref().unwrap();
         assert_eq!(
             (account.as_str(), current.kid.as_str()),
             ("acct", "11112222")

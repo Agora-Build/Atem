@@ -645,7 +645,10 @@ impl KeyAgent {
     /// and its previous keys into the sealed file (merged: a newer `K` the
     /// agent holds stays current), and data_keys.enc is deleted last, only
     /// once the home Astation is known to hold the storage key of the file
-    /// the keys now live in (escrowed, and not unlocked via `.prev`). Every
+    /// the keys now live in (escrowed, and not unlocked via `.prev`), and
+    /// only when every entry of every verified account parsed: a malformed
+    /// one keeps the file (logged at each unlock), while the account's
+    /// valid keys still move. Every
     /// crash point leaves data_keys.enc, or the keys durably re-sealed; the
     /// next unlock repeats the merge, which changes nothing the second time.
     ///
@@ -690,7 +693,8 @@ impl KeyAgent {
         let (escrowed, via_prev) = (unlocked.escrowed, unlocked.via_prev);
         let mut accounts = unlocked.accounts.clone();
         let mut changed = false;
-        for (account, current, previous) in legacy.keys_for(&verified) {
+        let found = legacy.keys_for(&verified);
+        for (account, current, previous) in found.keys {
             changed |= accounts.merge(&account, current, previous);
         }
         if changed {
@@ -698,7 +702,19 @@ impl KeyAgent {
             self.persist(&accounts)?;
             self.unlocked.as_mut().expect("unlocked above").accounts = accounts;
         }
-        if escrowed && !via_prev {
+        // An entry that didn't parse may still be readable some other way
+        // (or by a fixed atem): the file stays, the valid keys are in.
+        if !found.unreadable.is_empty() {
+            eprintln!(
+                "key agent: kept data_keys.enc: some keys of {} can't be read (the readable ones were moved)",
+                found
+                    .unreadable
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        } else if escrowed && !via_prev {
             remove_synced(&self.paths.data_keys)?;
             eprintln!(
                 "key agent: moved data_keys.enc into device_keys.sealed and project_names.json"
