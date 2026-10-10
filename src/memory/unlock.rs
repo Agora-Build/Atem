@@ -26,6 +26,20 @@ use crate::websocket_client::{AstationClient, AstationMessage};
 pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(300);
 /// Rotation needs no prompt, only a device signature.
 pub const ROTATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Handing the storage key to Astation outside an unlock: an Astation that
+/// stores storage keys answers at once; one that doesn't never answers, so
+/// don't keep the user waiting a full rotation timeout.
+pub const ESCROW_TIMEOUT: Duration = Duration::from_secs(15);
+/// Once Astation has already left a handover unanswered, retry only briefly.
+pub const ESCROW_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for Astation to store a handed-over storage key.
+fn escrow_wait(paths: &KeyPaths) -> Duration {
+    let unanswered = TrustStore::load_from(&paths.trust)
+        .map(|trust| trust.escrow_unanswered())
+        .unwrap_or(false);
+    if unanswered { ESCROW_RETRY_TIMEOUT } else { ESCROW_TIMEOUT }
+}
 
 /// What unlock and rotation need from an Astation connection.
 pub(crate) trait AstationLink {
@@ -458,7 +472,8 @@ pub(crate) async fn escrow_if_needed<L: AstationLink>(
     if pending.is_none() && (!status.unlocked || status.escrowed) {
         return Ok(None);
     }
-    rotate_via(link, agent, paths, astation_id, ROTATION_TIMEOUT)
+    let wait = escrow_wait(paths);
+    rotate_via(link, agent, paths, astation_id, wait)
         .await
         .map(Some)
 }
@@ -526,7 +541,7 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
         astation_id,
         &home,
         rotation,
-        ROTATION_TIMEOUT,
+        escrow_wait(paths),
     )
     .await
     .map(PairEscrow::Escrowed)
@@ -839,6 +854,18 @@ mod tests {
     use crate::memory::statements::{FakeAstation, SignedWire, StorageAck};
     use crate::memory::storage_key::{SealedDeviceKeys, StorageRotation, new_storage_key};
     use std::collections::VecDeque;
+
+    #[test]
+    fn escrow_waits_briefly_and_less_once_unanswered() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        assert_eq!(escrow_wait(&paths), ESCROW_TIMEOUT);
+        let mut trust = TrustStore::default();
+        trust.record_escrow_unanswered();
+        trust.save_to(&paths.trust).unwrap();
+        assert_eq!(escrow_wait(&paths), ESCROW_RETRY_TIMEOUT);
+        assert!(ESCROW_TIMEOUT < ROTATION_TIMEOUT);
+    }
 
     const WAIT: Duration = Duration::from_secs(5);
 
