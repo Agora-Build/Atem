@@ -324,6 +324,63 @@ impl KnowledgeClient {
         encryption.blocking(move |encryption| encryption.decrypt_skill(page.skill)).await.map_err(ApiError::from)
     }
 
+    /// Read every returned historical row back and authenticate its migrated fields.
+    pub async fn verify_encryption_migration(&self) -> Result<(), ApiError> {
+        let encryption = self.encryption()?;
+        let kid = encryption.kid.clone().ok_or_else(|| ApiError::Encryption("migration key is missing".into()))?;
+        for memories in [true, false] {
+            let mut since = 0;
+            loop {
+                let request = if memories { memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT) }
+                    else { skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT) };
+                let response = self.send(request).await?;
+                let (count, next) = if memories {
+                    let page: MemoryPage = response.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
+                    let count = page.memories.len();
+                    let next = page.memories.iter().map(|row| row.seq).max().unwrap_or(since);
+                    let kid = kid.clone();
+                    encryption.blocking(move |context| {
+                        for row in &page.memories {
+                            for (value, prefix) in [(&row.content, "e1"), (&row.project, "h1"), (&row.content_hash, "h1")] {
+                                crate::memory::migration::verify_field(value, prefix, context.mode, &kid)?;
+                            }
+                        }
+                        context.decrypt_memories(page.memories)?;
+                        Ok(())
+                    }).await?;
+                    (count, next)
+                } else {
+                    let page: SkillPage = response.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
+                    let count = page.skills.len();
+                    let next = page.skills.iter().map(|row| row.seq).max().unwrap_or(since);
+                    let kid = kid.clone();
+                    encryption.blocking(move |context| {
+                        for row in &page.skills {
+                            for value in [&row.project, &row.content_hash] {
+                                crate::memory::migration::verify_field(value, "h1", context.mode, &kid)?;
+                            }
+                            for (path, content) in &row.files {
+                                crate::memory::migration::verify_field(path, "e1", context.mode, &kid)?;
+                                if context.mode == EncryptionMode::Enabling {
+                                    crate::memory::migration::verify_field(std::str::from_utf8(content)?, "e1", context.mode, &kid)?;
+                                } else if let Ok(content) = std::str::from_utf8(content) {
+                                    crate::memory::migration::verify_field(content, "e1", context.mode, &kid)?;
+                                }
+                            }
+                        }
+                        context.decrypt_skills(page.skills)?;
+                        Ok(())
+                    }).await?;
+                    (count, next)
+                };
+                if count < PULL_LIMIT as usize { break; }
+                if next <= since { return Err(ApiError::Encryption("migration verification cursor did not advance".into())); }
+                since = next;
+            }
+        }
+        Ok(())
+    }
+
     /// Snapshot every historical row before rewriting any of them. Rewrites
     /// allocate fresh sequence values, so interleaving pull and rewrite could
     /// otherwise keep rediscovering our own migration writes.

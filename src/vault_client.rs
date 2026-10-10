@@ -283,6 +283,27 @@ impl VaultClient {
         Ok(())
     }
 
+    pub async fn verify_encryption_migration(&self) -> Result<()> {
+        let encryption = self.encryption()?;
+        let kid = encryption.kid.clone().ok_or_else(|| anyhow!("migration key is missing"))?;
+        let list: Vec<VaultListItem> = self.send(list_vaults_request(&self.base, &self.client_id)).await?.json().await?;
+        for item in list {
+            let entries: Vec<VaultEntry> = self.send(read_vault_request(&self.base, &self.client_id,
+                &item.vault_id, None, true)).await?.json().await?;
+            let kid = kid.clone();
+            encryption.blocking(move |context| {
+                crate::memory::migration::verify_field(&item.summary, "e1", context.mode, &kid)?;
+                for entry in &entries {
+                    crate::memory::migration::verify_field(&entry.content, "e1", context.mode, &kid)?;
+                }
+                open_summaries(context, vec![item.clone()])?;
+                open_entries(context, &item.vault_id, entries)?;
+                Ok(())
+            }).await?;
+        }
+        Ok(())
+    }
+
     pub async fn migrate_encryption(&self) -> Result<()> {
         use crate::memory::crypto::EncryptionMode;
         let encryption = self.encryption()?;

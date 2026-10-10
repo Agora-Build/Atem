@@ -18,6 +18,11 @@ enum AuthResponse {
     Denied(String),
 }
 
+struct OutboundMessage {
+    message: AstationMessage,
+    delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AstationMessage {
@@ -354,7 +359,7 @@ pub enum AstationMessage {
     StorageKeyAbandon { abandon: crate::memory::statements::SignedWire },
 
     #[serde(rename = "encryptionMigrationComplete")]
-    EncryptionMigrationComplete { mode: String, kid: String },
+    EncryptionMigrationComplete { mode: String, kid: String, completion: crate::memory::statements::SignedWire },
 
 }
 
@@ -384,7 +389,7 @@ pub struct AtemInstance {
 }
 
 pub struct AstationClient {
-    sender: Option<mpsc::UnboundedSender<AstationMessage>>,
+    sender: Option<mpsc::UnboundedSender<OutboundMessage>>,
     receiver: Option<mpsc::UnboundedReceiver<AstationMessage>>,
     transport_tasks: Vec<tokio::task::JoinHandle<()>>,
     atem_id_override: Option<String>,
@@ -515,16 +520,18 @@ impl AstationClient {
 
         let (mut write, mut read) = ws_stream.split();
         let (tx, rx) = mpsc::unbounded_channel::<AstationMessage>();
-        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AstationMessage>();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
         // Spawn task to handle outgoing messages
         let writer_task = tokio::spawn(async move {
-            while let Some(message) = msg_rx.recv().await {
-                if let Ok(json) = serde_json::to_string(&message) {
-                    if let Err(_) = write.send(Message::Text(json)).await {
-                        break;
-                    }
-                }
+            while let Some(outbound) = msg_rx.recv().await {
+                let result = match serde_json::to_string(&outbound.message) {
+                    Ok(json) => write.send(Message::Text(json)).await.map_err(|_| "WebSocket write failed".to_string()),
+                    Err(_) => Err("WebSocket message encoding failed".to_string()),
+                };
+                let failed = result.is_err();
+                if let Some(delivered) = outbound.delivered { let _ = delivered.send(result); }
+                if failed { break; }
             }
         });
 
@@ -841,12 +848,23 @@ impl AstationClient {
     pub async fn send_message(&self, message: AstationMessage) -> Result<()> {
         if let Some(sender) = &self.sender {
             sender
-                .send(message)
+                .send(OutboundMessage { message, delivered: None })
                 .map_err(|e| anyhow!("Failed to send message: {}", e))?;
         } else {
             return Err(anyhow!("Not connected to Astation"));
         }
         Ok(())
+    }
+
+    async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+        let sender = self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?;
+        let (delivered, receipt) = tokio::sync::oneshot::channel();
+        sender.send(OutboundMessage { message, delivered: Some(delivered) })
+            .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?;
+        tokio::time::timeout(Duration::from_secs(5), receipt).await
+            .map_err(|_| anyhow!("WebSocket delivery timed out; retry this command"))?
+            .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?
+            .map_err(|error| anyhow!(error))
     }
 
     /// Persist encryption mode/key messages before application code handles
@@ -905,7 +923,7 @@ impl AstationClient {
                 }
                 Ok(Some("Account encryption state unchanged".into()))
             }
-            Applied::ModeChanged(state) => {
+            Applied::ModeChanged(state) | Applied::MigrationPending(state) => {
                 if !state.mode.requires_key() {
                     // A running, unlocked agent drops the account's keys now; a
                     // locked one does at its next unlock.
@@ -928,9 +946,16 @@ impl AstationClient {
     }
 
     async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {
+        let trust = crate::memory::trust::TrustStore::load_from(&crate::memory::verification::KeyPaths::default_paths().trust)?;
+        let epoch = crate::memory::verification::effective_state(&trust, astation_id)?
+            .and_then(|(_, state)| state).map(|state| state.epoch);
         if let Some(target) = crate::memory::crypto::migrate_account(astation_id).await? {
             let kid = kid.ok_or_else(|| anyhow!("encryption migration has no key id"))?;
-            self.send_message(AstationMessage::EncryptionMigrationComplete { mode: target.to_string(), kid }).await?;
+            let (account, proof_kid) = (astation_id.to_string(), kid.clone());
+            let epoch = epoch.ok_or_else(|| anyhow!("the signed migration state is missing"))?;
+            let completion = crate::memory::key_agent::blocking(move ||
+                crate::memory::key_agent::default_agent().migration_completion(&account, epoch, target, &proof_kid)).await?;
+            self.send_message_flushed(AstationMessage::EncryptionMigrationComplete { mode: target.to_string(), kid, completion }).await?;
             return Ok(Some(format!("Encryption migration complete; requesting {target}")));
         }
         Ok(Some("Account encryption state updated".into()))
@@ -1472,6 +1497,38 @@ fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migration_flush_delivers_before_an_ephemeral_client_disconnects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let message = socket.next().await.unwrap().unwrap();
+            match message { Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                _ => panic!("expected the completion frame") }
+        });
+        let mut client = AstationClient::new();
+        client.connect_raw(&format!("ws://{address}")).await.unwrap();
+        client.send_message_flushed(AstationMessage::EncryptionMigrationComplete {
+            mode: "on".into(), kid: "0123abcd".into(),
+            completion: crate::memory::statements::SignedWire { statement: "c3RhdGVtZW50".into(), signature: "c2lnbmF0dXJl".into() },
+        }).await.unwrap();
+        drop(client);
+        let frame = tokio::time::timeout(Duration::from_secs(2), received).await.unwrap().unwrap();
+        assert_eq!(frame["type"], "encryptionMigrationComplete");
+        assert_eq!(frame["data"]["completion"]["statement"], "c3RhdGVtZW50");
+    }
+
+    #[tokio::test]
+    async fn migration_flush_fails_when_the_writer_has_already_closed() {
+        let mut client = AstationClient::new();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        client.sender = Some(sender);
+        drop(receiver);
+        assert!(client.send_message_flushed(AstationMessage::ProjectListRequest).await.is_err());
+    }
 
     fn isolated_client(atem_id: &str) -> (tempfile::TempDir, AstationClient) {
         let directory = tempfile::tempdir().unwrap();

@@ -279,6 +279,8 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
     knowledge.migrate_encryption().await.unwrap();
     vault.migrate_encryption().await.unwrap();
     assert_all_encrypted_with(&relay_state.lock().unwrap(), OLD_KID);
+    knowledge.verify_encryption_migration().await.unwrap();
+    vault.verify_encryption_migration().await.unwrap();
 
     let upload = Memory {
         id: "mem-upload".into(),
@@ -321,6 +323,8 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
     );
 
     device.set_key(EncryptionMode::Enabling, NEW_KID, [8; 32]);
+    assert!(knowledge.verify_encryption_migration().await.is_err());
+    assert!(vault.verify_encryption_migration().await.is_err());
     assert_eq!(
         knowledge.pull_memories(0).await.unwrap()[0].content,
         "relay starts as plaintext"
@@ -328,6 +332,8 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
     knowledge.migrate_encryption().await.unwrap();
     vault.migrate_encryption().await.unwrap();
     assert_all_encrypted_with(&relay_state.lock().unwrap(), NEW_KID);
+    knowledge.verify_encryption_migration().await.unwrap();
+    vault.verify_encryption_migration().await.unwrap();
 
     device.state(EncryptionMode::On, Some(NEW_KID));
     assert!(
@@ -339,6 +345,90 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
             .any(|memory| memory.content == "new encrypted upload")
     );
     assert_eq!(vault.read("v-test", None, true).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn repeated_signed_pending_states_resume_interrupted_migrations_with_a_loaded_key() {
+    use crate::memory::key_agent::KeyAgentApi;
+    use crate::memory::trust::TrustStore;
+    use crate::memory::verification::{Applied, apply_account_state};
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(directory.path());
+    device.set_key(EncryptionMode::Enabling, OLD_KID, [7; 32]);
+    let state = Arc::new(Mutex::new(RelayState::seeded()));
+    let base = stub_relay(state.clone()).await;
+
+    for (mode, target) in [(EncryptionMode::Enabling, "on"), (EncryptionMode::Disabling, "off")] {
+        if mode == EncryptionMode::Disabling {
+            device.state(mode, Some(OLD_KID));
+        }
+        let (knowledge, vault) = clients(&base, &device);
+        knowledge.migrate_encryption().await.unwrap();
+        assert!(vault.verify_encryption_migration().await.is_err());
+        // The command exits after rewriting knowledge, before rewriting vault history.
+        drop((knowledge, vault));
+
+        let trust = TrustStore::load_from(&device.paths.trust).unwrap();
+        let entry = trust.verified(ASTATION).unwrap();
+        let pending = entry.account_state.clone().unwrap();
+        let epoch = entry.account_epoch;
+        assert!(device.agent.held_kid(ASTATION).unwrap().is_some());
+        let Applied::MigrationPending(retry) = apply_account_state(&device.paths, ASTATION, Some(&pending)).unwrap() else {
+            panic!("a repeated signed pending state must trigger another migration pass");
+        };
+        assert_eq!(retry.mode, mode);
+        assert_eq!(retry.epoch, epoch);
+        assert!(apply_account_state(&device.paths, ASTATION, None).is_ok_and(|applied| matches!(applied, Applied::Ignored(_))));
+        let mut tampered = pending.clone();
+        tampered.signature = "AA==".into();
+        assert!(apply_account_state(&device.paths, ASTATION, Some(&tampered)).is_err());
+
+        let (knowledge, vault) = clients(&base, &device);
+        knowledge.migrate_encryption().await.unwrap();
+        vault.migrate_encryption().await.unwrap();
+        knowledge.verify_encryption_migration().await.unwrap();
+        vault.verify_encryption_migration().await.unwrap();
+        let first = device.agent.migration_completion(ASTATION, epoch, target, OLD_KID).unwrap();
+        let duplicate = device.agent.migration_completion(ASTATION, epoch, target, OLD_KID).unwrap();
+        assert_eq!(first.statement, duplicate.statement);
+        assert_eq!(first.signature, duplicate.signature);
+        assert_eq!(TrustStore::load_from(&device.paths.trust).unwrap().verified(ASTATION).unwrap().account_epoch, epoch);
+    }
+
+    device.state(EncryptionMode::Off, None);
+    let trust = TrustStore::load_from(&device.paths.trust).unwrap();
+    let final_state = trust.verified(ASTATION).unwrap().account_state.as_ref().unwrap();
+    assert!(matches!(apply_account_state(&device.paths, ASTATION, Some(final_state)).unwrap(), Applied::Unchanged));
+    assert!(device.agent.migration_completion(ASTATION, 2, "on", OLD_KID).is_err());
+}
+
+#[tokio::test]
+async fn migration_verification_checks_readback_and_every_vault_history_version() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(directory.path());
+    device.set_key(EncryptionMode::Enabling, OLD_KID, [7; 32]);
+    let state = Arc::new(Mutex::new(RelayState::seeded()));
+    let base = stub_relay(state.clone()).await;
+    let (knowledge, vault) = clients(&base, &device);
+    assert!(knowledge.verify_encryption_migration().await.is_err());
+    assert!(vault.verify_encryption_migration().await.is_err());
+    knowledge.migrate_encryption().await.unwrap();
+    vault.migrate_encryption().await.unwrap();
+    let migrated = state.lock().unwrap().clone();
+    state.lock().unwrap().memories[0].content = format!("e1.{OLD_KID}.AA==");
+    assert!(knowledge.verify_encryption_migration().await.is_err());
+    *state.lock().unwrap() = migrated.clone();
+    state.lock().unwrap().vault_entries[0]["content"] = json!("unmigrated historical version");
+    assert!(vault.verify_encryption_migration().await.is_err());
+    *state.lock().unwrap() = migrated;
+    device.state(EncryptionMode::Disabling, Some(OLD_KID));
+    assert!(knowledge.verify_encryption_migration().await.is_err());
+    assert!(vault.verify_encryption_migration().await.is_err());
+    knowledge.migrate_encryption().await.unwrap();
+    vault.migrate_encryption().await.unwrap();
+    knowledge.verify_encryption_migration().await.unwrap();
+    vault.verify_encryption_migration().await.unwrap();
 }
 
 #[tokio::test]

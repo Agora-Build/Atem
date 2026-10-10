@@ -25,6 +25,7 @@ pub mod account_keys;
 pub mod project_names;
 pub mod legacy_keys;
 pub mod unlock;
+pub mod migration;
 #[cfg(unix)]
 pub mod agent_socket;
 

@@ -215,6 +215,7 @@ statement whose `sign_gen` isn't their pinned generation.
 | `atem-storage-ack-v1` | signing key | account, sign_gen, device_id, new_storage_kid | Astation stored the new storage key as pending. |
 | `atem-storage-confirm-v1` | device signing key | account, device_id, new_storage_kid | The device switched to the new storage key; Astation may drop the old one. |
 | `atem-storage-abandon-v1` | device signing key | account, device_id, storage_kid | The device gives up a pending storage key it holds no file for; Astation drops its pending key only if it is exactly this one. |
+| `atem-migration-complete-v1` | device signing key | account, sign_gen, device_id, target (`on` / `off`), kid, state_epoch, stores, remaining, key_proof | Attests completion of a migration under an Astation-approved pending state; see "Migration completion lifecycle". |
 | `atem-sign-rotate-v1` | recovery signing key | account, old sign pub, new sign pub, new_gen, new recovery sign pub, not_before | Replaces the signing key after a recovery; valid only after `not_before` (72 hours). |
 | `atem-sign-veto-v1` | current signing key | account, sign_gen, vetoed new_gen | Cancels a pending replacement from the current Mac. |
 
@@ -847,7 +848,9 @@ Settings → **Security** → "End-to-end encrypt memory, skills and vault"
    (`encryptionMode` now carries the signed statement). The relay stores the
    mode per account.
 4. A verified device without `K` sends `keyRequest` and receives a signed
-   `keyGrant`. When every atem has migrated, Astation signs `on`.
+   `keyGrant`. After a verified device has migrated and verified all shared
+   stores, Astation durably accepts its signed completion and signs `on`.
+   Completion does not require every Atem process to be online.
 
 **While it's on**, atem refuses to upload plain text and **rejects any
 downloaded field that isn't encrypted** (`e1.`/`h1.`), so the relay can't
@@ -915,6 +918,111 @@ To cut a device off from memory, Astation creates a new `K` with a new
 devices, which re-encrypt and push again. atems keep the previous key until
 migration finishes. A removed device can still read anything it already
 downloaded.
+
+### Migration completion lifecycle
+
+Atem is an ephemeral CLI. Once Astation has accepted a completion message,
+closing the command, its WebSocket, or its pairing transport must not undo
+or prevent processing. Astation owns both the migration lifecycle and the
+authoritative encryption state. A transport flush or a bounded wait for the
+signed final state is useful delivery assurance, not an authorization rule.
+
+1. **Start, durably.** Owner approval commits `enabling` or `disabling` in
+   Astation's protected identity record before publication. The migration
+   journal records its account, target, kid and starting account-state epoch.
+   Re-signing the same pending mode can advance the advertised epoch without
+   starting another migration. A new owner-approved change starts a new
+   journal entry, even when it reuses a kid. Existing pending states acquire
+   a journal on first use; no keys are replaced during this upgrade.
+   A legacy account with a local key but no signed account state starts in
+   `enabling`, requiring a verified completion before `on`. An existing
+   durably approved `on` state remains intact. Generic state setters may
+   start pending modes, but cannot bypass completion to create final modes.
+2. **Migrate and verify.** An unlocked, verified Atem rewrites memories,
+   skill versions, vault summaries and all vault entry versions, then reads
+   them back. Enabling/rotation requires every nonempty protected field to
+   use the approved kid and every ciphertext to authenticate under `K`.
+   Disabling requires no encrypted/keyed protected fields to remain. A
+   failed, incomplete or interrupted pass sends no completion. Writes and
+   scans can be retried; a successful rewrite acknowledgment alone is not
+   a successful verification pass.
+3. **Authenticate before dispatch.** `encryptionMigrationComplete` carries
+   `completion: SignedWire`, an Ed25519 `atem-migration-complete-v1` signed
+   by the device's pinned device-signing key. Its fields are length-prefixed
+   in the table's order; integers are u64 big-endian. `stores` must equal
+   7 (memory=1, skills including history=2, vault including history=4), and
+   `remaining` must equal zero. `state_epoch` names a signed pending state
+   the device actually received. `key_proof` is HMAC-SHA256 over the encoded
+   first nine fields (including the label), under HKDF-SHA256(`K`, empty
+   salt, info `atem-migration-proof-v1`, 32 bytes). It proves possession of
+   the approved account key without exporting `K` from the key agent.
+   Astation captures the authenticated transport's device identity,
+   connection generation and data account at receipt, validates the report
+   against its own pins and journal, and persists it before asynchronous
+   work. The outer mode/kid must agree with the signed fields. Unsigned
+   legacy completions fail closed; relay envelope identities and counts
+   cannot substitute for the signature or key proof.
+   The report's state epoch must also be at least the reporting device's
+   current verification epoch; re-verifying identical keys cannot authorize
+   a report signed under an earlier verification.
+4. **Finish without the connection.** The queued work uses that immutable
+   account/device context and the durable report, never `connectedClients`
+   or a replacement WebSocket. Before committing, under the identity lock,
+   it rechecks the exact device pin and verification generation, Astation
+   signing identity, recovery-kit confirmation, the approved migration
+   interval/target/kid, key availability and the key proof. Revocation or
+   re-verification before commit invalidates that report, even if the same
+   device ID or keys reappear. The still-pending migration can be completed
+   by a new report from a verified device. Disconnect alone changes none
+   of these cryptographic facts.
+5. **Commit once, then publish.** Astation signs the final account state
+   and atomically saves the state, epoch, completion report and final signed
+   state in one protected-record update. It sends/broadcasts the result only
+   after that save succeeds. Duplicate reports for that operation return
+   the saved final state without another transition or epoch increment.
+   A late report from an older operation cannot finish a newer operation.
+   A revoke ordered after the durable commit does not roll back that account
+   state; normal key rotation/revocation policy applies.
+6. **Recover and retry.** A crash before durable acceptance requires the
+   sender to retry; a crash after acceptance is recovered from the journal
+   at Astation startup, key availability and relay reconnect. A failed
+   signature/key access/save leaves the pending mode and accepted report
+   intact for retry, and no success is published. A crash after commit but
+   before delivery reuses the saved final signature. Relay replication is
+   retried from the local state after reconnect or a mismatching relay
+   report; it never needs the reporting Atem to reconnect. A reconnecting
+   device receives Astation's current signed state and can resume a still
+   pending migration.
+   Atem retries migration on a repeated, authenticated pending state even
+   when it already holds `K`; retaining the signed state before a failed
+   scan or lost completion must not suppress recovery on the next command.
+   If the relay missed the pending transition, Astation replicates that
+   mode first and the committed final mode after the next status report,
+   retaining its own committed state throughout. Without local approved
+   state, the displayed mode defaults to `off` regardless of relay claims.
+   An account-routing change after acceptance does not retarget the work:
+   Astation commits the captured account and publishes only when routing
+   still selects that account, retaining the journal for later replication.
+
+**Trust boundary.** Only owner-approved local state and protected device
+pins authorize transitions. The relay is transport and storage: its mode,
+device label, counters, acknowledgments and connection events are not
+encryption authority. The report is a verified device's attestation about
+the records it cryptographically checked, not proof that an untrusted
+server erased all copies. The relay can withhold records or service; old
+plaintext backups remain outside migration's confidentiality guarantee.
+An unsigned old client must be updated to emit the report, rather than
+weakening this boundary to preserve compatibility.
+
+**Required regressions.** Deliver a valid completion and immediately remove
+the local/relay connection; delay the handler; deliver identical duplicates
+before and after commit; restart after acceptance and after commit; fail
+the final save; reconnect with the same device ID and a new generation;
+revoke/re-verify before acceptance, between acceptance and commit, and after
+commit; replay a previous migration after a new owner change; reject bad
+signatures, wrong accounts/devices/kids, incomplete scans and bad key proofs.
+Neither a relay "on" report nor an unsigned completion may change local
+state. All failure paths retain enough durable state for safe recovery.
 
 ### Costs
 
@@ -1235,7 +1343,7 @@ binary values are base64. `SignedWire` is `{statement, signature}`;
 | `encryptionMode` | Astation → atem | `account_state: SignedWire` (messages without it are ignored) |
 | `keyRequest` | atem → Astation | `public_key` (the verified device key); sent after verification, or on a repeated `encryptionMode`, when the signed state needs `K` and atem doesn't hold it |
 | `keyGrant` | Astation → atem | `grant: GrantWire` (messages without it are ignored) |
-| `encryptionMigrationComplete` | atem → Astation | unchanged |
+| `encryptionMigrationComplete` | atem → Astation | `mode`, `kid`, `completion: SignedWire` (`atem-migration-complete-v1`); unsigned legacy packets cannot authorize completion |
 
 Until Astation supports verification, atems stay unverified: they keep
 plain-text sync and ignore `encryptionMode` and `keyGrant` (decided
