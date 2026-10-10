@@ -24,7 +24,7 @@ use crate::memory::storage_key::{
     check_storage_ack, check_unlock_grant, new_storage_key, new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::{KeyPaths, newest_states, stored_state};
+use crate::memory::verification::{KeyPaths, effective_state, newest_states};
 
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
 /// other version with an error, so an old agent and a newer CLI fail clearly.
@@ -59,7 +59,8 @@ pub enum Request {
     },
     /// Opens a `K` grant from a verified Astation and stores `K` in the
     /// sealed file (it is never handed back). The grant must name the kid
-    /// of the latest signed account state in cred_state.json.
+    /// of the account's newest signed state in cred_state.json (across
+    /// every verified Astation naming the account).
     InstallGrant {
         astation_id: String,
         grant: GrantWire,
@@ -454,7 +455,11 @@ impl KeyAgent {
         if !crate::memory::crypto::valid_kid(&opened.kid) {
             bail!("encryption key id must be 8 lowercase hex characters");
         }
-        let state = stored_state(entry)?
+        // The newest signed state of the account (any verified Astation
+        // naming it), not just this Astation's: a stale one can't install
+        // an older key over the current one.
+        let state = effective_state(&trust, astation_id)?
+            .and_then(|(_, state)| state)
             .ok_or_else(|| anyhow!("received an encryption key before the account mode"))?;
         if state.kid.as_deref() != Some(opened.kid.as_str()) {
             bail!("encryption key grant does not match the announced account mode");
@@ -480,18 +485,15 @@ impl KeyAgent {
         self.unlocked()?;
         self.prune_retired();
         let trust = TrustStore::load_from(&self.paths.trust)?;
-        let entry = trust
-            .verified(astation_id)
+        let (account, state) = effective_state(&trust, astation_id)?
             .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))?;
-        let state = stored_state(entry)?.ok_or_else(|| {
+        let state = state.ok_or_else(|| {
             anyhow!("waiting for Astation's signed encryption state; reconnect to Astation")
         })?;
-        let results = self.unlocked()?.accounts.crypt(
-            &entry.data_account,
-            state.mode,
-            state.kid.as_deref(),
-            ops,
-        )?;
+        let results =
+            self.unlocked()?
+                .accounts
+                .crypt(&account, state.mode, state.kid.as_deref(), ops)?;
         Ok(Reply::Crypted { results })
     }
 

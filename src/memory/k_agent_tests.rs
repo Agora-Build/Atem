@@ -428,10 +428,9 @@ fn a_grant_a_newer_signed_state_retired_at_once_is_refused() {
             .agent
             .install_grant(ASTATION_ID, &device.grant(A, [42; 32])),
     );
-    assert!(
-        error.contains("a newer signed state retired this key"),
-        "{error}"
-    );
+    // The grant is checked against the newest state (off, no kid), not the
+    // stale one of the Astation it came through.
+    assert!(error.contains("does not match"), "{error}");
     assert!(!holds_k(device.agent.as_ref(), ASTATION_ID));
     assert_eq!(device.agent.held_kid(ASTATION_ID).unwrap(), None);
     assert_eq!(
@@ -896,4 +895,56 @@ fn before_its_first_escrow_a_device_keeps_data_keys_enc() {
     let sealed = sealed_account_keys(&server, &paths, &paths.device_keys_sealed);
     assert_eq!(sealed.current_kid(ACCOUNT), Some(A));
     assert_eq!(sealed.previous_kids(ACCOUNT), [OLD]);
+}
+
+#[test]
+fn every_caller_follows_the_newest_state_when_two_astations_name_one_account() {
+    use crate::memory::verification::account_mode;
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    // Both Astations say `on`, with different kids: astation-2's state is
+    // newer, so B is the account's key and A is stale.
+    device.state(EncryptionMode::On, Some(A));
+    let other = FakeAstation::new();
+    pin_as(&device.paths, "astation-2", &other, &device.keys, false);
+    set_state_as(
+        &device.paths,
+        "astation-2",
+        &other,
+        EncryptionMode::On,
+        Some(B),
+        9,
+    );
+    let agent = device.agent.as_ref();
+    let grant_b = seal_k_grant(
+        &other,
+        ACCOUNT,
+        DEVICE_ID,
+        device.keys.device_pub(),
+        B,
+        [7; 32],
+    );
+    agent.install_grant("astation-2", &grant_b).unwrap();
+    // The stale Astation's grant for A is refused: it would demote B.
+    let error = error_of(agent.install_grant(ASTATION_ID, &device.grant(A, [42; 32])));
+    assert!(error.contains("does not match"), "{error}");
+    assert_eq!(agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some(B));
+    assert_eq!(device.sealed_accounts().current_kid(ACCOUNT), Some(B));
+    assert!(device.sealed_accounts().previous_kids(ACCOUNT).is_empty());
+    // Crypt through either Astation seals under the newest kid.
+    for astation_id in [ASTATION_ID, "astation-2"] {
+        let sealed = agent
+            .crypt(astation_id, vec![CryptOp::seal("mem", "content", b"fact")])
+            .unwrap()
+            .remove(0)
+            .into_text()
+            .unwrap();
+        assert!(sealed.starts_with(&format!("e1.{B}.")), "{sealed}");
+        let mode = account_mode(&device.paths.trust, astation_id).unwrap();
+        assert_eq!(
+            (mode.mode, mode.kid.as_deref(), mode.data_account.as_str()),
+            (EncryptionMode::On, Some(B), ACCOUNT),
+            "{astation_id}"
+        );
+    }
 }

@@ -336,9 +336,29 @@ pub(crate) fn newest_states(
     Ok(newest)
 }
 
+/// The state that governs `astation_id`'s account: `None` when this device
+/// isn't verified with it, else its account and the newest signed state of
+/// that account across every verified Astation naming it (`newest_states`),
+/// `None` while none has sent one. Every caller that reads a mode or kid
+/// (the agent's install and `Crypt`, `account_mode`, `key_needed`) uses this
+/// one rule, so a stale Astation's older state can't demote a newer `K`.
+pub(crate) fn effective_state(
+    trust: &TrustStore,
+    astation_id: &str,
+) -> Result<Option<(String, Option<AccountState>)>> {
+    let Some(entry) = trust.verified(astation_id) else {
+        return Ok(None);
+    };
+    let account = entry.data_account.clone();
+    let state = newest_states(trust)?.remove(&account).flatten();
+    Ok(Some((account, state)))
+}
+
 /// What the latest signed account state says for this device and
-/// `astation_id`: the one source of the encryption mode and kid (build
-/// step 2b). `data_account` is the Astation id when it isn't verified.
+/// `astation_id` (the newest across the verified Astations naming its
+/// account, `effective_state`): the one source of the encryption mode and
+/// kid (build step 2b). `data_account` is the Astation id when it isn't
+/// verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountMode {
     pub mode: EncryptionMode,
@@ -351,19 +371,19 @@ pub struct AccountMode {
 /// signed state yet must not guess: that is an error.
 pub fn account_mode(trust_path: &Path, astation_id: &str) -> Result<AccountMode> {
     let trust = TrustStore::load_from(trust_path)?;
-    let Some(entry) = trust.verified(astation_id) else {
+    let Some((data_account, state)) = effective_state(&trust, astation_id)? else {
         return Ok(AccountMode {
             mode: EncryptionMode::Off,
             data_account: astation_id.into(),
             kid: None,
         });
     };
-    let state = stored_state(entry)?.ok_or_else(|| {
+    let state = state.ok_or_else(|| {
         anyhow!("waiting for Astation's signed encryption state; reconnect to Astation")
     })?;
     Ok(AccountMode {
         mode: state.mode,
-        data_account: state.account,
+        data_account,
         kid: state.kid,
     })
 }
@@ -647,13 +667,7 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 /// `key_agent::blocking`.
 pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) -> Result<bool> {
     let trust = TrustStore::load_from(&paths.trust)?;
-    let Some(entry) = trust.verified(astation_id) else {
-        return Ok(false);
-    };
-    let Some(state) = newest_states(&trust)?
-        .remove(&entry.data_account)
-        .flatten()
-    else {
+    let Some((_, Some(state))) = effective_state(&trust, astation_id)? else {
         return Ok(false);
     };
     if !state.mode.requires_key() {
