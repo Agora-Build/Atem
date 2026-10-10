@@ -96,6 +96,35 @@ impl AccountKeys {
         true
     }
 
+    /// Adds keys found in data_keys.enc (build steps 0–2a): `current`
+    /// becomes the account's current key only if it has none; every other
+    /// key not held yet (by kid) is added to the previous keys, so a newer
+    /// `K` installed meanwhile stays current. A repeat changes nothing.
+    /// Returns whether anything changed.
+    pub fn merge(&mut self, account: &str, current: AccountKey, previous: Vec<AccountKey>) -> bool {
+        use std::collections::btree_map::Entry;
+        let mut keys = std::iter::once(current).chain(previous);
+        let (ring, mut changed) = match self.rings.entry(account.into()) {
+            Entry::Occupied(ring) => (ring.into_mut(), false),
+            Entry::Vacant(slot) => {
+                let current = keys.next().expect("once yields one");
+                let ring = slot.insert(KeyRing {
+                    current,
+                    previous: Vec::new(),
+                });
+                (ring, true)
+            }
+        };
+        for key in keys {
+            if key.kid != ring.current.kid && !ring.previous.iter().any(|held| held.kid == key.kid)
+            {
+                ring.previous.push(key);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Drops what the signed states retired: every key of an account no
     /// verified Astation names or whose state is `off`, and the previous keys
     /// once the state is `on` with the current kid (every field has moved to
@@ -687,5 +716,28 @@ mod tests {
         let back: CryptOut = serde_json::from_str(r#"{"opened":"aGk="}"#).unwrap();
         assert_eq!(&*back.into_plain().unwrap(), b"hi");
         assert!(CryptOut::Sealed("e1.x".into()).into_plain().is_err());
+    }
+
+    #[test]
+    fn merge_adds_older_keys_and_never_replaces_the_current_one() {
+        let mut keys = AccountKeys::default();
+        assert!(keys.merge("acct", key("0123abcd", 1), vec![key("11112222", 2)]));
+        assert_eq!(keys.current_kid("acct"), Some("0123abcd"));
+        assert_eq!(keys.previous_kids("acct"), vec!["11112222".to_string()]);
+        // A newer K installed meanwhile stays current; the merge only adds history.
+        keys.install("acct", "89abcdef", Zeroizing::new([3; 32]));
+        assert!(
+            !keys.merge("acct", key("0123abcd", 1), vec![key("11112222", 2)]),
+            "a repeat changes nothing"
+        );
+        assert_eq!(keys.current_kid("acct"), Some("89abcdef"));
+        let mut previous = keys.previous_kids("acct");
+        previous.sort();
+        assert_eq!(
+            previous,
+            vec!["0123abcd".to_string(), "11112222".to_string()]
+        );
+        // A key held under the same kid isn't replaced by the merge.
+        assert!(!keys.merge("acct", key("89abcdef", 9), vec![]));
     }
 }

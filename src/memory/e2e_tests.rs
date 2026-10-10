@@ -526,3 +526,23 @@ fn big_batches_split_and_keep_their_order() {
     let opened = context.open_many(&sealed_big.iter().map(|value| ("v", "content", value.as_str())).collect::<Vec<_>>()).unwrap();
     assert_eq!(opened, big);
 }
+
+#[test]
+fn a_field_too_big_for_one_agent_request_fails_before_any_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(directory.path());
+    device.set_key(EncryptionMode::On, OLD_KID, [7; 32]);
+    let counting = Arc::new(CountingAgent { inner: device.agent.clone(), crypts: AtomicUsize::new(0) });
+    let context = EncryptionContext::for_astation_with(ASTATION, &device.paths, counting.clone()).unwrap();
+    let huge = vec![1u8; 5 << 20];
+    let small = b"small".to_vec();
+    let Err(error) = context.seal_many(&[("v", "content", small.as_slice()), ("v", "content", huge.as_slice())]) else {
+        panic!("a 5 MiB field must be refused");
+    };
+    let error = format!("{error:#}");
+    assert!(error.contains("a field is too large to encrypt ("), "{error}");
+    assert_eq!(counting.crypts.load(Ordering::SeqCst), 0, "nothing is sent");
+    // The largest skill still fits in one request.
+    let skill = vec![2u8; crate::memory::skills_fs::MAX_SKILL_BYTES];
+    assert_eq!(context.seal_many(&[("v", "content", skill.as_slice())]).unwrap().len(), 1);
+}

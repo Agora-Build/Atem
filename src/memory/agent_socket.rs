@@ -1116,20 +1116,21 @@ fn read_reply(mut stream: &UnixStream) -> std::io::Result<WipingBuf> {
 }
 
 impl KeyAgentClient {
-    /// Why the agent hung up. An agent of an older atem closes the
-    /// connection on a request it can't read (a step-2a agent reads at most
-    /// 1 MiB), so a short `status` asks for its version first.
+    /// Why the agent hung up (or timed out). An agent of an older atem
+    /// closes the connection on a request it can't read (a step-2a agent
+    /// reads at most 1 MiB), so a short `status` asks for its version first.
     fn closed(&self, error: Option<std::io::Error>) -> anyhow::Error {
         if let Some(version) = self.probe_version()
             && version != PROTOCOL_VERSION
         {
             return version_mismatch(version);
         }
+        // The listener's uid was checked when connecting: the agent's log
+        // says why it hung up.
+        let log = self.log.display();
         match error {
-            Some(error) => anyhow!(
-                "the key agent closed the connection ({error}); is it running as another user?"
-            ),
-            None => anyhow!("the key agent closed the connection; is it running as another user?"),
+            Some(error) => anyhow!("the key agent closed the connection ({error}); see {log}"),
+            None => anyhow!("the key agent closed the connection; see {log}"),
         }
     }
 
@@ -1333,6 +1334,12 @@ mod tests {
         let socket = start_agent(dir.path(), own_uid().wrapping_add(1));
         let error = format!("{:#}", KeyAgentClient::at(socket).status().err().unwrap());
         assert!(error.contains("closed the connection"), "{error}");
+        // The client checked the listener's uid already: the hint is the log.
+        assert!(
+            error.contains(&format!("see {}", agent_log_path().display())),
+            "{error}"
+        );
+        assert!(!error.contains("another user"), "{error}");
     }
 
     #[test]

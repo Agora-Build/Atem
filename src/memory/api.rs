@@ -167,7 +167,8 @@ impl std::error::Error for ApiError {}
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        Self::Encryption(error.to_string())
+        // The whole chain: the cause (a locked agent, a hang-up) is the useful part.
+        Self::Encryption(format!("{error:#}"))
     }
 }
 
@@ -213,7 +214,9 @@ fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::R
         PendingOp::PushSkill { base_version, .. } => json!({"op": "push", "skill": skills.next().ok_or_else(missing)?, "base_version": base_version}),
         PendingOp::DeleteSkill { scope, name, .. } => json!({"op": "delete", "scope": scope, "project": projects.next().ok_or_else(missing)?, "name": name}),
         PendingOp::PurgeSkill { scope, name, versions, .. } => json!({"op": "purge", "scope": scope, "project": projects.next().ok_or_else(missing)?, "name": name, "versions": versions}),
-        _ => op_to_wire(op),
+        // Listed, not a catch-all: a new op with a secret field must be
+        // encrypted above, never sent as it is by default.
+        PendingOp::DeleteMemory { .. } | PendingOp::InvalidateMemory { .. } => op_to_wire(op),
     })).collect()
 }
 
@@ -267,10 +270,10 @@ impl KnowledgeClient {
         #[cfg(test)]
         if let Some((paths, agent)) = &self.encryption_with {
             return EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone())
-                .map_err(|error| ApiError::Encryption(error.to_string()));
+                .map_err(ApiError::from);
         }
         EncryptionContext::for_astation(&self.astation_id)
-            .map_err(|error| ApiError::Encryption(error.to_string()))
+            .map_err(ApiError::from)
     }
 
     pub async fn push(&self, ops: &[&PendingOp], memory: bool) -> Result<Vec<OpResult>, ApiError> {
@@ -414,6 +417,15 @@ mod tests {
     use crate::memory::model::{content_hash, skill_hash, Scope};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn an_encryption_error_keeps_its_cause() {
+        let error = anyhow::anyhow!("the key agent closed the connection").context("sealing a memory");
+        assert_eq!(
+            ApiError::from(error).to_string(),
+            "end-to-end encryption: sealing a memory: the key agent closed the connection"
+        );
+    }
 
     #[test]
     fn invalidate_wire() {

@@ -523,6 +523,10 @@ pub fn complete_verification(
         let _trust_lock = TrustStore::lock(&paths.trust)?;
         let mut current = TrustStore::load_from(&paths.trust)?;
         let first = current.verified(astation_id).is_none();
+        // Accounts the Astations verified before this one name: what is
+        // stored for them may be theirs, so a first verification keeps it.
+        let named_elsewhere: std::collections::BTreeSet<String> =
+            current.verified_entries().map(|entry| entry.data_account.clone()).collect();
         current.confirm_since(astation_id, device_verified, checked_epoch)?;
         let newer = current
             .verified(astation_id)
@@ -541,9 +545,13 @@ pub fn complete_verification(
         }
         if first {
             // Whatever the unauthenticated path stored for this Astation (K,
-            // rotation history, project names) is dropped, not trusted.
-            crate::memory::legacy_keys::purge_unverified_at(&paths.data_keys, astation_id, &state.account)?;
-            crate::memory::project_names::forget_account_at(&paths.project_names, &state.account)?;
+            // rotation history, project names) is dropped, not trusted, unless
+            // another verified Astation names that account. Lock order:
+            // cred_state.json's lock (held) before project_names.lock.
+            crate::memory::legacy_keys::purge_unverified_at(&paths.data_keys, astation_id, &state.account, &named_elsewhere)?;
+            if !named_elsewhere.contains(&state.account) {
+                crate::memory::project_names::forget_account_at(&paths.project_names, &state.account)?;
+            }
         }
         current.save_to(&paths.trust)?;
         // Grants are for this verification's state's kid: installed unless
@@ -1268,8 +1276,20 @@ mod ceremony_tests {
         cert_epoch: u64,
         make: impl FnOnce(&FakeAstation, [u8; 32]) -> (SignedWire, Vec<GrantWire>),
     ) -> (KeyPaths, Result<VerificationOutcome>) {
+        first_verification_with(dir, cert_epoch, |_| {}, make)
+    }
+
+    /// [`first_verification`], with `setup` run once the agent has started
+    /// (an agent of an unverified device deletes data_keys.enc at start).
+    fn first_verification_with(
+        dir: &Path,
+        cert_epoch: u64,
+        setup: impl FnOnce(&KeyPaths),
+        make: impl FnOnce(&FakeAstation, [u8; 32]) -> (SignedWire, Vec<GrantWire>),
+    ) -> (KeyPaths, Result<VerificationOutcome>) {
         let paths = KeyPaths::in_dir(dir);
         let agent = test_agent(&paths);
+        setup(&paths);
         std::fs::write(&paths.legacy_device_key, [1u8; 32]).unwrap();
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, cert_epoch);
@@ -1374,15 +1394,21 @@ mod ceremony_tests {
     fn first_verification_purges_legacy_keys() {
         use crate::memory::legacy_keys::{summary_at, write_for_test};
         let dir = tempfile::tempdir().unwrap();
-        let legacy = KeyPaths::in_dir(dir.path());
-        // K, its rotation history and a project name from the unauthenticated #36 path.
-        write_for_test(&legacy.data_keys, ASTATION_ID, "acct", &[("0123abcd", [1; 32]), ("11112222", [2; 32])], &[("h1.11112222.aa", "github.com/agora/atem")]);
-        crate::memory::project_names::remember(&legacy.project_names, "acct", [("h1.11112222.aa".to_string(), "github.com/agora/atem".to_string())]).unwrap();
-        let (paths, result) = first_verification(dir.path(), 1, |fake, _| {
+        // K, its rotation history and a project name from the unauthenticated
+        // #36 path, written once the agent runs (it deletes the file at start
+        // on an unverified device), so the purge itself is what drops them.
+        // Another account's entry stays.
+        let (paths, result) = first_verification_with(dir.path(), 1, |legacy| {
+            write_for_test(&legacy.data_keys, ASTATION_ID, "acct", &[("0123abcd", [1; 32]), ("11112222", [2; 32])], &[("h1.11112222.aa", "github.com/agora/atem")]);
+            write_for_test(&legacy.data_keys, "astation-9", "other", &[("44445555", [3; 32])], &[("h1.44445555.bb", "p")]);
+            crate::memory::project_names::remember(&legacy.project_names, "acct", [("h1.11112222.aa".to_string(), "github.com/agora/atem".to_string())]).unwrap();
+        }, |fake, _| {
             (state(fake, EncryptionMode::On, Some("89abcdef"), 2), vec![])
         });
         result.unwrap();
+        assert!(paths.data_keys.exists(), "purged, not deleted");
         assert_eq!(summary_at(&paths.data_keys, "acct"), (None, vec![], 0), "the old K and its history must be gone");
+        assert_eq!(summary_at(&paths.data_keys, "other"), (Some("44445555".into()), vec![], 1));
         assert_eq!(crate::memory::project_names::ProjectNames::load_from(&paths.project_names).unwrap().len("acct"), 0);
     }
 
@@ -1738,6 +1764,58 @@ mod ceremony_tests {
             sealed_before,
             "the sealed keys are not re-sealed"
         );
+    }
+
+    #[test]
+    fn a_second_astation_naming_a_verified_account_purges_nothing_of_it() {
+        use crate::memory::legacy_keys::{summary_at, write_for_test};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths::in_dir(dir.path());
+        let agent = test_agent(&paths);
+        let fake = FakeAstation::new();
+        verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
+        // Keys and names of "acct", which astation-1 (verified) names; and
+        // the #36 path's entry for astation-2 naming "acct" and "stray".
+        write_for_test(&paths.data_keys, ASTATION_ID, "acct", &[("0123abcd", [1; 32])], &[("h1.0123abcd.aa", "p")]);
+        write_for_test(&paths.data_keys, "astation-2", "stray", &[("44445555", [3; 32])], &[]);
+        crate::memory::project_names::remember(&paths.project_names, "acct", [("h1.0123abcd.aa".to_string(), "p".to_string())]).unwrap();
+
+        let other = FakeAstation::new();
+        let handshake = Handshake::start(device_keys_for_verification(&paths, &agent).unwrap());
+        let astation = AstationKeys {
+            sign_pub: other.sign_pub(),
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [9; 32],
+        };
+        let transcript = handshake.transcript(&astation);
+        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
+        trust.set_pending("astation-2", "dev-1", handshake.keys(), &astation, &handshake.safety_code(&astation), &transcript);
+        trust.save_to(&paths.trust).unwrap();
+        let reveal = handshake.reveal();
+        let second = DeviceVerified {
+            account: "acct".into(),
+            sign_gen: 1,
+            device_id: "dev-1".into(),
+            device_pub: reveal.device_pub,
+            device_sign_pub: reveal.device_sign_pub,
+            unlock_auth_pub: reveal.unlock_auth_pub,
+            transcript,
+            epoch: 1,
+        };
+        complete_verification(
+            &paths,
+            &agent,
+            "astation-2",
+            handshake.into_keys(),
+            &other.sign(&second.encode()),
+            &state(&other, EncryptionMode::Off, None, 2),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(summary_at(&paths.data_keys, "acct"), (Some("0123abcd".into()), vec![], 1), "astation-1 still names it");
+        assert_eq!(crate::memory::project_names::ProjectNames::load_from(&paths.project_names).unwrap().len("acct"), 1);
+        assert_eq!(summary_at(&paths.data_keys, "stray"), (None, vec![], 0), "what only the unverified entry named goes");
     }
 
     #[test]

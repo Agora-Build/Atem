@@ -205,6 +205,9 @@ pub(crate) fn valid_kid(kid: &str) -> bool {
 /// split. One skill (at most `MAX_SKILL_BYTES`, 1 MiB) always fits.
 const CRYPT_BATCH_BYTES: usize = 2 << 20;
 const CRYPT_BATCH_OPS: usize = 1024;
+/// Most bytes one op may carry (`wire_len`, request and reply): well below
+/// the agent's 8 MiB line limit, so a field never makes the agent hang up.
+const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 
@@ -288,6 +291,9 @@ impl EncryptionContext {
             return Ok(Vec::new());
         }
         let agent = self.agent.as_deref().ok_or_else(|| anyhow!("encryption is off for this account"))?;
+        if let Some(size) = ops.iter().map(CryptOp::wire_len).find(|size| *size > CRYPT_OP_MAX_BYTES) {
+            bail!("a field is too large to encrypt ({size} bytes)");
+        }
         let mut results = Vec::with_capacity(ops.len());
         let mut batch = Vec::new();
         let mut bytes = 0;

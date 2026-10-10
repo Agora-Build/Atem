@@ -15,6 +15,13 @@ use crate::memory::statements::FakeAstation;
 use crate::memory::storage_key::{SealedDeviceKeys, new_storage_key};
 use crate::memory::trust::TrustStore;
 
+use crate::memory::account_keys::{AccountKey, seal_field};
+use crate::memory::device_keys::DeviceKeys;
+use crate::memory::fake_astation::{FakeKeyServer, pin};
+use crate::memory::legacy_keys::write_for_test;
+use crate::memory::project_names::ProjectNames;
+use crate::memory::verification::KeyPaths;
+
 const A: &str = "0123abcd";
 const B: &str = "89abcdef";
 
@@ -598,4 +605,295 @@ fn a_prune_error_before_anything_changed_is_logged_once() {
         Some(A)
     );
     assert_eq!(logged(&device), 1);
+}
+
+const OLD: &str = "11112222";
+
+/// A step-2a data_keys.enc for the fake device: K = [42; 32] (kid A) with
+/// the older [1; 32] (kid OLD), and one project name.
+fn legacy(paths: &KeyPaths, account: &str) {
+    write_for_test(
+        &paths.data_keys,
+        ASTATION_ID,
+        account,
+        &[(OLD, [1; 32]), (A, [42; 32])],
+        &[("h1.0123abcd.aa", "github.com/agora/atem")],
+    );
+}
+
+/// A field sealed under the older key, as the relay may still hold it.
+fn sealed_under_old() -> String {
+    seal_field(
+        &AccountKey {
+            kid: OLD.into(),
+            key: zeroize::Zeroizing::new([1; 32]),
+        },
+        "mem",
+        "content",
+        b"old",
+    )
+    .unwrap()
+}
+
+/// `data_keys.enc.corrupt-*` files beside `paths.data_keys`.
+fn moved_aside(paths: &KeyPaths) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(paths.data_keys.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("data_keys.enc.corrupt-")
+        })
+        .collect()
+}
+
+#[test]
+fn an_unlock_moves_data_keys_enc_into_the_sealed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+    set_state(
+        &paths,
+        &server.astation,
+        EncryptionMode::Enabling,
+        Some(A),
+        2,
+    );
+    legacy(&paths, ACCOUNT);
+    let agent = std::sync::Arc::new(test_agent(&paths));
+    assert!(paths.data_keys.exists(), "a locked agent leaves it");
+    unlock_with(agent.as_ref(), &server, &paths).unwrap();
+    assert!(!paths.data_keys.exists());
+    assert_eq!(agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some(A));
+    let names = ProjectNames::load_from(&paths.project_names).unwrap();
+    assert_eq!(
+        names.name(ACCOUNT, "h1.0123abcd.aa"),
+        Some("github.com/agora/atem")
+    );
+    let opened = agent
+        .crypt(
+            ASTATION_ID,
+            vec![CryptOp::open("mem", "content", &sealed_under_old())],
+        )
+        .unwrap();
+    assert_eq!(
+        &*opened.into_iter().next().unwrap().into_plain().unwrap(),
+        b"old"
+    );
+    // The re-sealed file carries K and its previous key (opened directly).
+    let sealed = sealed_account_keys(&server, &paths, &paths.device_keys_sealed);
+    assert_eq!(sealed.current_kid(ACCOUNT), Some(A));
+    assert_eq!(sealed.previous_kids(ACCOUNT), [OLD]);
+    // From now on K comes from the sealed file.
+    agent.lock_keys().unwrap();
+    unlock_with(agent.as_ref(), &server, &paths).unwrap();
+    assert!(holds_k(agent.as_ref(), ASTATION_ID));
+}
+
+#[test]
+fn a_failed_re_seal_keeps_data_keys_enc_for_the_next_unlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+    set_state(&paths, &server.astation, EncryptionMode::On, Some(A), 2);
+    legacy(&paths, ACCOUNT);
+    let agent = test_agent(&paths);
+    {
+        let _failing = fail_writes_to(&paths.device_keys_sealed);
+        unlock_with(&agent, &server, &paths).unwrap();
+    }
+    assert!(
+        paths.data_keys.exists(),
+        "the only copy of K is never deleted before it is sealed"
+    );
+    assert_eq!(agent.held_kid(ASTATION_ID).unwrap(), None);
+    // The names went first (no secrets): a repeat merges them again.
+    assert_eq!(
+        ProjectNames::load_from(&paths.project_names)
+            .unwrap()
+            .len(ACCOUNT),
+        1
+    );
+    agent.lock_keys().unwrap();
+    unlock_with(&agent, &server, &paths).unwrap();
+    assert!(!paths.data_keys.exists());
+    assert!(holds_k(&agent, ASTATION_ID));
+}
+
+#[test]
+fn a_repeated_migration_keeps_the_newer_k_and_adds_no_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::Enabling, B, [2; 32]);
+    for _ in 0..2 {
+        // A crash after the re-seal, before the delete, leaves it behind again.
+        legacy(&device.paths, ACCOUNT);
+        relock(&device);
+        assert!(!device.paths.data_keys.exists());
+    }
+    let (current, mut previous) = device.agent.lock().unwrap().kids_for_test(ACCOUNT);
+    previous.sort();
+    assert_eq!(current.as_deref(), Some(B));
+    assert_eq!(previous, vec![A.to_string(), OLD.to_string()]);
+    let mut sealed = device.sealed_accounts().previous_kids(ACCOUNT);
+    sealed.sort();
+    assert_eq!(sealed, previous, "the sealed file holds the same keys");
+}
+
+#[test]
+fn only_verified_accounts_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+    legacy(&paths, "someone-else");
+    let agent = test_agent(&paths);
+    unlock_with(&agent, &server, &paths).unwrap();
+    assert!(!paths.data_keys.exists());
+    assert_eq!(
+        agent.lock().unwrap().kids_for_test("someone-else"),
+        (None, vec![])
+    );
+    assert_eq!(
+        ProjectNames::load_from(&paths.project_names)
+            .unwrap()
+            .len("someone-else"),
+        0
+    );
+}
+
+#[test]
+fn an_unreadable_data_keys_enc_is_moved_aside_at_unlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+    std::fs::write(&paths.data_keys, b"from another machine").unwrap();
+    let agent = test_agent(&paths);
+    assert!(paths.data_keys.exists(), "a locked agent leaves it");
+    unlock_with(&agent, &server, &paths).unwrap();
+    assert!(!paths.data_keys.exists());
+    let aside = moved_aside(&paths);
+    assert_eq!(aside.len(), 1, "kept, never deleted");
+    assert_eq!(std::fs::read(&aside[0]).unwrap(), b"from another machine");
+}
+
+#[test]
+fn an_unverified_device_deletes_data_keys_enc_and_a_locked_one_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = KeyPaths::in_dir(dir.path());
+    legacy(&paths, ACCOUNT);
+    let _agent = test_agent(&paths);
+    assert!(
+        !paths.data_keys.exists(),
+        "never used by an unverified device"
+    );
+    assert!(moved_aside(&paths).is_empty());
+
+    // An unreadable one is moved aside, even there.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = KeyPaths::in_dir(dir.path());
+    std::fs::write(&paths.data_keys, b"from another machine").unwrap();
+    let _agent = test_agent(&paths);
+    assert!(!paths.data_keys.exists());
+    assert_eq!(moved_aside(&paths).len(), 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, _, _) = sealed_device(dir.path(), "0a1b2c3d");
+    legacy(&paths, ACCOUNT);
+    let _agent = test_agent(&paths);
+    assert!(
+        paths.data_keys.exists(),
+        "verified but locked: moved at the unlock"
+    );
+}
+
+#[test]
+fn unlocked_via_the_previous_file_data_keys_enc_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = UnlockedDevice::new(dir.path());
+    set_state(
+        &device.paths,
+        &device.server.astation,
+        EncryptionMode::Enabling,
+        Some(A),
+        2,
+    );
+    device.agent.lock_keys().unwrap();
+    std::fs::rename(
+        &device.paths.device_keys_sealed,
+        &device.paths.device_keys_prev,
+    )
+    .unwrap();
+    legacy(&device.paths, ACCOUNT);
+    let challenge = device.agent.begin_unlock(ASTATION_ID).unwrap();
+    let unlock_auth = UnlockAuthKey::load_from(&device.paths.unlock_auth_key)
+        .unwrap()
+        .unwrap();
+    let request = build_unlock_request(&challenge, "boot-1", 1, &unlock_auth);
+    // A current file appears whose storage key Astation may not hold.
+    SealedDeviceKeys::seal_with(
+        &device.keys,
+        &Default::default(),
+        DEVICE_ID,
+        "4e5f6a7b",
+        &new_storage_key(),
+    )
+    .unwrap()
+    .save_to(&device.paths.device_keys_sealed)
+    .unwrap();
+    let grant = device.server.grant_unlock(&request).unwrap();
+    device
+        .agent
+        .finish_unlock(ASTATION_ID, &request.statement, &grant)
+        .unwrap();
+    // K is usable and sealed into .prev, but data_keys.enc stays: Astation
+    // may not hold the key of the file that becomes current.
+    assert!(holds_k(device.agent.as_ref(), ASTATION_ID));
+    assert!(device.paths.data_keys.exists());
+    let prev = sealed_account_keys(
+        &device.server,
+        &device.paths,
+        &device.paths.device_keys_prev,
+    );
+    assert_eq!(prev.current_kid(ACCOUNT), Some(A));
+}
+
+#[test]
+fn before_its_first_escrow_a_device_keeps_data_keys_enc() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = KeyPaths::in_dir(dir.path());
+    let keys = DeviceKeys::generate();
+    keys.save_to(&paths.device_keys).unwrap();
+    let astation = FakeAstation::new();
+    pin(&paths, &astation, &keys, false);
+    set_state(&paths, &astation, EncryptionMode::Enabling, Some(A), 2);
+    legacy(&paths, ACCOUNT);
+    // The agent seals the plain file and starts unlocked, not escrowed.
+    let agent = test_agent(&paths);
+    assert!(holds_k(&agent, ASTATION_ID));
+    assert!(
+        paths.data_keys.exists(),
+        "Astation doesn't hold this storage key yet"
+    );
+    // Restarted before the escrow: the new sealed file gets K again from it.
+    drop(agent);
+    let agent = test_agent(&paths);
+    assert!(holds_k(&agent, ASTATION_ID));
+    assert!(paths.data_keys.exists());
+    // The first escrow is confirmed: now it goes.
+    let mut server = FakeKeyServer {
+        astation,
+        device_sign_pub: keys.device_sign_pub(),
+        unlock_auth_pub: keys.unlock_auth_pub(),
+        storage_keys: Default::default(),
+        pending: None,
+        pending_statement: None,
+        acked: Default::default(),
+    };
+    let ack = server
+        .accept_rotation(&agent.begin_rotation(ASTATION_ID).unwrap())
+        .unwrap();
+    agent.confirm_rotation(ASTATION_ID, &ack).unwrap();
+    assert!(!paths.data_keys.exists());
+    assert!(holds_k(&agent, ASTATION_ID));
+    let sealed = sealed_account_keys(&server, &paths, &paths.device_keys_sealed);
+    assert_eq!(sealed.current_kid(ACCOUNT), Some(A));
+    assert_eq!(sealed.previous_kids(ACCOUNT), [OLD]);
 }
