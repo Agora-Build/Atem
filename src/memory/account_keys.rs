@@ -48,6 +48,19 @@ pub struct AccountKeys {
 pub type SignedModes = BTreeMap<String, Option<(EncryptionMode, Option<String>)>>;
 
 impl AccountKeys {
+    pub fn migration_proof(&self, account: &str, kid: &str, input: &[u8]) -> Result<[u8; 32]> {
+        let ring = self.rings.get(account).filter(|ring| ring.current.kid == kid)
+            .ok_or_else(|| anyhow!(MISSING_KEY))?;
+        let mut derived = Zeroizing::new([0u8; 32]);
+        hkdf::Hkdf::<Sha256>::new(None, &ring.current.key[..])
+            .expand(b"atem-migration-proof-v1", &mut *derived)
+            .map_err(|_| anyhow!("migration proof key derivation failed"))?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&derived[..])
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(input);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rings.is_empty()
     }

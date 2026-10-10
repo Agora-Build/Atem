@@ -249,6 +249,8 @@ pub enum Applied {
     Ignored(&'static str),
     Unchanged,
     ModeChanged(AccountState),
+    /// A repeated signed pending state resumes a failed or interrupted migration.
+    MigrationPending(AccountState),
     KeyInstalled(String),
     /// A key grant arrived while the key agent is locked. After
     /// `atem cred unlock`, atem asks for the key again.
@@ -275,6 +277,11 @@ pub fn apply_account_state(
         ));
     }
     let Some(state) = trust.accept_account_state(astation_id, signed)? else {
+        if let Some(state) = stored_state(trust.verified(astation_id).unwrap())?
+            && matches!(state.mode, EncryptionMode::Enabling | EncryptionMode::Disabling)
+        {
+            return Ok(Applied::MigrationPending(state));
+        }
         return Ok(Applied::Unchanged);
     };
     // Checked before anything is saved: a bad kid leaves the trust store

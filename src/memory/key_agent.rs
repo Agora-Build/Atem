@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use crate::memory::account_keys::{AccountKeys, CryptOp, CryptOut, SignedModes};
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::encoding::dec;
+use crate::memory::crypto::EncryptionMode;
 use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, open_grant as open_sealed_grant};
 use crate::memory::legacy_keys::{self, Legacy};
 use crate::memory::statements::{
@@ -81,6 +82,12 @@ pub enum Request {
     HeldKid {
         astation_id: String,
     },
+    MigrationComplete {
+        astation_id: String,
+        state_epoch: u64,
+        mode: String,
+        kid: String,
+    },
     /// Starts an unlock through the home Astation: a single-use X25519 key.
     BeginUnlock {
         astation_id: String,
@@ -135,6 +142,9 @@ pub enum Reply {
     },
     HeldKid {
         kid: Option<String>,
+    },
+    MigrationComplete {
+        completion: SignedWire,
     },
     UnlockChallenge {
         e_pub: String,
@@ -349,6 +359,8 @@ impl KeyAgent {
             }
             Request::Crypt { astation_id, ops } => self.crypt(&astation_id, ops),
             Request::HeldKid { astation_id } => self.held_kid(&astation_id),
+            Request::MigrationComplete { astation_id, state_epoch, mode, kid } =>
+                self.migration_complete(&astation_id, state_epoch, &mode, &kid),
             Request::BeginUnlock { astation_id } => self.begin_unlock(&astation_id),
             Request::FinishUnlock {
                 astation_id,
@@ -509,6 +521,25 @@ impl KeyAgent {
                 .map(str::to_string)
         });
         Ok(Reply::HeldKid { kid })
+    }
+
+    fn migration_complete(&self, astation_id: &str, epoch: u64, target: &str, kid: &str) -> Result<Reply> {
+        let unlocked = self.unlocked()?;
+        let trust = TrustStore::load_from(&self.paths.trust)?;
+        let entry = trust.verified(astation_id).ok_or_else(|| anyhow!("device is unverified"))?;
+        let (account, state) = effective_state(&trust, astation_id)?.ok_or_else(|| anyhow!("device is unverified"))?;
+        let state = state.ok_or_else(|| anyhow!("the signed encryption state is missing"))?;
+        let pending = match target { "on" => EncryptionMode::Enabling, "off" => EncryptionMode::Disabling,
+            _ => bail!("invalid migration target") };
+        if state.mode != pending || state.epoch != epoch || state.kid.as_deref() != Some(kid)
+            || entry.device_id != unlocked.device_id
+            || entry.device_sign_pub != STANDARD.encode(unlocked.keys.device_sign_pub()) {
+            bail!("the approved migration or verified device changed; retry migration");
+        }
+        let mut statement = crate::memory::migration::proof_input(&account, state.sign_gen, &unlocked.device_id, target, kid, epoch);
+        let proof = unlocked.accounts.migration_proof(&account, kid, &statement)?;
+        statement.extend(crate::memory::encoding::enc(&[&proof]));
+        Ok(Reply::MigrationComplete { completion: unlocked.keys.sign_statement(&statement) })
     }
 
     /// The latest signed state of every account a verified Astation names
@@ -1303,6 +1334,14 @@ fn remove_plain_keys(paths: &KeyPaths) -> Result<()> {
 /// in process (`Mutex<KeyAgent>`, used by tests and by the socket server).
 pub trait KeyAgentApi: Send + Sync {
     fn call(&self, request: Request) -> Result<Reply>;
+
+    fn migration_completion(&self, astation_id: &str, state_epoch: u64, mode: &str, kid: &str) -> Result<SignedWire> {
+        match self.call(Request::MigrationComplete { astation_id: astation_id.into(), state_epoch,
+            mode: mode.into(), kid: kid.into() })? {
+            Reply::MigrationComplete { completion } => Ok(completion),
+            _ => unexpected(),
+        }
+    }
 
     fn status(&self) -> Result<AgentStatus> {
         match self.call(Request::Status)? {

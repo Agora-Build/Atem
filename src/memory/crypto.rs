@@ -614,6 +614,8 @@ pub async fn migrate_account(astation_id: &str) -> Result<Option<&'static str>> 
     knowledge.migrate_encryption().await
         .map_err(|error| anyhow!(error.to_string()))?;
     vault.migrate_encryption().await?;
+    knowledge.verify_encryption_migration().await.map_err(|error| anyhow!(error.to_string()))?;
+    vault.verify_encryption_migration().await?;
     Ok(Some(target))
 }
 
