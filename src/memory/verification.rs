@@ -314,8 +314,8 @@ pub(crate) fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>
 }
 
 /// The newest signed state of every account a verified Astation names: the
-/// highest epoch when two name one account, `None` while none of them has a
-/// signed state. The one rule for which `K` an account needs, shared by the
+/// highest epoch when two name one account (on equal epochs, the state of
+/// the smallest Astation id), `None` while none of them has a signed state. The one rule for which `K` an account needs, shared by the
 /// key agent (which keys it keeps) and `key_needed` (which it asks for).
 pub(crate) fn newest_states(
     trust: &TrustStore,
@@ -325,6 +325,8 @@ pub(crate) fn newest_states(
         let state = stored_state(entry)?;
         let slot: &mut Option<AccountState> =
             newest.entry(entry.data_account.clone()).or_insert(None);
+        // Entries come in Astation id order: strictly newer replaces, so the
+        // smallest id keeps an equal epoch.
         if let Some(state) = state
             && slot.as_ref().is_none_or(|current| state.epoch > current.epoch)
         {

@@ -26,7 +26,8 @@ use crate::memory::verification::{KeyPaths, newest_states, stored_state};
 
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
 /// other version with an error, so an old agent and a newer CLI fail clearly.
-pub const PROTOCOL_VERSION: u64 = 1;
+/// v2 (build step 2b): `K` stays in the agent (`InstallGrant`, `Crypt`).
+pub const PROTOCOL_VERSION: u64 = 2;
 
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 

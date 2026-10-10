@@ -1,4 +1,4 @@
-//! The key agent's Unix socket: newline-delimited JSON, `"v": 1` on every
+//! The key agent's Unix socket: newline-delimited JSON, `"v": 2` on every
 //! request, same-user peers only. `atem key-agent` serves it; commands that
 //! need keys connect, starting the agent when none is running.
 //! See designs/e2e-encryption.md "Keys on disk (atem)".
@@ -25,11 +25,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::key_agent::{KeyAgent, KeyAgentApi, PROTOCOL_VERSION, Reply, Request};
 use crate::memory::verification::KeyPaths;
 
-/// No request or reply is anywhere near this; it only bounds a misbehaving peer.
-const MAX_LINE: usize = 1 << 20;
+/// Bounds a misbehaving peer. A `Crypt` batch is kept under 2 MiB of input by
+/// `EncryptionContext`, and one skill (at most 1 MiB, base64 on the wire)
+/// always fits.
+const MAX_LINE: usize = 8 << 20;
 /// A connection that says nothing for this long is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -209,6 +212,14 @@ struct LoadUnlockedWire {
     storage_key: Zeroizing<String>,
 }
 
+/// `crypt` carries plain text to seal or hash: parsed straight from the
+/// line into `Zeroizing` fields (`CryptOp` is externally tagged).
+#[derive(Deserialize)]
+struct CryptWire {
+    astation_id: String,
+    ops: Vec<CryptOp>,
+}
+
 pub(crate) fn decode_request(line: &str) -> Result<Request> {
     let head: RequestHead = serde_json::from_str(line).context("key agent request is not JSON")?;
     match head.v {
@@ -230,6 +241,14 @@ pub(crate) fn decode_request(line: &str) -> Result<Request> {
             storage_key: wire.storage_key,
         });
     }
+    if head.op.as_deref() == Some("crypt") {
+        let wire: CryptWire =
+            serde_json::from_str(line).context("key agent request is malformed")?;
+        return Ok(Request::Crypt {
+            astation_id: wire.astation_id,
+            ops: wire.ops,
+        });
+    }
     serde_json::from_str(line).context("key agent request is malformed")
 }
 
@@ -240,7 +259,24 @@ struct ResponseHead {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
-    reply: Option<serde::de::IgnoredAny>,
+    reply: Option<ReplyHead>,
+}
+
+/// A reply's `kind`, everything else skipped.
+#[derive(Deserialize)]
+struct ReplyHead {
+    kind: Option<String>,
+}
+
+/// The `crypt` reply carries opened plain text: parsed straight from the line.
+#[derive(Deserialize)]
+struct CryptedResponse {
+    reply: CryptedReply,
+}
+
+#[derive(Deserialize)]
+struct CryptedReply {
+    results: Vec<CryptOut>,
 }
 
 pub(crate) fn decode_response(line: &str) -> Result<Reply> {
@@ -260,8 +296,15 @@ pub(crate) fn decode_response(line: &str) -> Result<Reply> {
                 .unwrap_or_else(|| "the key agent refused the request".into())
         );
     }
-    if head.reply.is_none() {
+    let Some(reply) = head.reply else {
         bail!("the key agent sent an empty reply");
+    };
+    if reply.kind.as_deref() == Some("crypted") {
+        let crypted: CryptedResponse =
+            serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
+        return Ok(Reply::Crypted {
+            results: crypted.reply.results,
+        });
     }
     let response: Response =
         serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
@@ -288,7 +331,7 @@ fn respond(agent: &Mutex<KeyAgent>, line: &str) -> WipingBuf {
     to_wiping_json(&response).unwrap_or_else(|_| {
         let mut buf = WipingBuf::new();
         buf.append(
-            b"{\"v\":1,\"ok\":false,\"error\":\"the key agent could not encode its reply\"}\n",
+            b"{\"v\":2,\"ok\":false,\"error\":\"the key agent could not encode its reply\"}\n",
         );
         buf
     })
@@ -704,8 +747,14 @@ async fn serve_connection(
     let (mut read, mut write) = stream.into_split();
     let mut pending = WipingBuf::new();
     let mut chunk = Zeroizing::new([0u8; 4096]);
+    // Bytes of `pending` already known to hold no newline: a multi-MiB
+    // `Crypt` line arrives in 4 KiB reads, and rescanning it all each time
+    // would be quadratic.
+    let mut scanned = 0;
     loop {
-        while let Some(end) = pending.0.iter().position(|byte| *byte == b'\n') {
+        while let Some(offset) = pending.0[scanned..].iter().position(|byte| *byte == b'\n') {
+            let end = scanned + offset;
+            scanned = 0;
             let line = Zeroizing::new(pending.0.drain(..=end).collect::<Vec<u8>>());
             let reply = match std::str::from_utf8(&line[..end]) {
                 Ok(text) => respond(agent, text),
@@ -713,6 +762,7 @@ async fn serve_connection(
             };
             write.write_all(&reply.0).await?;
         }
+        scanned = pending.0.len();
         if pending.0.len() > MAX_LINE {
             bail!("a request is too long");
         }
@@ -1169,20 +1219,23 @@ mod tests {
         let line = encode_request(&Request::Status).unwrap();
         assert!(line.ends_with('\n'));
         let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(value, serde_json::json!({"op": "status", "v": 1}));
+        assert_eq!(value, serde_json::json!({"op": "status", "v": 2}));
         assert!(matches!(
             decode_request(line.trim()).unwrap(),
             Request::Status
         ));
-        let newer = decode_request(r#"{"op":"status","v":2}"#).err().unwrap();
-        assert!(format!("{newer:#}").contains("protocol version 2"));
+        let newer = decode_request(r#"{"op":"status","v":3}"#).err().unwrap();
+        assert!(format!("{newer:#}").contains("protocol version 3"));
+        let older = decode_request(r#"{"op":"status","v":1}"#).err().unwrap();
+        assert!(format!("{older:#}").contains("protocol version 1"));
         assert!(decode_request(r#"{"op":"status"}"#).is_err());
     }
 
     #[test]
     fn a_newer_cli_gets_a_clear_error_from_an_older_agent() {
-        let newer_agent = decode_response(r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#);
-        let hint = format!("{:#}", newer_agent.err().unwrap());
+        // A step-2a agent (v1) left running after an upgrade.
+        let older_agent = decode_response(r#"{"v":1,"ok":true,"reply":{"kind":"done"}}"#);
+        let hint = format!("{:#}", older_agent.err().unwrap());
         // Check first that Astation holds the storage key, then stop it.
         let (status, pkill) = (
             hint.find("atem cred status").expect(&hint),
@@ -1190,11 +1243,11 @@ mod tests {
         );
         assert!(status < pkill, "{hint}");
         let refused = decode_response(
-            r#"{"v":1,"ok":false,"error":"unsupported key agent protocol version 2"}"#,
+            r#"{"v":2,"ok":false,"error":"unsupported key agent protocol version 3"}"#,
         );
-        assert!(format!("{:#}", refused.err().unwrap()).contains("protocol version 2"));
+        assert!(format!("{:#}", refused.err().unwrap()).contains("protocol version 3"));
         assert!(matches!(
-            decode_response(r#"{"v":1,"ok":true,"reply":{"kind":"done"}}"#).unwrap(),
+            decode_response(r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#).unwrap(),
             Reply::Done
         ));
     }
@@ -1222,17 +1275,17 @@ mod tests {
         );
         // A request in an unknown version is answered with an error, not dropped.
         let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-        stream.write_all(b"{\"op\":\"status\",\"v\":2}\n").unwrap();
+        stream.write_all(b"{\"op\":\"status\",\"v\":3}\n").unwrap();
         let mut line = String::new();
         BufReader::new(&stream).read_line(&mut line).unwrap();
         let response: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(response["v"], 1);
+        assert_eq!(response["v"], 2);
         assert_eq!(response["ok"], false);
         assert!(
             response["error"]
                 .as_str()
                 .unwrap()
-                .contains("protocol version 2")
+                .contains("protocol version 3")
         );
     }
 
@@ -1602,7 +1655,114 @@ mod tests {
                     ciphertext: "AA==".into(),
                 },
             },
+            Request::Crypt {
+                astation_id: "a".into(),
+                ops: vec![
+                    crate::memory::account_keys::CryptOp::seal("r", "f", b"hi"),
+                    crate::memory::account_keys::CryptOp::open("r", "f", "e1.x.AA=="),
+                    crate::memory::account_keys::CryptOp::keyed_hash(b"p"),
+                ],
+            },
+            Request::HeldKid {
+                astation_id: "a".into(),
+            },
         ]
+    }
+
+    /// A step-2a (v1) agent left running: answers every line in v1.
+    fn start_v1_agent(dir: &Path) -> PathBuf {
+        let socket = dir.join("run").join("agent.sock");
+        make_private(socket.parent().unwrap());
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                    let _ = (&stream).write_all(
+                        b"{\"v\":1,\"ok\":true,\"reply\":{\"kind\":\"status\",\"unlocked\":true,\"storage_kid\":null,\"escrowed\":true}}\n",
+                    );
+                }
+            }
+        });
+        socket
+    }
+
+    #[test]
+    fn cred_status_against_an_old_agent_says_to_stop_it() {
+        use crate::memory::trust::TrustStore;
+        use crate::memory::unlock::{AgentState, agent_state, status_report};
+        let dir = short_dir();
+        let client = KeyAgentClient::at(start_v1_agent(dir.path()));
+        assert!(client.is_running());
+        let state = agent_state(Some(&client));
+        let report = status_report(
+            &TrustStore::default(),
+            "astation-1",
+            &state,
+            Some("0a1b2c3d"),
+            None,
+        );
+        // The report is printed, not an error: the mismatch and what to do.
+        assert!(
+            report.contains("Key agent: not answering (the running key agent speaks protocol v1, this atem speaks v2"),
+            "{report}"
+        );
+        assert!(report.contains("pkill"), "{report}");
+        assert!(report.contains("retry"), "{report}");
+        assert!(report.contains("Storage key: 0a1b2c3d"), "{report}");
+        assert!(matches!(agent_state(None), AgentState::NotRunning));
+    }
+
+    #[test]
+    fn crypt_requests_and_replies_parse_without_the_tagged_enum() {
+        use crate::memory::account_keys::CryptOp;
+        let request = Request::Crypt {
+            astation_id: "a".into(),
+            ops: vec![
+                CryptOp::seal("r", "f", b"hi"),
+                CryptOp::open("r", "f", "e1.x"),
+                CryptOp::keyed_hash(b"p"),
+            ],
+        };
+        let line = encode_request(&request).unwrap();
+        assert!(line.contains(r#""op":"crypt""#), "{}", *line);
+        assert!(
+            line.contains(r#"{"seal":{"record":"r","field":"f","plain":"aGk="}}"#),
+            "{}",
+            *line
+        );
+        match decode_request(line.trim()).unwrap() {
+            Request::Crypt { astation_id, ops } => {
+                assert_eq!(astation_id, "a");
+                assert_eq!(ops.len(), 3);
+            }
+            _ => panic!("expected a crypt request"),
+        }
+        let reply = decode_response(
+            r#"{"v":2,"ok":true,"reply":{"kind":"crypted","results":[{"sealed":"e1.x"},{"opened":"aGk="},{"hashed":"h1.y"}]}}"#,
+        )
+        .unwrap();
+        let Reply::Crypted { results } = reply else {
+            panic!("expected crypted");
+        };
+        let mut results = results.into_iter();
+        assert_eq!(results.next().unwrap().into_text().unwrap(), "e1.x");
+        assert_eq!(&*results.next().unwrap().into_plain().unwrap(), b"hi");
+        assert_eq!(results.next().unwrap().into_text().unwrap(), "h1.y");
+    }
+
+    #[test]
+    fn a_crypt_batch_bigger_than_a_mebibyte_reaches_the_agent() {
+        use crate::memory::account_keys::CryptOp;
+        use crate::memory::key_agent::error_of;
+        let dir = short_dir();
+        let socket = start_agent(dir.path(), own_uid());
+        let client = KeyAgentClient::at(socket);
+        let big = vec![b'x'; 3 << 20];
+        let error = error_of(client.crypt("a", vec![CryptOp::seal("r", "f", &big)]));
+        // The locked agent's answer, not a refused line.
+        assert!(error.contains("locked"), "{error}");
     }
 
     #[test]

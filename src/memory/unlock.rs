@@ -587,6 +587,19 @@ pub enum AgentState {
     Unreachable(String),
 }
 
+/// The running agent's status. An agent that can't answer (an older one
+/// speaking another protocol version, say) is reported, not an error: the
+/// report carries its message and what to do about it.
+pub fn agent_state(agent: Option<&dyn KeyAgentApi>) -> AgentState {
+    match agent {
+        None => AgentState::NotRunning,
+        Some(agent) => match agent.status() {
+            Ok(status) => AgentState::Running(status),
+            Err(error) => AgentState::Unreachable(format!("{error:#}")),
+        },
+    }
+}
+
 /// `atem cred status`, for the paired Astation `astation_id`. `key_problem`
 /// (from `key_file_problem`) adds the reset instructions.
 pub fn status_report(
@@ -676,13 +689,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
                     .flatten()
                     .map(|sealed| sealed.storage_kid);
                 let problem = key_file_problem(&paths, &trust);
-                let agent = match running_agent() {
-                    None => AgentState::NotRunning,
-                    Some(agent) => match agent.status() {
-                        Ok(status) => AgentState::Running(status),
-                        Err(error) => AgentState::Unreachable(format!("{error:#}")),
-                    },
-                };
+                let agent = agent_state(running_agent().as_deref());
                 Ok(status_report(
                     &trust,
                     &paired.astation_id,

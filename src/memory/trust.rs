@@ -163,9 +163,12 @@ impl TrustStore {
         self.astations.get(astation_id)
     }
 
-    /// Every verified Astation's entry.
+    /// Every verified Astation's entry, in Astation id order (so ties are
+    /// broken the same way on every run).
     pub fn verified_entries(&self) -> impl Iterator<Item = &AstationTrust> {
-        self.astations.values()
+        let mut entries: Vec<_> = self.astations.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries.into_iter().map(|(_, entry)| entry)
     }
 
     /// The home Astation, once it is verified.

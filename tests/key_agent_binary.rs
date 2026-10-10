@@ -54,7 +54,7 @@ fn the_real_agent_starts_locked_and_answers_on_its_socket() {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    stream.write_all(b"{\"op\":\"status\",\"v\":1}\n").unwrap();
+    stream.write_all(b"{\"op\":\"status\",\"v\":2}\n").unwrap();
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).unwrap();
     let reply: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
@@ -85,7 +85,7 @@ fn status_at(socket: &std::path::Path) -> Option<serde_json::Value> {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .ok()?;
-    stream.write_all(b"{\"op\":\"status\",\"v\":1}\n").ok()?;
+    stream.write_all(b"{\"op\":\"status\",\"v\":2}\n").ok()?;
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).ok()?;
     serde_json::from_slice(&buf[..n]).ok()

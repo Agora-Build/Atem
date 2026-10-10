@@ -550,6 +550,33 @@ fn key_needed_follows_the_newest_signed_state_of_the_account() {
 }
 
 #[test]
+fn equal_epochs_pick_the_smallest_astation_id() {
+    use crate::memory::verification::newest_states;
+    let dir = tempfile::tempdir().unwrap();
+    let device = UnlockedDevice::new(dir.path());
+    // Three verified Astations name one account at the same epoch, each
+    // with another kid: the smallest id wins, whatever the map's order.
+    for (id, kid) in [("astation-0", A), ("astation-2", B)] {
+        let other = FakeAstation::new();
+        pin_as(&device.paths, id, &other, &device.keys, false);
+        set_state_as(&device.paths, id, &other, EncryptionMode::On, Some(kid), 7);
+    }
+    set_state(
+        &device.paths,
+        &device.server.astation,
+        EncryptionMode::On,
+        Some("4567cdef"),
+        7,
+    );
+    for _ in 0..32 {
+        let trust = TrustStore::load_from(&device.paths.trust).unwrap();
+        let newest = newest_states(&trust).unwrap();
+        let state = newest[ACCOUNT].as_ref().unwrap();
+        assert_eq!(state.kid.as_deref(), Some(A));
+    }
+}
+
+#[test]
 fn a_prune_error_before_anything_changed_is_logged_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut device = UnlockedDevice::new(dir.path());
