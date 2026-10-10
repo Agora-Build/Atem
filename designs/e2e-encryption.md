@@ -1359,7 +1359,8 @@ for an unlock and 60 s for a rotation. It strips control, bidi and invisible
 format characters from `reason` and `pending_kid` and shows at most 200
 characters.
 An `unlockDenied` with `revoked: true` (or, from an Astation that doesn't
-send the flag yet, "revoked" in `reason`) is recorded in `cred_state.json`;
+send the flag yet, "revoked" or "does not belong to this verified device" in
+`reason`, the answer of an Astation that has forgotten the device) is recorded in `cred_state.json`;
 `atem cred status` shows it, and the next `atem pair` with the agent locked
 renames the old key files to `<name>.revoked-<stamp>` and verifies with new
 keys. The signal is unsigned too, but acting on it only renames old files
@@ -1404,7 +1405,9 @@ the reference behaviour.
    last unlock) with Approve, Deny, and Deny and revoke; on deny send
    `unlockDenied { reason }`, and on Deny and revoke
    `unlockDenied { reason, revoked: true }` (atem then sets the device's
-   old keys aside at its next `atem pair`).
+   old keys aside at its next `atem pair`). A request from a device that was
+   revoked earlier, or that Astation doesn't know, is answered with
+   `revoked: true` too.
 3. **On approve,** take the storage key whose kid equals the request's
    `storage_kid`: the current key or the pending one. No such key →
    `unlockDenied`; never release another key (atem refuses a grant whose

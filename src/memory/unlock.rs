@@ -207,10 +207,14 @@ fn signed_request(
 }
 
 /// Whether an `unlockDenied` says the device was revoked: the `revoked`
-/// flag, or, from an Astation that doesn't send it yet, "revoked" in the
-/// reason.
+/// flag, or, from an Astation that doesn't send it yet, a reason saying so.
+/// An Astation that no longer knows the device (it forgets a revoked one)
+/// says the request "does not belong to this verified device".
 fn denial_revokes(reason: &str, revoked: bool) -> bool {
-    revoked || reason.to_lowercase().contains("revoked")
+    let reason = reason.to_lowercase();
+    revoked
+        || reason.contains("revoked")
+        || reason.contains("does not belong to this verified device")
 }
 
 /// Unlocks the agent through `astation_id` (the home Astation): the agent's
@@ -1101,6 +1105,10 @@ mod tests {
             ("Denied on the Mac", true),
             (
                 "Unlock was denied and this device's verification was REVOKED.",
+                false,
+            ),
+            (
+                "The request does not belong to this verified device and account.",
                 false,
             ),
         ] {
