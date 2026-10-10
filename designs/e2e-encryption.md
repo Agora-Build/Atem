@@ -507,9 +507,10 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   `device_keys.sealed` gains `account_keys`: per account, the current `kid`
   and key and the keys it replaced (`previous`). The field is omitted when
   empty, so a file without keys reads as "no keys". A file that carries
-  `account_keys` is written with `version: 2` (a file without them stays
-  `version: 1`), and the reader is strict: v2 requires non-empty
-  `account_keys`, v1 must not contain them, any other version is rejected.
+  `account_keys` is written with payload `version: 2` (a file without them
+  stays payload `version: 1`; the file envelope is always `version: 1`), and
+  the reader is strict: v2 requires non-empty `account_keys`, v1 must not
+  contain them, any other version is rejected.
   A step-2a binary therefore refuses a v2 file instead of silently dropping
   the keys. Every path that re-seals the file (rotation phase 1, a `.next`
   promotion, the first escrow, a migration, a lone-`.prev` promotion) carries
@@ -580,7 +581,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   `data_keys.enc`, and the next unlock repeats the merge. An unreadable
   `data_keys.enc` is never deleted (its key may be recoverable): it is renamed
   aside to `data_keys.enc.corrupt-<stamp>`. An unverified device's is deleted
-  when the agent starts (it only holds what the unauthenticated #36 path
+  when the agent starts (an unreadable one is moved aside) (it only holds what the unauthenticated #36 path
   stored). A device's first verification with an Astation purges what the
   #36 path stored for that Astation, except accounts another verified
   Astation also names (this covers `data_keys.enc` and the forgetting of
@@ -601,7 +602,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   - An unlock that opened the sealed file via `.prev` keeps `data_keys.enc`
     until a later unlock proves the home Astation holds the current key.
   - A step-2a binary refuses a v2 `device_keys.sealed` (see above), so
-    downgrading after a `K` was installed needs `atem cred` reset steps or a
+    downgrading after a `K` was installed needs the reset steps shown by `atem cred status` or a
     fresh grant.
   - A key agent left running across the upgrade speaks protocol v1; the
     new atem tells you to stop it. After the upgrade a verified device needs
@@ -1142,7 +1143,7 @@ project `…/a/bc` + name `d`).
 | Key grants (`K`, index, scope) | HPKE RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD | `info = enc("atem-grant-info-v1", account, type, device_id, device_pub, kid, scope_hmac)`; the signed `atem-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
 | Unlock reply (storage key) | same HPKE to the request's `e_pub`, empty AAD | `info = enc("atem-unlock-info-v1", account, device_id, storage_kid, SHA-256(request statement bytes))`; the signed `atem-unlock-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
 | Storage key to Astation (rotation) | same HPKE to the pinned `astation_enc_pub`, empty AAD | `info = enc("atem-storage-key-info-v1", account, device_id, new_storage_kid)`; the signed `atem-storage-rotate-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
-| `device_keys.sealed` | JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`; XChaCha20-Poly1305 under the 32-byte storage key; plaintext is the device key, the device signing key and (step 2b) `account_keys`, per account the current kid and key and the previous keys; `version` is 2 when `account_keys` is present, else 1 (the unlock-auth key lives in its own 0600 file `unlock_auth_key`) | AAD `enc("atem-device-keys-v1", device_id, storage_kid)` |
+| `device_keys.sealed` | JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`; XChaCha20-Poly1305 under the 32-byte storage key; plaintext is the device key, the device signing key and (step 2b) `account_keys`, per account the current kid and key and the previous keys; the payload `version` is 2 when `account_keys` is present, else 1 (the unlock-auth key lives in its own 0600 file `unlock_auth_key`) | AAD `enc("atem-device-keys-v1", device_id, storage_kid)` |
 | Credential names | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
 | Credential scopes | `HMAC-SHA256(I_scope, project_key)` | — |
 | Memory projects | `HMAC-SHA256(K_project, project_key)` | — |
