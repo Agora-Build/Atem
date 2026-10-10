@@ -1568,7 +1568,9 @@ async fn run_device_verification(
     use tokio::time::{Duration, timeout};
 
     let paths = KeyPaths::default_paths();
-    let device_id = crate::config::AtemConfig::ensure_instance_id();
+    // The device id is this atem's relay identity (`atem_id`): Astation checks it
+    // equals the id the connection authenticated as.
+    let device_id = crate::websocket_client::resolved_atem_id(&crate::auth::get_hostname());
     // The agent client blocks (socket I/O, autostart): call it off the runtime.
     let agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> =
         std::sync::Arc::from(crate::memory::key_agent::default_agent());

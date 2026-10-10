@@ -1227,7 +1227,7 @@ binary values are base64. `SignedWire` is `{statement, signature}`;
 
 | Type | Direction | Data |
 |---|---|---|
-| `verifyCommit` | atem → Astation | `device_id`, `commitment` |
+| `verifyCommit` | atem → Astation | `device_id` (this atem's `atem_id`, which Astation checks against the id the connection authenticated as), `commitment` |
 | `verifyKeys` | Astation → atem | `sign_pub` (65-byte uncompressed SEC1 point, CryptoKit `x963Representation`), `enc_pub`, `recovery_sign_pub`, `nonce` |
 | `verifyReveal` | atem → Astation | `device_pub`, `device_sign_pub`, `unlock_auth_pub`, `nonce` |
 | `deviceVerified` | Astation → atem | `device_verified: SignedWire`, `account_state: SignedWire`, `grants: [GrantWire]` |
