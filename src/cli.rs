@@ -442,7 +442,7 @@ pub enum CredCommands {
     Status,
     /// Unlock this device's keys (approve with Touch ID on your Mac)
     Unlock,
-    /// Wipe the unlocked keys from the key agent's memory
+    /// Wipe the unlocked keys from memory and stop the key agent
     Lock,
 }
 
