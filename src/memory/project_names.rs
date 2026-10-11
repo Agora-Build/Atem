@@ -14,6 +14,8 @@ pub struct ProjectNames {
     version: u8,
     #[serde(default)]
     accounts: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 fn version_one() -> u8 {
@@ -84,6 +86,18 @@ impl ProjectNames {
         self.accounts.get(account).map(|names| names.values().cloned().collect()).unwrap_or_default()
     }
 
+    pub fn project_labels(&self, account: &str) -> Vec<String> {
+        let mut projects: BTreeMap<_, _> = self.projects(account).into_iter().map(|key| (key.clone(), key)).collect();
+        if let Some(labels) = self.labels.get(account) {
+            for (key, label) in labels {
+                if super::credential_projects::canonical_project(label).as_ref() == Some(key) {
+                    projects.insert(key.clone(), label.clone());
+                }
+            }
+        }
+        projects.into_values().collect()
+    }
+
     #[cfg(test)]
     pub fn len(&self, account: &str) -> usize {
         self.accounts.get(account).map_or(0, BTreeMap::len)
@@ -129,7 +143,22 @@ pub fn forget_account_at(path: &Path, account: &str) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     let mut names = ProjectNames::load_for_write(path)?;
-    if names.accounts.remove(account).is_some() {
+    let removed = names.accounts.remove(account).is_some();
+    if names.labels.remove(account).is_some() || removed {
+        names.save_to(path)?;
+    }
+    Ok(())
+}
+
+/// Display spelling is account scoped; hash-to-key identity stays unchanged.
+pub fn remember_label(path: &Path, account: &str, label: &str) -> Result<()> {
+    let Some(key) = super::credential_projects::canonical_project(label) else { return Ok(()); };
+    let _lock = crate::memory::trust::TrustStore::lock(path)?;
+    let mut names = ProjectNames::load_for_write(path)?;
+    let labels = names.labels.entry(account.to_string()).or_default();
+    let label = label.trim();
+    if labels.get(&key).map(String::as_str) != Some(label) {
+        labels.insert(key, label.to_string());
         names.save_to(path)?;
     }
     Ok(())
@@ -182,6 +211,27 @@ mod tests {
         let names = ProjectNames::load_from(&path).unwrap();
         assert_eq!(names.len("acct"), 0);
         assert_eq!(names.len("other"), 1);
+    }
+
+    #[test]
+    fn display_labels_survive_name_writes_and_remain_account_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project_names.json");
+        remember(&path, "acct", [pair("h1.x.aa", "github.com/org/repo")]).unwrap();
+        remember_label(&path, "acct", "github.com/Org/Repo").unwrap();
+        remember_label(&path, "other", "github.com/Private/Other").unwrap();
+        remember(&path, "acct", [pair("h1.x.bb", "github.com/org/second")]).unwrap();
+        let names = ProjectNames::load_from(&path).unwrap();
+        assert_eq!(names.name("acct", "h1.x.aa"), Some("github.com/org/repo"));
+        assert_eq!(names.project_labels("acct"), ["github.com/Org/Repo", "github.com/org/second"]);
+        assert_eq!(names.project_labels("other"), ["github.com/Private/Other"]);
+        let before = std::fs::read(&path).unwrap();
+        remember_label(&path, "acct", "github.com/Org/Repo").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        forget_account_at(&path, "acct").unwrap();
+        let names = ProjectNames::load_from(&path).unwrap();
+        assert!(names.project_labels("acct").is_empty());
+        assert_eq!(names.project_labels("other"), ["github.com/Private/Other"]);
     }
 
     #[test]

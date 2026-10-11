@@ -391,10 +391,13 @@ impl KeyAgent {
                     || entry.device_sign_pub != STANDARD.encode(unlocked.keys.device_sign_pub()) {
                     bail!("project report identity changed");
                 }
+                if let Some(label) = current_project.as_deref() {
+                    super::project_names::remember_label(&self.paths.project_names, &entry.data_account, label)?;
+                }
                 let names = super::project_names::ProjectNames::load_from(&self.paths.project_names)?;
                 let report = super::credential_projects::seal_report(&unlocked.keys, &entry.data_account,
                     &entry.device_id, &*decode32(&entry.astation_enc_pub, "Astation encryption key")?,
-                    names.projects(&entry.data_account), current_project.as_deref())?;
+                    names.project_labels(&entry.data_account), current_project.as_deref())?;
                 Ok(Reply::CredentialProjects { report })
             }
             Request::PublicKeys => {

@@ -894,7 +894,7 @@ impl AstationClient {
         let report = blocking(move || {
             let agent = running_agent().ok_or_else(|| anyhow!("key agent is not running"))?;
             if !agent.status()?.unlocked { return Err(anyhow!("key agent is locked")); }
-            let project = std::env::current_dir().ok().and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.key);
+            let project = std::env::current_dir().ok().and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.label);
             agent.credential_projects(&astation_id, project)
         }).await?;
         self.send_message_flushed(AstationMessage::CredentialProjectListResponse { report }).await
