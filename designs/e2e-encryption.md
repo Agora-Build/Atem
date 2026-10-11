@@ -1067,6 +1067,10 @@ Astation's editable credential project picker receives the current Git project
 and account-specific remembered project names from an updated, unlocked Atem.
 These suggestions are HPKE-encrypted to the pinned Astation and device-signed,
 even when memory encryption is off. They do not grant any credential access.
+Display and saved scopes keep the Git remote's original capitalization, while
+identity and matching remain case-insensitive. An optional signed, encrypted
+label envelope preserves compatibility with the existing lowercase report;
+labels never alter project hashes or credential permissions.
 See [credential project reporting](../docs/credential-project-reporting.md) for
 the protocol, lifecycle and optional metadata failure behavior.
 

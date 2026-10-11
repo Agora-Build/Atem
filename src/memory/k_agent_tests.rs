@@ -33,13 +33,23 @@ fn credential_projects_are_account_scoped_encrypted_and_require_current_unlocked
         [("hash-a".into(), "github.com/org/known".into())]).unwrap();
     crate::memory::project_names::remember(&device.paths.project_names, "other-account",
         [("hash-b".into(), "github.com/private/other".into())]).unwrap();
-    let report = device.agent.credential_projects(ASTATION_ID, Some("github.com/org/current".into())).unwrap();
+    let report = device.agent.credential_projects(ASTATION_ID, Some("github.com/Org/Current".into())).unwrap();
     let statement = STANDARD.decode(&report.signed.statement).unwrap();
     let fields = crate::memory::encoding::dec(&statement).unwrap();
     let info = crate::memory::encoding::enc(&[b"atem-credential-projects-info-v1", &fields[1], &fields[2], &fields[3], &fields[4]]);
     let plain = crate::memory::grant::hpke_open(&device.server.astation.enc_secret_bytes(),
         &STANDARD.decode(&report.encapped_key).unwrap(), &STANDARD.decode(&report.ciphertext).unwrap(), &info).unwrap();
     assert_eq!(serde_json::from_slice::<Vec<String>>(&plain).unwrap(), ["github.com/org/current", "github.com/org/known"]);
+    let labels = report.labels.unwrap();
+    let label_fields = crate::memory::encoding::dec(&STANDARD.decode(&labels.signed.statement).unwrap()).unwrap();
+    let label_info = crate::memory::encoding::enc(&[b"atem-credential-project-labels-info-v1", &label_fields[1], &label_fields[2], &label_fields[3], &label_fields[4]]);
+    let label_plain = crate::memory::grant::hpke_open(&device.server.astation.enc_secret_bytes(),
+        &STANDARD.decode(&labels.encapped_key).unwrap(), &STANDARD.decode(&labels.ciphertext).unwrap(), &label_info).unwrap();
+    let entries: Vec<crate::memory::credential_projects::ProjectLabel> = serde_json::from_slice(&label_plain).unwrap();
+    assert_eq!(entries[0].label, "github.com/Org/Current");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(ProjectNames::load_from(&device.paths.project_names).unwrap().project_labels(ACCOUNT),
+        ["github.com/Org/Current", "github.com/org/known"]);
     assert!(device.agent.credential_projects("unverified", None).is_err());
     let mut trust = TrustStore::load_from(&device.paths.trust).unwrap();
     trust.record_revoked(ASTATION_ID, 1);
