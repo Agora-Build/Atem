@@ -856,8 +856,11 @@ for good. That's the point of the design.
 
 ### The Astation setting
 
-Settings → **Security** → "End-to-end encrypt memory, skills and vault"
-(off by default).
+Settings → **End-to-End Encryption** (off by default): **Turn On…**,
+**Turn Off…**, **Rotate Key…**, **Show Recovery Key…** and **Restore
+Encryption Key…**; the status line shows the mode and the key id (e.g. "On
+since … — key <kid>", or "Turning on — N plaintext, N encrypted…" while
+migrating).
 
 **Turning it on:**
 1. Astation creates `K` (if needed) and asks for Touch ID or the Mac
