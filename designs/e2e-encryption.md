@@ -418,7 +418,11 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   bound (same inode) and that `agent.socket` still names it; if not, it
   wipes its keys and exits, freeing the key directory's lock. Either way
   the next command starts a locked agent and `atem cred unlock` asks
-  Astation again. `loginctl enable-linger <user>` keeps the runtime dir,
+  Astation again. `atem cred lock` stops the agent too: it wipes its keys
+  at once, stops listening, removes its socket and `agent.socket`, gives
+  requests already in flight up to a second to finish, clears its pid and
+  exits (`Lock` with `stop: true`; an agent from before the field only
+  wipes). `loginctl enable-linger <user>` keeps the runtime dir,
   and so the agent, across logouts. Nothing is lost when the agent stops:
   the keys stay sealed on disk (or in the plain file before the first
   escrow).
@@ -443,6 +447,18 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   (NotFound), the socket is another file, or `agent.socket` names another
   path; other errors (out of file descriptors, permissions) prove nothing.
   A relative `$XDG_RUNTIME_DIR` is ignored (treated as unset).
+- **An agent from an older build.** An agent keeps running the code it
+  started with, across rebuilds and upgrades. Its status reply carries a
+  `build` (the version plus the executable's mtime and size when it
+  started; absent from an older agent, which counts as older). A command
+  that may start the agent compares it with its own build once: a locked
+  agent of another build holds no keys, so it is stopped (asked to, or, if
+  too old for that, sent SIGTERM only when its pid is confirmed as this
+  user's `atem key-agent` as above) and this build's agent started. An
+  unlocked one is never restarted silently: the command warns that `atem
+  cred lock`, then `atem cred unlock` switches to the new agent, keeps
+  using the old one, and turns its rejection of a request it doesn't know
+  into the same hint. `atem cred status` marks it "(older build; …)".
 - **Home Astation.** One storage key per device, held by the device's first
   verified Astation and recorded as `home_astation` in `cred_state.json`;
   the home never moves. Unlock and rotation go only through the home
@@ -1171,7 +1187,7 @@ atem cred list [--all]
                       # name, scope, version, updated; never values
 atem cred status      # verified? safety code, locked?, unlock mode, granted projects
 atem cred unlock      # ask Astation to unlock now (get also triggers it)
-atem cred lock        # wipe keys from agent memory now
+atem cred lock        # wipe keys from agent memory now and stop the agent
 atem cred add <name> [--global]
                       # optional: opens the add dialog on the Mac; value typed there
 ```

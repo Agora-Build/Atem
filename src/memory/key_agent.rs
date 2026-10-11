@@ -34,6 +34,39 @@ pub const PROTOCOL_VERSION: u64 = 2;
 
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 
+/// What to do about an unlocked agent started by an older atem build.
+pub const OLDER_BUILD: &str = "The key agent is from an older atem build; run `atem cred lock`, then `atem cred unlock` to use the new one.";
+
+/// This build's identity: the version plus the size and modification time
+/// of the executable as it was when this process started. A rebuild (or an
+/// upgrade) rewrites the executable, so an agent left running from before
+/// it reports another value, while the version alone stays the same across
+/// dev builds. Stat'ing the file is cheap on every CLI run, unlike hashing
+/// it, and needs no build script. On Linux `/proc/self/exe` is the file this
+/// process runs even after it was replaced on disk.
+pub fn build_id() -> &'static str {
+    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        let exe = std::fs::metadata("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let exe = std::env::current_exe().and_then(std::fs::metadata);
+        let version = env!("CARGO_PKG_VERSION");
+        match exe {
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                format!(
+                    "{version}+{}.{:09}-{}",
+                    meta.mtime(),
+                    meta.mtime_nsec(),
+                    meta.size()
+                )
+            }
+            Err(_) => version.to_string(),
+        }
+    })
+}
+
 /// Appended to key-file errors, which never stop the agent (it starts locked).
 pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back.";
 
@@ -120,7 +153,13 @@ pub enum Request {
         astation_id: String,
         storage_kid: String,
     },
-    Lock,
+    /// Wipes the keys. With `stop` (`atem cred lock`), the agent then stops
+    /// listening, lets requests in flight finish (briefly) and exits; an
+    /// agent from before the field ignores it and only wipes.
+    Lock {
+        #[serde(default)]
+        stop: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +172,9 @@ pub enum Reply {
         unlocked: bool,
         storage_kid: Option<String>,
         escrowed: bool,
+        /// The agent's `build_id`; absent from an agent older than the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
     },
     PublicKeys {
         device_pub: String,
@@ -186,6 +228,9 @@ pub struct AgentStatus {
     pub storage_kid: Option<String>,
     /// Whether the home Astation holds that storage key.
     pub escrowed: bool,
+    /// The agent was started by another atem build than this one (or one
+    /// that doesn't say).
+    pub older_build: bool,
 }
 
 struct Unlocked {
@@ -407,7 +452,7 @@ impl KeyAgent {
             } => self.abandon_pending(&astation_id, &storage_kid),
             // Always allowed: until Astation holds the storage key, the plain
             // device_keys file stays on disk and is re-sealed at the next start.
-            Request::Lock => {
+            Request::Lock { .. } => {
                 self.wipe();
                 Ok(Reply::Done)
             }
@@ -431,6 +476,7 @@ impl KeyAgent {
                 unlocked: true,
                 storage_kid: Some(unlocked.storage_kid.clone()),
                 escrowed: unlocked.escrowed,
+                build: Some(build_id().to_string()),
             },
             None => Reply::Status {
                 unlocked: false,
@@ -440,6 +486,7 @@ impl KeyAgent {
                     .find_map(|path| SealedDeviceKeys::load_from(path).ok().flatten())
                     .map(|sealed| sealed.storage_kid),
                 escrowed: false,
+                build: Some(build_id().to_string()),
             },
         }
     }
@@ -1380,10 +1427,12 @@ pub trait KeyAgentApi: Send + Sync {
                 unlocked,
                 storage_kid,
                 escrowed,
+                build,
             } => Ok(AgentStatus {
                 unlocked,
                 storage_kid,
                 escrowed,
+                older_build: build.as_deref() != Some(build_id()),
             }),
             _ => unexpected(),
         }
@@ -1558,8 +1607,19 @@ pub trait KeyAgentApi: Send + Sync {
 
     /// Wipes the unlocked keys. (Not `lock`: `Mutex::lock` would shadow it.)
     fn lock_keys(&self) -> Result<()> {
-        match self.call(Request::Lock)? {
+        match self.call(Request::Lock { stop: false })? {
             Reply::Done => Ok(()),
+            _ => unexpected(),
+        }
+    }
+
+    /// `atem cred lock`: wipes the unlocked keys and asks the agent to exit.
+    /// `Ok(true)` once it has stopped; `Ok(false)` when it is still there
+    /// (an agent from an older atem only wipes). In process, wiping is all
+    /// there is to it.
+    fn lock_and_stop(&self) -> Result<bool> {
+        match self.call(Request::Lock { stop: true })? {
+            Reply::Done => Ok(true),
             _ => unexpected(),
         }
     }
@@ -1581,6 +1641,10 @@ impl KeyAgentApi for std::sync::Mutex<KeyAgent> {
 impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T> {
     fn call(&self, request: Request) -> Result<Reply> {
         (**self).call(request)
+    }
+
+    fn lock_and_stop(&self) -> Result<bool> {
+        (**self).lock_and_stop()
     }
 }
 

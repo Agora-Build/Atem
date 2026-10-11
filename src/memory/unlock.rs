@@ -728,6 +728,12 @@ pub fn status_report(
         (Some(kid), false) => format!("Storage key: {kid}"),
         (None, _) => "Storage key: none".to_string(),
     };
+    let agent_line = match agent {
+        AgentState::Running(status) if status.older_build => {
+            format!("{agent_line} (older build; run `atem cred lock`, then `atem cred unlock`)")
+        }
+        _ => agent_line,
+    };
     let mut report = format!(
         "{}\nHome Astation: {}\nKey agent: {agent_line}\n{storage_line}\n",
         trust.verification_line(astation_id),
@@ -740,14 +746,20 @@ pub fn status_report(
 }
 
 /// `atem cred lock`: what happened, or why the agent couldn't be reached.
+/// The agent wipes its keys and exits; the next `atem cred unlock` starts
+/// this build's.
 pub fn lock_keys_message(agent: Option<&dyn KeyAgentApi>) -> Result<String> {
     match agent {
-        None => Ok("The key agent isn't running; this device's keys are locked.".into()),
+        None => Ok("Locked: no key agent was running.".into()),
         Some(agent) => {
-            agent
-                .lock_keys()
+            let stopped = agent
+                .lock_and_stop()
                 .map_err(|error| anyhow!("Not locked: {error:#}"))?;
-            Ok("Locked: the key agent wiped this device's keys from memory.".into())
+            Ok(if stopped {
+                "Locked: the key agent wiped this device's keys and stopped.".into()
+            } else {
+                "Locked: the key agent wiped this device's keys, but it is still running from an older atem build; the next `atem cred unlock` replaces it.".into()
+            })
         }
     }
 }
@@ -1744,6 +1756,7 @@ mod tests {
             unlocked: true,
             storage_kid: Some("4e5f6a7b".into()),
             escrowed: false,
+            older_build: false,
         });
         let report = status_report(&trust, ASTATION_ID, &waiting, None, None);
         assert!(
@@ -1917,6 +1930,7 @@ mod tests {
             unlocked: true,
             storage_kid: Some("4e5f6a7b".into()),
             escrowed: false,
+            older_build: false,
         });
         let report = status_report(&trust, ASTATION_ID, &waiting, None, None);
         assert!(report.contains("Key agent: unlocked\n"), "{report}");
@@ -1930,6 +1944,7 @@ mod tests {
             unlocked: false,
             storage_kid: Some("0a1b2c3d".into()),
             escrowed: false,
+            older_build: false,
         });
         let report = status_report(&trust, ASTATION_ID, &locked, None, None);
         assert!(
@@ -1943,6 +1958,7 @@ mod tests {
             unlocked: false,
             storage_kid: Some("9a9b9c9d".into()),
             escrowed: false,
+            older_build: false,
         });
         let report = status_report(&trust, ASTATION_ID, &unconfirmed, None, None);
         assert!(
@@ -2244,15 +2260,43 @@ mod tests {
 
     #[test]
     fn lock_reports_what_it_did() {
-        assert!(lock_keys_message(None).unwrap().contains("isn't running"));
+        assert_eq!(
+            lock_keys_message(None).unwrap(),
+            "Locked: no key agent was running."
+        );
         let dir = tempfile::tempdir().unwrap();
         let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
         let agent = agent(&paths);
-        assert!(
-            lock_keys_message(Some(agent.as_ref()))
-                .unwrap()
-                .contains("Locked")
+        assert_eq!(
+            lock_keys_message(Some(agent.as_ref())).unwrap(),
+            "Locked: the key agent wiped this device's keys and stopped."
         );
+    }
+
+    #[test]
+    fn status_flags_an_agent_of_an_older_build() {
+        let trust = TrustStore::default();
+        for unlocked in [true, false] {
+            let older = AgentState::Running(AgentStatus {
+                unlocked,
+                storage_kid: Some("0a1b2c3d".into()),
+                escrowed: true,
+                older_build: true,
+            });
+            let report = status_report(&trust, ASTATION_ID, &older, None, None);
+            assert!(
+                report.contains("(older build; run `atem cred lock`, then `atem cred unlock`)\n"),
+                "{report}"
+            );
+        }
+        let current = AgentState::Running(AgentStatus {
+            unlocked: true,
+            storage_kid: Some("0a1b2c3d".into()),
+            escrowed: true,
+            older_build: false,
+        });
+        let report = status_report(&trust, ASTATION_ID, &current, None, None);
+        assert!(!report.contains("older build"), "{report}");
     }
 
     #[test]

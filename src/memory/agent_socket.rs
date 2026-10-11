@@ -27,7 +27,9 @@ use zeroize::Zeroizing;
 
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::encoding::WipingBuf;
-use crate::memory::key_agent::{KeyAgent, KeyAgentApi, PROTOCOL_VERSION, Reply, Request};
+use crate::memory::key_agent::{
+    KeyAgent, KeyAgentApi, OLDER_BUILD, PROTOCOL_VERSION, Reply, Request, build_id,
+};
 use crate::memory::verification::KeyPaths;
 
 /// Bounds a misbehaving peer. A `Crypt` batch is kept under 2 MiB of input by
@@ -36,6 +38,10 @@ use crate::memory::verification::KeyPaths;
 const MAX_LINE: usize = 8 << 20;
 /// A connection that says nothing for this long is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a stopping agent lets requests already in flight finish.
+const DRAIN_WAIT: Duration = Duration::from_secs(1);
+/// How long `atem cred lock` waits for the agent to go away.
+const STOP_WAIT: Duration = Duration::from_secs(2);
 
 fn own_uid() -> u32 {
     unsafe { libc::getuid() }
@@ -287,8 +293,13 @@ pub(crate) fn decode_response(line: &str) -> Result<Reply> {
         .ok_or_else(|| anyhow!("the key agent sent an empty reply"))
 }
 
-fn respond(agent: &Mutex<KeyAgent>, line: &str) -> WipingBuf {
-    let response = match decode_request(line).and_then(|request| agent.call(request)) {
+/// The reply to `line`, and whether it was a lock that stops the agent.
+fn respond(agent: &Mutex<KeyAgent>, line: &str) -> (WipingBuf, bool) {
+    let mut stop = false;
+    let response = match decode_request(line).and_then(|request| {
+        stop = matches!(request, Request::Lock { stop: true });
+        agent.call(request)
+    }) {
         Ok(reply) => Response {
             v: PROTOCOL_VERSION,
             ok: true,
@@ -302,13 +313,15 @@ fn respond(agent: &Mutex<KeyAgent>, line: &str) -> WipingBuf {
             reply: None,
         },
     };
-    to_wiping_json(&response).unwrap_or_else(|_| {
+    let stop = stop && response.ok;
+    let reply = to_wiping_json(&response).unwrap_or_else(|_| {
         let mut buf = WipingBuf::new();
         buf.append(
             b"{\"v\":2,\"ok\":false,\"error\":\"the key agent could not encode its reply\"}\n",
         );
         buf
-    })
+    });
+    (reply, stop)
 }
 
 /// Another key agent holds a lock or answers on the socket.
@@ -329,8 +342,9 @@ impl std::fmt::Display for AlreadyRunning {
 
 impl std::error::Error for AlreadyRunning {}
 
-/// Lock files of the agents this process serves; held until it exits.
-static HELD_LOCKS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+/// Lock files of the agents this process serves, by socket; held until it
+/// exits or the agent on that socket stops.
+static HELD_LOCKS: Mutex<Vec<(PathBuf, std::fs::File)>> = Mutex::new(Vec::new());
 
 /// An exclusive lock on `agent.lock` beside the socket, so two agents starting
 /// together can't both replace the socket. Waits briefly for a starting agent.
@@ -644,7 +658,7 @@ fn bind_as(socket: &Path, uid: u32) -> Result<tokio::net::UnixListener> {
         .with_context(|| format!("could not listen on {}", socket.display()))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
     if let Ok(mut held) = HELD_LOCKS.lock() {
-        held.push(lock);
+        held.push((socket.to_path_buf(), lock));
     }
     Ok(listener)
 }
@@ -661,12 +675,28 @@ pub async fn serve(
 
 /// `serve`, and with a `watch`, checks every `watch.every` that clients can
 /// still reach the agent; once they can't, wipes its keys and returns.
+/// A `Lock { stop: true }` (already wiped while handling it) makes it stop
+/// accepting, remove its socket (and record), give requests in flight up to
+/// `DRAIN_WAIT` to finish, then drop the rest and return.
 pub(crate) async fn serve_watched(
     listener: tokio::net::UnixListener,
     agent: Arc<Mutex<KeyAgent>>,
     allowed_uid: u32,
     watch: Option<Watch>,
 ) -> Result<()> {
+    // The socket this listener is bound to, to remove it when stopping (only
+    // while it is still the file bound here).
+    let bound = listener
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_pathname().map(Path::to_path_buf))
+        .and_then(|path| {
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            Some((path, (meta.dev(), meta.ino())))
+        });
+    let (stopping, mut stop_requested) = tokio::sync::watch::channel(false);
+    let stopping = Arc::new(stopping);
+    let mut connections = tokio::task::JoinSet::new();
     let mut checks = tokio::time::interval(
         watch
             .as_ref()
@@ -674,15 +704,17 @@ pub(crate) async fn serve_watched(
     );
     checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        while connections.try_join_next().is_some() {}
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
+            _ = stop_requested.wait_for(|stop| *stop) => break,
             _ = checks.tick(), if watch.is_some() => {
                 if let Some(watch) = &watch
                     && let Some(why) = watch.orphaned()
                 {
                     eprintln!("key agent: {why}; no client can reach this agent, so it wipes its keys and exits");
                     if let Ok(mut agent) = agent.lock() {
-                        let _ = agent.handle(Request::Lock);
+                        let _ = agent.handle(Request::Lock { stop: false });
                     }
                     watch.clean_up();
                     return Ok(());
@@ -699,25 +731,55 @@ pub(crate) async fn serve_watched(
                 continue;
             }
         };
-        let agent = agent.clone();
-        tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, &agent, allowed_uid).await {
+        let (agent, stopping) = (agent.clone(), stopping.clone());
+        connections.spawn(async move {
+            if let Err(error) = serve_connection(stream, &agent, allowed_uid, &stopping).await {
                 eprintln!("key agent: {error:#}");
             }
         });
     }
+    eprintln!("key agent: locked by `atem cred lock`; exiting");
+    drop(listener);
+    if let Some((path, identity)) = &bound
+        && std::fs::symlink_metadata(path).is_ok_and(|meta| (meta.dev(), meta.ino()) == *identity)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some((path, _)) = &bound
+        && let Ok(mut held) = HELD_LOCKS.lock()
+    {
+        held.retain(|(socket, _)| socket != path);
+    }
+    if let Some(watch) = &watch {
+        watch.clean_up();
+    }
+    let drained = tokio::time::timeout(DRAIN_WAIT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        eprintln!("key agent: dropped requests still in flight");
+        connections.abort_all();
+    }
+    // A request that finished after the lock (an unlock, say) is wiped too.
+    if let Ok(mut agent) = agent.lock() {
+        let _ = agent.handle(Request::Lock { stop: false });
+    }
+    Ok(())
 }
 
 async fn serve_connection(
     stream: tokio::net::UnixStream,
     agent: &Mutex<KeyAgent>,
     allowed_uid: u32,
+    stopping: &tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let peer = stream.peer_cred()?.uid();
     if peer != allowed_uid {
         bail!("refused a connection from uid {peer}");
     }
+    let mut stopped = stopping.subscribe();
     let (mut read, mut write) = stream.into_split();
     let mut pending = WipingBuf::new();
     let mut chunk = Zeroizing::new([0u8; 4096]);
@@ -730,19 +792,28 @@ async fn serve_connection(
             let end = scanned + offset;
             scanned = 0;
             let line = Zeroizing::new(pending.0.drain(..=end).collect::<Vec<u8>>());
-            let reply = match std::str::from_utf8(&line[..end]) {
+            let (reply, stop) = match std::str::from_utf8(&line[..end]) {
                 Ok(text) => respond(agent, text),
                 Err(_) => respond(agent, ""),
             };
             write.write_all(&reply.0).await?;
+            if stop {
+                stopping.send_replace(true);
+                return Ok(());
+            }
         }
         scanned = pending.0.len();
         if pending.0.len() > MAX_LINE {
             bail!("a request is too long");
         }
-        let n = tokio::time::timeout(IDLE_TIMEOUT, read.read(&mut chunk[..]))
-            .await
-            .map_err(|_| anyhow!("closed an idle connection"))??;
+        // A stopping agent takes no further request; one only partly read
+        // is dropped (its client sees the connection close).
+        let n = tokio::select! {
+            read = tokio::time::timeout(IDLE_TIMEOUT, read.read(&mut chunk[..])) => {
+                read.map_err(|_| anyhow!("closed an idle connection"))??
+            }
+            _ = stopped.wait_for(|stop| *stop) => return Ok(()),
+        };
         if n == 0 {
             return Ok(());
         }
@@ -784,6 +855,8 @@ fn harden_process() {
 /// `atem key-agent`: serve this user's agent until the process exits.
 pub async fn run_key_agent() -> Result<()> {
     harden_process();
+    // Taken now, before a rebuild can replace the executable on disk.
+    let _ = build_id();
     let paths = KeyPaths::default_paths();
     let socket = agent_socket_path();
     // `key_dir` holds the key directory's lock until the process exits.
@@ -914,6 +987,14 @@ pub struct KeyAgentClient {
     start_wait: Duration,
     /// The user the listener must run as (this user; settable in tests).
     expected_uid: u32,
+    /// With a build to compare (clients that may start an agent), the first
+    /// request first checks that the running agent is this build: a locked
+    /// agent of another build is replaced, an unlocked one kept with a
+    /// warning.
+    build: Option<String>,
+    build_checked: std::sync::atomic::AtomicBool,
+    /// `OLDER_BUILD`, once the check found an unlocked older agent.
+    older_build: Mutex<Option<String>>,
 }
 
 impl KeyAgentClient {
@@ -928,18 +1009,23 @@ impl KeyAgentClient {
             lock: None,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
+            build: None,
+            build_checked: std::sync::atomic::AtomicBool::new(false),
+            older_build: Mutex::new(None),
         }
     }
 
     /// A client for this user's agent that starts it when none answers.
     pub fn autostart() -> Self {
-        Self::finding(
+        let mut client = Self::finding(
             &crate::config::AtemConfig::config_dir(),
             std::env::var_os("XDG_RUNTIME_DIR"),
             Some(Box::new(|| {
                 spawn_agent(&std::env::current_exe()?, &agent_log_path(), &[]).map(|_| ())
             })),
-        )
+        );
+        client.build = Some(build_id().to_string());
+        client
     }
 
     /// A client for this user's running agent that never starts one.
@@ -967,6 +1053,9 @@ impl KeyAgentClient {
             lock: Some(config_dir.join("key_agent.lock")),
             start_wait: START_WAIT,
             expected_uid: own_uid(),
+            build: None,
+            build_checked: std::sync::atomic::AtomicBool::new(false),
+            older_build: Mutex::new(None),
         }
     }
 
@@ -981,6 +1070,9 @@ impl KeyAgentClient {
             lock: None,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
+            build: None,
+            build_checked: std::sync::atomic::AtomicBool::new(false),
+            older_build: Mutex::new(None),
         }
     }
 
@@ -996,6 +1088,19 @@ impl KeyAgentClient {
     pub(crate) fn waiting(mut self, wait: Duration) -> Self {
         self.start_wait = wait;
         self
+    }
+
+    /// Checks the running agent against `build` before the first request.
+    #[cfg(test)]
+    pub(crate) fn checking_build(mut self, build: &str) -> Self {
+        self.build = Some(build.to_string());
+        self
+    }
+
+    /// `OLDER_BUILD` once an unlocked agent of an older build was found.
+    #[cfg(test)]
+    pub(crate) fn older_build_warning(&self) -> Option<String> {
+        self.older_build.lock().ok()?.clone()
     }
 
     /// Expects the listener to run as `uid` instead of this user.
@@ -1122,10 +1227,129 @@ impl KeyAgentClient {
     }
 }
 
+impl KeyAgentClient {
+    /// Waits up to `wait` for the agent to stop answering; true once it has.
+    fn wait_gone(&self, wait: Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if !self.is_running() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// `request` to the running agent, never starting one; `None` when no
+    /// agent answers it.
+    fn ask_running(&self, request: &Request) -> Option<Reply> {
+        let stream = self.dial().ok()?.ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
+        let line = encode_request(request).ok()?;
+        (&stream).write_all(line.as_bytes()).ok()?;
+        let reply = read_reply(&stream).ok()?;
+        decode_response(std::str::from_utf8(&reply.0).ok()?).ok()
+    }
+
+    /// Once per client (with a build to compare): the running agent must be
+    /// this build. A locked agent of another build holds no keys, so it is
+    /// asked to stop (or, an agent too old to stop when asked, confirmed as
+    /// this user's `atem key-agent` and sent SIGTERM) and the next request
+    /// starts this build's. An unlocked one is never restarted: it is used,
+    /// with a warning.
+    fn check_build(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let Some(build) = self.build.as_deref() else {
+            return Ok(());
+        };
+        if self.build_checked.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Some(Reply::Status {
+            unlocked,
+            build: theirs,
+            ..
+        }) = self.ask_running(&Request::Status)
+        else {
+            return Ok(());
+        };
+        if theirs.as_deref() == Some(build) {
+            return Ok(());
+        }
+        if unlocked {
+            // Once per process, however many clients a command makes.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::SeqCst) {
+                eprintln!("{OLDER_BUILD}");
+            }
+            if let Ok(mut older) = self.older_build.lock() {
+                *older = Some(OLDER_BUILD.to_string());
+            }
+            return Ok(());
+        }
+        let _ = self.ask_running(&Request::Lock { stop: true });
+        if self.wait_gone(STOP_WAIT) {
+            return Ok(());
+        }
+        if let Some(lock) = self.lock.as_deref()
+            && lock_is_held(lock) == Some(true)
+            && let Some(pid) = confirmed_holder(lock)
+            && process_uid(pid) == Some(self.expected_uid)
+        {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            if self.wait_gone(STOP_WAIT) {
+                return Ok(());
+            }
+        }
+        bail!(
+            "the running key agent is from an older atem build and doesn't stop when asked; find it with `pgrep -af '[a]tem key-agent'` and stop it (`pkill -u \"$USER\" -f 'atem key-agent'`), then retry (it is locked: its keys stay sealed on disk)"
+        )
+    }
+}
+
+/// The owner of process `pid` (Linux; `None` elsewhere or when gone).
+fn process_uid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::metadata(format!("/proc/{pid}"))
+            .ok()
+            .map(|meta| meta.uid())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// An agent from an older atem rejects a request it doesn't know as
+/// malformed (`unknown variant`): say what to do instead.
+fn explain_unknown_request(error: anyhow::Error) -> anyhow::Error {
+    if format!("{error:#}").contains("unknown variant") {
+        anyhow!("{OLDER_BUILD} (It doesn't know this request.)")
+    } else {
+        error
+    }
+}
+
 impl KeyAgentApi for KeyAgentClient {
+    fn lock_and_stop(&self) -> Result<bool> {
+        match self.call(Request::Lock { stop: true })? {
+            Reply::Done => Ok(self.wait_gone(STOP_WAIT)),
+            _ => bail!("the key agent sent an unexpected reply"),
+        }
+    }
+
     fn call(&self, request: Request) -> Result<Reply> {
         let line = encode_request(&request)?;
         drop(request);
+        self.check_build()?;
         let stream = self.connect()?;
         let closed = |error: std::io::Error| self.closed(Some(error));
         stream
@@ -1142,7 +1366,7 @@ impl KeyAgentApi for KeyAgentClient {
         }
         let text = std::str::from_utf8(&reply.0)
             .map_err(|_| anyhow!("the key agent sent a non-UTF-8 reply"))?;
-        decode_response(text)
+        decode_response(text).map_err(explain_unknown_request)
     }
 }
 
@@ -1417,7 +1641,8 @@ mod tests {
                 astation_id: "a".into(),
                 storage_kid: "abcd1234".into(),
             },
-            Request::Lock,
+            Request::Lock { stop: false },
+            Request::Lock { stop: true },
         ];
         for request in requests {
             let line = encode_request(&request).unwrap();
@@ -1740,7 +1965,7 @@ mod tests {
         let socket = start_agent(dir.path(), own_uid());
         let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         let one = encode_request(&Request::Status).unwrap();
-        let two = encode_request(&Request::Lock).unwrap();
+        let two = encode_request(&Request::Lock { stop: false }).unwrap();
         stream
             .write_all(format!("{}{}", one.as_str(), two.as_str()).as_bytes())
             .unwrap();
@@ -1929,6 +2154,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+
+    #[test]
+    fn a_locked_key_agent_process_exits_and_clears_its_records() {
+        let dir = short_dir();
+        let home = dir.path().join("home");
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&home).unwrap();
+        make_private(&run);
+        let mut agent = key_agent_process(&home, &run, &dir.path().join("a.log"));
+        let config = home.join(".config").join("atem");
+        let client = KeyAgentClient::finding(&config, Some(run.clone().into_os_string()), None);
+        assert!(eventually(|| client.is_running()));
+        assert!(client.lock_and_stop().unwrap(), "the agent stopped");
+        assert!(
+            eventually(|| agent.0.try_wait().unwrap().is_some()),
+            "the agent process kept running"
+        );
+        assert!(!run.join("atem").join("agent.sock").exists());
+        assert!(!config.join("agent.socket").exists(), "its record is gone");
+        assert_eq!(
+            std::fs::read_to_string(config.join("key_agent.lock")).unwrap(),
+            "",
+            "a clean exit clears its pid"
+        );
+        let log = std::fs::read_to_string(dir.path().join("a.log")).unwrap();
+        assert!(log.contains("exiting"), "{log}");
     }
 
     #[test]
@@ -2319,5 +2571,226 @@ mod tests {
             socket_path_in(&config, Some(private.clone().into_os_string())),
             private.join("atem").join("agent.sock")
         );
+    }
+
+    /// `start_agent`, plus a receiver that fires once serving stops.
+    fn start_stoppable_agent(dir: &Path) -> (PathBuf, std::sync::mpsc::Receiver<()>) {
+        let socket = dir.join("run").join("agent.sock");
+        let paths = KeyPaths::in_dir(dir);
+        let (ready, started) = std::sync::mpsc::channel();
+        let (done, stopped) = std::sync::mpsc::channel();
+        let path = socket.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = bind(&path).unwrap();
+                let agent = Arc::new(Mutex::new(KeyAgent::new(paths).unwrap()));
+                ready.send(()).unwrap();
+                let _ = serve(listener, agent, own_uid()).await;
+                let _ = done.send(());
+            });
+        });
+        started.recv().unwrap();
+        (socket, stopped)
+    }
+
+    /// An agent of an older build: answers `status` with `status` (a JSON
+    /// reply) and every other request with `other`, and never exits.
+    fn start_scripted_agent(dir: &Path, status: &'static str, other: &'static str) -> PathBuf {
+        let socket = dir.join("run").join("agent.sock");
+        make_private(socket.parent().unwrap());
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(&stream);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                        let reply = if line.contains("\"op\":\"status\"") {
+                            status
+                        } else {
+                            other
+                        };
+                        if (&stream)
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .is_err()
+                        {
+                            return;
+                        }
+                        line.clear();
+                    }
+                });
+            }
+        });
+        socket
+    }
+
+    const OLD_LOCKED: &str = r#"{"v":2,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false}}"#;
+    const OLD_DONE: &str = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
+
+    #[test]
+    fn lock_wipes_the_agent_and_stops_it() {
+        let dir = short_dir();
+        let (socket, stopped) = start_stoppable_agent(dir.path());
+        // A client that keeps its connection open doesn't hold the agent up.
+        let idle = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let client = KeyAgentClient::at(socket.clone());
+        assert!(client.lock_and_stop().unwrap(), "the agent stopped");
+        assert!(!socket.exists(), "its socket is gone");
+        assert!(!client.is_running());
+        stopped
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the agent kept serving after a lock");
+        drop(idle);
+    }
+
+    #[test]
+    fn lock_stops_a_watched_agent_and_removes_its_record() {
+        let dir = short_dir();
+        let (socket, paths, agent, stopped) = watched_agent(dir.path());
+        let client = KeyAgentClient::at(socket.clone());
+        assert!(client.lock_and_stop().unwrap());
+        stopped
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the agent kept serving after a lock");
+        assert!(!agent.status().unwrap().unlocked, "its keys are wiped");
+        assert!(!socket.exists());
+        assert!(!paths.agent_socket.exists(), "its record is gone");
+    }
+
+    #[test]
+    fn lock_with_an_older_agent_that_only_wipes_says_it_is_still_running() {
+        use crate::memory::unlock::lock_keys_message;
+        let dir = short_dir();
+        let socket = start_scripted_agent(dir.path(), OLD_LOCKED, OLD_DONE);
+        let client = KeyAgentClient::at(socket);
+        assert!(!client.lock_and_stop().unwrap(), "an older agent stays");
+        let message = lock_keys_message(Some(&client)).unwrap();
+        assert!(message.starts_with("Locked"), "{message}");
+        assert!(message.contains("older atem"), "{message}");
+        assert!(message.contains("atem cred unlock"), "{message}");
+    }
+
+    #[test]
+    fn the_status_reply_carries_the_build_and_none_means_older() {
+        use crate::memory::key_agent::build_id;
+        let dir = short_dir();
+        let (socket, _stopped) = start_stoppable_agent(dir.path());
+        let line = encode_request(&Request::Status).unwrap();
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        stream.write_all(line.as_bytes()).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&stream).read_line(&mut reply).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["reply"]["build"], build_id());
+        assert!(build_id().starts_with(env!("CARGO_PKG_VERSION")));
+        let status = KeyAgentClient::at(socket).status().unwrap();
+        assert!(!status.older_build);
+        // An agent from before the field existed.
+        assert!(matches!(
+            decode_response(OLD_LOCKED).unwrap(),
+            Reply::Status { build: None, .. }
+        ));
+        let old = short_dir();
+        let status = KeyAgentClient::at(start_scripted_agent(old.path(), OLD_LOCKED, OLD_DONE))
+            .status()
+            .unwrap();
+        assert!(status.older_build);
+    }
+
+    /// Counts launches; each starts a fresh agent for `dir`.
+    fn relaunching(dir: &Path, launches: Arc<std::sync::atomic::AtomicUsize>) -> Launcher {
+        let dir = dir.to_path_buf();
+        Box::new(move || {
+            launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            start_agent(&dir, own_uid());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_locked_agent_of_another_build_is_replaced() {
+        let dir = short_dir();
+        let (socket, stopped) = start_stoppable_agent(dir.path());
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = KeyAgentClient::with_launcher(
+            socket.clone(),
+            relaunching(dir.path(), launches.clone()),
+        )
+        .checking_build("0.0.0+another-build");
+        assert!(!client.status().unwrap().unlocked);
+        stopped
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the older agent kept serving");
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(client.is_running(), "the new agent serves");
+        assert_eq!(client.older_build_warning(), None);
+    }
+
+    #[test]
+    fn a_locked_older_agent_that_wont_stop_and_cant_be_confirmed_gets_guidance() {
+        let dir = short_dir();
+        let socket = start_scripted_agent(dir.path(), OLD_LOCKED, OLD_DONE);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client =
+            KeyAgentClient::with_launcher(socket, relaunching(dir.path(), launches.clone()))
+                .checking_build("0.0.0+another-build");
+        let error = format!("{:#}", client.status().err().unwrap());
+        assert!(error.contains("older atem build"), "{error}");
+        assert!(error.contains("pkill"), "{error}");
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_unlocked_older_agent_is_kept_with_a_warning() {
+        let dir = short_dir();
+        let (socket, _paths, agent, stopped) = watched_agent(dir.path());
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client =
+            KeyAgentClient::with_launcher(socket, relaunching(dir.path(), launches.clone()))
+                .checking_build("0.0.0+another-build");
+        assert!(client.status().unwrap().unlocked, "the old agent answered");
+        assert_eq!(
+            client.older_build_warning().as_deref(),
+            Some(crate::memory::key_agent::OLDER_BUILD)
+        );
+        assert_eq!(
+            crate::memory::key_agent::OLDER_BUILD,
+            "The key agent is from an older atem build; run `atem cred lock`, then `atem cred unlock` to use the new one."
+        );
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            stopped.recv_timeout(Duration::from_millis(300)).is_err(),
+            "never restarted silently"
+        );
+        assert!(agent.status().unwrap().unlocked, "its keys stay");
+    }
+
+    #[test]
+    fn a_request_an_older_agent_doesnt_know_gets_the_hint() {
+        let dir = short_dir();
+        let socket = start_scripted_agent(
+            dir.path(),
+            OLD_LOCKED,
+            r#"{"v":2,"ok":false,"error":"key agent request is malformed: unknown variant `credential_projects`, expected one of `status`, `lock`"}"#,
+        );
+        let client = KeyAgentClient::at(socket);
+        let error = format!(
+            "{:#}",
+            client
+                .credential_projects("astation-1", None)
+                .err()
+                .unwrap()
+        );
+        assert!(error.contains("older atem build"), "{error}");
+        assert!(
+            error.contains("`atem cred lock`, then `atem cred unlock`"),
+            "{error}"
+        );
+        assert!(!error.contains("unknown variant"), "{error}");
     }
 }
