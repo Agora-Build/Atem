@@ -591,9 +591,11 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   not fail the request), when a running agent is told of a new `off` state,
   and at every unlock.
 - **Project names** (`h1.` hash -> project key) live in `project_names.json`
-  by account. Verified OFF contexts also remember their raw project keys for
-  local discovery; failure to save optional OFF metadata does not fail a command.
-  (0600, no secrets); the hash itself is computed by the agent. Writes hold
+  by account (0600, no secrets); the hash itself is computed by the agent.
+  Verified OFF contexts also remember their raw project keys for local
+  discovery, and the file keeps optional original-case `labels` for
+  credential project reports; failure to save optional OFF metadata does not
+  fail a command. Writes hold
   an `flock` on `project_names.lock`; lock order is `cred_state` / trust lock
   first, then `project_names.lock`, never the reverse. A corrupt file is
   renamed aside and reset (it holds no secrets); a version mismatch is an
