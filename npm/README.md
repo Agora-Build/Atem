@@ -16,6 +16,12 @@ curl -fsSL https://dl.agora.build/atem/install.sh | bash
 
 Both download a prebuilt binary for your platform (linux-x64, linux-arm64, darwin-x64, darwin-arm64).
 
+The npm package downloads the binary for its published version. Documentation
+on GitHub `main` can describe features newer than the latest release. Check
+`atem --version` and `atem cred --help`; use a current release that includes
+the commands you need, or build from source below. Run a source build using
+its explicit path, such as `./target/release/atem`, to avoid an older installed CLI.
+
 ## Commands
 
 ```bash
@@ -42,7 +48,9 @@ tasks and diagrams. `serv files`, `config`, and tokens from
 
 `atem pair` receives your Agora login from Astation, then verifies the device:
 atem and your Mac each show a 12-character safety code. If they match, type
-`y` here and approve on the Mac with Touch ID, in either order. With `--save`
+`y` here; on the Mac click **Codes Match**, then approve with Touch ID.
+Either side can finish first. A connected or SSO-paired session alone does not
+mean the device is verified; check `atem cred status`. With `--save`
 the credentials keep working when Astation disconnects; without it they stop
 5 minutes after the disconnect (atem asks when `--save` isn't given).
 
@@ -51,7 +59,7 @@ the credentials keep working when Astation disconnects; without it they stop
 ```bash
 atem cred status                        # Show whether this device is verified, its home Astation and its key agent
 atem cred unlock                        # Unlock this device's keys (approve with Touch ID on your Mac)
-atem cred lock                          # Wipe the unlocked keys from the key agent's memory
+atem cred lock                          # Wipe unlocked keys and stop the key agent
 atem cred projects                      # Send known Git projects to Astation's credential picker (keys must be unlocked)
 ```
 
@@ -62,9 +70,20 @@ ID) and starts a background `atem key-agent` that holds the keys in memory.
 `atem cred lock` then `atem cred unlock` to pick up the new agent.
 
 `atem cred projects` sends this repo's Git remote, and the project names atem
-remembers, to Astation's credential picker, encrypted to your Mac. Storing and
-fetching credential values (`atem cred get`) is not available yet; it is
-designed in `designs/e2e-encryption.md`.
+remembers, to Astation's credential picker, encrypted to your Mac. Retrieving
+values from Astation's local Credentials store (`atem cred get/list`) is not
+available yet; it is described in the
+[encryption design](https://github.com/Agora-Build/Atem/blob/main/designs/e2e-encryption.md).
+
+Updated clients and key agents retain the remote's original capitalization,
+such as `github.com/Agora-Build/Atem`; project identity and duplicate checks
+ignore case. Older clients/agents may report lowercase names. Reports are
+encrypted even when memory encryption is off and can remain in the picker
+after the sending command exits. You can also enter another Git remote in
+Astation's Credentials editor.
+
+See [pairing, unlocking and project suggestions](https://github.com/Agora-Build/Atem/blob/main/docs/credentials.md)
+for the steps when Atem runs on another machine and for upgrade troubleshooting.
 
 ### Tokens
 
@@ -159,24 +178,33 @@ Memories are applied as a managed block in `~/.claude/CLAUDE.md`,
 `~/.codex/AGENTS.md` and `<repo>/CLAUDE.local.md`; skills go to
 `.claude/skills` and `.agents/skills`. Files tracked by git are never written.
 Anything that looks like a credential value is refused; save the
-credential's name, never its value. See `designs/atem-memory.md`.
+credential's name, never its value. See the [memory design](https://github.com/Agora-Build/Atem/blob/main/designs/atem-memory.md).
 
 Works with end-to-end encryption on or off. When it is on, changes sync only
 while the device is unlocked (`atem cred unlock`); see below.
 
 ### End-to-end encryption
 
-Turned on or off in Astation (Settings → End-to-End Encryption). When it is
-on, memory content, skill files and vault content are encrypted on this machine
-before they reach the relay, and project names become keyed hashes. Only your
-Mac, verified atems and the recovery key can decrypt them, so a leak of the
-relay database exposes nothing readable.
+Turned on or off in Astation (Settings > Security > End-to-End Encryption).
+When it is on, memory content, skill files and vault content are encrypted on
+this machine before they reach the relay, and project names become keyed hashes.
+Your Mac, verified Atem devices holding the account key, and holders of the
+recovery material can decrypt that content. The relay still sees routing identifiers and metadata,
+such as timestamps and ciphertext sizes; it is not authoritative for device
+trust or encryption state. Migration cannot prove that a server erased old
+plaintext backups.
 
 The device must be verified (`atem pair`) and unlocked (`atem cred unlock`).
 While it is locked, `atem sync` keeps changes queued. Switching encryption on
 or off migrates existing data; each verified atem finishes its part at its next
-`atem cred unlock` (`atem sync` alone doesn't contact Astation). The local
-`knowledge.db` stays plain text (mode 0600). See `designs/e2e-encryption.md`.
+`atem cred unlock` (`atem sync` alone doesn't contact Astation). **Turning on**
+or **Turning off** is a pending migration, even when the field counts show
+no remaining plaintext or obsolete fields. Astation commits the final state
+after accepting a verified migration completion; the CLI can then disconnect.
+Turning encryption off migrates shared data to plaintext; local Astation
+Keychain credentials keep their protection. The local `knowledge.db` stays
+plain text (mode 0600). See the [user guide](https://github.com/Agora-Build/Atem/blob/main/docs/credentials.md)
+and [protocol design](https://github.com/Agora-Build/Atem/blob/main/designs/e2e-encryption.md).
 
 ### Dev Servers
 
