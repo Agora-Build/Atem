@@ -3,7 +3,7 @@
 /// Detects HTML files written by an active agent (Claude Code, Codex, etc.)
 /// to `~/.agent/diagrams/` and opens them in the browser.
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Result, anyhow};
@@ -39,11 +39,15 @@ pub fn build_visualize_prompt(topic: &str) -> String {
 ///
 /// Creates the directory if it does not exist.
 pub fn snapshot_diagrams_dir() -> HashMap<PathBuf, SystemTime> {
-    let dir = diagrams_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    snapshot_dir(&diagrams_dir())
+}
+
+/// `snapshot_diagrams_dir` for any folder (tests use a temporary one).
+fn snapshot_dir(dir: &Path) -> HashMap<PathBuf, SystemTime> {
+    let _ = std::fs::create_dir_all(dir);
 
     let mut snapshot = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("html") {
@@ -62,7 +66,12 @@ pub fn snapshot_diagrams_dir() -> HashMap<PathBuf, SystemTime> {
 ///
 /// Returns paths to new or modified `.html` files, sorted newest-first.
 pub fn detect_new_html_files(pre_snapshot: &HashMap<PathBuf, SystemTime>) -> Vec<String> {
-    let current = snapshot_diagrams_dir();
+    detect_new_html_files_in(&diagrams_dir(), pre_snapshot)
+}
+
+/// `detect_new_html_files` for any folder (tests use a temporary one).
+fn detect_new_html_files_in(dir: &Path, pre_snapshot: &HashMap<PathBuf, SystemTime>) -> Vec<String> {
+    let current = snapshot_dir(dir);
     let mut new_files: Vec<(PathBuf, SystemTime)> = Vec::new();
 
     for (path, modified) in &current {
@@ -202,10 +211,12 @@ pub fn resolve_diagram_server_url(config: &crate::config::AtemConfig) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Tests that touch ~/.agent/diagrams/ must hold this lock.
-    static DIAGRAMS_DIR_LOCK: Mutex<()> = Mutex::new(());
+    /// A temporary diagrams folder, so tests never touch ~/.agent/diagrams/.
+    fn temp_diagrams() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("diagrams");
+        (tmp, dir)
+    }
 
     #[test]
     fn test_diagrams_dir_ends_with_expected_path() {
@@ -228,9 +239,9 @@ mod tests {
 
     #[test]
     fn test_snapshot_is_idempotent() {
-        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
-        let snap1 = snapshot_diagrams_dir();
-        let snap2 = snapshot_diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
+        let snap1 = snapshot_dir(&dir);
+        let snap2 = snapshot_dir(&dir);
         assert_eq!(snap1.len(), snap2.len());
         for (path, time) in &snap1 {
             assert_eq!(snap2.get(path), Some(time));
@@ -239,25 +250,24 @@ mod tests {
 
     #[test]
     fn test_detect_new_files_empty_when_unchanged() {
-        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
-        let snap = snapshot_diagrams_dir();
-        let new_files = detect_new_html_files(&snap);
+        let (_tmp, dir) = temp_diagrams();
+        let snap = snapshot_dir(&dir);
+        let new_files = detect_new_html_files_in(&dir, &snap);
         assert!(new_files.is_empty());
     }
 
     #[test]
     fn test_detect_new_files_finds_new_file() {
-        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
-        let dir = diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
         let _ = std::fs::create_dir_all(&dir);
 
-        let snap = snapshot_diagrams_dir();
+        let snap = snapshot_dir(&dir);
 
         // Write a temp file
         let test_file = dir.join("_test_visualize_detect.html");
         std::fs::write(&test_file, "<html>test</html>").unwrap();
 
-        let new_files = detect_new_html_files(&snap);
+        let new_files = detect_new_html_files_in(&dir, &snap);
         assert!(new_files.iter().any(|f| f.contains("_test_visualize_detect.html")));
 
         // Cleanup
@@ -274,11 +284,10 @@ mod tests {
 
     #[test]
     fn test_detect_new_files_sorted_newest_first() {
-        let _lock = DIAGRAMS_DIR_LOCK.lock().unwrap();
-        let dir = diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
         let _ = std::fs::create_dir_all(&dir);
 
-        let snap = snapshot_diagrams_dir();
+        let snap = snapshot_dir(&dir);
 
         // Write two files with a small gap
         let f1 = dir.join("_test_sort_a.html");
@@ -288,7 +297,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&f2, "<html>b</html>").unwrap();
 
-        let new_files = detect_new_html_files(&snap);
+        let new_files = detect_new_html_files_in(&dir, &snap);
         assert!(new_files.len() >= 2);
         // Newest first — f2 should come before f1
         let pos_b = new_files.iter().position(|f| f.contains("_test_sort_b.html"));
@@ -334,21 +343,21 @@ mod tests {
     #[test]
     fn test_snapshot_creates_directory() {
         // snapshot_diagrams_dir should create the dir if it doesn't exist
-        let dir = diagrams_dir();
-        let _ = snapshot_diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
+        let _ = snapshot_dir(&dir);
         assert!(dir.exists());
     }
 
     #[test]
     fn test_snapshot_ignores_non_html_files() {
-        let dir = diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
         let _ = std::fs::create_dir_all(&dir);
 
         // Create a non-html file
         let txt_file = dir.join("_test_nonhtml.txt");
         std::fs::write(&txt_file, "not html").unwrap();
 
-        let snap = snapshot_diagrams_dir();
+        let snap = snapshot_dir(&dir);
         // The txt file should not be in the snapshot
         assert!(!snap.keys().any(|p| p.to_string_lossy().contains("_test_nonhtml.txt")));
 
@@ -358,38 +367,38 @@ mod tests {
 
     #[test]
     fn test_detect_ignores_deleted_files() {
-        let dir = diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
         let _ = std::fs::create_dir_all(&dir);
 
         // Create a file, take snapshot, then delete the file
         let test_file = dir.join("_test_deleted.html");
         std::fs::write(&test_file, "<html>temp</html>").unwrap();
 
-        let snap = snapshot_diagrams_dir();
+        let snap = snapshot_dir(&dir);
 
         // Delete the file
         let _ = std::fs::remove_file(&test_file);
 
         // detect_new_html_files should not report deleted files as new
-        let new_files = detect_new_html_files(&snap);
+        let new_files = detect_new_html_files_in(&dir, &snap);
         assert!(!new_files.iter().any(|f| f.contains("_test_deleted.html")));
     }
 
     #[test]
     fn test_detect_finds_modified_file() {
-        let dir = diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
         let _ = std::fs::create_dir_all(&dir);
 
         let test_file = dir.join("_test_modified.html");
         std::fs::write(&test_file, "<html>v1</html>").unwrap();
 
-        let snap = snapshot_diagrams_dir();
+        let snap = snapshot_dir(&dir);
 
         // Modify the file (need a small delay so mtime changes)
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&test_file, "<html>v2 - modified content</html>").unwrap();
 
-        let new_files = detect_new_html_files(&snap);
+        let new_files = detect_new_html_files_in(&dir, &snap);
         assert!(new_files.iter().any(|f| f.contains("_test_modified.html")));
 
         // Cleanup
@@ -398,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_detect_with_empty_pre_snapshot() {
-        let dir = diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
         let _ = std::fs::create_dir_all(&dir);
 
         let test_file = dir.join("_test_empty_pre.html");
@@ -406,7 +415,7 @@ mod tests {
 
         // Empty pre-snapshot means all current files are "new"
         let empty_snap = HashMap::new();
-        let new_files = detect_new_html_files(&empty_snap);
+        let new_files = detect_new_html_files_in(&dir, &empty_snap);
         assert!(new_files.iter().any(|f| f.contains("_test_empty_pre.html")));
 
         // Cleanup
@@ -435,15 +444,15 @@ mod tests {
 
     #[test]
     fn test_detect_returns_full_paths() {
-        let dir = diagrams_dir();
+        let (_tmp, dir) = temp_diagrams();
         let _ = std::fs::create_dir_all(&dir);
 
-        let snap = snapshot_diagrams_dir();
+        let snap = snapshot_dir(&dir);
 
         let test_file = dir.join("_test_full_path.html");
         std::fs::write(&test_file, "<html>test</html>").unwrap();
 
-        let new_files = detect_new_html_files(&snap);
+        let new_files = detect_new_html_files_in(&dir, &snap);
         for f in &new_files {
             if f.contains("_test_full_path.html") {
                 // Should contain the full absolute path
