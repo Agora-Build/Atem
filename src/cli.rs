@@ -1559,7 +1559,7 @@ async fn run_pair(save: bool) -> Result<()> {
             }
             // Held until now so they are checked against the pins this run set.
             for status in active_client.apply_held_encryption().await {
-                println!("{status}");
+                println!("{}", crate::memory::unlock::shown(&status));
             }
             Ok(())
         }

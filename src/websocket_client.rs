@@ -987,7 +987,7 @@ impl AstationClient {
             match self.handle_encryption_message(&message).await {
                 Ok(Some(status)) => statuses.push(status),
                 Ok(None) => {}
-                Err(error) => statuses.push(format!("Ignored an encryption message: {error}")),
+                Err(error) => statuses.push(format!("Ignored an encryption message: {error:#}")),
             }
         }
         statuses

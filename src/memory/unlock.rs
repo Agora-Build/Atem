@@ -84,7 +84,7 @@ fn now_secs() -> u64 {
 /// (a relay could otherwise rewrite the terminal) or invisible and bidi
 /// format characters (which could reorder what the user reads), at most
 /// 200 characters.
-fn shown(text: &str) -> String {
+pub(crate) fn shown(text: &str) -> String {
     text.chars()
         .filter(|&c| {
             !c.is_control()
@@ -860,21 +860,21 @@ fn migration_pending(trust: &TrustStore, home: &str) -> Result<bool> {
 /// `encryptionMode` is handled (that runs the migration and reports it), at
 /// most `wait`.
 async fn finish_migration<L: AstationLink>(link: &mut L, wait: Duration) {
-    let finished = tokio::time::timeout(wait, async {
-        while let Some(message) = link.recv().await {
-            let is_mode = matches!(message, AstationMessage::EncryptionMode { .. });
-            if is_mode || matches!(message, AstationMessage::KeyGrant { .. }) {
-                apply_encryption_message(link, &message).await;
-                if is_mode {
-                    return true;
-                }
+    // Only the wait for Astation's message is timed: applying an
+    // `encryptionMode` runs the migration, which may take longer.
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let Ok(Some(message)) = tokio::time::timeout_at(deadline, link.recv()).await else {
+            eprintln!("⚠️  Astation didn't send the encryption state; try again in a moment.");
+            return;
+        };
+        let is_mode = matches!(message, AstationMessage::EncryptionMode { .. });
+        if is_mode || matches!(message, AstationMessage::KeyGrant { .. }) {
+            apply_encryption_message(link, &message).await;
+            if is_mode {
+                return;
             }
         }
-        false
-    })
-    .await;
-    if !matches!(finished, Ok(true)) {
-        eprintln!("⚠️  Astation didn't send the encryption state; try again in a moment.");
     }
 }
 
