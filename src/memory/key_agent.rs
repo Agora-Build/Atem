@@ -35,7 +35,7 @@ pub const PROTOCOL_VERSION: u64 = 2;
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 
 /// What to do about an unlocked agent started by an older atem build.
-pub const OLDER_BUILD: &str = "The key agent is from an older atem build; run `atem cred lock`, then `atem cred unlock` to use the new one.";
+pub const OLDER_BUILD: &str = "The key agent was started by another atem build; run `atem cred lock`, then `atem cred unlock` to use this one.";
 
 /// This build's identity: the version plus the size and modification time
 /// of the executable as it was when this process started. A rebuild (or an

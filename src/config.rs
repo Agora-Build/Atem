@@ -867,7 +867,8 @@ mod tests {
         let raw = fs::read(&path).unwrap();
         assert!(!raw.windows(6).any(|w| w == b"secret"), "sign_key must not be plaintext");
         assert!(!raw.windows(6).any(|w| w == b"appid1"), "app_id must not be plaintext");
-        assert!(!raw.starts_with(b"{") && !raw.starts_with(b"["), "file must not be JSON");
+        // Not a first-byte check: random ciphertext starts with `{`/`[` 1 in 128.
+        assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_err(), "file must not be JSON");
     }
 
     #[test]

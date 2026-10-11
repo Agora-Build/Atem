@@ -2762,7 +2762,7 @@ mod tests {
         );
         assert_eq!(
             crate::memory::key_agent::OLDER_BUILD,
-            "The key agent is from an older atem build; run `atem cred lock`, then `atem cred unlock` to use the new one."
+            "The key agent was started by another atem build; run `atem cred lock`, then `atem cred unlock` to use this one."
         );
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
@@ -2788,7 +2788,7 @@ mod tests {
                 .err()
                 .unwrap()
         );
-        assert!(error.contains("older atem build"), "{error}");
+        assert!(error.contains("another atem build"), "{error}");
         assert!(
             error.contains("`atem cred lock`, then `atem cred unlock`"),
             "{error}"

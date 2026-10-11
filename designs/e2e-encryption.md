@@ -447,7 +447,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   (NotFound), the socket is another file, or `agent.socket` names another
   path; other errors (out of file descriptors, permissions) prove nothing.
   A relative `$XDG_RUNTIME_DIR` is ignored (treated as unset).
-- **An agent from an older build.** An agent keeps running the code it
+- **An agent from another build.** An agent keeps running the code it
   started with, across rebuilds and upgrades. Its status reply carries a
   `build` (the version plus the executable's mtime and size when it
   started; absent from an older agent, which counts as older). A command
@@ -458,7 +458,9 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   unlocked one is never restarted silently: the command warns that `atem
   cred lock`, then `atem cred unlock` switches to the new agent, keeps
   using the old one, and turns its rejection of a request it doesn't know
-  into the same hint. `atem cred status` marks it "(older build; …)".
+  into the same hint. `atem cred status` marks it "(started by another atem
+  build; …)". Builds are compared for equality only: a dev build and the
+  npm release of the same version differ, and neither counts as newer.
 - **Home Astation.** One storage key per device, held by the device's first
   verified Astation and recorded as `home_astation` in `cred_state.json`;
   the home never moves. Unlock and rotation go only through the home

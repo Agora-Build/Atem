@@ -368,9 +368,11 @@ mod tests {
         ));
         store.save_to(&path).unwrap();
 
+        // Random ciphertext can start with `[` or `{` (about 1 in 128), so
+        // check that it doesn't parse as JSON and holds no field names.
         let raw = fs::read(&path).unwrap();
-        assert!(!raw.starts_with(b"["));
-        assert!(!raw.starts_with(b"{"));
+        assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_err(), "file must not be JSON");
+        assert!(!raw.windows(12).any(|w| w == b"access_token"), "must not be plaintext");
 
         let loaded = CredentialStore::load_from(&path);
         assert_eq!(loaded.entries.len(), 1);
