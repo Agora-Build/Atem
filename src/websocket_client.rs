@@ -1073,68 +1073,6 @@ impl AstationClient {
         }
     }
 
-    pub async fn request_projects(&self) -> Result<()> {
-        self.send_message(AstationMessage::ProjectListRequest).await
-    }
-
-    pub async fn request_token(
-        &self,
-        channel: &str,
-        uid: &str,
-        project_id: Option<String>,
-    ) -> Result<()> {
-        let message = AstationMessage::TokenRequest {
-            channel: channel.to_string(),
-            uid: uid.to_string(),
-            project_id,
-        };
-        self.send_message(message).await
-    }
-
-    pub async fn launch_claude(&self, context: Option<String>) -> Result<()> {
-        let message = AstationMessage::ClaudeLaunchRequest { context };
-        self.send_message(message).await
-    }
-
-    pub async fn send_user_command(
-        &self,
-        command: &str,
-        context: std::collections::HashMap<String, String>,
-    ) -> Result<()> {
-        let message = AstationMessage::UserCommand {
-            command: command.to_string(),
-            context,
-        };
-        self.send_message(message).await
-    }
-
-    pub async fn send_status_update(&self, status: &str) -> Result<()> {
-        let mut data = std::collections::HashMap::new();
-        data.insert("client_type".to_string(), "Atem".to_string());
-        data.insert("version".to_string(), "0.1.0".to_string());
-
-        let message = AstationMessage::StatusUpdate {
-            status: status.to_string(),
-            data,
-        };
-        self.send_message(message).await
-    }
-
-    pub async fn send_heartbeat(&self) -> Result<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-
-        let message = AstationMessage::Heartbeat { timestamp };
-        self.send_message(message).await
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.sender.is_some() && self.receiver.is_some()
-    }
-
     pub async fn send_mark_result(
         &self,
         task_id: &str,
@@ -1177,18 +1115,6 @@ impl AstationClient {
             file_path,
         };
         self.send_message(msg).await
-    }
-
-    pub async fn send_codex_task(
-        &self,
-        prompt: &str,
-        context: Option<std::collections::HashMap<String, String>>,
-    ) -> Result<()> {
-        let message = AstationMessage::CodexTaskRequest {
-            prompt: prompt.to_string(),
-            context,
-        };
-        self.send_message(message).await
     }
 
     pub async fn send_command_response(
@@ -1250,19 +1176,6 @@ impl AstationClient {
             event_type,
             text,
             data,
-        })
-        .await
-    }
-
-    /// Notify Astation that an agent's status has changed.
-    pub async fn send_agent_status(
-        &self,
-        agent_id: &str,
-        status: crate::agent_client::AgentStatus,
-    ) -> Result<()> {
-        self.send_message(AstationMessage::AgentStatusUpdate {
-            agent_id: agent_id.to_string(),
-            status,
         })
         .await
     }

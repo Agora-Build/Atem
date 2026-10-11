@@ -67,35 +67,6 @@ pub fn format_projects(projects: &[BffProject], show_certificates: bool) -> Stri
     text
 }
 
-pub fn format_unix_timestamp(secs: u64) -> String {
-    let days_since_epoch = secs / 86400;
-    let mut remaining_days = days_since_epoch as i64;
-    let mut year = 1970i64;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-    let days_in_months: [i64; 12] = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 0;
-    for (i, &dim) in days_in_months.iter().enumerate() {
-        if remaining_days < dim {
-            month = i + 1;
-            break;
-        }
-        remaining_days -= dim;
-    }
-    let day = remaining_days + 1;
-    format!("{:04}-{:02}-{:02}", year, month, day)
-}
-
 pub fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
@@ -152,20 +123,5 @@ mod tests {
         let out = format_projects(&projects, false);
         assert!(out.contains("suspended"));
         assert!(out.contains("2025-01-08T00:00:00Z"));
-    }
-
-    #[test]
-    fn format_unix_timestamp_known_date() {
-        assert_eq!(format_unix_timestamp(1464165672), "2016-05-25");
-    }
-
-    #[test]
-    fn format_unix_timestamp_epoch() {
-        assert_eq!(format_unix_timestamp(0), "1970-01-01");
-    }
-
-    #[test]
-    fn format_unix_timestamp_leap_year() {
-        assert_eq!(format_unix_timestamp(1582934400), "2020-02-29");
     }
 }

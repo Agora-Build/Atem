@@ -703,15 +703,6 @@ impl crate::auth::AuthSession {
         crate::auth::write_private_file(&path, json.as_bytes())?;
         Ok(())
     }
-
-    /// Clear saved session.
-    pub fn clear_saved() -> Result<()> {
-        let path = Self::session_path();
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
