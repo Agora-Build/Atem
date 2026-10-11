@@ -188,7 +188,7 @@ fn rotation_kid(rotation: &StorageRotation) -> Result<String> {
 
 /// What is wrong with this device's key files, when it has a verified home
 /// Astation and they can't be unlocked as they are (the fix is the reset).
-/// A plain step-1 `device_keys` is fine: the agent seals it when it starts.
+/// A plain `device_keys` file is fine: the agent seals it when it starts.
 pub fn key_file_problem(paths: &KeyPaths, trust: &TrustStore) -> Option<String> {
     trust.home()?;
     if paths.device_keys.exists() {
@@ -515,9 +515,9 @@ async fn send_rotation<L: AstationLink>(
 
 /// Hands the storage key to the home Astation when the agent holds one
 /// Astation doesn't have yet (after a first verification, or after the
-/// agent sealed a plain step-1 file). A rotation already pending in the agent
-/// (e.g. the verification's escrow whose ack was lost) is resent unchanged,
-/// never begun again. `None` when there is nothing to send.
+/// agent sealed a plain `device_keys` file). A rotation already pending in
+/// the agent (e.g. the verification's escrow whose ack was lost) is resent
+/// unchanged, never begun again. `None` when there is nothing to send.
 pub(crate) async fn escrow_if_needed<L: AstationLink>(
     link: &mut L,
     agent: &Arc<dyn KeyAgentApi>,

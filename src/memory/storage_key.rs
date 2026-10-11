@@ -73,8 +73,7 @@ impl SealedDeviceKeys {
         )
     }
 
-    /// Seals the device keys and the account keys (build step 2b) under
-    /// `storage_key`.
+    /// Seals the device keys and the account keys under `storage_key`.
     pub fn seal_with(
         keys: &DeviceKeys,
         accounts: &AccountKeys,

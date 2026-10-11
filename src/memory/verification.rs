@@ -203,8 +203,9 @@ pub struct KeyPaths {
     /// `project_names.json`: `h1.` project hash → readable project key.
     pub project_names: PathBuf,
     pub trust: PathBuf,
-    /// The plain step-1 file; the key agent seals it into
-    /// `device_keys_sealed` and deletes it.
+    /// The plain file (a step-1 device's, or a fresh device's until its
+    /// first escrow); the key agent seals it into `device_keys_sealed` and
+    /// deletes it once Astation is known to hold the storage key.
     pub device_keys: PathBuf,
     pub device_keys_sealed: PathBuf,
     /// Written in rotation phase 1, renamed over `device_keys_sealed` in phase 3.
@@ -366,8 +367,7 @@ pub(crate) fn effective_state(
 /// What the latest signed account state says for this device and
 /// `astation_id` (the newest across the verified Astations naming its
 /// account, `effective_state`): the one source of the encryption mode and
-/// kid (build step 2b). `data_account` is the Astation id when it isn't
-/// verified.
+/// kid. `data_account` is the Astation id when it isn't verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountMode {
     pub mode: EncryptionMode,
@@ -480,7 +480,7 @@ pub fn complete_verification(
     check_state(&state)?;
     match &keys {
         // New keys become the home Astation's to hold: never under another
-        // home (R12: the home never moves), which could never unlock them.
+        // home (the home never moves), which could never unlock them.
         VerificationKeys::Fresh(_) => {
             if has_device_keys(paths) {
                 bail!(
@@ -689,8 +689,8 @@ pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) 
     }
 }
 
-/// Whether this device has keys on disk: a plain step-1 file, or any sealed
-/// file (the current one, or a rotation's `.next` / `.prev`).
+/// Whether this device has keys on disk: a plain `device_keys` file, or any
+/// sealed file (the current one, or a rotation's `.next` / `.prev`).
 fn has_device_keys(paths: &KeyPaths) -> bool {
     [
         &paths.device_keys,
@@ -707,7 +707,7 @@ fn has_device_keys(paths: &KeyPaths) -> bool {
 /// renames every key file to `<name>.revoked-<stamp>` (never deletes),
 /// forgets that Astation's verification, the home and the escrow state, so
 /// `device_keys_for_verification` then gives fresh keys. Returns the line to
-/// print, or `None` when nothing was revoked (behaviour as before).
+/// print, or `None` when nothing was revoked.
 ///
 /// The revocation signal is unsigned (it arrives over the relay). Acting on
 /// it only renames the old files aside and re-verifies with a fresh safety
@@ -758,7 +758,7 @@ pub fn set_aside_revoked_keys(paths: &KeyPaths, agent: &dyn KeyAgentApi) -> Resu
 /// The keys to verify with: this device's sealed keys when it has them (so
 /// every Astation pins the same device key), fresh ones otherwise. Sealed
 /// keys are revealed only while the key agent holds them unlocked; starting
-/// the agent also seals a plain step-1 `device_keys` file.
+/// the agent also seals a plain `device_keys` file.
 pub fn device_keys_for_verification(
     paths: &KeyPaths,
     agent: &dyn KeyAgentApi,

@@ -38,14 +38,6 @@ pub fn op_to_wire(op: &PendingOp) -> Value {
     }
 }
 
-fn batch(base: &str, client_id: &str, kind: &str, ops: &[&PendingOp]) -> ApiRequest {
-    ApiRequest {
-        method: "POST",
-        url: format!("{}/api/{}/batch?id={}", base_trim(base), kind, enc(client_id)),
-        body: Some(json!({"ops": ops.iter().map(|o| op_to_wire(o)).collect::<Vec<_>>()})),
-    }
-}
-
 fn pull(base: &str, client_id: &str, kind: &str, since: i64, limit: u32) -> ApiRequest {
     ApiRequest {
         method: "GET",
@@ -54,12 +46,6 @@ fn pull(base: &str, client_id: &str, kind: &str, since: i64, limit: u32) -> ApiR
     }
 }
 
-pub fn memory_batch_request(base: &str, client_id: &str, ops: &[&PendingOp]) -> ApiRequest {
-    batch(base, client_id, "memory", ops)
-}
-pub fn skills_batch_request(base: &str, client_id: &str, ops: &[&PendingOp]) -> ApiRequest {
-    batch(base, client_id, "skills", ops)
-}
 pub fn memory_pull_request(base: &str, client_id: &str, since: i64, limit: u32) -> ApiRequest {
     pull(base, client_id, "memory", since, limit)
 }
@@ -515,17 +501,13 @@ mod tests {
     }
 
     #[test]
-    fn memory_batch_body() {
-        let add = PendingOp::AddMemory { memory: sample() };
-        let del = PendingOp::DeleteMemory { id: "mem_x".into() };
-        let r = memory_batch_request("https://relay.example", "inst", &[&add, &del]);
-        assert_eq!(r.method, "POST");
-        assert_eq!(r.url, "https://relay.example/api/memory/batch?id=inst");
-        let body = r.body.unwrap();
-        assert_eq!(body["ops"][0]["op"], "add");
-        assert_eq!(body["ops"][0]["memory"]["id"], "mem_1");
-        assert_eq!(body["ops"][0]["memory"]["scope"], "project");
-        assert_eq!(body["ops"][1], json!({"op": "delete", "id": "mem_x"}));
+    fn memory_ops_wire() {
+        let add = op_to_wire(&PendingOp::AddMemory { memory: sample() });
+        assert_eq!(add["op"], "add");
+        assert_eq!(add["memory"]["id"], "mem_1");
+        assert_eq!(add["memory"]["scope"], "project");
+        let del = op_to_wire(&PendingOp::DeleteMemory { id: "mem_x".into() });
+        assert_eq!(del, json!({"op": "delete", "id": "mem_x"}));
     }
 
     #[test]

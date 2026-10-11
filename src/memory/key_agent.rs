@@ -183,8 +183,8 @@ pub struct AgentStatus {
 
 struct Unlocked {
     keys: DeviceKeys,
-    /// `K` and the keys it replaced, per account (build step 2b), as sealed
-    /// in the file this agent holds the storage key for.
+    /// `K` and the keys it replaced, per account, as sealed in the file this
+    /// agent holds the storage key for.
     accounts: AccountKeys,
     device_id: String,
     storage_kid: String,
@@ -284,7 +284,7 @@ pub(crate) fn open_sealed_checked(
 }
 
 impl KeyAgent {
-    /// An agent for the key files in `paths`: locked, unless a plain step-1
+    /// An agent for the key files in `paths`: locked, unless a plain
     /// `device_keys` file is migrated (then unlocked, not yet escrowed).
     /// First it sweeps the temps crashed writers left beside those files.
     /// A migration or key-file error never stops the agent: it starts locked
@@ -679,17 +679,17 @@ impl KeyAgent {
     /// the keys now live in (escrowed, and not unlocked via `.prev`), and
     /// only when every entry of every verified account parsed: a malformed
     /// one keeps the file (logged at each unlock), while the account's
-    /// valid keys still move. Every
-    /// crash point leaves data_keys.enc, or the keys durably re-sealed; the
-    /// next unlock repeats the merge, which changes nothing the second time.
+    /// valid keys still move. Every crash point leaves data_keys.enc, or the
+    /// keys durably re-sealed; the next unlock repeats the merge, which
+    /// changes nothing the second time.
     ///
     /// Before the first escrow the file stays: an agent restarted then
     /// re-seals the plain device_keys under a new storage key with no
     /// account keys (the old sealed file can't be opened), and the keys come
-    /// back from data_keys.enc. A `K` granted after build step 2b on such a
-    /// device is lost by that restart, with any previous keys only it held:
-    /// atem asks Astation for the current `K` again (keyRequest), but older
-    /// keys may not be granted again.
+    /// back from data_keys.enc. A `K` granted on such a device (held only in
+    /// the sealed file) is lost by that restart, with any previous keys only
+    /// it held: atem asks Astation for the current `K` again (keyRequest),
+    /// but older keys may not be granted again.
     ///
     /// cred_state.json's lock is held throughout (before project_names.lock,
     /// the order everywhere), so a first verification's purge of what the
@@ -1078,7 +1078,7 @@ impl KeyAgent {
             Ok(())
         })?;
         if pending.initial {
-            // Only now does the plain step-1 file go.
+            // Only now does the plain device_keys file go.
             remove_plain_keys(&self.paths)?;
         } else {
             // Phase 3: the new file becomes current. The old one stays as
@@ -1260,7 +1260,7 @@ impl KeyAgent {
             .save_to(&self.paths.unlock_auth_key)?;
         trust.set_home(&home);
         trust.save_to(&self.paths.trust)?;
-        // The plain file stays until Astation confirms the first escrow (Task 6).
+        // The plain file stays until Astation confirms the first escrow.
         eprintln!(
             "key agent: sealed device_keys under storage key {storage_kid}; run `atem cred unlock` to hand it to Astation {home}"
         );
@@ -1322,7 +1322,7 @@ fn remove_synced(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Deletes the plain step-1 `device_keys` file (absent is fine).
+/// Deletes the plain `device_keys` file (absent is fine).
 fn remove_plain_keys(paths: &KeyPaths) -> Result<()> {
     match std::fs::remove_file(&paths.device_keys) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),

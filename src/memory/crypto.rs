@@ -1,6 +1,6 @@
 //! End-to-end encryption for relay-backed memory, skills, and vaults.
 //! Local knowledge.db remains plaintext; transforms happen only at HTTP edges.
-//! `K` lives only in the key agent (build step 2b): `EncryptionContext` reads
+//! `K` lives only in the key agent: `EncryptionContext` reads
 //! the mode from the signed account state and asks the agent to seal, open
 //! and hash. Also: private atomic file writes for every key file.
 
@@ -272,7 +272,7 @@ impl EncryptionContext {
     }
 
     /// Runs `work` on a blocking thread when it may reach the key agent
-    /// (R7: socket I/O and autostart must not stall the runtime); inline
+    /// (socket I/O and autostart must not stall the runtime); inline
     /// when encryption is off.
     pub async fn blocking<T: Send + 'static>(
         &self,
