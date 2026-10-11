@@ -83,6 +83,10 @@ Run inside the repository with the verified device unlocked:
 atem cred projects
 ```
 
+An unlocked atem also reports on its own whenever it connects to Astation: the
+TUI, `atem pair`, and right after `atem cred unlock` in the repository. Run
+`atem cred projects` to send the report right away from another repository.
+
 Open Settings > Credentials on the Mac, add a credential, select **Use project
 scope**, and choose the reported project. Refresh the list if needed. You can
 also enter another Git remote manually; no connected Atem is needed for that.
