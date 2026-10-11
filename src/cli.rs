@@ -1379,11 +1379,23 @@ fn prompt_yes_no(question: &str) -> bool {
     let _ = io::stdout().flush();
 
     let stdin = io::stdin();
-    let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_err() {
-        return false;
+    loop {
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return true,
+            // Empty takes the default ("[y/N]").
+            "" | "n" | "no" => return false,
+            // A typo ("yn") asks again instead of meaning "no".
+            _ => {
+                print!("Type y or n: ");
+                let _ = io::stdout().flush();
+            }
+        }
     }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Asks whether the safety codes match. Keys typed earlier (an extra Enter after
@@ -1462,7 +1474,9 @@ async fn run_pair(save: bool) -> Result<()> {
                 Some(message) => {
                     match client.handle_encryption_message(&message).await {
                         Ok(Some(status)) => {
-                            println!("{status}");
+                            if status != crate::websocket_client::HOLDING_ENCRYPTION {
+                                println!("{}", crate::memory::unlock::shown(&status));
+                            }
                             continue;
                         }
                         Ok(None) => {}

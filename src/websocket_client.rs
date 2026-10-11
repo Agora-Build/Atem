@@ -405,6 +405,9 @@ pub struct AstationClient {
     held_encryption: Vec<AstationMessage>,
 }
 
+/// Status of an encryption message held for later; internal, not shown.
+pub const HOLDING_ENCRYPTION: &str = "Holding an encryption message until Astation's identity is known";
+
 /// At most this many held encryption messages are kept (the newest).
 const MAX_HELD_ENCRYPTION: usize = 16;
 
@@ -891,7 +894,7 @@ impl AstationClient {
             // Applied once a connection knows the Astation (`apply_held_encryption`);
             // signatures are still checked against the pinned keys then.
             self.hold_encryption(message.clone());
-            return Ok(Some("Holding an encryption message until Astation's identity is known".into()));
+            return Ok(Some(HOLDING_ENCRYPTION.into()));
         };
         let paths = KeyPaths::default_paths();
         let applied = match message {
@@ -987,6 +990,8 @@ impl AstationClient {
             match self.handle_encryption_message(&message).await {
                 Ok(Some(status)) => statuses.push(status),
                 Ok(None) => {}
+                // Older than the state the verification just delivered: stale, not news.
+                Err(error) if format!("{error:#}").contains(crate::memory::trust::STATE_OLDER_THAN_VERIFICATION) => {}
                 Err(error) => statuses.push(format!("Ignored an encryption message: {error:#}")),
             }
         }
