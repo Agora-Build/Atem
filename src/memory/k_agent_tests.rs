@@ -25,6 +25,30 @@ use crate::memory::verification::KeyPaths;
 const A: &str = "0123abcd";
 const B: &str = "89abcdef";
 
+#[test]
+fn credential_projects_are_account_scoped_encrypted_and_require_current_unlocked_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = UnlockedDevice::new(dir.path());
+    crate::memory::project_names::remember(&device.paths.project_names, ACCOUNT,
+        [("hash-a".into(), "github.com/org/known".into())]).unwrap();
+    crate::memory::project_names::remember(&device.paths.project_names, "other-account",
+        [("hash-b".into(), "github.com/private/other".into())]).unwrap();
+    let report = device.agent.credential_projects(ASTATION_ID, Some("github.com/org/current".into())).unwrap();
+    let statement = STANDARD.decode(&report.signed.statement).unwrap();
+    let fields = crate::memory::encoding::dec(&statement).unwrap();
+    let info = crate::memory::encoding::enc(&[b"atem-credential-projects-info-v1", &fields[1], &fields[2], &fields[3], &fields[4]]);
+    let plain = crate::memory::grant::hpke_open(&device.server.astation.enc_secret_bytes(),
+        &STANDARD.decode(&report.encapped_key).unwrap(), &STANDARD.decode(&report.ciphertext).unwrap(), &info).unwrap();
+    assert_eq!(serde_json::from_slice::<Vec<String>>(&plain).unwrap(), ["github.com/org/current", "github.com/org/known"]);
+    assert!(device.agent.credential_projects("unverified", None).is_err());
+    let mut trust = TrustStore::load_from(&device.paths.trust).unwrap();
+    trust.record_revoked(ASTATION_ID, 1);
+    trust.save_to(&device.paths.trust).unwrap();
+    assert!(device.agent.credential_projects(ASTATION_ID, None).is_err());
+    device.agent.lock_keys().unwrap();
+    assert!(device.agent.credential_projects(ASTATION_ID, None).is_err());
+}
+
 /// Locks the agent and unlocks it again through the fake Astation: what the
 /// agent then holds came from the sealed file.
 fn relock(device: &UnlockedDevice) {

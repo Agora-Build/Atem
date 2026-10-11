@@ -155,6 +155,12 @@ pub enum AstationMessage {
     #[serde(rename = "agentListRequest")]
     AgentListRequest,
 
+    #[serde(rename = "credentialProjectListRequest")]
+    CredentialProjectListRequest,
+
+    #[serde(rename = "credentialProjectListResponse")]
+    CredentialProjectListResponse { report: crate::memory::credential_projects::ProjectReportWire },
+
     /// Atem → Astation: snapshot of all registered agents.
     #[serde(rename = "agentListResponse")]
     AgentListResponse {
@@ -598,12 +604,14 @@ impl AstationClient {
         .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
         .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
 
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             completion_timeout,
             self.authenticate_after_challenge(auth_required, allow_pairing),
         )
         .await
-        .map_err(|_| anyhow!("Authentication timed out"))?
+        .map_err(|_| anyhow!("Authentication timed out"))?;
+        if result.is_ok() { let _ = self.report_credential_projects().await; }
+        result
     }
 
     async fn authenticate_after_challenge(
@@ -878,6 +886,20 @@ impl AstationClient {
             .map_err(|error| anyhow!(error))
     }
 
+    /// Best effort metadata; failure never prevents the user's command.
+    pub async fn report_credential_projects(&self) -> Result<()> {
+        use crate::memory::key_agent::{blocking, running_agent};
+        let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
+        crate::auth::require_pairing("credential project discovery")?;
+        let report = blocking(move || {
+            let agent = running_agent().ok_or_else(|| anyhow!("key agent is not running"))?;
+            if !agent.status()?.unlocked { return Err(anyhow!("key agent is locked")); }
+            let project = std::env::current_dir().ok().and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.key);
+            agent.credential_projects(&astation_id, project)
+        }).await?;
+        self.send_message_flushed(AstationMessage::CredentialProjectListResponse { report }).await
+    }
+
     /// Persist encryption mode/key messages before application code handles
     /// ordinary Astation traffic. Returns a user-facing status when handled.
     pub async fn handle_encryption_message(
@@ -886,6 +908,11 @@ impl AstationClient {
     ) -> Result<Option<String>> {
         use crate::memory::key_agent::{blocking, default_agent, running_agent, LOCKED};
         use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied, KeyPaths};
+
+        if matches!(message, AstationMessage::CredentialProjectListRequest) {
+            let _ = self.report_credential_projects().await;
+            return Ok(Some(String::new()));
+        }
 
         if !matches!(message, AstationMessage::EncryptionMode { .. } | AstationMessage::KeyGrant { .. }) {
             return Ok(None);

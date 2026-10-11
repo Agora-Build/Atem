@@ -80,6 +80,10 @@ impl ProjectNames {
             .map(String::as_str)
     }
 
+    pub fn projects(&self, account: &str) -> Vec<String> {
+        self.accounts.get(account).map(|names| names.values().cloned().collect()).unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub fn len(&self, account: &str) -> usize {
         self.accounts.get(account).map_or(0, BTreeMap::len)

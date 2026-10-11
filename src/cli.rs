@@ -436,6 +436,8 @@ pub enum ServCommands {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum CredCommands {
+    /// Send known Git projects to Astation's credential picker (keys must be unlocked)
+    Projects,
     /// Show whether this device is verified, its home Astation and its key agent
     Status,
     /// Unlock this device's keys (approve with Touch ID on your Mac)
