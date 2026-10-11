@@ -11,6 +11,12 @@ use crate::memory::device_keys::PublicKeys;
 use crate::memory::statements::{AccountState, DeviceVerified, SignedWire, verify_astation};
 use crate::memory::verification::AstationKeys;
 
+/// Why a signed account state older than this device's verification is
+/// refused. Messages held during `atem pair` are usually older than the
+/// state the verification delivered, so pair skips them quietly.
+pub const STATE_OLDER_THAN_VERIFICATION: &str =
+    "account state is older than this device's verification";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstationTrust {
     pub device_id: String,
@@ -424,7 +430,7 @@ impl TrustStore {
             bail!("account state is signed by a different signing-key generation");
         }
         if state.epoch < entry.epoch_floor {
-            bail!("account state is older than this device's verification");
+            bail!(STATE_OLDER_THAN_VERIFICATION);
         }
         if entry.account_state.is_some() {
             if state.epoch < entry.account_epoch {
