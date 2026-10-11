@@ -1353,6 +1353,11 @@ or during device verification are held and applied after verification,
 still checked against the pinned keys. A grant that arrives while the key
 agent is locked is ignored; after the unlock atem sends `keyRequest` if the
 newest signed state still needs `K`.
+When the keys are already unlocked and the newest signed state is
+`enabling` or `disabling`, `atem cred unlock` still connects to the home
+Astation, applies the state it sends on connect, finishes this device's
+migration and sends the signed `encryptionMigrationComplete` (`atem sync`
+talks only to the relay, so it can't).
 
 Until Astation supports verification, atems stay unverified: they keep
 plain-text sync and ignore `encryptionMode` and `keyGrant` (decided

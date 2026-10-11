@@ -12,7 +12,8 @@ use std::time::Duration;
 use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::encoding::dec;
 use crate::memory::key_agent::{
-    AgentStatus, KeyAgentApi, RESET, blocking, build_unlock_request, default_agent, running_agent,
+    AgentStatus, KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, default_agent,
+    running_agent,
 };
 use crate::memory::statements::{SignedWire, StorageRotate};
 use crate::memory::storage_key::{
@@ -107,6 +108,9 @@ fn shown(text: &str) -> String {
 /// for again once they are unlocked (`request_missing_key`).
 async fn apply_encryption_message<L: AstationLink>(link: &mut L, message: &AstationMessage) {
     match link.apply_encryption(message).await {
+        // "…locked; run `atem cred unlock`" is noise here: this is the
+        // unlock, and it asks for a missing key once the keys are unlocked.
+        Ok(Some(status)) if status.contains(LOCKED) => {}
         Ok(Some(status)) => println!("{}", shown(&status)),
         Ok(None) => {}
         Err(error) => eprintln!(
@@ -825,13 +829,56 @@ async fn unlock_command(paths: &KeyPaths) -> Result<()> {
     };
     if let Some(message) = nothing_to_do {
         println!("{message}");
+        if migration_pending(&TrustStore::load_from(&paths.trust)?, &home)? {
+            // Astation sends the signed state on connect; applying it finishes
+            // the migration and sends the signed completion report.
+            println!("Finishing the encryption migration with Astation…");
+            let mut client = connect_home(&home).await?;
+            finish_migration(&mut client, MIGRATION_WAIT).await;
+        }
         return Ok(());
     }
     let mut client = connect_home(&home).await?;
     unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await
 }
 
-/// "Already unlocked" when `atem cred unlock` has nothing to ask Astation:
+/// How long an already unlocked `atem cred unlock` waits for Astation's
+/// signed state when a migration is pending.
+const MIGRATION_WAIT: Duration = Duration::from_secs(15);
+
+/// The newest signed state for `home`'s account is `enabling` or
+/// `disabling`: this device's part of the migration may not be reported yet.
+fn migration_pending(trust: &TrustStore, home: &str) -> Result<bool> {
+    Ok(matches!(
+        crate::memory::verification::effective_state(trust, home)?,
+        Some((_, Some(state)))
+            if matches!(state.mode, crate::memory::crypto::EncryptionMode::Enabling | crate::memory::crypto::EncryptionMode::Disabling)
+    ))
+}
+
+/// Applies the encryption messages Astation sends on connect until one
+/// `encryptionMode` is handled (that runs the migration and reports it), at
+/// most `wait`.
+async fn finish_migration<L: AstationLink>(link: &mut L, wait: Duration) {
+    let finished = tokio::time::timeout(wait, async {
+        while let Some(message) = link.recv().await {
+            let is_mode = matches!(message, AstationMessage::EncryptionMode { .. });
+            if is_mode || matches!(message, AstationMessage::KeyGrant { .. }) {
+                apply_encryption_message(link, &message).await;
+                if is_mode {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    if !matches!(finished, Ok(true)) {
+        eprintln!("⚠️  Astation didn't send the encryption state; try again in a moment.");
+    }
+}
+
+/// "Already unlocked" when `atem cred unlock` needs no Touch ID:
 /// the keys are unlocked, Astation holds their storage key, no rotation is
 /// waiting to be resent and `K` isn't missing (blocking: agent call).
 fn already_unlocked(
@@ -1171,6 +1218,53 @@ mod tests {
             link.applied.iter().any(|a| a.starts_with("ModeChanged")),
             "{:?}",
             link.applied
+        );
+    }
+
+    #[test]
+    fn a_migration_is_pending_only_while_enabling_or_disabling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        for (mode, pending) in [
+            (EncryptionMode::Off, false),
+            (EncryptionMode::Enabling, true),
+            (EncryptionMode::On, false),
+            (EncryptionMode::Disabling, true),
+        ] {
+            let kid = mode.requires_key().then_some(K_KID);
+            set_state(&paths, &server.astation, mode, kid, 10 + mode as u64);
+            let trust = TrustStore::load_from(&paths.trust).unwrap();
+            assert_eq!(
+                migration_pending(&trust, ASTATION_ID).unwrap(),
+                pending,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finishing_a_migration_applies_the_state_astation_sends_on_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let agent = agent(&paths);
+        set_state(&paths, &server.astation, EncryptionMode::Off, None, 58);
+        let mut link = ScriptedLink::new(server).with_keys(&paths, &agent);
+        let mode = signed_mode(&link.server, EncryptionMode::On, 59);
+        // Unrelated traffic first, then the state.
+        link.inbox.push_back(AstationMessage::Heartbeat {
+            timestamp: "1".into(),
+        });
+        link.inbox.push_back(mode);
+        finish_migration(&mut link, WAIT).await;
+        assert_eq!(link.applied.len(), 1, "{:?}", link.applied);
+        assert!(
+            link.applied[0].starts_with("ModeChanged"),
+            "{:?}",
+            link.applied
+        );
+        assert_eq!(
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
+            EncryptionMode::On
         );
     }
 
