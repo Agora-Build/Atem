@@ -1508,6 +1508,9 @@ async fn run_pair(save: bool) -> Result<()> {
             let verify_astation_id = astation_id.clone();
             let mut active_client = if result != "local" {
                 println!("Establishing an authenticated relay session...");
+                // The pairing-code connection never learns Astation's identity:
+                // encryption messages it held are applied on the authenticated one.
+                let held = client.take_held_encryption();
                 drop(client);
                 let mut identity_client = crate::websocket_client::AstationClient::new();
                 identity_client
@@ -1519,6 +1522,9 @@ async fn run_pair(save: bool) -> Result<()> {
                             error
                         )
                     })?;
+                for message in held {
+                    identity_client.hold_encryption(message);
+                }
                 identity_client
             } else {
                 client
@@ -1551,6 +1557,10 @@ async fn run_pair(save: bool) -> Result<()> {
                 eprintln!("⚠️  {error}");
                 eprintln!("Pairing is saved. Run 'atem pair' again to verify this device.");
             }
+            // Held until now so they are checked against the pins this run set.
+            for status in active_client.apply_held_encryption().await {
+                println!("{}", crate::memory::unlock::shown(&status));
+            }
             Ok(())
         }
         Ok(Err(e)) => Err(e),
@@ -1573,7 +1583,8 @@ async fn next_verify_message(
                 | AstationMessage::DeviceVerified { .. }
                 | AstationMessage::VerifyAbort { .. }),
             ) => return Ok(message),
-            Some(_) => continue,
+            // Applied after the verification, against the pins it sets.
+            Some(message) => client.hold_encryption(message),
             None => anyhow::bail!("Astation connection closed during device verification"),
         }
     }

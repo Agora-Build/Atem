@@ -399,7 +399,14 @@ pub struct AstationClient {
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
     connected_astation_id: Option<String>,
+    /// Encryption messages held until they can be applied: ones that arrived
+    /// before Astation said who it is (a pairing-code relay connection never
+    /// authenticates), or during device verification.
+    held_encryption: Vec<AstationMessage>,
 }
+
+/// At most this many held encryption messages are kept (the newest).
+const MAX_HELD_ENCRYPTION: usize = 16;
 
 impl AstationClient {
     pub fn new() -> Self {
@@ -413,6 +420,7 @@ impl AstationClient {
             relay_code_path_override: None,
             ws_closed: false,
             connected_astation_id: None,
+            held_encryption: Vec::new(),
         }
     }
 
@@ -870,7 +878,7 @@ impl AstationClient {
     /// Persist encryption mode/key messages before application code handles
     /// ordinary Astation traffic. Returns a user-facing status when handled.
     pub async fn handle_encryption_message(
-        &self,
+        &mut self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
         use crate::memory::key_agent::{blocking, default_agent, running_agent, LOCKED};
@@ -880,7 +888,10 @@ impl AstationClient {
             return Ok(None);
         }
         let Some(astation_id) = self.connected_astation_id.clone() else {
-            return Ok(Some("Ignored an encryption message that arrived before Astation's identity".into()));
+            // Applied once a connection knows the Astation (`apply_held_encryption`);
+            // signatures are still checked against the pinned keys then.
+            self.hold_encryption(message.clone());
+            return Ok(Some("Holding an encryption message until Astation's identity is known".into()));
         };
         let paths = KeyPaths::default_paths();
         let applied = match message {
@@ -943,6 +954,43 @@ impl AstationClient {
             }
             Applied::KeyInstalled(kid) => self.finish_encryption_migration(&astation_id, Some(kid)).await,
         }
+    }
+
+    /// Keeps an encryption message to apply later (`apply_held_encryption`).
+    /// Anything else is not held.
+    pub fn hold_encryption(&mut self, message: AstationMessage) {
+        if !matches!(message, AstationMessage::EncryptionMode { .. } | AstationMessage::KeyGrant { .. }) {
+            return;
+        }
+        if self.held_encryption.len() >= MAX_HELD_ENCRYPTION {
+            self.held_encryption.remove(0);
+        }
+        self.held_encryption.push(message);
+    }
+
+    /// Takes the held encryption messages (`atem pair` replaces its
+    /// pairing-code connection with an authenticated one, which holds them
+    /// again with `hold_encryption`).
+    pub fn take_held_encryption(&mut self) -> Vec<AstationMessage> {
+        std::mem::take(&mut self.held_encryption)
+    }
+
+    /// Applies the held encryption messages, in arrival order, once this
+    /// client knows its Astation; returns their status lines. Without an
+    /// Astation id they stay held.
+    pub async fn apply_held_encryption(&mut self) -> Vec<String> {
+        if self.connected_astation_id.is_none() {
+            return Vec::new();
+        }
+        let mut statuses = Vec::new();
+        for message in std::mem::take(&mut self.held_encryption) {
+            match self.handle_encryption_message(&message).await {
+                Ok(Some(status)) => statuses.push(status),
+                Ok(None) => {}
+                Err(error) => statuses.push(format!("Ignored an encryption message: {error:#}")),
+            }
+        }
+        statuses
     }
 
     async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {
@@ -1528,6 +1576,40 @@ mod tests {
         client.sender = Some(sender);
         drop(receiver);
         assert!(client.send_message_flushed(AstationMessage::ProjectListRequest).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encryption_messages_before_the_astation_identity_are_held_then_applied() {
+        // A pairing-code relay connection: no Astation identity yet.
+        let mut pairing = AstationClient::new();
+        let unsigned = AstationMessage::EncryptionMode { account_state: None };
+        let status = pairing.handle_encryption_message(&unsigned).await.unwrap().unwrap();
+        assert!(status.contains("Holding"), "{status}");
+        assert!(pairing.apply_held_encryption().await.is_empty(), "still no identity");
+        // Other traffic is never held.
+        pairing.hold_encryption(AstationMessage::Heartbeat { timestamp: "1".into() });
+
+        // The authenticated connection takes them over and applies them,
+        // through the same signature checks (unsigned here: ignored).
+        let mut authenticated = AstationClient::new();
+        authenticated.connected_astation_id = Some("astation-1".into());
+        for message in pairing.take_held_encryption() {
+            authenticated.hold_encryption(message);
+        }
+        assert_eq!(
+            authenticated.apply_held_encryption().await,
+            vec!["Ignored an unsigned encryption mode from the relay".to_string()]
+        );
+        assert!(authenticated.apply_held_encryption().await.is_empty());
+    }
+
+    #[test]
+    fn only_the_newest_held_encryption_messages_are_kept() {
+        let mut client = AstationClient::new();
+        for _ in 0..MAX_HELD_ENCRYPTION + 3 {
+            client.hold_encryption(AstationMessage::KeyGrant { grant: None });
+        }
+        assert_eq!(client.take_held_encryption().len(), MAX_HELD_ENCRYPTION);
     }
 
     fn isolated_client(atem_id: &str) -> (tempfile::TempDir, AstationClient) {

@@ -1341,9 +1341,23 @@ binary values are base64. `SignedWire` is `{statement, signature}`;
 | `deviceVerified` | Astation → atem | `device_verified: SignedWire`, `account_state: SignedWire`, `grants: [GrantWire]` |
 | `verifyAbort` | either | `reason` |
 | `encryptionMode` | Astation → atem | `account_state: SignedWire` (messages without it are ignored) |
-| `keyRequest` | atem → Astation | `public_key` (the verified device key); sent after verification, or on a repeated `encryptionMode`, when the signed state needs `K` and atem doesn't hold it |
+| `keyRequest` | atem → Astation | `public_key` (the verified device key); sent after verification, on a repeated `encryptionMode`, or after `atem cred unlock`, when the signed state needs `K` and atem doesn't hold it |
 | `keyGrant` | Astation → atem | `grant: GrantWire` (messages without it are ignored) |
 | `encryptionMigrationComplete` | atem → Astation | `mode`, `kid`, `completion: SignedWire` (`atem-migration-complete-v1`); unsigned legacy packets cannot authorize completion |
+
+atem applies `encryptionMode` and `keyGrant` whenever they arrive, also
+while it waits for another reply (`atem cred unlock`, a rotation, an
+escrow): Astation sends them right after connect. Ones that arrive before
+atem knows the Astation's id (`atem pair`'s pairing-code relay connection)
+or during device verification are held and applied after verification,
+still checked against the pinned keys. A grant that arrives while the key
+agent is locked is ignored; after the unlock atem sends `keyRequest` if the
+newest signed state still needs `K`.
+When the keys are already unlocked and the newest signed state is
+`enabling` or `disabling`, `atem cred unlock` still connects to the home
+Astation, applies the state it sends on connect, finishes this device's
+migration and sends the signed `encryptionMigrationComplete` (`atem sync`
+talks only to the relay, so it can't).
 
 Until Astation supports verification, atems stay unverified: they keep
 plain-text sync and ignore `encryptionMode` and `keyGrant` (decided
