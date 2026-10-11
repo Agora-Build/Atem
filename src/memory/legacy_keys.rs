@@ -5,10 +5,11 @@
 //! account into `device_keys.sealed` and `project_names.json`, and deletes
 //! the file once the home Astation holds the storage key of the sealed file
 //! and every entry of those accounts parsed (key_agent.rs
-//! `migrate_data_keys`; a malformed entry keeps the file). An agent on an unverified device
-//! deletes it at start. An unreadable one is moved aside (`move_aside`),
-//! never deleted. A first verification purges what the unauthenticated #36
-//! path stored in it, except accounts another verified Astation names.
+//! `migrate_data_keys`; a malformed entry keeps the file). An agent on an
+//! unverified device deletes it at start. An unreadable one is moved aside
+//! (`move_aside`), never deleted. A first verification purges what the
+//! unauthenticated #36 path stored in it, except accounts another verified
+//! Astation names.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};

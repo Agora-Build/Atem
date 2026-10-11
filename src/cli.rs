@@ -1431,7 +1431,8 @@ fn prompt_save_credentials() -> bool {
     prompt_yes_no("Save credentials so they keep working when Astation disconnects? [y/N]: ")
 }
 
-/// `atem pair [--save]` — connect to Astation, send PairSavePreference, wait for CredentialSync.
+/// `atem pair [--save]` — connect to Astation, send PairSavePreference, wait for CredentialSync,
+/// then verify this device (`run_device_verification`).
 async fn run_pair(save: bool) -> Result<()> {
     use tokio::time::{Duration, timeout};
     let config = crate::config::AtemConfig::load()?;
@@ -1467,7 +1468,6 @@ async fn run_pair(save: bool) -> Result<()> {
 
     println!("Waiting for Astation to send SSO credentials...");
 
-    // Wait up to 60s for CredentialSync.
     let received = timeout(Duration::from_secs(60), async {
         loop {
             match client.recv_message_async().await {
