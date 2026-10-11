@@ -114,14 +114,7 @@ pub struct EnvDef {
 impl EnvDef {
     fn new(name: &str, host: &str, prefix: &str) -> Self {
         EnvDef { name: name.into(), host: host.into(), prefix: prefix.into(), ..Default::default() }
-    }
-    /// Base URL up to `projects/<app_id>`, no `/join` or `/leave` — used for
-    /// building request URLs and the UI endpoint preview.
-    pub fn projects_base(&self, app_id: &str) -> String {
-        format!("{}/{}/conversational-ai-agent/v2/projects/{}",
-            self.host.trim_end_matches('/'), self.prefix.trim_matches('/'), app_id)
-    }
-}
+    }}
 
 /// Built-in environment defaults. `[[atem.environments]]` overrides by name.
 pub fn default_environments() -> Vec<EnvDef> {
@@ -873,12 +866,6 @@ pub enum Pipeline {
     Cascaded,
     /// `[agent.mllm]` — multimodal end-to-end model.
     Mllm,
-}
-
-impl Pipeline {
-    pub fn as_str(self) -> &'static str {
-        match self { Self::Cascaded => "cascaded", Self::Mllm => "mllm" }
-    }
 }
 
 /// Public display fields from `[agent.avatar]`. Excludes `params`,

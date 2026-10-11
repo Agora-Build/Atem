@@ -165,12 +165,6 @@ impl TunnelProvider {
             ),
         }
     }
-    fn name(self) -> &'static str {
-        match self {
-            Self::Ngrok => "ngrok",
-            Self::Cloudflared => "cloudflared",
-        }
-    }
 }
 
 /// Dispatch to the right spawn_* helper. Returns the tunnel process
@@ -342,7 +336,6 @@ async fn spawn_ngrok(port: u16, domain: Option<&str>) -> Result<(std::process::C
         anyhow::bail!("ngrok :4040 already in use");
     }
 
-    let mut cmd = std::process::Command::new("ngrok");
     let mut cmd = std::process::Command::new("ngrok");
     cmd.arg("http").arg(port.to_string());
     if let Some(d) = domain {

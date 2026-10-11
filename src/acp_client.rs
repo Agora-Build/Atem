@@ -33,15 +33,6 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
-/// An incoming JSON-RPC 2.0 notification (no `id` field).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonRpcNotification {
-    pub jsonrpc: String,
-    pub method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
-}
-
 /// JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
@@ -955,7 +946,7 @@ mod tests {
     /// notification frame through it, and verify it surfaces as an event.
     #[tokio::test]
     async fn test_connect_and_recv_event_via_mock_server() {
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::SinkExt;
         use tokio::net::TcpListener;
         use tokio_tungstenite::tungstenite::Message;
 
@@ -989,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_raw_reaches_server() {
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::StreamExt;
         use tokio::net::TcpListener;
         use tokio::sync::oneshot;
         use tokio_tungstenite::tungstenite::Message;

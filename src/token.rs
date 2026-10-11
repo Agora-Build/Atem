@@ -442,15 +442,6 @@ fn format_relative_duration(secs: u64) -> String {
     }
 }
 
-fn format_timestamp(ts: u32) -> String {
-    format_timestamp_impl(ts as u64)
-}
-
-/// Like format_timestamp but takes a u64 (for values that may exceed u32).
-fn format_timestamp_u64(ts: u64) -> String {
-    format_timestamp_impl(ts)
-}
-
 fn format_timestamp_impl(secs: u64) -> String {
     let days = secs / 86400;
     let time_of_day = secs % 86400;
@@ -562,34 +553,6 @@ fn read_string(data: &[u8], offset: &mut usize) -> Result<String> {
     let s = String::from_utf8(data[*offset..*offset + len].to_vec())?;
     *offset += len;
     Ok(s)
-}
-
-// Legacy token generator (kept for backward compatibility)
-pub fn generate_rtm_token(
-    app_id: &str,
-    app_certificate: &str,
-    user_id: &str,
-    expire_seconds: u32,
-) -> String {
-    if app_certificate.is_empty() {
-        return String::new();
-    }
-    let expire_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        + expire_seconds as u64;
-    let raw = format!("{}{}{}{}", app_id, app_certificate, user_id, expire_epoch);
-    let digest = format!("{:x}", md5_simple(raw.as_bytes()));
-    format!("007{}{:016x}", &digest[..16], expire_epoch)
-}
-
-fn md5_simple(data: &[u8]) -> u128 {
-    let mut h: u128 = 0;
-    for &b in data {
-        h = h.wrapping_mul(31).wrapping_add(b as u128);
-    }
-    h
 }
 
 #[cfg(test)]
@@ -1325,7 +1288,7 @@ mod tests {
 
         // Use the official crate directly with controlled salt/ts
         let expire: u32 = 600;
-        let mut token = access_token::new_access_token(&app_id, &app_cert, expire);
+        let token = access_token::new_access_token(&app_id, &app_cert, expire);
         // Override salt and issue_ts to match reference
         // Note: the struct fields aren't public, so we verify via roundtrip instead
         let built = token.build();
@@ -1334,18 +1297,5 @@ mod tests {
         assert!(token_str.starts_with("007"));
         let info = decode_token(&token_str).unwrap();
         assert_eq!(info.app_id, app_id);
-    }
-
-    // Legacy token tests
-    #[test]
-    fn legacy_empty_certificate_returns_empty_token() {
-        let token = generate_rtm_token("app", "", "user", 3600);
-        assert!(token.is_empty());
-    }
-
-    #[test]
-    fn legacy_token_starts_with_prefix() {
-        let token = generate_rtm_token("app", "cert", "user", 3600);
-        assert!(token.starts_with("007"));
     }
 }

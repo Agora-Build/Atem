@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::time::Duration;
 
-const DEFAULT_SERVER_URL: &str = "https://station.agora.build";
-
 // ===== Capability tiers: shared pairing/login gates =====
 //
 // Tier 1 (`atem login`) unlocks a limited set of functions; tier 2 (paired
@@ -201,32 +199,14 @@ impl SessionManager {
         self.sessions.get_mut(astation_id).filter(|s| s.is_valid())
     }
 
-    /// Save or update a session for a specific Astation.
-    pub fn save_session(&mut self, session: AuthSession) -> Result<()> {
-        self.insert_session(session);
-        self.save()
-    }
-
     pub(crate) fn insert_session(&mut self, session: AuthSession) {
         let astation_id = session.astation_id.clone();
         self.sessions.insert(astation_id, session);
     }
 
-    /// Remove a session for a specific Astation.
-    pub fn remove(&mut self, astation_id: &str) -> Result<()> {
-        self.sessions.remove(astation_id);
-        self.save()
-    }
-
     /// Get all active (valid) sessions.
     pub fn active_sessions(&self) -> Vec<&AuthSession> {
         self.sessions.values().filter(|s| s.is_valid()).collect()
-    }
-
-    /// Clean up expired sessions and save.
-    pub fn cleanup_expired(&mut self) -> Result<()> {
-        self.sessions.retain(|_, session| session.is_valid());
-        self.save()
     }
 
     /// Get the path to the sessions file.
@@ -342,186 +322,12 @@ pub fn generate_otp() -> String {
     code.to_string()
 }
 
-/// Build the deep link URL that activates the local Astation app.
-pub fn build_deep_link(session_id: &str, hostname: &str, otp: &str) -> String {
-    format!(
-        "astation://auth?id={}&tag={}&otp={}",
-        session_id, hostname, otp
-    )
-}
-
-/// Build the web fallback URL for when Astation is not installed locally.
-pub fn build_web_fallback_url(server_url: &str, session_id: &str, hostname: &str) -> String {
-    format!(
-        "{}/auth?id={}&tag={}",
-        server_url.trim_end_matches('/'),
-        session_id,
-        hostname
-    )
-}
-
 /// Get the local machine hostname.
 pub fn get_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown".to_string())
-}
-
-/// Try to open a URL (deep link or web page) on the local system.
-pub fn open_url(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(url).spawn()?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open").arg(url).spawn()?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", url])
-            .spawn()?;
-    }
-    Ok(())
-}
-
-/// Create a new auth session on the Astation server.
-pub async fn create_server_session(
-    server_url: &str,
-    hostname: &str,
-) -> Result<(String, String, String)> {
-    let url = format!("{}/api/sessions", server_url.trim_end_matches('/'));
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "hostname": hostname }))
-        .send()
-        .await
-        .map_err(|e| anyhow!("Failed to create session: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Server returned {}: {}", status, body));
-    }
-
-    #[derive(Deserialize)]
-    struct CreateResp {
-        id: String,
-        otp: String,
-    }
-
-    let data: CreateResp = resp
-        .json()
-        .await
-        .map_err(|e| anyhow!("Failed to parse server response: {}", e))?;
-
-    Ok((data.id, data.otp, server_url.to_string()))
-}
-
-/// Poll the server for session status until granted, denied, or timeout.
-pub async fn poll_session_status(
-    server_url: &str,
-    session_id: &str,
-    astation_id: &str,
-    timeout: Duration,
-) -> Result<AuthSession> {
-    let url = format!(
-        "{}/api/sessions/{}/status",
-        server_url.trim_end_matches('/'),
-        session_id
-    );
-    let client = reqwest::Client::new();
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > timeout {
-            return Err(anyhow!("Authentication timed out"));
-        }
-
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to check session status: {}", e))?;
-
-        if resp.status().is_success() {
-            #[derive(Deserialize)]
-            struct StatusResp {
-                id: String,
-                status: String,
-                token: Option<String>,
-            }
-
-            let data: StatusResp = resp.json().await?;
-
-            match data.status.as_str() {
-                "granted" => {
-                    let token = data
-                        .token
-                        .ok_or_else(|| anyhow!("Granted but no token received"))?;
-                    return Ok(AuthSession::new(
-                        data.id,
-                        token,
-                        astation_id.to_string(),
-                        get_hostname(),
-                    ));
-                }
-                "denied" => {
-                    return Err(anyhow!("Authentication was denied"));
-                }
-                "expired" => {
-                    return Err(anyhow!("Session expired"));
-                }
-                _ => {
-                    // Still pending, wait and retry
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-        } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(anyhow!("Session not found or expired"));
-        } else {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    }
-}
-
-/// Run the full login flow.
-/// Note: This is for the old HTTP-based auth flow. For WebSocket-based auth,
-/// the astation_id is received in the auth_required message.
-pub async fn run_login_flow(server_url: Option<&str>, astation_id: &str) -> Result<AuthSession> {
-    let server = server_url.unwrap_or(DEFAULT_SERVER_URL);
-    let hostname = get_hostname();
-
-    println!("Authenticating with Astation...");
-    println!();
-
-    // Step 1: Create session on server
-    let (session_id, otp, _server) = create_server_session(server, &hostname).await?;
-
-    // Step 2: Try deep link to local Astation
-    let deep_link = build_deep_link(&session_id, &hostname, &otp);
-    let web_url = build_web_fallback_url(server, &session_id, &hostname);
-
-    println!("OTP Code: {}", otp);
-    println!();
-
-    let _ = open_url(&deep_link);
-
-    println!("If Astation didn't open automatically, visit:");
-    println!("  {}", web_url);
-    println!();
-    println!("Waiting for authorization...");
-
-    // Step 3: Poll for grant
-    let timeout = Duration::from_secs(300); // 5 minutes
-    let session = poll_session_status(server, &session_id, astation_id, timeout).await?;
-
-    println!("Authenticated successfully!");
-    Ok(session)
 }
 
 #[cfg(test)]
@@ -637,27 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn deep_link_format() {
-        let link = build_deep_link("sess123", "my-host", "12345678");
-        assert_eq!(link, "astation://auth?id=sess123&tag=my-host&otp=12345678");
-    }
-
-    #[test]
-    fn web_fallback_url_format() {
-        let url = build_web_fallback_url("https://station.agora.build", "sess123", "my-host");
-        assert_eq!(
-            url,
-            "https://station.agora.build/auth?id=sess123&tag=my-host"
-        );
-    }
-
-    #[test]
-    fn web_fallback_url_strips_trailing_slash() {
-        let url = build_web_fallback_url("https://station.agora.build/", "s1", "h1");
-        assert_eq!(url, "https://station.agora.build/auth?id=s1&tag=h1");
-    }
-
-    #[test]
     fn auth_session_serialization_roundtrip() {
         let session = AuthSession::new(
             "test-id".to_string(),
@@ -678,86 +463,6 @@ mod tests {
     fn hostname_returns_non_empty() {
         let h = get_hostname();
         assert!(!h.is_empty());
-    }
-
-    // --- Mock server helpers ---
-
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    /// Spin up a one-shot HTTP server that returns the given body for any request.
-    async fn mock_http_server(response_body: &'static str, status: u16) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let status_line = match status {
-            200 => "200 OK",
-            404 => "404 Not Found",
-            _ => "500 Internal Server Error",
-        };
-        tokio::spawn(async move {
-            // Accept multiple connections (poll loops retry)
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    let body = response_body;
-                    let resp = format!(
-                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        status_line,
-                        body.len(),
-                        body
-                    );
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                }
-            }
-        });
-        addr
-    }
-
-    #[tokio::test]
-    async fn create_server_session_parses_id_field() {
-        let body = r#"{"id":"abc-123","otp":"12345678","hostname":"host","status":"pending","created_at":"2024-01-01T00:00:00Z","expires_at":"2024-01-01T04:00:00Z"}"#;
-        let addr = mock_http_server(body, 200).await;
-        let url = format!("http://{}", addr);
-        let (session_id, otp, _) = create_server_session(&url, "test-host").await.unwrap();
-        assert_eq!(session_id, "abc-123");
-        assert_eq!(otp, "12345678");
-    }
-
-    #[tokio::test]
-    async fn poll_session_status_parses_granted() {
-        let body = r#"{"id":"abc-123","status":"granted","token":"tok-xyz"}"#;
-        let addr = mock_http_server(body, 200).await;
-        let url = format!("http://{}", addr);
-        let session = poll_session_status(&url, "abc-123", "astation-test", Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(session.session_id, "abc-123");
-        assert_eq!(session.token, "tok-xyz");
-        assert_eq!(session.astation_id, "astation-test");
-    }
-
-    #[tokio::test]
-    async fn poll_session_status_returns_error_on_denied() {
-        let body = r#"{"id":"abc-123","status":"denied"}"#;
-        let addr = mock_http_server(body, 200).await;
-        let url = format!("http://{}", addr);
-        let err = poll_session_status(&url, "abc-123", "astation-test", Duration::from_secs(5))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("denied"));
-    }
-
-    #[tokio::test]
-    async fn poll_session_status_returns_error_on_404() {
-        let body = r#"{"error":"not found"}"#;
-        let addr = mock_http_server(body, 404).await;
-        let url = format!("http://{}", addr);
-        let err = poll_session_status(&url, "no-such-id", "astation-test", Duration::from_secs(5))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not found") || err.to_string().contains("expired"));
     }
 
     // ===== Session Expiry & Refresh Tests =====

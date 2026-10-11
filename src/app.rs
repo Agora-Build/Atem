@@ -33,8 +33,6 @@ use crate::agent_client::{AgentEvent, AgentInfo, AgentKind, AgentOrigin, AgentPr
 use crate::agent_registry::AgentRegistry;
 use crate::acp_client::AcpClient;
 
-pub const AGORA_RTM_TOKEN_TTL_SECS: u32 = 3600;
-
 #[derive(Debug, Clone)]
 pub enum AppMode {
     MainMenu,
@@ -65,14 +63,6 @@ pub enum ActiveCli {
     Codex,
 }
 
-#[derive(Debug, Clone)]
-pub struct TokenInfo {
-    pub token: String,
-    pub channel: String,
-    pub uid: String,
-    pub expires_in: String,
-}
-
 pub struct App {
     pub mode: AppMode,
     pub selected_index: usize,
@@ -83,7 +73,6 @@ pub struct App {
     pub show_popup: bool,
     pub popup_message: String,
     pub status_message: Option<String>,
-    pub token_info: Option<TokenInfo>,
     pub astation_client: AstationClient,
     pub astation_connected: bool,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
@@ -143,9 +132,6 @@ pub struct App {
     pub active_agent_id: Option<String>,
     /// Cursor position in the AgentPanel list.
     pub agent_panel_selected: usize,
-    /// Pending credentials waiting for user to decide whether to save to disk.
-    /// (customer_id, customer_secret)
-    pub pending_credential_save: Option<(String, String)>,
     /// Background Astation connection result channel (set up at startup).
     pub astation_connect_rx: Option<tokio::sync::oneshot::Receiver<
         Result<(crate::websocket_client::AstationClient, Option<String>)>
@@ -223,7 +209,6 @@ impl App {
             show_popup: false,
             popup_message: String::new(),
             status_message: None,
-            token_info: None,
             astation_client: AstationClient::new(),
             astation_connected: false,
             connected_astation_id: None,
@@ -278,7 +263,6 @@ impl App {
             acp_clients: HashMap::new(),
             active_agent_id: None,
             agent_panel_selected: 0,
-            pending_credential_save: None,
             astation_connect_rx: None,
             astation_reconnect_at: None,
             pending_astation_command: None,
@@ -1195,41 +1179,6 @@ impl App {
         Ok(true)
     }
 
-    /// Launch Claude Code as a PTY agent and register it.
-    ///
-    /// Returns the agent ID on success.
-    pub async fn launch_claude_pty_agent(&mut self) -> anyhow::Result<String> {
-        use crate::agent_client::{AgentInfo, AgentKind, AgentProtocol, AgentOrigin, AgentStatus, PtyAgentClient};
-
-        // Start Claude Code PTY session
-        let session = self.claude_client.start_session().await?;
-
-        // Generate agent ID
-        let agent_id = format!("claude-pty-{}", uuid::Uuid::new_v4());
-
-        // ClaudeSession already has sender/receiver channels, use them directly
-        let pty_client = PtyAgentClient::new(&agent_id, session.sender, session.receiver);
-
-        // Register agent
-        let agent_info = AgentInfo {
-            id: agent_id.clone(),
-            name: "Claude Code (PTY)".to_string(),
-            kind: AgentKind::ClaudeCode,
-            protocol: AgentProtocol::Pty,
-            origin: AgentOrigin::Launched,
-            status: AgentStatus::Idle,
-            session_ids: vec![],
-            acp_url: None,
-            pty_pid: None, // PTY doesn't expose PID easily
-        };
-
-        self.agent_registry.register(agent_info);
-
-        // TODO: Store pty_client somewhere so we can send prompts to it
-        // For now, we've registered the agent
-        Ok(agent_id)
-    }
-
     /// Scan lockfiles for externally started agents and register them.
     ///
     /// Called once at startup (or on demand).  Agents that are already in
@@ -1746,34 +1695,6 @@ impl App {
         }
     }
 
-    pub async fn try_connect_astation(&mut self) -> Result<()> {
-        if !self.astation_connected {
-            match self.astation_client.connect_with_pairing(&self.config).await {
-                Ok(code) => {
-                    self.astation_connected = true;
-                    self.pairing_code = Some(code);
-                    self.rebuild_menu();
-                    self.status_message = Some("Connected to Astation".to_string());
-                }
-                Err(_) => {
-                    // Fall back to direct URL connection
-                    let url = self.config.astation_ws().to_string();
-                    match self.astation_client.connect(&url).await {
-                        Ok(_) => {
-                            self.astation_connected = true;
-                            self.rebuild_menu();
-                            self.status_message = Some("Connected to Astation".to_string());
-                        }
-                        Err(_) => {
-                            // Continue in local mode (no Astation)
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
         match self.astation_client.handle_encryption_message(&message).await {
             Ok(Some(status)) => {
@@ -1819,13 +1740,6 @@ impl App {
                 expires_in,
                 timestamp: _,
             } => {
-                self.token_info = Some(TokenInfo {
-                    token: token.clone(),
-                    channel: channel.clone(),
-                    uid: uid.clone(),
-                    expires_in: expires_in.clone(),
-                });
-
                 self.output_text = format!(
                     "\u{1f511} RTC Token Generated (from Astation):\n\n\
                     Channel: {}\n\
@@ -2642,13 +2556,6 @@ impl App {
             }
         }
     }
-}
-
-pub fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_millis() as u64
 }
 
 #[cfg(test)]

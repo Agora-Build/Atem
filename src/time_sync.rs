@@ -69,11 +69,6 @@ impl TimeSync {
     pub fn offset(&self) -> i64 {
         self.offset_secs
     }
-
-    /// Force re-sync on next call to now().
-    pub fn invalidate(&mut self) {
-        self.synced_at = None;
-    }
 }
 
 /// Parse HTTP date format "Sun, 02 Feb 2026 19:30:00 GMT" to Unix timestamp.
