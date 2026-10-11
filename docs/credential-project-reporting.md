@@ -6,8 +6,9 @@ Git remote. Suggestions never grant a device access to a credential. Agora App
 projects and local filesystem paths are not credential project identities.
 
 An updated, unlocked Atem reports its current Git remote and project names it
-has remembered for the account. It reports after authenticated connection and
-in response to `credentialProjectListRequest`. `atem cred projects` explicitly
+has remembered for the account. It reports after authenticated connection, right
+after `atem cred unlock` succeeds (the report on connect was skipped because the
+keys were still locked), and in response to `credentialProjectListRequest`. `atem cred projects` explicitly
 publishes suggestions with a bounded connection/delivery wait. Locked or unverified clients
 send no inventory and never trigger an unlock prompt just to fill this list.
 An ephemeral CLI can send its report and exit; no persistent connection or

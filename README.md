@@ -79,7 +79,10 @@ ID) and starts a background `atem key-agent` that holds the keys in memory.
 `atem cred lock` then `atem cred unlock` to pick up the new agent.
 
 `atem cred projects` sends this repo's Git remote, and the project names atem
-remembers, to Astation's credential picker, encrypted to your Mac. Retrieving
+remembers, to Astation's credential picker, encrypted to your Mac. An
+unlocked atem also sends it on its own whenever it connects to Astation (the
+TUI, `atem pair`, and right after `atem cred unlock`), so you need
+`atem cred projects` only to send it right away from another repo. Retrieving
 values from Astation's local Credentials store (`atem cred get/list`) is not
 available yet; it is designed in `designs/e2e-encryption.md`.
 

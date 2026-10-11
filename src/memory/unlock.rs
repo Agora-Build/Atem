@@ -863,7 +863,11 @@ async fn unlock_command(paths: &KeyPaths) -> Result<()> {
         return Ok(());
     }
     let mut client = connect_home(&home).await?;
-    unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await
+    unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
+    // The report sent on connect was skipped (the keys were still locked);
+    // send it now, on the same connection. Best effort, like on connect.
+    let _ = client.report_credential_projects().await;
+    Ok(())
 }
 
 /// How long an already unlocked `atem cred unlock` waits for Astation's
