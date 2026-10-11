@@ -739,12 +739,14 @@ pub(crate) async fn serve_watched(
         });
     }
     eprintln!("key agent: locked by `atem cred lock`; exiting");
-    drop(listener);
+    // Unlink before closing the listener: clients count the agent as stopped
+    // once a dial fails, and by then its socket file must be gone too.
     if let Some((path, identity)) = &bound
         && std::fs::symlink_metadata(path).is_ok_and(|meta| (meta.dev(), meta.ino()) == *identity)
     {
         let _ = std::fs::remove_file(path);
     }
+    drop(listener);
     if let Some((path, _)) = &bound
         && let Ok(mut held) = HELD_LOCKS.lock()
     {
