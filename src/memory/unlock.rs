@@ -758,6 +758,18 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
     let paired = crate::auth::require_pairing("atem cred")?;
     let paths = KeyPaths::default_paths();
     match command {
+        CredCommands::Projects => {
+            crate::auth::require_pairing("credential project discovery")?;
+            let trust = TrustStore::load_from(&paths.trust)?;
+            let home = trust.home().ok_or_else(|| anyhow!("Verify this device with Astation first"))?;
+            if !blocking(|| default_agent().status().map(|status| status.unlocked)).await? { bail!(LOCKED); }
+            let client = tokio::time::timeout(Duration::from_secs(15), connect_home(home)).await
+                .map_err(|_| anyhow!("Astation connection timed out; retry project reporting"))??;
+            client.report_credential_projects().await
+                .context("Project reporting requires an updated, unlocked Atem key agent")?;
+            println!("Sent project suggestions to Astation.");
+            Ok(())
+        }
         CredCommands::Status => {
             let report = blocking(move || {
                 let trust = TrustStore::load_from(&paths.trust)?;

@@ -225,6 +225,7 @@ pub struct EncryptionContext {
     /// `None` while encryption is off.
     agent: Option<Arc<dyn KeyAgentApi>>,
     names_path: PathBuf,
+    remember_off_projects: bool,
 }
 
 impl std::fmt::Debug for EncryptionContext {
@@ -261,6 +262,8 @@ impl EncryptionContext {
 
     pub(crate) fn for_astation_with(astation_id: &str, paths: &KeyPaths, agent: Arc<dyn KeyAgentApi>) -> Result<Self> {
         let state = crate::memory::verification::account_mode(&paths.trust, astation_id)?;
+        let remember_off_projects = crate::memory::trust::TrustStore::load_from(&paths.trust)?
+            .verified(astation_id).is_some_and(|entry| entry.data_account == state.data_account);
         Ok(Self {
             mode: state.mode,
             data_account: state.data_account,
@@ -268,6 +271,7 @@ impl EncryptionContext {
             astation_id: astation_id.into(),
             agent: state.mode.requires_key().then_some(agent),
             names_path: paths.project_names.clone(),
+            remember_off_projects,
         })
     }
 
@@ -315,14 +319,19 @@ impl EncryptionContext {
     }
 
     pub fn wire_project(&self, project: &str) -> Result<String> {
-        if project.is_empty() || !self.should_encrypt() { return Ok(project.to_string()); }
+        if project.is_empty() { return Ok(project.to_string()); }
         Ok(self.wire_projects(&[project.to_string()])?.remove(0))
     }
 
     /// Project keys as the relay sees them (`h1.` hashes while encrypting),
     /// remembered in project_names.json. Empty stays empty.
     pub fn wire_projects(&self, projects: &[String]) -> Result<Vec<String>> {
-        if !self.should_encrypt() { return Ok(projects.to_vec()); }
+        if !self.should_encrypt() {
+            if self.remember_off_projects {
+                let _ = self.remember(projects.iter().filter(|project| !project.is_empty()).map(|project| (project.clone(), project.clone())).collect());
+            }
+            return Ok(projects.to_vec());
+        }
         let ops = projects.iter()
             .filter(|project| !project.is_empty())
             .map(|project| CryptOp::keyed_hash(project.as_bytes()))
@@ -737,6 +746,21 @@ mod tests {
         let unknown = Memory { id: "mem-9".into(), project: "h1.0123abcd.ff".into(), ..Memory::default() };
         let error = context.decrypt_memory(unknown).unwrap_err().to_string();
         assert!(error.contains("unknown on this Atem"), "{error}");
+    }
+
+    #[test]
+    fn verified_off_projects_are_remembered_without_making_metadata_failures_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut device = UnlockedDevice::new(dir.path());
+        device.state(EncryptionMode::Off, None);
+        let context = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, Arc::new(NoAgent)).unwrap();
+        assert_eq!(context.wire_project("github.com/org/repo").unwrap(), "github.com/org/repo");
+        let names = crate::memory::project_names::ProjectNames::load_from(&device.paths.project_names).unwrap();
+        assert_eq!(names.projects(&context.data_account), ["github.com/org/repo"]);
+        let newer = br#"{"version":9,"accounts":{}}"#;
+        std::fs::write(&device.paths.project_names, newer).unwrap();
+        assert_eq!(context.wire_project("github.com/org/other").unwrap(), "github.com/org/other");
+        assert_eq!(std::fs::read(&device.paths.project_names).unwrap(), newer);
     }
 
     #[test]

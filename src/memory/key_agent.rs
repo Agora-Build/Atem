@@ -48,6 +48,10 @@ pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, devic
 pub enum Request {
     Status,
     PublicKeys,
+    CredentialProjects {
+        astation_id: String,
+        current_project: Option<String>,
+    },
     /// Keys handed over at the first verification (same-user socket): the
     /// agent holds them unlocked until Astation has their storage key.
     LoadUnlocked {
@@ -122,6 +126,9 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reply {
+    CredentialProjects {
+        report: super::credential_projects::ProjectReportWire,
+    },
     Status {
         unlocked: bool,
         storage_kid: Option<String>,
@@ -328,6 +335,23 @@ impl KeyAgent {
     pub fn handle(&mut self, request: Request) -> Result<Reply> {
         match request {
             Request::Status => Ok(self.status()),
+            Request::CredentialProjects { astation_id, current_project } => {
+                let _lock = TrustStore::lock(&self.paths.trust)?;
+                let trust = TrustStore::load_from(&self.paths.trust)?;
+                if trust.revoked().is_some() { bail!("device verification was revoked"); }
+                let entry = trust.verified(&astation_id).ok_or_else(|| anyhow!("Astation is not verified"))?;
+                let unlocked = self.unlocked()?;
+                if entry.device_id != unlocked.device_id || entry.sign_gen != 1
+                    || entry.device_pub != STANDARD.encode(unlocked.keys.device_pub())
+                    || entry.device_sign_pub != STANDARD.encode(unlocked.keys.device_sign_pub()) {
+                    bail!("project report identity changed");
+                }
+                let names = super::project_names::ProjectNames::load_from(&self.paths.project_names)?;
+                let report = super::credential_projects::seal_report(&unlocked.keys, &entry.data_account,
+                    &entry.device_id, &*decode32(&entry.astation_enc_pub, "Astation encryption key")?,
+                    names.projects(&entry.data_account), current_project.as_deref())?;
+                Ok(Reply::CredentialProjects { report })
+            }
             Request::PublicKeys => {
                 let unlocked = self.unlocked()?;
                 Ok(Reply::PublicKeys {
@@ -1334,6 +1358,13 @@ fn remove_plain_keys(paths: &KeyPaths) -> Result<()> {
 /// in process (`Mutex<KeyAgent>`, used by tests and by the socket server).
 pub trait KeyAgentApi: Send + Sync {
     fn call(&self, request: Request) -> Result<Reply>;
+
+    fn credential_projects(&self, astation_id: &str, current_project: Option<String>) -> Result<super::credential_projects::ProjectReportWire> {
+        match self.call(Request::CredentialProjects { astation_id: astation_id.into(), current_project })? {
+            Reply::CredentialProjects { report } => Ok(report),
+            _ => unexpected(),
+        }
+    }
 
     fn migration_completion(&self, astation_id: &str, state_epoch: u64, mode: &str, kid: &str) -> Result<SignedWire> {
         match self.call(Request::MigrationComplete { astation_id: astation_id.into(), state_epoch,

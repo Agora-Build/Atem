@@ -575,6 +575,8 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   not fail the request), when a running agent is told of a new `off` state,
   and at every unlock.
 - **Project names** (`h1.` hash -> project key) live in `project_names.json`
+  by account. Verified OFF contexts also remember their raw project keys for
+  local discovery; failure to save optional OFF metadata does not fail a command.
   (0600, no secrets); the hash itself is computed by the agent. Writes hold
   an `flock` on `project_names.lock`; lock order is `cred_state` / trust lock
   first, then `project_names.lock`, never the reverse. A corrupt file is
@@ -1044,6 +1046,13 @@ shared notepad for agents (see [[vault]]) and gets no credential commands.
 Memory and skills only *name* a credential (see [[atem-memory]]).
 
 ### Projects and isolation
+
+Astation's editable credential project picker receives the current Git project
+and account-specific remembered project names from an updated, unlocked Atem.
+These suggestions are HPKE-encrypted to the pinned Astation and device-signed,
+even when memory encryption is off. They do not grant any credential access.
+See [credential project reporting](../docs/credential-project-reporting.md) for
+the protocol, lifecycle and optional metadata failure behavior.
 
 A project is the repo's normalized git `origin` URL, the same key Atem
 Memory uses (`src/memory/project.rs`): `git@github.com:Agora-Build/DialF.git`
