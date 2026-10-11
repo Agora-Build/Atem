@@ -28,7 +28,43 @@ atem repl                               # Interactive REPL with AI command inter
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
 atem logout                             # Log out from SSO
+atem pair                               # Pair with Astation, then verify this device
+atem pair --save                        # Same, and keep credentials for offline use
+atem unpair                             # Remove all Astation pairings
 ```
+
+`atem login` unlocks a limited set: project list, tokens for the active
+project, and the dev servers (`serv rtc`, `serv convo`, `serv webhooks`).
+Pairing with Astation unlocks the full set: vault, sync, memory, skills,
+`atem cred`, and Astation-driven remote agent control, voice coding, mark
+tasks and diagrams. `serv files`, `config`, and tokens from
+`AGORA_APP_ID`/`AGORA_APP_CERTIFICATE` need neither.
+
+`atem pair` receives your Agora login from Astation, then verifies the device:
+atem and your Mac each show a 12-character safety code. If they match, type
+`y` here and approve on the Mac with Touch ID, in either order. With `--save`
+the credentials keep working when Astation disconnects; without it they stop
+5 minutes after the disconnect (atem asks when `--save` isn't given).
+
+### Device keys (`atem cred`)
+
+```bash
+atem cred status                        # Show whether this device is verified, its home Astation and its key agent
+atem cred unlock                        # Unlock this device's keys (approve with Touch ID on your Mac)
+atem cred lock                          # Wipe the unlocked keys from the key agent's memory
+atem cred projects                      # Send known Git projects to Astation's credential picker (keys must be unlocked)
+```
+
+This device's keys are sealed on disk under a storage key that only the paired
+Mac (the home Astation) holds. `atem cred unlock` asks the Mac for it (Touch
+ID) and starts a background `atem key-agent` that holds the keys in memory.
+`atem cred lock` wipes them and stops the agent. After upgrading atem, run
+`atem cred lock` then `atem cred unlock` to pick up the new agent.
+
+`atem cred projects` sends this repo's Git remote, and the project names atem
+remembers, to Astation's credential picker, encrypted to your Mac. Storing and
+fetching credential values (`atem cred get`) is not available yet; it is
+designed in `designs/e2e-encryption.md`.
 
 ### Tokens
 
@@ -65,6 +101,22 @@ atem config convo --validate            # Validate existing config without modif
 atem config convo --config <PATH>       # Use a specific config file
 ```
 
+### Vault (shared cross-agent context)
+
+```bash
+atem vault new --summary "auth refactor context"   # Create a vault, prints its id
+atem vault list                                     # List vaults you can read
+atem vault read --vault-id <id>                     # Current contents
+atem vault read --vault-id <id> --history           # Every version (shown eN vM)
+atem vault read --vault-id <id> --format plain      # Bare text (pipe into a prompt)
+atem vault write --vault-id <id> --text "decided: JWT in cookie"   # Append an entry
+atem vault write --vault-id <id> --entry-id 3 --text "..."         # Override entry e3
+atem vault set-summary --vault-id <id> --text "..."  # Update the summary
+```
+
+Requires pairing with Astation. Lets multiple atems (each driving an agent)
+share a versioned, append-only context store hosted on the Astation relay.
+
 ### Memory & Skills (shared across agents and machines)
 
 Requires pairing with Astation. Agents learn from each other: facts and skills
@@ -83,12 +135,16 @@ atem memory search "valkey"                      # Local full-text search (offli
 atem memory replace <id> "the fact as it is now" # New fact replaces the old one (history kept)
 atem memory invalidate <id>                      # Mark outdated without a replacement
 atem memory rm <id>                              # Remove everywhere
+atem memory purge <id>                           # Remove a fact that contained a credential, stop re-harvesting it
+atem memory apply                                # Rewrite the managed blocks and skills from the local store
 atem memory status                               # Account, machine, project, pending changes
 
 atem skill add ./my-skill                        # Directory with SKILL.md (global by default)
 atem skill list
+atem skill rm <name>                             # Remove everywhere
 atem skill history <name>                        # Every version, newest first
 atem skill restore <name> --version 3            # Re-push an old version as a new one
+atem skill purge <name> --version 3              # Erase versions that contained a credential (or --all-versions)
 ```
 
 Listings show short ids like `8245ecf6…e6fe` (first 8 + last 4 characters).
@@ -105,6 +161,23 @@ Memories are applied as a managed block in `~/.claude/CLAUDE.md`,
 Anything that looks like a credential value is refused; save the
 credential's name, never its value. See `designs/atem-memory.md`.
 
+Works with end-to-end encryption on or off. When it is on, changes sync only
+while the device is unlocked (`atem cred unlock`); see below.
+
+### End-to-end encryption
+
+Turned on or off in Astation (Settings → End-to-End Encryption). When it is
+on, memory content, skill files and vault content are encrypted on this machine
+before they reach the relay, and project names become keyed hashes. Only your
+Mac, verified atems and the recovery key can decrypt them, so a leak of the
+relay database exposes nothing readable.
+
+The device must be verified (`atem pair`) and unlocked (`atem cred unlock`).
+While it is locked, `atem sync` keeps changes queued. Switching encryption on
+or off migrates existing data; each verified atem finishes its part at its next
+`atem cred unlock` (`atem sync` alone doesn't contact Astation). The local
+`knowledge.db` stays plain text (mode 0600). See `designs/e2e-encryption.md`.
+
 ### Dev Servers
 
 ```bash
@@ -119,6 +192,8 @@ atem serv rtc --background              # Run as background daemon
 atem serv diagrams                      # Host diagrams from SQLite (HTTP)
 atem serv diagrams --port 9000
 atem serv diagrams --background
+atem serv files ~/docs                  # Serve a directory or file over HTTPS (Markdown rendered)
+atem serv files ~/docs --background     # Port auto-picked; reused next run
 atem serv webhooks                      # Receive Agora webhooks locally (auto-tunneled via ngrok)
 atem serv webhooks --no-tunnel          # Local listener only — bring your own tunnel
 atem serv webhooks --background         # Run as background daemon
@@ -141,6 +216,8 @@ done
 **`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging, RTC encryption (8 modes; gcm2 modes auto-generate a copyable salt).
 
 **`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
+
+**`serv files`** — serves a directory (or a single file) over HTTPS. Markdown is rendered to HTML; append `?raw=1` to any URL for the raw bytes. Useful for browsing AI-generated docs on a remote machine.
 
 **`serv webhooks`** — local receiver for Agora webhook events (ConvoAI: `agent_joined`, `agent_left`, `agent_history`, `agent_error`, `agent_metrics`, …; RTC NCS events). Validates `Agora-Signature-V2` (HMAC-SHA256) when a `secret` is configured in `webhooks.toml`; accepts unsigned events otherwise with a warning. Live web console at `http://127.0.0.1:9090/` shows incoming events; each event also prints a one-line summary to stdout. Default tunnel provider is **ngrok**; set `tunnel_provider = "cloudflared"` for zero-auth quick tunnels. Use `--no-tunnel` if you're running cloudflared / ngrok separately for stable URLs across atem restarts.
 
