@@ -60,8 +60,9 @@ machine. Keep the unlock command open while you approve Touch ID on the Mac;
 the approval wait is bounded to five minutes. The background key agent holds
 the unlocked device and account keys, so later CLI commands can exit normally.
 
-After installing a new build, a status marked **older build** means the
-unlocked agent still uses the old executable. With the updated binary run:
+A status marked **started by another atem build** means the unlocked agent
+runs a different executable: an older install, or another copy such as a
+development build next to the npm one. With the atem you want to use, run:
 
 ```sh
 atem cred lock

@@ -730,7 +730,7 @@ pub fn status_report(
     };
     let agent_line = match agent {
         AgentState::Running(status) if status.older_build => {
-            format!("{agent_line} (older build; run `atem cred lock`, then `atem cred unlock`)")
+            format!("{agent_line} (started by another atem build; run `atem cred lock`, then `atem cred unlock`)")
         }
         _ => agent_line,
     };
@@ -2289,7 +2289,7 @@ mod tests {
             });
             let report = status_report(&trust, ASTATION_ID, &older, None, None);
             assert!(
-                report.contains("(older build; run `atem cred lock`, then `atem cred unlock`)\n"),
+                report.contains("(started by another atem build; run `atem cred lock`, then `atem cred unlock`)\n"),
                 "{report}"
             );
         }
@@ -2300,7 +2300,7 @@ mod tests {
             older_build: false,
         });
         let report = status_report(&trust, ASTATION_ID, &current, None, None);
-        assert!(!report.contains("older build"), "{report}");
+        assert!(!report.contains("another atem build"), "{report}");
     }
 
     #[test]
