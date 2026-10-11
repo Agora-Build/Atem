@@ -11,7 +11,11 @@ in response to `credentialProjectListRequest`. `atem cred projects` explicitly
 publishes suggestions with a bounded connection/delivery wait. Locked or unverified clients
 send no inventory and never trigger an unlock prompt just to fill this list.
 An ephemeral CLI can send its report and exit; no persistent connection or
-unbounded acknowledgment wait is required.
+unbounded acknowledgment wait is required. Signing the report needs a key
+agent from a build that knows the request: after updating atem, an agent
+still unlocked from the older build keeps running it, and `atem cred lock`
+followed by `atem cred unlock` picks up the new agent (a locked older agent
+is replaced automatically).
 
 `credentialProjectListResponse` carries a `report` with `signed`,
 `encapped_key`, and `ciphertext`. The payload is a JSON array of canonical
