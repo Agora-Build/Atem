@@ -619,10 +619,27 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 println!("{} is already outdated; nothing changed.", id);
             }
         }
-        MemoryCommands::Purge { id } => {
+        MemoryCommands::Purge { id, yes } => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
-            let id = purge_memory(&store, &id)?;
+            // The id and scope only: a purged memory may hold a credential.
+            let (full_id, scope) = match store.get_memory(id.trim())? {
+                Some(m) => (m.id, m.scope.as_str().to_string()),
+                None => {
+                    let full = store.resolve_memory_id(&id)?;
+                    let scope = store.get_memory(&full)?.map(|m| m.scope.as_str().to_string()).unwrap_or_default();
+                    (full, scope)
+                }
+            };
+            let what = if scope.is_empty() { full_id.clone() } else { format!("{full_id} ({scope})") };
+            if !crate::cli::confirm_destructive(
+                &format!("Purge memory {what} from the relay and every machine? This can't be undone."),
+                yes,
+            )? {
+                println!("Cancelled; nothing was purged.");
+                return Ok(());
+            }
+            let id = purge_memory(&store, &full_id)?;
             println!("Purged {}. Its text is removed from the relay and from other machines at their next sync.", id);
             println!("{}", ROTATE_WARNING);
             best_effort_sync(&store, &ctx).await;
@@ -758,7 +775,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
                 println!("{}", l);
             }
         }
-        SkillCommands::Purge { name, scope, version, all_versions } => {
+        SkillCommands::Purge { name, scope, version, all_versions, yes } => {
             let scope = Scope::parse(&scope)?;
             let project = project_for_scope(scope, &ctx, None)?;
             let versions = if all_versions {
@@ -766,6 +783,17 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             } else {
                 Some(vec![version.ok_or_else(|| anyhow!("Pass --version <n> or --all-versions"))?])
             };
+            let which = match &versions {
+                None => "every version".to_string(),
+                Some(v) => format!("version {}", v[0]),
+            };
+            if !crate::cli::confirm_destructive(
+                &format!("Erase {which} of skill '{name}' ({}) from the relay and every machine? This can't be undone.", scope.as_str()),
+                yes,
+            )? {
+                println!("Cancelled; nothing was purged.");
+                return Ok(());
+            }
             if let Some(cur) = store.get_skill(scope, &project, &name)? {
                 let hits_latest = versions.as_ref().map(|v| v.contains(&cur.version)).unwrap_or(true);
                 if hits_latest {
