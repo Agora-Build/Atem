@@ -261,6 +261,9 @@ pub(crate) async fn await_device_verified(
     }
 }
 
+/// At most this many characters of an abort reason are sent.
+const MAX_ABORT_REASON: usize = 200;
+
 /// Drops the pending pin and, unless Astation cancelled, tells Astation
 /// (`verifyAbort`, delivery confirmed, at most ~5 s, failure ignored).
 /// Returns the error to report.
@@ -275,7 +278,12 @@ pub(crate) async fn abandon_verification(
         trust.remove_pending(astation_id);
         Ok(())
     });
-    if let Some(reason) = failure.abort_reason {
+    if let Some(mut reason) = failure.abort_reason {
+        // Short enough for Astation's dialog: an error chain can be long.
+        if let Some((cut, _)) = reason.char_indices().nth(MAX_ABORT_REASON) {
+            reason.truncate(cut);
+            reason.push('…');
+        }
         // Bounded: send_message_flushed waits at most 5 s.
         let _ = client
             .send_message_flushed(AstationMessage::VerifyAbort { reason })
