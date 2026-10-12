@@ -74,6 +74,14 @@ pub struct TrustStore {
     pending: HashMap<String, AstationTrust>,
 }
 
+/// Whether this device is verified with an Astation (`verification_status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    Verified,
+    NotVerified,
+    Revoked,
+}
+
 /// Who revoked this device, and when (Unix seconds).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokedBy {
@@ -452,6 +460,18 @@ impl TrustStore {
         entry.account_state = Some(signed.clone());
         entry.account_epoch = state.epoch;
         Ok(Some(state))
+    }
+
+    /// Whether this device is verified with `astation_id`. A revocation wins
+    /// over any pin (the same decision `verification_line` shows).
+    pub fn verification_status(&self, astation_id: &str) -> VerificationStatus {
+        if self.revoked.is_some() {
+            VerificationStatus::Revoked
+        } else if self.verified(astation_id).is_some() {
+            VerificationStatus::Verified
+        } else {
+            VerificationStatus::NotVerified
+        }
     }
 
     pub fn verification_line(&self, astation_id: &str) -> String {
@@ -848,6 +868,20 @@ mod tests {
         assert_eq!(
             loaded.verification_line("other"),
             "Verified: no  (run 'atem pair' to verify this device)"
+        );
+        assert_eq!(
+            loaded.verification_status(ASTATION),
+            VerificationStatus::Verified
+        );
+        assert_eq!(
+            loaded.verification_status("other"),
+            VerificationStatus::NotVerified
+        );
+        let mut revoked = loaded;
+        revoked.record_revoked(ASTATION, 1_700_000_000);
+        assert_eq!(
+            revoked.verification_status(ASTATION),
+            VerificationStatus::Revoked
         );
     }
 

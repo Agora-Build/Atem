@@ -96,6 +96,22 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// The main menu's credential line for a paired device, with its
+/// verification (`TrustStore::verification_status`) when known.
+pub(crate) fn paired_status_line(
+    login_id: &str,
+    status: Option<crate::memory::trust::VerificationStatus>,
+) -> String {
+    use crate::memory::trust::VerificationStatus;
+    let suffix = match status {
+        Some(VerificationStatus::Verified) => " \u{b7} verified",
+        Some(VerificationStatus::NotVerified) => " \u{b7} not verified \u{2014} run `atem pair`",
+        Some(VerificationStatus::Revoked) => " \u{b7} revoked \u{2014} run `atem pair`",
+        None => "",
+    };
+    format!("\u{1f517} Paired (SSO: {login_id}){suffix}")
+}
+
 pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Build credential status line
     let store = crate::credentials::CredentialStore::load();
@@ -111,10 +127,14 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
         .find(|e| e.source == crate::credentials::CredentialSource::AstationPaired)
     {
         let id = p.login_id.as_deref().unwrap_or("-");
-        (
-            format!("\u{1f517} Paired (SSO: {})", id),
-            Style::default().fg(Color::Cyan),
-        )
+        // Read where the credential store is (each draw); a missing or
+        // unreadable trust file just leaves the suffix out.
+        let status = p.astation_id.as_deref().and_then(|astation_id| {
+            crate::memory::trust::TrustStore::load_from(&crate::memory::trust::trust_path())
+                .ok()
+                .map(|trust| trust.verification_status(astation_id))
+        });
+        (paired_status_line(id, status), Style::default().fg(Color::Cyan))
     } else {
         (
             "\u{26a0}\u{fe0f}  Not logged in — run `atem login` or `atem pair`".to_string(),
@@ -599,4 +619,27 @@ pub(crate) fn style_from_cell(cell: &VtCell) -> Style {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
     style
+}
+
+#[cfg(test)]
+mod paired_status_tests {
+    use super::paired_status_line;
+    use crate::memory::trust::VerificationStatus;
+
+    #[test]
+    fn the_paired_line_shows_the_verification() {
+        assert_eq!(
+            paired_status_line("me", Some(VerificationStatus::Verified)),
+            "\u{1f517} Paired (SSO: me) \u{b7} verified"
+        );
+        assert_eq!(
+            paired_status_line("me", Some(VerificationStatus::NotVerified)),
+            "\u{1f517} Paired (SSO: me) \u{b7} not verified \u{2014} run `atem pair`"
+        );
+        assert_eq!(
+            paired_status_line("me", Some(VerificationStatus::Revoked)),
+            "\u{1f517} Paired (SSO: me) \u{b7} revoked \u{2014} run `atem pair`"
+        );
+        assert_eq!(paired_status_line("me", None), "\u{1f517} Paired (SSO: me)");
+    }
 }

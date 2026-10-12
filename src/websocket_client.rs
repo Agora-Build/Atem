@@ -875,7 +875,9 @@ impl AstationClient {
         Ok(())
     }
 
-    async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+    /// Sends and waits (at most 5 s) until the writer has written the frame,
+    /// so a client dropped right after doesn't lose it.
+    pub(crate) async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
         let sender = self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?;
         let (delivered, receipt) = tokio::sync::oneshot::channel();
         sender.send(OutboundMessage { message, delivered: Some(delivered) })
