@@ -20,6 +20,7 @@ mod token;
 mod tui;
 mod vault_client;
 mod memory;
+mod pair_verify;
 mod websocket_client;
 // Agent hub — ACP/PTY protocol abstraction
 mod acp_client;

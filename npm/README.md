@@ -49,7 +49,10 @@ tasks and diagrams. `serv files`, `config`, and tokens from
 `atem pair` receives your Agora login from Astation, then verifies the device:
 atem and your Mac each show a 12-character safety code. If they match, type
 `y` here; on the Mac click **Codes Match**, then approve with Touch ID.
-Either side can finish first. A connected or SSO-paired session alone does not
+Either side can finish first. atem reads that `y` from the terminal itself,
+never from piped input or keys typed earlier, so run `atem pair` in an
+interactive terminal. If verification fails, the pairing stays saved, Astation
+is told, and `atem pair` exits nonzero; run it again to verify. A connected or SSO-paired session alone does not
 mean the device is verified; check `atem cred status`. With `--save`
 the credentials keep working when Astation disconnects; without it they stop
 5 minutes after the disconnect (atem asks when `--save` isn't given).

@@ -1400,35 +1400,6 @@ fn prompt_yes_no(question: &str) -> bool {
     }
 }
 
-/// Asks whether the safety codes match. Keys typed earlier (an extra Enter after
-/// a previous prompt) are discarded first, and an empty answer asks again, so
-/// only a deliberate "y" trusts the device. End of input counts as "no".
-fn prompt_codes_match() -> bool {
-    use std::io::{self, BufRead, Write};
-
-    #[cfg(unix)]
-    unsafe {
-        if libc::isatty(0) == 1 {
-            libc::tcflush(0, libc::TCIFLUSH);
-        }
-    }
-    let stdin = io::stdin();
-    loop {
-        print!("Does the code on your Mac match? Type y or n: ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => return false,
-            Ok(_) => {}
-        }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => return true,
-            "n" | "no" => return false,
-            _ => continue,
-        }
-    }
-}
-
 fn prompt_save_credentials() -> bool {
     prompt_yes_no("Save credentials so they keep working when Astation disconnects? [y/N]: ")
 }
@@ -1567,42 +1538,22 @@ async fn run_pair(save: bool) -> Result<()> {
             } else {
                 println!("Credentials are session-only (5 min grace period after disconnect).");
             }
-            if let Err(error) =
-                run_device_verification(&mut active_client, &verify_astation_id).await
-            {
-                eprintln!("⚠️  {error}");
-                eprintln!("Pairing is saved. Run 'atem pair' again to verify this device.");
-            }
+            // A failed verification is shown here, then makes the exit
+            // status nonzero; the pairing stays saved.
+            let verified = crate::pair_verify::verification_result(
+                run_device_verification(&mut active_client, &verify_astation_id).await,
+            );
             // Held until now so they are checked against the pins this run set.
             for status in active_client.apply_held_encryption().await {
                 println!("{}", crate::memory::unlock::shown(&status));
             }
-            Ok(())
+            verified
         }
         Ok(Err(e)) => Err(e),
         Err(_) => anyhow::bail!(
             "Pairing timed out waiting for credentials. \
              (Astation may not yet support SSO token sync — check Astation version.)"
         ),
-    }
-}
-
-/// Waits for the next device-verification message, skipping unrelated traffic.
-async fn next_verify_message(
-    client: &mut crate::websocket_client::AstationClient,
-) -> Result<crate::websocket_client::AstationMessage> {
-    use crate::websocket_client::AstationMessage;
-    loop {
-        match client.recv_message_async().await {
-            Some(
-                message @ (AstationMessage::VerifyKeys { .. }
-                | AstationMessage::DeviceVerified { .. }
-                | AstationMessage::VerifyAbort { .. }),
-            ) => return Ok(message),
-            // Applied after the verification, against the pins it sets.
-            Some(message) => client.hold_encryption(message),
-            None => anyhow::bail!("Astation connection closed during device verification"),
-        }
     }
 }
 
@@ -1622,7 +1573,11 @@ async fn run_device_verification(
     };
     use crate::websocket_client::AstationMessage;
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use tokio::time::{Duration, timeout};
+    use crate::pair_verify::{
+        FIRST_REPLY_TIMEOUT, TOUCH_ID_TIMEOUT, abandon_verification, await_device_verified,
+        code_failure, next_verify_message, prompt_codes_match, request_key_after_verification,
+    };
+    use tokio::time::timeout;
 
     let paths = KeyPaths::default_paths();
     // The device id is this atem's relay identity (`atem_id`): Astation checks it
@@ -1651,7 +1606,7 @@ async fn run_device_verification(
         })
         .await?;
 
-    let astation = match timeout(Duration::from_secs(15), next_verify_message(client)).await {
+    let astation = match timeout(FIRST_REPLY_TIMEOUT, next_verify_message(client)).await {
         Err(_) => {
             if TrustStore::load_from(&paths.trust)?.verified(astation_id).is_some() {
                 println!(
@@ -1695,110 +1650,89 @@ async fn run_device_verification(
         Ok(())
     })?;
 
-    let outcome: Result<()> = async {
-        println!();
-        println!("Safety code:  {code}");
-        println!("Your Mac shows a code too. They must match exactly.");
-        println!("Confirm on both, in either order: type y here, and approve on your Mac with Touch ID.");
-        if !prompt_codes_match() {
-            // Drop the pending pin first so it goes even if the send fails.
-            TrustStore::update(&paths.trust, |t| {
-                t.remove_pending(astation_id);
-                Ok(())
-            })?;
-            let _ = client
-                .send_message(AstationMessage::VerifyAbort {
-                    reason: "the codes didn't match on atem".into(),
-                })
-                .await;
-            anyhow::bail!(
-                "Device verification cancelled: the codes didn't match, so nothing was trusted."
+    // From here on every failure drops the pending pin and, unless Astation
+    // cancelled, tells Astation (`abandon_verification`).
+    println!();
+    println!("Safety code:  {code}");
+    println!("Your Mac shows a code too. They must match exactly.");
+    println!("Confirm on both, in either order: type y here, and approve on your Mac with Touch ID.");
+    // Read from the terminal (/dev/tty), never stdin. Blocking, like before.
+    if let Some(failure) = code_failure(prompt_codes_match()) {
+        return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+    }
+
+    println!("Waiting for your Mac (approve with Touch ID if you haven't yet)…");
+    let reply = match await_device_verified(client, TOUCH_ID_TIMEOUT).await {
+        Ok(reply) => reply,
+        Err(failure) => {
+            return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+        }
+    };
+    let applied = {
+        let (paths, agent) = (paths.clone(), agent.clone());
+        let astation_id = astation_id.to_string();
+        let keys = handshake.into_keys();
+        blocking(move || {
+            complete_verification(
+                &paths,
+                agent.as_ref(),
+                &astation_id,
+                keys,
+                &reply.device_verified,
+                &reply.account_state,
+                &reply.grants,
+            )
+        })
+        .await
+    };
+    let outcome = match applied {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let failure = crate::pair_verify::VerifyFailure::local(
+                format!("atem could not apply the verification: {error:#}"),
+                error,
             );
+            return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
         }
+    };
 
-        println!("Waiting for your Mac (approve with Touch ID if you haven't yet)…");
-        match timeout(Duration::from_secs(300), next_verify_message(client)).await {
-            Err(_) => anyhow::bail!("Timed out waiting for Astation to confirm this device."),
-            Ok(result) => match result? {
-                AstationMessage::DeviceVerified {
-                    device_verified,
-                    account_state,
-                    grants,
-                } => {
-                    let outcome = {
-                        let (paths, agent) = (paths.clone(), agent.clone());
-                        let astation_id = astation_id.to_string();
-                        let keys = handshake.into_keys();
-                        blocking(move || {
-                            complete_verification(
-                                &paths,
-                                agent.as_ref(),
-                                &astation_id,
-                                keys,
-                                &device_verified,
-                                &account_state,
-                                &grants,
-                            )
-                        })
-                        .await?
-                    };
-                    println!("✅ Device verified with Astation (safety code {code}).");
-                    // Every warning, whatever the escrow below does (e.g. K
-                    // couldn't be stored in the key agent).
-                    if let Some(warning) = &outcome.warning {
-                        eprintln!("⚠️  {warning}");
-                    }
-                    // The first escrow, in this run. Until Astation holds the
-                    // storage key the plain device_keys file stays on disk.
-                    let escrowed = crate::memory::unlock::pair_escrow(
-                        &mut *client,
-                        &agent,
-                        &paths,
-                        astation_id,
-                        outcome.escrow,
-                    )
-                    .await;
-                    match escrowed {
-                        Ok(PairEscrow::Escrowed(storage_kid)) => {
-                            println!("Astation holds this device's storage key ({storage_kid}).")
-                        }
-                        Ok(PairEscrow::HeldByHome(home)) => println!(
-                            "This device's storage key is held via your home Astation {home}; nothing to do."
-                        ),
-                        Ok(PairEscrow::Nothing) => {}
-                        Err(error) => eprintln!(
-                            "⚠️  {}",
-                            crate::memory::unlock::escrow_failure_message(&error)
-                        ),
-                    }
-                    if outcome.key_needed {
-                        client
-                            .send_message(AstationMessage::KeyRequest {
-                                public_key: STANDARD.encode(reveal.device_pub),
-                            })
-                            .await?;
-                        println!("Encryption key requested from Astation");
-                    }
-                    Ok(())
-                }
-                AstationMessage::VerifyAbort { reason } => {
-                    anyhow::bail!("Astation declined device verification: {reason}")
-                }
-                _ => anyhow::bail!("unexpected message during device verification"),
-            },
-        }
+    // Verified: nothing below fails the verification.
+    println!("✅ Device verified with Astation (safety code {code}).");
+    // Every warning, whatever the escrow below does (e.g. K couldn't be
+    // stored in the key agent).
+    if let Some(warning) = &outcome.warning {
+        eprintln!("⚠️  {warning}");
     }
+    // The first escrow, in this run. Until Astation holds the storage key
+    // the plain device_keys file stays on disk.
+    let escrowed = crate::memory::unlock::pair_escrow(
+        &mut *client,
+        &agent,
+        &paths,
+        astation_id,
+        outcome.escrow,
+    )
     .await;
-
-    if outcome.is_err() {
-        // Every failure after set_pending drops the pending pin (a no-op if
-        // it is already gone or was confirmed).
-        let _ = TrustStore::update(&paths.trust, |t| {
-            t.remove_pending(astation_id);
-            Ok(())
-        });
+    match escrowed {
+        Ok(PairEscrow::Escrowed(storage_kid)) => {
+            println!("Astation holds this device's storage key ({storage_kid}).")
+        }
+        Ok(PairEscrow::HeldByHome(home)) => println!(
+            "This device's storage key is held via your home Astation {home}; nothing to do."
+        ),
+        Ok(PairEscrow::Nothing) => {}
+        Err(error) => eprintln!(
+            "⚠️  {}",
+            crate::memory::unlock::escrow_failure_message(&error)
+        ),
     }
-    outcome
+    if outcome.key_needed {
+        match request_key_after_verification(client, STANDARD.encode(reveal.device_pub)).await {
+            None => println!("Encryption key requested from Astation"),
+            Some(warning) => eprintln!("⚠️  {warning}"),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
