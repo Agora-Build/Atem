@@ -47,7 +47,11 @@ pub enum Commands {
         save: bool,
     },
     /// Unpair from Astation
-    Unpair,
+    Unpair {
+        /// Don't ask for confirmation (needed when input isn't a terminal)
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Manage and communicate with AI agents (Claude Code, Codex, etc.)
     Agent {
         #[command(subcommand)]
@@ -579,6 +583,9 @@ pub enum MemoryCommands {
     /// Remove a memory that contained a credential, everywhere, and stop re-harvesting it
     Purge {
         id: String,
+        /// Don't ask for confirmation (needed when input isn't a terminal)
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Rewrite the managed memory blocks and skills from the local store
     Apply {
@@ -632,6 +639,9 @@ pub enum SkillCommands {
         version: Option<i64>,
         #[arg(long)]
         all_versions: bool,
+        /// Don't ask for confirmation (needed when input isn't a terminal)
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -925,7 +935,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Pair { save } => run_pair(save).await,
-        Commands::Unpair => {
+        Commands::Unpair { yes } => {
             let mut store = crate::credentials::CredentialStore::load();
             let count = store
                 .entries
@@ -936,11 +946,20 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 println!("No paired sessions to remove.");
                 return Ok(());
             }
+            let plural = if count == 1 { "" } else { "s" };
+            if !confirm_destructive(
+                &format!(
+                    "Remove {count} Astation pairing{plural}? This machine loses vault, memory sync and `atem cred` until you run `atem pair` again."
+                ),
+                yes,
+            )? {
+                println!("Cancelled; nothing was removed.");
+                return Ok(());
+            }
             store
                 .entries
                 .retain(|e| e.source != crate::credentials::CredentialSource::AstationPaired);
             store.save()?;
-            let plural = if count == 1 { "" } else { "s" };
             println!("Unpaired ({count} session{plural} removed).");
             Ok(())
         }
@@ -1374,6 +1393,26 @@ async fn handle_vault_command(command: VaultCommands) -> Result<()> {
 }
 
 /// Prompt a yes/no question on stdin. Defaults to false on empty / non-tty.
+/// Confirms an irreversible command. `--yes` skips the question; without a
+/// terminal and without `--yes` it refuses rather than guess, so scripts must
+/// say `--yes`. A typo asks again; Enter means no.
+pub(crate) fn confirm_destructive(question: &str, yes: bool) -> Result<bool> {
+    use std::io::IsTerminal;
+    destructive_decision(yes, std::io::stdin().is_terminal(), || {
+        prompt_yes_no(&format!("{question} [y/N]: "))
+    })
+}
+
+fn destructive_decision(yes: bool, is_terminal: bool, ask: impl FnOnce() -> bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !is_terminal {
+        anyhow::bail!("This can't be undone, and input isn't a terminal to confirm it: pass --yes to go ahead.");
+    }
+    Ok(ask())
+}
+
 fn prompt_yes_no(question: &str) -> bool {
     use std::io::{self, BufRead, Write};
 
@@ -1739,6 +1778,40 @@ async fn run_device_verification(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn destructive_commands_confirm_or_need_yes() {
+        // --yes goes ahead without asking, terminal or not.
+        assert!(destructive_decision(true, false, || panic!("asked")).unwrap());
+        assert!(destructive_decision(true, true, || panic!("asked")).unwrap());
+        // No terminal and no --yes: refuse, never guess.
+        let error = destructive_decision(false, false, || panic!("asked")).unwrap_err();
+        assert!(error.to_string().contains("--yes"), "{error}");
+        // A terminal: the answer decides.
+        assert!(destructive_decision(false, true, || true).unwrap());
+        assert!(!destructive_decision(false, true, || false).unwrap());
+    }
+
+    #[test]
+    fn purge_and_unpair_accept_yes() {
+        let cli = Cli::try_parse_from(["atem", "unpair", "--yes"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Unpair { yes: true })));
+        let cli = Cli::try_parse_from(["atem", "memory", "purge", "mem_1a2b", "-y"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Memory { command: MemoryCommands::Purge { yes: true, .. } })
+        ));
+        let cli = Cli::try_parse_from(["atem", "skill", "purge", "demo", "--all-versions", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill { command: SkillCommands::Purge { yes: true, all_versions: true, .. } })
+        ));
+        let cli = Cli::try_parse_from(["atem", "memory", "purge", "mem_1a2b"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Memory { command: MemoryCommands::Purge { yes: false, .. } })
+        ));
+    }
 
     #[test]
     fn cli_no_args_returns_none_command() {
@@ -2514,7 +2587,7 @@ mod tests {
     #[test]
     fn cli_unpair() {
         let cli = Cli::try_parse_from(["atem", "unpair"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Unpair)));
+        assert!(matches!(cli.command, Some(Commands::Unpair { yes: false })));
     }
 
     #[test]

@@ -36,7 +36,7 @@ atem login                              # Log in with Agora Console (opens brows
 atem logout                             # Log out from SSO
 atem pair                               # Pair with Astation, then verify this device
 atem pair --save                        # Same, and keep credentials for offline use
-atem unpair                             # Remove all Astation pairings
+atem unpair [--yes]                     # Remove all Astation pairings (asks first)
 ```
 
 `atem login` unlocks a limited set: project list, tokens for the active
@@ -160,7 +160,7 @@ atem memory search "valkey"                      # Local full-text search (offli
 atem memory replace <id> "the fact as it is now" # New fact replaces the old one (history kept)
 atem memory invalidate <id>                      # Mark outdated without a replacement
 atem memory rm <id>                              # Remove everywhere
-atem memory purge <id>                           # Remove a fact that contained a credential, stop re-harvesting it
+atem memory purge <id> [--yes]                   # Remove a fact that contained a credential, stop re-harvesting it (asks first)
 atem memory apply                                # Rewrite the managed blocks and skills from the local store
 atem memory status                               # Account, machine, project, pending changes
 
@@ -169,7 +169,7 @@ atem skill list
 atem skill rm <name>                             # Remove everywhere
 atem skill history <name>                        # Every version, newest first
 atem skill restore <name> --version 3            # Re-push an old version as a new one
-atem skill purge <name> --version 3              # Erase versions that contained a credential (or --all-versions)
+atem skill purge <name> --version 3 [--yes]      # Erase versions that contained a credential (or --all-versions; asks first)
 ```
 
 Listings show short ids like `8245ecf6…e6fe` (first 8 + last 4 characters).
