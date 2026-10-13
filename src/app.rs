@@ -1,3 +1,5 @@
+mod terminal;
+
 use anyhow::Result;
 use crossterm::{
     execute,
@@ -15,10 +17,7 @@ use std::{
     process::Command,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError},
-    time::Duration,
-};
+use tokio::time::Duration;
 use vt100::Parser as VtParser;
 
 use crate::agora_api::{BffProject, format_projects};
@@ -64,6 +63,8 @@ pub enum ActiveCli {
 }
 
 pub struct App {
+    pub last_session_refresh: Option<Instant>,
+    pub terminal_outbox: VecDeque<crate::terminal_share::Message>,
     pub mode: AppMode,
     pub selected_index: usize,
     pub main_menu_items: Vec<String>,
@@ -80,12 +81,14 @@ pub struct App {
     pub codex_client: CodexClient,
     pub codex_output_log: String,
     pub codex_raw_log: String,
+    pub codex_raw_log_start: usize,
     pub codex_user_actions: Vec<String>,
     pub codex_log_file: Option<PathBuf>,
     pub codex_summary_file: Option<PathBuf>,
     pub codex_terminal: VtParser,
-    pub codex_sender: Option<UnboundedSender<String>>,
-    pub codex_receiver: Option<UnboundedReceiver<String>>,
+    pub codex_sender: Option<crate::pty_session::PtyInput>,
+    pub codex_receiver: Option<tokio::sync::mpsc::Receiver<crate::pty_session::PtyEvent>>,
+    pub codex_share: Option<crate::terminal_share::SharedTerminal>,
     pub codex_waiting_exit: bool,
     pub codex_resize_handle: Option<CodexResizeHandle>,
     pub codex_view_rows: u16,
@@ -93,17 +96,20 @@ pub struct App {
     pub claude_client: ClaudeClient,
     pub claude_output_log: String,
     pub claude_raw_log: String,
+    pub claude_raw_log_start: usize,
     pub claude_user_actions: Vec<String>,
     pub claude_log_file: Option<PathBuf>,
     pub claude_summary_file: Option<PathBuf>,
     pub claude_terminal: VtParser,
-    pub claude_sender: Option<UnboundedSender<String>>,
-    pub claude_receiver: Option<UnboundedReceiver<String>>,
+    pub claude_sender: Option<crate::pty_session::PtyInput>,
+    pub claude_receiver: Option<tokio::sync::mpsc::Receiver<crate::pty_session::PtyEvent>>,
+    pub claude_share: Option<crate::terminal_share::SharedTerminal>,
     pub claude_waiting_exit: bool,
     pub claude_resize_handle: Option<ClaudeResizeHandle>,
     pub claude_view_rows: u16,
     pub claude_view_cols: u16,
     pub force_terminal_redraw: bool,
+    pub terminal_ui: crate::tui::terminal_view::State,
     pub rtm_client: Option<RtmClient>,
     pub rtm_client_id: String,
     pub last_activity_ping: Option<Instant>,
@@ -200,6 +206,8 @@ impl App {
         let config = crate::config::AtemConfig::load().unwrap_or_default();
         let rtm_client_id = config.rtm_account().to_string();
         let mut app = Self {
+            last_session_refresh: None,
+            terminal_outbox: VecDeque::new(),
             mode: AppMode::MainMenu,
             selected_index: 0,
             main_menu_items: Vec::new(),
@@ -215,12 +223,14 @@ impl App {
             codex_client: CodexClient::new(),
             codex_output_log: String::new(),
             codex_raw_log: String::new(),
+            codex_raw_log_start: 0,
             codex_user_actions: Vec::new(),
             codex_log_file: None,
             codex_summary_file: None,
-            codex_terminal: VtParser::new(200, 80, 0),
+            codex_terminal: VtParser::new(crate::pty_session::DEFAULT_ROWS, crate::pty_session::DEFAULT_COLS, crate::pty_session::SCROLLBACK_ROWS),
             codex_sender: None,
             codex_receiver: None,
+            codex_share: None,
             codex_waiting_exit: false,
             codex_resize_handle: None,
             codex_view_rows: 0,
@@ -228,17 +238,20 @@ impl App {
             claude_client: ClaudeClient::new(),
             claude_output_log: String::new(),
             claude_raw_log: String::new(),
+            claude_raw_log_start: 0,
             claude_user_actions: Vec::new(),
             claude_log_file: None,
             claude_summary_file: None,
-            claude_terminal: VtParser::new(200, 80, 0),
+            claude_terminal: VtParser::new(crate::pty_session::DEFAULT_ROWS, crate::pty_session::DEFAULT_COLS, crate::pty_session::SCROLLBACK_ROWS),
             claude_sender: None,
             claude_receiver: None,
+            claude_share: None,
             claude_waiting_exit: false,
             claude_resize_handle: None,
             claude_view_rows: 0,
             claude_view_cols: 0,
             force_terminal_redraw: false,
+            terminal_ui: crate::tui::terminal_view::State::new(),
             rtm_client: None,
             rtm_client_id,
             last_activity_ping: None,
@@ -297,9 +310,7 @@ impl App {
         }
     }
 
-    /// Rebuild the main menu items based on Astation connection state.
-    /// When not connected, agent-dependent items (Claude, Codex, Agent Panel)
-    /// are hidden to guide the user toward pairing first.
+    /// Local terminals remain available while Astation is disconnected.
     pub fn rebuild_menu(&mut self) {
         self.menu_actions.clear();
         self.main_menu_items.clear();
@@ -308,13 +319,18 @@ impl App {
         self.menu_actions.push(MenuAction::ListProjects);
         self.main_menu_items.push("\u{1f4cb} List Agora Projects".to_string());
 
-        if self.astation_connected {
-            self.menu_actions.push(MenuAction::LaunchClaude);
-            self.main_menu_items.push("\u{1f916} Launch Claude Code".to_string());
-
-            self.menu_actions.push(MenuAction::LaunchCodex);
-            self.main_menu_items.push("\u{1f9e0} Launch Codex".to_string());
-        }
+        self.menu_actions.push(MenuAction::LaunchClaude);
+        self.main_menu_items.push(if self.claude_receiver.is_some() {
+            "Resume Claude Code".into()
+        } else {
+            "Launch Claude Code".into()
+        });
+        self.menu_actions.push(MenuAction::LaunchCodex);
+        self.main_menu_items.push(if self.codex_receiver.is_some() {
+            "Resume Codex".into()
+        } else {
+            "Launch Codex".into()
+        });
 
         self.menu_actions.push(MenuAction::ExecuteShell);
         self.main_menu_items.push("\u{1f4bb} Execute Shell Command".to_string());
@@ -380,22 +396,8 @@ impl App {
                 self.active_cli = ActiveCli::Claude;
                 self.input_text.clear();
                 self.claude_waiting_exit = false;
-                if self.claude_output_log.is_empty() {
-                    self.claude_output_log = "\u{1f916} Claude Code CLI Session\n\n\
-                        Atem routes your input to the Claude Code CLI and streams its replies back here.\n\
-                        Type commands in the input box and press Enter to send them to Claude.\n\
-                        Press Ctrl+C to end the Claude session and return to the main menu.\n\
-                        After a session, press 'u' to save a summary report.\n"
-                        .to_string();
-                }
-
                 match self.ensure_claude_session().await {
-                    Ok(new_session_started) => {
-                        if new_session_started {
-                            self.record_claude_output("\u{1f50c} Claude Code CLI session started.\n");
-                        }
-                        self.refresh_claude_view();
-                    }
+                    Ok(_) => self.refresh_claude_view(),
                     Err(err) => {
                         self.record_claude_output(format!(
                             "\u{274c} Unable to start Claude Code CLI: {}\n",
@@ -411,22 +413,8 @@ impl App {
                 self.active_cli = ActiveCli::Codex;
                 self.input_text.clear();
                 self.codex_waiting_exit = false;
-                if self.codex_output_log.is_empty() {
-                    self.codex_output_log = "\u{1f9e0} Codex CLI Session\n\n\
-                        Atem routes your input to the Codex CLI and streams its replies back here.\n\
-                        Type commands in the input box and press Enter to send them to Codex.\n\
-                        Press Ctrl+C to end the Codex session and return to the main menu.\n\
-                        After a session, press 'u' to save a summary report.\n"
-                        .to_string();
-                }
-
                 match self.ensure_codex_session().await {
-                    Ok(new_session_started) => {
-                        if new_session_started {
-                            self.record_codex_output("\u{1f50c} Codex CLI session started.\n");
-                        }
-                        self.refresh_codex_view();
-                    }
+                    Ok(_) => self.refresh_codex_view(),
                     Err(err) => {
                         self.record_codex_output(&format!(
                             "\u{274c} Unable to start Codex CLI: {}\n",
@@ -525,6 +513,7 @@ impl App {
             // Restore TUI state
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen)?;
+            self.force_terminal_redraw = true;
 
             self.output_text.push_str(&result);
         } else {
@@ -570,61 +559,15 @@ impl App {
 
     pub async fn send_codex_prompt(&mut self, prompt: &str) -> Result<()> {
         let trimmed = prompt.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-        if self.codex_waiting_exit {
-            self.status_message =
-                Some("Codex is shutting down. Please wait for the session to exit.".to_string());
-            return Ok(());
-        }
-
-        let is_quit_cmd =
-            trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit");
-
-        match self.ensure_codex_session().await {
-            Ok(new_session_started) => {
-                if new_session_started {
-                    self.record_codex_output("\u{1f50c} Codex CLI session started.\n");
-                }
-            }
-            Err(err) => {
-                self.record_codex_output(&format!("\u{274c} Unable to start Codex CLI: {}\n", err));
-                self.refresh_codex_view();
-                return Ok(());
-            }
-        }
-
-        self.record_codex_output(&format!("> {}\n", trimmed));
+        if trimmed.is_empty() { return Ok(()); }
+        if self.codex_waiting_exit { anyhow::bail!("Codex is shutting down"); }
+        self.ensure_codex_session().await?;
+        let sender = self.codex_sender.as_ref().ok_or_else(|| anyhow::anyhow!("Codex terminal unavailable"))?;
+        sender.send(format!("{trimmed}\n\r"))?;
         self.codex_user_actions.push(trimmed.to_string());
-
-        if self.codex_sender.is_some() {
-            self.send_codex_data(trimmed);
-
-            // Split into a raw newline and a CR so Codex sees both.
-            if self.codex_sender.is_some() {
-                self.send_codex_data("\n");
-            }
-            if self.codex_sender.is_some() {
-                self.send_codex_data("\r");
-            }
-
-            if self.codex_sender.is_none() {
-                self.record_codex_output("\u{26a0}\u{fe0f} Codex CLI session is unavailable (send failed).\n");
-                self.codex_receiver = None;
-                self.codex_resize_handle = None;
-                self.codex_waiting_exit = false;
-            } else if is_quit_cmd {
-                self.codex_waiting_exit = true;
-                self.status_message = Some(
-                    "Codex exit requested. Waiting for the session to shut down...".to_string(),
-                );
-            }
-        } else {
-            self.record_codex_output("\u{26a0}\u{fe0f} Codex CLI session is unavailable.\n");
+        if trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit") {
+            self.codex_waiting_exit = true;
         }
-
-        self.refresh_codex_view();
         Ok(())
     }
 
@@ -634,41 +577,36 @@ impl App {
             return Ok(false);
         }
 
-        let session = self.codex_client.start_session().await?;
+        let rows = if self.codex_view_rows == 0 { crate::pty_session::DEFAULT_ROWS } else { self.codex_view_rows };
+        let cols = if self.codex_view_cols == 0 { crate::pty_session::DEFAULT_COLS } else { self.codex_view_cols };
+        let session = self.codex_client.start_session_sized(rows, cols).await?;
+        self.replace_terminal("codex");
         self.codex_sender = Some(session.sender);
         self.codex_receiver = Some(session.receiver);
         self.codex_resize_handle = Some(session.resize_handle);
         self.codex_raw_log.clear();
+        self.codex_raw_log_start = 0;
         self.codex_output_log.clear();
         self.codex_user_actions.clear();
         self.codex_log_file = None;
         self.codex_summary_file = None;
-        let rows = if self.codex_view_rows == 0 {
-            200
-        } else {
-            self.codex_view_rows
-        };
-        let cols = if self.codex_view_cols == 0 {
-            80
-        } else {
-            self.codex_view_cols
-        };
-        self.codex_terminal = VtParser::new(rows, cols, 0);
-        if let Some(handle) = &self.codex_resize_handle {
-            if let Err(err) = handle.resize(rows, cols) {
-                self.status_message = Some(format!("Failed to sync Codex terminal size: {}", err));
-            }
-        }
+        self.codex_view_rows = rows;
+        self.codex_view_cols = cols;
+        self.codex_terminal = VtParser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS);
         self.codex_waiting_exit = false;
         Ok(true)
     }
 
     pub fn record_codex_output(&mut self, data: impl AsRef<str>) {
         let text = data.as_ref();
-        self.codex_raw_log.push_str(text);
+        crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, text);
 
-        self.codex_terminal.process(text.as_bytes());
-        self.update_codex_output_from_terminal();
+        if self.codex_receiver.is_some() {
+            self.status_message = Some(text.trim().to_string());
+        } else {
+            self.codex_terminal.process(text.as_bytes());
+            self.update_codex_output_from_terminal();
+        }
     }
 
     pub fn update_codex_output_from_terminal(&mut self) {
@@ -691,36 +629,10 @@ impl App {
     }
 
     pub fn send_codex_data(&mut self, data: &str) {
-        let Some(sender) = self.codex_sender.clone() else {
-            return;
-        };
-        if sender.send(data.to_string()).is_err() {
-            self.codex_sender = None;
-            self.codex_receiver = None;
-            self.codex_resize_handle = None;
-            self.codex_waiting_exit = false;
-        }
-    }
-
-    pub fn respond_codex_cursor_position(&mut self) {
-        let (row, col) = self.codex_terminal.screen().cursor_position();
-        let response = format!("\u{1b}[{};{}R", row + 1, col + 1);
-        self.send_codex_data(&response);
-    }
-
-    pub fn handle_codex_control_sequences(&mut self, chunk: &str) {
-        if chunk.contains("\u{1b}[6n") {
-            // Device Status Report - cursor position
-            let occurrences = chunk.matches("\u{1b}[6n").count();
-            for _ in 0..occurrences {
-                self.respond_codex_cursor_position();
-            }
-        }
-        if chunk.contains("\u{1b}[5n") {
-            // Status report request - respond OK
-            let occurrences = chunk.matches("\u{1b}[5n").count();
-            for _ in 0..occurrences {
-                self.send_codex_data("\u{1b}[0n");
+        if self.codex_share.as_ref().is_some_and(|s| s.exit_status.is_some()) { return; }
+        if let Some(sender) = &self.codex_sender {
+            if let Err(error) = sender.send(data.to_string()) {
+                self.status_message = Some(error.to_string());
             }
         }
     }
@@ -732,29 +644,21 @@ impl App {
     }
 
     pub fn rebuild_codex_terminal(&mut self) {
-        let rows = if self.codex_view_rows > 0 {
-            self.codex_view_rows
-        } else {
-            200
-        };
-        let cols = if self.codex_view_cols > 0 {
-            self.codex_view_cols
-        } else {
-            80
-        };
-
-        self.codex_terminal = VtParser::new(rows, cols, 0);
-        if !self.codex_raw_log.is_empty() {
-            self.codex_terminal.process(self.codex_raw_log.as_bytes());
-        }
+        self.codex_terminal.set_size(self.codex_view_rows.max(2), self.codex_view_cols.max(2));
         self.update_codex_output_from_terminal();
     }
 
     pub fn adjust_codex_terminal_size(&mut self, rows: u16, cols: u16) {
-        if rows == 0 || cols == 0 {
+        if self.codex_sender.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
+        let rows = rows.min(200);
+        let cols = cols.min(400);
+        if rows < 2 || cols < 2 {
             return;
         }
-        if self.codex_view_rows == rows && self.codex_view_cols == cols {
+        if self.codex_view_rows == rows
+            && self.codex_view_cols == cols
+            && self.codex_terminal.screen().size() == (rows, cols)
+        {
             return;
         }
 
@@ -770,44 +674,7 @@ impl App {
     }
 
     pub fn process_codex_output(&mut self) {
-        let mut new_chunks: Vec<String> = Vec::new();
-        let mut disconnected = false;
-
-        if let Some(receiver) = &mut self.codex_receiver {
-            loop {
-                match receiver.try_recv() {
-                    Ok(line) => new_chunks.push(line),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if disconnected {
-            new_chunks.push("\u{26a0}\u{fe0f} Codex CLI session disconnected.\n".to_string());
-        }
-
-        let exit_detected = new_chunks.iter().any(|chunk| {
-            chunk.contains("Codex CLI exited with status") || chunk.contains("Codex CLI wait error")
-        });
-
-        if !new_chunks.is_empty() {
-            for chunk in &new_chunks {
-                self.record_codex_output(chunk);
-                self.handle_codex_control_sequences(chunk);
-            }
-
-            if !(disconnected || exit_detected) {
-                self.refresh_codex_view();
-            }
-        }
-
-        if disconnected || exit_detected {
-            self.finalize_codex_session();
-        }
+        self.process_terminal_output("codex");
     }
 
     pub async fn ensure_rtm_client(&mut self) -> Result<()> {
@@ -934,13 +801,11 @@ impl App {
     }
 
     pub fn finalize_codex_session(&mut self) {
-        if !matches!(self.mode, AppMode::CodexChat) {
-            return;
-        }
+        let was_focused = matches!(self.mode, AppMode::CodexChat);
 
         let had_activity_before_finalize = !self.codex_raw_log.trim().is_empty();
 
-        self.record_codex_output("\u{2699}\u{fe0f} Codex CLI session ended.\n");
+        crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, "\u{2699}\u{fe0f} Codex CLI session ended.\n");
 
         let mut status_parts: Vec<String> = Vec::new();
 
@@ -948,7 +813,7 @@ impl App {
             match self.persist_codex_log() {
                 Ok(Some(path)) => {
                     let msg = format!("\u{1f4dd} Codex log saved to {}", path.display());
-                    self.record_codex_output(&format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
                 Ok(None) => {
@@ -956,7 +821,7 @@ impl App {
                 }
                 Err(err) => {
                     let msg = format!("\u{26a0}\u{fe0f} Failed to save Codex log: {}", err);
-                    self.record_codex_output(&format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
             }
@@ -965,12 +830,12 @@ impl App {
             match self.write_codex_summary_file(&summary) {
                 Ok(path) => {
                     let msg = format!("\u{1f4c4} Summary saved to {}", path.display());
-                    self.record_codex_output(&format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
                 Err(err) => {
                     let msg = format!("\u{26a0}\u{fe0f} Failed to save Codex summary: {}", err);
-                    self.record_codex_output(&format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
             }
@@ -978,15 +843,16 @@ impl App {
             status_parts.push("Codex session ended (no output captured).".to_string());
         }
 
-        self.codex_sender = None;
         self.codex_receiver = None;
-        self.codex_resize_handle = None;
+        self.rebuild_menu();
 
-        self.mode = AppMode::MainMenu;
-        self.show_popup = false;
-        self.popup_message.clear();
-        self.output_text.clear();
-        self.input_text.clear();
+        if was_focused {
+            self.mode = AppMode::MainMenu;
+            self.show_popup = false;
+            self.popup_message.clear();
+            self.output_text.clear();
+            self.input_text.clear();
+        }
         self.status_message = if status_parts.is_empty() {
             Some("Codex session ended.".to_string())
         } else {
@@ -1056,65 +922,15 @@ impl App {
 
     pub async fn send_claude_prompt(&mut self, prompt: &str) -> Result<()> {
         let trimmed = prompt.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-        if self.claude_waiting_exit {
-            self.status_message =
-                Some("Claude is shutting down. Please wait for the session to exit.".to_string());
-            return Ok(());
-        }
-
-        let is_quit_cmd =
-            trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit");
-
-        match self.ensure_claude_session().await {
-            Ok(new_session_started) => {
-                if new_session_started {
-                    self.record_claude_output("\u{1f50c} Claude Code CLI session started.\n");
-                }
-            }
-            Err(err) => {
-                self.record_claude_output(format!(
-                    "\u{274c} Unable to start Claude Code CLI: {}\n",
-                    err
-                ));
-                self.refresh_claude_view();
-                return Ok(());
-            }
-        }
-
-        self.record_claude_output(format!("> {}\n", trimmed));
+        if trimmed.is_empty() { return Ok(()); }
+        if self.claude_waiting_exit { anyhow::bail!("Claude is shutting down"); }
+        self.ensure_claude_session().await?;
+        let sender = self.claude_sender.as_ref().ok_or_else(|| anyhow::anyhow!("Claude terminal unavailable"))?;
+        sender.send(format!("{trimmed}\n\r"))?;
         self.claude_user_actions.push(trimmed.to_string());
-
-        if self.claude_sender.is_some() {
-            self.send_claude_data(trimmed);
-
-            if self.claude_sender.is_some() {
-                self.send_claude_data("\n");
-            }
-            if self.claude_sender.is_some() {
-                self.send_claude_data("\r");
-            }
-
-            if self.claude_sender.is_none() {
-                self.record_claude_output(
-                    "\u{26a0}\u{fe0f} Claude Code CLI session is unavailable (send failed).\n",
-                );
-                self.claude_receiver = None;
-                self.claude_resize_handle = None;
-                self.claude_waiting_exit = false;
-            } else if is_quit_cmd {
-                self.claude_waiting_exit = true;
-                self.status_message = Some(
-                    "Claude exit requested. Waiting for the session to shut down...".to_string(),
-                );
-            }
-        } else {
-            self.record_claude_output("\u{26a0}\u{fe0f} Claude Code CLI session is unavailable.\n");
+        if trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit") {
+            self.claude_waiting_exit = true;
         }
-
-        self.refresh_claude_view();
         Ok(())
     }
 
@@ -1124,32 +940,22 @@ impl App {
             return Ok(false);
         }
 
-        let session = self.claude_client.start_session().await?;
+        let rows = if self.claude_view_rows == 0 { crate::pty_session::DEFAULT_ROWS } else { self.claude_view_rows };
+        let cols = if self.claude_view_cols == 0 { crate::pty_session::DEFAULT_COLS } else { self.claude_view_cols };
+        let session = self.claude_client.start_session_sized(rows, cols).await?;
+        self.replace_terminal("claude");
         self.claude_sender = Some(session.sender);
         self.claude_receiver = Some(session.receiver);
         self.claude_resize_handle = Some(session.resize_handle);
         self.claude_raw_log.clear();
+        self.claude_raw_log_start = 0;
         self.claude_output_log.clear();
         self.claude_user_actions.clear();
         self.claude_log_file = None;
         self.claude_summary_file = None;
-        let rows = if self.claude_view_rows == 0 {
-            200
-        } else {
-            self.claude_view_rows
-        };
-        let cols = if self.claude_view_cols == 0 {
-            80
-        } else {
-            self.claude_view_cols
-        };
-        self.claude_terminal = VtParser::new(rows, cols, 0);
-        if let Some(handle) = &self.claude_resize_handle
-            && let Err(err) = handle.resize(rows, cols)
-        {
-            self.status_message =
-                Some(format!("Failed to sync Claude terminal size: {}", err));
-        }
+        self.claude_view_rows = rows;
+        self.claude_view_cols = cols;
+        self.claude_terminal = VtParser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS);
         self.claude_waiting_exit = false;
 
         // Register (or re-register) the Claude PTY session in the agent registry.
@@ -1306,9 +1112,13 @@ impl App {
 
     pub fn record_claude_output(&mut self, data: impl AsRef<str>) {
         let text = data.as_ref();
-        self.claude_raw_log.push_str(text);
-        self.claude_terminal.process(text.as_bytes());
-        self.update_claude_output_from_terminal();
+        crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, text);
+        if self.claude_receiver.is_some() {
+            self.status_message = Some(text.trim().to_string());
+        } else {
+            self.claude_terminal.process(text.as_bytes());
+            self.update_claude_output_from_terminal();
+        }
     }
 
     pub fn update_claude_output_from_terminal(&mut self) {
@@ -1331,42 +1141,10 @@ impl App {
     }
 
     pub fn send_claude_data(&mut self, data: &str) {
-        let Some(sender) = self.claude_sender.clone() else {
-            return;
-        };
-        if sender.send(data.to_string()).is_err() {
-            self.claude_sender = None;
-            self.claude_receiver = None;
-            self.claude_resize_handle = None;
-            self.claude_waiting_exit = false;
-        }
-    }
-
-    pub fn respond_claude_cursor_position(&mut self) {
-        let (row, col) = self.claude_terminal.screen().cursor_position();
-        let response = format!("\u{1b}[{};{}R", row + 1, col + 1);
-        self.send_claude_data(&response);
-    }
-
-    pub fn handle_claude_control_sequences(&mut self, chunk: &str) {
-        if chunk.contains("\u{1b}[6n") {
-            let occurrences = chunk.matches("\u{1b}[6n").count();
-            for _ in 0..occurrences {
-                self.respond_claude_cursor_position();
-            }
-        }
-        if chunk.contains("\u{1b}[5n") {
-            let occurrences = chunk.matches("\u{1b}[5n").count();
-            for _ in 0..occurrences {
-                self.send_claude_data("\u{1b}[0n");
-            }
-        }
-        // Device Attributes query - Claude CLI may send this
-        if chunk.contains("\u{1b}[c") {
-            let occurrences = chunk.matches("\u{1b}[c").count();
-            for _ in 0..occurrences {
-                // Respond as VT100
-                self.send_claude_data("\u{1b}[?1;0c");
+        if self.claude_share.as_ref().is_some_and(|s| s.exit_status.is_some()) { return; }
+        if let Some(sender) = &self.claude_sender {
+            if let Err(error) = sender.send(data.to_string()) {
+                self.status_message = Some(error.to_string());
             }
         }
     }
@@ -1378,29 +1156,21 @@ impl App {
     }
 
     pub fn rebuild_claude_terminal(&mut self) {
-        let rows = if self.claude_view_rows > 0 {
-            self.claude_view_rows
-        } else {
-            200
-        };
-        let cols = if self.claude_view_cols > 0 {
-            self.claude_view_cols
-        } else {
-            80
-        };
-
-        self.claude_terminal = VtParser::new(rows, cols, 0);
-        if !self.claude_raw_log.is_empty() {
-            self.claude_terminal.process(self.claude_raw_log.as_bytes());
-        }
+        self.claude_terminal.set_size(self.claude_view_rows.max(2), self.claude_view_cols.max(2));
         self.update_claude_output_from_terminal();
     }
 
     pub fn adjust_claude_terminal_size(&mut self, rows: u16, cols: u16) {
-        if rows == 0 || cols == 0 {
+        if self.claude_sender.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
+        let rows = rows.min(200);
+        let cols = cols.min(400);
+        if rows < 2 || cols < 2 {
             return;
         }
-        if self.claude_view_rows == rows && self.claude_view_cols == cols {
+        if self.claude_view_rows == rows
+            && self.claude_view_cols == cols
+            && self.claude_terminal.screen().size() == (rows, cols)
+        {
             return;
         }
 
@@ -1417,58 +1187,18 @@ impl App {
     }
 
     pub fn process_claude_output(&mut self) {
-        let mut new_chunks: Vec<String> = Vec::new();
-        let mut disconnected = false;
-
-        if let Some(receiver) = &mut self.claude_receiver {
-            loop {
-                match receiver.try_recv() {
-                    Ok(line) => new_chunks.push(line),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if disconnected {
-            new_chunks.push("\u{26a0}\u{fe0f} Claude Code CLI session disconnected.\n".to_string());
-        }
-
-        let exit_detected = new_chunks.iter().any(|chunk| {
-            chunk.contains("Claude CLI exited with status")
-                || chunk.contains("Claude CLI wait error")
-        });
-
-        if !new_chunks.is_empty() {
-            for chunk in &new_chunks {
-                self.record_claude_output(chunk);
-                self.handle_claude_control_sequences(chunk);
-            }
-
-            if !(disconnected || exit_detected) {
-                self.refresh_claude_view();
-            }
-        }
-
-        if disconnected || exit_detected {
-            self.finalize_claude_session();
-        }
+        self.process_terminal_output("claude");
     }
 
     pub fn finalize_claude_session(&mut self) {
-        if !matches!(self.mode, AppMode::ClaudeChat) {
-            return;
-        }
+        let was_focused = matches!(self.mode, AppMode::ClaudeChat);
 
         // If there's an active mark task, flag it for async finalization
         self.dispatcher.set_main_needs_finalize();
 
         let had_activity_before_finalize = !self.claude_raw_log.trim().is_empty();
 
-        self.record_claude_output("\u{2699}\u{fe0f} Claude Code CLI session ended.\n");
+        crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, "\u{2699}\u{fe0f} Claude Code CLI session ended.\n");
 
         let mut status_parts: Vec<String> = Vec::new();
 
@@ -1476,7 +1206,7 @@ impl App {
             match self.persist_claude_log() {
                 Ok(Some(path)) => {
                     let msg = format!("\u{1f4dd} Claude log saved to {}", path.display());
-                    self.record_claude_output(format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
                 Ok(None) => {
@@ -1485,7 +1215,7 @@ impl App {
                 }
                 Err(err) => {
                     let msg = format!("\u{26a0}\u{fe0f} Failed to save Claude log: {}", err);
-                    self.record_claude_output(format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
             }
@@ -1494,12 +1224,12 @@ impl App {
             match self.write_claude_summary_file(&summary) {
                 Ok(path) => {
                     let msg = format!("\u{1f4c4} Summary saved to {}", path.display());
-                    self.record_claude_output(format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
                 Err(err) => {
                     let msg = format!("\u{26a0}\u{fe0f} Failed to save Claude summary: {}", err);
-                    self.record_claude_output(format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
             }
@@ -1507,15 +1237,16 @@ impl App {
             status_parts.push("Claude session ended (no output captured).".to_string());
         }
 
-        self.claude_sender = None;
         self.claude_receiver = None;
-        self.claude_resize_handle = None;
+        self.rebuild_menu();
 
-        self.mode = AppMode::MainMenu;
-        self.show_popup = false;
-        self.popup_message.clear();
-        self.output_text.clear();
-        self.input_text.clear();
+        if was_focused {
+            self.mode = AppMode::MainMenu;
+            self.show_popup = false;
+            self.popup_message.clear();
+            self.output_text.clear();
+            self.input_text.clear();
+        }
         self.status_message = if status_parts.is_empty() {
             Some("Claude session ended.".to_string())
         } else {
@@ -1696,6 +1427,14 @@ impl App {
     }
 
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
+        let shared = self.claude_share.as_ref().is_some_and(|s| s.has_viewer())
+            || self.codex_share.as_ref().is_some_and(|s| s.has_viewer());
+        if (shared || self.astation_client.is_ws_closed()) && matches!(&message, AstationMessage::AgentInput { .. } | AstationMessage::AgentPrompt { .. }
+            | AstationMessage::VoiceRequest { .. } | AstationMessage::VoiceCommand { .. }
+            | AstationMessage::VoiceToggle { .. } | AstationMessage::UserCommand { .. }) {
+            self.handle_terminal_legacy_rejection();
+            return;
+        }
         match self.astation_client.handle_encryption_message(&message).await {
             Ok(Some(status)) => {
                 self.status_message = Some(status);
@@ -1844,8 +1583,8 @@ impl App {
 
                 // Track output start position before sending command (use raw_log which accumulates)
                 let output_start_pos = match target {
-                    ActiveCli::Claude => self.claude_raw_log.len(),
-                    ActiveCli::Codex => self.codex_raw_log.len(),
+                    ActiveCli::Claude => self.claude_raw_log_start + self.claude_raw_log.len(),
+                    ActiveCli::Codex => self.codex_raw_log_start + self.codex_raw_log.len(),
                 };
 
                 // Store pending command for output relay
@@ -1934,6 +1673,9 @@ impl App {
             } => {
                 self.handle_voice_request(session_id, accumulated_text, relay_url).await;
             }
+            AstationMessage::Terminal(envelope) => {
+                self.handle_terminal_message(envelope);
+            }
             AstationMessage::AgentInput {
                 agent_id,
                 kind,
@@ -1989,6 +1731,7 @@ impl App {
     /// Marks any paired credential entries for that Astation with `disconnected_at`
     /// so the grace-period logic in `CredentialStore::resolve` can take effect.
     pub fn on_astation_disconnect(&mut self) {
+        self.disconnect_terminals();
         if let Some(aid) = self.connected_astation_id.take() {
             let mut store = crate::credentials::CredentialStore::load();
             if let Some(entry) = store.find_paired_mut(&aid) {
@@ -2018,6 +1761,7 @@ impl App {
 
     /// Pop the next task from the dispatcher's main queue and send it to the Claude PTY.
     pub async fn try_dispatch_main(&mut self) {
+        if self.claude_sender.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
         if self.dispatcher.main_is_active() {
             return;
         }
@@ -2051,7 +1795,7 @@ impl App {
                 }
             }
             Err(err) => {
-                eprintln!("\u{274c} Failed to start Claude session for task {}: {}", task_id, err);
+                crate::diagnostics::warn(format!("Failed to start Claude session for task {}: {}", task_id, err));
                 let _ = self
                     .astation_client
                     .send_mark_result(&task_id, false, &format!("Failed to start Claude: {}", err))
@@ -2064,19 +1808,15 @@ impl App {
             }
         }
 
-        // Send prompt to Claude via PTY
-        self.record_claude_output(format!("> [Mark Task {}]\n", task_id));
-        self.claude_user_actions.push(format!("[Mark Task {}]", task_id));
-
-        if self.claude_sender.is_some() {
-            self.send_claude_data(&item.prompt);
-            if self.claude_sender.is_some() {
-                self.send_claude_data("\n");
-            }
-            if self.claude_sender.is_some() {
-                self.send_claude_data("\r");
-            }
+        // One queued write prevents a rejected prompt from submitting an unrelated draft.
+        let result = self.claude_sender.as_ref().unwrap().send(format!("{}\n\r", item.prompt));
+        if let Err(error) = result {
+            let _ = self.astation_client.send_mark_result(&task_id, false, &error.to_string()).await;
+            self.dispatcher.complete_main();
+            self.work_items.remove(&task_id);
+            return;
         }
+        self.claude_user_actions.push(format!("[Mark Task {}]", task_id));
 
         self.refresh_claude_view();
         self.status_message = Some(format!("\u{1f4cc} Task {} → Claude", task_id));
@@ -2192,11 +1932,19 @@ impl App {
     /// [`agent_key_to_bytes`]). Unknown kinds/keys are dropped with a status note.
     pub fn handle_agent_input(
         &mut self,
-        _agent_id: Option<String>,
+        agent_id: Option<String>,
         kind: String,
         text: Option<String>,
         key: Option<String>,
     ) {
+        if self.claude_share.as_ref().is_some_and(|s| s.has_viewer()) || self.codex_share.as_ref().is_some_and(|s| s.has_viewer()) {
+            self.status_message = Some("Use terminal-v1 control for an attached terminal".into());
+            return;
+        }
+        if agent_id.is_some() {
+            self.status_message = Some("Explicit terminal targeting requires terminal-v1".into());
+            return;
+        }
         // `kind` selects the input; the non-matching field is ignored (Astation
         // only ever populates one).
         let data: Option<String> = match kind.as_str() {
@@ -2268,7 +2016,7 @@ impl App {
             session_id,
             relay_url,
             sent_at: now,
-            output_snapshot_len: self.claude_raw_log.len(),
+            output_snapshot_len: self.claude_raw_log_start + self.claude_raw_log.len(),
             last_output_at: now,
         });
     }
@@ -2281,7 +2029,7 @@ impl App {
             None => return,
         };
 
-        let current_len = self.claude_raw_log.len();
+        let current_len = self.claude_raw_log_start + self.claude_raw_log.len();
 
         // Output is still growing — update snapshot
         if current_len > pending.output_snapshot_len {
@@ -2304,9 +2052,9 @@ impl App {
 
         // Claude is done — extract the response text.
         // At this point current_len <= pending.output_snapshot_len (output stopped growing).
-        let start = pending.output_snapshot_len.min(self.claude_raw_log.len());
-        let response_text = if start < self.claude_raw_log.len() {
-            self.claude_raw_log[start..].to_string()
+        let output = crate::app::terminal::log_since(&self.claude_raw_log, self.claude_raw_log_start, pending.output_snapshot_len);
+        let response_text = if !output.is_empty() {
+            output.to_string()
         } else {
             "No output received from Claude.".to_string()
         };
@@ -2382,7 +2130,7 @@ impl App {
             sent_at: now,
             pre_snapshot,
             detected_file: None,
-            output_snapshot_len: self.claude_raw_log.len(),
+            output_snapshot_len: self.claude_raw_log_start + self.claude_raw_log.len(),
             last_output_at: now,
         });
     }
@@ -2397,7 +2145,7 @@ impl App {
             None => return,
         };
 
-        let current_len = self.claude_raw_log.len();
+        let current_len = self.claude_raw_log_start + self.claude_raw_log.len();
 
         // Output is still growing — update snapshot
         if current_len > pending.output_snapshot_len {
@@ -2470,17 +2218,17 @@ impl App {
             // Extract output since command was sent (use raw_log which accumulates all output)
             let (output, success) = match pending.target {
                 ActiveCli::Claude => {
-                    let full_log = &self.claude_raw_log;
-                    if full_log.len() > pending.output_start_pos {
-                        (full_log[pending.output_start_pos..].to_string(), true)
+                    let output = crate::app::terminal::log_since(&self.claude_raw_log, self.claude_raw_log_start, pending.output_start_pos);
+                    if !output.is_empty() {
+                        (output.to_string(), true)
                     } else {
                         ("No output received".to_string(), false)
                     }
                 }
                 ActiveCli::Codex => {
-                    let full_log = &self.codex_raw_log;
-                    if full_log.len() > pending.output_start_pos {
-                        (full_log[pending.output_start_pos..].to_string(), true)
+                    let output = crate::app::terminal::log_since(&self.codex_raw_log, self.codex_raw_log_start, pending.output_start_pos);
+                    if !output.is_empty() {
+                        (output.to_string(), true)
                     } else {
                         ("No output received".to_string(), false)
                     }
@@ -2500,9 +2248,14 @@ impl App {
     }
 
     pub async fn process_astation_messages(&mut self) {
+        // Revoke before draining requests that were queued on a closed transport.
+        if self.astation_connected && self.astation_client.is_ws_closed() {
+            self.disconnect_terminals();
+        }
         // Drain all pending messages (non-blocking try_recv loop)
         let mut message_count = 0;
-        while let Some(message) = self.astation_client.recv_message() {
+        while message_count < 32 {
+            let Some(message) = self.astation_client.recv_message() else { break; };
             self.handle_astation_message(message).await;
             message_count += 1;
         }
@@ -2519,7 +2272,8 @@ impl App {
         }
 
         // Refresh session activity if we received any messages
-        if message_count > 0 {
+        if message_count > 0 && self.last_session_refresh.is_none_or(|last| last.elapsed() >= Duration::from_secs(60)) {
+            self.last_session_refresh = Some(Instant::now());
             if let Some(session) = crate::auth::AuthSession::load_saved() {
                 let mut session = session;
                 session.refresh();
@@ -2583,7 +2337,7 @@ mod tests {
     #[test]
     fn handle_agent_input_text_types_line_and_submits_to_claude() {
         let mut app = App::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
         app.claude_sender = Some(tx);
         app.mode = AppMode::ClaudeChat;
         app.handle_agent_input(None, "text".into(), Some("hello".into()), None);
@@ -2594,7 +2348,7 @@ mod tests {
     #[test]
     fn handle_agent_input_key_writes_raw_control_bytes() {
         let mut app = App::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
         app.claude_sender = Some(tx);
         app.mode = AppMode::ClaudeChat;
         app.handle_agent_input(None, "key".into(), None, Some("ctrl-c".into()));
@@ -2605,7 +2359,7 @@ mod tests {
     #[test]
     fn handle_agent_input_empty_text_sends_nothing() {
         let mut app = App::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
         app.claude_sender = Some(tx);
         app.mode = AppMode::ClaudeChat;
         app.handle_agent_input(None, "text".into(), Some("   ".into()), None);
@@ -2615,7 +2369,7 @@ mod tests {
     #[test]
     fn handle_agent_input_unknown_key_sends_nothing() {
         let mut app = App::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
         app.claude_sender = Some(tx);
         app.mode = AppMode::ClaudeChat;
         app.handle_agent_input(None, "key".into(), None, Some("f13".into()));
@@ -2625,7 +2379,7 @@ mod tests {
     #[test]
     fn handle_agent_input_routes_to_codex_when_focused() {
         let mut app = App::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
         app.codex_sender = Some(tx);
         app.mode = AppMode::CodexChat;
         app.handle_agent_input(None, "key".into(), None, Some("esc".into()));
@@ -2815,20 +2569,20 @@ mod tests {
     // ── Dynamic menu tests ──────────────────────────────────────────────
 
     #[test]
-    fn test_menu_disconnected_hides_agent_items() {
+    fn test_menu_disconnected_keeps_local_terminals() {
         let app = App::new(); // astation_connected defaults to false
         assert!(!app.astation_connected);
-        // Should NOT contain Claude, Codex, or Agent Panel
-        assert!(!app.menu_actions.contains(&MenuAction::LaunchClaude));
-        assert!(!app.menu_actions.contains(&MenuAction::LaunchCodex));
+        // Local terminals work offline; the connected agent panel requires Astation
+        assert!(app.menu_actions.contains(&MenuAction::LaunchClaude));
+        assert!(app.menu_actions.contains(&MenuAction::LaunchCodex));
         assert!(!app.menu_actions.contains(&MenuAction::AgentPanel));
         // Should contain Projects, Shell, Help, Exit
         assert!(app.menu_actions.contains(&MenuAction::ListProjects));
         assert!(app.menu_actions.contains(&MenuAction::ExecuteShell));
         assert!(app.menu_actions.contains(&MenuAction::Help));
         assert!(app.menu_actions.contains(&MenuAction::Exit));
-        assert_eq!(app.menu_actions.len(), 4);
-        assert_eq!(app.main_menu_items.len(), 4);
+        assert_eq!(app.menu_actions.len(), 6);
+        assert_eq!(app.main_menu_items.len(), 6);
     }
 
     #[test]
@@ -2850,10 +2604,10 @@ mod tests {
         app.rebuild_menu();
         // Select last item (Exit at index 6)
         app.selected_index = 6;
-        // Disconnect and rebuild — menu shrinks to 4 items
+        // Disconnect and rebuild - only the connected agent panel disappears
         app.astation_connected = false;
         app.rebuild_menu();
         assert!(app.selected_index < app.menu_actions.len());
-        assert_eq!(app.selected_index, 3); // clamped to last valid index
+        assert_eq!(app.selected_index, 5); // clamped to last valid index
     }
 }

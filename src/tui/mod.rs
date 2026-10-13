@@ -1,21 +1,18 @@
+mod clipboard;
 pub mod draw;
+pub mod terminal_view;
 pub mod voice_fx;
 
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEventKind, KeyModifiers,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
     },
     execute,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Stdout};
 use tokio::time::Duration;
 
@@ -24,35 +21,198 @@ use crate::app::{App, AppMode, MenuAction};
 use draw::draw_ui;
 
 pub async fn run_tui() -> Result<()> {
-    // Interactive TUI mode
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut app = App::new();
-    let result = run_tui_loop(&mut terminal, &mut app).await;
-
-    // Cleanup
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-
-    result
+    run_agent_tui(None, &[]).await
 }
 
-async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
-    // Fast startup: scan lockfiles (no network), then render immediately.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let guard = Self;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        Ok(guard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            crossterm::cursor::Show
+        );
+    }
+}
+
+pub async fn run_agent_tui(agent: Option<&str>, agent_args: &[String]) -> Result<()> {
+    let diagnostics = crate::diagnostics::Capture::start();
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let mut app = App::new();
+    match agent {
+        Some("codex") => {
+            app.mode = AppMode::CodexChat;
+            app.active_cli = crate::app::ActiveCli::Codex;
+            app.codex_client.append_launch_args(agent_args);
+            sync_terminal_sizes(&mut app, terminal.size()?);
+            app.ensure_codex_session().await?;
+        }
+        Some("claude") | Some("claude-code") => {
+            app.mode = AppMode::ClaudeChat;
+            app.claude_client.append_launch_args(agent_args);
+            sync_terminal_sizes(&mut app, terminal.size()?);
+            app.ensure_claude_session().await?;
+        }
+        Some(_) => anyhow::bail!("Expected claude, claude-code or codex"),
+        None => {}
+    }
+    terminal.clear()?;
+    run_tui_loop(&mut terminal, &mut app, &diagnostics).await
+}
+
+fn sync_terminal_sizes(app: &mut App, size: ratatui::layout::Size) {
+    let rows = size.height.saturating_sub(1).clamp(2, 200);
+    let cols = size.width.clamp(2, 400);
+    app.terminal_ui.viewport = (rows, cols);
+    if matches!(app.mode, AppMode::CodexChat) || app.codex_sender.is_none() {
+        app.adjust_codex_terminal_size(rows, cols);
+    }
+    if matches!(app.mode, AppMode::ClaudeChat) || app.claude_sender.is_none() {
+        app.adjust_claude_terminal_size(rows, cols);
+    }
+}
+
+fn send_agent(app: &mut App, bytes: &str) {
+    if matches!(app.mode, AppMode::CodexChat) {
+        app.send_codex_data(bytes);
+    } else {
+        app.send_claude_data(bytes);
+    }
+}
+
+async fn copy_terminal(app: &mut App) {
+    let text = if let Some(view) = &app.terminal_ui.browse {
+        view.text()
+    } else if matches!(app.mode, AppMode::CodexChat) {
+        terminal_view::visible_text(app.codex_terminal.screen(), app.terminal_ui.viewport)
+    } else {
+        terminal_view::visible_text(app.claude_terminal.screen(), app.terminal_ui.viewport)
+    };
+    match clipboard::copy(&text).await {
+        Ok(message) => {
+            app.terminal_ui.browse = None;
+            app.status_message = Some(message.into());
+        }
+        Err(error) => app.status_message = Some(error.to_string()),
+    }
+    if let Some(message) = &app.status_message {
+        app.terminal_ui.feedback = Some((message.clone(), std::time::Instant::now()));
+    }
+}
+
+async fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    use terminal_view::Action;
+    if app.terminal_ui.help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.terminal_ui.help = false,
+            KeyCode::Up => {
+                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_add(1)
+            }
+            KeyCode::PageUp => {
+                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_sub(10)
+            }
+            KeyCode::PageDown => {
+                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_add(10)
+            }
+            _ => {}
+        }
+        return;
+    }
+    let action = app.terminal_ui.key(key);
+    match action {
+        Action::Prefix | Action::Cancel => {}
+        Action::Hide => app.leave_terminal_view(),
+        Action::Take => app.reclaim_terminal(),
+        Action::Stop => app.stop_terminal(),
+        Action::Redraw => app.force_terminal_redraw = true,
+        Action::Help => {
+            app.terminal_ui.help = true;
+            app.terminal_ui.help_scroll = 0;
+        }
+        Action::Browse => app.browse_terminal(0),
+        Action::Copy => copy_terminal(app).await,
+        Action::SendPrefix => send_agent(app, &app.terminal_ui.prefix.bytes()),
+        Action::Agent(key) if app.terminal_ui.browse.is_some() => {
+            let view = app.terminal_ui.browse.as_mut().unwrap();
+            let (rows, cols) = view.viewport;
+            let offset = view.offset;
+            match key.code {
+                KeyCode::Esc => app.terminal_ui.browse = None,
+                KeyCode::Enter => copy_terminal(app).await,
+                KeyCode::PageUp => {
+                    app.browse_terminal(offset.saturating_add(usize::from(rows.saturating_sub(1))))
+                }
+                KeyCode::PageDown => {
+                    app.browse_terminal(offset.saturating_sub(usize::from(rows.saturating_sub(1))))
+                }
+                KeyCode::Up => view.cursor.0 = view.cursor.0.saturating_sub(1),
+                KeyCode::Down => view.cursor.0 = (view.cursor.0 + 1).min(rows - 1),
+                KeyCode::Left => view.cursor.1 = view.cursor.1.saturating_sub(1),
+                KeyCode::Right => view.cursor.1 = (view.cursor.1 + 1).min(cols - 1),
+                KeyCode::Home => view.cursor.1 = 0,
+                KeyCode::End => view.cursor.1 = cols - 1,
+                KeyCode::Char(' ') => {
+                    view.anchor = if view.anchor.is_some() {
+                        None
+                    } else {
+                        Some(view.cursor)
+                    }
+                }
+                _ => {}
+            }
+        }
+        Action::Agent(key) | Action::AgentWithPrefix(key) => {
+            let screen = if matches!(app.mode, AppMode::CodexChat) {
+                app.codex_terminal.screen()
+            } else {
+                app.claude_terminal.screen()
+            };
+            if let Some(bytes) = crate::terminal_keys::encode(key, screen.application_cursor()) {
+                let bytes = if matches!(action, Action::AgentWithPrefix(_)) {
+                    app.terminal_ui.prefix.bytes() + &bytes
+                } else {
+                    bytes
+                };
+                send_agent(app, &bytes);
+            }
+        }
+    }
+}
+
+async fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    diagnostics: &crate::diagnostics::Capture,
+) -> Result<()> {
+    sync_terminal_sizes(app, terminal.size()?);
+    terminal.draw(|frame| draw_ui(frame, app))?;
     app.startup_scan_agents().await;
 
     // Kick off Astation connection in the background — won't block the UI.
     app.spawn_astation_connect();
 
     loop {
+        terminal.autoresize()?;
+        for message in diagnostics.drain() {
+            app.terminal_ui.record(message);
+        }
         // Check if background Astation connection has completed
         app.poll_astation_connect();
 
@@ -63,6 +223,9 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
         app.process_astation_messages().await;
         app.process_codex_output();
         app.process_claude_output();
+        // Drain bytes from the old geometry before notifying the CLI of a resize.
+        sync_terminal_sizes(app, terminal.size()?);
+        app.pump_terminals();
         // Forward ACP agent events to Astation
         app.poll_acp_events().await;
 
@@ -72,8 +235,10 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
 
         // Dispatcher: collect completed background task results
         for result in app.dispatcher.poll_background_results() {
-            let _ = app.astation_client
-                .send_mark_result(&result.task_id, result.success, &result.output).await;
+            let _ = app
+                .astation_client
+                .send_mark_result(&result.task_id, result.success, &result.output)
+                .await;
             app.work_items.remove(&result.task_id);
         }
 
@@ -90,133 +255,34 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
             app.force_terminal_redraw = false;
         }
 
+        app.terminal_ui.observe_status(&app.status_message);
         terminal.draw(|f| draw_ui(f, app))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if event::poll(Duration::from_millis(16))? {
+            let event = event::read()?;
+            if let Event::Resize(_, _) = &event {
+                app.terminal_ui.reset_view();
+                app.force_terminal_redraw = true;
+            }
+            if let Event::Paste(text) = &event {
+                if app.terminal_ui.help {
+                    app.status_message = Some("Close help before pasting into the agent".into());
+                } else {
+                    app.terminal_ui.browse = None;
+                    if app.terminal_ui.pending {
+                        app.terminal_ui.pending = false;
+                        send_agent(app, &app.terminal_ui.prefix.bytes());
+                    }
+                    app.terminal_paste(text);
+                }
+            }
+            if let Event::Key(key) = event {
+                if key.kind != KeyEventKind::Release {
                     app.register_local_activity(true).await;
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                    // In Codex mode, forward ALL keystrokes directly to
-                    // Codex's PTY.  Only Ctrl+B escapes back to the menu.
-                    if matches!(app.mode, AppMode::CodexChat) {
-                        if ctrl && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
-                        {
-                            app.finalize_codex_session();
-                            continue;
-                        }
-
-                        let data: Option<String> = if ctrl {
-                            match key.code {
-                                KeyCode::Char(c) => {
-                                    let byte =
-                                        (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                                    Some(String::from(byte as char))
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Char(c) => Some(String::from(c)),
-                                KeyCode::Enter => Some("\r".to_string()),
-                                KeyCode::Backspace => Some("\x7f".to_string()),
-                                KeyCode::Tab => Some("\t".to_string()),
-                                KeyCode::Esc => Some("\x1b".to_string()),
-                                KeyCode::Up => Some("\x1b[A".to_string()),
-                                KeyCode::Down => Some("\x1b[B".to_string()),
-                                KeyCode::Right => Some("\x1b[C".to_string()),
-                                KeyCode::Left => Some("\x1b[D".to_string()),
-                                KeyCode::Home => Some("\x1b[H".to_string()),
-                                KeyCode::End => Some("\x1b[F".to_string()),
-                                KeyCode::PageUp => Some("\x1b[5~".to_string()),
-                                KeyCode::PageDown => Some("\x1b[6~".to_string()),
-                                KeyCode::Delete => Some("\x1b[3~".to_string()),
-                                KeyCode::Insert => Some("\x1b[2~".to_string()),
-                                KeyCode::F(n) => Some(match n {
-                                    1 => "\x1bOP".to_string(),
-                                    2 => "\x1bOQ".to_string(),
-                                    3 => "\x1bOR".to_string(),
-                                    4 => "\x1bOS".to_string(),
-                                    5 => "\x1b[15~".to_string(),
-                                    6 => "\x1b[17~".to_string(),
-                                    7 => "\x1b[18~".to_string(),
-                                    8 => "\x1b[19~".to_string(),
-                                    9 => "\x1b[20~".to_string(),
-                                    10 => "\x1b[21~".to_string(),
-                                    11 => "\x1b[23~".to_string(),
-                                    12 => "\x1b[24~".to_string(),
-                                    _ => format!("\x1b[{}~", n),
-                                }),
-                                _ => None,
-                            }
-                        };
-
-                        if let Some(bytes) = data {
-                            app.send_codex_data(&bytes);
-                        }
-                        continue;
-                    }
-
-                    // In Claude mode, forward ALL keystrokes directly to
-                    // Claude Code's PTY.  Only Ctrl+B escapes back to the menu.
-                    if matches!(app.mode, AppMode::ClaudeChat) {
-                        if ctrl && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
-                        {
-                            app.finalize_claude_session();
-                            continue;
-                        }
-
-                        // Convert the key event to bytes and send to PTY.
-                        let data: Option<String> = if ctrl {
-                            match key.code {
-                                KeyCode::Char(c) => {
-                                    // Ctrl+A..Z -> 0x01..0x1A
-                                    let byte =
-                                        (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                                    Some(String::from(byte as char))
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Char(c) => Some(String::from(c)),
-                                KeyCode::Enter => Some("\r".to_string()),
-                                KeyCode::Backspace => Some("\x7f".to_string()),
-                                KeyCode::Tab => Some("\t".to_string()),
-                                KeyCode::Esc => Some("\x1b".to_string()),
-                                KeyCode::Up => Some("\x1b[A".to_string()),
-                                KeyCode::Down => Some("\x1b[B".to_string()),
-                                KeyCode::Right => Some("\x1b[C".to_string()),
-                                KeyCode::Left => Some("\x1b[D".to_string()),
-                                KeyCode::Home => Some("\x1b[H".to_string()),
-                                KeyCode::End => Some("\x1b[F".to_string()),
-                                KeyCode::PageUp => Some("\x1b[5~".to_string()),
-                                KeyCode::PageDown => Some("\x1b[6~".to_string()),
-                                KeyCode::Delete => Some("\x1b[3~".to_string()),
-                                KeyCode::Insert => Some("\x1b[2~".to_string()),
-                                KeyCode::F(n) => Some(match n {
-                                    1 => "\x1bOP".to_string(),
-                                    2 => "\x1bOQ".to_string(),
-                                    3 => "\x1bOR".to_string(),
-                                    4 => "\x1bOS".to_string(),
-                                    5 => "\x1b[15~".to_string(),
-                                    6 => "\x1b[17~".to_string(),
-                                    7 => "\x1b[18~".to_string(),
-                                    8 => "\x1b[19~".to_string(),
-                                    9 => "\x1b[20~".to_string(),
-                                    10 => "\x1b[21~".to_string(),
-                                    11 => "\x1b[23~".to_string(),
-                                    12 => "\x1b[24~".to_string(),
-                                    _ => format!("\x1b[{}~", n),
-                                }),
-                                _ => None,
-                            }
-                        };
-
-                        if let Some(bytes) = data {
-                            app.send_claude_data(&bytes);
-                        }
+                    if matches!(app.mode, AppMode::CodexChat | AppMode::ClaudeChat) {
+                        handle_terminal_key(app, key).await;
                         continue;
                     }
 
@@ -246,11 +312,12 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                                     KeyCode::Up | KeyCode::Char('k') => {
                                         let count = app.agent_registry.all().len();
                                         if count > 0 {
-                                            app.agent_panel_selected = if app.agent_panel_selected == 0 {
-                                                count - 1
-                                            } else {
-                                                app.agent_panel_selected - 1
-                                            };
+                                            app.agent_panel_selected =
+                                                if app.agent_panel_selected == 0 {
+                                                    count - 1
+                                                } else {
+                                                    app.agent_panel_selected - 1
+                                                };
                                         }
                                     }
                                     KeyCode::Enter => {
@@ -258,13 +325,15 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                                         if let Some(info) = agents.get(app.agent_panel_selected) {
                                             let id = info.id.clone();
                                             app.active_agent_id = Some(id.clone());
-                                            app.status_message = Some(format!("Active agent: {}", id));
+                                            app.status_message =
+                                                Some(format!("Active agent: {}", id));
                                         }
                                     }
                                     KeyCode::Char('r') | KeyCode::Char('R') if !ctrl => {
                                         // Refresh: rescan lockfiles
                                         app.startup_scan_agents().await;
-                                        app.status_message = Some("Agent list refreshed".to_string());
+                                        app.status_message =
+                                            Some("Agent list refreshed".to_string());
                                     }
                                     _ => {}
                                 },
@@ -272,7 +341,9 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                                     KeyCode::Down | KeyCode::Char('j') => app.next_item(),
                                     KeyCode::Up | KeyCode::Char('k') => app.previous_item(),
                                     KeyCode::Enter => {
-                                        if app.menu_actions.get(app.selected_index) == Some(&MenuAction::Exit) {
+                                        if app.menu_actions.get(app.selected_index)
+                                            == Some(&MenuAction::Exit)
+                                        {
                                             return Ok(());
                                         }
                                         app.handle_selection().await?;
@@ -299,11 +370,11 @@ async fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
                                     KeyCode::Char('s') | KeyCode::Char('S') if !ctrl => {
                                         if !app.cached_projects.is_empty() {
                                             app.show_certificates = !app.show_certificates;
-                                            let info = format_projects(&app.cached_projects, app.show_certificates);
-                                            app.output_text = format!(
-                                                "Agora Projects\n\n{}",
-                                                info
+                                            let info = format_projects(
+                                                &app.cached_projects,
+                                                app.show_certificates,
                                             );
+                                            app.output_text = format!("Agora Projects\n\n{}", info);
                                         }
                                     }
                                     _ => {}

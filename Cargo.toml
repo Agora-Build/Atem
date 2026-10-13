@@ -19,6 +19,8 @@ futures-util = "0.3"
 portable-pty = "0.9"
 vte = "0.11"
 vt100 = "0.15"
+# Keep the remote renderer's generated width profile in sync with vt100.
+unicode-width = "=0.1.14"
 libc = "0.2"
 toml = "0.8"
 toml_edit = "0.22"

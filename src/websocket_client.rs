@@ -26,6 +26,9 @@ struct OutboundMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AstationMessage {
+    #[serde(rename = "terminal")]
+    Terminal(crate::terminal_share::Envelope),
+
     #[serde(rename = "projectListRequest")]
     ProjectListRequest,
 
@@ -396,7 +399,8 @@ pub struct AtemInstance {
 
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<OutboundMessage>>,
-    receiver: Option<mpsc::UnboundedReceiver<AstationMessage>>,
+    terminal_sender: Option<mpsc::Sender<OutboundMessage>>,
+    receiver: Option<mpsc::Receiver<AstationMessage>>,
     transport_tasks: Vec<tokio::task::JoinHandle<()>>,
     atem_id_override: Option<String>,
     session_path_override: Option<std::path::PathBuf>,
@@ -422,6 +426,7 @@ impl AstationClient {
         Self {
             sender: None,
             receiver: None,
+            terminal_sender: None,
             transport_tasks: Vec::new(),
             atem_id_override: None,
             session_path_override: None,
@@ -485,6 +490,7 @@ impl AstationClient {
 
     fn abort_transport(&mut self) {
         self.sender = None;
+        self.terminal_sender = None;
         self.receiver = None;
         for task in self.transport_tasks.drain(..) {
             task.abort();
@@ -536,12 +542,19 @@ impl AstationClient {
             .map_err(|e| anyhow!("Failed to connect to WebSocket: {}", e))?;
 
         let (mut write, mut read) = ws_stream.split();
-        let (tx, rx) = mpsc::unbounded_channel::<AstationMessage>();
+        let (tx, rx) = mpsc::channel::<AstationMessage>(64);
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<OutboundMessage>(32);
 
         // Spawn task to handle outgoing messages
         let writer_task = tokio::spawn(async move {
-            while let Some(outbound) = msg_rx.recv().await {
+            loop {
+                let outbound = tokio::select! {
+                    outbound = msg_rx.recv() => outbound,
+                    outbound = terminal_rx.recv() => outbound,
+                };
+                let Some(outbound) = outbound else { break; };
                 let result = match serde_json::to_string(&outbound.message) {
                     Ok(json) => write.send(Message::Text(json)).await.map_err(|_| "WebSocket write failed".to_string()),
                     Err(_) => Err("WebSocket message encoding failed".to_string()),
@@ -558,7 +571,8 @@ impl AstationClient {
                 match message {
                     Ok(Message::Text(text)) => {
                         if let Ok(astation_msg) = serde_json::from_str::<AstationMessage>(&text) {
-                            if let Err(_) = tx.send(astation_msg) {
+                            if matches!(&astation_msg, AstationMessage::Terminal(_)) && text.len() > 32 * 1024 { continue; }
+                            if tx.send(astation_msg).await.is_err() {
                                 break; // Receiver has been dropped
                             }
                         }
@@ -575,6 +589,7 @@ impl AstationClient {
         });
 
         self.sender = Some(msg_tx);
+        self.terminal_sender = Some(terminal_tx);
         self.receiver = Some(rx);
         self.transport_tasks = vec![writer_task, reader_task];
         self.ws_closed = false;
@@ -719,9 +734,9 @@ impl AstationClient {
                         if let Some(session) = session_mgr.get_mut(&astation_id) {
                             session.refresh();
                             if let Err(error) = self.save_session_manager(&session_mgr) {
-                                eprintln!(
+                                crate::diagnostics::warn(format!(
                                     "Warning: could not refresh saved Astation session: {error}"
-                                );
+                                ));
                             }
                         }
                         return Ok(());
@@ -864,7 +879,18 @@ impl AstationClient {
         None
     }
 
+    /// A separate bounded queue prevents a slow terminal viewer from growing
+    /// the ordinary control-message queue or blocking the TUI loop.
+    pub fn try_send_terminal(&self, envelope: crate::terminal_share::Envelope) -> Result<()> {
+        self.terminal_sender.as_ref().ok_or_else(|| anyhow!("Not connected"))?
+            .try_send(OutboundMessage { message: AstationMessage::Terminal(envelope), delivered: None })
+            .map_err(|_| anyhow!("Terminal transport queue full or closed"))
+    }
+
     pub async fn send_message(&self, message: AstationMessage) -> Result<()> {
+        if let AstationMessage::Terminal(envelope) = message {
+            return self.try_send_terminal(envelope);
+        }
         if let Some(sender) = &self.sender {
             sender
                 .send(OutboundMessage { message, delivered: None })
@@ -1063,7 +1089,7 @@ impl AstationClient {
     /// Returns true if the WebSocket connection has been closed.
     /// Detected lazily when `recv_message()` encounters a closed channel.
     pub fn is_ws_closed(&self) -> bool {
-        self.ws_closed
+        self.ws_closed || self.transport_tasks.iter().any(|task| task.is_finished())
     }
 
     /// Blocking: waits until a message arrives (for CLI use only, not the TUI loop).
@@ -1492,6 +1518,27 @@ fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_transport_is_detected_before_buffered_input_is_drained() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            socket.send(Message::Text(r#"{"type":"terminal","data":{"v":1,"op":"list"}}"#.into())).await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let mut client = AstationClient::new();
+        client.connect_raw(&format!("ws://{address}")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client.is_ws_closed() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(matches!(client.recv_message(), Some(AstationMessage::Terminal(_))));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn migration_flush_delivers_before_an_ephemeral_client_disconnects() {

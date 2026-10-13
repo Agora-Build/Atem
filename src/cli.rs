@@ -214,11 +214,18 @@ pub enum ProjectCommands {
 pub enum AgentCommands {
     /// Scan lockfiles and list all detected agents
     List,
-    /// Launch Claude Code as a PTY agent
+    /// Open the original interactive CLI in a shareable Atem terminal
     Launch {
-        /// Agent type to launch (claude-code or codex)
+        /// Agent type to launch (claude, claude-code or codex)
         #[arg(default_value = "claude-code")]
         agent_type: String,
+        /// Arguments passed to the original agent CLI (e.g. --profile oss)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "AGENT_ARGS"
+        )]
+        agent_args: Vec<String>,
     },
     /// Connect to an ACP agent at a WebSocket URL and show its server info
     Connect {
@@ -964,13 +971,10 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Agent { agent_command } => match agent_command {
-            AgentCommands::Launch { agent_type } => {
-                println!("Launching {} as PTY agent...", agent_type);
-                println!("Note: This will be implemented in the TUI mode");
-                println!("For now, use: atem (enter TUI)");
-                // TODO: Implement CLI agent launch with interactive session
-                Ok(())
-            }
+            AgentCommands::Launch {
+                agent_type,
+                agent_args,
+            } => crate::tui::run_agent_tui(Some(&agent_type), &agent_args).await,
             AgentCommands::List => {
                 use crate::agent_detector::{scan_lockfiles, scan_default_ports};
                 use crate::agent_client::AgentProtocol;
@@ -2053,6 +2057,90 @@ mod tests {
     }
 
     // ── agent command ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cli_agent_launch_defaults_to_claude_without_extra_args() {
+        let cli = Cli::try_parse_from(["atem", "agent", "launch"]).unwrap();
+        let Some(Commands::Agent {
+            agent_command: AgentCommands::Launch {
+                agent_type,
+                agent_args,
+            },
+        }) = cli.command
+        else {
+            panic!("expected agent launch")
+        };
+        assert_eq!(agent_type, "claude-code");
+        assert!(agent_args.is_empty());
+    }
+
+    #[test]
+    fn cli_agent_launch_forwards_codex_profile_with_or_without_separator() {
+        for arguments in [
+            vec!["atem", "agent", "launch", "codex", "--profile", "oss"],
+            vec!["atem", "agent", "launch", "codex", "--", "--profile", "oss"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Some(Commands::Agent {
+                agent_command: AgentCommands::Launch {
+                    agent_type,
+                    agent_args,
+                },
+            }) = cli.command
+            else {
+                panic!("expected agent launch")
+            };
+            assert_eq!(agent_type, "codex");
+            assert_eq!(agent_args, ["--profile", "oss"]);
+        }
+    }
+
+    #[test]
+    fn cli_agent_launch_preserves_quoted_values_and_literal_separator() {
+        let cli = Cli::try_parse_from([
+            "atem",
+            "agent",
+            "launch",
+            "claude",
+            "--append-system-prompt",
+            "a prompt with spaces\nand a newline",
+            "--",
+            "--literal",
+        ])
+        .unwrap();
+        let Some(Commands::Agent {
+            agent_command: AgentCommands::Launch {
+                agent_type,
+                agent_args,
+            },
+        }) = cli.command
+        else {
+            panic!("expected agent launch")
+        };
+        assert_eq!(agent_type, "claude");
+        assert_eq!(
+            agent_args,
+            [
+                "--append-system-prompt",
+                "a prompt with spaces\nand a newline",
+                "--",
+                "--literal"
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_agent_launch_forwards_agent_help_after_separator() {
+        let cli =
+            Cli::try_parse_from(["atem", "agent", "launch", "codex", "--", "--help"]).unwrap();
+        let Some(Commands::Agent {
+            agent_command: AgentCommands::Launch { agent_args, .. },
+        }) = cli.command
+        else {
+            panic!("expected agent launch")
+        };
+        assert_eq!(agent_args, ["--help"]);
+    }
 
     #[test]
     fn cli_agent_list_parses() {
