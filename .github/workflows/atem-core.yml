@@ -37,3 +37,10 @@ jobs:
       - name: C consumer (and Swift on macOS)
         if: runner.os != 'Windows'
         run: ./scripts/check-atem-core-ffi.sh
+      - name: Package dry run (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          ./scripts/package-atem-core-macos.sh dev target/atem-core-package
+          test -s target/atem-core-package/atem-core-dev-macos-xcframework.zip
+          (cd target/atem-core-package && shasum -a 256 -c atem-core-dev-SHA256SUMS.txt)

@@ -122,9 +122,24 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ env.ARCHIVE }}
 
+  atem-core-macos:
+    name: atem-core (macOS xcframework)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Package
+        run: ./scripts/package-atem-core-macos.sh "${GITHUB_REF_NAME#v}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atem-core-macos
+          path: dist/*
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, atem-core-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
