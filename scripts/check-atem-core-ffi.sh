@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 cargo build -p atem-core-ffi --release
 # The system libraries a Rust static library needs on this platform.
-LIBS=$(cargo rustc -p atem-core-ffi --release --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+LIBS=$(cargo rustc --color never -p atem-core-ffi --release --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
   | sed -n 's/.*native-static-libs: //p' | tail -1)
 LIB=target/release/libatem_core_ffi.a
 INCLUDE=crates/atem-core-ffi/include
