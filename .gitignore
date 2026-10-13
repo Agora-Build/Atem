@@ -38,6 +38,8 @@ docs/superpowers/
 node_modules/
 package.json
 package-lock.json
+# …except the ConvoAI toolkit's: it makes the vendored bundle reproducible.
+!scripts/convoai-toolkit/package-lock.json
 test-llm-server.js
 test-rtc-page.js
 test-convo-page.js
