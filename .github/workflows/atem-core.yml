@@ -1,0 +1,39 @@
+name: atem-core
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/check-atem-core-ffi.sh"
+      - "scripts/package-atem-core-macos.sh"
+      - ".github/workflows/atem-core.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/check-atem-core-ffi.sh"
+      - "scripts/package-atem-core-macos.sh"
+      - ".github/workflows/atem-core.yml"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test atem-core and atem-core-ffi
+        run: cargo test -p atem-core -p atem-core-ffi
+      - name: Build the C library
+        run: cargo build -p atem-core-ffi --release
+      - name: C consumer (and Swift on macOS)
+        if: runner.os != 'Windows'
+        run: ./scripts/check-atem-core-ffi.sh
