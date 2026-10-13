@@ -3,9 +3,6 @@ use anyhow::Result;
 use atem_core::token as core;
 use std::collections::HashMap;
 
-pub const SERVICE_TYPE_RTC: u16 = core::SERVICE_RTC;
-pub const SERVICE_TYPE_RTM: u16 = core::SERVICE_RTM;
-
 /// Role for RTC tokens.
 #[derive(Debug, Clone, Copy)]
 pub enum Role {
@@ -243,8 +240,7 @@ impl TokenInfo {
 
     /// Same as `display` but with an injectable "now" for deterministic tests.
     pub fn display_at(&self, now: u64) -> String {
-        const RULE: &str =
-            "────────────────────────────────────────────────────────────────────────";
+        const RULE: &str = "────────────────────────────────────────────────────────────────────────";
         let mut lines: Vec<String> = Vec::new();
 
         // ── Token info ────────────────────────────────────────────────
@@ -273,7 +269,10 @@ impl TokenInfo {
                 format_relative_duration(self.issue_ts as u64 - now)
             )
         } else if now < exp {
-            format!("yes — expires in {}", format_relative_duration(exp - now))
+            format!(
+                "yes — expires in {}",
+                format_relative_duration(exp - now)
+            )
         } else {
             format!(
                 "EXPIRED — ended {} ago",
@@ -479,16 +478,8 @@ mod tests {
 
     #[test]
     fn empty_certificate_returns_empty_rtc_token() {
-        let token = build_token_rtc(
-            "appid",
-            "",
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Publisher,
-            3600,
-            1000000,
-        )
-        .unwrap();
+        let token =
+            build_token_rtc("appid", "", "chan", RtcAccount::parse("0"), Role::Publisher, 3600, 1000000).unwrap();
         assert!(token.is_empty());
     }
 
@@ -516,7 +507,13 @@ mod tests {
 
     #[test]
     fn rtm_token_starts_with_version() {
-        let token = build_token_rtm(TEST_APP_ID, TEST_APP_CERT, "user", 3600, 1000000).unwrap();
+        let token = build_token_rtm(
+            TEST_APP_ID,
+            TEST_APP_CERT,
+            "user",
+            3600,
+            1000000,
+        ).unwrap();
         assert!(token.starts_with("007"));
     }
 
@@ -537,17 +534,23 @@ mod tests {
         assert_eq!(info.app_id, app_id);
         assert_eq!(info.expire, 3600);
         assert!(!info.services.is_empty());
-        assert_eq!(info.services[0].service_type, SERVICE_TYPE_RTC);
+        assert_eq!(info.services[0].service_type, core::SERVICE_RTC);
     }
 
     #[test]
     fn rtm_token_generate_then_decode_roundtrip() {
         let app_id = TEST_APP_ID;
-        let token = build_token_rtm(app_id, TEST_APP_CERT, "alice", 7200, 1700000000).unwrap();
+        let token = build_token_rtm(
+            app_id,
+            TEST_APP_CERT,
+            "alice",
+            7200,
+            1700000000,
+        ).unwrap();
         let info = decode_token(&token).unwrap();
         assert_eq!(info.app_id, app_id);
         assert_eq!(info.expire, 7200);
-        assert_eq!(info.services[0].service_type, SERVICE_TYPE_RTM);
+        assert_eq!(info.services[0].service_type, core::SERVICE_RTM);
     }
 
     #[test]
@@ -568,8 +571,8 @@ mod tests {
         assert_eq!(info.app_id, app_id);
         assert_eq!(info.expire, 7200);
         let service_types: Vec<u16> = info.services.iter().map(|s| s.service_type).collect();
-        assert!(service_types.contains(&SERVICE_TYPE_RTC));
-        assert!(service_types.contains(&SERVICE_TYPE_RTM));
+        assert!(service_types.contains(&core::SERVICE_RTC));
+        assert!(service_types.contains(&core::SERVICE_RTM));
     }
 
     #[test]
@@ -589,8 +592,8 @@ mod tests {
         assert!(!token.is_empty());
         let info = decode_token(&token).unwrap();
         let service_types: Vec<u16> = info.services.iter().map(|s| s.service_type).collect();
-        assert!(service_types.contains(&SERVICE_TYPE_RTC));
-        assert!(service_types.contains(&SERVICE_TYPE_RTM));
+        assert!(service_types.contains(&core::SERVICE_RTC));
+        assert!(service_types.contains(&core::SERVICE_RTM));
     }
 
     #[test]
@@ -613,26 +616,8 @@ mod tests {
     fn publisher_has_more_privileges_than_subscriber() {
         let app_id = TEST_APP_ID;
         let cert = TEST_APP_CERT;
-        let pub_token = build_token_rtc(
-            app_id,
-            cert,
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Publisher,
-            3600,
-            0,
-        )
-        .unwrap();
-        let sub_token = build_token_rtc(
-            app_id,
-            cert,
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Subscriber,
-            3600,
-            0,
-        )
-        .unwrap();
+        let pub_token = build_token_rtc(app_id, cert, "chan", RtcAccount::parse("0"), Role::Publisher, 3600, 0).unwrap();
+        let sub_token = build_token_rtc(app_id, cert, "chan", RtcAccount::parse("0"), Role::Subscriber, 3600, 0).unwrap();
         let pub_info = decode_token(&pub_token).unwrap();
         let sub_info = decode_token(&sub_token).unwrap();
         assert!(pub_info.services[0].privileges.len() > sub_info.services[0].privileges.len());
@@ -649,16 +634,11 @@ mod tests {
         let token = build_token_rtc(
             TEST_APP_ID,
             TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Publisher,
-            3600,
-            1700000000,
-        )
-        .unwrap();
+            "chan", RtcAccount::parse("0"), Role::Publisher, 3600, 1700000000,
+        ).unwrap();
         let unpadded = token.trim_end_matches('=').to_string();
         let info = decode_token(&unpadded).unwrap();
-        assert_eq!(info.services[0].service_type, SERVICE_TYPE_RTC);
+        assert_eq!(info.services[0].service_type, core::SERVICE_RTC);
     }
 
     #[test]
@@ -666,13 +646,8 @@ mod tests {
         let token = build_token_rtc(
             TEST_APP_ID,
             TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Publisher,
-            3600,
-            1700000000,
-        )
-        .unwrap();
+            "chan", RtcAccount::parse("0"), Role::Publisher, 3600, 1700000000,
+        ).unwrap();
         let info = decode_token(&token).unwrap();
         assert_eq!(info.services[0].privileges.len(), 4);
     }
@@ -682,13 +657,8 @@ mod tests {
         let token = build_token_rtc(
             TEST_APP_ID,
             TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Subscriber,
-            3600,
-            1700000000,
-        )
-        .unwrap();
+            "chan", RtcAccount::parse("0"), Role::Subscriber, 3600, 1700000000,
+        ).unwrap();
         let info = decode_token(&token).unwrap();
         assert_eq!(info.services[0].privileges.len(), 1);
     }
@@ -699,13 +669,8 @@ mod tests {
         let token = build_token_rtc(
             TEST_APP_ID,
             TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Publisher,
-            expire_secs,
-            1700000000,
-        )
-        .unwrap();
+            "chan", RtcAccount::parse("0"), Role::Publisher, expire_secs, 1700000000,
+        ).unwrap();
         let info = decode_token(&token).unwrap();
         assert_eq!(info.expire, expire_secs);
         for (_, &v) in &info.services[0].privileges {
@@ -817,31 +782,21 @@ mod tests {
     fn rtc_int_uid_token_differs_from_string_account_token() {
         // Different account strings — "42" vs "alice" — must yield different tokens.
         let t1 = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            1700000000,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("42"), Role::Publisher, 3600, 1700000000,
         )
         .unwrap();
         let t2 = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("alice"),
-            Role::Publisher,
-            3600,
-            1700000000,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("alice"), Role::Publisher, 3600, 1700000000,
         )
         .unwrap();
         assert_ne!(t1, t2);
         // Both must still decode.
         let info1 = decode_token(&t1).unwrap();
         let info2 = decode_token(&t2).unwrap();
-        assert_eq!(info1.services[0].service_type, SERVICE_TYPE_RTC);
-        assert_eq!(info2.services[0].service_type, SERVICE_TYPE_RTC);
+        assert_eq!(info1.services[0].service_type, core::SERVICE_RTC);
+        assert_eq!(info2.services[0].service_type, core::SERVICE_RTC);
     }
 
     #[test]
@@ -851,23 +806,13 @@ mod tests {
         // payload carrying channel+user is byte-identical. This proves that
         // the int-vs-string mode is NOT recoverable from the token.
         let t_int = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::Int(2233),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::Int(2233), Role::Publisher, 3600, 0,
         )
         .unwrap();
         let t_str = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::Str("2233"),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::Str("2233"), Role::Publisher, 3600, 0,
         )
         .unwrap();
 
@@ -896,64 +841,44 @@ mod tests {
     fn rtc_with_rtm_int_uid_same_account_for_both() {
         // --rtc-user-id 42 --with-rtm  → RTC and RTM both keyed on "42"
         let token = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("42"), Role::Publisher, 3600, 3600,
             None,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
         let types: Vec<u16> = info.services.iter().map(|s| s.service_type).collect();
-        assert!(types.contains(&SERVICE_TYPE_RTC));
-        assert!(types.contains(&SERVICE_TYPE_RTM));
+        assert!(types.contains(&core::SERVICE_RTC));
+        assert!(types.contains(&core::SERVICE_RTM));
     }
 
     #[test]
     fn rtc_with_rtm_int_uid_and_separate_rtm_account() {
         // --rtc-user-id 42 --with-rtm --rtm-user-id rtm_alice
         let token = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("42"), Role::Publisher, 3600, 3600,
             Some("rtm_alice"),
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
         let types: Vec<u16> = info.services.iter().map(|s| s.service_type).collect();
-        assert!(types.contains(&SERVICE_TYPE_RTC));
-        assert!(types.contains(&SERVICE_TYPE_RTM));
+        assert!(types.contains(&core::SERVICE_RTC));
+        assert!(types.contains(&core::SERVICE_RTM));
     }
 
     #[test]
     fn rtc_with_rtm_separate_account_produces_different_token_than_same_account() {
         // Same RTC account but distinct RTM accounts → different token bytes.
         let same = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("alice"),
-            Role::Publisher,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("alice"), Role::Publisher, 3600, 3600,
             None,
         )
         .unwrap();
         let separate = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("alice"),
-            Role::Publisher,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("alice"), Role::Publisher, 3600, 3600,
             Some("bob"),
         )
         .unwrap();
@@ -965,13 +890,8 @@ mod tests {
     #[test]
     fn rtc_with_rtm_subscriber_has_only_join_channel_on_rtc_side() {
         let token = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("42"),
-            Role::Subscriber,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("42"), Role::Subscriber, 3600, 3600,
             None,
         )
         .unwrap();
@@ -979,7 +899,7 @@ mod tests {
         let rtc = info
             .services
             .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
+            .find(|s| s.service_type == core::SERVICE_RTC)
             .expect("RTC service missing");
         // Subscriber = joinChannel only (no publish privileges)
         assert_eq!(rtc.privileges.len(), 1);
@@ -990,13 +910,8 @@ mod tests {
     #[test]
     fn build_token_rtc_int_uid_empty_cert_returns_empty() {
         let t = build_token_rtc(
-            "appid",
-            "",
-            "chan",
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            0,
+            "appid", "", "chan", RtcAccount::parse("42"),
+            Role::Publisher, 3600, 0,
         )
         .unwrap();
         assert!(t.is_empty());
@@ -1005,14 +920,8 @@ mod tests {
     #[test]
     fn build_token_rtc_with_rtm_separate_empty_cert_returns_empty() {
         let t = build_token_rtc_with_rtm(
-            "appid",
-            "",
-            "chan",
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            3600,
-            Some("rtm_user"),
+            "appid", "", "chan", RtcAccount::parse("42"),
+            Role::Publisher, 3600, 3600, Some("rtm_user"),
         )
         .unwrap();
         assert!(t.is_empty());
@@ -1023,48 +932,30 @@ mod tests {
     #[test]
     fn decoded_rtc_token_surfaces_channel_and_user() {
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "mychan",
-            RtcAccount::parse("alice"),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "mychan",
+            RtcAccount::parse("alice"), Role::Publisher, 3600, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
         let display = info.display();
-        assert!(
-            display.contains("Channel             mychan"),
-            "display missing channel:\n{display}"
-        );
-        assert!(
-            display.contains("RTC User            alice"),
-            "display missing RTC user:\n{display}"
-        );
+        assert!(display.contains("Channel             mychan"), "display missing channel:\n{display}");
+        assert!(display.contains("RTC User            alice"), "display missing RTC user:\n{display}");
     }
 
     #[test]
     fn decoded_rtm_token_surfaces_user() {
-        let token = build_token_rtm(TEST_APP_ID, TEST_APP_CERT, "alice_rtm", 3600, 0).unwrap();
+        let token =
+            build_token_rtm(TEST_APP_ID, TEST_APP_CERT, "alice_rtm", 3600, 0).unwrap();
         let info = decode_token(&token).unwrap();
         let display = info.display();
-        assert!(
-            display.contains("RTM User            alice_rtm"),
-            "display missing RTM user:\n{display}"
-        );
+        assert!(display.contains("RTM User            alice_rtm"), "display missing RTM user:\n{display}");
     }
 
     #[test]
     fn decoded_combined_token_surfaces_both_users_and_channel() {
         let token = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "combined_chan",
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "combined_chan",
+            RtcAccount::parse("42"), Role::Publisher, 3600, 3600,
             Some("rtm_alice"),
         )
         .unwrap();
@@ -1079,13 +970,8 @@ mod tests {
     fn display_shows_version_validity_and_sections() {
         // Build a token issued at a known ts so we can check the validity output.
         let token = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "demo",
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "demo",
+            RtcAccount::parse("42"), Role::Publisher, 3600, 3600,
             Some("alice"),
         )
         .unwrap();
@@ -1095,12 +981,9 @@ mod tests {
         let display = info.display_at(now);
 
         // Section headers
-        assert!(
-            display.contains("TOKEN INFO"),
-            "missing TOKEN INFO:\n{display}"
-        );
-        assert!(display.contains("VALIDITY"), "missing VALIDITY:\n{display}");
-        assert!(display.contains("SERVICES"), "missing SERVICES:\n{display}");
+        assert!(display.contains("TOKEN INFO"),  "missing TOKEN INFO:\n{display}");
+        assert!(display.contains("VALIDITY"),    "missing VALIDITY:\n{display}");
+        assert!(display.contains("SERVICES"),    "missing SERVICES:\n{display}");
 
         // Version
         assert!(display.contains("Version"));
@@ -1110,10 +993,8 @@ mod tests {
         assert!(display.contains("Valid from"));
         assert!(display.contains("Valid until"));
         assert!(display.contains("Valid now"));
-        assert!(
-            display.contains("expires in 30m 0s"),
-            "expected 'expires in 30m 0s', got:\n{display}"
-        );
+        assert!(display.contains("expires in 30m 0s"),
+            "expected 'expires in 30m 0s', got:\n{display}");
 
         // Service data
         assert!(display.contains("RTC"));
@@ -1130,13 +1011,8 @@ mod tests {
     #[test]
     fn display_flags_expired_token() {
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "c",
-            RtcAccount::parse("1"),
-            Role::Publisher,
-            60,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Publisher, 60, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
@@ -1148,33 +1024,25 @@ mod tests {
     #[test]
     fn display_flags_not_yet_valid_token() {
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "c",
-            RtcAccount::parse("1"),
-            Role::Publisher,
-            60,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Publisher, 60, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
         // Simulate a "now" before the token was issued (clock skew case)
         let earlier = info.issue_ts as u64 - 120;
         let display = info.display_at(earlier);
-        assert!(
-            display.contains("not yet valid"),
-            "expected 'not yet valid':\n{display}"
-        );
+        assert!(display.contains("not yet valid"), "expected 'not yet valid':\n{display}");
     }
 
     #[test]
     fn format_relative_duration_always_ends_in_seconds() {
-        assert_eq!(format_relative_duration(0), "0s");
-        assert_eq!(format_relative_duration(45), "45s");
-        assert_eq!(format_relative_duration(60), "1m 0s");
-        assert_eq!(format_relative_duration(90), "1m 30s");
-        assert_eq!(format_relative_duration(3600), "1h 0m 0s");
-        assert_eq!(format_relative_duration(3665), "1h 1m 5s");
+        assert_eq!(format_relative_duration(0),      "0s");
+        assert_eq!(format_relative_duration(45),     "45s");
+        assert_eq!(format_relative_duration(60),     "1m 0s");
+        assert_eq!(format_relative_duration(90),     "1m 30s");
+        assert_eq!(format_relative_duration(3600),   "1h 0m 0s");
+        assert_eq!(format_relative_duration(3665),   "1h 1m 5s");
         assert_eq!(format_relative_duration(86_400), "1d 0h 0m 0s");
         assert_eq!(format_relative_duration(90_061), "1d 1h 1m 1s");
     }
@@ -1184,41 +1052,22 @@ mod tests {
         // Structural check: decode_token's ServiceInfo should carry channel +
         // rtc_user_id for RTC, rtm_user_id for RTM, and no cross-contamination.
         let token = build_token_rtc_with_rtm(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "xx",
-            RtcAccount::parse("rtc_acc"),
-            Role::Publisher,
-            3600,
-            3600,
+            TEST_APP_ID, TEST_APP_CERT, "xx",
+            RtcAccount::parse("rtc_acc"), Role::Publisher, 3600, 3600,
             Some("rtm_acc"),
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
 
-        let rtc = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
-            .unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == core::SERVICE_RTC).unwrap();
         assert_eq!(rtc.channel.as_deref(), Some("xx"));
         assert_eq!(rtc.rtc_user_id.as_deref(), Some("rtc_acc"));
-        assert!(
-            rtc.rtm_user_id.is_none(),
-            "RTC service must not carry rtm_user_id"
-        );
+        assert!(rtc.rtm_user_id.is_none(), "RTC service must not carry rtm_user_id");
 
-        let rtm = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTM)
-            .unwrap();
+        let rtm = info.services.iter().find(|s| s.service_type == core::SERVICE_RTM).unwrap();
         assert_eq!(rtm.rtm_user_id.as_deref(), Some("rtm_acc"));
         assert!(rtm.channel.is_none(), "RTM service must not carry channel");
-        assert!(
-            rtm.rtc_user_id.is_none(),
-            "RTM service must not carry rtc_user_id"
-        );
+        assert!(rtm.rtc_user_id.is_none(), "RTM service must not carry rtc_user_id");
     }
 
     // ── Edge cases ────────────────────────────────────────────────────────
@@ -1246,21 +1095,12 @@ mod tests {
         // Agora caps string accounts at 255 bytes. Build one of exactly 255.
         let long = "a".repeat(255);
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse(&long),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse(&long), Role::Publisher, 3600, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
-        let rtc = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
-            .unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == core::SERVICE_RTC).unwrap();
         assert_eq!(rtc.rtc_user_id.as_deref(), Some(long.as_str()));
     }
 
@@ -1270,21 +1110,12 @@ mod tests {
         // our decode correctly reconstructs a realistic channel name.
         let channel = "room-42@agora.io:1";
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            channel,
-            RtcAccount::parse("42"),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, channel,
+            RtcAccount::parse("42"), Role::Publisher, 3600, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
-        let rtc = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
-            .unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == core::SERVICE_RTC).unwrap();
         assert_eq!(rtc.channel.as_deref(), Some(channel));
     }
 
@@ -1294,21 +1125,12 @@ mod tests {
         // get_uid_str(0) returns "" (sentinel), so the token carries an empty
         // uid string, not "0". This is the correct behaviour for int uid 0.
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("0"),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("0"), Role::Publisher, 3600, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
-        let rtc = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
-            .unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == core::SERVICE_RTC).unwrap();
         assert_eq!(rtc.rtc_user_id.as_deref(), Some(""));
     }
 
@@ -1317,45 +1139,27 @@ mod tests {
         // In contrast to int uid 0, a string account "0" (passed via s/0)
         // stores the literal "0" in the token — no "server assigns" sentinel.
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "chan",
-            RtcAccount::parse("s/0"),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "chan",
+            RtcAccount::parse("s/0"), Role::Publisher, 3600, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
-        let rtc = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
-            .unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == core::SERVICE_RTC).unwrap();
         assert_eq!(rtc.rtc_user_id.as_deref(), Some("0"));
     }
 
     #[test]
     fn rtc_publisher_token_has_all_four_privileges() {
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "c",
-            RtcAccount::parse("1"),
-            Role::Publisher,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Publisher, 3600, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
-        let rtc = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
-            .unwrap();
+        let rtc = info.services.iter().find(|s| s.service_type == core::SERVICE_RTC).unwrap();
         use atem_core::token::{
-            PRIVILEGE_JOIN_CHANNEL, PRIVILEGE_PUBLISH_AUDIO_STREAM, PRIVILEGE_PUBLISH_DATA_STREAM,
-            PRIVILEGE_PUBLISH_VIDEO_STREAM,
+            PRIVILEGE_JOIN_CHANNEL, PRIVILEGE_PUBLISH_AUDIO_STREAM,
+            PRIVILEGE_PUBLISH_VIDEO_STREAM, PRIVILEGE_PUBLISH_DATA_STREAM,
         };
         assert!(rtc.privileges.contains_key(&PRIVILEGE_JOIN_CHANNEL));
         assert!(rtc.privileges.contains_key(&PRIVILEGE_PUBLISH_AUDIO_STREAM));
@@ -1366,22 +1170,15 @@ mod tests {
     #[test]
     fn rtc_subscriber_token_has_only_join_channel() {
         let token = build_token_rtc(
-            TEST_APP_ID,
-            TEST_APP_CERT,
-            "c",
-            RtcAccount::parse("1"),
-            Role::Subscriber,
-            3600,
-            0,
+            TEST_APP_ID, TEST_APP_CERT, "c",
+            RtcAccount::parse("1"), Role::Subscriber, 3600, 0,
         )
         .unwrap();
         let info = decode_token(&token).unwrap();
-        let rtc = info
-            .services
-            .iter()
-            .find(|s| s.service_type == SERVICE_TYPE_RTC)
-            .unwrap();
-        use atem_core::token::{PRIVILEGE_JOIN_CHANNEL, PRIVILEGE_PUBLISH_AUDIO_STREAM};
+        let rtc = info.services.iter().find(|s| s.service_type == core::SERVICE_RTC).unwrap();
+        use atem_core::token::{
+            PRIVILEGE_JOIN_CHANNEL, PRIVILEGE_PUBLISH_AUDIO_STREAM,
+        };
         assert!(rtc.privileges.contains_key(&PRIVILEGE_JOIN_CHANNEL));
         assert!(!rtc.privileges.contains_key(&PRIVILEGE_PUBLISH_AUDIO_STREAM));
     }
@@ -1392,17 +1189,11 @@ mod tests {
         // Skipped unless AGORA_APP_ID and AGORA_APP_CERTIFICATE are set.
         let app_id = match std::env::var("AGORA_APP_ID") {
             Ok(v) if !v.is_empty() => v,
-            _ => {
-                eprintln!("skipped: AGORA_APP_ID not set");
-                return;
-            }
+            _ => { eprintln!("skipped: AGORA_APP_ID not set"); return; }
         };
         let app_cert = match std::env::var("AGORA_APP_CERTIFICATE") {
             Ok(v) if !v.is_empty() => v,
-            _ => {
-                eprintln!("skipped: AGORA_APP_CERTIFICATE not set");
-                return;
-            }
+            _ => { eprintln!("skipped: AGORA_APP_CERTIFICATE not set"); return; }
         };
 
         let token_str = build_token_rtc(
