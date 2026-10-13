@@ -11,6 +11,11 @@ use crate::app::{App, AppMode};
 
 pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
+    frame.render_widget(Clear, size);
+    if matches!(app.mode, AppMode::CodexChat | AppMode::ClaudeChat) {
+        draw_terminal_view(frame, app);
+        return;
+    }
 
     // Create layout
     let chunks = Layout::default()
@@ -41,13 +46,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     match app.mode {
         AppMode::MainMenu => draw_main_menu(frame, chunks[1], app),
         AppMode::TokenGeneration => draw_output_view(frame, chunks[1], app),
-        AppMode::ClaudeChat => {
-            if app.astation_connected {
-                draw_output_view(frame, chunks[1], app)
-            } else {
-                draw_claude_panel(frame, chunks[1], app)
-            }
-        }
+        AppMode::ClaudeChat => draw_claude_panel(frame, chunks[1], app),
         AppMode::CommandExecution => draw_command_input(frame, chunks[1], app),
         AppMode::CodexChat => draw_codex_panel(frame, chunks[1], app),
         AppMode::AgentPanel => draw_agent_panel(frame, chunks[1], app),
@@ -57,9 +56,10 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     let base_footer = match app.mode {
         AppMode::MainMenu => "\u{2191}\u{2193}/jk: Navigate | Enter: Select | q: Quit",
         AppMode::CommandExecution => "Type command + Enter | b: Back | q: Quit",
-        AppMode::CodexChat => "All input goes to Codex | Ctrl+B: Back to menu",
-        AppMode::ClaudeChat => "All input goes to Claude | Ctrl+B: Back to menu",
-        AppMode::AgentPanel => "\u{2191}\u{2193}/jk: Navigate | Enter: Set Active | r: Refresh | b: Back",
+        AppMode::CodexChat | AppMode::ClaudeChat => "Use the Atem prefix for terminal controls",
+        AppMode::AgentPanel => {
+            "\u{2191}\u{2193}/jk: Navigate | Enter: Set Active | r: Refresh | b: Back"
+        }
         AppMode::TokenGeneration if !app.cached_projects.is_empty() => {
             if app.show_certificates {
                 "s: Hide Certificates | b: Back | q: Quit"
@@ -134,7 +134,10 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
                 .ok()
                 .map(|trust| trust.verification_status(astation_id))
         });
-        (paired_status_line(id, status), Style::default().fg(Color::Cyan))
+        (
+            paired_status_line(id, status),
+            Style::default().fg(Color::Cyan),
+        )
     } else {
         (
             "\u{26a0}\u{fe0f}  Not logged in — run `atem login` or `atem pair`".to_string(),
@@ -148,7 +151,7 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
 
     // Pairing banner: show when not connected to Astation
     let pairing_line = if !app.astation_connected {
-        Some("Connect to Astation to unlock Claude, Codex, and Agent features")
+        Some("Connect to Astation for remote agent control and connected features")
     } else {
         None
     };
@@ -158,20 +161,14 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
     // Split area: status lines + menu list
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(num_status_lines),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(num_status_lines), Constraint::Min(0)])
         .split(area);
 
     if let Some(pairing_text) = pairing_line {
         // Two status lines: credential + pairing
         let status_chunks = ratatui::layout::Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(chunks[0]);
 
         frame.render_widget(cred_paragraph, status_chunks[0]);
@@ -261,188 +258,164 @@ pub(crate) fn draw_command_input(frame: &mut Frame, area: ratatui::layout::Rect,
 }
 
 pub(crate) fn draw_codex_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let border_color = if app.voice_active {
-        super::voice_fx::border_color(app.voice_volume)
-    } else {
-        Color::Green
-    };
-    let terminal_block = Block::default()
-        .borders(Borders::ALL)
-        .title("Codex Terminal [Ctrl+B: back to menu]")
-        .border_style(Style::default().fg(border_color));
-    let terminal_inner = terminal_block.inner(area);
-    frame.render_widget(terminal_block, area);
+    let screen = app
+        .terminal_ui
+        .browse
+        .as_ref()
+        .map_or(app.codex_terminal.screen(), |b| &b.screen);
+    draw_terminal_screen(
+        frame,
+        area,
+        screen,
+        app.terminal_ui.browse.as_ref(),
+        app.terminal_ui.help,
+    );
+}
 
-    app.adjust_codex_terminal_size(terminal_inner.height, terminal_inner.width);
+pub(crate) fn draw_claude_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let screen = app
+        .terminal_ui
+        .browse
+        .as_ref()
+        .map_or(app.claude_terminal.screen(), |b| &b.screen);
+    draw_terminal_screen(
+        frame,
+        area,
+        screen,
+        app.terminal_ui.browse.as_ref(),
+        app.terminal_ui.help,
+    );
+}
 
-    if terminal_inner.width > 0 && terminal_inner.height > 0 {
-        let screen = app.codex_terminal.screen();
-        let cursor_pos = screen.cursor_position();
-        let cursor_hidden = screen.hide_cursor();
-
-        {
-            let buffer = frame.buffer_mut();
-            for row in 0..terminal_inner.height {
-                let mut col = 0;
-                while col < terminal_inner.width {
-                    let gx = terminal_inner.x + col;
-                    let gy = terminal_inner.y + row;
-
-                    let cell_opt = screen.cell(row, col);
-                    if let Some(cell) = cell_opt {
-                        if cell.is_wide_continuation() {
-                            if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                                buf_cell.set_symbol(" ").set_style(Style::default());
-                            }
-                            col += 1;
-                            continue;
-                        }
-
-                        let mut symbol = cell.contents();
-                        if symbol.is_empty() {
-                            symbol.push(' ');
-                        }
-
-                        let style = style_from_cell(cell);
-                        if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                            buf_cell.set_symbol(symbol.as_str()).set_style(style);
-                        }
-
-                        if cell.is_wide() && col + 1 < terminal_inner.width {
-                            let gx_next = terminal_inner.x + col + 1;
-                            if let Some(buf_cell) = buffer.cell_mut((gx_next, gy)) {
-                                buf_cell.set_symbol(" ").set_style(style);
-                            }
-                            col += 2;
-                        } else {
-                            col += 1;
-                        }
-                    } else {
-                        if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                            buf_cell.set_symbol(" ").set_style(Style::default());
-                        }
-                        col += 1;
-                    }
-                }
+fn draw_terminal_screen(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    screen: &vt100::Screen,
+    browse: Option<&super::terminal_view::Browse>,
+    help: bool,
+) {
+    let buffer = frame.buffer_mut();
+    for row in 0..area.height {
+        for col in 0..area.width {
+            let Some(target) = buffer.cell_mut((area.x + col, area.y + row)) else {
+                continue;
+            };
+            let Some(cell) = screen.cell(row, col) else {
+                target.set_symbol(" ").set_style(Style::default());
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                target.set_symbol(" ").set_skip(true);
+                continue;
             }
-
-            if !cursor_hidden {
-                let (cursor_row, cursor_col) = cursor_pos;
-                if cursor_row < terminal_inner.height && cursor_col < terminal_inner.width {
-                    let gx = terminal_inner.x + cursor_col;
-                    let gy = terminal_inner.y + cursor_row;
-                    let base_style = screen
-                        .cell(cursor_row, cursor_col)
-                        .map(style_from_cell)
-                        .unwrap_or_else(Style::default);
-                    let mut symbol = screen
-                        .cell(cursor_row, cursor_col)
-                        .map(|cell| cell.contents())
-                        .unwrap_or_else(|| " ".to_string());
-                    if symbol.is_empty() {
-                        symbol.push(' ');
-                    }
-                    if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                        buf_cell
-                            .set_symbol(symbol.as_str())
-                            .set_style(base_style.add_modifier(Modifier::REVERSED));
-                    }
-                }
+            let symbol = cell.contents();
+            let clipped_wide = cell.is_wide() && col + 1 == area.width;
+            let mut style = style_from_cell(cell);
+            if browse.is_some_and(|b| {
+                b.selected(row, col)
+                    || b.cursor == (row, col)
+                    || (cell.is_wide() && b.cursor == (row, col + 1))
+            }) {
+                style = style.add_modifier(Modifier::REVERSED);
             }
+            target
+                .set_symbol(if symbol.is_empty() || clipped_wide {
+                    " "
+                } else {
+                    &symbol
+                })
+                .set_style(style);
+        }
+    }
+    if !help && browse.is_none() && !screen.hide_cursor() {
+        let (row, col) = screen.cursor_position();
+        if row < area.height && col < area.width {
+            frame.set_cursor_position((area.x + col, area.y + row));
         }
     }
 }
 
-pub(crate) fn draw_claude_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let border_color = if app.voice_active {
-        super::voice_fx::border_color(app.voice_volume)
+fn draw_terminal_view(frame: &mut Frame, app: &mut App) {
+    let size = frame.area();
+    let area = super::terminal_view::viewport(size);
+    let (provider, input) = if matches!(app.mode, AppMode::CodexChat) {
+        draw_codex_panel(frame, area, app);
+        ("Codex", &app.codex_sender)
     } else {
-        Color::Green
+        draw_claude_panel(frame, area, app);
+        ("Claude", &app.claude_sender)
     };
-    let terminal_block = Block::default()
-        .borders(Borders::ALL)
-        .title("Claude Terminal [Ctrl+B: back to menu]")
-        .border_style(Style::default().fg(border_color));
-    let terminal_inner = terminal_block.inner(area);
-    frame.render_widget(terminal_block, area);
-
-    app.adjust_claude_terminal_size(terminal_inner.height, terminal_inner.width);
-
-    if terminal_inner.width > 0 && terminal_inner.height > 0 {
-        let screen = app.claude_terminal.screen();
-        let cursor_pos = screen.cursor_position();
-        let cursor_hidden = screen.hide_cursor();
-
-        {
-            let buffer = frame.buffer_mut();
-            for row in 0..terminal_inner.height {
-                let mut col = 0;
-                while col < terminal_inner.width {
-                    let gx = terminal_inner.x + col;
-                    let gy = terminal_inner.y + row;
-
-                    let cell_opt = screen.cell(row, col);
-                    if let Some(cell) = cell_opt {
-                        if cell.is_wide_continuation() {
-                            if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                                buf_cell.set_symbol(" ").set_style(Style::default());
-                            }
-                            col += 1;
-                            continue;
-                        }
-
-                        let mut symbol = cell.contents();
-                        if symbol.is_empty() {
-                            symbol.push(' ');
-                        }
-
-                        let style = style_from_cell(cell);
-                        if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                            buf_cell.set_symbol(symbol.as_str()).set_style(style);
-                        }
-
-                        if cell.is_wide() && col + 1 < terminal_inner.width {
-                            let gx_next = terminal_inner.x + col + 1;
-                            if let Some(buf_cell) = buffer.cell_mut((gx_next, gy)) {
-                                buf_cell.set_symbol(" ").set_style(style);
-                            }
-                            col += 2;
-                        } else {
-                            col += 1;
-                        }
-                    } else {
-                        if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                            buf_cell.set_symbol(" ").set_style(Style::default());
-                        }
-                        col += 1;
-                    }
-                }
-            }
-
-            if !cursor_hidden {
-                let (cursor_row, cursor_col) = cursor_pos;
-                if cursor_row < terminal_inner.height && cursor_col < terminal_inner.width {
-                    let gx = terminal_inner.x + cursor_col;
-                    let gy = terminal_inner.y + cursor_row;
-                    let base_style = screen
-                        .cell(cursor_row, cursor_col)
-                        .map(style_from_cell)
-                        .unwrap_or_default();
-                    let mut symbol = screen
-                        .cell(cursor_row, cursor_col)
-                        .map(|cell| cell.contents())
-                        .unwrap_or_else(|| " ".to_string());
-                    if symbol.is_empty() {
-                        symbol.push(' ');
-                    }
-                    if let Some(buf_cell) = buffer.cell_mut((gx, gy)) {
-                        buf_cell
-                            .set_symbol(symbol.as_str())
-                            .set_style(base_style.add_modifier(Modifier::REVERSED));
-                    }
-                }
-            }
+    let prefix = app.terminal_ui.prefix.label();
+    let text = if app.terminal_ui.help {
+        "atem | Esc: close help | Up/Down: scroll details".to_string()
+    } else if app.terminal_ui.pending {
+        format!("{prefix} | h:menu g:take x:stop r:redraw [:history c:copy ?:help")
+    } else if let Some(browse) = &app.terminal_ui.browse {
+        format!(
+            "atem | history +{} | arrows:move Space:select Enter:copy PgUp/PgDn:scroll Esc:live",
+            browse.offset
+        )
+    } else if let Some((message, _)) = app
+        .terminal_ui
+        .feedback
+        .as_ref()
+        .filter(|(_, when)| when.elapsed().as_secs() < 4)
+    {
+        format!("atem | {message}")
+    } else {
+        let control = if input.as_ref().is_some_and(|s| s.remote_controlled()) {
+            "remote"
+        } else {
+            "local"
+        };
+        let link = if app.astation_connected {
+            "online"
+        } else {
+            "offline"
+        };
+        let notice = if app.terminal_ui.messages.is_empty() {
+            ""
+        } else {
+            " | notice"
+        };
+        format!("atem | {provider} | {control} | Astation {link}{notice} | {prefix} then ?:help")
+    };
+    if size.height > 0 {
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(if app.voice_active {
+                super::voice_fx::border_color(app.voice_volume)
+            } else {
+                Color::Cyan
+            })),
+            ratatui::layout::Rect {
+                y: size.y + size.height - 1,
+                height: 1,
+                ..size
+            },
+        );
+    }
+    if app.terminal_ui.help {
+        let area = centered_rect(85, 85, size);
+        frame.render_widget(Clear, area);
+        let mut text = format!(
+            "{prefix}, then:\n\nh / m  Hide terminal; keep the agent running\ng      Take control locally\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
+        );
+        for message in app.terminal_ui.messages.iter().rev() {
+            text.push('\n');
+            text.push_str(message);
+            text.push('\n');
         }
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((app.terminal_ui.help_scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Atem terminal controls"),
+                ),
+            area,
+        );
     }
 }
 
@@ -533,10 +506,10 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
             };
 
             let status_icon = match info.status {
-                AgentStatus::Idle => "\u{26aa}",            // grey circle
-                AgentStatus::Thinking => "\u{1f7e1}",       // yellow circle
+                AgentStatus::Idle => "\u{26aa}",             // grey circle
+                AgentStatus::Thinking => "\u{1f7e1}",        // yellow circle
                 AgentStatus::WaitingForInput => "\u{1f7e2}", // green circle
-                AgentStatus::Disconnected => "\u{1f534}",   // red circle
+                AgentStatus::Disconnected => "\u{1f534}",    // red circle
             };
 
             let active_marker = if is_active { " \u{2605}" } else { "" }; // ★
@@ -544,7 +517,11 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
             let kind_label = format!("{:?}", info.kind);
             let sessions = info.session_ids.len();
             let session_info = if sessions > 0 {
-                format!(" ({} session{})", sessions, if sessions == 1 { "" } else { "s" })
+                format!(
+                    " ({} session{})",
+                    sessions,
+                    if sessions == 1 { "" } else { "s" }
+                )
             } else {
                 String::new()
             };
@@ -577,11 +554,12 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
         })
         .collect();
 
-    let active_label = app
-        .active_agent_id
-        .as_deref()
-        .unwrap_or("none");
-    let title = format!(" \u{1f916} Agent Panel — {} agents | active: {} ", agents.len(), active_label);
+    let active_label = app.active_agent_id.as_deref().unwrap_or("none");
+    let title = format!(
+        " \u{1f916} Agent Panel — {} agents | active: {} ",
+        agents.len(),
+        active_label
+    );
 
     let list = List::new(items)
         .block(
@@ -596,11 +574,8 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
 }
 
 pub(crate) fn style_from_cell(cell: &VtCell) -> Style {
-    let mut fg = vt_color_to_tui(cell.fgcolor());
-    let mut bg = vt_color_to_tui(cell.bgcolor());
-    if cell.inverse() {
-        std::mem::swap(&mut fg, &mut bg);
-    }
+    let fg = vt_color_to_tui(cell.fgcolor());
+    let bg = vt_color_to_tui(cell.bgcolor());
 
     let mut style = Style::default();
     if fg != Color::Reset {
@@ -608,6 +583,9 @@ pub(crate) fn style_from_cell(cell: &VtCell) -> Style {
     }
     if bg != Color::Reset {
         style = style.bg(bg);
+    }
+    if cell.inverse() {
+        style = style.add_modifier(Modifier::REVERSED);
     }
     if cell.bold() {
         style = style.add_modifier(Modifier::BOLD);
@@ -625,6 +603,186 @@ pub(crate) fn style_from_cell(cell: &VtCell) -> Style {
 mod paired_status_tests {
     use super::paired_status_line;
     use crate::memory::trust::VerificationStatus;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Recording(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Recording {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reverse_video_preserves_default_colors_and_explicit_colors() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[7mdefault\x1b[0m\r\n\x1b[31;44;7mcolored");
+        let default = super::style_from_cell(parser.screen().cell(0, 0).unwrap());
+        assert!(
+            default
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        let colored = super::style_from_cell(parser.screen().cell(1, 0).unwrap());
+        assert_eq!(colored.fg, Some(ratatui::style::Color::Indexed(1)));
+        assert_eq!(colored.bg, Some(ratatui::style::Color::Indexed(4)));
+        assert!(
+            colored
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn connected_claude_keeps_the_terminal_renderer_and_size() {
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = crate::app::App::new();
+        app.mode = crate::app::AppMode::ClaudeChat;
+        app.astation_connected = true;
+        app.adjust_claude_terminal_size(39, 100);
+        terminal
+            .draw(|frame| super::draw_ui(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.claude_terminal.screen().size(), (39, 100));
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("atem | Claude | local"));
+    }
+
+    #[test]
+    fn ansi_redraw_clears_stale_art_and_keeps_one_footer_and_native_cursor() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let backend = ratatui::backend::CrosstermBackend::new(Recording(bytes.clone()));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 25)),
+            },
+        )
+        .unwrap();
+        let mut app = crate::app::App::new();
+        app.mode = crate::app::AppMode::CodexChat;
+        app.adjust_codex_terminal_size(24, 80);
+        app.codex_terminal
+            .process("\x1b[4;40H\u{28ff}\u{28fe}\u{28fc}\x1b[24;1H? for shortcuts".as_bytes());
+        let mut outer = vt100::Parser::new(25, 80, 0);
+        terminal
+            .draw(|frame| super::draw_ui(frame, &mut app))
+            .unwrap();
+        outer.process(&std::mem::take(&mut *bytes.lock().unwrap()));
+        assert!(outer.screen().contents().contains('\u{28ff}'));
+
+        app.codex_terminal.process("\x1b[2J\x1b[HATEM_READY \u{4e2d}\u{6587}\x1b[24;1H? for shortcuts\x1b[24;55H2 warnings\x1b[23;3H\x1b[?25h".as_bytes());
+        app.status_message = Some("A very long credential notification that belongs in details, never over the agent screen".repeat(10));
+        app.terminal_ui.observe_status(&app.status_message);
+        terminal
+            .draw(|frame| super::draw_ui(frame, &mut app))
+            .unwrap();
+        outer.process(&std::mem::take(&mut *bytes.lock().unwrap()));
+        let text = outer.screen().contents();
+        assert!(!text.contains('\u{28ff}'));
+        assert_eq!(text.matches("? for shortcuts").count(), 1);
+        assert_eq!(text.matches("2 warnings").count(), 1);
+        assert_eq!(text.matches("atem |").count(), 1);
+        assert!(!text.contains("credential notification"));
+        assert_eq!(outer.screen().cursor_position(), (22, 2));
+        assert!(!outer.screen().hide_cursor());
+        for row in 0..24 {
+            for col in 0..80 {
+                let actual = outer.screen().cell(row, col).unwrap().contents();
+                let expected = app
+                    .codex_terminal
+                    .screen()
+                    .cell(row, col)
+                    .unwrap()
+                    .contents();
+                assert_eq!(actual.trim_end(), expected.trim_end(), "cell {row},{col}");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_codex_repaints_match_the_canonical_grid_without_stale_animation() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/codex-terminal-repaint.json"
+        ))
+        .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(Recording(bytes.clone())),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 152, 52)),
+            },
+        )
+        .unwrap();
+        let mut app = crate::app::App::new();
+        app.mode = crate::app::AppMode::CodexChat;
+        app.adjust_codex_terminal_size(51, 152);
+        let mut outer = vt100::Parser::new(52, 152, 0);
+        let mut saw_animation = false;
+        for (index, frame) in fixture["frames"].as_array().unwrap().iter().enumerate() {
+            // Real Codex clears its animation with incremental edits, without a full clear.
+            for chunk in frame.as_str().unwrap().as_bytes().chunks(37) {
+                app.codex_terminal.process(chunk);
+            }
+            terminal
+                .draw(|frame| super::draw_ui(frame, &mut app))
+                .unwrap();
+            outer.process(&std::mem::take(&mut *bytes.lock().unwrap()));
+            let dots = outer
+                .screen()
+                .contents()
+                .chars()
+                .filter(|c| ('\u{2800}'..='\u{28ff}').contains(c))
+                .count();
+            saw_animation |= dots > 100;
+            for row in 0..51 {
+                for col in 0..152 {
+                    let expected = app.codex_terminal.screen().cell(row, col).unwrap();
+                    let actual = outer.screen().cell(row, col).unwrap();
+                    assert_eq!(
+                        actual.contents().trim_end(),
+                        expected.contents().trim_end(),
+                        "frame {index}, cell {row},{col}"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_animation,
+            "fixture must exercise the original animation"
+        );
+        let text = outer.screen().contents();
+        // Codex's live status spinner is valid output and must be preserved.
+        assert!(
+            text.chars()
+                .filter(|c| ('\u{2800}'..='\u{28ff}').contains(c))
+                .count()
+                <= 1
+        );
+        assert_eq!(text.matches("atem |").count(), 1);
+        assert_eq!(
+            outer.screen().cursor_position(),
+            app.codex_terminal.screen().cursor_position()
+        );
+        assert_eq!(
+            outer.screen().hide_cursor(),
+            app.codex_terminal.screen().hide_cursor()
+        );
+    }
 
     #[test]
     fn the_paired_line_shows_the_verification() {

@@ -1288,7 +1288,7 @@ impl KeyAgentClient {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::SeqCst) {
-                eprintln!("{OLDER_BUILD}");
+                crate::diagnostics::warn(OLDER_BUILD);
             }
             if let Ok(mut older) = self.older_build.lock() {
                 *older = Some(OLDER_BUILD.to_string());
