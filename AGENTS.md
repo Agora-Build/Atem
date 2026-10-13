@@ -137,7 +137,7 @@ scripts/
 ├── run-local-dev-tests.sh # End-to-end CLI smoke test
 ├── check-atem-core-ffi.sh # Build atem-core-ffi, run the C (and macOS Swift) consumers
 ├── package-atem-core-macos.sh # Universal AtemCore.xcframework + header + SHA-256 sums (macOS)
-├── update-convoai-toolkit.sh # Refresh vendored assets/convo/ (pinned upstream commit)
+├── update-convoai-toolkit.sh # Refresh vendored assets/convo/ (pinned upstream commit; deps from scripts/convoai-toolkit/package-lock.json, esbuild pinned; UPDATE_LOCK=1 re-resolves)
 └── test-create-agent.sh # ConvoAI agent creation (requires env vars)
 designs/
 ├── agent-visualize.md   # Agent diagram generation
@@ -420,7 +420,7 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   drives Agora ConvoAI v2 (`/join`, `/leave`). Config loaded from
   `~/.config/atem/convo.toml` (override via `--config`). Page uses the vendored
   Conversational-AI-Demo toolkit at `assets/convo/` (refreshed by
-  `scripts/update-convoai-toolkit.sh`, stale bundles blocked at release time).
+  `scripts/update-convoai-toolkit.sh`, reproducible from a committed lockfile and pinned esbuild, stale bundles blocked at release time).
   Features: live transcription (RTM), preset checkboxes, avatar video
   (Akool/LiveAvatar/Anam), RTC Stats, API History, camera toggle,
   RTC encryption (key + base64 salt sent to ConvoAI as `properties.rtc.{encryption_key, encryption_salt, encryption_mode}`;
