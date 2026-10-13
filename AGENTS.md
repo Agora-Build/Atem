@@ -47,11 +47,16 @@ crates/
 src/
 ├── main.rs              # Entry point, CLI parsing (clap)
 ├── app.rs               # TUI state machine, mark task queue, Claude session management
+├── app/terminal.rs      # terminal-v1 message handling for the Claude/Codex sessions
 ├── cli.rs               # CLI command definitions
 ├── repl.rs              # Interactive REPL mode
 ├── websocket_client.rs  # Astation WebSocket protocol (message types + client)
 ├── claude_client.rs     # PTY-based Claude Code CLI integration
 ├── codex_client.rs      # PTY-based Codex terminal integration
+├── pty_session.rs       # Shared byte-oriented PTY transport (bounded input/output, write epochs)
+├── terminal_share.rs    # terminal-v1: canonical-screen ANSI frames, viewer credit, control leases over the Astation link
+├── terminal_keys.rs     # xterm key encoding for the emulated terminal
+├── diagnostics.rs       # Background warnings queued while the TUI owns the screen
 ├── token.rs             # Agora RTC/RTM token generation
 ├── rtm_client.rs        # Agora RTM FFI wrapper with async Tokio channels
 ├── ai_client.rs         # Anthropic API client for intent parsing
@@ -115,6 +120,8 @@ src/
 └── tui/
     ├── mod.rs           # Main event loop, rendering dispatch
     ├── draw.rs          # Frame rendering
+    ├── terminal_view.rs # Agent terminal view: prefix keys (ATEM_TERMINAL_PREFIX), local history/selection
+    ├── clipboard.rs     # Copy via tmux load-buffer or OSC 52
     └── voice_fx.rs      # Voice activity visual effects
 native/
 ├── include/atem_rtm.h   # C header for RTM client interface
@@ -139,7 +146,9 @@ designs/
 ├── connection-priority.md # Connection cascade: local > relay
 ├── relay-support.md     # Relay server support
 ├── voice-coding-stages.md # Voice coding implementation stages
-├── remote-agent-control.md   # Astation → atem → agent (text/voice/control keys)
+├── remote-agent-control.md   # Astation → atem → agent (text/voice/control keys, terminal-v1 proposal)
+├── local-agent-runtime.md    # Launch the original claude/codex CLI in Atem, local and remote access to one session
+├── terminal-v1-implementation.md # Shared terminal: what Atem built, wire contract, keys, limits
 ├── atem-identity.md          # instance_id + unique relay atem_id
 ├── vault.md                  # Shared cross-agent context store (relay + Postgres)
 ├── agora-account-grouping.md # Proposed: merge Astations under one Agora login (opt-in)
@@ -182,7 +191,9 @@ Key methods:
 - `AgentInput { agent_id?, kind, text?, key? }` - remote agent control: text or a control key from Astation → focused agent PTY (`handle_agent_input`)
 - Also: project lists, token requests, voice/video toggle, heartbeat, auth flow
 
-**Remote Agent Control** (`app.rs`, `websocket_client.rs`): Receives `AgentInput` from Astation and writes it to the focused agent's PTY — `kind:"text"` types a line and submits it (`\n\r`, matching `send_claude_prompt`); `kind:"key"` writes raw control bytes via `agent_key_to_bytes` (enter/esc/ctrl-c/arrows/y/n). Routes to the codex PTY when it's the active chat, else claude; no-ops if no agent session is live (v1 drives an already-running agent). Voice reuses the existing `VoiceRequest` path. See `designs/remote-agent-control.md`.
+**Remote Agent Control** (`app.rs`, `websocket_client.rs`): Receives `AgentInput` from Astation and writes it to the focused agent's PTY — `kind:"text"` types a line and submits it (`\n\r`, matching `send_claude_prompt`); `kind:"key"` writes raw control bytes via `agent_key_to_bytes` (enter/esc/ctrl-c/arrows/y/n). Routes to the codex PTY when it's the active chat, else claude; no-ops if no agent session is live (v1 drives an already-running agent). Voice reuses the existing `VoiceRequest` path. While a terminal-v1 viewer is attached, `AgentInput` is refused (a status message says to use terminal-v1) and so is any `agent_id`.
+
+**Shared terminal** (`src/terminal_share.rs`, `pty_session.rs`, `app/terminal.rs`, `tui/terminal_view.rs`): `atem agent launch [claude|claude-code|codex] [AGENT_ARGS]...` runs `tui::run_agent_tui`, which starts the installed CLI in a PTY (arguments are forwarded as separate values, with or without `--`; `CLAUDE_CLI_*`/`CODEX_CLI_*` env still apply and come first) and shows it full screen with one status row. It works without Astation. Over the authenticated Astation link, `{"type":"terminal","data":{"v":1,"op":...}}` messages (`list`, `subscribe`, `unsubscribe`, `ack`, `control`, `input`, `resize`, `stop` in; `sessions`, `attached`, `frame`, `controller`, `written`, `exited`, `error` out) let a viewer see the canonical screen as base64 ANSI frames (16 KiB per frame, 128 KiB unacknowledged, bounded queues) and, holding a control lease, send raw input bytes. Terminal ids are `claude` and `codex`; one Claude and one Codex session, one viewer each; sessions end when Atem quits. Local keys use the prefix Ctrl+] (`ATEM_TERMINAL_PREFIX` changes it): `h` hide, `g` take control back, `x` stop, `r` redraw, `[` history, `c` copy, `?` help. Background warnings go through `diagnostics` so they never write over the renderer. See `designs/terminal-v1-implementation.md` (the contract), `designs/local-agent-runtime.md` and `designs/remote-agent-control.md`.
 
 **Vault** (`vault_client.rs`): Client for the relay-hosted shared cross-agent context store. `atem vault new/list/read/write/set-summary` — a versioned, append-only store that multiple atems read/write to hand off context between their agents. Pure request builders + human/plain renderers + a thin reqwest executor (auth: `Authorization: session <id>` + `?id=<instance_id>`). The `/api/vault` endpoints + Postgres live in the relay-server (Astation repo). See `designs/vault.md`.
 

@@ -104,6 +104,9 @@ atem token rtm create --rtm-user-id bob --expire 3600
 atem token rtm decode <token>           # Decode existing Signaling (RTM) token
 ```
 
+The token code is also a Rust library, `atem-core`, in the
+[GitHub repository](https://github.com/Agora-Build/Atem/tree/main/crates/atem-core). The npm package installs the CLI only.
+
 ### Projects
 
 ```bash
@@ -261,13 +264,41 @@ done
 
 ```bash
 atem agent list                         # Scan and list detected AI agents
-atem agent launch                       # Launch Claude Code as PTY agent
-atem agent launch codex                 # Launch Codex as PTY agent
+atem agent launch                       # Open the original Claude Code CLI in an Atem terminal
+atem agent launch codex                 # Open the original Codex CLI in an Atem terminal
+atem agent launch claude --continue     # Arguments after the agent type go to that CLI: continue the last Claude session
+atem agent launch codex resume --last   # Continue the last Codex session
+atem agent launch claude -- --help      # Use -- to read the agent's own help
 atem agent connect <WS_URL>             # Connect to ACP agent and show info
 atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent
 atem agent probe <WS_URL>              # Probe URL for ACP support
 atem agent visualize "topic"            # Generate visual HTML diagram via ACP agent
 ```
+
+`atem agent launch [claude|claude-code|codex] [ARGS]...` runs the installed
+`claude` or `codex` CLI, unchanged, in a full-screen Atem terminal. It uses
+your working directory and your own login for that CLI. Nothing here replaces
+the CLI with an API conversation. It works without Astation. If you are
+paired, Astation can view the same session and take control of it (one
+viewer per session; while Astation holds control, local typing is refused until you press
+the prefix, then `g`). Quitting Atem ends the session.
+
+Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
+
+| Key | Action |
+|-----|--------|
+| `h` | Hide the terminal; the agent keeps running |
+| `g` | Take control back locally |
+| `x` | Stop the agent |
+| `r` | Redraw the screen |
+| `[` | Browse local history (arrows, Space to select, Enter to copy, Esc to return) |
+| `c` | Copy the visible text (tmux buffer inside tmux, otherwise OSC 52) |
+| `?` | Help and recent notices |
+
+Press the prefix twice to send it to the agent. Set `ATEM_TERMINAL_PREFIX`
+(for example `Ctrl-a`) to change it. The `CLAUDE_CLI_BIN`/`CLAUDE_CLI_ARGS`
+and `CODEX_CLI_BIN`/`CODEX_CLI_ARGS` variables still override the command.
+See [`designs/terminal-v1-implementation.md`](https://github.com/Agora-Build/Atem/blob/main/designs/terminal-v1-implementation.md).
 
 ## TUI Modes
 
