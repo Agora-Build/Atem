@@ -65,6 +65,8 @@ and library that disagree fail loudly. Zero the struct first
 The JSON shape and the RTC `role` values (`ATEM_CORE_ROLE_EXPLICIT`,
 `_PUBLISHER`, `_SUBSCRIBER`) are documented in the header.
 
+`atem_core_version()` reports the atem-core crate version (currently 0.1.0), independent of the Atem release version used in the asset names; pin the release asset for identity, and check `atem_core_abi_version()` for compatibility.
+
 ## Using the release artifacts (macOS)
 
 Each Atem release carries `atem-core-<version>-macos-xcframework.zip`,

@@ -36,7 +36,8 @@ let token: String = appID.withCString { app in
             var error: UnsafeMutablePointer<CChar>? = nil
             let status = atem_core_build_rtc_token(&p, &out, &error)
             if status != ATEM_CORE_OK { fail("build status \(status): \(take(error) ?? "")") }
-            return take(out) ?? fail("no token")
+            guard let token = take(out) else { fail("no token") }
+            return token
         }
     }
 }

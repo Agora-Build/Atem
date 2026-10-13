@@ -17,6 +17,6 @@ cc -std=c11 -Wall -Wextra -Werror -I "$INCLUDE" crates/atem-core-ffi/tests/c/con
 
 if [ "$(uname)" = "Darwin" ]; then
   swiftc -import-objc-header "$INCLUDE/atem_core.h" crates/atem-core-ffi/tests/swift/main.swift \
-    -Xlinker "$LIB" -o "$OUT/swift_consumer"
+    -Xlinker "$LIB" $LIBS -o "$OUT/swift_consumer"
   "$OUT/swift_consumer"
 fi

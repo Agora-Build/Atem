@@ -99,7 +99,8 @@ int32_t atem_core_build_rtm_token(const AtemCoreRtmTokenParams *params,
  */
 int32_t atem_core_decode_token(const char *token, char **out_json, char **out_error);
 
-/* *out_valid = 1 if token was signed with app_certificate, else 0. */
+/* *out_valid = 1 if token was signed with app_certificate, else 0.
+ * *out_valid is also 0 on any error. */
 int32_t atem_core_verify_token_signature(const char *token, const char *app_certificate,
                                          int32_t *out_valid, char **out_error);
 

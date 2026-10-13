@@ -214,7 +214,7 @@ pub(crate) fn parse(token: &str) -> Result<Parsed, TokenError> {
     let expire = r.u32()?;
     let salt = r.u32()?;
     let count = r.u16()?;
-    let mut services = Vec::with_capacity(count as usize);
+    let mut services = Vec::with_capacity((count as usize).min((data.len() - r.pos) / 4));
     for _ in 0..count {
         let service_type = r.u16()?;
         let n = r.u16()?;
