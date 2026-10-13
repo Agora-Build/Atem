@@ -7,3 +7,8 @@ pub mod token;
 mod wire;
 
 pub use error::TokenError;
+pub use token::{
+    DecodedService, DecodedToken, Issue, RtcIdentity, RtcPrivileges, RtcTokenRequest, RtmLogin,
+    RtmTokenRequest, ServiceDetails, build_rtc_token, build_rtm_token, decode_token,
+    verify_token_signature,
+};
