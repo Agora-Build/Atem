@@ -266,7 +266,8 @@ done
 atem agent list                         # Scan and list detected AI agents
 atem agent launch                       # Open the original Claude Code CLI in an Atem terminal
 atem agent launch codex                 # Open the original Codex CLI in an Atem terminal
-atem agent launch claude --continue     # Arguments after the agent type go to that CLI
+atem agent launch claude --continue     # Arguments after the agent type go to that CLI: continue the last Claude session
+atem agent launch codex resume --last   # Continue the last Codex session
 atem agent launch claude -- --help      # Use -- to read the agent's own help
 atem agent connect <WS_URL>             # Connect to ACP agent and show info
 atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent

@@ -219,7 +219,7 @@ pub enum AgentCommands {
         /// Agent type to launch (claude, claude-code or codex)
         #[arg(default_value = "claude-code")]
         agent_type: String,
-        /// Arguments passed to the original agent CLI (e.g. --profile oss)
+        /// Arguments passed to the original agent CLI (e.g. --continue for claude, resume --last for codex)
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
