@@ -61,5 +61,5 @@ openssl-vendored = ["openssl-sys/vendored"]
 cc = "1.0"
 
 [workspace]
-members = ["crates/atem-core"]
+members = ["crates/atem-core", "crates/atem-core-ffi"]
 resolver = "3"
