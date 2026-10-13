@@ -439,8 +439,8 @@ cargo clippy                      # Lint
 ### Token library (`atem-core`)
 
 Token generation lives in the `atem-core` crate, with a C ABI in
-`atem-core-ffi` for Swift and other native hosts (Astation uses it from
-macOS). Run its tests with `cargo test -p atem-core -p atem-core-ffi` and
+`atem-core-ffi` for Swift and other native hosts (intended for
+Astation; not integrated yet). Run its tests with `cargo test -p atem-core -p atem-core-ffi` and
 `./scripts/check-atem-core-ffi.sh`. Release assets, the C ABI and the Swift
 steps are in [`crates/atem-core-ffi/README.md`](crates/atem-core-ffi/README.md).
 

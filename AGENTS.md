@@ -41,7 +41,7 @@ The repo is a Cargo workspace: the `atem` binary at the root plus two library cr
 
 ```
 crates/
-├── atem-core/           # Agora AccessToken2 (RTC/RTM) build/decode/verify, shared with Astation; no I/O, no state
+├── atem-core/           # Agora AccessToken2 (RTC/RTM) build/decode/verify, built for Astation to share (integration is a follow-up); no I/O, no state
 │   └── tests/upstream_compat.rs  # must equal Agora's own agora_token crate (pinned git rev)
 └── atem-core-ffi/       # versioned C ABI (ABI 1) over atem-core: include/atem_core.h, module.modulemap, tests/c, tests/swift
 src/
@@ -144,7 +144,7 @@ designs/
 ├── vault.md                  # Shared cross-agent context store (relay + Postgres)
 ├── agora-account-grouping.md # Proposed: merge Astations under one Agora login (opt-in)
 ├── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
-├── atem-core.md              # atem-core token library + C ABI (Swift/Astation integration)
+├── atem-core.md              # atem-core token library + C ABI (built for a Swift/Astation integration, which is a follow-up)
 ├── e2e-encryption.md         # E2E encryption: memory, skills, vault (atem side built) + credentials (atem cred, proposed)
 ├── plans/                    # Implementation plans, kept after they ship (e.g. e2e step 2b: K in the agent)
 └── specs/                    # Completed feature specs (atem pair SSO credentials, serv convo, config convo wizard)

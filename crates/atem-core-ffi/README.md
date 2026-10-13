@@ -71,7 +71,8 @@ Each Atem release carries `atem-core-<version>-macos-xcframework.zip`,
 `atem-core-<version>-atem_core.h` and `atem-core-<version>-SHA256SUMS.txt`
 (`<version>` is the tag without the `v`).
 
-1. Download the zip and the sums file from the Atem release page.
+1. Download all three assets (the zip, the header and the sums file) from the
+   Atem release page into one directory. The sums file lists the header too.
 2. Check them: `shasum -a 256 -c atem-core-<version>-SHA256SUMS.txt`
 3. Unzip, then add `AtemCore.xcframework` to the Xcode target under
    Frameworks, Libraries. Set it to "Do Not Embed": it is a static library.

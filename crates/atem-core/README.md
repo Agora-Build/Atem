@@ -1,6 +1,6 @@
 # atem-core
 
-Shared Rust library for atem and Astation. It builds, decodes and verifies
+Rust library for atem, built to be shared with Astation. It builds, decodes and verifies
 Agora AccessToken2 tokens (version `007`) for RTC and RTM. It has no I/O, keeps
 no state and never logs. See [`designs/atem-core.md`](../../designs/atem-core.md)
 for the design. C and Swift callers use the `atem-core-ffi` crate
@@ -15,7 +15,7 @@ for string accounts, an empty certificate meaning "no token"). They live in
 The App ID and certificate below are Agora's public test values, not real
 credentials.
 
-```rust
+```rust,ignore
 use atem_core::{build_rtc_token, Issue, RtcIdentity, RtcPrivileges, RtcTokenRequest};
 
 let token = build_rtc_token(
@@ -45,7 +45,7 @@ reproducible (tests).
 
 ## Build an RTM token
 
-```rust
+```rust,ignore
 use atem_core::{build_rtm_token, Issue, RtmTokenRequest};
 
 let token = build_rtm_token(
@@ -61,7 +61,7 @@ let token = build_rtm_token(
 
 ## Decode and verify
 
-```rust
+```rust,ignore
 use atem_core::{decode_token, verify_token_signature};
 
 let decoded = decode_token(&token)?;           // app_id, issued_at, expire, services
@@ -101,8 +101,8 @@ dependency at a fixed revision) as a dev-dependency. Upstream picks the issue
 time and salt itself, so each test decodes upstream's token, rebuilds it with
 atem-core from the same issue time and salt, and requires the same string. It
 covers uid and user-account RTC tokens, publisher, subscriber and explicit
-privileges, RTC tokens with an RTM login, and RTM tokens. The published test vector is also checked byte for byte from the C and
-Swift callers.
+privileges, RTC tokens with an RTM login, and RTM tokens. The published test vector is also checked byte for byte from the C
+and Swift callers.
 
 ```bash
 cargo test -p atem-core
