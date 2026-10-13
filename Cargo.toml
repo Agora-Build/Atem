@@ -59,3 +59,7 @@ openssl-vendored = ["openssl-sys/vendored"]
 
 [build-dependencies]
 cc = "1.0"
+
+[workspace]
+members = ["crates/atem-core"]
+resolver = "3"
