@@ -55,7 +55,7 @@ dependencies = [
 [[package]]
 name = "agora_token"
 version = "0.1.0"
-source = "git+https://github.com/AgoraIO/Tools.git#374cd21f5220d2c921ec903c1eae2ee1464be651"
+source = "git+https://github.com/AgoraIO/Tools.git?rev=374cd21f5220d2c921ec903c1eae2ee1464be651#374cd21f5220d2c921ec903c1eae2ee1464be651"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -151,8 +151,8 @@ name = "atem"
 version = "0.6.13"
 dependencies = [
  "aes-gcm",
- "agora_token",
  "anyhow",
+ "atem-core",
  "base64 0.21.7",
  "cc",
  "chacha20poly1305",
@@ -198,6 +198,27 @@ dependencies = [
  "vte",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "atem-core"
+version = "0.1.0"
+dependencies = [
+ "agora_token",
+ "base64 0.22.1",
+ "flate2",
+ "getrandom 0.2.16",
+ "hmac",
+ "serde",
+ "sha2",
+]
+
+[[package]]
+name = "atem-core-ffi"
+version = "0.1.0"
+dependencies = [
+ "atem-core",
+ "serde_json",
 ]
 
 [[package]]

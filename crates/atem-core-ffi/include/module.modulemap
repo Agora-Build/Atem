@@ -1,0 +1,4 @@
+module AtemCore {
+    header "atem_core.h"
+    export *
+}

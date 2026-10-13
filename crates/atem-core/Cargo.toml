@@ -1,0 +1,20 @@
+[package]
+name = "atem-core"
+version = "0.1.0"
+edition = "2024"
+description = "Agora AccessToken2 (RTC/RTM) generation and inspection shared by atem and Astation"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+flate2 = "1.0"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+agora_token = { git = "https://github.com/AgoraIO/Tools.git", rev = "374cd21f5220d2c921ec903c1eae2ee1464be651" }
