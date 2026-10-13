@@ -436,6 +436,14 @@ cargo clippy                      # Lint
 ./scripts/release.sh 0.5.0        # Explicit version
 ```
 
+### Token library (`atem-core`)
+
+Token generation lives in the `atem-core` crate, with a C ABI in
+`atem-core-ffi` for Swift and other native hosts (Astation uses it from
+macOS). Run its tests with `cargo test -p atem-core -p atem-core-ffi` and
+`./scripts/check-atem-core-ffi.sh`. Release assets, the C ABI and the Swift
+steps are in [`crates/atem-core-ffi/README.md`](crates/atem-core-ffi/README.md).
+
 ### Release
 
 Releases are tag-driven — pushing `vX.Y.Z` triggers

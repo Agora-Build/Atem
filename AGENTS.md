@@ -24,6 +24,8 @@ cargo build --release                    # Release build
 cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
 cargo test                               # Run tests (1,250+; use -- --test-threads=1 if a test flakes)
+cargo test -p atem-core -p atem-core-ffi # Token library + C ABI tests (workspace members)
+./scripts/check-atem-core-ffi.sh         # Build libatem_core_ffi.a, drive it from C (and Swift on macOS)
 cargo check                              # Type-check without building
 cargo fmt                                # Format code
 cargo clippy --all-targets --all-features  # Lint
@@ -35,7 +37,13 @@ cargo clippy --all-targets --all-features  # Lint
 
 ### Source Structure
 
+The repo is a Cargo workspace: the `atem` binary at the root plus two library crates.
+
 ```
+crates/
+├── atem-core/           # Agora AccessToken2 (RTC/RTM) build/decode/verify, shared with Astation; no I/O, no state
+│   └── tests/upstream_compat.rs  # must equal Agora's own agora_token crate (pinned git rev)
+└── atem-core-ffi/       # versioned C ABI (ABI 1) over atem-core: include/atem_core.h, module.modulemap, tests/c, tests/swift
 src/
 ├── main.rs              # Entry point, CLI parsing (clap)
 ├── app.rs               # TUI state machine, mark task queue, Claude session management
@@ -120,6 +128,8 @@ scripts/
 ├── install.sh           # curl | bash installer (dl.agora.build)
 ├── release.sh           # Bump version + commit + tag (no push)
 ├── run-local-dev-tests.sh # End-to-end CLI smoke test
+├── check-atem-core-ffi.sh # Build atem-core-ffi, run the C (and macOS Swift) consumers
+├── package-atem-core-macos.sh # Universal AtemCore.xcframework + header + SHA-256 sums (macOS)
 ├── update-convoai-toolkit.sh # Refresh vendored assets/convo/ (pinned upstream commit)
 └── test-create-agent.sh # ConvoAI agent creation (requires env vars)
 designs/
@@ -134,6 +144,7 @@ designs/
 ├── vault.md                  # Shared cross-agent context store (relay + Postgres)
 ├── agora-account-grouping.md # Proposed: merge Astations under one Agora login (opt-in)
 ├── atem-memory.md            # Atem Memory: shared memory + skills across agents and machines
+├── atem-core.md              # atem-core token library + C ABI (Swift/Astation integration)
 ├── e2e-encryption.md         # E2E encryption: memory, skills, vault (atem side built) + credentials (atem cred, proposed)
 ├── plans/                    # Implementation plans, kept after they ship (e.g. e2e step 2b: K in the agent)
 └── specs/                    # Completed feature specs (atem pair SSO credentials, serv convo, config convo wizard)
@@ -379,6 +390,8 @@ Pushing the tag triggers GitHub Actions (`.github/workflows/release.yml`):
 1. Builds binaries for linux-x64, linux-arm64, darwin-x64, darwin-arm64
 2. Creates GitHub release with tarballed binaries
 3. Publishes `@agora-build/atem` to npm (version synced from tag)
+
+The same workflow builds the atem-core macOS package (`scripts/package-atem-core-macos.sh`) and attaches three assets to the release: `atem-core-<version>-macos-xcframework.zip`, `atem-core-<version>-atem_core.h` and `atem-core-<version>-SHA256SUMS.txt`. See `crates/atem-core-ffi/README.md`.
 
 Requires `NPM_TOKEN` secret in GitHub repo settings.
 
