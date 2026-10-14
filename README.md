@@ -151,13 +151,30 @@ Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
 
 | Key | Action |
 |-----|--------|
-| `h` | Hide the terminal; the agent keeps running |
+| `h` or `m` | Hide the terminal; the agent keeps running |
 | `g` | Take control back locally |
 | `x` | Stop the agent |
 | `r` | Redraw the screen |
 | `[` | Browse local history (arrows, Space to select, Enter to copy, Esc to return) |
 | `c` | Copy the visible text (tmux buffer inside tmux, otherwise OSC 52) |
 | `?` | Help and recent notices |
+
+The bottom row reads, for example,
+`Atem | Claude | Local | Astation ✓ | Notice | Ctrl+] then ?:help`:
+
+- `Claude` or `Codex` is the agent on screen.
+- `Local` means your keyboard drives the agent; `Remote` means Astation holds
+  control and local typing is refused until you press the prefix, then `g`.
+- `Astation ✓` means an authenticated Astation link; `Astation ✗` means none
+  (not paired, Astation unreachable, or re-authenticating). When Astation
+  challenges an open connection again (for example after it alone reconnected
+  to the relay), Atem briefly shows `Astation ✗`, drops remote viewers and
+  control, and answers with the saved session; it shows `✓` again once Astation
+  accepts. If Astation refuses or doesn't answer within 15 seconds, Atem
+  records a notice and reconnects with the saved session (a refused session
+  needs `atem pair`). Remote viewers subscribe again afterwards, view only.
+- `Notice` appears once Atem has recorded a warning or status message. Press
+  the prefix, then `?`, to read the recent notices (newest first).
 
 Press the prefix twice to send it to the agent. To change it, set
 `terminal_prefix = "Ctrl-a"` in `~/.config/atem/config.toml`, or
