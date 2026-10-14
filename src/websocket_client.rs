@@ -12,10 +12,54 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::config::AtemConfig;
 
 /// Authentication response from Astation
-enum AuthResponse {
+#[derive(Debug, PartialEq)]
+pub(crate) enum AuthResponse {
     Authenticated,
     SessionExpired,
     Denied(String),
+}
+
+/// A validated `auth_required` challenge (protocol v2).
+struct AuthChallenge {
+    astation_id: String,
+    challenge: String,
+    transport: String,
+}
+
+impl AuthChallenge {
+    fn parse(auth_required: &AstationMessage) -> Result<Self> {
+        let AstationMessage::StatusUpdate { data, .. } = auth_required else {
+            return Err(anyhow!("Invalid auth_required message"));
+        };
+        let astation_id = data
+            .get("astation_id")
+            .ok_or_else(|| anyhow!("auth_required missing astation_id"))?
+            .clone();
+        if data.get("protocol").map(String::as_str) != Some("2") {
+            return Err(anyhow!("Astation authentication protocol v2 is required"));
+        }
+        let challenge = data
+            .get("challenge")
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| anyhow!("Invalid Astation authentication challenge"))?
+            .clone();
+        let transport = data
+            .get("transport")
+            .filter(|value| matches!(value.as_str(), "loopback" | "lan" | "relay"))
+            .ok_or_else(|| anyhow!("Invalid Astation authentication transport"))?
+            .clone();
+        Ok(Self { astation_id, challenge, transport })
+    }
+}
+
+/// True for Astation's `auth_required` challenge.
+pub(crate) fn is_auth_required(message: &AstationMessage) -> bool {
+    matches!(message, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
 }
 
 struct OutboundMessage {
@@ -406,9 +450,14 @@ pub struct AstationClient {
     session_path_override: Option<std::path::PathBuf>,
     #[cfg(test)]
     relay_code_path_override: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    local_token_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
     connected_astation_id: Option<String>,
+    /// The newest challenge answered on this socket, as (astation_id,
+    /// challenge): a repeat of it is spent and is not answered again.
+    answered_challenge: Option<(String, String)>,
     /// Encryption messages held until they can be applied: ones that arrived
     /// before Astation said who it is (a pairing-code relay connection never
     /// authenticates), or during device verification.
@@ -432,8 +481,11 @@ impl AstationClient {
             session_path_override: None,
             #[cfg(test)]
             relay_code_path_override: None,
+            #[cfg(test)]
+            local_token_path_override: None,
             ws_closed: false,
             connected_astation_id: None,
+            answered_challenge: None,
             held_encryption: Vec::new(),
         }
     }
@@ -444,12 +496,28 @@ impl AstationClient {
     }
 
     #[cfg(test)]
-    fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
+    pub(crate) fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
         let mut client = Self::new();
         client.atem_id_override = Some(atem_id.to_string());
         client.relay_code_path_override = Some(session_path.with_file_name("relay-code"));
         client.session_path_override = Some(session_path);
         client
+    }
+
+    /// The connect-time challenge/response alone (no credential report).
+    #[cfg(test)]
+    pub(crate) async fn authenticate_for_test(&mut self) -> Result<()> {
+        let auth_required = self
+            .wait_for_message(is_auth_required)
+            .await
+            .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
+        self.authenticate_after_challenge(auth_required, false).await
+    }
+
+    /// Pretend the connect-time authentication pinned `astation_id`.
+    #[cfg(test)]
+    pub(crate) fn pin_astation_for_test(&mut self, astation_id: &str) {
+        self.connected_astation_id = Some(astation_id.to_string());
     }
 
     fn resolved_atem_id(&self, hostname: &str) -> String {
@@ -496,6 +564,7 @@ impl AstationClient {
             task.abort();
         }
         self.ws_closed = true;
+        self.answered_challenge = None;
     }
 
     /// Connect to Astation using a saved auth session.
@@ -611,9 +680,7 @@ impl AstationClient {
         // Wait for auth_required message (with timeout)
         let auth_required = tokio::time::timeout(
             challenge_timeout,
-            self.wait_for_message(|msg| {
-                matches!(msg, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
-            })
+            self.wait_for_message(is_auth_required)
         )
         .await
         .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
@@ -634,123 +701,46 @@ impl AstationClient {
         auth_required: AstationMessage,
         allow_pairing: bool,
     ) -> Result<()> {
-        // Extract the server identity and challenge from auth_required.
-        let (astation_id, challenge, transport, protocol) =
-            if let AstationMessage::StatusUpdate { data, .. } = &auth_required {
-                let astation_id = data
-                    .get("astation_id")
-                    .ok_or_else(|| anyhow!("auth_required missing astation_id"))?
-                    .clone();
-                (
-                    astation_id,
-                    data.get("challenge").cloned(),
-                    data.get("transport").cloned(),
-                    data.get("protocol").cloned(),
-                )
-            } else {
-                return Err(anyhow!("Invalid auth_required message"));
-            };
-        self.connected_astation_id = Some(astation_id.clone());
-
-        if protocol.as_deref() != Some("2") {
-            return Err(anyhow!("Astation authentication protocol v2 is required"));
+        // Remember who answered, even when the rest of the challenge is invalid.
+        if let AstationMessage::StatusUpdate { data, .. } = &auth_required
+            && let Some(astation_id) = data.get("astation_id")
+        {
+            self.connected_astation_id = Some(astation_id.clone());
         }
-        let challenge = challenge
-            .as_deref()
-            .filter(|value| {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-            .ok_or_else(|| anyhow!("Invalid Astation authentication challenge"))?;
-        let transport = transport
-            .as_deref()
-            .filter(|value| matches!(*value, "loopback" | "lan" | "relay"))
-            .ok_or_else(|| anyhow!("Invalid Astation authentication transport"))?;
+        let challenge = AuthChallenge::parse(&auth_required)?;
+        let astation_id = challenge.astation_id.clone();
 
-        let hostname = crate::auth::get_hostname();
-        let atem_id = self.resolved_atem_id(&hostname);
-
-        if transport == "loopback" {
-            let token = read_local_bootstrap_token()
-                .ok_or_else(|| anyhow!("Astation local bootstrap token is unavailable"))?;
-            let mut auth_data = std::collections::HashMap::new();
-            auth_data.insert("method".to_string(), "local_proof".to_string());
-            auth_data.insert("atem_id".to_string(), atem_id.clone());
-            auth_data.insert("hostname".to_string(), hostname.clone());
-            auth_data.insert(
-                "proof".to_string(),
-                device_auth_proof(&token, challenge, &astation_id, &atem_id, "local")?,
-            );
-            self.send_message(AstationMessage::StatusUpdate {
-                status: "auth".to_string(),
-                data: auth_data,
-            })
-            .await?;
-
-            return match self.wait_for_auth_response(&astation_id).await? {
-                Some(AuthResponse::Authenticated) => Ok(()),
-                Some(AuthResponse::Denied(message)) => {
-                    Err(anyhow!("Local authentication denied: {}", message))
+        if let Some(proof) = self.auth_proof(&challenge)? {
+            self.send_message(proof).await?;
+            self.answered_challenge = Some((astation_id.clone(), challenge.challenge.clone()));
+            let response = self.wait_for_auth_response(&astation_id).await?;
+            if challenge.transport == "loopback" {
+                return match response {
+                    Some(AuthResponse::Authenticated) => Ok(()),
+                    Some(AuthResponse::Denied(message)) => {
+                        Err(anyhow!("Local authentication denied: {}", message))
+                    }
+                    Some(AuthResponse::SessionExpired) => {
+                        Err(anyhow!("Unexpected local session expiry"))
+                    }
+                    None => Err(anyhow!("Connection closed during local authentication")),
+                };
+            }
+            match response {
+                Some(AuthResponse::Authenticated) => {
+                    self.refresh_saved_session(&astation_id);
+                    return Ok(());
                 }
-                Some(AuthResponse::SessionExpired) => {
-                    Err(anyhow!("Unexpected local session expiry"))
-                }
-                None => Err(anyhow!("Connection closed during local authentication")),
-            };
-        }
-
-        // Load session manager
-        let mut session_mgr = self.load_session_manager()?;
-
-        // Try session-based auth first if we have a saved session for this Astation
-        if let Some(session) = session_mgr.get(&astation_id) {
-            let mut auth_data = std::collections::HashMap::new();
-            auth_data.insert("session_id".to_string(), session.session_id.clone());
-            auth_data.insert("atem_id".to_string(), atem_id.clone());
-            auth_data.insert(
-                "proof".to_string(),
-                device_auth_proof(
-                    &session.token,
-                    challenge,
-                    &astation_id,
-                    &atem_id,
-                    &session.session_id,
-                )?,
-            );
-
-            let auth_msg = AstationMessage::StatusUpdate {
-                status: "auth".to_string(),
-                data: auth_data,
-            };
-            self.send_message(auth_msg).await?;
-
-            // Wait for response
-            if let Some(response) = self.wait_for_auth_response(&astation_id).await? {
-                match response {
-                    AuthResponse::Authenticated => {
-                        // Session auth successful - refresh and save
-                        if let Some(session) = session_mgr.get_mut(&astation_id) {
-                            session.refresh();
-                            if let Err(error) = self.save_session_manager(&session_mgr) {
-                                crate::diagnostics::warn(format!(
-                                    "Warning: could not refresh saved Astation session: {error}"
-                                ));
-                            }
-                        }
-                        return Ok(());
-                    }
-                    AuthResponse::SessionExpired => {
-                        // Fall through to pairing
-                    }
-                    AuthResponse::Denied(msg) => {
-                        return Err(anyhow!("Authentication denied: {}", msg));
-                    }
+                // Fall through to pairing.
+                Some(AuthResponse::SessionExpired) | None => {}
+                Some(AuthResponse::Denied(msg)) => {
+                    return Err(anyhow!("Authentication denied: {}", msg));
                 }
             }
         }
 
+        let hostname = crate::auth::get_hostname();
+        let atem_id = self.resolved_atem_id(&hostname);
         if !allow_pairing {
             return Err(anyhow!("Pairing required; run 'atem pair'"));
         }
@@ -807,61 +797,174 @@ impl AstationClient {
         }
     }
 
+    /// Build the non-interactive proof answering `challenge`: the local
+    /// bootstrap proof on loopback, else the saved session's proof. `None` when
+    /// there is no saved session for that Astation. Shared by the connect path
+    /// and re-authentication over an open socket so the two can't drift.
+    fn auth_proof(&self, challenge: &AuthChallenge) -> Result<Option<AstationMessage>> {
+        let hostname = crate::auth::get_hostname();
+        let atem_id = self.resolved_atem_id(&hostname);
+        let astation_id = &challenge.astation_id;
+        let mut auth_data = std::collections::HashMap::new();
+        if challenge.transport == "loopback" {
+            let token = self
+                .local_bootstrap_token()
+                .ok_or_else(|| anyhow!("Astation local bootstrap token is unavailable"))?;
+            auth_data.insert("method".to_string(), "local_proof".to_string());
+            auth_data.insert("atem_id".to_string(), atem_id.clone());
+            auth_data.insert("hostname".to_string(), hostname);
+            auth_data.insert(
+                "proof".to_string(),
+                device_auth_proof(&token, &challenge.challenge, astation_id, &atem_id, "local")?,
+            );
+        } else {
+            let session_mgr = self.load_session_manager()?;
+            let Some(session) = session_mgr.get(astation_id) else {
+                return Ok(None);
+            };
+            auth_data.insert("session_id".to_string(), session.session_id.clone());
+            auth_data.insert("atem_id".to_string(), atem_id.clone());
+            auth_data.insert(
+                "proof".to_string(),
+                device_auth_proof(
+                    &session.token,
+                    &challenge.challenge,
+                    astation_id,
+                    &atem_id,
+                    &session.session_id,
+                )?,
+            );
+        }
+        Ok(Some(AstationMessage::StatusUpdate {
+            status: "auth".to_string(),
+            data: auth_data,
+        }))
+    }
+
+    fn local_bootstrap_token(&self) -> Option<String> {
+        #[cfg(all(test, unix))]
+        if let Some(path) = self.local_token_path_override.as_deref() {
+            return read_local_bootstrap_token_from(path);
+        }
+        read_local_bootstrap_token()
+    }
+
+    /// Refresh the saved session's activity after a successful session proof.
+    fn refresh_saved_session(&self, astation_id: &str) {
+        let result = self.load_session_manager().and_then(|mut session_mgr| {
+            match session_mgr.get_mut(astation_id) {
+                Some(session) => session.refresh(),
+                None => return Ok(()),
+            }
+            self.save_session_manager(&session_mgr)
+        });
+        if let Err(error) = result {
+            crate::diagnostics::warn(format!(
+                "Warning: could not refresh saved Astation session: {error}"
+            ));
+        }
+    }
+
+    /// Answer an `auth_required` that arrives on an already-authenticated
+    /// socket (Astation reconnected to the relay, which kept this socket).
+    /// Only the pinned Astation is answered, and only non-interactively; the
+    /// proof is queued without waiting. Returns the answered challenge.
+    pub(crate) async fn answer_auth_required(&mut self, auth_required: &AstationMessage) -> Result<String> {
+        let challenge = AuthChallenge::parse(auth_required)?;
+        let pinned = self
+            .connected_astation_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("this connection never authenticated an Astation"))?;
+        if challenge.astation_id != pinned {
+            return Err(anyhow!(
+                "Astation {} challenged a connection authenticated with {pinned}",
+                challenge.astation_id
+            ));
+        }
+        let proof = self
+            .auth_proof(&challenge)?
+            .ok_or_else(|| anyhow!("no saved session for this Astation; run `atem pair`"))?;
+        self.send_message(proof).await?;
+        self.answered_challenge = Some((challenge.astation_id, challenge.challenge.clone()));
+        Ok(challenge.challenge)
+    }
+
+    /// True when `auth_required` repeats the challenge this socket already
+    /// answered, from the same Astation (Astation re-sends a pending challenge
+    /// when a hello races it). Answering a spent challenge would be denied.
+    pub(crate) fn is_answered_challenge(&self, auth_required: &AstationMessage) -> bool {
+        let AstationMessage::StatusUpdate { data, .. } = auth_required else { return false; };
+        self.answered_challenge.as_ref().is_some_and(|(astation_id, challenge)| {
+            data.get("astation_id") == Some(astation_id) && data.get("challenge") == Some(challenge)
+        })
+    }
+
+    /// Re-authentication succeeded: keep the saved session fresh, as connect does.
+    pub(crate) fn reauthenticated(&self) {
+        if let Some(astation_id) = self.connected_astation_id.as_deref() {
+            self.refresh_saved_session(astation_id);
+        }
+    }
+
+    /// Classify one message as an authentication response for `astation_id`.
+    /// `None` when it is not one. A grant persists the new session only with
+    /// `persist_grant` (pairing can grant one; re-authentication never pairs).
+    pub(crate) fn auth_response(&self, msg: &AstationMessage, astation_id: &str, persist_grant: bool) -> Result<Option<AuthResponse>> {
+        let AstationMessage::StatusUpdate { status, data } = msg else { return Ok(None); };
+        match status.as_str() {
+            "auth" => match data.get("status").map(String::as_str) {
+                Some("granted") if !persist_grant => Ok(Some(AuthResponse::Authenticated)),
+                Some("granted") => {
+                    let session_id = data.get("session_id").ok_or_else(|| {
+                        anyhow!("Pairing response missing session ID")
+                    })?;
+                    let token = data.get("token").ok_or_else(|| {
+                        anyhow!("Pairing response missing session token")
+                    })?;
+                    let hostname = crate::auth::get_hostname();
+                    let session = crate::auth::AuthSession::new(
+                        session_id.clone(),
+                        token.clone(),
+                        astation_id.to_string(),
+                        hostname,
+                    );
+
+                    self.persist_session(session)?;
+                    self.remember_astation_relay_code(astation_id);
+                    Ok(Some(AuthResponse::Authenticated))
+                }
+                Some("denied") => {
+                    let msg = data.get("message")
+                        .map(|s| s.as_str())
+                        .unwrap_or("Unknown reason");
+                    Ok(Some(AuthResponse::Denied(msg.to_string())))
+                }
+                _ => Ok(None),
+            },
+            "authenticated" => {
+                // Alternative authenticated message format
+                self.remember_astation_relay_code(astation_id);
+                Ok(Some(AuthResponse::Authenticated))
+            }
+            "error" => Ok(data.get("message").map(|msg| {
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("expired") || lower.contains("pairing required") {
+                    AuthResponse::SessionExpired
+                } else {
+                    AuthResponse::Denied(msg.clone())
+                }
+            })),
+            _ => Ok(None),
+        }
+    }
+
     /// Wait for auth response message and extract session if granted
     async fn wait_for_auth_response(&mut self, astation_id: &str) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
-            match msg {
-                AstationMessage::StatusUpdate { status, data } if status == "auth" => {
-                    // Check auth response
-                    if let Some(auth_status) = data.get("status") {
-                        match auth_status.as_str() {
-                            "granted" => {
-                                let session_id = data.get("session_id").ok_or_else(|| {
-                                    anyhow!("Pairing response missing session ID")
-                                })?;
-                                let token = data.get("token").ok_or_else(|| {
-                                    anyhow!("Pairing response missing session token")
-                                })?;
-                                let hostname = crate::auth::get_hostname();
-                                let session = crate::auth::AuthSession::new(
-                                    session_id.clone(),
-                                    token.clone(),
-                                    astation_id.to_string(),
-                                    hostname,
-                                );
-
-                                self.persist_session(session)?;
-                                self.remember_astation_relay_code(astation_id);
-                                return Ok(Some(AuthResponse::Authenticated));
-                            }
-                            "denied" => {
-                                let msg = data.get("message")
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("Unknown reason");
-                                return Ok(Some(AuthResponse::Denied(msg.to_string())));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                AstationMessage::StatusUpdate { status, data: _ } if status == "authenticated" => {
-                    // Alternative authenticated message format
-                    self.remember_astation_relay_code(astation_id);
-                    return Ok(Some(AuthResponse::Authenticated));
-                }
-                AstationMessage::StatusUpdate { status, data } if status == "error" => {
-                    if let Some(msg) = data.get("message") {
-                        let lower = msg.to_ascii_lowercase();
-                        if lower.contains("expired") || lower.contains("pairing required") {
-                            return Ok(Some(AuthResponse::SessionExpired));
-                        }
-                        return Ok(Some(AuthResponse::Denied(msg.clone())));
-                    }
-                }
-                _ => {
-                    // Ignore other messages during auth
-                }
+            if let Some(response) = self.auth_response(&msg, astation_id, true)? {
+                return Ok(Some(response));
             }
+            // Ignore other messages during auth
         }
         Ok(None) // Connection closed
     }
@@ -1376,7 +1479,7 @@ pub(crate) fn resolved_atem_id(hostname: &str) -> String {
     atem_id
 }
 
-fn device_auth_proof(
+pub(crate) fn device_auth_proof(
     token: &str,
     challenge: &str,
     astation_id: &str,
@@ -1611,6 +1714,97 @@ mod tests {
         let session_path = directory.path().join("sessions.json");
         let client = AstationClient::new_with_test_state(atem_id, session_path);
         (directory, client)
+    }
+
+    /// A test Astation that records the first frame Atem sends it.
+    async fn recording_peer() -> (String, tokio::task::JoinHandle<Option<AstationMessage>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next()).await.ok()??;
+            match frame.ok()? {
+                Message::Text(text) => serde_json::from_str(&text).ok(),
+                _ => None,
+            }
+        });
+        (format!("ws://{address}"), server)
+    }
+
+    fn reauth_challenge(astation_id: &str, transport: &str) -> AstationMessage {
+        AstationMessage::StatusUpdate {
+            status: "auth_required".to_string(),
+            data: std::collections::HashMap::from([
+                ("astation_id".to_string(), astation_id.to_string()),
+                ("challenge".to_string(), "d".repeat(64)),
+                ("transport".to_string(), transport.to_string()),
+                ("protocol".to_string(), "2".to_string()),
+            ]),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reauth_over_loopback_answers_with_the_local_proof() {
+        use std::os::unix::fs::PermissionsExt;
+        let (state, mut client) = isolated_client("atem-test-loopback");
+        let token_path = state.path().join("local-bootstrap-token");
+        fs::write(&token_path, "bootstrap-secret\n").unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        client.local_token_path_override = Some(token_path);
+        let (url, server) = recording_peer().await;
+        client.connect_raw(&url).await.unwrap();
+        client.pin_astation_for_test("astation-local");
+
+        let challenge = client
+            .answer_auth_required(&reauth_challenge("astation-local", "loopback"))
+            .await
+            .unwrap();
+        assert_eq!(challenge, "d".repeat(64));
+        let Some(AstationMessage::StatusUpdate { status, data }) = server.await.unwrap() else {
+            panic!("no proof reached Astation");
+        };
+        assert_eq!(status, "auth");
+        assert_eq!(data["method"], "local_proof");
+        assert_eq!(data["atem_id"], "atem-test-loopback");
+        assert_eq!(
+            data["proof"],
+            device_auth_proof("bootstrap-secret", &"d".repeat(64), "astation-local", "atem-test-loopback", "local").unwrap()
+        );
+        assert!(!data.contains_key("session_id"));
+    }
+
+    #[tokio::test]
+    async fn reauth_without_a_saved_session_never_starts_pairing() {
+        let (_state, mut client) = isolated_client("atem-test-no-session");
+        let (url, server) = recording_peer().await;
+        client.connect_raw(&url).await.unwrap();
+        client.pin_astation_for_test("astation-unknown");
+
+        let error = client
+            .answer_auth_required(&reauth_challenge("astation-unknown", "relay"))
+            .await
+            .expect_err("answered without a saved session");
+        assert!(error.to_string().contains("atem pair"), "{error}");
+        drop(client);
+        assert!(server.await.unwrap().is_none(), "sent something without a session");
+    }
+
+    #[tokio::test]
+    async fn reauth_refuses_a_different_astation() {
+        let (_state, mut client) = isolated_client("atem-test-pinned");
+        let (url, server) = recording_peer().await;
+        client.connect_raw(&url).await.unwrap();
+        client.pin_astation_for_test("astation-pinned");
+
+        let error = client
+            .answer_auth_required(&reauth_challenge("astation-other", "relay"))
+            .await
+            .expect_err("answered a different Astation");
+        assert!(error.to_string().contains("astation-other"), "{error}");
+        drop(client);
+        assert!(server.await.unwrap().is_none());
     }
 
     #[test]

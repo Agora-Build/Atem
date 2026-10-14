@@ -245,6 +245,10 @@ remote action and an acknowledgement from Atem; it must work while the host
 is unattended. The local user can reclaim immediately. Viewing, window focus,
 or device rotation alone never claims keyboard control. On disconnect revoke
 the lease; reconnect restores View only and requires a fresh claim.
+The same holds when Astation re-challenges an open socket (`auth_required`
+after Astation alone reconnected to the relay): Atem treats the link as down,
+revokes the lease and acts on nothing but auth messages until the proof is
+accepted; a failed or unanswered proof closes the socket for a normal reconnect.
 
 Route local keys, remote keys, and paste through one ordered writer. A remote
 operation carries session ID, process generation, controller lease generation,
