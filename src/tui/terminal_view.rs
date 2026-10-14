@@ -171,7 +171,9 @@ pub struct State {
 }
 
 impl State {
-    pub fn new() -> Self {
+    /// `prefix` is the configured prefix key (`terminal_prefix` in
+    /// config.toml, or `ATEM_TERMINAL_PREFIX`, which wins); `None` = Ctrl+].
+    pub fn new(prefix: Option<&str>) -> Self {
         let mut state = Self {
             prefix: Prefix::default(),
             pending: false,
@@ -183,13 +185,13 @@ impl State {
             messages: VecDeque::new(),
             last_status: None,
         };
-        if let Ok(raw) = std::env::var("ATEM_TERMINAL_PREFIX") {
-            if let Some(prefix) = Prefix::parse(&raw) {
+        if let Some(raw) = prefix {
+            if let Some(prefix) = Prefix::parse(raw) {
                 state.prefix = prefix;
             } else {
-                state.record(
-                    "Invalid ATEM_TERMINAL_PREFIX; use Ctrl-] or Ctrl-a. Using Ctrl-].".into(),
-                );
+                state.record(format!(
+                    "Invalid terminal prefix {raw:?} (ATEM_TERMINAL_PREFIX or terminal_prefix in config.toml); use Ctrl+], Ctrl+\\ or Ctrl+<letter> other than i or m. Using Ctrl+]."
+                ));
             }
         }
         state
@@ -260,7 +262,7 @@ mod tests {
 
     #[test]
     fn tmux_and_agent_control_keys_pass_through_without_the_atem_prefix() {
-        let mut state = State::new();
+        let mut state = State::new(None);
         state.prefix = Prefix::default();
         for character in ['b', 'g', 'c'] {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
@@ -278,7 +280,7 @@ mod tests {
 
     #[test]
     fn prefix_can_be_changed_and_can_be_sent_literally() {
-        let mut state = State::new();
+        let mut state = State::new(None);
         state.prefix = Prefix::parse("Ctrl-a").unwrap();
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
         assert_eq!(state.key(key), Action::Prefix);
@@ -293,6 +295,26 @@ mod tests {
             state.key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL)),
             Action::Prefix
         );
+    }
+
+    #[test]
+    fn the_configured_prefix_is_used_and_a_bad_one_falls_back_with_a_notice() {
+        assert_eq!(State::new(None).prefix, Prefix::default());
+        assert!(State::new(None).messages.is_empty());
+
+        let state = State::new(Some("Ctrl-a"));
+        assert_eq!(state.prefix.label(), "Ctrl+a");
+        assert!(state.messages.is_empty());
+
+        let state = State::new(Some("Ctrl-word"));
+        assert_eq!(state.prefix, Prefix::default());
+        let notice = state.messages.back().expect("a notice for the bad value");
+        assert!(notice.contains("\"Ctrl-word\""), "{notice}");
+        assert!(
+            notice.contains("ATEM_TERMINAL_PREFIX") && notice.contains("terminal_prefix"),
+            "{notice}"
+        );
+        assert!(notice.contains("Ctrl+]"), "{notice}");
     }
 
     #[test]

@@ -39,6 +39,14 @@ pub struct AtemConfig {
     /// Env var override: `ATEM_EXTRA_HOSTNAMES` (comma-separated).
     #[serde(default)]
     pub extra_hostnames: Option<Vec<String>>,
+
+    /// Prefix key of the shared agent terminal (`atem agent launch`), e.g.
+    /// `terminal_prefix = "Ctrl-a"`. Accepts Ctrl+], Ctrl+\ or Ctrl+<letter>
+    /// (not i or m); unset means Ctrl+].
+    ///
+    /// Env var override: `ATEM_TERMINAL_PREFIX`.
+    #[serde(default)]
+    pub terminal_prefix: Option<String>,
 }
 
 impl AtemConfig {
@@ -72,6 +80,9 @@ impl AtemConfig {
         }
         if let Ok(val) = std::env::var("ASTATION_RELAY_CODE") {
             config.astation_relay_code = Some(val);
+        }
+        if let Ok(val) = std::env::var("ATEM_TERMINAL_PREFIX") {
+            config.terminal_prefix = Some(val);
         }
         if let Ok(val) = std::env::var("DIAGRAM_SERVER_URL") {
             config.diagram_server_url = Some(val);
@@ -708,6 +719,14 @@ impl crate::auth::AuthSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_prefix_is_read_from_config_toml() {
+        let config: AtemConfig = toml::from_str("terminal_prefix = \"Ctrl-a\"\n").unwrap();
+        assert_eq!(config.terminal_prefix.as_deref(), Some("Ctrl-a"));
+        let config: AtemConfig = toml::from_str("").unwrap();
+        assert_eq!(config.terminal_prefix, None);
+    }
     use std::sync::Mutex;
 
     /// Tests that touch ~/.config/atem/active_project.json must hold this lock.
