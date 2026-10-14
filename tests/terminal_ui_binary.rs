@@ -127,7 +127,7 @@ fn compact_terminal_preserves_control_keys_paste_resize_and_copy() {
         "39 120"
     );
     let text = screen.lock().unwrap().screen().contents();
-    assert_eq!(text.matches("atem |").count(), 1);
+    assert_eq!(text.matches("Atem |").count(), 1);
     assert_eq!(text.matches("? for shortcuts").count(), 1);
     assert!(!text.contains("Agora.io AI CLI Tool"));
 
@@ -159,7 +159,7 @@ fn compact_terminal_preserves_control_keys_paste_resize_and_copy() {
     });
     let text = screen.lock().unwrap().screen().contents();
     assert_eq!(text.matches("? for shortcuts").count(), 1);
-    assert_eq!(text.matches("atem |").count(), 1);
+    assert_eq!(text.matches("Atem |").count(), 1);
 
     // Copy is an explicit outer clipboard request, not bytes typed into the agent.
     writer.write_all(b"\x1dc").unwrap();
