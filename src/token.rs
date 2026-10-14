@@ -1,4 +1,5 @@
-/// Agora AccessToken2 generation and decoding, through the `atem-core` library.
+//! Agora AccessToken2 generation and decoding, through the `atem-core` library.
+
 use anyhow::Result;
 use atem_core::token as core;
 use std::collections::HashMap;
@@ -11,8 +12,8 @@ pub enum Role {
 }
 
 /// Classify an RTC user identifier:
-/// - all digits → `Int(u32)` — use `build_token_with_uid` (SDK join with `joinChannel(uid:)`)
-/// - anything else → `Str(&str)` — use `build_token_with_user_account` (SDK join with `joinChannelWithUserAccount(:)`)
+/// - all digits → `Int(u32)` — an int uid (SDK join with `joinChannel(uid:)`)
+/// - anything else → `Str(&str)` — a user account (SDK join with `joinChannelWithUserAccount(:)`)
 #[derive(Debug, Clone, Copy)]
 pub enum RtcAccount<'a> {
     Int(u32),

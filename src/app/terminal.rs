@@ -73,7 +73,7 @@ impl App {
     }
 
     pub fn handle_terminal_message(&mut self, envelope: Envelope) {
-        // This flag is set only after the authenticated connection completes.
+        // Set only while the connection is authenticated (cleared during re-authentication).
         if !self.astation_connected || self.astation_client.is_ws_closed() {
             return;
         }

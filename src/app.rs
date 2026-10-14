@@ -147,9 +147,9 @@ pub struct App {
     /// Uses `Instant` (monotonic clock — pauses during system sleep on both Linux and macOS),
     /// so retries only fire when the device is actively awake. No battery drain while sleeping.
     pub astation_reconnect_at: Option<Instant>,
-    /// Re-authentication over the open socket, while Astation's newest
-    /// `auth_required` is unanswered (see `app/reauth.rs`).
-    pub astation_reauth: Option<reauth::PendingReauth>,
+    /// Deadline of a re-authentication proof sent over the open socket that
+    /// Astation has not accepted yet (see `app/reauth.rs`).
+    pub astation_reauth: Option<Instant>,
     /// Pending command from Astation waiting for output relay.
     pub pending_astation_command: Option<PendingAstationCommand>,
     /// Pending voice coding request waiting for Claude to finish.
@@ -1356,7 +1356,7 @@ impl App {
                 }
             }
 
-            // No valid session - try local with fresh auth (5s timeout)
+            // No valid session: try local without pairing (loopback bootstrap proof)
             let mut client = crate::websocket_client::AstationClient::new();
             let local_url = config.astation_ws().to_string();
             match client.connect_without_pairing(&local_url).await {
@@ -1515,7 +1515,8 @@ impl App {
                 }
             }
             AstationMessage::StatusUpdate { status: _, data: _ } => {
-                // Status updates are informational; ignore in TUI
+                // `auth_required` and auth replies were handled by
+                // `intercept_astation_reauth`; other status updates need nothing.
             }
             AstationMessage::CodexTaskResponse {
                 output,
