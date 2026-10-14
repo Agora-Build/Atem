@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 /// How long Astation has to accept the proof before the socket is dropped.
 pub(super) const REAUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The newest `auth_required` this client answered, still unacknowledged.
+/// A re-authentication proof Astation has not acknowledged yet (the answered
+/// challenge itself is remembered by the client).
 #[derive(Debug, Clone)]
 pub struct PendingReauth {
-    pub challenge: String,
     pub deadline: Instant,
 }
 
@@ -38,7 +38,10 @@ impl App {
             .connected_astation_id()
             .unwrap_or_default()
             .to_string();
-        match self.astation_client.auth_response(message, &astation_id) {
+        match self
+            .astation_client
+            .auth_response(message, &astation_id, false)
+        {
             // Not an auth response: nothing else is acted on until Astation
             // accepts the proof (no input, terminal, voice, task or launch).
             Ok(None) => {}
@@ -75,22 +78,18 @@ impl App {
     }
 
     async fn answer_astation_challenge(&mut self, message: &AstationMessage) {
-        let challenge = match message {
-            AstationMessage::StatusUpdate { data, .. } => data.get("challenge"),
-            _ => None,
-        };
-        if let (Some(pending), Some(challenge)) = (&self.astation_reauth, challenge)
-            && &pending.challenge == challenge
-        {
-            return; // A repeat of the challenge already answered.
+        // A repeat of the challenge already answered on this socket (at
+        // connect or re-auth) by the same Astation is spent; another
+        // astation_id goes on to the pin check and fails closed.
+        if self.astation_client.is_answered_challenge(message) {
+            return;
         }
         if self.astation_reauth.is_none() {
             self.suspend_astation();
         }
         match self.astation_client.answer_auth_required(message).await {
-            Ok(challenge) => {
+            Ok(_) => {
                 self.astation_reauth = Some(PendingReauth {
-                    challenge,
                     deadline: Instant::now() + REAUTH_TIMEOUT,
                 });
                 self.status_message = Some("Astation re-authenticating…".to_string());
@@ -503,6 +502,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repeat_of_the_connect_time_challenge_is_ignored() {
+        let (mut app, mut peer) = connected_app().await;
+        // Authenticate this socket the way connect does, with challenge "a…".
+        app.astation_connected = false;
+        let connect_challenge = "a".repeat(64);
+        peer.send
+            .send(auth_required(ASTATION, &connect_challenge))
+            .unwrap();
+        peer.send
+            .send(status("authenticated", &[("method", "session_proof")]))
+            .unwrap();
+        app.astation_client.authenticate_for_test().await.unwrap();
+        app.astation_connected = true;
+        let connect_proof = next_auth(&mut app, &mut peer).await;
+        assert_eq!(
+            connect_proof["proof"],
+            expected_session_proof(&connect_challenge)
+        );
+
+        // Astation re-sends that pending challenge (a hello raced it).
+        peer.send
+            .send(auth_required(ASTATION, &connect_challenge))
+            .unwrap();
+        let frames = pump(&mut app, &mut peer).await;
+        assert!(
+            !frames.iter().flatten().any(is_auth),
+            "answered a spent challenge"
+        );
+        assert!(app.astation_connected, "went offline for a spent challenge");
+        assert!(app.astation_reauth.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_pending_challenge_from_another_astation_fails_closed() {
+        let (mut app, mut peer) = connected_app().await;
+        let challenge = "b".repeat(64);
+        peer.send.send(auth_required(ASTATION, &challenge)).unwrap();
+        next_auth(&mut app, &mut peer).await;
+
+        peer.send
+            .send(auth_required("astation-impostor", &challenge))
+            .unwrap();
+        let frames = until_closed(&mut app, &mut peer).await;
+        assert!(!frames.iter().any(is_auth), "answered a foreign Astation");
+        assert!(!app.astation_connected);
+        assert!(app.astation_reauth.is_none());
+        assert!(app.astation_reconnect_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_grant_during_reauthentication_never_replaces_the_saved_session() {
+        let (mut app, mut peer) = connected_app().await;
+        peer.send
+            .send(auth_required(ASTATION, &"b".repeat(64)))
+            .unwrap();
+        next_auth(&mut app, &mut peer).await;
+        peer.send
+            .send(status(
+                "auth",
+                &[
+                    ("status", "granted"),
+                    ("session_id", "session-other"),
+                    ("token", "token-other"),
+                ],
+            ))
+            .unwrap();
+        pump(&mut app, &mut peer).await;
+        assert!(app.astation_connected);
+        let sessions =
+            crate::auth::SessionManager::load_from(&peer._state.path().join("sessions.json"))
+                .unwrap();
+        let session = sessions.get(ASTATION).expect("saved session kept");
+        assert_eq!(session.session_id, SESSION_ID);
+        assert_eq!(session.token, TOKEN);
+    }
+
+    #[tokio::test]
     async fn auth_required_from_another_astation_is_not_answered() {
         let (mut app, mut peer) = connected_app().await;
         peer.send
@@ -544,7 +620,6 @@ mod tests {
         let proof = next_auth(&mut app, &mut peer).await;
         assert_eq!(proof["proof"], expected_session_proof(&second));
         let pending = app.astation_reauth.as_ref().unwrap();
-        assert_eq!(pending.challenge, second);
         assert!(pending.deadline > first_deadline);
         assert!(!app.astation_connected);
     }

@@ -455,6 +455,9 @@ pub struct AstationClient {
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
     connected_astation_id: Option<String>,
+    /// The newest challenge answered on this socket, as (astation_id,
+    /// challenge): a repeat of it is spent and is not answered again.
+    answered_challenge: Option<(String, String)>,
     /// Encryption messages held until they can be applied: ones that arrived
     /// before Astation said who it is (a pairing-code relay connection never
     /// authenticates), or during device verification.
@@ -482,6 +485,7 @@ impl AstationClient {
             local_token_path_override: None,
             ws_closed: false,
             connected_astation_id: None,
+            answered_challenge: None,
             held_encryption: Vec::new(),
         }
     }
@@ -498,6 +502,16 @@ impl AstationClient {
         client.relay_code_path_override = Some(session_path.with_file_name("relay-code"));
         client.session_path_override = Some(session_path);
         client
+    }
+
+    /// The connect-time challenge/response alone (no credential report).
+    #[cfg(test)]
+    pub(crate) async fn authenticate_for_test(&mut self) -> Result<()> {
+        let auth_required = self
+            .wait_for_message(is_auth_required)
+            .await
+            .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
+        self.authenticate_after_challenge(auth_required, false).await
     }
 
     /// Pretend the connect-time authentication pinned `astation_id`.
@@ -550,6 +564,7 @@ impl AstationClient {
             task.abort();
         }
         self.ws_closed = true;
+        self.answered_challenge = None;
     }
 
     /// Connect to Astation using a saved auth session.
@@ -697,6 +712,7 @@ impl AstationClient {
 
         if let Some(proof) = self.auth_proof(&challenge)? {
             self.send_message(proof).await?;
+            self.answered_challenge = Some((astation_id.clone(), challenge.challenge.clone()));
             let response = self.wait_for_auth_response(&astation_id).await?;
             if challenge.transport == "loopback" {
                 return match response {
@@ -869,7 +885,18 @@ impl AstationClient {
             .auth_proof(&challenge)?
             .ok_or_else(|| anyhow!("no saved session for this Astation; run `atem pair`"))?;
         self.send_message(proof).await?;
+        self.answered_challenge = Some((challenge.astation_id, challenge.challenge.clone()));
         Ok(challenge.challenge)
+    }
+
+    /// True when `auth_required` repeats the challenge this socket already
+    /// answered, from the same Astation (Astation re-sends a pending challenge
+    /// when a hello races it). Answering a spent challenge would be denied.
+    pub(crate) fn is_answered_challenge(&self, auth_required: &AstationMessage) -> bool {
+        let AstationMessage::StatusUpdate { data, .. } = auth_required else { return false; };
+        self.answered_challenge.as_ref().is_some_and(|(astation_id, challenge)| {
+            data.get("astation_id") == Some(astation_id) && data.get("challenge") == Some(challenge)
+        })
     }
 
     /// Re-authentication succeeded: keep the saved session fresh, as connect does.
@@ -880,11 +907,13 @@ impl AstationClient {
     }
 
     /// Classify one message as an authentication response for `astation_id`.
-    /// `None` when it is not one. A grant persists the new session.
-    pub(crate) fn auth_response(&self, msg: &AstationMessage, astation_id: &str) -> Result<Option<AuthResponse>> {
+    /// `None` when it is not one. A grant persists the new session only with
+    /// `persist_grant` (pairing can grant one; re-authentication never pairs).
+    pub(crate) fn auth_response(&self, msg: &AstationMessage, astation_id: &str, persist_grant: bool) -> Result<Option<AuthResponse>> {
         let AstationMessage::StatusUpdate { status, data } = msg else { return Ok(None); };
         match status.as_str() {
             "auth" => match data.get("status").map(String::as_str) {
+                Some("granted") if !persist_grant => Ok(Some(AuthResponse::Authenticated)),
                 Some("granted") => {
                     let session_id = data.get("session_id").ok_or_else(|| {
                         anyhow!("Pairing response missing session ID")
@@ -932,7 +961,7 @@ impl AstationClient {
     /// Wait for auth response message and extract session if granted
     async fn wait_for_auth_response(&mut self, astation_id: &str) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
-            if let Some(response) = self.auth_response(&msg, astation_id)? {
+            if let Some(response) = self.auth_response(&msg, astation_id, true)? {
                 return Ok(Some(response));
             }
             // Ignore other messages during auth
