@@ -308,11 +308,7 @@ else
 fi
 echo
 
-# ── Agent / Serv (should not crash on empty state) ──────────────────
-echo "$(yellow "Agent")"
-run "atem agent list" -- "$ATEM" agent list
-echo
-
+# ── Serv (should not crash on empty state) ──────────────────────────
 echo "$(yellow "Serv")"
 run "atem serv list" -- "$ATEM" serv list
 echo

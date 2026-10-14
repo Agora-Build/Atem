@@ -212,8 +212,6 @@ pub enum ProjectCommands {
 
 #[derive(Subcommand)]
 pub enum AgentCommands {
-    /// Scan lockfiles and list all detected agents
-    List,
     /// Open the original interactive CLI in a shareable Atem terminal
     Launch {
         /// Agent type to launch (claude, claude-code or codex)
@@ -226,32 +224,6 @@ pub enum AgentCommands {
             value_name = "AGENT_ARGS"
         )]
         agent_args: Vec<String>,
-    },
-    /// Connect to an ACP agent at a WebSocket URL and show its server info
-    Connect {
-        /// WebSocket URL of the ACP server (e.g. ws://localhost:8765)
-        url: String,
-        /// Timeout for the ACP probe in milliseconds
-        #[arg(long, default_value = "3000")]
-        timeout: u64,
-    },
-    /// Send a text prompt to a running ACP agent and stream the response
-    Prompt {
-        /// WebSocket URL of the ACP server
-        url: String,
-        /// The prompt text to send
-        text: String,
-        /// Timeout per response event in milliseconds
-        #[arg(long, default_value = "30000")]
-        timeout: u64,
-    },
-    /// Probe a WebSocket URL to check for ACP support
-    Probe {
-        /// WebSocket URL to probe
-        url: String,
-        /// Timeout in milliseconds
-        #[arg(long, default_value = "2000")]
-        timeout: u64,
     },
     /// Generate a visual HTML diagram via an active ACP agent
     Visualize {
@@ -975,139 +947,6 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 agent_type,
                 agent_args,
             } => crate::tui::run_agent_tui(Some(&agent_type), &agent_args).await,
-            AgentCommands::List => {
-                use crate::agent_detector::{scan_lockfiles, scan_default_ports};
-                use crate::agent_client::AgentProtocol;
-
-                // Scan both lockfiles and default ports
-                let mut agents = scan_lockfiles();
-                let port_agents = scan_default_ports().await;
-                agents.extend(port_agents);
-
-                if agents.is_empty() {
-                    println!("No agents detected.");
-                    println!("Tip: start Claude Code in ACP mode or Codex and re-run.");
-                    println!("Example: npx -y @rebornix/stdio-to-ws --persist --grace-period 604800 \\");
-                    println!("         \"npx @zed-industries/claude-code-acp\" --port 8765");
-                } else {
-                    println!("Detected agents ({})\n", agents.len());
-                    for (i, agent) in agents.iter().enumerate() {
-                        let proto = match agent.protocol {
-                            AgentProtocol::Acp => "ACP",
-                            AgentProtocol::Pty => "PTY",
-                        };
-                        let pid_str = agent
-                            .pid
-                            .map(|p| format!("pid={p}"))
-                            .unwrap_or_else(|| "pid=?".to_string());
-                        println!(
-                            "  {}. {} [{}] {} — {}",
-                            i + 1,
-                            agent.kind,
-                            proto,
-                            pid_str,
-                            agent.acp_url
-                        );
-                    }
-                }
-                Ok(())
-            }
-
-            AgentCommands::Connect { url, timeout } => {
-                use crate::acp_client::AcpClient;
-                use crate::agent_detector::probe_acp;
-
-                println!("Probing {} …", url);
-                let result = probe_acp(&url, timeout).await;
-                match &result {
-                    crate::agent_detector::ProbeResult::AcpAvailable { kind, version } => {
-                        println!("ACP server detected: {} v{}", kind, version);
-                    }
-                    crate::agent_detector::ProbeResult::NotAcp => {
-                        anyhow::bail!("Port is open but did not respond with a valid ACP handshake");
-                    }
-                    crate::agent_detector::ProbeResult::Unreachable => {
-                        anyhow::bail!("Could not connect to {}", url);
-                    }
-                }
-
-                println!("Running initialize + new_session …");
-                let mut client = AcpClient::connect(&url).await?;
-                let info = client.initialize().await?;
-                let session_id = client.new_session().await?;
-
-                println!("\nConnected successfully:");
-                println!("  Agent   : {}", info.kind);
-                println!("  Version : {}", info.version);
-                println!("  Session : {}", session_id);
-                Ok(())
-            }
-
-            AgentCommands::Prompt { url, text, timeout } => {
-                use crate::acp_client::AcpClient;
-                use crate::agent_client::AgentEvent;
-                use std::time::Duration;
-
-                println!("Connecting to {} …", url);
-                let mut client = AcpClient::connect(&url).await?;
-                let info = client.initialize().await?;
-                let _session_id = client.new_session().await?;
-
-                println!("Agent: {} — sending prompt …\n", info.kind);
-                client.send_prompt(&text)?;
-
-                // Poll for events until Done or timeout
-                let deadline =
-                    std::time::Instant::now() + Duration::from_millis(timeout);
-                loop {
-                    if std::time::Instant::now() >= deadline {
-                        eprintln!("\nTimeout waiting for agent response.");
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    let events = client.drain_events();
-                    for event in events {
-                        match event {
-                            AgentEvent::TextDelta(t) => print!("{}", t),
-                            AgentEvent::ToolCall { name, .. } => {
-                                print!("\n[tool: {}] ", name)
-                            }
-                            AgentEvent::ToolResult { .. } => print!("[result] "),
-                            AgentEvent::Done => {
-                                println!();
-                                return Ok(());
-                            }
-                            AgentEvent::Error(e) => {
-                                anyhow::bail!("Agent error: {}", e);
-                            }
-                            AgentEvent::Disconnected => {
-                                anyhow::bail!("Agent disconnected");
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-
-            AgentCommands::Probe { url, timeout } => {
-                use crate::agent_detector::{probe_acp, ProbeResult};
-
-                print!("Probing {} … ", url);
-                let result = probe_acp(&url, timeout).await;
-                match result {
-                    ProbeResult::AcpAvailable { kind, version } => {
-                        println!("ACP ({} v{})", kind, version);
-                    }
-                    ProbeResult::NotAcp => {
-                        println!("open but not ACP");
-                    }
-                    ProbeResult::Unreachable => {
-                        println!("unreachable");
-                    }
-                }
-                Ok(())
-            }
-
             AgentCommands::Visualize { topic, url, timeout, no_browser } => {
                 use crate::acp_client::AcpClient;
                 use crate::agent_client::AgentEvent;
@@ -2143,102 +1982,30 @@ mod tests {
     }
 
     #[test]
-    fn cli_agent_list_parses() {
-        let cli = Cli::try_parse_from(["atem", "agent", "list"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Agent {
-                agent_command: AgentCommands::List
-            })
-        ));
-    }
-
-    #[test]
-    fn cli_agent_connect_parses() {
-        let cli =
-            Cli::try_parse_from(["atem", "agent", "connect", "ws://localhost:8765"]).unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Connect { url, timeout },
-            }) => {
-                assert_eq!(url, "ws://localhost:8765");
-                assert_eq!(timeout, 3000);
-            }
-            _ => panic!("expected Agent Connect"),
+    fn cli_removed_agent_subcommands_are_rejected() {
+        for args in [
+            &["atem", "agent", "list"][..],
+            &["atem", "agent", "connect", "ws://localhost:8765"],
+            &["atem", "agent", "prompt", "ws://localhost:8765", "hi"],
+            &["atem", "agent", "probe", "ws://localhost:8765"],
+        ] {
+            let err = match Cli::try_parse_from(args) {
+                Ok(_) => panic!("{args:?} should be rejected"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "{args:?}"
+            );
         }
-    }
-
-    #[test]
-    fn cli_agent_connect_custom_timeout() {
-        let cli = Cli::try_parse_from([
-            "atem",
-            "agent",
-            "connect",
-            "ws://localhost:9000",
-            "--timeout",
-            "5000",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Connect { timeout, .. },
-            }) => {
-                assert_eq!(timeout, 5000);
-            }
-            _ => panic!("expected Agent Connect"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_prompt_parses() {
-        let cli = Cli::try_parse_from([
-            "atem",
-            "agent",
-            "prompt",
-            "ws://localhost:8765",
-            "write a hello world in Rust",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Prompt { url, text, timeout },
-            }) => {
-                assert_eq!(url, "ws://localhost:8765");
-                assert_eq!(text, "write a hello world in Rust");
-                assert_eq!(timeout, 30000);
-            }
-            _ => panic!("expected Agent Prompt"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_probe_parses() {
-        let cli =
-            Cli::try_parse_from(["atem", "agent", "probe", "ws://127.0.0.1:8765"]).unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Probe { url, timeout },
-            }) => {
-                assert_eq!(url, "ws://127.0.0.1:8765");
-                assert_eq!(timeout, 2000);
-            }
-            _ => panic!("expected Agent Probe"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_probe_custom_timeout() {
-        let cli = Cli::try_parse_from([
-            "atem", "agent", "probe", "ws://localhost:9999", "--timeout", "500",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Probe { timeout, .. },
-            }) => {
-                assert_eq!(timeout, 500);
-            }
-            _ => panic!("expected Agent Probe"),
+        // The rest of `atem agent` and `atem serv diagrams` still parse.
+        for args in [
+            &["atem", "agent", "launch"][..],
+            &["atem", "agent", "visualize", "topic"],
+            &["atem", "serv", "diagrams"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
         }
     }
 

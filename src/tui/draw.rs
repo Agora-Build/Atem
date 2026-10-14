@@ -477,8 +477,7 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
         let msg = Paragraph::new(
             "No agents registered.\n\n\
              Agents are discovered automatically when Claude Code or Codex\n\
-             processes are running (via their lockfiles), or can be connected\n\
-             manually with `atem agent connect <url>`.\n\n\
+             processes are running (via their lockfiles or ACP ports).\n\n\
              Press 'r' to refresh, 'b' to go back.",
         )
         .style(Style::default().fg(Color::DarkGray))

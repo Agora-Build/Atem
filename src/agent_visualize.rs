@@ -120,8 +120,9 @@ pub async fn resolve_agent_url(explicit: Option<String>) -> Result<String> {
 
     Err(anyhow!(
         "No running ACP agent detected.\n\
-         Start an agent first, e.g.:\n  \
-         npx -y @anthropic-ai/claude-code --acp\n\
+         Start an agent first, e.g. Claude Code through an ACP adapter and a WebSocket bridge:\n  \
+         npx -y @rebornix/stdio-to-ws --persist --grace-period 604800 \\\n    \
+         \"npx @zed-industries/claude-code-acp\" --port 8765\n\
          Or pass --url ws://localhost:8765 explicitly."
     ))
 }

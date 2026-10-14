@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::agent_client::{AgentKind, AgentProtocol};
+use crate::agent_client::AgentKind;
 
 // ── Lockfile types ────────────────────────────────────────────────────────
 
@@ -35,7 +35,6 @@ pub struct LockfileData {
 #[derive(Debug, Clone)]
 pub struct DetectedAgent {
     pub kind: AgentKind,
-    pub protocol: AgentProtocol,
     /// WebSocket URL built from the lockfile port.
     pub acp_url: String,
     /// PID from the lockfile (if any).
@@ -81,7 +80,6 @@ pub fn parse_lockfile(path: &Path, kind: AgentKind) -> Option<DetectedAgent> {
 
     Some(DetectedAgent {
         kind,
-        protocol: AgentProtocol::Acp,
         acp_url,
         pid: data.pid,
         lockfile: path.to_path_buf(),
@@ -136,7 +134,6 @@ pub async fn scan_default_ports() -> Vec<DetectedAgent> {
             ProbeResult::AcpAvailable { kind, version: _ } => {
                 agents.push(DetectedAgent {
                     kind,
-                    protocol: AgentProtocol::Acp,
                     acp_url: url,
                     pid: None, // No PID available from port scan
                     lockfile: std::path::PathBuf::from(format!("<port-scan:{}>", port)),
@@ -262,7 +259,6 @@ mod tests {
         assert_eq!(agent.acp_url, "ws://127.0.0.1:8765");
         assert_eq!(agent.pid, Some(12345));
         assert_eq!(agent.kind, AgentKind::ClaudeCode);
-        assert_eq!(agent.protocol, AgentProtocol::Acp);
     }
 
     #[test]
@@ -429,7 +425,6 @@ mod tests {
         // Verify all detected agents have valid WebSocket URLs
         for agent in agents {
             assert!(agent.acp_url.starts_with("ws://127.0.0.1:"));
-            assert_eq!(agent.protocol, AgentProtocol::Acp);
             // Port should be in the expected range
             let port_str = agent.acp_url.strip_prefix("ws://127.0.0.1:").unwrap();
             let port: u16 = port_str.parse().unwrap();

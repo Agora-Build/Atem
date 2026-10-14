@@ -125,15 +125,11 @@ atem project show                       # Show current project
 ### AI Agents (WIP)
 
 ```bash
-atem agent list                         # Scan and list detected AI agents
 atem agent launch                       # Open the original Claude Code CLI in an Atem terminal
 atem agent launch codex                 # Open the original Codex CLI in an Atem terminal
 atem agent launch claude --continue     # Arguments after the agent type go to that CLI: continue the last Claude session
 atem agent launch codex resume --last   # Continue the last Codex session
 atem agent launch claude -- --help      # Use -- to read the agent's own help
-atem agent connect <WS_URL>             # Connect to ACP agent and show info
-atem agent prompt <WS_URL> "text"       # Send prompt to ACP agent
-atem agent probe <WS_URL>               # Probe URL for ACP support
 atem agent visualize "topic"            # Generate visual HTML diagram via agent
 atem agent visualize "topic" --url ws://localhost:8765  # Explicit agent URL
 atem agent visualize "topic" --no-browser               # Skip opening browser
