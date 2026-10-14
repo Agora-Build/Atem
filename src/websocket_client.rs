@@ -274,7 +274,9 @@ pub enum AstationMessage {
         message: String,
     },
 
-    /// Astation → Atem: request to generate a visual diagram via an agent.
+    /// Astation → Atem: request to generate a visual diagram. Diagram
+    /// generation was removed from atem; every request is answered at once
+    /// with an unsuccessful `VisualizeResult`.
     #[serde(rename = "visualizeRequest")]
     VisualizeRequest {
         session_id: String,
@@ -283,7 +285,8 @@ pub enum AstationMessage {
         relay_url: Option<String>,
     },
 
-    /// Atem → Astation: result of a visualize request.
+    /// Atem → Astation: answer to a visualize request (always
+    /// `success: false` since diagram generation was removed).
     #[serde(rename = "visualizeResult")]
     VisualizeResult {
         session_id: String,
@@ -567,12 +570,10 @@ impl AstationClient {
         self.answered_challenge = None;
     }
 
-    /// Connect to Astation using a saved auth session.
-    /// Connect with session (now handled via message-based auth)
-    /// This is now just an alias for connect() since auth happens after connection.
+    /// Alias for `connect_without_pairing`: the saved session is looked up
+    /// from disk by Astation id when the challenge arrives, so `_session_id`
+    /// is unused.
     pub async fn connect_with_session(&mut self, base_url: &str, _session_id: &str) -> Result<()> {
-        // Session auth now happens inside connect() via authenticate()
-        // The session_id parameter is ignored - session is loaded from disk
         self.connect_without_pairing(base_url).await
     }
 
@@ -868,8 +869,8 @@ impl AstationClient {
     /// Answer an `auth_required` that arrives on an already-authenticated
     /// socket (Astation reconnected to the relay, which kept this socket).
     /// Only the pinned Astation is answered, and only non-interactively; the
-    /// proof is queued without waiting. Returns the answered challenge.
-    pub(crate) async fn answer_auth_required(&mut self, auth_required: &AstationMessage) -> Result<String> {
+    /// proof is queued without waiting.
+    pub(crate) async fn answer_auth_required(&mut self, auth_required: &AstationMessage) -> Result<()> {
         let challenge = AuthChallenge::parse(auth_required)?;
         let pinned = self
             .connected_astation_id
@@ -885,8 +886,8 @@ impl AstationClient {
             .auth_proof(&challenge)?
             .ok_or_else(|| anyhow!("no saved session for this Astation; run `atem pair`"))?;
         self.send_message(proof).await?;
-        self.answered_challenge = Some((challenge.astation_id, challenge.challenge.clone()));
-        Ok(challenge.challenge)
+        self.answered_challenge = Some((challenge.astation_id, challenge.challenge));
+        Ok(())
     }
 
     /// True when `auth_required` repeats the challenge this socket already
@@ -1189,8 +1190,8 @@ impl AstationClient {
         }
     }
 
-    /// Returns true if the WebSocket connection has been closed.
-    /// Detected lazily when `recv_message()` encounters a closed channel.
+    /// Returns true if the WebSocket connection has been closed: `recv_message()`
+    /// found the channel closed, or a transport task (reader or writer) ended.
     pub fn is_ws_closed(&self) -> bool {
         self.ws_closed || self.transport_tasks.iter().any(|task| task.is_finished())
     }
@@ -1274,51 +1275,15 @@ impl AstationClient {
         self.send_message(AstationMessage::AgentListResponse { agents }).await
     }
 
-    /// Stream an agent event to Astation.
-    pub async fn send_agent_event(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-        event: &crate::agent_client::AgentEvent,
-    ) -> Result<()> {
-        use crate::agent_client::AgentEvent;
-        let (event_type, text, data) = match event {
-            AgentEvent::TextDelta(t) => {
-                ("text_delta".to_string(), Some(t.clone()), None)
-            }
-            AgentEvent::ToolCall { id, name, input } => (
-                "tool_call".to_string(),
-                None,
-                Some(serde_json::json!({ "id": id, "name": name, "input": input })),
-            ),
-            AgentEvent::ToolResult { id, output } => (
-                "tool_result".to_string(),
-                None,
-                Some(serde_json::json!({ "id": id, "output": output })),
-            ),
-            AgentEvent::Done => ("done".to_string(), None, None),
-            AgentEvent::Error(msg) => ("error".to_string(), Some(msg.clone()), None),
-            AgentEvent::Disconnected => ("disconnected".to_string(), None, None),
-        };
 
-        self.send_message(AstationMessage::AgentEventMsg {
-            agent_id: agent_id.to_string(),
-            session_id: session_id.to_string(),
-            event_type,
-            text,
-            data,
-        })
-        .await
-    }
-
-    /// Register with the relay service to get a pairing code, then connect.
+    /// Connect to Astation for pairing.
     ///
     /// Flow:
-    /// 1. POST to relay /api/pair → get pairing code
-    /// 2. Try local Astation (ws://127.0.0.1:8080/ws)
-    /// 3. If local fails → fall back to relay WebSocket
+    /// 1. Try local Astation (`astation_ws`, default ws://127.0.0.1:8080/ws)
+    /// 2. If local fails → POST to relay /api/pair → get pairing code
+    /// 3. Connect the relay WebSocket with that code (no auth yet)
     ///
-    /// Returns the pairing code on success.
+    /// Returns the pairing code on success ("local" for a local connection).
     pub async fn connect_with_pairing(&mut self, config: &AtemConfig) -> Result<String> {
         // 1. Try local Astation first (fast, no relay needed)
         let local_url = config.astation_ws().to_string();
@@ -1757,11 +1722,9 @@ mod tests {
         client.connect_raw(&url).await.unwrap();
         client.pin_astation_for_test("astation-local");
 
-        let challenge = client
-            .answer_auth_required(&reauth_challenge("astation-local", "loopback"))
-            .await
-            .unwrap();
-        assert_eq!(challenge, "d".repeat(64));
+        let challenge = reauth_challenge("astation-local", "loopback");
+        client.answer_auth_required(&challenge).await.unwrap();
+        assert!(client.is_answered_challenge(&challenge));
         let Some(AstationMessage::StatusUpdate { status, data }) = server.await.unwrap() else {
             panic!("no proof reached Astation");
         };
@@ -2925,12 +2888,12 @@ mod tests {
             id: id.to_string(),
             name: format!("agent-{id}"),
             kind: AgentKind::ClaudeCode,
-            protocol: AgentProtocol::Acp,
+            protocol: AgentProtocol::Pty,
             origin: AgentOrigin::Launched,
             status: AgentStatus::Idle,
             session_ids: vec![],
-            acp_url: Some("ws://localhost:8765".to_string()),
-            pty_pid: None,
+            acp_url: None,
+            pty_pid: Some(4242),
         }
     }
 
@@ -3070,7 +3033,9 @@ mod tests {
         if let AstationMessage::AgentListResponse { agents } = parsed {
             let a = &agents[0];
             assert_eq!(a.id, "test-id");
-            assert_eq!(a.acp_url.as_deref(), Some("ws://localhost:8765"));
+            assert_eq!(a.protocol, crate::agent_client::AgentProtocol::Pty);
+            assert!(a.acp_url.is_none());
+            assert_eq!(a.pty_pid, Some(4242));
         } else {
             panic!("expected AgentListResponse");
         }

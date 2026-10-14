@@ -26,20 +26,15 @@ mod vault_client;
 mod memory;
 mod pair_verify;
 mod websocket_client;
-// Agent hub — ACP/PTY protocol abstraction
-mod acp_client;
+// Agent hub — PTY agents launched by `atem agent launch`
 mod agent_client;
-mod agent_detector;
 mod agent_registry;
-mod agent_visualize;
 // Shared HTTPS scaffolding
 mod web_server;
 // RTC test server
 mod rtc_test_server;
 // Static-file HTTPS server (atem serv files)
 mod files_server;
-// Diagram hosting server
-mod diagram_server;
 // Local Agora webhook receiver + ngrok tunnel
 mod webhook_server;
 

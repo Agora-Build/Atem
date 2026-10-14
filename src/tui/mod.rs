@@ -203,7 +203,6 @@ async fn run_tui_loop(
 ) -> Result<()> {
     sync_terminal_sizes(app, terminal.size()?);
     terminal.draw(|frame| draw_ui(frame, app))?;
-    app.startup_scan_agents().await;
 
     // Kick off Astation connection in the background — won't block the UI.
     app.spawn_astation_connect();
@@ -226,8 +225,6 @@ async fn run_tui_loop(
         // Drain bytes from the old geometry before notifying the CLI of a resize.
         sync_terminal_sizes(app, terminal.size()?);
         app.pump_terminals();
-        // Forward ACP agent events to Astation
-        app.poll_acp_events().await;
 
         // Dispatcher: drain triage verdicts and try to send next task to main
         app.dispatcher.poll_triage_results();
@@ -328,12 +325,6 @@ async fn run_tui_loop(
                                             app.status_message =
                                                 Some(format!("Active agent: {}", id));
                                         }
-                                    }
-                                    KeyCode::Char('r') | KeyCode::Char('R') if !ctrl => {
-                                        // Refresh: rescan lockfiles
-                                        app.startup_scan_agents().await;
-                                        app.status_message =
-                                            Some("Agent list refreshed".to_string());
                                     }
                                     _ => {}
                                 },

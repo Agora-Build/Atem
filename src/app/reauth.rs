@@ -11,13 +11,6 @@ use std::time::{Duration, Instant};
 /// How long Astation has to accept the proof before the socket is dropped.
 pub(super) const REAUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A re-authentication proof Astation has not acknowledged yet (the answered
-/// challenge itself is remembered by the client).
-#[derive(Debug, Clone)]
-pub struct PendingReauth {
-    pub deadline: Instant,
-}
-
 impl App {
     /// Handles `auth_required` and, while re-authentication is pending, every
     /// other message. Returns true when the message was consumed.
@@ -62,14 +55,14 @@ impl App {
     /// Fails a re-authentication Astation did not answer in time, or whose
     /// socket closed (the ordinary disconnect check only covers online links).
     pub(super) fn check_astation_reauth_deadline(&mut self) {
-        let Some(pending) = &self.astation_reauth else {
+        let Some(deadline) = self.astation_reauth else {
             return;
         };
         if self.astation_client.is_ws_closed() {
             self.fail_astation_reauth(
                 "Astation closed the connection during re-authentication; reconnecting".to_string(),
             );
-        } else if Instant::now() >= pending.deadline {
+        } else if Instant::now() >= deadline {
             self.fail_astation_reauth(format!(
                 "Astation did not answer re-authentication within {}s; reconnecting",
                 REAUTH_TIMEOUT.as_secs()
@@ -88,10 +81,8 @@ impl App {
             self.suspend_astation();
         }
         match self.astation_client.answer_auth_required(message).await {
-            Ok(_) => {
-                self.astation_reauth = Some(PendingReauth {
-                    deadline: Instant::now() + REAUTH_TIMEOUT,
-                });
+            Ok(()) => {
+                self.astation_reauth = Some(Instant::now() + REAUTH_TIMEOUT);
                 self.status_message = Some("Astation re-authenticating…".to_string());
             }
             Err(error) => {
@@ -474,9 +465,9 @@ mod tests {
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();
         next_auth(&mut app, &mut peer).await;
-        let pending = app.astation_reauth.as_mut().expect("re-auth pending");
-        assert!(pending.deadline > Instant::now() + REAUTH_TIMEOUT - Duration::from_secs(2));
-        pending.deadline = Instant::now();
+        let deadline = app.astation_reauth.as_mut().expect("re-auth pending");
+        assert!(*deadline > Instant::now() + REAUTH_TIMEOUT - Duration::from_secs(2));
+        *deadline = Instant::now();
         assert_fails_closed(&mut app, &mut peer, "did not answer").await;
     }
 
@@ -602,7 +593,7 @@ mod tests {
         let first = "b".repeat(64);
         peer.send.send(auth_required(ASTATION, &first)).unwrap();
         next_auth(&mut app, &mut peer).await;
-        let first_deadline = app.astation_reauth.as_ref().unwrap().deadline;
+        let first_deadline = app.astation_reauth.unwrap();
 
         peer.send.send(auth_required(ASTATION, &first)).unwrap();
         let frames = pump(&mut app, &mut peer).await;
@@ -610,17 +601,13 @@ mod tests {
             !frames.iter().flatten().any(is_auth),
             "answered a duplicate challenge"
         );
-        assert_eq!(
-            app.astation_reauth.as_ref().unwrap().deadline,
-            first_deadline
-        );
+        assert_eq!(app.astation_reauth.unwrap(), first_deadline);
 
         let second = "c".repeat(64);
         peer.send.send(auth_required(ASTATION, &second)).unwrap();
         let proof = next_auth(&mut app, &mut peer).await;
         assert_eq!(proof["proof"], expected_session_proof(&second));
-        let pending = app.astation_reauth.as_ref().unwrap();
-        assert!(pending.deadline > first_deadline);
+        assert!(app.astation_reauth.unwrap() > first_deadline);
         assert!(!app.astation_connected);
     }
 

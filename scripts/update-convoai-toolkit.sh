@@ -20,7 +20,7 @@
 # and fails if assets/convo/ doesn't match. Moving to the npm package is a
 # separate migration.
 #
-# Requires: git + npx (esbuild pulled transitively).
+# Requires: git, npm and npx (npx fetches esbuild at ESBUILD_VERSION).
 set -euo pipefail
 
 REPO="https://github.com/AgoraIO-Community/Conversational-AI-Demo.git"

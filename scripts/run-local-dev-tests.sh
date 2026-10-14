@@ -113,7 +113,6 @@ run_contains "atem config --help"      "show"            -- "$ATEM" config --hel
 run_contains "atem agent --help"       ""                -- "$ATEM" agent --help
 run_contains "atem serv --help"        ""                -- "$ATEM" serv --help
 run_contains "atem serv list --help"   ""                -- "$ATEM" serv list --help
-run_contains "atem serv diagrams --help" ""              -- "$ATEM" serv diagrams --help
 run_contains "atem login --help"       ""                -- "$ATEM" login --help
 run_contains "atem logout --help"      ""                -- "$ATEM" logout --help
 run_contains "atem pair --help"        "save"            -- "$ATEM" pair --help
@@ -308,11 +307,7 @@ else
 fi
 echo
 
-# ── Agent / Serv (should not crash on empty state) ──────────────────
-echo "$(yellow "Agent")"
-run "atem agent list" -- "$ATEM" agent list
-echo
-
+# ── Serv (should not crash on empty state) ──────────────────────────
 echo "$(yellow "Serv")"
 run "atem serv list" -- "$ATEM" serv list
 echo

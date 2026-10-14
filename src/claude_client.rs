@@ -92,7 +92,6 @@ mod tests {
         };
         let mut session = client.start_session().await.unwrap();
 
-        // Send a line to cat's stdin
         session.sender.send("ping\n".to_string()).unwrap();
 
         // Read output — should see "ping" echoed back
