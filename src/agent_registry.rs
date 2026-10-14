@@ -1,5 +1,5 @@
-/// In-memory registry of all known agents (launched by Atem or discovered
-/// externally via lockfile / ACP probe).
+/// In-memory registry of the agents Atem launched (PTY sessions from
+/// `atem agent launch`).
 ///
 /// The registry is the single source of truth that Astation queries when it
 /// wants to know which agents are available and what their current status is.
@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::agent_client::{AgentInfo, AgentProtocol, AgentStatus};
+use crate::agent_client::{AgentInfo, AgentStatus};
 
 // ── AgentRegistry ─────────────────────────────────────────────────────────
 
@@ -74,15 +74,6 @@ impl AgentRegistry {
         self.inner.write().unwrap().remove(id);
     }
 
-    /// Return true if any ACP agent for the given URL is already registered.
-    pub fn has_acp_url(&self, url: &str) -> bool {
-        self.inner
-            .read()
-            .unwrap()
-            .values()
-            .any(|a| a.acp_url.as_deref() == Some(url))
-    }
-
     /// Return the number of registered agents.
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().len()
@@ -100,17 +91,6 @@ impl AgentRegistry {
             .unwrap()
             .values()
             .filter(|a| a.status != AgentStatus::Disconnected)
-            .cloned()
-            .collect()
-    }
-
-    /// Return all agents using a specific protocol.
-    pub fn by_protocol(&self, protocol: AgentProtocol) -> Vec<AgentInfo> {
-        self.inner
-            .read()
-            .unwrap()
-            .values()
-            .filter(|a| a.protocol == protocol)
             .cloned()
             .collect()
     }
@@ -137,19 +117,12 @@ mod tests {
         }
     }
 
-    fn make_acp_info(id: &str, url: &str) -> AgentInfo {
-        AgentInfo {
-            acp_url: Some(url.to_string()),
-            ..make_info(id, AgentProtocol::Acp)
-        }
-    }
-
     // ── register / get ────────────────────────────────────────────────────
 
     #[test]
     fn test_register_and_get() {
         let reg = AgentRegistry::new();
-        let info = make_info("agent-1", AgentProtocol::Acp);
+        let info = make_info("agent-1", AgentProtocol::Pty);
         reg.register(info.clone());
         let got = reg.get("agent-1").unwrap();
         assert_eq!(got.id, "agent-1");
@@ -165,7 +138,7 @@ mod tests {
     #[test]
     fn test_register_replaces_existing() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("a", AgentProtocol::Acp));
+        reg.register(make_info("a", AgentProtocol::Pty));
 
         let updated = AgentInfo {
             name: "updated-name".to_string(),
@@ -181,7 +154,7 @@ mod tests {
     #[test]
     fn test_register_returns_id() {
         let reg = AgentRegistry::new();
-        let returned = reg.register(make_info("agent-42", AgentProtocol::Acp));
+        let returned = reg.register(make_info("agent-42", AgentProtocol::Pty));
         assert_eq!(returned, "agent-42");
     }
 
@@ -196,9 +169,9 @@ mod tests {
     #[test]
     fn test_all_returns_every_agent() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("a", AgentProtocol::Acp));
+        reg.register(make_info("a", AgentProtocol::Pty));
         reg.register(make_info("b", AgentProtocol::Pty));
-        reg.register(make_info("c", AgentProtocol::Acp));
+        reg.register(make_info("c", AgentProtocol::Pty));
 
         let ids: Vec<_> = {
             let mut v: Vec<_> = reg.all().into_iter().map(|a| a.id).collect();
@@ -213,7 +186,7 @@ mod tests {
     #[test]
     fn test_remove_existing() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("x", AgentProtocol::Acp));
+        reg.register(make_info("x", AgentProtocol::Pty));
         reg.remove("x");
         assert!(reg.get("x").is_none());
     }
@@ -230,7 +203,7 @@ mod tests {
     #[test]
     fn test_update_status() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("a", AgentProtocol::Acp));
+        reg.register(make_info("a", AgentProtocol::Pty));
 
         reg.update_status("a", AgentStatus::Thinking);
         assert_eq!(reg.get("a").unwrap().status, AgentStatus::Thinking);
@@ -250,7 +223,7 @@ mod tests {
     #[test]
     fn test_add_session() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("a", AgentProtocol::Acp));
+        reg.register(make_info("a", AgentProtocol::Pty));
 
         reg.add_session("a", "sess-1");
         reg.add_session("a", "sess-2");
@@ -264,7 +237,7 @@ mod tests {
     #[test]
     fn test_add_session_deduplicates() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("a", AgentProtocol::Acp));
+        reg.register(make_info("a", AgentProtocol::Pty));
 
         reg.add_session("a", "sess-1");
         reg.add_session("a", "sess-1"); // duplicate
@@ -275,7 +248,7 @@ mod tests {
     #[test]
     fn test_remove_session() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("a", AgentProtocol::Acp));
+        reg.register(make_info("a", AgentProtocol::Pty));
 
         reg.add_session("a", "sess-1");
         reg.add_session("a", "sess-2");
@@ -286,28 +259,6 @@ mod tests {
         assert_eq!(sessions[0], "sess-2");
     }
 
-    // ── has_acp_url ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_has_acp_url_true() {
-        let reg = AgentRegistry::new();
-        reg.register(make_acp_info("a", "ws://localhost:8765"));
-        assert!(reg.has_acp_url("ws://localhost:8765"));
-    }
-
-    #[test]
-    fn test_has_acp_url_false() {
-        let reg = AgentRegistry::new();
-        reg.register(make_acp_info("a", "ws://localhost:8765"));
-        assert!(!reg.has_acp_url("ws://localhost:9999"));
-    }
-
-    #[test]
-    fn test_has_acp_url_empty_registry() {
-        let reg = AgentRegistry::new();
-        assert!(!reg.has_acp_url("ws://localhost:8765"));
-    }
-
     // ── len / is_empty ────────────────────────────────────────────────────
 
     #[test]
@@ -316,7 +267,7 @@ mod tests {
         assert_eq!(reg.len(), 0);
         assert!(reg.is_empty());
 
-        reg.register(make_info("a", AgentProtocol::Acp));
+        reg.register(make_info("a", AgentProtocol::Pty));
         assert_eq!(reg.len(), 1);
         assert!(!reg.is_empty());
 
@@ -330,10 +281,10 @@ mod tests {
     #[test]
     fn test_connected_excludes_disconnected() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("active", AgentProtocol::Acp));
+        reg.register(make_info("active", AgentProtocol::Pty));
         reg.register(AgentInfo {
             status: AgentStatus::Disconnected,
-            ..make_info("gone", AgentProtocol::Acp)
+            ..make_info("gone", AgentProtocol::Pty)
         });
 
         let connected = reg.connected();
@@ -344,46 +295,21 @@ mod tests {
     #[test]
     fn test_connected_includes_all_non_disconnected_states() {
         let reg = AgentRegistry::new();
-        reg.register(make_info("idle", AgentProtocol::Acp));
+        reg.register(make_info("idle", AgentProtocol::Pty));
         reg.register(AgentInfo {
             id: "thinking".into(),
             name: "thinking".into(),
             status: AgentStatus::Thinking,
-            ..make_info("thinking", AgentProtocol::Acp)
+            ..make_info("thinking", AgentProtocol::Pty)
         });
         reg.register(AgentInfo {
             id: "waiting".into(),
             name: "waiting".into(),
             status: AgentStatus::WaitingForInput,
-            ..make_info("waiting", AgentProtocol::Acp)
+            ..make_info("waiting", AgentProtocol::Pty)
         });
 
         assert_eq!(reg.connected().len(), 3);
-    }
-
-    // ── by_protocol ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_by_protocol_acp() {
-        let reg = AgentRegistry::new();
-        reg.register(make_info("acp-1", AgentProtocol::Acp));
-        reg.register(make_info("pty-1", AgentProtocol::Pty));
-        reg.register(make_info("acp-2", AgentProtocol::Acp));
-
-        let acp = reg.by_protocol(AgentProtocol::Acp);
-        assert_eq!(acp.len(), 2);
-        assert!(acp.iter().all(|a| a.protocol == AgentProtocol::Acp));
-    }
-
-    #[test]
-    fn test_by_protocol_pty() {
-        let reg = AgentRegistry::new();
-        reg.register(make_info("acp-1", AgentProtocol::Acp));
-        reg.register(make_info("pty-1", AgentProtocol::Pty));
-
-        let pty = reg.by_protocol(AgentProtocol::Pty);
-        assert_eq!(pty.len(), 1);
-        assert_eq!(pty[0].id, "pty-1");
     }
 
     // ── Clone shares state ────────────────────────────────────────────────
@@ -393,7 +319,7 @@ mod tests {
         let reg1 = AgentRegistry::new();
         let reg2 = reg1.clone();
 
-        reg1.register(make_info("shared", AgentProtocol::Acp));
+        reg1.register(make_info("shared", AgentProtocol::Pty));
 
         // reg2 (clone) should see the new agent immediately
         assert!(reg2.get("shared").is_some());
@@ -412,7 +338,7 @@ mod tests {
         for i in 0..20 {
             let r = reg.clone();
             handles.push(thread::spawn(move || {
-                r.register(make_info(&format!("agent-{i}"), AgentProtocol::Acp));
+                r.register(make_info(&format!("agent-{i}"), AgentProtocol::Pty));
             }));
         }
 

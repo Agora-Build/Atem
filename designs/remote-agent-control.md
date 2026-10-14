@@ -144,8 +144,9 @@ Today's `AstationMessage` (both sides) carries: `voiceRequest` /
 `commandResponse` (generic command), `markTask*`, `agentListRequest/Response`,
 etc. It also includes `agentInput` for text-to-agent-stdin and key events.
 The payload carries an optional agent ID, but the v1 handler uses the focused
-PTY rather than that selector. Atem's `agentPrompt`/`agentEvent` ACP path is a
-separate integration; it does not make v1 PTY input addressable.
+PTY rather than that selector. `agentPrompt` routes by agent ID to a launched
+PTY; it does not make v1 PTY input addressable either. (The ACP path that
+streamed `agentEvent` back was removed from Atem.)
 
 v1 uses `agentInput` for text + keys.
 

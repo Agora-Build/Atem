@@ -47,20 +47,18 @@ installed version of an external agent.
 | `src/app.rs`, `src/tui/mod.rs` | Display captured terminal output and drive launched sessions from the TUI | Session ownership is tied to the TUI process; Claude/Codex menu entries require an Astation connection |
 | `src/tui/mod.rs`, `src/tui/draw.rs` | Forward local keyboard input and render the emulated CLI screen; reserve Ctrl+B for Atem | Validate keyboard, paste, Unicode, cursor, and terminal-mode fidelity against both original CLIs |
 | `atem agent launch [claude-code\|codex]` | Prints a placeholder directing the user to the TUI | The CLI command does not launch a session |
-| `src/acp_client.rs` | Uses `session/new`, plain-text `session/prompt` parameters, and `message`/`session/done` notifications | Current standard ACP adapters may use different schemas; test and update the contract before claiming interoperability |
 | `src/agent_registry.rs` | In-memory agent snapshots and status | No durable session bindings or output replay across process restarts |
 | `AgentPrompt` in `src/app.rs` | Routes by agent ID; ignores the supplied session ID | Cannot safely address multiple conversations without a session mapping |
 | `AgentInput` in `src/app.rs` | Writes text or keys to the focused PTY; ignores `agent_id` | Explicit session routing, controller ownership, and the full terminal key/paste contract are missing |
 | Terminal output in `src/app.rs` | Feeds a local vt100 parser and records output | No shared screen snapshots/diffs, revision recovery, or remote resize policy |
 | Existing voice path | Sends transcribed requests to Claude | Selecting the intended Codex/Claude terminal session requires addressed routing |
-| `poll_acp_events` | Forwards live ACP events to Astation | No general durable event subscription for independent local CLI clients |
 
-The baseline's `atem agent list/connect/prompt/probe` commands have since been
-removed; the ACP client remains for `atem agent visualize` and the TUI.
+The baseline's ACP commands (`atem agent list/connect/prompt/probe/visualize`),
+the ACP client and agent detector, and ACP event forwarding to Astation have
+since been removed from Atem.
 
 Calling a server an agent server does not identify its protocol. A Codex
-app-server WebSocket endpoint cannot be passed to the existing ACP client and
-assumed to work.
+app-server WebSocket endpoint is not an ACP endpoint and needs its own adapter.
 
 ## Reference: how Paseo communicates with agents
 
@@ -407,8 +405,8 @@ ACP means Agent Client Protocol here. Use its current initialization, session,
 prompt, update, cancellation, and permission schemas. Support the provider's
 advertised transport; stdio does not require a WebSocket bridge.
 
-Existing Atem ACP helpers are starting material. Their current schemas need a
-compatibility audit and real-provider tests. A matching port number or an
+Atem no longer has ACP helpers; an adapter is written against the current
+schemas and tested with real providers. A matching port number or an
 `initialize` reply alone does not establish prompt/output compatibility.
 
 ### PTY: terminal interaction and display
@@ -615,7 +613,7 @@ compatibility validation on both sides.
 - Background-owner packaging and precise stop/detach lifetime behavior.
 - Optional Claude bridge packaging, ACP compatibility, semantic transcript
   retention, and external-backend ownership.
-- Final CLI names and backward compatibility for existing ACP commands.
+- Final CLI names.
 
 ## Sources
 

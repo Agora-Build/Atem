@@ -58,7 +58,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
         AppMode::CommandExecution => "Type command + Enter | b: Back | q: Quit",
         AppMode::CodexChat | AppMode::ClaudeChat => "Use the Atem prefix for terminal controls",
         AppMode::AgentPanel => {
-            "\u{2191}\u{2193}/jk: Navigate | Enter: Set Active | r: Refresh | b: Back"
+            "\u{2191}\u{2193}/jk: Navigate | Enter: Set Active | b: Back"
         }
         AppMode::TokenGeneration if !app.cached_projects.is_empty() => {
             if app.show_certificates {
@@ -476,9 +476,9 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
     if agents.is_empty() {
         let msg = Paragraph::new(
             "No agents registered.\n\n\
-             Agents are discovered automatically when Claude Code or Codex\n\
-             processes are running (via their lockfiles or ACP ports).\n\n\
-             Press 'r' to refresh, 'b' to go back.",
+             Claude Code or Codex sessions started in Atem\n\
+             (`atem agent launch`) appear here.\n\n\
+             Press 'b' to go back.",
         )
         .style(Style::default().fg(Color::DarkGray))
         .block(
@@ -500,7 +500,6 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
             let is_active = app.active_agent_id.as_deref() == Some(info.id.as_str());
 
             let protocol_badge = match info.protocol {
-                AgentProtocol::Acp => "[ACP]",
                 AgentProtocol::Pty => "[PTY]",
             };
 
@@ -526,14 +525,13 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
             };
 
             let line = format!(
-                "{} {} {} {}{}{} — {}",
+                "{} {} {} {}{}{}",
                 status_icon,
                 protocol_badge,
                 kind_label,
                 info.id,
                 active_marker,
                 session_info,
-                info.acp_url.as_deref().unwrap_or("pty"),
             );
 
             let style = if is_selected {

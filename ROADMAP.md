@@ -26,7 +26,7 @@ Built and usable today, but not yet at their best — actively being improved.
 
 ### AI Agents
 
-`atem agent` connects to local AI coding agents (Claude Code, Codex) over ACP/PTY — detect running agents, launch them, send prompts, generate diagrams. The commands work today (see the README), but the current implementation is early; reliability, the ACP integration, and the UX are all being refined.
+`atem agent launch` opens the original Claude Code or Codex CLI in an Atem terminal that Astation can view and control. It works today (see the README), but the implementation is early; reliability and the UX are being refined.
 
 ### Astation Integration
 

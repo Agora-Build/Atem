@@ -225,20 +225,6 @@ pub enum AgentCommands {
         )]
         agent_args: Vec<String>,
     },
-    /// Generate a visual HTML diagram via an active ACP agent
-    Visualize {
-        /// Topic or system to visualize
-        topic: String,
-        /// WebSocket URL of the ACP server (auto-detected if omitted)
-        #[arg(long)]
-        url: Option<String>,
-        /// Timeout in milliseconds
-        #[arg(long, default_value = "120000")]
-        timeout: u64,
-        /// Skip opening the result in a browser
-        #[arg(long)]
-        no_browser: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -323,18 +309,6 @@ pub enum ServCommands {
         #[arg(long)]
         background: bool,
         /// Internal: daemon marker (hidden)
-        #[arg(long, hide = true)]
-        _serv_daemon: bool,
-    },
-    /// Host diagrams from SQLite — serves HTML at /d/{id}
-    Diagrams {
-        /// HTTP port (default: 8787)
-        #[arg(long, default_value = "8787")]
-        port: u16,
-        /// Run as a background daemon
-        #[arg(long)]
-        background: bool,
-        /// Internal: marks this process as the detached daemon (hidden)
         #[arg(long, hide = true)]
         _serv_daemon: bool,
     },
@@ -947,113 +921,6 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 agent_type,
                 agent_args,
             } => crate::tui::run_agent_tui(Some(&agent_type), &agent_args).await,
-            AgentCommands::Visualize { topic, url, timeout, no_browser } => {
-                use crate::acp_client::AcpClient;
-                use crate::agent_client::AgentEvent;
-                use crate::agent_visualize::{
-                    build_visualize_prompt, detect_new_html_files,
-                    open_html_in_browser, resolve_agent_url, snapshot_diagrams_dir,
-                };
-                use std::time::Duration;
-
-                let agent_url = resolve_agent_url(url).await?;
-                println!("Connecting to {} …", agent_url);
-
-                let mut client = AcpClient::connect(&agent_url).await?;
-                let info = client.initialize().await?;
-                let _session_id = client.new_session().await?;
-                println!("Agent: {} — generating diagram …\n", info.kind);
-
-                // Snapshot diagrams dir before sending prompt
-                let pre_snapshot = snapshot_diagrams_dir();
-
-                let prompt = build_visualize_prompt(&topic);
-                client.send_prompt(&prompt)?;
-
-                // Poll for events; watch for Write tool calls targeting .html
-                let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
-                let mut detected_file: Option<String> = None;
-
-                loop {
-                    if std::time::Instant::now() >= deadline {
-                        eprintln!("\nTimeout waiting for agent.");
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let events = client.drain_events();
-                    for event in events {
-                        match event {
-                            AgentEvent::TextDelta(t) => print!("{}", t),
-                            AgentEvent::ToolCall { name, input, .. } => {
-                                print!("\n[tool: {}] ", name);
-                                // Detect Write tool targeting an .html file
-                                if name == "Write" {
-                                    if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
-                                        if fp.ends_with(".html") {
-                                            detected_file = Some(fp.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                            AgentEvent::ToolResult { .. } => print!("[done] "),
-                            AgentEvent::Done => {
-                                println!();
-
-                                // Determine which file to open
-                                let file_path = detected_file.or_else(|| {
-                                    detect_new_html_files(&pre_snapshot).into_iter().next()
-                                });
-
-                                match file_path {
-                                    Some(path) => {
-                                        println!("\nDiagram saved: {}", path);
-
-                                        // Upload to diagram server
-                                        let config = crate::config::AtemConfig::load().unwrap_or_default();
-                                        match crate::agent_visualize::resolve_diagram_server_url(&config) {
-                                            Ok(server_url) => {
-                                                match crate::agent_visualize::upload_diagram(&path, &topic, &server_url).await {
-                                                    Ok(url) => {
-                                                        println!("View at: {}", url);
-                                                        if !no_browser {
-                                                            open_html_in_browser(&url);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("Upload failed: {}", e);
-                                                        if !no_browser {
-                                                            open_html_in_browser(&path);
-                                                            println!("Opened local file in browser.");
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Could not resolve diagram server: {}", e);
-                                                if !no_browser {
-                                                    open_html_in_browser(&path);
-                                                    println!("Opened local file in browser.");
-                                                }
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        eprintln!("No HTML diagram file was detected.");
-                                    }
-                                }
-                                return Ok(());
-                            }
-                            AgentEvent::Error(e) => {
-                                anyhow::bail!("Agent error: {}", e);
-                            }
-                            AgentEvent::Disconnected => {
-                                anyhow::bail!("Agent disconnected");
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
         },
         Commands::Serv { serv_command } => match serv_command {
             ServCommands::Rtc {
@@ -1105,18 +972,6 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                     port, no_tunnel, no_browser, background,
                     _daemon: _serv_daemon,
                 }).await
-            }
-            ServCommands::Diagrams {
-                port,
-                background,
-                _serv_daemon,
-            } => {
-                let config = crate::diagram_server::DiagramServerConfig {
-                    port,
-                    background,
-                    _daemon: _serv_daemon,
-                };
-                crate::diagram_server::run_server(config).await
             }
             ServCommands::Files {
                 dir,
@@ -1982,12 +1837,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_removed_agent_subcommands_are_rejected() {
+    fn cli_removed_acp_and_diagram_subcommands_are_rejected() {
         for args in [
             &["atem", "agent", "list"][..],
             &["atem", "agent", "connect", "ws://localhost:8765"],
             &["atem", "agent", "prompt", "ws://localhost:8765", "hi"],
             &["atem", "agent", "probe", "ws://localhost:8765"],
+            &["atem", "agent", "visualize", "topic"],
+            &["atem", "serv", "diagrams"],
         ] {
             let err = match Cli::try_parse_from(args) {
                 Ok(_) => panic!("{args:?} should be rejected"),
@@ -1999,129 +1856,8 @@ mod tests {
                 "{args:?}"
             );
         }
-        // The rest of `atem agent` and `atem serv diagrams` still parse.
-        for args in [
-            &["atem", "agent", "launch"][..],
-            &["atem", "agent", "visualize", "topic"],
-            &["atem", "serv", "diagrams"],
-        ] {
-            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
-        }
-    }
-
-    // ── agent visualize ──────────────────────────────────────────────────
-
-    #[test]
-    fn cli_agent_visualize_parses() {
-        let cli = Cli::try_parse_from([
-            "atem", "agent", "visualize", "WebRTC data flow",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Visualize { topic, url, timeout, no_browser },
-            }) => {
-                assert_eq!(topic, "WebRTC data flow");
-                assert!(url.is_none());
-                assert_eq!(timeout, 120000);
-                assert!(!no_browser);
-            }
-            _ => panic!("expected Agent Visualize"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_visualize_with_url() {
-        let cli = Cli::try_parse_from([
-            "atem", "agent", "visualize", "auth system",
-            "--url", "ws://localhost:8765",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Visualize { topic, url, .. },
-            }) => {
-                assert_eq!(topic, "auth system");
-                assert_eq!(url.as_deref(), Some("ws://localhost:8765"));
-            }
-            _ => panic!("expected Agent Visualize"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_visualize_no_browser_flag() {
-        let cli = Cli::try_parse_from([
-            "atem", "agent", "visualize", "pipeline", "--no-browser",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Visualize { no_browser, .. },
-            }) => {
-                assert!(no_browser);
-            }
-            _ => panic!("expected Agent Visualize"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_visualize_custom_timeout() {
-        let cli = Cli::try_parse_from([
-            "atem", "agent", "visualize", "data flow", "--timeout", "60000",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Visualize { timeout, .. },
-            }) => {
-                assert_eq!(timeout, 60000);
-            }
-            _ => panic!("expected Agent Visualize"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_visualize_all_flags() {
-        let cli = Cli::try_parse_from([
-            "atem", "agent", "visualize", "Atem architecture",
-            "--url", "ws://10.0.0.1:9000",
-            "--timeout", "30000",
-            "--no-browser",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Visualize { topic, url, timeout, no_browser },
-            }) => {
-                assert_eq!(topic, "Atem architecture");
-                assert_eq!(url.as_deref(), Some("ws://10.0.0.1:9000"));
-                assert_eq!(timeout, 30000);
-                assert!(no_browser);
-            }
-            _ => panic!("expected Agent Visualize"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_visualize_topic_with_spaces() {
-        let cli = Cli::try_parse_from([
-            "atem", "agent", "visualize", "multi word topic with spaces",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Agent {
-                agent_command: AgentCommands::Visualize { topic, .. },
-            }) => {
-                assert_eq!(topic, "multi word topic with spaces");
-            }
-            _ => panic!("expected Agent Visualize"),
-        }
-    }
-
-    #[test]
-    fn cli_agent_visualize_missing_topic_fails() {
-        let result = Cli::try_parse_from(["atem", "agent", "visualize"]);
-        assert!(result.is_err(), "visualize without topic should fail");
+        // `atem agent launch` still parses.
+        assert!(Cli::try_parse_from(["atem", "agent", "launch"]).is_ok());
     }
 
     // ── config set / clear ────────────────────────────────────────────────
@@ -2308,49 +2044,6 @@ mod tests {
                 serv_command: ServCommands::Killall
             })
         ));
-    }
-
-    // ── serv diagrams command ───────────────────────────────────────────
-
-    #[test]
-    fn cli_serv_diagrams_defaults() {
-        let cli = Cli::try_parse_from(["atem", "serv", "diagrams"]).unwrap();
-        match cli.command {
-            Some(Commands::Serv {
-                serv_command: ServCommands::Diagrams { port, background, _serv_daemon },
-            }) => {
-                assert_eq!(port, 8787);
-                assert!(!background);
-                assert!(!_serv_daemon);
-            }
-            _ => panic!("expected Serv Diagrams command"),
-        }
-    }
-
-    #[test]
-    fn cli_serv_diagrams_with_port() {
-        let cli = Cli::try_parse_from(["atem", "serv", "diagrams", "--port", "9000"]).unwrap();
-        match cli.command {
-            Some(Commands::Serv {
-                serv_command: ServCommands::Diagrams { port, .. },
-            }) => {
-                assert_eq!(port, 9000);
-            }
-            _ => panic!("expected Serv Diagrams command"),
-        }
-    }
-
-    #[test]
-    fn cli_serv_diagrams_background_flag() {
-        let cli = Cli::try_parse_from(["atem", "serv", "diagrams", "--background"]).unwrap();
-        match cli.command {
-            Some(Commands::Serv {
-                serv_command: ServCommands::Diagrams { background, .. },
-            }) => {
-                assert!(background);
-            }
-            _ => panic!("expected Serv Diagrams command"),
-        }
     }
 
     // ── serv convo command ────────────────────────────────────────────────

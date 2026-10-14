@@ -274,7 +274,9 @@ pub enum AstationMessage {
         message: String,
     },
 
-    /// Astation → Atem: request to generate a visual diagram via an agent.
+    /// Astation → Atem: request to generate a visual diagram. Diagram
+    /// generation was removed from atem; every request is answered at once
+    /// with an unsuccessful `VisualizeResult`.
     #[serde(rename = "visualizeRequest")]
     VisualizeRequest {
         session_id: String,
@@ -283,7 +285,8 @@ pub enum AstationMessage {
         relay_url: Option<String>,
     },
 
-    /// Atem → Astation: result of a visualize request.
+    /// Atem → Astation: answer to a visualize request (always
+    /// `success: false` since diagram generation was removed).
     #[serde(rename = "visualizeResult")]
     VisualizeResult {
         session_id: String,
@@ -1272,42 +1275,6 @@ impl AstationClient {
         self.send_message(AstationMessage::AgentListResponse { agents }).await
     }
 
-    /// Stream an agent event to Astation.
-    pub async fn send_agent_event(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-        event: &crate::agent_client::AgentEvent,
-    ) -> Result<()> {
-        use crate::agent_client::AgentEvent;
-        let (event_type, text, data) = match event {
-            AgentEvent::TextDelta(t) => {
-                ("text_delta".to_string(), Some(t.clone()), None)
-            }
-            AgentEvent::ToolCall { id, name, input } => (
-                "tool_call".to_string(),
-                None,
-                Some(serde_json::json!({ "id": id, "name": name, "input": input })),
-            ),
-            AgentEvent::ToolResult { id, output } => (
-                "tool_result".to_string(),
-                None,
-                Some(serde_json::json!({ "id": id, "output": output })),
-            ),
-            AgentEvent::Done => ("done".to_string(), None, None),
-            AgentEvent::Error(msg) => ("error".to_string(), Some(msg.clone()), None),
-            AgentEvent::Disconnected => ("disconnected".to_string(), None, None),
-        };
-
-        self.send_message(AstationMessage::AgentEventMsg {
-            agent_id: agent_id.to_string(),
-            session_id: session_id.to_string(),
-            event_type,
-            text,
-            data,
-        })
-        .await
-    }
 
     /// Connect to Astation for pairing.
     ///
@@ -2921,12 +2888,12 @@ mod tests {
             id: id.to_string(),
             name: format!("agent-{id}"),
             kind: AgentKind::ClaudeCode,
-            protocol: AgentProtocol::Acp,
+            protocol: AgentProtocol::Pty,
             origin: AgentOrigin::Launched,
             status: AgentStatus::Idle,
             session_ids: vec![],
-            acp_url: Some("ws://localhost:8765".to_string()),
-            pty_pid: None,
+            acp_url: None,
+            pty_pid: Some(4242),
         }
     }
 
@@ -3066,7 +3033,9 @@ mod tests {
         if let AstationMessage::AgentListResponse { agents } = parsed {
             let a = &agents[0];
             assert_eq!(a.id, "test-id");
-            assert_eq!(a.acp_url.as_deref(), Some("ws://localhost:8765"));
+            assert_eq!(a.protocol, crate::agent_client::AgentProtocol::Pty);
+            assert!(a.acp_url.is_none());
+            assert_eq!(a.pty_pid, Some(4242));
         } else {
             panic!("expected AgentListResponse");
         }

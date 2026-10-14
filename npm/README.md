@@ -1,6 +1,6 @@
 # @agora-build/atem
 
-A terminal that connects builders, Agora platform, and AI agents. Manage Agora projects and tokens, route tasks between [Astation](https://github.com/Agora-Build/Astation) and AI coding agents, generate diagrams, drive voice-powered coding workflows, and more -- all from a single CLI/TUI.
+A terminal that connects builders, Agora platform, and AI agents. Manage Agora projects and tokens, route tasks between [Astation](https://github.com/Agora-Build/Astation) and AI coding agents, drive voice-powered coding workflows, and more -- all from a single CLI/TUI.
 
 ## Install
 
@@ -42,8 +42,8 @@ atem unpair [--yes]                     # Remove all Astation pairings (asks fir
 `atem login` unlocks a limited set: project list, tokens for the active
 project, and the dev servers (`serv rtc`, `serv convo`, `serv webhooks`).
 Pairing with Astation unlocks the full set: vault, sync, memory, skills,
-`atem cred`, and Astation-driven remote agent control, voice coding, mark
-tasks and diagrams. `serv files`, `config`, and tokens from
+`atem cred`, and Astation-driven remote agent control, voice coding and mark
+tasks. `serv files`, `config`, and tokens from
 `AGORA_APP_ID`/`AGORA_APP_CERTIFICATE` need neither.
 
 `atem pair` receives your Agora login from Astation, then verifies the device:
@@ -226,9 +226,6 @@ atem serv attach 3                      # …or by index from `atem serv list`
 atem serv rtc                           # Launch RTC test page (HTTPS)
 atem serv rtc --channel test --port 8443
 atem serv rtc --background              # Run as background daemon
-atem serv diagrams                      # Host diagrams from SQLite (HTTP)
-atem serv diagrams --port 9000
-atem serv diagrams --background
 atem serv files ~/docs                  # Serve a directory or file over HTTPS (Markdown rendered)
 atem serv files ~/docs --background     # Port auto-picked; reused next run
 atem serv webhooks                      # Receive Agora webhooks locally (auto-tunneled via ngrok)
@@ -252,8 +249,6 @@ done
 
 **`serv rtc`** — RTC test page: join/leave, publish/subscribe audio+video, token generation, RTM messaging, RTC encryption (8 modes; gcm2 modes auto-generate a copyable salt).
 
-**`serv diagrams`** — SQLite-backed HTTP server for hosting AI-generated HTML diagrams.
-
 **`serv files`** — serves a directory (or a single file) over HTTPS. Markdown is rendered to HTML; append `?raw=1` to any URL for the raw bytes. Useful for browsing AI-generated docs on a remote machine.
 
 **`serv webhooks`** — local receiver for Agora webhook events (ConvoAI: `agent_joined`, `agent_left`, `agent_history`, `agent_error`, `agent_metrics`, …; RTC NCS events). Validates `Agora-Signature-V2` (HMAC-SHA256) when a `secret` is configured in `webhooks.toml`; accepts unsigned events otherwise with a warning. Live web console at `http://127.0.0.1:9090/` shows incoming events; each event also prints a one-line summary to stdout. Default tunnel provider is **ngrok**; set `tunnel_provider = "cloudflared"` for zero-auth quick tunnels. Use `--no-tunnel` if you're running cloudflared / ngrok separately for stable URLs across atem restarts.
@@ -268,7 +263,6 @@ atem agent launch codex                 # Open the original Codex CLI in an Atem
 atem agent launch claude --continue     # Arguments after the agent type go to that CLI: continue the last Claude session
 atem agent launch codex resume --last   # Continue the last Codex session
 atem agent launch claude -- --help      # Use -- to read the agent's own help
-atem agent visualize "topic"            # Generate visual HTML diagram via ACP agent
 ```
 
 `atem agent launch [claude|claude-code|codex] [ARGS]...` runs the installed

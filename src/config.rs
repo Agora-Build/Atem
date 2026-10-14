@@ -13,7 +13,6 @@ pub struct AtemConfig {
     /// Most recently authenticated Astation identity. Learned automatically and
     /// used to select its persistent relay room on remote reconnect.
     pub astation_relay_code: Option<String>,
-    pub diagram_server_url: Option<String>,
     pub bff_url: Option<String>,
     pub sso_url: Option<String>,
 
@@ -83,9 +82,6 @@ impl AtemConfig {
         }
         if let Ok(val) = std::env::var("ATEM_TERMINAL_PREFIX") {
             config.terminal_prefix = Some(val);
-        }
-        if let Ok(val) = std::env::var("DIAGRAM_SERVER_URL") {
-            config.diagram_server_url = Some(val);
         }
         if let Ok(val) = std::env::var("ATEM_BFF_URL") {
             if !val.is_empty() {
@@ -232,9 +228,6 @@ impl AtemConfig {
         if let Some(code) = &self.astation_relay_code {
             table.insert("astation_relay_code".into(), toml::Value::String(code.clone()));
         }
-        if let Some(ds) = &self.diagram_server_url {
-            table.insert("diagram_server_url".into(), toml::Value::String(ds.clone()));
-        }
         if let Some(bff) = &self.bff_url {
             table.insert("bff_url".into(), toml::Value::String(bff.clone()));
         }
@@ -310,10 +303,6 @@ impl AtemConfig {
         lines.push(format!(
             "astation_relay_code: {}",
             self.astation_relay_code.as_deref().unwrap_or("(not learned)")
-        ));
-        lines.push(format!(
-            "diagram_server_url: {}",
-            self.diagram_server_url.as_deref().unwrap_or("(not set)")
         ));
         lines.push(format!(
             "instance_id: {}",
@@ -739,7 +728,6 @@ mod tests {
         assert!(config.rtm_account.is_none());
         assert!(config.astation_ws.is_none());
         assert!(config.astation_relay_url.is_none());
-        assert!(config.diagram_server_url.is_none());
         assert!(config.bff_url.is_none());
         assert!(config.sso_url.is_none());
     }

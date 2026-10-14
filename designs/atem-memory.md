@@ -236,7 +236,7 @@ CREATE INDEX skill_versions_account_seq ON skill_versions (account_id, seq);
 
 ### Local (SQLite, each machine)
 
-`~/.config/atem/knowledge.db`, using `rusqlite` like `diagram_server.rs`,
+`~/.config/atem/knowledge.db`, using `rusqlite`,
 file mode 0600. The file is created with mode 0600 before it's opened, so
 there's no window where it's readable by others:
 

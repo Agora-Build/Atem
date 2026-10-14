@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents working with this repository.
 
 ## Project Overview
 
-Atem is a terminal that connects builders, Agora platform, and AI agents. It provides a CLI and TUI for managing Agora projects and tokens, routing tasks between Astation and AI coding agents, generating and hosting visual diagrams, voice-driven coding, and more.
+Atem is a terminal that connects builders, Agora platform, and AI agents. It provides a CLI and TUI for managing Agora projects and tokens, routing tasks between Astation and AI coding agents, voice-driven coding, and more.
 
 Install:
 
@@ -67,12 +67,8 @@ src/
 ├── auth.rs              # Astation auth session management, deep link flow
 ├── config.rs            # Config, SSO/BFF URL helpers, active project, project cache
 ├── time_sync.rs         # HTTP Date-based time synchronization
-├── acp_client.rs        # ACP (Agent Communication Protocol) JSON-RPC 2.0 over WebSocket
-├── agent_client.rs      # Agent event types (TextDelta, ToolCall, Done, etc.) and PTY client
-├── agent_detector.rs    # Lockfile scan + ACP port probe for running agents
-├── agent_registry.rs    # Registry of all known agents (PTY + ACP)
-├── agent_visualize.rs   # Diagram generation: prompt builder, fs snapshot/diff, upload
-├── diagram_server.rs    # Diagram hosting: SQLite blob store + HTTP server
+├── agent_client.rs      # Agent types (AgentInfo, kind, status) sent in Astation's agent list
+├── agent_registry.rs    # Registry of the PTY agents Atem launched (Claude Code, Codex)
 ├── webhook_server.rs    # atem serv webhooks — Agora webhook receiver +
                           # ngrok/cloudflared tunnel integration + SSE console
 ├── rtc_test_server.rs   # Browser-based RTC test page server
@@ -141,7 +137,6 @@ scripts/
 ├── update-convoai-toolkit.sh # Refresh vendored assets/convo/ (pinned upstream commit; deps from scripts/convoai-toolkit/package-lock.json, esbuild pinned; UPDATE_LOCK=1 re-resolves)
 └── test-create-agent.sh # ConvoAI agent creation (requires env vars)
 designs/
-├── agent-visualize.md   # Agent diagram generation
 ├── session-auth.md      # Session-based pairing authentication
 ├── universal-sessions.md # Universal sessions (astation_id keying)
 ├── connection-priority.md # Connection cascade: local > relay
@@ -187,8 +182,8 @@ Key methods:
 - `MarkTaskAssignment { task_id, received_at_ms }` - received from Astation
 - `MarkTaskResult { task_id, success, message }` - sent back to Astation
 - `VoiceRequest { session_id, accumulated_text, relay_url }` - voice coding from Astation
-- `VisualizeRequest { session_id, topic, relay_url? }` - diagram generation from Astation
-- `VisualizeResult { session_id, success, message, file_path? }` - sent back to Astation
+- `VisualizeRequest { session_id, topic, relay_url? }` - diagram request from Astation; diagram generation was removed, so atem answers each one at once with `VisualizeResult { success: false, message: "Diagram generation was removed from atem" }`
+- `VisualizeResult { session_id, success, message, file_path? }` - sent back to Astation (always unsuccessful, no `file_path`)
 - `AgentInput { agent_id?, kind, text?, key? }` - remote agent control: text or a control key from Astation → focused agent PTY (`handle_agent_input`)
 - Also: project lists, token requests, voice/video toggle, heartbeat, auth flow (`auth_required` → `auth`; the connect path and re-authentication share `auth_proof` to build the proof and `auth_response` to classify replies, so the two can't drift)
 
@@ -205,14 +200,6 @@ Key methods:
 **Claude Code Integration** (`claude_client.rs`): Manages Claude Code as a PTY subprocess using `portable-pty`. Includes terminal output parsing via `vt100`, session recording, and resize handling.
 
 **RTM Signaling** (`rtm_client.rs`): FFI wrapper for native C RTM client with async Tokio channels. Default build uses a stub; enable `real_rtm` feature for Agora SDK.
-
-**ACP Client** (`acp_client.rs`): JSON-RPC 2.0 over WebSocket for communicating with ACP agents (Claude Code, Codex). Manages initialize handshake, session creation, prompt sending, and event polling.
-
-**Agent Detection** (`agent_detector.rs`): Discovers running agents by scanning lockfiles (`~/.claude/*.lock`, `~/.codex/*.lock`) and probing common ACP ports (8765-8770).
-
-**Agent Visualize** (`agent_visualize.rs`): Generates visual HTML diagrams via ACP agents. Snapshots `~/.agent/diagrams/` before sending a prompt, detects new HTML files via ToolCall events or filesystem diff, uploads to diagram server, and opens results in the browser.
-
-**Diagram Server** (`diagram_server.rs`): SQLite-backed HTTP server for hosting diagrams. Stores HTML as blobs, serves at `/d/{id}`. Auto-starts as background daemon when needed. Integrates with server registry (`atem serv list/kill`).
 
 **Webhook Server** (`webhook_server.rs`): Receives Agora webhook POSTs (ConvoAI events 101–111, 201–202; RTC NCS events) on a local HTTP port. Optionally spawns `ngrok http <port>` or `cloudflared tunnel --url <port>` to expose the listener publicly. Validates `Agora-Signature-V2` (HMAC-SHA256) against `secret` from `webhooks.toml` when configured, skips validation with a banner warning otherwise. Broadcasts each accepted event to a live web console (SSE) at `GET /` and prints a one-line summary to stdout. `--background` mode: standard daemon shape — registers in `~/.config/atem/servers/webhooks-<port>.json`, redirects stdout/stderr to `webhooks-<port>.log`, manageable via `atem serv list / kill / killall`. ngrok collision detection (refuses to start when a foreign ngrok already owns `:4040` and prints actionable next steps including the paid-plan link). cloudflared failure path captures stderr tail and surfaces it.
 
@@ -308,7 +295,7 @@ with Astation unlocks the full set (tier 2) — Astation is the control plane.
 |---|---|---|
 | 0 | — | serv files, config, token with AGORA_APP_ID/CERT env, `project use <index>`, `project show` (local cache) |
 | 1 | `atem login` | `project list`, `project use <app-id>`, token (active project), serv rtc/convo/webhooks |
-| 2 | paired with Astation | vault, sync, memory, skill, cred, and Astation-driven remote agent control, voice coding, mark tasks, visualize |
+| 2 | paired with Astation | vault, sync, memory, skill, cred, and Astation-driven remote agent control, voice coding, mark tasks |
 
 Gates are centralized in `src/auth.rs`: `require_login(feature)` is the tier-1
 gate (passes when `CredentialStore::load().entries` is non-empty);
@@ -350,7 +337,7 @@ Build script (`build.rs`) compiles C++17 code via the `cc` crate. With `real_rtm
 | FFI | libc, cc | C interop for RTM |
 | Config | toml, dirs | Configuration loading |
 | Crypto | hmac, sha2 | Token generation |
-| Storage | rusqlite (bundled) | Diagram store, Atem Memory store (`knowledge.db`) |
+| Storage | rusqlite (bundled) | Atem Memory store (`knowledge.db`) |
 
 ## Mark Task Flow
 
@@ -518,7 +505,7 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   talk to the live daemon-owned agent.
 
 - **`atem serv list/kill/killall` registry conventions**: All servers
-  (rtc, convo, diagrams) write JSON entries to `~/.config/atem/servers/`.
+  (rtc, convo, webhooks, files) write JSON entries to `~/.config/atem/servers/`.
   Convo entries use the channel name itself as the id (no kind/port
   suffix) since channels are unique per agent. `list` shows a 1-based
   index (`#`), `ID`, `PID`, `PORT`, `STATUS` (cached from convo's 60s

@@ -29,9 +29,11 @@ use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
 use crate::rtm_client::{RtmClient, RtmEvent};
 use crate::websocket_client::{AstationClient, AstationMessage};
-use crate::agent_client::{AgentEvent, AgentInfo, AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
+use crate::agent_client::{AgentInfo, AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
 use crate::agent_registry::AgentRegistry;
-use crate::acp_client::AcpClient;
+
+/// The answer to every `visualizeRequest` from Astation.
+pub const VISUALIZE_REMOVED: &str = "Diagram generation was removed from atem";
 
 #[derive(Debug, Clone)]
 pub enum AppMode {
@@ -131,10 +133,8 @@ pub struct App {
     pub active_cli: ActiveCli,
     pub pinned_cli: Option<ActiveCli>,
     pub pairing_code: Option<String>,
-    /// Registry of all known agents (PTY + ACP, launched or discovered).
+    /// Registry of the PTY agents Atem launched (Claude Code, Codex).
     pub agent_registry: AgentRegistry,
-    /// Live ACP WebSocket connections keyed by agent_id.
-    pub acp_clients: HashMap<String, AcpClient>,
     /// ID of the agent currently selected as the active routing target.
     pub active_agent_id: Option<String>,
     /// Cursor position in the AgentPanel list.
@@ -154,8 +154,6 @@ pub struct App {
     pub pending_astation_command: Option<PendingAstationCommand>,
     /// Pending voice coding request waiting for Claude to finish.
     pub pending_voice_request: Option<PendingVoiceRequest>,
-    /// Pending visualize request waiting for agent to write HTML diagram.
-    pub pending_visualize: Option<PendingVisualize>,
 }
 
 /// Tracks a command sent from Astation that needs output relayed back.
@@ -164,18 +162,6 @@ pub struct PendingAstationCommand {
     pub target: ActiveCli,
     pub output_start_pos: usize, // Position in output_log where command output starts
     pub sent_at: Instant,
-}
-
-/// Tracks a visualize request waiting for the agent to write an HTML diagram.
-#[derive(Debug, Clone)]
-pub struct PendingVisualize {
-    pub session_id: String,
-    pub relay_url: Option<String>,
-    pub sent_at: Instant,
-    pub pre_snapshot: HashMap<PathBuf, SystemTime>,
-    pub detected_file: Option<String>,
-    pub output_snapshot_len: usize,
-    pub last_output_at: Instant,
 }
 
 /// Map an `agentInput` control-key name (from Astation) to the raw byte
@@ -277,7 +263,6 @@ impl App {
             pinned_cli: None,
             pairing_code: None,
             agent_registry: AgentRegistry::new(),
-            acp_clients: HashMap::new(),
             active_agent_id: None,
             agent_panel_selected: 0,
             astation_connect_rx: None,
@@ -285,7 +270,6 @@ impl App {
             astation_reauth: None,
             pending_astation_command: None,
             pending_voice_request: None,
-            pending_visualize: None,
         };
         app.rebuild_menu();
         app
@@ -968,7 +952,7 @@ impl App {
         // Claude PTY; if not, mint a new one.
         let existing_id = self
             .agent_registry
-            .by_protocol(AgentProtocol::Pty)
+            .all()
             .into_iter()
             .find(|a| a.kind == AgentKind::ClaudeCode && a.origin == AgentOrigin::Launched)
             .map(|a| a.id);
@@ -988,131 +972,6 @@ impl App {
         });
 
         Ok(true)
-    }
-
-    /// Scan lockfiles for externally started agents and register them.
-    ///
-    /// Called once at startup (or on demand).  Agents that are already in
-    /// the registry (same ACP URL) are skipped.
-    pub async fn startup_scan_agents(&mut self) {
-        use crate::agent_detector::{scan_lockfiles, scan_default_ports};
-
-        // First, scan for lockfiles (traditional detection)
-        let mut detected = scan_lockfiles();
-
-        // Then, scan common ACP ports (for agents without lockfiles)
-        let port_detected = scan_default_ports().await;
-        detected.extend(port_detected);
-
-        for agent in detected {
-            if self.agent_registry.has_acp_url(&agent.acp_url) {
-                continue; // already registered
-            }
-            let id = format!(
-                "{}-ext-{}",
-                agent.kind,
-                agent.pid.map(|p| p.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-            );
-            self.agent_registry.register(AgentInfo {
-                id,
-                name: agent.kind.to_string(),
-                kind: agent.kind,
-                protocol: AgentProtocol::Acp,
-                origin: AgentOrigin::External,
-                status: AgentStatus::Idle,
-                session_ids: vec![],
-                acp_url: Some(agent.acp_url),
-                pty_pid: agent.pid,
-            });
-        }
-
-        // Push current agent list to Astation so the UI is immediately up-to-date.
-        let agents = self.agent_registry.all();
-        if !agents.is_empty() {
-            let _ = self.astation_client.send_agent_list(agents).await;
-        }
-    }
-
-    /// Connect to an ACP agent by ID, run the handshake, and store the live
-    /// client.  The agent must already be in the registry with an `acp_url`.
-    pub async fn connect_acp_agent(&mut self, agent_id: &str) -> anyhow::Result<()> {
-        let info = self
-            .agent_registry
-            .get(agent_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown agent: {}", agent_id))?;
-
-        let url = info
-            .acp_url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Agent {} has no ACP URL", agent_id))?
-            .to_string();
-
-        let mut client = AcpClient::connect(&url).await?;
-        let server_info = client.initialize().await?;
-        let _session_id = client.new_session().await?;
-
-        // Update kind from the server's own name
-        self.status_message = Some(format!(
-            "\u{1f517} Agent connected: {} ({} v{})",
-            agent_id, server_info.kind, server_info.version
-        ));
-
-        self.agent_registry.update_status(agent_id, AgentStatus::Idle);
-        self.acp_clients.insert(agent_id.to_string(), client);
-        Ok(())
-    }
-
-    /// Poll all live ACP clients for pending events and forward them to
-    /// Astation as `agentEvent` messages.  Called every TUI tick.
-    pub async fn poll_acp_events(&mut self) {
-        // Collect events per agent first (to avoid borrow issues)
-        let agent_ids: Vec<String> = self.acp_clients.keys().cloned().collect();
-
-        for agent_id in agent_ids {
-            let events = {
-                let client = self.acp_clients.get_mut(&agent_id).unwrap();
-                client.drain_events()
-            };
-            if events.is_empty() {
-                continue;
-            }
-
-            let session_id = self
-                .acp_clients
-                .get(&agent_id)
-                .and_then(|c| c.session_id().map(|s| s.to_string()))
-                .unwrap_or_default();
-
-            let mut disconnected = false;
-            for event in &events {
-                // Update registry status
-                match event {
-                    AgentEvent::TextDelta(_) | AgentEvent::ToolCall { .. } => {
-                        self.agent_registry
-                            .update_status(&agent_id, AgentStatus::Thinking);
-                    }
-                    AgentEvent::Done => {
-                        self.agent_registry
-                            .update_status(&agent_id, AgentStatus::Idle);
-                    }
-                    AgentEvent::Disconnected => {
-                        self.agent_registry
-                            .update_status(&agent_id, AgentStatus::Disconnected);
-                        disconnected = true;
-                    }
-                    _ => {}
-                }
-                // Forward to Astation
-                let _ = self
-                    .astation_client
-                    .send_agent_event(&agent_id, &session_id, event)
-                    .await;
-            }
-
-            if disconnected {
-                self.acp_clients.remove(&agent_id);
-            }
-        }
     }
 
     pub fn record_claude_output(&mut self, data: impl AsRef<str>) {
@@ -1656,22 +1515,6 @@ impl App {
                                 }
                             }
                         }
-                        AgentProtocol::Acp => {
-                            // Try the live client first; connect on demand if needed.
-                            if !self.acp_clients.contains_key(&agent_id) {
-                                if let Err(e) = self.connect_acp_agent(&agent_id).await {
-                                    self.status_message = Some(format!("\u{274c} ACP connect failed for {}: {}", agent_id, e));
-                                }
-                            }
-                            if let Some(acp) = self.acp_clients.get_mut(&agent_id) {
-                                if let Err(e) = acp.send_prompt(&text) {
-                                    self.status_message = Some(format!("\u{274c} ACP send failed: {}", e));
-                                } else {
-                                    self.agent_registry
-                                        .update_status(&agent_id, AgentStatus::Thinking);
-                                }
-                            }
-                        }
                     },
                 }
             }
@@ -1693,12 +1536,12 @@ impl App {
             } => {
                 self.handle_agent_input(agent_id, kind, text, key);
             }
-            AstationMessage::VisualizeRequest {
-                session_id,
-                topic,
-                relay_url,
-            } => {
-                self.handle_visualize_request(session_id, topic, relay_url).await;
+            AstationMessage::VisualizeRequest { session_id, .. } => {
+                // Diagram generation was removed; answer so Astation stops waiting.
+                let _ = self
+                    .astation_client
+                    .send_visualize_result(&session_id, false, VISUALIZE_REMOVED, None)
+                    .await;
             }
             AstationMessage::CredentialSync {
                 access_token,
@@ -2096,123 +1939,6 @@ impl App {
         self.pending_voice_request = None;
     }
 
-    // MARK: - Visualize Request Processing
-
-    /// Handle a visualize request from Astation: send prompt to Claude and track for completion.
-    pub async fn handle_visualize_request(
-        &mut self,
-        session_id: String,
-        topic: String,
-        relay_url: Option<String>,
-    ) {
-        use crate::agent_visualize::{build_visualize_prompt, snapshot_diagrams_dir};
-
-        self.status_message = Some(format!(
-            "\u{1f4ca} Visualize request: {}",
-            &topic[..topic.len().min(50)]
-        ));
-
-        let prompt = build_visualize_prompt(&topic);
-        let pre_snapshot = snapshot_diagrams_dir();
-
-        // Send the prompt to Claude Code
-        if let Err(err) = self.send_claude_prompt(&prompt).await {
-            self.status_message =
-                Some(format!("Failed to send visualize request to Claude: {}", err));
-            let _ = self
-                .astation_client
-                .send_visualize_result(
-                    &session_id,
-                    false,
-                    &format!("Failed to send to Claude: {}", err),
-                    None,
-                )
-                .await;
-            return;
-        }
-
-        // Track pending request — watch for Claude output completion
-        let now = Instant::now();
-        self.pending_visualize = Some(PendingVisualize {
-            session_id,
-            relay_url,
-            sent_at: now,
-            pre_snapshot,
-            detected_file: None,
-            output_snapshot_len: self.claude_raw_log_start + self.claude_raw_log.len(),
-            last_output_at: now,
-        });
-    }
-
-    /// Check if a pending visualize request's Claude output is complete (3s inactivity).
-    /// When done, detect new HTML files and notify Astation.
-    pub async fn check_visualize_completion(&mut self) {
-        use crate::agent_visualize::detect_new_html_files;
-
-        let pending = match self.pending_visualize.clone() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let current_len = self.claude_raw_log_start + self.claude_raw_log.len();
-
-        // Output is still growing — update snapshot
-        if current_len > pending.output_snapshot_len {
-            if let Some(ref mut p) = self.pending_visualize {
-                p.output_snapshot_len = current_len;
-                p.last_output_at = Instant::now();
-            }
-            return;
-        }
-
-        // No new output yet — wait at least 3 seconds of inactivity
-        if pending.last_output_at.elapsed() < Duration::from_secs(3) {
-            return;
-        }
-
-        // Also require at least 3s since the prompt was sent (avoid racing)
-        if pending.sent_at.elapsed() < Duration::from_secs(3) {
-            return;
-        }
-
-        // Agent is done — detect new HTML files
-        let file_path = pending
-            .detected_file
-            .clone()
-            .or_else(|| detect_new_html_files(&pending.pre_snapshot).into_iter().next());
-
-        let (success, message) = match &file_path {
-            Some(path) => {
-                // Try to upload to diagram server
-                let config = AtemConfig::load().unwrap_or_default();
-                match crate::agent_visualize::resolve_diagram_server_url(&config) {
-                    Ok(server_url) => {
-                        match crate::agent_visualize::upload_diagram(path, "visualize", &server_url).await {
-                            Ok(url) => (true, format!("Diagram: {} — View at: {}", path, url)),
-                            Err(_) => (true, format!("Diagram generated: {}", path)),
-                        }
-                    }
-                    Err(_) => (true, format!("Diagram generated: {}", path)),
-                }
-            }
-            None => (false, "No HTML diagram file was detected".to_string()),
-        };
-
-        // Notify Astation
-        let _ = self
-            .astation_client
-            .send_visualize_result(
-                &pending.session_id,
-                success,
-                &message,
-                file_path,
-            )
-            .await;
-
-        self.status_message = Some(format!("\u{1f4ca} {}", message));
-        self.pending_visualize = None;
-    }
-
     /// Check if pending Astation command has output ready and relay it back.
     /// Sends output after 2 seconds of inactivity.
     pub async fn check_relay_output(&mut self) {
@@ -2296,9 +2022,6 @@ impl App {
 
         // Check if pending voice request has completed
         self.check_voice_request_completion().await;
-
-        // Check if pending visualize request has completed
-        self.check_visualize_completion().await;
     }
 
     /// Check if it is time to retry the Astation connection.
@@ -2459,121 +2182,53 @@ mod tests {
         assert_eq!(cloned.output_snapshot_len, 100);
     }
 
-    #[test]
-    fn test_pending_visualize_default_is_none() {
-        let app = App::new();
-        assert!(app.pending_visualize.is_none());
-    }
+    /// Diagram generation was removed: every `visualizeRequest` is answered
+    /// at once with an unsupported `visualizeResult`, and nothing is sent to
+    /// an agent.
+    #[tokio::test]
+    async fn visualize_request_is_answered_as_unsupported() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    #[test]
-    fn test_pending_visualize_tracks_fields() {
-        let now = Instant::now();
-        let pv = PendingVisualize {
-            session_id: "vis-1".to_string(),
-            relay_url: Some("https://relay.test".to_string()),
-            sent_at: now,
-            pre_snapshot: HashMap::new(),
-            detected_file: None,
-            output_snapshot_len: 0,
-            last_output_at: now,
-        };
-        assert_eq!(pv.session_id, "vis-1");
-        assert_eq!(pv.relay_url.as_deref(), Some("https://relay.test"));
-        assert!(pv.detected_file.is_none());
-        assert!(pv.pre_snapshot.is_empty());
-    }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                match socket.next().await {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        return serde_json::from_str::<AstationMessage>(&text).unwrap();
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("socket ended before a reply: {other:?}"),
+                }
+            }
+        });
 
-    #[test]
-    fn test_pending_visualize_clone() {
-        let now = Instant::now();
-        let pv = PendingVisualize {
-            session_id: "vis-clone".to_string(),
-            relay_url: None,
-            sent_at: now,
-            pre_snapshot: HashMap::new(),
-            detected_file: Some("/tmp/test.html".to_string()),
-            output_snapshot_len: 42,
-            last_output_at: now,
-        };
-        let cloned = pv.clone();
-        assert_eq!(cloned.session_id, "vis-clone");
-        assert_eq!(cloned.detected_file.as_deref(), Some("/tmp/test.html"));
-        assert_eq!(cloned.output_snapshot_len, 42);
-    }
+        let mut app = App::new();
+        app.astation_client.connect_raw(&format!("ws://{address}")).await.unwrap();
+        app.handle_astation_message(AstationMessage::VisualizeRequest {
+            session_id: "vis-1".into(),
+            topic: "WebRTC flow".into(),
+            relay_url: Some("https://relay.test".into()),
+        })
+        .await;
 
-    #[test]
-    fn test_pending_visualize_with_relay_url() {
-        let now = Instant::now();
-        let pv = PendingVisualize {
-            session_id: "vis-relay".to_string(),
-            relay_url: Some("https://relay.agora.build".to_string()),
-            sent_at: now,
-            pre_snapshot: HashMap::new(),
-            detected_file: None,
-            output_snapshot_len: 0,
-            last_output_at: now,
-        };
-        assert_eq!(pv.relay_url.as_deref(), Some("https://relay.agora.build"));
-    }
-
-    #[test]
-    fn test_pending_visualize_with_pre_snapshot() {
-        let now = Instant::now();
-        let mut snap = HashMap::new();
-        snap.insert(
-            PathBuf::from("/home/user/.agent/diagrams/existing.html"),
-            SystemTime::now(),
-        );
-        let pv = PendingVisualize {
-            session_id: "vis-snap".to_string(),
-            relay_url: None,
-            sent_at: now,
-            pre_snapshot: snap,
-            detected_file: None,
-            output_snapshot_len: 0,
-            last_output_at: now,
-        };
-        assert_eq!(pv.pre_snapshot.len(), 1);
-        assert!(pv.pre_snapshot.contains_key(&PathBuf::from("/home/user/.agent/diagrams/existing.html")));
-    }
-
-    #[test]
-    fn test_pending_visualize_detected_file_overrides_snapshot() {
-        // When detected_file is Some, it should be used instead of snapshot diff
-        let now = Instant::now();
-        let pv = PendingVisualize {
-            session_id: "vis-detect".to_string(),
-            relay_url: None,
-            sent_at: now,
-            pre_snapshot: HashMap::new(),
-            detected_file: Some("/home/user/.agent/diagrams/detected.html".to_string()),
-            output_snapshot_len: 100,
-            last_output_at: now,
-        };
-        // The detected_file should be preferred
-        let file_path = pv.detected_file.clone().or_else(|| None);
-        assert_eq!(file_path.as_deref(), Some("/home/user/.agent/diagrams/detected.html"));
-    }
-
-    #[test]
-    fn test_pending_visualize_clone_preserves_snapshot() {
-        let now = Instant::now();
-        let mut snap = HashMap::new();
-        snap.insert(PathBuf::from("/tmp/a.html"), SystemTime::now());
-        snap.insert(PathBuf::from("/tmp/b.html"), SystemTime::now());
-        let pv = PendingVisualize {
-            session_id: "vis-snap-clone".to_string(),
-            relay_url: None,
-            sent_at: now,
-            pre_snapshot: snap,
-            detected_file: None,
-            output_snapshot_len: 0,
-            last_output_at: now,
-        };
-        let cloned = pv.clone();
-        assert_eq!(cloned.pre_snapshot.len(), 2);
-        assert!(cloned.pre_snapshot.contains_key(&PathBuf::from("/tmp/a.html")));
-        assert!(cloned.pre_snapshot.contains_key(&PathBuf::from("/tmp/b.html")));
+        let reply = tokio::time::timeout(Duration::from_secs(3), peer)
+            .await
+            .expect("no visualizeResult reached Astation")
+            .unwrap();
+        match reply {
+            AstationMessage::VisualizeResult { session_id, success, message, file_path } => {
+                assert_eq!(session_id, "vis-1");
+                assert!(!success);
+                assert_eq!(message, "Diagram generation was removed from atem");
+                assert!(file_path.is_none());
+            }
+            other => panic!("expected VisualizeResult, got {other:?}"),
+        }
+        assert!(app.claude_sender.is_none(), "no agent session was started");
     }
 
     // ── Dynamic menu tests ──────────────────────────────────────────────
