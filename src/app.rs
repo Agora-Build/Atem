@@ -1,3 +1,4 @@
+mod reauth;
 mod terminal;
 
 use anyhow::Result;
@@ -146,6 +147,9 @@ pub struct App {
     /// Uses `Instant` (monotonic clock — pauses during system sleep on both Linux and macOS),
     /// so retries only fire when the device is actively awake. No battery drain while sleeping.
     pub astation_reconnect_at: Option<Instant>,
+    /// Re-authentication over the open socket, while Astation's newest
+    /// `auth_required` is unanswered (see `app/reauth.rs`).
+    pub astation_reauth: Option<reauth::PendingReauth>,
     /// Pending command from Astation waiting for output relay.
     pub pending_astation_command: Option<PendingAstationCommand>,
     /// Pending voice coding request waiting for Claude to finish.
@@ -278,6 +282,7 @@ impl App {
             agent_panel_selected: 0,
             astation_connect_rx: None,
             astation_reconnect_at: None,
+            astation_reauth: None,
             pending_astation_command: None,
             pending_voice_request: None,
             pending_visualize: None,
@@ -1427,6 +1432,9 @@ impl App {
     }
 
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
+        if self.intercept_astation_reauth(&message).await {
+            return;
+        }
         let shared = self.claude_share.as_ref().is_some_and(|s| s.has_viewer())
             || self.codex_share.as_ref().is_some_and(|s| s.has_viewer());
         if (shared || self.astation_client.is_ws_closed()) && matches!(&message, AstationMessage::AgentInput { .. } | AstationMessage::AgentPrompt { .. }
@@ -2259,6 +2267,7 @@ impl App {
             self.handle_astation_message(message).await;
             message_count += 1;
         }
+        self.check_astation_reauth_deadline();
 
         // Detect WebSocket disconnect (channel closed after draining remaining messages)
         if self.astation_connected && self.astation_client.is_ws_closed() {
