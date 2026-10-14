@@ -295,8 +295,10 @@ Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
 | `c` | Copy the visible text (tmux buffer inside tmux, otherwise OSC 52) |
 | `?` | Help and recent notices |
 
-Press the prefix twice to send it to the agent. Set `ATEM_TERMINAL_PREFIX`
-(for example `Ctrl-a`) to change it. The `CLAUDE_CLI_BIN`/`CLAUDE_CLI_ARGS`
+Press the prefix twice to send it to the agent. To change it, set
+`terminal_prefix = "Ctrl-a"` in `~/.config/atem/config.toml`, or
+`ATEM_TERMINAL_PREFIX` (which wins over the file). Ctrl+], Ctrl+\ or
+Ctrl+<letter> other than i or m are accepted. The `CLAUDE_CLI_BIN`/`CLAUDE_CLI_ARGS`
 and `CODEX_CLI_BIN`/`CODEX_CLI_ARGS` variables still override the command.
 See [`designs/terminal-v1-implementation.md`](https://github.com/Agora-Build/Atem/blob/main/designs/terminal-v1-implementation.md).
 

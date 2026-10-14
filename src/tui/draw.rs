@@ -347,12 +347,12 @@ fn draw_terminal_view(frame: &mut Frame, app: &mut App) {
     };
     let prefix = app.terminal_ui.prefix.label();
     let text = if app.terminal_ui.help {
-        "atem | Esc: close help | Up/Down: scroll details".to_string()
+        "Atem | Esc: close help | Up/Down: scroll details".to_string()
     } else if app.terminal_ui.pending {
         format!("{prefix} | h:menu g:take x:stop r:redraw [:history c:copy ?:help")
     } else if let Some(browse) = &app.terminal_ui.browse {
         format!(
-            "atem | history +{} | arrows:move Space:select Enter:copy PgUp/PgDn:scroll Esc:live",
+            "Atem | history +{} | arrows:move Space:select Enter:copy PgUp/PgDn:scroll Esc:live",
             browse.offset
         )
     } else if let Some((message, _)) = app
@@ -361,24 +361,24 @@ fn draw_terminal_view(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .filter(|(_, when)| when.elapsed().as_secs() < 4)
     {
-        format!("atem | {message}")
+        format!("Atem | {message}")
     } else {
         let control = if input.as_ref().is_some_and(|s| s.remote_controlled()) {
-            "remote"
+            "Remote"
         } else {
-            "local"
+            "Local"
         };
         let link = if app.astation_connected {
-            "online"
+            "✓"
         } else {
-            "offline"
+            "✗"
         };
         let notice = if app.terminal_ui.messages.is_empty() {
             ""
         } else {
-            " | notice"
+            " | Notice"
         };
-        format!("atem | {provider} | {control} | Astation {link}{notice} | {prefix} then ?:help")
+        format!("Atem | {provider} | {control} | Astation {link}{notice} | {prefix} then ?:help")
     };
     if size.height > 0 {
         frame.render_widget(
@@ -398,7 +398,7 @@ fn draw_terminal_view(frame: &mut Frame, app: &mut App) {
         let area = centered_rect(85, 85, size);
         frame.render_widget(Clear, area);
         let mut text = format!(
-            "{prefix}, then:\n\nh / m  Hide terminal; keep the agent running\ng      Take control locally\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
+            "{prefix}, then:\n\nh / m  Hide terminal; keep the agent running\ng      Take control locally\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nterminal_prefix in ~/.config/atem/config.toml or ATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
         );
         for message in app.terminal_ui.messages.iter().rev() {
             text.push('\n');
@@ -659,7 +659,7 @@ mod paired_status_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("atem | Claude | local"));
+        assert!(text.contains("Atem | Claude | Local"));
     }
 
     #[test]
@@ -696,7 +696,7 @@ mod paired_status_tests {
         assert!(!text.contains('\u{28ff}'));
         assert_eq!(text.matches("? for shortcuts").count(), 1);
         assert_eq!(text.matches("2 warnings").count(), 1);
-        assert_eq!(text.matches("atem |").count(), 1);
+        assert_eq!(text.matches("Atem |").count(), 1);
         assert!(!text.contains("credential notification"));
         assert_eq!(outer.screen().cursor_position(), (22, 2));
         assert!(!outer.screen().hide_cursor());
@@ -773,7 +773,7 @@ mod paired_status_tests {
                 .count()
                 <= 1
         );
-        assert_eq!(text.matches("atem |").count(), 1);
+        assert_eq!(text.matches("Atem |").count(), 1);
         assert_eq!(
             outer.screen().cursor_position(),
             app.codex_terminal.screen().cursor_position()

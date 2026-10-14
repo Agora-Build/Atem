@@ -251,7 +251,7 @@ impl App {
             claude_view_rows: 0,
             claude_view_cols: 0,
             force_terminal_redraw: false,
-            terminal_ui: crate::tui::terminal_view::State::new(),
+            terminal_ui: crate::tui::terminal_view::State::new(config.terminal_prefix.as_deref()),
             rtm_client: None,
             rtm_client_id,
             last_activity_ping: None,
