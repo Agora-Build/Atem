@@ -18,6 +18,7 @@ use tokio::time::Duration;
 
 use crate::agora_api::format_projects;
 use crate::app::{App, AppMode, MenuAction};
+use crate::session::{Provider, Session};
 use draw::draw_ui;
 
 pub async fn run_tui() -> Result<()> {
@@ -53,22 +54,20 @@ pub async fn run_agent_tui(agent: Option<&str>, agent_args: &[String]) -> Result
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new();
-    match agent {
-        Some("codex") => {
-            app.mode = AppMode::CodexChat;
-            app.active_cli = crate::app::ActiveCli::Codex;
-            app.codex_client.append_launch_args(agent_args);
-            sync_terminal_sizes(&mut app, terminal.size()?);
-            app.ensure_codex_session().await?;
-        }
-        Some("claude") | Some("claude-code") => {
-            app.mode = AppMode::ClaudeChat;
-            app.claude_client.append_launch_args(agent_args);
-            sync_terminal_sizes(&mut app, terminal.size()?);
-            app.ensure_claude_session().await?;
-        }
+    let provider = match agent {
+        Some("codex") => Some(Provider::Codex),
+        Some("claude") | Some("claude-code") => Some(Provider::Claude),
         Some(_) => anyhow::bail!("Expected claude, claude-code or codex"),
-        None => {}
+        None => None,
+    };
+    if let Some(provider) = provider {
+        app.focus_provider(provider);
+        match provider {
+            Provider::Codex => app.codex_client.append_launch_args(agent_args),
+            Provider::Claude => app.claude_client.append_launch_args(agent_args),
+        }
+        sync_terminal_sizes(&mut app, terminal.size()?);
+        app.ensure_session(provider).await?;
     }
     terminal.clear()?;
     run_tui_loop(&mut terminal, &mut app, &diagnostics).await
@@ -78,29 +77,35 @@ fn sync_terminal_sizes(app: &mut App, size: ratatui::layout::Size) {
     let rows = size.height.saturating_sub(1).clamp(2, 200);
     let cols = size.width.clamp(2, 400);
     app.terminal_ui.viewport = (rows, cols);
-    if matches!(app.mode, AppMode::CodexChat) || app.codex_sender.is_none() {
-        app.adjust_codex_terminal_size(rows, cols);
-    }
-    if matches!(app.mode, AppMode::ClaudeChat) || app.claude_sender.is_none() {
-        app.adjust_claude_terminal_size(rows, cols);
+    // The focused session, and sessions without a process, follow the local viewport.
+    for id in app.sessions.ids() {
+        let no_process = app.sessions.get(&id).is_some_and(|s| s.input.is_none());
+        if app.is_focused(&id) || no_process {
+            app.adjust_terminal_size(&id, rows, cols);
+        }
     }
 }
 
+/// The session local keys go to: the focused one, else Claude's.
+// Task 2: route by id
+fn key_target(app: &App) -> Option<&Session> {
+    app.focused_session()
+        .or_else(|| app.session_for(Provider::Claude))
+}
+
 fn send_agent(app: &mut App, bytes: &str) {
-    if matches!(app.mode, AppMode::CodexChat) {
-        app.send_codex_data(bytes);
-    } else {
-        app.send_claude_data(bytes);
+    if let Some(id) = key_target(app).map(|s| s.id.clone()) {
+        app.send_data(&id, bytes);
     }
 }
 
 async fn copy_terminal(app: &mut App) {
     let text = if let Some(view) = &app.terminal_ui.browse {
         view.text()
-    } else if matches!(app.mode, AppMode::CodexChat) {
-        terminal_view::visible_text(app.codex_terminal.screen(), app.terminal_ui.viewport)
     } else {
-        terminal_view::visible_text(app.claude_terminal.screen(), app.terminal_ui.viewport)
+        key_target(app).map_or_else(String::new, |s| {
+            terminal_view::visible_text(s.terminal.screen(), app.terminal_ui.viewport)
+        })
     };
     match clipboard::copy(&text).await {
         Ok(message) => {
@@ -179,12 +184,9 @@ async fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         Action::Agent(key) | Action::AgentWithPrefix(key) => {
-            let screen = if matches!(app.mode, AppMode::CodexChat) {
-                app.codex_terminal.screen()
-            } else {
-                app.claude_terminal.screen()
-            };
-            if let Some(bytes) = crate::terminal_keys::encode(key, screen.application_cursor()) {
+            let application_cursor =
+                key_target(app).is_some_and(|s| s.terminal.screen().application_cursor());
+            if let Some(bytes) = crate::terminal_keys::encode(key, application_cursor) {
                 let bytes = if matches!(action, Action::AgentWithPrefix(_)) {
                     app.terminal_ui.prefix.bytes() + &bytes
                 } else {
@@ -220,8 +222,7 @@ async fn run_tui_loop(
 
         // Process any pending Astation messages (also detects WS disconnect)
         app.process_astation_messages().await;
-        app.process_codex_output();
-        app.process_claude_output();
+        app.process_sessions_output();
         app.poll_chat().await;
         // Drain bytes from the old geometry before notifying the CLI of a resize.
         sync_terminal_sizes(app, terminal.size()?);
@@ -279,7 +280,7 @@ async fn run_tui_loop(
                     app.register_local_activity(true).await;
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                    if matches!(app.mode, AppMode::CodexChat | AppMode::ClaudeChat) {
+                    if matches!(app.mode, AppMode::Terminal) {
                         handle_terminal_key(app, key).await;
                         continue;
                     }

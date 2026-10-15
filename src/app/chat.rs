@@ -7,6 +7,7 @@ use crate::chat::adapter::{AgentAdapter, AgentEvent, LogItem};
 use crate::chat::claude::{ClaudeAdapter, hooks};
 use crate::chat::session::{ChatSession, Out, State};
 use crate::chat::wire::{self, ChatEnvelope, Inbound};
+use crate::session::{Session, SessionId};
 use crate::websocket_client::AstationMessage;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -166,24 +167,27 @@ impl AgentChat {
 }
 
 impl App {
-    /// Before a Claude respawn: report the old process's last state (its exit), tell
-    /// its open conversations to reopen, and drop it (removing its directory).
-    pub(crate) async fn retire_claude_chat(&mut self) {
-        if self.claude_chat.is_none() {
+    /// Before a respawn: report the old process's last state (its exit), tell
+    /// its open conversations to reopen, and drop its chat (removing its directory).
+    pub(crate) async fn retire_chat(&mut self, id: &SessionId) {
+        if self.sessions.get(id).is_none_or(|s| s.chat.is_none()) {
             return;
         }
         self.poll_chat().await;
-        if let Some(mut chat) = self.claude_chat.take() {
+        if let Some(mut chat) = self.sessions.get_mut(id).and_then(|s| s.chat.take()) {
             let envelopes = chat.end_conversations(RESTARTED);
             self.send_chat(envelopes).await;
         }
     }
 
-    /// Prepares chat for the Claude process about to be spawned and returns the
-    /// arguments to put first on its command line. Any earlier chat (an older
-    /// process) is dropped. On failure Claude starts without chat.
-    pub(crate) fn prepare_claude_chat(&mut self, agent_id: &str, args: &[String]) -> Vec<String> {
-        self.claude_chat = None;
+    /// Prepares chat for the Claude process about to be spawned: the chat for
+    /// its session and the arguments to put first on its command line. On
+    /// failure Claude starts without chat (`None`, no arguments).
+    pub(crate) fn prepare_claude_chat(
+        &mut self,
+        agent_id: &str,
+        args: &[String],
+    ) -> (Option<AgentChat>, Vec<String>) {
         if !self.chat_swept {
             // Directories of Atem processes that died without cleaning up.
             self.chat_swept = true;
@@ -193,13 +197,13 @@ impl App {
             Ok(dir) => dir,
             Err(error) => {
                 crate::diagnostics::warn(format!("Chat is off for Claude: {error}"));
-                return Vec::new();
+                return (None, Vec::new());
             }
         };
         let mut adapter = ClaudeAdapter::new();
         match adapter.prepare_launch(args, &dir) {
             Ok(plan) => {
-                self.claude_chat = Some(AgentChat {
+                let chat = AgentChat {
                     agent_id: agent_id.to_string(),
                     adapter: Some(Box::new(adapter)),
                     session: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
@@ -207,13 +211,13 @@ impl App {
                     opens: 0,
                     chat_v1: false,
                     reason_noticed: false,
-                });
-                plan.extra_args
+                };
+                (Some(chat), plan.extra_args)
             }
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&dir);
                 crate::diagnostics::warn(format!("Chat is off for Claude: {error}"));
-                Vec::new()
+                (None, Vec::new())
             }
         }
     }
@@ -221,10 +225,19 @@ impl App {
     /// Each tick: read the agent's events and log, update the session, send what
     /// changed to open conversations, and keep the registry in step.
     pub async fn poll_chat(&mut self) {
-        let input_count = self.claude_sender.as_ref().map_or(0, |s| s.input_count());
-        // The PTY receiver is dropped when the process exits (finalize_claude_session).
-        let exited = self.claude_receiver.is_none();
-        let Some(chat) = self.claude_chat.as_mut() else {
+        for id in self.sessions.ids() {
+            self.poll_session_chat(&id).await;
+        }
+    }
+
+    async fn poll_session_chat(&mut self, id: &SessionId) {
+        let Some(session) = self.sessions.get_mut(id) else {
+            return;
+        };
+        let input_count = session.input.as_ref().map_or(0, |s| s.input_count());
+        // The PTY receiver is dropped when the process exits (finalize_session).
+        let exited = session.events.is_none();
+        let Some(chat) = session.chat.as_mut() else {
             return;
         };
         let mut outs = Vec::new();
@@ -289,12 +302,12 @@ impl App {
             crate::diagnostics::warn(format!("Chat: {detail}"));
         }
         self.send_chat(envelopes).await;
-        self.sync_chat_registry().await;
+        self.sync_chat_registry(id).await;
     }
 
     /// Registry status and capabilities from the chat; tells Astation when they change.
-    async fn sync_chat_registry(&mut self) {
-        let Some(chat) = &self.claude_chat else {
+    async fn sync_chat_registry(&mut self, id: &SessionId) {
+        let Some(chat) = self.sessions.get(id).and_then(|s| s.chat.as_ref()) else {
             return;
         };
         let (status, capabilities) = if chat.chat_v1 {
@@ -356,8 +369,17 @@ impl App {
             Inbound::Submit { request_id, .. } => Some(request_id.as_str()),
             _ => None,
         };
-        let available = match &self.claude_chat {
-            Some(chat) if chat.agent_id == agent => match &chat.adapter {
+        let session_id = self
+            .sessions
+            .iter()
+            .find(|s| s.chat.as_ref().is_some_and(|chat| chat.agent_id == agent))
+            .map(|s| s.id.clone());
+        let chat = session_id
+            .as_ref()
+            .and_then(|id| self.sessions.get(id))
+            .and_then(|s| s.chat.as_ref());
+        let available = match chat {
+            Some(chat) => match &chat.adapter {
                 // Exited: history and status stay readable; prompts are refused.
                 None => Ok(()),
                 Some(adapter) => {
@@ -376,7 +398,14 @@ impl App {
             let reply = wire::error(&conversation, &agent, &text, request_id);
             return self.send_chat(vec![reply]).await;
         }
-        let chat = self.claude_chat.as_mut().expect("checked above");
+        let Some(Session {
+            chat: Some(chat),
+            input,
+            ..
+        }) = session_id.and_then(|id| self.sessions.get_mut(&id))
+        else {
+            unreachable!("checked above");
+        };
         let envelopes = match inbound {
             Inbound::Open { before } => {
                 let generation = chat.session.generation().to_string();
@@ -422,7 +451,7 @@ impl App {
                         Some(&request_id),
                     )]
                 } else {
-                    let sender = self.claude_sender.as_ref();
+                    let sender = input.as_ref();
                     let input_count = sender.map_or(0, |s| s.input_count());
                     let remote = sender.is_some_and(|s| s.remote_controlled());
                     let outs = match chat.session.submit(
@@ -462,8 +491,10 @@ impl App {
     /// Astation disconnected or is re-authenticating: drop every conversation
     /// (nothing is sent). The agent keeps running; a new `open` restores state.
     pub fn close_chat_conversations(&mut self) {
-        if let Some(chat) = self.claude_chat.as_mut() {
-            chat.conversations.clear();
+        for session in self.sessions.iter_mut() {
+            if let Some(chat) = session.chat.as_mut() {
+                chat.conversations.clear();
+            }
         }
     }
 }

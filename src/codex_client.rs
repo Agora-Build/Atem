@@ -1,6 +1,5 @@
 use crate::pty_session;
 use anyhow::Result;
-pub type CodexResizeHandle = pty_session::PtyHandle;
 pub type CodexSession = pty_session::PtySession;
 
 #[derive(Clone, Debug)]

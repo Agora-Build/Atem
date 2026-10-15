@@ -8,11 +8,12 @@ use vt100::{Cell as VtCell, Color as VtColor};
 
 use crate::agent_client::{AgentProtocol, AgentStatus};
 use crate::app::{App, AppMode};
+use crate::session::{Provider, Session};
 
 pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
     frame.render_widget(Clear, size);
-    if matches!(app.mode, AppMode::CodexChat | AppMode::ClaudeChat) {
+    if matches!(app.mode, AppMode::Terminal) {
         draw_terminal_view(frame, app);
         return;
     }
@@ -46,9 +47,12 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     match app.mode {
         AppMode::MainMenu => draw_main_menu(frame, chunks[1], app),
         AppMode::TokenGeneration => draw_output_view(frame, chunks[1], app),
-        AppMode::ClaudeChat => draw_claude_panel(frame, chunks[1], app),
+        AppMode::Terminal => {
+            if let Some(session) = app.focused_session() {
+                draw_session_panel(frame, chunks[1], session, &app.terminal_ui);
+            }
+        }
         AppMode::CommandExecution => draw_command_input(frame, chunks[1], app),
-        AppMode::CodexChat => draw_codex_panel(frame, chunks[1], app),
         AppMode::AgentPanel => draw_agent_panel(frame, chunks[1], app),
     }
 
@@ -56,7 +60,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     let base_footer = match app.mode {
         AppMode::MainMenu => "\u{2191}\u{2193}/jk: Navigate | Enter: Select | q: Quit",
         AppMode::CommandExecution => "Type command + Enter | b: Back | q: Quit",
-        AppMode::CodexChat | AppMode::ClaudeChat => "Use the Atem prefix for terminal controls",
+        AppMode::Terminal => "Use the Atem prefix for terminal controls",
         AppMode::AgentPanel => {
             "\u{2191}\u{2193}/jk: Navigate | Enter: Set Active | b: Back"
         }
@@ -257,33 +261,23 @@ pub(crate) fn draw_command_input(frame: &mut Frame, area: ratatui::layout::Rect,
     frame.render_widget(input, chunks[1]);
 }
 
-pub(crate) fn draw_codex_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let screen = app
-        .terminal_ui
+/// The session's canonical screen, or the local history view while browsing.
+pub(crate) fn draw_session_panel(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    session: &Session,
+    terminal_ui: &super::terminal_view::State,
+) {
+    let screen = terminal_ui
         .browse
         .as_ref()
-        .map_or(app.codex_terminal.screen(), |b| &b.screen);
+        .map_or(session.terminal.screen(), |b| &b.screen);
     draw_terminal_screen(
         frame,
         area,
         screen,
-        app.terminal_ui.browse.as_ref(),
-        app.terminal_ui.help,
-    );
-}
-
-pub(crate) fn draw_claude_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let screen = app
-        .terminal_ui
-        .browse
-        .as_ref()
-        .map_or(app.claude_terminal.screen(), |b| &b.screen);
-    draw_terminal_screen(
-        frame,
-        area,
-        screen,
-        app.terminal_ui.browse.as_ref(),
-        app.terminal_ui.help,
+        terminal_ui.browse.as_ref(),
+        terminal_ui.help,
     );
 }
 
@@ -338,13 +332,12 @@ fn draw_terminal_screen(
 fn draw_terminal_view(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
     let area = super::terminal_view::viewport(size);
-    let (provider, input) = if matches!(app.mode, AppMode::CodexChat) {
-        draw_codex_panel(frame, area, app);
-        ("Codex", &app.codex_sender)
-    } else {
-        draw_claude_panel(frame, area, app);
-        ("Claude", &app.claude_sender)
-    };
+    let session = app.focused_session();
+    if let Some(session) = session {
+        draw_session_panel(frame, area, session, &app.terminal_ui);
+    }
+    let provider = session.map_or(Provider::Claude, |s| s.provider).label();
+    let input = session.and_then(|s| s.input.as_ref());
     let prefix = app.terminal_ui.prefix.label();
     let text = if app.terminal_ui.help {
         "Atem | Esc: close help | Up/Down: scroll details".to_string()
@@ -363,7 +356,7 @@ fn draw_terminal_view(frame: &mut Frame, app: &mut App) {
     {
         format!("Atem | {message}")
     } else {
-        let control = if input.as_ref().is_some_and(|s| s.remote_controlled()) {
+        let control = if input.is_some_and(|s| s.remote_controlled()) {
             "Remote"
         } else {
             "Local"
@@ -600,6 +593,7 @@ pub(crate) fn style_from_cell(cell: &VtCell) -> Style {
 #[cfg(test)]
 mod paired_status_tests {
     use super::paired_status_line;
+    use crate::session::{Provider, Session, SessionId};
     use crate::memory::trust::VerificationStatus;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -638,18 +632,35 @@ mod paired_status_tests {
         );
     }
 
+    /// A session of `provider` without a process, shown by the terminal view.
+    fn focus_session(app: &mut crate::app::App, provider: Provider) -> SessionId {
+        let session = Session::new(
+            provider,
+            crate::pty_session::DEFAULT_ROWS,
+            crate::pty_session::DEFAULT_COLS,
+        );
+        let id = app.sessions.insert(session).unwrap().id.clone();
+        app.focused = Some(id.clone());
+        app.mode = crate::app::AppMode::Terminal;
+        id
+    }
+
+    fn terminal_of<'a>(app: &'a mut crate::app::App, id: &SessionId) -> &'a mut vt100::Parser {
+        &mut app.sessions.get_mut(id).unwrap().terminal
+    }
+
     #[test]
     fn connected_claude_keeps_the_terminal_renderer_and_size() {
         let backend = ratatui::backend::TestBackend::new(100, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = crate::app::App::new();
-        app.mode = crate::app::AppMode::ClaudeChat;
+        let id = focus_session(&mut app, Provider::Claude);
         app.astation_connected = true;
-        app.adjust_claude_terminal_size(39, 100);
+        app.adjust_terminal_size(&id, 39, 100);
         terminal
             .draw(|frame| super::draw_ui(frame, &mut app))
             .unwrap();
-        assert_eq!(app.claude_terminal.screen().size(), (39, 100));
+        assert_eq!(terminal_of(&mut app, &id).screen().size(), (39, 100));
         let text: String = terminal
             .backend()
             .buffer()
@@ -672,9 +683,9 @@ mod paired_status_tests {
         )
         .unwrap();
         let mut app = crate::app::App::new();
-        app.mode = crate::app::AppMode::CodexChat;
-        app.adjust_codex_terminal_size(24, 80);
-        app.codex_terminal
+        let id = focus_session(&mut app, Provider::Codex);
+        app.adjust_terminal_size(&id, 24, 80);
+        terminal_of(&mut app, &id)
             .process("\x1b[4;40H\u{28ff}\u{28fe}\u{28fc}\x1b[24;1H? for shortcuts".as_bytes());
         let mut outer = vt100::Parser::new(25, 80, 0);
         terminal
@@ -683,7 +694,7 @@ mod paired_status_tests {
         outer.process(&std::mem::take(&mut *bytes.lock().unwrap()));
         assert!(outer.screen().contents().contains('\u{28ff}'));
 
-        app.codex_terminal.process("\x1b[2J\x1b[HATEM_READY \u{4e2d}\u{6587}\x1b[24;1H? for shortcuts\x1b[24;55H2 warnings\x1b[23;3H\x1b[?25h".as_bytes());
+        terminal_of(&mut app, &id).process("\x1b[2J\x1b[HATEM_READY \u{4e2d}\u{6587}\x1b[24;1H? for shortcuts\x1b[24;55H2 warnings\x1b[23;3H\x1b[?25h".as_bytes());
         app.status_message = Some("A very long credential notification that belongs in details, never over the agent screen".repeat(10));
         app.terminal_ui.observe_status(&app.status_message);
         terminal
@@ -701,8 +712,7 @@ mod paired_status_tests {
         for row in 0..24 {
             for col in 0..80 {
                 let actual = outer.screen().cell(row, col).unwrap().contents();
-                let expected = app
-                    .codex_terminal
+                let expected = terminal_of(&mut app, &id)
                     .screen()
                     .cell(row, col)
                     .unwrap()
@@ -727,14 +737,14 @@ mod paired_status_tests {
         )
         .unwrap();
         let mut app = crate::app::App::new();
-        app.mode = crate::app::AppMode::CodexChat;
-        app.adjust_codex_terminal_size(51, 152);
+        let id = focus_session(&mut app, Provider::Codex);
+        app.adjust_terminal_size(&id, 51, 152);
         let mut outer = vt100::Parser::new(52, 152, 0);
         let mut saw_animation = false;
         for (index, frame) in fixture["frames"].as_array().unwrap().iter().enumerate() {
             // Real Codex clears its animation with incremental edits, without a full clear.
             for chunk in frame.as_str().unwrap().as_bytes().chunks(37) {
-                app.codex_terminal.process(chunk);
+                terminal_of(&mut app, &id).process(chunk);
             }
             terminal
                 .draw(|frame| super::draw_ui(frame, &mut app))
@@ -749,7 +759,7 @@ mod paired_status_tests {
             saw_animation |= dots > 100;
             for row in 0..51 {
                 for col in 0..152 {
-                    let expected = app.codex_terminal.screen().cell(row, col).unwrap();
+                    let expected = terminal_of(&mut app, &id).screen().cell(row, col).unwrap();
                     let actual = outer.screen().cell(row, col).unwrap();
                     assert_eq!(
                         actual.contents().trim_end(),
@@ -774,11 +784,11 @@ mod paired_status_tests {
         assert_eq!(text.matches("Atem |").count(), 1);
         assert_eq!(
             outer.screen().cursor_position(),
-            app.codex_terminal.screen().cursor_position()
+            terminal_of(&mut app, &id).screen().cursor_position()
         );
         assert_eq!(
             outer.screen().hide_cursor(),
-            app.codex_terminal.screen().hide_cursor()
+            terminal_of(&mut app, &id).screen().hide_cursor()
         );
     }
 

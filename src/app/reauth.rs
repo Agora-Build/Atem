@@ -133,7 +133,8 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::AppMode;
-    use crate::terminal_share::{Message, SharedTerminal};
+    use crate::session::{Provider, Session};
+    use crate::terminal_share::Message;
     use crate::websocket_client::device_auth_proof;
     use futures_util::{SinkExt, StreamExt};
     use std::collections::HashMap;
@@ -243,13 +244,15 @@ mod tests {
 
     /// Adds a live `cat` PTY as Codex with a remote viewer that holds control.
     fn share_codex_with_remote_controller(app: &mut App) {
-        let session = crate::pty_session::spawn("cat", &[]).unwrap();
-        app.codex_sender = Some(session.sender);
-        app.codex_receiver = Some(session.receiver);
-        app.codex_resize_handle = Some(session.resize_handle);
-        app.codex_share = Some(SharedTerminal::new("codex"));
+        let mut session = Session::new(
+            Provider::Codex,
+            crate::pty_session::DEFAULT_ROWS,
+            crate::pty_session::DEFAULT_COLS,
+        );
+        session.attach(crate::pty_session::spawn("cat", &[]).unwrap());
+        app.sessions.insert(session).unwrap();
         app.mode = AppMode::MainMenu;
-        let generation = app.codex_share.as_ref().unwrap().generation.clone();
+        let generation = codex(app).share.generation.clone();
         app.handle_terminal_message(
             Message::Subscribe {
                 terminal_id: "codex".into(),
@@ -274,8 +277,12 @@ mod tests {
             }
             .into(),
         );
-        assert!(app.codex_share.as_ref().unwrap().has_viewer());
-        assert!(app.codex_sender.as_ref().unwrap().remote_controlled());
+        assert!(codex(app).share.has_viewer());
+        assert!(codex(app).input.as_ref().unwrap().remote_controlled());
+    }
+
+    fn codex(app: &App) -> &Session {
+        app.session_for(Provider::Codex).unwrap()
     }
 
     /// Runs the TUI's Astation step until the peer receives an `auth` message
@@ -352,8 +359,8 @@ mod tests {
 
         let proof = next_auth(&mut app, &mut peer).await;
         assert!(!app.astation_connected, "status bar must show Astation ✗");
-        assert!(!app.codex_share.as_ref().unwrap().has_viewer());
-        assert!(!app.codex_sender.as_ref().unwrap().remote_controlled());
+        assert!(!codex(&app).share.has_viewer());
+        assert!(!codex(&app).input.as_ref().unwrap().remote_controlled());
         assert!(app.terminal_outbox.is_empty());
         assert_eq!(proof["session_id"], SESSION_ID);
         assert_eq!(proof["atem_id"], ATEM_ID);
@@ -371,7 +378,7 @@ mod tests {
     async fn authenticated_reply_restores_online_and_resends_the_agent_list_view_only() {
         let (mut app, mut peer) = connected_app().await;
         share_codex_with_remote_controller(&mut app);
-        let generation = app.codex_share.as_ref().unwrap().generation.clone();
+        let generation = codex(&app).share.generation.clone();
         peer.send
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();
@@ -391,20 +398,21 @@ mod tests {
             "agent list not re-sent: {frames:?}"
         );
         // Remote viewers start again from a fresh subscribe; nothing resumes.
-        assert!(!app.codex_share.as_ref().unwrap().has_viewer());
-        assert!(!app.codex_sender.as_ref().unwrap().remote_controlled());
+        assert!(!codex(&app).share.has_viewer());
+        assert!(!codex(&app).input.as_ref().unwrap().remote_controlled());
 
         // The local PTY is the same process, still running.
-        assert_eq!(app.codex_share.as_ref().unwrap().generation, generation);
-        app.send_codex_data("still alive\n");
+        assert_eq!(codex(&app).share.generation, generation);
+        let id = codex(&app).id.clone();
+        app.send_data(&id, "still alive\n");
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !app
-                .codex_terminal
+            while !codex(&app)
+                .terminal
                 .screen()
                 .contents()
                 .contains("still alive")
             {
-                app.process_codex_output();
+                app.process_terminal_output(&id);
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -616,7 +624,9 @@ mod tests {
     async fn requests_are_ignored_while_reauthentication_is_pending() {
         let (mut app, mut peer) = connected_app().await;
         let (input, mut written) = crate::pty_session::PtyInput::test_channel();
-        app.claude_sender = Some(input);
+        let mut claude = Session::new(Provider::Claude, 24, 80);
+        claude.input = Some(input);
+        app.sessions.insert(claude).unwrap();
         peer.send
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();

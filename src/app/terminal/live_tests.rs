@@ -30,15 +30,12 @@ async fn conversation(provider: &'static str) {
     let chat_root = tempfile::tempdir().unwrap();
     let mut app = App::new();
     app.chat_root = chat_root.path().join("run");
-    if provider == "codex" {
-        app.ensure_codex_session().await.unwrap();
-        app.mode = AppMode::CodexChat;
-        app.adjust_codex_terminal_size(40, 120);
-    } else {
-        app.ensure_claude_session().await.unwrap();
-        app.mode = AppMode::ClaudeChat;
-        app.adjust_claude_terminal_size(40, 120);
-    }
+    let kind = Provider::from_alias(provider).unwrap();
+    app.ensure_session(kind).await.unwrap();
+    let id = app.session_id_for(kind).unwrap();
+    app.focused = Some(id.clone());
+    app.mode = AppMode::Terminal;
+    app.adjust_terminal_size(&id, 40, 120);
     app.leave_terminal_view();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -197,7 +194,7 @@ async fn conversation(provider: &'static str) {
                     app.handle_terminal_message(envelope);
                 }
             }
-            app.process_terminal_output(provider);
+            app.process_terminal_output(&id);
             app.pump_terminals();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -209,12 +206,11 @@ async fn conversation(provider: &'static str) {
     app.disconnect_terminals();
     let peer_result = peer.await;
     // Remove only the log artifacts this test's process generated on exit.
-    let artifacts = if provider == "codex" {
-        [&app.codex_log_file, &app.codex_summary_file]
-    } else {
-        [&app.claude_log_file, &app.claude_summary_file]
-    };
-    for path in artifacts.into_iter().flatten() {
+    let session = app.sessions.get(&id).unwrap();
+    for path in [&session.log_file, &session.summary_file]
+        .into_iter()
+        .flatten()
+    {
         let _ = std::fs::remove_file(path);
     }
     assert!(matches!(app.mode, AppMode::MainMenu));

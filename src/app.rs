@@ -1,4 +1,4 @@
-mod chat;
+pub(crate) mod chat;
 #[cfg(test)]
 mod chat_tests;
 mod reauth;
@@ -22,11 +22,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::Duration;
-use vt100::Parser as VtParser;
 
 use crate::agora_api::{BffProject, format_projects};
-use crate::claude_client::{ClaudeClient, ClaudeResizeHandle};
-use crate::codex_client::{CodexClient, CodexResizeHandle};
+use crate::claude_client::ClaudeClient;
+use crate::codex_client::CodexClient;
+use crate::session::{Provider, Session, SessionId, Sessions};
 use crate::command::StreamBuffer;
 use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
@@ -42,8 +42,8 @@ pub const VISUALIZE_REMOVED: &str = "Diagram generation was removed from atem";
 pub enum AppMode {
     MainMenu,
     TokenGeneration,
-    ClaudeChat,
-    CodexChat,
+    /// The focused session's terminal (`App::focused`).
+    Terminal,
     CommandExecution,
     AgentPanel,
 }
@@ -59,13 +59,6 @@ pub enum MenuAction {
     AgentPanel,
     Help,
     Exit,
-}
-
-/// Which CLI backend is currently active for routing commands.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ActiveCli {
-    Claude,
-    Codex,
 }
 
 pub struct App {
@@ -84,36 +77,14 @@ pub struct App {
     pub astation_connected: bool,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,
+    /// Launch configuration for Codex sessions.
     pub codex_client: CodexClient,
-    pub codex_output_log: String,
-    pub codex_raw_log: String,
-    pub codex_raw_log_start: usize,
-    pub codex_user_actions: Vec<String>,
-    pub codex_log_file: Option<PathBuf>,
-    pub codex_summary_file: Option<PathBuf>,
-    pub codex_terminal: VtParser,
-    pub codex_sender: Option<crate::pty_session::PtyInput>,
-    pub codex_receiver: Option<tokio::sync::mpsc::Receiver<crate::pty_session::PtyEvent>>,
-    pub codex_share: Option<crate::terminal_share::SharedTerminal>,
-    pub codex_waiting_exit: bool,
-    pub codex_resize_handle: Option<CodexResizeHandle>,
-    pub codex_view_rows: u16,
-    pub codex_view_cols: u16,
+    /// Launch configuration for Claude Code sessions.
     pub claude_client: ClaudeClient,
-    pub claude_output_log: String,
-    pub claude_raw_log: String,
-    pub claude_raw_log_start: usize,
-    pub claude_user_actions: Vec<String>,
-    pub claude_log_file: Option<PathBuf>,
-    pub claude_summary_file: Option<PathBuf>,
-    pub claude_terminal: VtParser,
-    pub claude_sender: Option<crate::pty_session::PtyInput>,
-    pub claude_receiver: Option<tokio::sync::mpsc::Receiver<crate::pty_session::PtyEvent>>,
-    pub claude_share: Option<crate::terminal_share::SharedTerminal>,
-    pub claude_waiting_exit: bool,
-    pub claude_resize_handle: Option<ClaudeResizeHandle>,
-    pub claude_view_rows: u16,
-    pub claude_view_cols: u16,
+    /// The agent sessions launched in Atem.
+    pub sessions: Sessions,
+    /// The session the TUI shows in `AppMode::Terminal` (kept after leaving the view).
+    pub focused: Option<SessionId>,
     pub force_terminal_redraw: bool,
     pub terminal_ui: crate::tui::terminal_view::State,
     pub rtm_client: Option<RtmClient>,
@@ -133,8 +104,6 @@ pub struct App {
     pub dispatcher: TaskDispatcher,
     pub work_items: HashMap<String, WorkItem>,
     pub voice_commands: StreamBuffer,
-    pub active_cli: ActiveCli,
-    pub pinned_cli: Option<ActiveCli>,
     pub pairing_code: Option<String>,
     /// Registry of the PTY agents Atem launched (Claude Code, Codex).
     pub agent_registry: AgentRegistry,
@@ -157,8 +126,6 @@ pub struct App {
     pub pending_astation_command: Option<PendingAstationCommand>,
     /// Pending voice coding request waiting for Claude to finish.
     pub pending_voice_request: Option<PendingVoiceRequest>,
-    /// Chat (chat-v1) for the Claude session launched in Atem, when its adapter is prepared.
-    pub claude_chat: Option<chat::AgentChat>,
     /// Where per-session chat directories are created (`chat-<uuid>`).
     pub chat_root: PathBuf,
     /// Stale chat directories under `chat_root` were swept (once per App).
@@ -168,7 +135,7 @@ pub struct App {
 /// Tracks a command sent from Astation that needs output relayed back.
 #[derive(Debug, Clone)]
 pub struct PendingAstationCommand {
-    pub target: ActiveCli,
+    pub target: Provider,
     pub output_start_pos: usize, // Position in output_log where command output starts
     pub sent_at: Instant,
 }
@@ -220,35 +187,9 @@ impl App {
             astation_connected: false,
             connected_astation_id: None,
             codex_client: CodexClient::new(),
-            codex_output_log: String::new(),
-            codex_raw_log: String::new(),
-            codex_raw_log_start: 0,
-            codex_user_actions: Vec::new(),
-            codex_log_file: None,
-            codex_summary_file: None,
-            codex_terminal: VtParser::new(crate::pty_session::DEFAULT_ROWS, crate::pty_session::DEFAULT_COLS, crate::pty_session::SCROLLBACK_ROWS),
-            codex_sender: None,
-            codex_receiver: None,
-            codex_share: None,
-            codex_waiting_exit: false,
-            codex_resize_handle: None,
-            codex_view_rows: 0,
-            codex_view_cols: 0,
             claude_client: ClaudeClient::new(),
-            claude_output_log: String::new(),
-            claude_raw_log: String::new(),
-            claude_raw_log_start: 0,
-            claude_user_actions: Vec::new(),
-            claude_log_file: None,
-            claude_summary_file: None,
-            claude_terminal: VtParser::new(crate::pty_session::DEFAULT_ROWS, crate::pty_session::DEFAULT_COLS, crate::pty_session::SCROLLBACK_ROWS),
-            claude_sender: None,
-            claude_receiver: None,
-            claude_share: None,
-            claude_waiting_exit: false,
-            claude_resize_handle: None,
-            claude_view_rows: 0,
-            claude_view_cols: 0,
+            sessions: Sessions::default(),
+            focused: None,
             force_terminal_redraw: false,
             terminal_ui: crate::tui::terminal_view::State::new(config.terminal_prefix.as_deref()),
             rtm_client: None,
@@ -268,8 +209,6 @@ impl App {
             dispatcher: TaskDispatcher::new(),
             work_items: HashMap::new(),
             voice_commands: StreamBuffer::new(&["execute", "run it", "do it", "go ahead", "send it"]),
-            active_cli: ActiveCli::Claude,
-            pinned_cli: None,
             pairing_code: None,
             agent_registry: AgentRegistry::new(),
             active_agent_id: None,
@@ -279,7 +218,6 @@ impl App {
             astation_reauth: None,
             pending_astation_command: None,
             pending_voice_request: None,
-            claude_chat: None,
             chat_root: crate::chat::claude::hooks::session_dir_root(),
             chat_swept: false,
         };
@@ -321,13 +259,16 @@ impl App {
         self.main_menu_items.push("\u{1f4cb} List Agora Projects".to_string());
 
         self.menu_actions.push(MenuAction::LaunchClaude);
-        self.main_menu_items.push(if self.claude_receiver.is_some() {
+        // Task 2: route by id
+        let running = |p| self.session_for(p).is_some_and(|s| s.events.is_some());
+        let (claude_running, codex_running) = (running(Provider::Claude), running(Provider::Codex));
+        self.main_menu_items.push(if claude_running {
             "Resume Claude Code".into()
         } else {
             "Launch Claude Code".into()
         });
         self.menu_actions.push(MenuAction::LaunchCodex);
-        self.main_menu_items.push(if self.codex_receiver.is_some() {
+        self.main_menu_items.push(if codex_running {
             "Resume Codex".into()
         } else {
             "Launch Codex".into()
@@ -393,37 +334,11 @@ impl App {
             }
             Some(MenuAction::LaunchClaude) => {
                 // Launch Claude Code - always launch locally from Atem (like Codex)
-                self.mode = AppMode::ClaudeChat;
-                self.active_cli = ActiveCli::Claude;
-                self.input_text.clear();
-                self.claude_waiting_exit = false;
-                match self.ensure_claude_session().await {
-                    Ok(_) => self.refresh_claude_view(),
-                    Err(err) => {
-                        self.record_claude_output(format!(
-                            "\u{274c} Unable to start Claude Code CLI: {}\n",
-                            err
-                        ));
-                        self.refresh_claude_view();
-                    }
-                }
+                self.launch_from_menu(Provider::Claude).await;
             }
             Some(MenuAction::LaunchCodex) => {
                 // Launch Codex
-                self.mode = AppMode::CodexChat;
-                self.active_cli = ActiveCli::Codex;
-                self.input_text.clear();
-                self.codex_waiting_exit = false;
-                match self.ensure_codex_session().await {
-                    Ok(_) => self.refresh_codex_view(),
-                    Err(err) => {
-                        self.record_codex_output(&format!(
-                            "\u{274c} Unable to start Codex CLI: {}\n",
-                            err
-                        ));
-                        self.refresh_codex_view();
-                    }
-                }
+                self.launch_from_menu(Provider::Codex).await;
             }
             Some(MenuAction::ExecuteShell) => {
                 // Execute Shell Command
@@ -558,57 +473,195 @@ impl App {
         Ok(())
     }
 
-    pub async fn send_codex_prompt(&mut self, prompt: &str) -> Result<()> {
+    // MARK: - Sessions
+
+    /// The session of `provider`: its live one, else the last one created
+    /// (one per provider until Task 2).
+    // Task 2: route by id
+    pub(crate) fn session_id_for(&self, provider: Provider) -> Option<SessionId> {
+        self.sessions.latest(provider).or_else(|| {
+            self.sessions
+                .iter()
+                .filter(|s| s.provider == provider)
+                .last()
+                .map(|s| s.id.clone())
+        })
+    }
+
+    // Task 2: route by id
+    pub(crate) fn session_for(&self, provider: Provider) -> Option<&Session> {
+        self.session_id_for(provider).and_then(|id| self.sessions.get(&id))
+    }
+
+    // Task 2: route by id
+    pub(crate) fn session_for_mut(&mut self, provider: Provider) -> Option<&mut Session> {
+        let id = self.session_id_for(provider)?;
+        self.sessions.get_mut(&id)
+    }
+
+    /// The session shown by the terminal view, while it is open.
+    pub fn focused_session(&self) -> Option<&Session> {
+        if !matches!(self.mode, AppMode::Terminal) {
+            return None;
+        }
+        self.sessions.get(self.focused.as_ref()?)
+    }
+
+    pub fn focused_session_mut(&mut self) -> Option<&mut Session> {
+        if !matches!(self.mode, AppMode::Terminal) {
+            return None;
+        }
+        self.sessions.get_mut(self.focused.as_ref()?)
+    }
+
+    /// The terminal view is open on `id`.
+    pub fn is_focused(&self, id: &SessionId) -> bool {
+        matches!(self.mode, AppMode::Terminal) && self.focused.as_ref() == Some(id)
+    }
+
+    /// The session of `provider`; when there is none, one without a process
+    /// (sized to the local viewport) that shows notices until a launch replaces it.
+    // Task 2: route by id
+    fn provider_session_id(&mut self, provider: Provider) -> SessionId {
+        if let Some(id) = self.session_id_for(provider) {
+            return id;
+        }
+        let (rows, cols) = self.terminal_ui.viewport;
+        let mut session = if rows == 0 || cols == 0 {
+            Session::new(provider, crate::pty_session::DEFAULT_ROWS, crate::pty_session::DEFAULT_COLS)
+        } else {
+            let mut session = Session::new(provider, rows.max(2), cols.max(2));
+            session.view = (rows, cols);
+            session
+        };
+        // No process: never counted as live, so the insert can't be refused.
+        session.exited_at = Some(Instant::now());
+        let id = session.id.clone();
+        let _ = self.sessions.insert(session);
+        id
+    }
+
+    /// Open the terminal view on `provider`'s session.
+    // Task 2: route by id
+    pub fn focus_provider(&mut self, provider: Provider) {
+        let id = self.provider_session_id(provider);
+        self.focused = Some(id);
+        self.mode = AppMode::Terminal;
+    }
+
+    async fn launch_from_menu(&mut self, provider: Provider) {
+        self.focus_provider(provider);
+        self.input_text.clear();
+        if let Some(session) = self.session_for_mut(provider) {
+            session.waiting_exit = false;
+        }
+        if let Err(err) = self.ensure_session(provider).await {
+            self.record_output(provider, format!(
+                "\u{274c} Unable to start {} CLI: {}\n",
+                provider.product(),
+                err
+            ));
+        }
+        if let Some(id) = self.session_id_for(provider) {
+            self.refresh_view(&id);
+        }
+    }
+
+    /// Type `prompt` into `provider`'s session and submit it, starting the
+    /// session when it isn't running.
+    // Task 2: route by id
+    pub async fn send_prompt(&mut self, provider: Provider, prompt: &str) -> Result<()> {
         let trimmed = prompt.trim();
         if trimmed.is_empty() { return Ok(()); }
-        if self.codex_waiting_exit { anyhow::bail!("Codex is shutting down"); }
-        self.ensure_codex_session().await?;
-        let sender = self.codex_sender.as_ref().ok_or_else(|| anyhow::anyhow!("Codex terminal unavailable"))?;
-        sender.send(format!("{trimmed}\n\r"))?;
-        self.codex_user_actions.push(trimmed.to_string());
+        if self.session_for(provider).is_some_and(|s| s.waiting_exit) {
+            anyhow::bail!("{} is shutting down", provider.label());
+        }
+        self.ensure_session(provider).await?;
+        let session = self
+            .session_for_mut(provider)
+            .filter(|s| s.input.is_some())
+            .ok_or_else(|| anyhow::anyhow!("{} terminal unavailable", provider.label()))?;
+        session.input.as_ref().unwrap().send(format!("{trimmed}\n\r"))?;
+        session.last_used = Instant::now();
+        session.user_actions.push(trimmed.to_string());
         if trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit") {
-            self.codex_waiting_exit = true;
+            session.waiting_exit = true;
         }
         Ok(())
     }
 
-    pub async fn ensure_codex_session(&mut self) -> Result<bool> {
-        let needs_session = self.codex_sender.is_none() || self.codex_receiver.is_none();
-        if !needs_session {
+    /// Start `provider`'s session unless it is running (one per provider until
+    /// Task 2). Returns whether a new process was started.
+    // Task 2: route by id
+    pub async fn ensure_session(&mut self, provider: Provider) -> Result<bool> {
+        let previous = self.session_id_for(provider);
+        let previous_session = previous.as_ref().and_then(|id| self.sessions.get(id));
+        if previous_session.is_some_and(|s| s.input.is_some() && s.events.is_some()) {
             return Ok(false);
         }
+        let view = previous_session.map_or(self.terminal_ui.viewport, |s| s.view);
+        let rows = if view.0 == 0 { crate::pty_session::DEFAULT_ROWS } else { view.0 };
+        let cols = if view.1 == 0 { crate::pty_session::DEFAULT_COLS } else { view.1 };
 
-        let rows = if self.codex_view_rows == 0 { crate::pty_session::DEFAULT_ROWS } else { self.codex_view_rows };
-        let cols = if self.codex_view_cols == 0 { crate::pty_session::DEFAULT_COLS } else { self.codex_view_cols };
-        let session = self.codex_client.start_session_sized(rows, cols).await?;
-        self.replace_terminal("codex");
-        self.codex_sender = Some(session.sender);
-        self.codex_receiver = Some(session.receiver);
-        self.codex_resize_handle = Some(session.resize_handle);
-        self.codex_raw_log.clear();
-        self.codex_raw_log_start = 0;
-        self.codex_output_log.clear();
-        self.codex_user_actions.clear();
-        self.codex_log_file = None;
-        self.codex_summary_file = None;
-        self.codex_view_rows = rows;
-        self.codex_view_cols = cols;
-        self.codex_terminal = VtParser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS);
-        self.codex_waiting_exit = false;
-
-        // Codex has no chat adapter yet: its activity can't be detected (Unknown)
-        // and it advertises no chat capability.
-        let agent_id = self
+        let kind = provider.kind();
+        // A stable agent ID across respawns: reuse the launched PTY's entry.
+        let existing_id = self
             .agent_registry
             .all()
             .into_iter()
-            .find(|a| a.kind == AgentKind::Codex && a.origin == AgentOrigin::Launched)
-            .map(|a| a.id)
-            .unwrap_or_else(|| format!("codex-pty-{}", uuid::Uuid::new_v4()));
+            .find(|a| a.kind == kind && a.origin == AgentOrigin::Launched)
+            .map(|a| a.id);
+        let (pty, chat, agent_id) = match provider {
+            Provider::Claude => {
+                let agent_id = existing_id.unwrap_or_else(|| {
+                    format!("claude-pty-{}", uuid::Uuid::new_v4())
+                });
+                // The previous process's conversations are told to reopen.
+                if let Some(previous) = &previous {
+                    self.retire_chat(previous).await;
+                }
+                // Chat hooks for this process (a new generation); empty when chat could not be prepared.
+                let launch_args = self.claude_client.launch_args().to_vec();
+                let (chat, chat_args) = self.prepare_claude_chat(&agent_id, &launch_args);
+                // On failure the prepared chat is dropped (removing its directory).
+                let pty = self.claude_client.start_session_sized(rows, cols, &chat_args).await?;
+                (pty, chat, agent_id)
+            }
+            Provider::Codex => {
+                let pty = self.codex_client.start_session_sized(rows, cols).await?;
+                let agent_id = existing_id.unwrap_or_else(|| {
+                    format!("codex-pty-{}", uuid::Uuid::new_v4())
+                });
+                (pty, None, agent_id)
+            }
+        };
+        let mut session = Session::new(provider, rows, cols);
+        session.attach(pty);
+        session.view = (rows, cols);
+        session.chat = chat;
+        let id = session.id.clone();
+        if let Some(previous) = previous
+            && let Some(old) = self.sessions.remove(&previous)
+        {
+            self.replace_terminal(old);
+            if self.focused.as_ref() == Some(&previous) {
+                self.focused = Some(id.clone());
+            }
+        }
+        self.sessions.insert(session)?;
+
+        // Register (or re-register) the PTY session in the agent registry.
+        // Status stays Unknown and chat-v1 unadvertised until Claude's hooks report
+        // the session (`poll_chat`); Codex has no chat adapter yet: its activity
+        // can't be detected (Unknown) and it advertises no chat capability.
         self.agent_registry.register(AgentInfo {
             id: agent_id,
-            name: "codex".to_string(),
-            kind: AgentKind::Codex,
+            name: match provider {
+                Provider::Claude => "claude-code",
+                Provider::Codex => "codex",
+            }
+            .to_string(),
+            kind,
             protocol: AgentProtocol::Pty,
             origin: AgentOrigin::Launched,
             status: AgentStatus::Unknown,
@@ -617,24 +670,32 @@ impl App {
             pty_pid: None,
             capabilities: vec![],
         });
-        self.send_agent_list_if_connected().await;
+        if provider == Provider::Codex {
+            self.send_agent_list_if_connected().await;
+        }
         Ok(true)
     }
 
-    pub fn record_codex_output(&mut self, data: impl AsRef<str>) {
+    /// A notice for `provider`'s session: the status line while its process
+    /// runs, else its screen.
+    // Task 2: route by id
+    pub fn record_output(&mut self, provider: Provider, data: impl AsRef<str>) {
         let text = data.as_ref();
-        crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, text);
-
-        if self.codex_receiver.is_some() {
+        let id = self.provider_session_id(provider);
+        let Some(session) = self.sessions.get_mut(&id) else { return; };
+        crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, text);
+        if session.events.is_some() {
             self.status_message = Some(text.trim().to_string());
         } else {
-            self.codex_terminal.process(text.as_bytes());
-            self.update_codex_output_from_terminal();
+            session.terminal.process(text.as_bytes());
+            self.update_output_from_terminal(&id);
         }
     }
 
-    pub fn update_codex_output_from_terminal(&mut self) {
-        let screen = self.codex_terminal.screen();
+    pub fn update_output_from_terminal(&mut self, id: &SessionId) {
+        let focused = self.is_focused(id);
+        let Some(session) = self.sessions.get_mut(id) else { return; };
+        let screen = session.terminal.screen();
         let (_rows, cols) = screen.size();
 
         let mut lines: Vec<String> = screen
@@ -642,63 +703,73 @@ impl App {
             .map(|line| line.replace('\u{0000}', ""))
             .collect();
 
-        while lines.last().map_or(false, |line| line.trim().is_empty()) {
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
             lines.pop();
         }
 
-        self.codex_output_log = lines.join("\n");
-        if matches!(self.mode, AppMode::CodexChat) {
-            self.output_text = self.codex_output_log.clone();
+        session.output_log = lines.join("\n");
+        if focused {
+            self.output_text = session.output_log.clone();
         }
     }
 
-    pub fn send_codex_data(&mut self, data: &str) {
-        if self.codex_share.as_ref().is_some_and(|s| s.exit_status.is_some()) { return; }
-        if let Some(sender) = &self.codex_sender {
+    pub fn send_data(&mut self, id: &SessionId, data: &str) {
+        let Some(session) = self.sessions.get_mut(id) else { return; };
+        if session.share.exit_status.is_some() { return; }
+        if let Some(sender) = &session.input {
+            session.last_used = Instant::now();
             if let Err(error) = sender.send(data.to_string()) {
                 self.status_message = Some(error.to_string());
             }
         }
     }
 
-    pub fn refresh_codex_view(&mut self) {
-        if matches!(self.mode, AppMode::CodexChat) {
-            self.output_text = self.codex_output_log.clone();
+    pub fn refresh_view(&mut self, id: &SessionId) {
+        if self.is_focused(id)
+            && let Some(session) = self.sessions.get(id)
+        {
+            self.output_text = session.output_log.clone();
         }
     }
 
-    pub fn rebuild_codex_terminal(&mut self) {
-        self.codex_terminal.set_size(self.codex_view_rows.max(2), self.codex_view_cols.max(2));
-        self.update_codex_output_from_terminal();
+    pub fn rebuild_terminal(&mut self, id: &SessionId) {
+        let Some(session) = self.sessions.get_mut(id) else { return; };
+        session.terminal.set_size(session.view.0.max(2), session.view.1.max(2));
+        self.update_output_from_terminal(id);
     }
 
-    pub fn adjust_codex_terminal_size(&mut self, rows: u16, cols: u16) {
-        if self.codex_sender.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
+    pub fn adjust_terminal_size(&mut self, id: &SessionId, rows: u16, cols: u16) {
+        let Some(session) = self.sessions.get_mut(id) else { return; };
+        if session.input.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
         let rows = rows.min(200);
         let cols = cols.min(400);
         if rows < 2 || cols < 2 {
             return;
         }
-        if self.codex_view_rows == rows
-            && self.codex_view_cols == cols
-            && self.codex_terminal.screen().size() == (rows, cols)
-        {
+        if session.view == (rows, cols) && session.terminal.screen().size() == (rows, cols) {
             return;
         }
 
-        self.codex_view_rows = rows;
-        self.codex_view_cols = cols;
-        self.rebuild_codex_terminal();
+        session.view = (rows, cols);
+        self.rebuild_terminal(id);
 
-        if let Some(handle) = &self.codex_resize_handle {
-            if let Err(err) = handle.resize(rows, cols) {
-                self.status_message = Some(format!("Failed to resize Codex terminal: {}", err));
-            }
+        let Some(session) = self.sessions.get(id) else { return; };
+        if let Some(handle) = &session.handle
+            && let Err(err) = handle.resize(rows, cols)
+        {
+            self.status_message = Some(format!(
+                "Failed to resize {} terminal: {}",
+                session.provider.label(),
+                err
+            ));
         }
     }
 
-    pub fn process_codex_output(&mut self) {
-        self.process_terminal_output("codex");
+    /// Drain every session's PTY output.
+    pub fn process_sessions_output(&mut self) {
+        for id in self.sessions.ids() {
+            self.process_terminal_output(&id);
+        }
     }
 
     pub async fn ensure_rtm_client(&mut self) -> Result<()> {
@@ -796,14 +867,16 @@ impl App {
 
     pub async fn flush_pending_transcriptions(&mut self) -> Result<()> {
         while let Some(text) = self.pending_transcriptions.pop_front() {
-            if matches!(self.mode, AppMode::CodexChat) {
-                if let Err(err) = self.send_codex_prompt(&text).await {
+            // Task 2: route by id
+            let focused = self.focused_session().map(|s| s.provider);
+            if focused == Some(Provider::Codex) {
+                if let Err(err) = self.send_prompt(Provider::Codex, &text).await {
                     self.status_message =
                         Some(format!("Failed to send transcription to Codex: {}", err));
                     return Err(err);
                 }
-            } else if matches!(self.mode, AppMode::ClaudeChat) && !self.astation_connected {
-                if let Err(err) = self.send_claude_prompt(&text).await {
+            } else if focused == Some(Provider::Claude) && !self.astation_connected {
+                if let Err(err) = self.send_prompt(Provider::Claude, &text).await {
                     self.status_message =
                         Some(format!("Failed to send transcription to Claude: {}", err));
                     return Err(err);
@@ -824,332 +897,62 @@ impl App {
         self.maybe_send_activity_ping(focused).await;
     }
 
-    pub fn finalize_codex_session(&mut self) {
-        let was_focused = matches!(self.mode, AppMode::CodexChat);
+    pub fn finalize_session(&mut self, id: &SessionId) {
+        let was_focused = self.is_focused(id);
+        let Some(provider) = self.sessions.get(id).map(|s| s.provider) else { return; };
+        let label = provider.label();
 
-        let had_activity_before_finalize = !self.codex_raw_log.trim().is_empty();
+        if provider == Provider::Claude {
+            // If there's an active mark task, flag it for async finalization
+            self.dispatcher.set_main_needs_finalize();
+        }
 
-        crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, "\u{2699}\u{fe0f} Codex CLI session ended.\n");
+        let Some(session) = self.sessions.get_mut(id) else { return; };
+        let had_activity_before_finalize = !session.raw_log.trim().is_empty();
+
+        crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("\u{2699}\u{fe0f} {} CLI session ended.\n", provider.product()));
 
         let mut status_parts: Vec<String> = Vec::new();
 
         if had_activity_before_finalize {
-            match self.persist_codex_log() {
+            match Self::persist_log(session) {
                 Ok(Some(path)) => {
-                    let msg = format!("\u{1f4dd} Codex log saved to {}", path.display());
-                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-                Ok(None) => {
-                    status_parts.push("Codex session ended with no output to save.".to_string());
-                }
-                Err(err) => {
-                    let msg = format!("\u{26a0}\u{fe0f} Failed to save Codex log: {}", err);
-                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-            }
-
-            let summary = self.generate_codex_summary();
-            match self.write_codex_summary_file(&summary) {
-                Ok(path) => {
-                    let msg = format!("\u{1f4c4} Summary saved to {}", path.display());
-                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-                Err(err) => {
-                    let msg = format!("\u{26a0}\u{fe0f} Failed to save Codex summary: {}", err);
-                    crate::app::terminal::append_log(&mut self.codex_raw_log, &mut self.codex_raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-            }
-        } else {
-            status_parts.push("Codex session ended (no output captured).".to_string());
-        }
-
-        self.codex_receiver = None;
-        self.rebuild_menu();
-
-        if was_focused {
-            self.mode = AppMode::MainMenu;
-            self.show_popup = false;
-            self.popup_message.clear();
-            self.output_text.clear();
-            self.input_text.clear();
-        }
-        self.status_message = if status_parts.is_empty() {
-            Some("Codex session ended.".to_string())
-        } else {
-            Some(status_parts.join(" | "))
-        };
-        self.codex_waiting_exit = false;
-    }
-
-    pub fn persist_codex_log(&mut self) -> Result<Option<PathBuf>> {
-        if self.codex_raw_log.trim().is_empty() {
-            return Ok(None);
-        }
-        if let Some(path) = &self.codex_log_file {
-            return Ok(Some(path.clone()));
-        }
-
-        let dir = PathBuf::from("codex_logs");
-        fs::create_dir_all(&dir)?;
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let path = dir.join(format!("codex-session-{}.ansi", timestamp));
-        fs::write(&path, self.codex_raw_log.as_bytes())?;
-        self.codex_log_file = Some(path.clone());
-        Ok(Some(path))
-    }
-
-    pub fn generate_codex_summary(&self) -> String {
-        let mut summary = String::new();
-        summary.push_str("# Codex Session Summary\n\n");
-        summary.push_str(&format!(
-            "Commands executed: {}\n",
-            self.codex_user_actions.len()
-        ));
-        if !self.codex_user_actions.is_empty() {
-            summary.push_str("\n## Commands\n");
-            let max_commands = 10;
-            for cmd in self.codex_user_actions.iter().take(max_commands) {
-                summary.push_str("- ");
-                summary.push_str(cmd);
-                summary.push('\n');
-            }
-            if self.codex_user_actions.len() > max_commands {
-                summary.push_str("- \u{2026}\n");
-            }
-        }
-        summary.push_str("\n");
-        summary.push_str(&format!(
-            "Total output lines captured: {}\n",
-            self.codex_output_log.lines().count()
-        ));
-        if let Some(path) = &self.codex_log_file {
-            summary.push_str(&format!("Full log saved at: {}\n", path.display()));
-        } else {
-            summary.push_str("Full log has not been saved yet.\n");
-        }
-        summary
-    }
-
-    pub fn write_codex_summary_file(&mut self, summary: &str) -> Result<PathBuf> {
-        let dir = PathBuf::from("codex_logs");
-        fs::create_dir_all(&dir)?;
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let path = dir.join(format!("codex-summary-{}.md", timestamp));
-        fs::write(&path, summary)?;
-        self.codex_summary_file = Some(path.clone());
-        Ok(path)
-    }
-
-    pub async fn send_claude_prompt(&mut self, prompt: &str) -> Result<()> {
-        let trimmed = prompt.trim();
-        if trimmed.is_empty() { return Ok(()); }
-        if self.claude_waiting_exit { anyhow::bail!("Claude is shutting down"); }
-        self.ensure_claude_session().await?;
-        let sender = self.claude_sender.as_ref().ok_or_else(|| anyhow::anyhow!("Claude terminal unavailable"))?;
-        sender.send(format!("{trimmed}\n\r"))?;
-        self.claude_user_actions.push(trimmed.to_string());
-        if trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit") {
-            self.claude_waiting_exit = true;
-        }
-        Ok(())
-    }
-
-    pub async fn ensure_claude_session(&mut self) -> Result<bool> {
-        let needs_session = self.claude_sender.is_none() || self.claude_receiver.is_none();
-        if !needs_session {
-            return Ok(false);
-        }
-
-        let rows = if self.claude_view_rows == 0 { crate::pty_session::DEFAULT_ROWS } else { self.claude_view_rows };
-        let cols = if self.claude_view_cols == 0 { crate::pty_session::DEFAULT_COLS } else { self.claude_view_cols };
-        // A stable agent ID across respawns: reuse the launched Claude PTY's entry.
-        let existing_id = self
-            .agent_registry
-            .all()
-            .into_iter()
-            .find(|a| a.kind == AgentKind::ClaudeCode && a.origin == AgentOrigin::Launched)
-            .map(|a| a.id);
-        let agent_id = existing_id.unwrap_or_else(|| {
-            format!("claude-pty-{}", uuid::Uuid::new_v4())
-        });
-        // The previous process's conversations are told to reopen.
-        self.retire_claude_chat().await;
-        // Chat hooks for this process (a new generation); empty when chat could not be prepared.
-        let launch_args = self.claude_client.launch_args().to_vec();
-        let chat_args = self.prepare_claude_chat(&agent_id, &launch_args);
-        let session = match self.claude_client.start_session_sized(rows, cols, &chat_args).await {
-            Ok(session) => session,
-            Err(error) => {
-                self.claude_chat = None;
-                return Err(error);
-            }
-        };
-        self.replace_terminal("claude");
-        self.claude_sender = Some(session.sender);
-        self.claude_receiver = Some(session.receiver);
-        self.claude_resize_handle = Some(session.resize_handle);
-        self.claude_raw_log.clear();
-        self.claude_raw_log_start = 0;
-        self.claude_output_log.clear();
-        self.claude_user_actions.clear();
-        self.claude_log_file = None;
-        self.claude_summary_file = None;
-        self.claude_view_rows = rows;
-        self.claude_view_cols = cols;
-        self.claude_terminal = VtParser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS);
-        self.claude_waiting_exit = false;
-
-        // Register (or re-register) the Claude PTY session in the agent registry.
-        // Status stays Unknown and chat-v1 unadvertised until Claude's hooks report
-        // the session (`poll_chat`).
-        self.agent_registry.register(AgentInfo {
-            id: agent_id.clone(),
-            name: "claude-code".to_string(),
-            kind: AgentKind::ClaudeCode,
-            protocol: AgentProtocol::Pty,
-            origin: AgentOrigin::Launched,
-            status: AgentStatus::Unknown,
-            session_ids: vec![],
-            acp_url: None,
-            pty_pid: None,
-            capabilities: vec![],
-        });
-
-        Ok(true)
-    }
-
-    pub fn record_claude_output(&mut self, data: impl AsRef<str>) {
-        let text = data.as_ref();
-        crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, text);
-        if self.claude_receiver.is_some() {
-            self.status_message = Some(text.trim().to_string());
-        } else {
-            self.claude_terminal.process(text.as_bytes());
-            self.update_claude_output_from_terminal();
-        }
-    }
-
-    pub fn update_claude_output_from_terminal(&mut self) {
-        let screen = self.claude_terminal.screen();
-        let (_rows, cols) = screen.size();
-
-        let mut lines: Vec<String> = screen
-            .rows(0, cols)
-            .map(|line| line.replace('\u{0000}', ""))
-            .collect();
-
-        while lines.last().is_some_and(|line| line.trim().is_empty()) {
-            lines.pop();
-        }
-
-        self.claude_output_log = lines.join("\n");
-        if matches!(self.mode, AppMode::ClaudeChat) {
-            self.output_text = self.claude_output_log.clone();
-        }
-    }
-
-    pub fn send_claude_data(&mut self, data: &str) {
-        if self.claude_share.as_ref().is_some_and(|s| s.exit_status.is_some()) { return; }
-        if let Some(sender) = &self.claude_sender {
-            if let Err(error) = sender.send(data.to_string()) {
-                self.status_message = Some(error.to_string());
-            }
-        }
-    }
-
-    pub fn refresh_claude_view(&mut self) {
-        if matches!(self.mode, AppMode::ClaudeChat) {
-            self.output_text = self.claude_output_log.clone();
-        }
-    }
-
-    pub fn rebuild_claude_terminal(&mut self) {
-        self.claude_terminal.set_size(self.claude_view_rows.max(2), self.claude_view_cols.max(2));
-        self.update_claude_output_from_terminal();
-    }
-
-    pub fn adjust_claude_terminal_size(&mut self, rows: u16, cols: u16) {
-        if self.claude_sender.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
-        let rows = rows.min(200);
-        let cols = cols.min(400);
-        if rows < 2 || cols < 2 {
-            return;
-        }
-        if self.claude_view_rows == rows
-            && self.claude_view_cols == cols
-            && self.claude_terminal.screen().size() == (rows, cols)
-        {
-            return;
-        }
-
-        self.claude_view_rows = rows;
-        self.claude_view_cols = cols;
-        self.rebuild_claude_terminal();
-
-        if let Some(handle) = &self.claude_resize_handle
-            && let Err(err) = handle.resize(rows, cols)
-        {
-            self.status_message =
-                Some(format!("Failed to resize Claude terminal: {}", err));
-        }
-    }
-
-    pub fn process_claude_output(&mut self) {
-        self.process_terminal_output("claude");
-    }
-
-    pub fn finalize_claude_session(&mut self) {
-        let was_focused = matches!(self.mode, AppMode::ClaudeChat);
-
-        // If there's an active mark task, flag it for async finalization
-        self.dispatcher.set_main_needs_finalize();
-
-        let had_activity_before_finalize = !self.claude_raw_log.trim().is_empty();
-
-        crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, "\u{2699}\u{fe0f} Claude Code CLI session ended.\n");
-
-        let mut status_parts: Vec<String> = Vec::new();
-
-        if had_activity_before_finalize {
-            match self.persist_claude_log() {
-                Ok(Some(path)) => {
-                    let msg = format!("\u{1f4dd} Claude log saved to {}", path.display());
-                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
+                    let msg = format!("\u{1f4dd} {} log saved to {}", label, path.display());
+                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
                 Ok(None) => {
                     status_parts
-                        .push("Claude session ended with no output to save.".to_string());
+                        .push(format!("{} session ended with no output to save.", label));
                 }
                 Err(err) => {
-                    let msg = format!("\u{26a0}\u{fe0f} Failed to save Claude log: {}", err);
-                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
+                    let msg = format!("\u{26a0}\u{fe0f} Failed to save {} log: {}", label, err);
+                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
             }
 
-            let summary = self.generate_claude_summary();
-            match self.write_claude_summary_file(&summary) {
+            let summary = Self::generate_summary(session);
+            match Self::write_summary_file(session, &summary) {
                 Ok(path) => {
                     let msg = format!("\u{1f4c4} Summary saved to {}", path.display());
-                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
+                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
                 Err(err) => {
-                    let msg = format!("\u{26a0}\u{fe0f} Failed to save Claude summary: {}", err);
-                    crate::app::terminal::append_log(&mut self.claude_raw_log, &mut self.claude_raw_log_start, &format!("{}\n", msg));
+                    let msg = format!("\u{26a0}\u{fe0f} Failed to save {} summary: {}", label, err);
+                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
                     status_parts.push(msg);
                 }
             }
         } else {
-            status_parts.push("Claude session ended (no output captured).".to_string());
+            status_parts.push(format!("{} session ended (no output captured).", label));
         }
 
-        self.claude_receiver = None;
+        // The PTY receiver is dropped: the session has exited.
+        session.events = None;
+        session.exited_at = Some(Instant::now());
+        session.waiting_exit = false;
         self.rebuild_menu();
 
         if was_focused {
@@ -1160,55 +963,56 @@ impl App {
             self.input_text.clear();
         }
         self.status_message = if status_parts.is_empty() {
-            Some("Claude session ended.".to_string())
+            Some(format!("{} session ended.", label))
         } else {
             Some(status_parts.join(" | "))
         };
-        self.claude_waiting_exit = false;
     }
 
-    pub fn persist_claude_log(&mut self) -> Result<Option<PathBuf>> {
-        if self.claude_raw_log.trim().is_empty() {
+    /// Saves the raw log under `./<provider>_logs/` (once per session).
+    pub fn persist_log(session: &mut Session) -> Result<Option<PathBuf>> {
+        if session.raw_log.trim().is_empty() {
             return Ok(None);
         }
-        if let Some(path) = &self.claude_log_file {
+        if let Some(path) = &session.log_file {
             return Ok(Some(path.clone()));
         }
 
-        let dir = PathBuf::from("claude_logs");
+        let name = session.provider.as_str();
+        let dir = PathBuf::from(format!("{name}_logs"));
         fs::create_dir_all(&dir)?;
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let path = dir.join(format!("claude-session-{}.ansi", timestamp));
-        fs::write(&path, self.claude_raw_log.as_bytes())?;
-        self.claude_log_file = Some(path.clone());
+        let path = dir.join(format!("{}-session-{}.ansi", name, timestamp));
+        fs::write(&path, session.raw_log.as_bytes())?;
+        session.log_file = Some(path.clone());
         Ok(Some(path))
     }
 
-    pub fn generate_claude_summary(&self) -> String {
+    pub fn generate_summary(session: &Session) -> String {
         let mut summary = String::new();
-        summary.push_str("# Claude Code Session Summary\n\n");
+        summary.push_str(&format!("# {} Session Summary\n\n", session.provider.product()));
         summary.push_str(&format!(
             "Commands executed: {}\n",
-            self.claude_user_actions.len()
+            session.user_actions.len()
         ));
-        if !self.claude_user_actions.is_empty() {
+        if !session.user_actions.is_empty() {
             summary.push_str("\n## Commands\n");
             let max_commands = 10;
-            for cmd in self.claude_user_actions.iter().take(max_commands) {
+            for cmd in session.user_actions.iter().take(max_commands) {
                 summary.push_str("- ");
                 summary.push_str(cmd);
                 summary.push('\n');
             }
-            if self.claude_user_actions.len() > max_commands {
+            if session.user_actions.len() > max_commands {
                 summary.push_str("- \u{2026}\n");
             }
         }
         summary.push('\n');
         summary.push_str(&format!(
             "Total output lines captured: {}\n",
-            self.claude_output_log.lines().count()
+            session.output_log.lines().count()
         ));
-        if let Some(path) = &self.claude_log_file {
+        if let Some(path) = &session.log_file {
             summary.push_str(&format!("Full log saved at: {}\n", path.display()));
         } else {
             summary.push_str("Full log has not been saved yet.\n");
@@ -1216,13 +1020,14 @@ impl App {
         summary
     }
 
-    pub fn write_claude_summary_file(&mut self, summary: &str) -> Result<PathBuf> {
-        let dir = PathBuf::from("claude_logs");
+    pub fn write_summary_file(session: &mut Session, summary: &str) -> Result<PathBuf> {
+        let name = session.provider.as_str();
+        let dir = PathBuf::from(format!("{name}_logs"));
         fs::create_dir_all(&dir)?;
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let path = dir.join(format!("claude-summary-{}.md", timestamp));
+        let path = dir.join(format!("{}-summary-{}.md", name, timestamp));
         fs::write(&path, summary)?;
-        self.claude_summary_file = Some(path.clone());
+        session.summary_file = Some(path.clone());
         Ok(path)
     }
 
@@ -1342,8 +1147,7 @@ impl App {
         if self.intercept_astation_reauth(&message).await {
             return;
         }
-        let shared = self.claude_share.as_ref().is_some_and(|s| s.has_viewer())
-            || self.codex_share.as_ref().is_some_and(|s| s.has_viewer());
+        let shared = self.sessions.iter().any(|s| s.share.has_viewer());
         if (shared || self.astation_client.is_ws_closed()) && matches!(&message, AstationMessage::AgentInput { .. } | AstationMessage::AgentPrompt { .. }
             | AstationMessage::VoiceRequest { .. } | AstationMessage::VoiceCommand { .. }
             | AstationMessage::VoiceToggle { .. } | AstationMessage::UserCommand { .. }) {
@@ -1431,13 +1235,15 @@ impl App {
                 timestamp: _,
             } => {
                 if success {
-                    self.record_codex_output(&format!("\u{1f9e0} [Astation] {}\n", output));
+                    self.record_output(Provider::Codex, format!("\u{1f9e0} [Astation] {}\n", output));
                 } else {
-                    self.record_codex_output(&format!("\u{274c} [Astation] {}\n", output));
+                    self.record_output(Provider::Codex, format!("\u{274c} [Astation] {}\n", output));
                 }
 
-                if matches!(self.mode, AppMode::CodexChat) {
-                    self.refresh_codex_view();
+                // Task 2: route by id
+                let codex = self.session_id_for(Provider::Codex);
+                if let Some(codex) = codex.filter(|id| self.is_focused(id)) {
+                    self.refresh_view(&codex);
                 } else if success {
                     self.output_text = format!("\u{1f9e0} Codex response (via Astation):\n\n{}", output);
                 } else {
@@ -1453,7 +1259,8 @@ impl App {
                 if !active && self.voice_commands.has_content() {
                     let command = self.voice_commands.take();
                     self.status_message = Some(format!("\u{1f3a4} PTT: {}", command));
-                    if let Err(err) = self.send_claude_prompt(&command).await {
+                    // Task 2: route by id
+                    if let Err(err) = self.send_prompt(Provider::Claude, &command).await {
                         self.status_message =
                             Some(format!("Failed to send PTT voice to Claude: {}", err));
                     }
@@ -1489,43 +1296,40 @@ impl App {
             AstationMessage::UserCommand { command, context } => {
                 let action = context.get("action").map(|s| s.as_str()).unwrap_or("cli_input");
 
-                // Determine target CLI
+                // Determine target CLI: "cli_input" goes to the focused session's
+                // provider (Claude when none was focused).
+                // Task 2: route by id
                 let target = match action {
-                    "cli_input" => self.pinned_cli.clone().unwrap_or(self.active_cli.clone()),
-                    "claude_input" => ActiveCli::Claude,
-                    "codex_input" => ActiveCli::Codex,
-                    _ => ActiveCli::Claude,
+                    "cli_input" => self
+                        .focused
+                        .as_ref()
+                        .and_then(|id| self.sessions.get(id))
+                        .map_or(Provider::Claude, |s| s.provider),
+                    "claude_input" => Provider::Claude,
+                    "codex_input" => Provider::Codex,
+                    _ => Provider::Claude,
                 };
 
                 // Track output start position before sending command (use raw_log which accumulates)
-                let output_start_pos = match target {
-                    ActiveCli::Claude => self.claude_raw_log_start + self.claude_raw_log.len(),
-                    ActiveCli::Codex => self.codex_raw_log_start + self.codex_raw_log.len(),
-                };
+                let output_start_pos = self
+                    .session_for(target)
+                    .map_or(0, |s| s.raw_log_start + s.raw_log.len());
 
                 // Store pending command for output relay
                 self.pending_astation_command = Some(PendingAstationCommand {
-                    target: target.clone(),
+                    target,
                     output_start_pos,
                     sent_at: Instant::now(),
                 });
 
                 // Send command to appropriate CLI
                 match action {
-                    "cli_input" => {
-                        match target {
-                            ActiveCli::Claude => { self.send_claude_prompt(&command).await.ok(); }
-                            ActiveCli::Codex => { self.send_codex_prompt(&command).await.ok(); }
-                        }
-                    }
-                    "claude_input" => { self.send_claude_prompt(&command).await.ok(); }
-                    "codex_input" => { self.send_codex_prompt(&command).await.ok(); }
                     "shell" => {
                         self.execute_command(&command).await.ok();
                         // For shell commands, clear pending since we don't track shell output relay yet
                         self.pending_astation_command = None;
                     }
-                    _ => { self.send_claude_prompt(&command).await.ok(); }
+                    _ => { self.send_prompt(target, &command).await.ok(); }
                 }
 
                 self.status_message = Some(format!(
@@ -1551,12 +1355,13 @@ impl App {
                     Some(info) => match info.protocol {
                         AgentProtocol::Pty => {
                             // Route to the active PTY based on agent kind.
+                            // Task 2: route by id
                             match info.kind {
                                 AgentKind::ClaudeCode => {
-                                    let _ = self.send_claude_prompt(&text).await;
+                                    let _ = self.send_prompt(Provider::Claude, &text).await;
                                 }
                                 AgentKind::Codex => {
-                                    let _ = self.send_codex_prompt(&text).await;
+                                    let _ = self.send_prompt(Provider::Codex, &text).await;
                                 }
                                 AgentKind::Unknown(_) => {
                                     self.status_message = Some("\u{274c} No PTY route for unknown agent kind".to_string());
@@ -1664,8 +1469,9 @@ impl App {
     }
 
     /// Pop the next task from the dispatcher's main queue and send it to the Claude PTY.
+    // Task 2: route by id
     pub async fn try_dispatch_main(&mut self) {
-        if self.claude_sender.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
+        if self.session_for(Provider::Claude).and_then(|s| s.input.as_ref()).is_some_and(|s| s.remote_controlled()) { return; }
         if self.dispatcher.main_is_active() {
             return;
         }
@@ -1685,17 +1491,19 @@ impl App {
         };
 
         // Ensure Claude session and send the prompt
-        self.mode = AppMode::ClaudeChat;
+        self.focus_provider(Provider::Claude);
         self.input_text.clear();
-        self.claude_waiting_exit = false;
-        if self.claude_output_log.is_empty() {
-            self.claude_output_log = "\u{1f916} Claude Code CLI Session (Mark Task)\n\n".to_string();
+        if let Some(session) = self.session_for_mut(Provider::Claude) {
+            session.waiting_exit = false;
+            if session.output_log.is_empty() {
+                session.output_log = "\u{1f916} Claude Code CLI Session (Mark Task)\n\n".to_string();
+            }
         }
 
-        match self.ensure_claude_session().await {
+        match self.ensure_session(Provider::Claude).await {
             Ok(new_session_started) => {
                 if new_session_started {
-                    self.record_claude_output("\u{1f50c} Claude Code CLI session started for mark task.\n");
+                    self.record_output(Provider::Claude, "\u{1f50c} Claude Code CLI session started for mark task.\n");
                 }
             }
             Err(err) => {
@@ -1713,16 +1521,19 @@ impl App {
         }
 
         // One queued write prevents a rejected prompt from submitting an unrelated draft.
-        let result = self.claude_sender.as_ref().unwrap().send(format!("{}\n\r", item.prompt));
+        let Some(claude) = self.session_id_for(Provider::Claude) else { return; };
+        let session = self.sessions.get_mut(&claude).expect("ensured above");
+        let result = session.input.as_ref().unwrap().send(format!("{}\n\r", item.prompt));
         if let Err(error) = result {
             let _ = self.astation_client.send_mark_result(&task_id, false, &error.to_string()).await;
             self.dispatcher.complete_main();
             self.work_items.remove(&task_id);
             return;
         }
-        self.claude_user_actions.push(format!("[Mark Task {}]", task_id));
+        session.last_used = Instant::now();
+        session.user_actions.push(format!("[Mark Task {}]", task_id));
 
-        self.refresh_claude_view();
+        self.refresh_view(&claude);
         self.status_message = Some(format!("\u{1f4cc} Task {} → Claude", task_id));
     }
 
@@ -1821,7 +1632,8 @@ impl App {
             self.status_message = Some(format!("\u{1f3a4} Voice: {}", command));
 
             // Send to Claude Code
-            if let Err(err) = self.send_claude_prompt(&command).await {
+            // Task 2: route by id
+            if let Err(err) = self.send_prompt(Provider::Claude, &command).await {
                 self.status_message =
                     Some(format!("Failed to send voice command to Claude: {}", err));
             }
@@ -1841,7 +1653,7 @@ impl App {
         text: Option<String>,
         key: Option<String>,
     ) {
-        if self.claude_share.as_ref().is_some_and(|s| s.has_viewer()) || self.codex_share.as_ref().is_some_and(|s| s.has_viewer()) {
+        if self.sessions.iter().any(|s| s.share.has_viewer()) {
             self.status_message = Some("Use terminal-v1 control for an attached terminal".into());
             return;
         }
@@ -1853,7 +1665,7 @@ impl App {
         // only ever populates one).
         let data: Option<String> = match kind.as_str() {
             // Type the line and submit it. Trims + skips empty like
-            // send_claude_prompt, and matches its submit sequence (text, then
+            // send_prompt, and matches its submit sequence (text, then
             // "\n", then "\r") which the Claude/Codex TUIs need to accept a line.
             "text" => text
                 .map(|t| t.trim().to_string())
@@ -1875,12 +1687,15 @@ impl App {
         };
 
         // Route to the focused agent's PTY. Codex when it's the active chat;
-        // Claude otherwise (matches the voice path's default target). The
-        // send_* helpers no-op if that agent has no live session.
-        if matches!(self.mode, AppMode::CodexChat) && self.codex_sender.is_some() {
-            self.send_codex_data(&data);
-        } else {
-            self.send_claude_data(&data);
+        // Claude otherwise (matches the voice path's default target).
+        // send_data no-ops if that agent has no live session.
+        // Task 2: route by id
+        let target = match self.focused_session() {
+            Some(s) if s.provider == Provider::Codex && s.input.is_some() => Some(s.id.clone()),
+            _ => self.session_id_for(Provider::Claude),
+        };
+        if let Some(target) = target {
+            self.send_data(&target, &data);
         }
         self.status_message = Some(format!("\u{2328} agentInput: {}", kind));
     }
@@ -1894,7 +1709,8 @@ impl App {
         self.status_message = Some(format!("\u{1f3a4} Voice request: {}", &accumulated_text[..accumulated_text.len().min(50)]));
 
         // Send the transcribed text to Claude Code
-        if let Err(err) = self.send_claude_prompt(&accumulated_text).await {
+        // Task 2: route by id
+        if let Err(err) = self.send_prompt(Provider::Claude, &accumulated_text).await {
             self.status_message =
                 Some(format!("Failed to send voice request to Claude: {}", err));
             // POST failure to relay so it unblocks
@@ -1920,9 +1736,16 @@ impl App {
             session_id,
             relay_url,
             sent_at: now,
-            output_snapshot_len: self.claude_raw_log_start + self.claude_raw_log.len(),
+            output_snapshot_len: self.claude_log_end(),
             last_output_at: now,
         });
+    }
+
+    /// The absolute end of the Claude session's raw log.
+    // Task 2: route by id
+    fn claude_log_end(&self) -> usize {
+        self.session_for(Provider::Claude)
+            .map_or(0, |s| s.raw_log_start + s.raw_log.len())
     }
 
     /// Check if a pending voice request's Claude output is complete (2s inactivity).
@@ -1933,7 +1756,7 @@ impl App {
             None => return,
         };
 
-        let current_len = self.claude_raw_log_start + self.claude_raw_log.len();
+        let current_len = self.claude_log_end();
 
         // Output is still growing — update snapshot
         if current_len > pending.output_snapshot_len {
@@ -1956,7 +1779,9 @@ impl App {
 
         // Claude is done — extract the response text.
         // At this point current_len <= pending.output_snapshot_len (output stopped growing).
-        let output = crate::app::terminal::log_since(&self.claude_raw_log, self.claude_raw_log_start, pending.output_snapshot_len);
+        let output = self
+            .session_for(Provider::Claude)
+            .map_or("", |s| crate::app::terminal::log_since(&s.raw_log, s.raw_log_start, pending.output_snapshot_len));
         let response_text = if !output.is_empty() {
             output.to_string()
         } else {
@@ -2003,23 +1828,14 @@ impl App {
             }
 
             // Extract output since command was sent (use raw_log which accumulates all output)
-            let (output, success) = match pending.target {
-                ActiveCli::Claude => {
-                    let output = crate::app::terminal::log_since(&self.claude_raw_log, self.claude_raw_log_start, pending.output_start_pos);
-                    if !output.is_empty() {
-                        (output.to_string(), true)
-                    } else {
-                        ("No output received".to_string(), false)
-                    }
-                }
-                ActiveCli::Codex => {
-                    let output = crate::app::terminal::log_since(&self.codex_raw_log, self.codex_raw_log_start, pending.output_start_pos);
-                    if !output.is_empty() {
-                        (output.to_string(), true)
-                    } else {
-                        ("No output received".to_string(), false)
-                    }
-                }
+            // Task 2: route by id
+            let output = self
+                .session_for(pending.target)
+                .map_or("", |s| crate::app::terminal::log_since(&s.raw_log, s.raw_log_start, pending.output_start_pos));
+            let (output, success) = if !output.is_empty() {
+                (output.to_string(), true)
+            } else {
+                ("No output received".to_string(), false)
             };
 
             // Send response back to Astation
@@ -2119,12 +1935,20 @@ mod tests {
         assert_eq!(agent_key_to_bytes("Enter"), None); // case-sensitive by design
     }
 
+    /// A session of `provider` writing to `input` (no process), shown by the terminal view.
+    fn focus_test_session(app: &mut App, provider: Provider, input: crate::pty_session::PtyInput) {
+        let mut session = Session::new(provider, 24, 80);
+        session.input = Some(input);
+        let id = app.sessions.insert(session).unwrap().id.clone();
+        app.focused = Some(id);
+        app.mode = AppMode::Terminal;
+    }
+
     #[test]
     fn handle_agent_input_text_types_line_and_submits_to_claude() {
         let mut app = App::new();
         let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        app.claude_sender = Some(tx);
-        app.mode = AppMode::ClaudeChat;
+        focus_test_session(&mut app, Provider::Claude, tx);
         app.handle_agent_input(None, "text".into(), Some("hello".into()), None);
         let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(got, "hello\n\r");
@@ -2134,8 +1958,7 @@ mod tests {
     fn handle_agent_input_key_writes_raw_control_bytes() {
         let mut app = App::new();
         let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        app.claude_sender = Some(tx);
-        app.mode = AppMode::ClaudeChat;
+        focus_test_session(&mut app, Provider::Claude, tx);
         app.handle_agent_input(None, "key".into(), None, Some("ctrl-c".into()));
         let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(got, "\x03");
@@ -2145,8 +1968,7 @@ mod tests {
     fn handle_agent_input_empty_text_sends_nothing() {
         let mut app = App::new();
         let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        app.claude_sender = Some(tx);
-        app.mode = AppMode::ClaudeChat;
+        focus_test_session(&mut app, Provider::Claude, tx);
         app.handle_agent_input(None, "text".into(), Some("   ".into()), None);
         assert!(rx.try_recv().is_err());
     }
@@ -2155,8 +1977,7 @@ mod tests {
     fn handle_agent_input_unknown_key_sends_nothing() {
         let mut app = App::new();
         let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        app.claude_sender = Some(tx);
-        app.mode = AppMode::ClaudeChat;
+        focus_test_session(&mut app, Provider::Claude, tx);
         app.handle_agent_input(None, "key".into(), None, Some("f13".into()));
         assert!(rx.try_recv().is_err());
     }
@@ -2165,31 +1986,10 @@ mod tests {
     fn handle_agent_input_routes_to_codex_when_focused() {
         let mut app = App::new();
         let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        app.codex_sender = Some(tx);
-        app.mode = AppMode::CodexChat;
+        focus_test_session(&mut app, Provider::Codex, tx);
         app.handle_agent_input(None, "key".into(), None, Some("esc".into()));
         let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(got, "\x1b");
-    }
-
-    #[test]
-    fn test_active_cli_default_is_claude() {
-        let app = App::new();
-        assert_eq!(app.active_cli, ActiveCli::Claude);
-    }
-
-    #[test]
-    fn test_active_cli_equality() {
-        assert_eq!(ActiveCli::Claude, ActiveCli::Claude);
-        assert_eq!(ActiveCli::Codex, ActiveCli::Codex);
-        assert_ne!(ActiveCli::Claude, ActiveCli::Codex);
-        assert_ne!(ActiveCli::Codex, ActiveCli::Claude);
-    }
-
-    #[test]
-    fn test_pinned_cli_default_is_none() {
-        let app = App::new();
-        assert!(app.pinned_cli.is_none());
     }
 
     #[test]
@@ -2280,7 +2080,7 @@ mod tests {
             }
             other => panic!("expected VisualizeResult, got {other:?}"),
         }
-        assert!(app.claude_sender.is_none(), "no agent session was started");
+        assert!(app.session_for(Provider::Claude).is_none(), "no agent session was started");
     }
 
     // ── Dynamic menu tests ──────────────────────────────────────────────

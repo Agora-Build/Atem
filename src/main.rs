@@ -9,6 +9,7 @@ mod claude_client;
 mod cli;
 mod codex_client;
 mod pty_session;
+mod session;
 mod terminal_share;
 mod terminal_keys;
 mod diagnostics;

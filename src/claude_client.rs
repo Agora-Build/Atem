@@ -1,6 +1,5 @@
 use crate::pty_session;
 use anyhow::Result;
-pub type ClaudeResizeHandle = pty_session::PtyHandle;
 pub type ClaudeSession = pty_session::PtySession;
 
 #[derive(Clone, Debug)]

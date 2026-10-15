@@ -1,5 +1,6 @@
 use super::{App, AppMode};
 use crate::pty_session::PtyEvent;
+use crate::session::{Provider, Session, SessionId};
 use crate::terminal_share::{Envelope, Message};
 
 pub(super) fn append_log(log: &mut String, offset: &mut usize, text: &str) {
@@ -24,17 +25,13 @@ pub(super) fn log_since(log: &str, offset: usize, position: usize) -> &str {
 }
 
 impl App {
-    pub(super) fn replace_terminal(&mut self, provider: &str) {
-        let slot = if provider == "codex" {
-            &mut self.codex_share
-        } else {
-            &mut self.claude_share
-        };
-        let previous = slot.replace(crate::terminal_share::SharedTerminal::new(provider));
-        if let Some(previous) = previous.filter(|s| s.has_viewer()) {
+    /// A session replaced by a new process of its provider: its remote viewer
+    /// is told to refresh. Dropping it ends what is left of its process.
+    pub(super) fn replace_terminal(&mut self, previous: Session) {
+        if previous.share.has_viewer() {
             self.queue_terminal(Message::Exited {
-                terminal_id: previous.id,
-                generation: previous.generation,
+                terminal_id: previous.share.id.clone(),
+                generation: previous.share.generation.clone(),
                 status: "Session replaced; refresh the terminal list".into(),
             });
         }
@@ -49,12 +46,9 @@ impl App {
     }
 
     pub fn disconnect_terminals(&mut self) {
-        for (share, input) in [
-            (&mut self.codex_share, &self.codex_sender),
-            (&mut self.claude_share, &self.claude_sender),
-        ] {
-            if let (Some(share), Some(input)) = (share, input) {
-                share.disconnect(input);
+        for session in self.sessions.iter_mut() {
+            if let Some(input) = &session.input {
+                session.share.disconnect(input);
             }
         }
         self.terminal_outbox.clear();
@@ -85,13 +79,13 @@ impl App {
             return;
         }
         if matches!(envelope.message, Message::List) {
-            let sessions = [
-                (&self.codex_share, &self.codex_terminal),
-                (&self.claude_share, &self.claude_terminal),
-            ]
-            .into_iter()
-            .filter_map(|(share, parser)| share.as_ref().map(|s| s.info(parser.screen())))
-            .collect();
+            // Task 2: route by id (one terminal per provider, Codex first).
+            let sessions = [Provider::Codex, Provider::Claude]
+                .into_iter()
+                .filter_map(|provider| self.session_for(provider))
+                .filter(|s| s.input.is_some())
+                .map(|s| s.share.info(s.terminal.screen()))
+                .collect();
             self.queue_terminal(Message::Sessions { sessions });
             return;
         }
@@ -105,31 +99,30 @@ impl App {
             | Message::Stop { terminal_id, .. } => terminal_id.clone(),
             _ => return,
         };
-        let (share, parser, input, handle) = match id.as_str() {
-            "codex" => (
-                &mut self.codex_share,
-                &mut self.codex_terminal,
-                &self.codex_sender,
-                &self.codex_resize_handle,
-            ),
-            "claude" => (
-                &mut self.claude_share,
-                &mut self.claude_terminal,
-                &self.claude_sender,
-                &self.claude_resize_handle,
-            ),
-            _ => {
-                self.queue_terminal(Message::Error {
-                    terminal_id: Some(id),
-                    message: "Unknown terminal".into(),
-                });
-                return;
-            }
+        // Task 2: route by id
+        let Some(provider) = Provider::from_alias(&id) else {
+            self.queue_terminal(Message::Error {
+                terminal_id: Some(id),
+                message: "Unknown terminal".into(),
+            });
+            return;
         };
-        let result = if let (Some(share), Some(input), Some(handle)) = (share, input, handle) {
-            share.handle(envelope.message, parser, input, handle)
-        } else {
-            Err("Terminal unavailable; launch the CLI in Atem first".into())
+        let is_input = matches!(envelope.message, Message::Input { .. });
+        let result = match self.session_for_mut(provider) {
+            Some(Session {
+                share,
+                terminal,
+                input: Some(input),
+                handle: Some(handle),
+                last_used,
+                ..
+            }) => {
+                if is_input {
+                    *last_used = std::time::Instant::now();
+                }
+                share.handle(envelope.message, terminal, input, handle)
+            }
+            _ => Err("Terminal unavailable; launch the CLI in Atem first".into()),
         };
         match result {
             Ok(messages) => {
@@ -144,27 +137,21 @@ impl App {
         }
     }
 
-    pub fn process_terminal_output(&mut self, id: &str) {
-        let (share, parser, input, receiver, log, log_offset) = if id == "codex" {
-            (
-                &mut self.codex_share,
-                &mut self.codex_terminal,
-                &self.codex_sender,
-                &mut self.codex_receiver,
-                &mut self.codex_raw_log,
-                &mut self.codex_raw_log_start,
-            )
-        } else {
-            (
-                &mut self.claude_share,
-                &mut self.claude_terminal,
-                &self.claude_sender,
-                &mut self.claude_receiver,
-                &mut self.claude_raw_log,
-                &mut self.claude_raw_log_start,
-            )
+    pub fn process_terminal_output(&mut self, id: &SessionId) {
+        let Some(session) = self.sessions.get_mut(id) else {
+            return;
         };
-        let (Some(share), Some(input), Some(receiver)) = (share, input, receiver) else {
+        let label = session.provider.as_str();
+        let Session {
+            share,
+            terminal: parser,
+            input: Some(input),
+            events: Some(receiver),
+            raw_log: log,
+            raw_log_start: log_offset,
+            ..
+        } = session
+        else {
             return;
         };
         let mut replies = Vec::new();
@@ -174,7 +161,9 @@ impl App {
                 Ok(PtyEvent::Output(bytes)) => {
                     append_log(log, log_offset, &share.process(parser, input, &bytes));
                 }
-                Ok(PtyEvent::Error(error)) => self.status_message = Some(format!("{id}: {error}")),
+                Ok(PtyEvent::Error(error)) => {
+                    self.status_message = Some(format!("{label}: {error}"))
+                }
                 Ok(PtyEvent::Written { sequence, result }) => {
                     if let Some(reply) = share.written(sequence, result.err()) {
                         replies.push(reply);
@@ -196,16 +185,9 @@ impl App {
         for reply in replies {
             self.queue_terminal(reply);
         }
-        if id == "codex" {
-            self.update_codex_output_from_terminal();
-            if exit {
-                self.finalize_codex_session();
-            }
-        } else {
-            self.update_claude_output_from_terminal();
-            if exit {
-                self.finalize_claude_session();
-            }
+        self.update_output_from_terminal(id);
+        if exit {
+            self.finalize_session(id);
         }
     }
 
@@ -214,28 +196,24 @@ impl App {
             return;
         }
         let mut messages = Vec::new();
-        for (share, parser, input) in [
-            (
-                &mut self.codex_share,
-                &self.codex_terminal,
-                &self.codex_sender,
-            ),
-            (
-                &mut self.claude_share,
-                &self.claude_terminal,
-                &self.claude_sender,
-            ),
-        ] {
-            if let (Some(share), Some(input)) = (share, input) {
-                match share.frames(parser.screen()) {
-                    Ok(frames) => messages.extend(frames),
-                    Err(error) => {
-                        share.disconnect(input);
-                        messages.push(Message::Error {
-                            terminal_id: Some(share.id.clone()),
-                            message: error,
-                        });
-                    }
+        for session in self.sessions.iter_mut() {
+            let Session {
+                share,
+                terminal: parser,
+                input: Some(input),
+                ..
+            } = session
+            else {
+                continue;
+            };
+            match share.frames(parser.screen()) {
+                Ok(frames) => messages.extend(frames),
+                Err(error) => {
+                    share.disconnect(input);
+                    messages.push(Message::Error {
+                        terminal_id: Some(share.id.clone()),
+                        message: error,
+                    });
                 }
             }
         }
@@ -257,8 +235,8 @@ impl App {
     pub fn leave_terminal_view(&mut self) {
         self.terminal_ui.reset_view();
         self.force_terminal_redraw = true;
-        let action = match self.mode {
-            AppMode::CodexChat => super::MenuAction::LaunchCodex,
+        let action = match self.focused_session().map(|s| s.provider) {
+            Some(Provider::Codex) => super::MenuAction::LaunchCodex,
             _ => super::MenuAction::LaunchClaude,
         };
         self.rebuild_menu();
@@ -274,33 +252,27 @@ impl App {
     }
 
     pub fn reclaim_terminal(&mut self) {
-        let (share, input) = match self.mode {
-            AppMode::CodexChat => (&mut self.codex_share, &self.codex_sender),
-            AppMode::ClaudeChat => (&mut self.claude_share, &self.claude_sender),
-            _ => return,
+        let Some(session) = self.focused_session_mut() else {
+            return;
         };
-        if let (Some(share), Some(input)) = (share, input)
-            && let Some(message) = share.reclaim(input)
-        {
-            self.queue_terminal(message);
-        }
+        let message = match &session.input {
+            Some(input) => session.share.reclaim(input),
+            None => None,
+        };
         // Force the local viewport to regain size ownership on the next draw.
-        match self.mode {
-            AppMode::CodexChat => self.codex_view_rows = 0,
-            AppMode::ClaudeChat => self.claude_view_rows = 0,
-            _ => {}
+        session.view.0 = 0;
+        if let Some(message) = message {
+            self.queue_terminal(message);
         }
         self.status_message = Some("Local control restored; unfinished input preserved".into());
     }
 
     pub fn stop_terminal(&mut self) {
         self.reclaim_terminal();
-        let handle = match self.mode {
-            AppMode::CodexChat => &self.codex_resize_handle,
-            AppMode::ClaudeChat => &self.claude_resize_handle,
-            _ => return,
+        let Some(session) = self.focused_session() else {
+            return;
         };
-        if let Some(handle) = handle
+        if let Some(handle) = &session.handle
             && let Err(error) = handle.stop()
         {
             self.status_message = Some(error.to_string());
@@ -311,29 +283,27 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let (parser, sender) = match self.mode {
-            AppMode::CodexChat => (&self.codex_terminal, &self.codex_sender),
-            AppMode::ClaudeChat => (&self.claude_terminal, &self.claude_sender),
-            _ => {
-                self.input_text.push_str(text);
-                return;
-            }
+        let Some(session) = self.focused_session_mut() else {
+            self.input_text.push_str(text);
+            return;
         };
-        let data = crate::terminal_keys::paste(text, parser.screen().bracketed_paste());
-        if let Some(sender) = sender {
-            // One paste is atomic at the writer. Never partially submit a large paste.
-            if let Err(error) = sender.send(data) {
-                self.status_message = Some(error.to_string());
-            }
+        let data = crate::terminal_keys::paste(text, session.terminal.screen().bracketed_paste());
+        let Some(sender) = &session.input else {
+            return;
+        };
+        // One paste is atomic at the writer. Never partially submit a large paste.
+        let result = sender.send(data);
+        session.last_used = std::time::Instant::now();
+        if let Err(error) = result {
+            self.status_message = Some(error.to_string());
         }
     }
 
     pub fn browse_terminal(&mut self, offset: usize) {
-        let parser = match self.mode {
-            AppMode::CodexChat => &mut self.codex_terminal,
-            AppMode::ClaudeChat => &mut self.claude_terminal,
-            _ => return,
+        let Some(session) = self.focused_session_mut() else {
+            return;
         };
+        let parser = &mut session.terminal;
         // Browsing never changes the canonical screen sent to Astation or query replies.
         parser.set_scrollback(offset);
         let screen = parser.screen().clone();
@@ -372,102 +342,100 @@ mod live_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal_share::SharedTerminal;
+
+    /// A live `cat` PTY as `provider`'s session, shown by the terminal view.
+    fn app_with_cat_as(provider: Provider) -> App {
+        let mut app = App::new();
+        let mut session = Session::new(
+            provider,
+            crate::pty_session::DEFAULT_ROWS,
+            crate::pty_session::DEFAULT_COLS,
+        );
+        session.attach(crate::pty_session::spawn("cat", &[]).unwrap());
+        let id = app.sessions.insert(session).unwrap().id.clone();
+        app.focused = Some(id);
+        app.mode = AppMode::Terminal;
+        app
+    }
 
     fn app_with_cat() -> App {
-        let mut app = App::new();
-        let session = crate::pty_session::spawn("cat", &[]).unwrap();
-        app.codex_sender = Some(session.sender);
-        app.codex_receiver = Some(session.receiver);
-        app.codex_resize_handle = Some(session.resize_handle);
-        app.codex_share = Some(SharedTerminal::new("codex"));
-        app.mode = AppMode::CodexChat;
-        app
+        app_with_cat_as(Provider::Codex)
+    }
+
+    fn codex_id(app: &App) -> SessionId {
+        app.session_id_for(Provider::Codex).unwrap()
+    }
+
+    fn codex(app: &App) -> &Session {
+        app.session_for(Provider::Codex).unwrap()
     }
 
     #[tokio::test]
     async fn hiding_the_view_preserves_the_same_process_and_drains_output() {
         let mut app = app_with_cat();
-        let generation = app.codex_share.as_ref().unwrap().generation.clone();
+        let id = codex_id(&app);
+        let generation = codex(&app).share.generation.clone();
         app.leave_terminal_view();
-        app.send_codex_data("still alive\n");
+        app.send_data(&id, "still alive\n");
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !app
-                .codex_terminal
+            while !codex(&app)
+                .terminal
                 .screen()
                 .contents()
                 .contains("still alive")
             {
-                app.process_codex_output();
+                app.process_terminal_output(&id);
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(app.codex_share.as_ref().unwrap().generation, generation);
-        assert!(!app.ensure_codex_session().await.unwrap());
+        assert_eq!(codex(&app).share.generation, generation);
+        assert!(!app.ensure_session(Provider::Codex).await.unwrap());
         assert!(matches!(app.mode, AppMode::MainMenu));
     }
 
     #[test]
     fn disconnected_peer_cannot_subscribe_and_legacy_input_cannot_bypass_lease() {
         let mut app = app_with_cat();
-        let generation = app.codex_share.as_ref().unwrap().generation.clone();
+        let generation = codex(&app).share.generation.clone();
         let request = Message::Subscribe {
             terminal_id: "codex".into(),
             generation,
         };
         app.handle_terminal_message(request.clone().into());
-        assert!(!app.codex_share.as_ref().unwrap().has_viewer());
+        assert!(!codex(&app).share.has_viewer());
         app.astation_connected = true;
         app.handle_terminal_message(request.into());
-        assert!(app.codex_share.as_ref().unwrap().has_viewer());
+        assert!(codex(&app).share.has_viewer());
         app.handle_agent_input(None, "key".into(), None, Some("enter".into()));
         assert!(app.status_message.as_ref().unwrap().contains("terminal-v1"));
         app.disconnect_terminals();
-        assert!(!app.codex_share.as_ref().unwrap().has_viewer());
+        assert!(!codex(&app).share.has_viewer());
     }
 
     #[test]
     fn remote_size_survives_local_redraw_until_local_reclaim() {
         let mut app = app_with_cat();
-        app.codex_terminal.set_size(30, 90);
-        app.codex_sender.as_ref().unwrap().set_remote(true);
-        app.adjust_codex_terminal_size(40, 120);
-        assert_eq!(app.codex_terminal.screen().size(), (30, 90));
+        let id = codex_id(&app);
+        app.sessions.get_mut(&id).unwrap().terminal.set_size(30, 90);
+        codex(&app).input.as_ref().unwrap().set_remote(true);
+        app.adjust_terminal_size(&id, 40, 120);
+        assert_eq!(codex(&app).terminal.screen().size(), (30, 90));
         app.reclaim_terminal();
-        app.adjust_codex_terminal_size(40, 120);
-        assert_eq!(app.codex_terminal.screen().size(), (40, 120));
+        app.adjust_terminal_size(&id, 40, 120);
+        assert_eq!(codex(&app).terminal.screen().size(), (40, 120));
     }
 
     #[test]
     fn remote_release_restores_the_cached_local_size_for_both_providers() {
         for provider in ["codex", "claude"] {
-            let mut app = app_with_cat();
+            let mut app = app_with_cat_as(Provider::from_alias(provider).unwrap());
             app.astation_connected = true;
-            if provider == "claude" {
-                app.claude_sender = app.codex_sender.take();
-                app.claude_receiver = app.codex_receiver.take();
-                app.claude_resize_handle = app.codex_resize_handle.take();
-                app.codex_share = None;
-                app.claude_share = Some(SharedTerminal::new(provider));
-                app.mode = AppMode::ClaudeChat;
-            }
-            let resize = if provider == "codex" {
-                App::adjust_codex_terminal_size
-            } else {
-                App::adjust_claude_terminal_size
-            };
+            let id = app.focused.clone().unwrap();
+            let resize = |app: &mut App, rows, cols| app.adjust_terminal_size(&id, rows, cols);
             resize(&mut app, 40, 120);
-            let generation = if provider == "codex" {
-                &app.codex_share
-            } else {
-                &app.claude_share
-            }
-            .as_ref()
-            .unwrap()
-            .generation
-            .clone();
+            let generation = app.sessions.get(&id).unwrap().share.generation.clone();
             app.handle_terminal_message(
                 Message::Subscribe {
                     terminal_id: provider.into(),
@@ -507,11 +475,7 @@ mod tests {
                 .into(),
             );
             resize(&mut app, 40, 120);
-            let screen = if provider == "codex" {
-                app.codex_terminal.screen()
-            } else {
-                app.claude_terminal.screen()
-            };
+            let screen = app.sessions.get(&id).unwrap().terminal.screen();
             assert_eq!(screen.size(), (30, 90));
             app.handle_terminal_message(
                 Message::Control {
@@ -524,11 +488,7 @@ mod tests {
             );
             // No explicit local reclaim and no change to the cached viewport dimensions.
             resize(&mut app, 40, 120);
-            let screen = if provider == "codex" {
-                app.codex_terminal.screen()
-            } else {
-                app.claude_terminal.screen()
-            };
+            let screen = app.sessions.get(&id).unwrap().terminal.screen();
             assert_eq!(screen.size(), (40, 120));
         }
     }
@@ -536,11 +496,16 @@ mod tests {
     #[test]
     fn history_browsing_never_changes_the_canonical_screen_or_discards_new_output() {
         let mut app = App::new();
-        app.mode = AppMode::CodexChat;
-        app.codex_terminal = vt100::Parser::new(3, 40, 20);
-        app.codex_terminal
-            .process(b"old\r\none\r\ntwo\r\nthree\r\nfour");
-        let live = app.codex_terminal.screen().contents();
+        let mut session = Session::new(Provider::Codex, 3, 40);
+        session.terminal = vt100::Parser::new(3, 40, 20);
+        let id = app.sessions.insert(session).unwrap().id.clone();
+        app.focused = Some(id.clone());
+        app.mode = AppMode::Terminal;
+        fn terminal<'a>(app: &'a mut App, id: &SessionId) -> &'a mut vt100::Parser {
+            &mut app.sessions.get_mut(id).unwrap().terminal
+        }
+        terminal(&mut app, &id).process(b"old\r\none\r\ntwo\r\nthree\r\nfour");
+        let live = terminal(&mut app, &id).screen().contents();
         app.browse_terminal(2);
         assert!(
             app.terminal_ui
@@ -551,11 +516,11 @@ mod tests {
                 .contents()
                 .contains("one")
         );
-        assert_eq!(app.codex_terminal.screen().scrollback(), 0);
-        assert_eq!(app.codex_terminal.screen().contents(), live);
-        app.codex_terminal.process(b"\r\nnew output");
+        assert_eq!(terminal(&mut app, &id).screen().scrollback(), 0);
+        assert_eq!(terminal(&mut app, &id).screen().contents(), live);
+        terminal(&mut app, &id).process(b"\r\nnew output");
         assert!(
-            app.codex_terminal
+            terminal(&mut app, &id)
                 .screen()
                 .contents()
                 .contains("new output")
@@ -694,6 +659,7 @@ mod tests {
             panic!("peer disconnected before remote input was displayed");
         });
         let mut app = app_with_cat();
+        let id = codex_id(&app);
         app.leave_terminal_view();
         app.astation_client
             .connect_raw(&format!("ws://{address}"))
@@ -708,7 +674,7 @@ mod tests {
                         app.handle_terminal_message(envelope);
                     }
                 }
-                app.process_codex_output();
+                app.process_terminal_output(&id);
                 app.pump_terminals();
                 if app.astation_client.is_ws_closed() {
                     app.disconnect_terminals();
@@ -721,8 +687,8 @@ mod tests {
         .unwrap();
         peer.await.unwrap();
         assert!(matches!(app.mode, AppMode::MainMenu));
-        assert!(app.codex_receiver.is_some());
-        assert!(!app.codex_sender.as_ref().unwrap().remote_controlled());
-        assert!(app.codex_terminal.screen().contents().contains("REMOTE"));
+        assert!(codex(&app).events.is_some());
+        assert!(!codex(&app).input.as_ref().unwrap().remote_controlled());
+        assert!(codex(&app).terminal.screen().contents().contains("REMOTE"));
     }
 }
