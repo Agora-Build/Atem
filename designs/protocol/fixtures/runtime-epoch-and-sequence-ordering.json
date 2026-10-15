@@ -38,7 +38,17 @@
       {
        "session_id": "ses-oldoldoldold",
        "process_gen": "88888888-8888-4888-8888-888888888888",
-       "state": "running"
+       "provider": "claude",
+       "cwd_label": "Atem",
+       "state": "running",
+       "activity": "ready",
+       "activity_since": 1760500000000,
+       "controller": null,
+       "capabilities": [
+        "terminal-v1",
+        "chat-v1"
+       ],
+       "created_at": 1760490000000
       }
      ]
     }
@@ -59,7 +69,17 @@
       {
        "session_id": "ses-aaaaaaaaaaaa",
        "process_gen": "22222222-2222-4222-8222-222222222222",
-       "state": "running"
+       "provider": "claude",
+       "cwd_label": "Atem",
+       "state": "running",
+       "activity": "ready",
+       "activity_since": 1760500000000,
+       "controller": null,
+       "capabilities": [
+        "terminal-v1",
+        "chat-v1"
+       ],
+       "created_at": 1760490000000
       }
      ]
     }
@@ -89,7 +109,17 @@
       {
        "session_id": "ses-oldoldoldold",
        "process_gen": "88888888-8888-4888-8888-888888888888",
-       "state": "running"
+       "provider": "claude",
+       "cwd_label": "Atem",
+       "state": "running",
+       "activity": "ready",
+       "activity_since": 1760500000000,
+       "controller": null,
+       "capabilities": [
+        "terminal-v1",
+        "chat-v1"
+       ],
+       "created_at": 1760490000000
       }
      ]
     }
@@ -117,7 +147,17 @@
      "descriptor": {
       "session_id": "ses-aaaaaaaaaaaa",
       "process_gen": "22222222-2222-4222-8222-222222222222",
-      "state": "exited"
+      "provider": "claude",
+      "cwd_label": "Atem",
+      "state": "exited",
+      "activity": "unknown",
+      "activity_since": 1760500000000,
+      "controller": null,
+      "capabilities": [
+       "terminal-v1",
+       "chat-v1"
+      ],
+      "created_at": 1760490000000
      }
     }
    }
@@ -144,7 +184,17 @@
      "descriptor": {
       "session_id": "ses-aaaaaaaaaaaa",
       "process_gen": "22222222-2222-4222-8222-222222222222",
-      "state": "removed"
+      "provider": "claude",
+      "cwd_label": "Atem",
+      "state": "removed",
+      "activity": "unknown",
+      "activity_since": 1760500000000,
+      "controller": null,
+      "capabilities": [
+       "terminal-v1",
+       "chat-v1"
+      ],
+      "created_at": 1760490000000
      }
     }
    }
@@ -184,7 +234,17 @@
      "descriptor": {
       "session_id": "ses-aaaaaaaaaaaa",
       "process_gen": "22222222-2222-4222-8222-222222222222",
-      "state": "exited"
+      "provider": "claude",
+      "cwd_label": "Atem",
+      "state": "exited",
+      "activity": "unknown",
+      "activity_since": 1760500000000,
+      "controller": null,
+      "capabilities": [
+       "terminal-v1",
+       "chat-v1"
+      ],
+      "created_at": 1760490000000
      }
     }
    }

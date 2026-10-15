@@ -274,19 +274,10 @@
   },
   {
    "assert_client": {
-    "controls": true,
-    "deadline_ms": 31500
-   }
-  },
-  {
-   "advance_ms": 1
-  },
-  {
-   "assert_client": {
     "controls": false,
     "input_enabled": false
    }
   }
  ],
- "note": "Client-side fixture: t is the fake monotonic clock (ms). The t=17000 reply to the t=5000 renew arrives after the acknowledged deadline (15000) with no timer tick and is dropped. A replayed reply to an already consumed re is dropped. A repeat acquire while holding control sets deadline = min(32000, 31000+500, auth) = 31500 and never extends; at 31501 control and input are off."
+ "note": "Client-side fixture (t = fake monotonic clock, ms). The t=17000 reply to the t=5000 renew arrives after the acknowledged deadline (15000), with no timer tick, and is dropped. A replayed reply to an already consumed re is dropped. A repeat acquire sent at 31000 whose reply (ms_left 500) is applied at 31500 gives deadline = min(32000, 31000+500, auth) = 31500 = now, so control and input are off immediately (expiry is now >= deadline)."
 }

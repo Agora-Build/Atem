@@ -1,11 +1,12 @@
-# atem-session v1: sessions, control leases and receipts (DRAFT r4 for joint review)
+# atem-session v1: sessions, control leases and receipts (DRAFT r5 for joint review)
 
-Status: Atem-side draft r4, 2026-10-15. r1 (`7a0c691`), r2 (`9383193`) and r3
+Status: Atem-side draft r5, 2026-10-15. r1 (`7a0c691`), r2 (`9383193`), r3
 (`1bf805c`, [r3 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r3-review.md))
+and r4 (`fd907cc`, [r4 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r4-review.md))
 were reviewed by Astation ([r1 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
 [r2 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r2-review.md),
 summarised in [session-multiplexing.md](../session-multiplexing.md) §12). r2
-answered r1 items 1–7 and 9; r3 answered r2 review items 1–5; r4 answers the three r3 corrections. Item 8 (trust, freshness, end-to-end channel,
+answered r1 items 1–7 and 9; r3 answered r2 review items 1–5; r4 answered the three r3 corrections; r5 answers the three r4 findings. Item 8 (trust, freshness, end-to-end channel,
 QR grants) stays an implementation gate (§9). Not final until both sides
 accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
 
@@ -163,6 +164,11 @@ Descriptor:
  "capabilities":["terminal-v1","chat-v1"],"created_at":1760490000000}
 ```
 
+- Every descriptor field is **required** in both `sessions` and
+  `session_changed` (a change carries the complete new descriptor, never a
+  patch); `controller` is `null` when no lease is held and `capabilities` may be
+  `[]`. Decoders reject a descriptor with a missing field. A removal is a
+  complete descriptor with `state:"removed"` (its last values).
 - `state`: `running`, `exited`, `interrupted`, `recovery_required`, `closed`,
   `removed`. `activity`: `ready`, `working`, `waiting`, `unknown`.
 - **Runtime fencing.** `runtime_epoch` is a host-persisted counter incremented
@@ -207,7 +213,7 @@ Descriptor:
 Normative rules:
 
 - **Duration**: a lease lasts 15 s from its grant/renewal on the host's
-  monotonic clock, capped by the attachment's remaining authorization. Clients
+  monotonic clock (expired when `now >= grant + 15 000 ms`), capped by the attachment's remaining authorization. Clients
   renew every 5 s and never after their own monotonic estimate of expiry.
   `ms_left` is for estimation only.
 - **Fencing**: a lease is held by one (`controller_session`, `attachment_gen`).
@@ -217,16 +223,19 @@ Normative rules:
      one reply; replies with an unknown, already consumed or duplicate `re` are
      dropped, even when the binding matches.
   2. Before applying it, the client checks its previously acknowledged local
-     deadline on the monotonic clock; if that deadline has passed (whether or not
-     a UI timer fired), the reply is dropped, the client becomes a viewer, and only
-     an explicit new `acquire` can regain control.
+     deadline on the monotonic clock; if that deadline has passed (`now >=
+     deadline`, whether or not a UI timer fired), the reply is dropped, the
+     client becomes a viewer, and only an explicit new `acquire` can regain
+     control.
   3. Otherwise the new deadline = the request's monotonic **send** time +
      `ms_left` from the reply (never the reply's arrival time + 15 s), and never
      later than the authorization deadline.
   4. For a repeat `acquire` while already holding control, the new deadline =
      `min(previous deadline, request send time + ms_left, authorization
-     deadline)`: it never extends and honours a shorter remaining lifetime. When
-     the deadline passes, input is disabled. An explicit `acquire` after expiry is
+     deadline)`: it never extends and honours a shorter remaining lifetime.
+  5. Expiry is `now >= deadline`, on both host and client. A client that computes
+     a deadline already reached when it applies a reply disables control and input
+     immediately (it never holds control with zero remaining lifetime). An explicit `acquire` after expiry is
      a new operation (rule 2 still discards replies to requests sent before it).
   Fixture `late-renew-reply-does-not-resurrect-control` (acquire at t=0, renew
   at t=5000, reply delivered at t=17000 with no timer tick; a duplicate earlier
@@ -290,9 +299,29 @@ Kinds and payloads (v1):
 | `accepted` | `executing` | durably recorded before the first external side effect |
 | `accepted` | `rejected` | before any side effect: session closed, trust generation changed, or the durable write of `executing` failed |
 | `executing` | `completed` | the kind's completion (table above) observed |
-| `executing` | `outcome_unknown` | crash/restart and reconciliation can't establish the outcome |
+| `executing` | `rejected` | dispatch failed **with proof that no side effect happened** (see below) |
+| `executing` | `outcome_unknown` | dispatch failed after a possible partial effect, the agent process ended before the kind's completion, or crash/restart and reconciliation can't establish the outcome |
 
-  `completed`, `rejected` and `outcome_unknown` are final. A receipt's
+  `completed`, `rejected` and `outcome_unknown` are final. Every exit from
+  `executing` is persisted (fsync) before it is reported; a receipt never stays
+  `executing` because of an ordinary failure.
+- **Dispatch failures** (normative, per kind):
+  - `prompt`: the paste is one PTY write of all chunks reserved together. If the
+    reservation/enqueue fails, no byte reached the PTY → `rejected`,
+    `detail:"could not write to the terminal"`. If the writer reports an error
+    after some bytes may have been written → `outcome_unknown`,
+    `detail:"write interrupted"`. If the agent process ends before the turn
+    completes → `outcome_unknown`, `detail:"agent exited"`.
+  - `interrupt`: the interrupt key could not be enqueued → `rejected`; written
+    but no interrupted/ended turn observed within 10 s → `outcome_unknown`,
+    `detail:"no interrupt observed"`.
+  - `stop`: the signal could not be delivered (e.g. `ESRCH`/`EPERM`) and the
+    process is still alive → `rejected`, `detail:"stop failed"`; delivered but
+    the process hasn't exited within 10 s → `outcome_unknown`,
+    `detail:"process still running"` (a later observed exit doesn't change it).
+  - A failure that cannot be classified as "no side effect" is
+    `outcome_unknown`. Neither final failure state is ever retried
+    automatically; a duplicate `submit` returns the recorded final receipt. A receipt's
   `request_id`, target, kind and digest never change; replies carry the same
   values through recovery.
 - **Crash boundaries**: `accepted` is persisted (fsync) before the reply;
@@ -366,6 +395,9 @@ reuse, failed durable write, local reclaim at the PTY boundary, old attachment
 and old runtime input): hello/welcome, list/snapshot+revision, gap recovery, tombstone,
 acquire/renew/expiry, repeat acquire, takeover, local input revocation, queued
 bytes dropped on transfer, stale epoch, submit accepted→executing→completed,
+dispatch failure before any effect (→ rejected) and after a possible partial
+effect (→ outcome_unknown), each followed by a duplicate submit and recovery
+after restart returning the same final receipt,
 duplicate submit, reused id (other target), crash after executing →
 outcome_unknown, trust change before dispatch → rejected, closed session,
 receipt query scoped to target.
