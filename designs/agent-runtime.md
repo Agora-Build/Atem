@@ -1,10 +1,65 @@
 # Atem runtime: one owner for every agent session and the Astation connection
 
-Status: proposed 2026-10-15 (decisions A–C agreed with the user); not
-implemented. It is phase 2 of [local-agent-runtime.md](local-agent-runtime.md)
+Status: proposed 2026-10-15 (decisions A–C agreed with the user); being
+built. **Superseded where it differs by the approved
+[session-multiplexing.md](session-multiplexing.md)** (Astation + user,
+2026-10-15); see "Alignment with session-multiplexing.md" below, which is
+binding for Atem. It is phase 2 of [local-agent-runtime.md](local-agent-runtime.md)
 ("background PTY owner, private local attach/detach, stable session
 identities") and answers Astation's handoff "Atem pair versus running agent
 host: connection ownership race" (2026-10-15).
+
+## Alignment with session-multiplexing.md
+
+The approved product design changes this document as follows. Where the text
+below disagrees, this section wins.
+
+1. **Workers own agents.** Each session runs in its own `atem worker` process
+   that owns the agent process, PTY, output collection and submission journal.
+   The runtime is a broker (Astation connections, registry, key agent access,
+   local IPC). A runtime crash or frontend exit does not end workers; a new
+   runtime adopts surviving workers through authenticated local IPC, checking
+   session id, process generation and process-start metadata (never a pid
+   alone). A worker or agent crash, or a reboot, shows the session as
+   Interrupted / Recovery Required; a provider resume, when offered, is a new
+   process generation. Transcripts are never replayed into a new process.
+2. **CLI workflow.** `atem status` (read-only, offline, stale marks; labels
+   Account / Pairing / Verification / Credentials / Authorization / Relay /
+   Local agents; `atem cred status` is an alias). `atem pair` reports status and
+   changes nothing when already paired; `atem pair verify` verifies the existing
+   binding (no-op when validly verified; interruption keeps the pairing);
+   `atem cred unlock` never starts pairing or verification (unverified → "run
+   `atem pair verify`"); `atem cred lock` works offline; `atem unpair` removes the
+   binding, commits a new host trust generation and invalidates remote
+   authorization while keeping account data and running agents. The
+   "`atem pair` cases" below are replaced by this.
+3. **Control leases.** One controller per session; a renewable lease that
+   expires after 15 s without renewal (earlier when authorization expires);
+   many viewers; explicit takeover leaves the old controller a viewer; local
+   terminal input wins atomically; every mutation path (terminal, chat, future
+   APIs) checks target, controller identity, lease epoch and permissions;
+   stale epochs and old process generations are rejected.
+4. **Receipts.** A worker durably records a submission (request id bound to the
+   exact target and payload digest) before acknowledging acceptance; states
+   accepted / executing / completed / rejected / outcome-unknown; duplicates
+   return the recorded outcome; same id with other content is rejected. Raw
+   keystrokes are a live stream, never replayed. Retention: receipts for the
+   session's life + 7 days, Atem-owned conversation history 30 days after
+   closure (configurable limits, export/delete), bounded raw scrollback.
+   Records owner-only and encrypted under the local key policy, no plaintext
+   fallback.
+5. **Transports.** Astation's direct port-8080 connection and the relay are thin
+   adapters over one identity, registry, lease and receipt implementation.
+   Authorization freshness: at most 24 h after the last validated trust update;
+   at the deadline remote viewing/control pause while agents and the local
+   terminal continue.
+6. **Joint contract first.** Trust anchor and enrollment, membership,
+   freshness proofs, end-to-end encrypted transport, QR grants and the session
+   / lease / receipt wire messages are specified jointly with Astation as a
+   versioned contract with fixtures (`designs/protocol/`) before either side
+   implements the parts that communicate. Atem builds the local parts (CLI
+   workflow, runtime, workers, journal, host lease logic) against that
+   contract as it lands.
 
 ## Problem
 
