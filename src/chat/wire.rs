@@ -327,7 +327,8 @@ pub fn error(conv: &str, agent: &str, text: &str, request_id: Option<&str>) -> C
     envelope(conv, agent, "error", None, ErrorBody { text, request_id })
 }
 
-/// Atem ends a conversation (after an `error` saying why).
+/// Atem ends a conversation: after an `error` saying why, or without one when a
+/// ninth conversation replaces the oldest.
 pub fn close(conv: &str, agent: &str) -> ChatEnvelope {
     envelope(conv, agent, "close", None, Map::new())
 }

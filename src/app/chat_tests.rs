@@ -280,6 +280,14 @@ impl Drop for Harness {
     }
 }
 
+fn age_heartbeat(h: &mut Harness, conversation: &str) {
+    let chat = h.app.claude_chat.as_mut().unwrap();
+    chat.conversations
+        .get_mut(conversation)
+        .unwrap()
+        .last_heartbeat = Instant::now() - Duration::from_secs(16);
+}
+
 fn sequences(events: &[Value]) -> Vec<u64> {
     events
         .iter()
@@ -558,7 +566,7 @@ async fn heartbeat_resends_status_with_its_original_since() {
     h.wait_for_chat().await;
     let (opened, _) = h.open("c1", 0).await;
     let since = opened["data"]["status"]["since"].clone();
-    h.app.claude_chat.as_mut().unwrap().last_heartbeat = Instant::now() - Duration::from_secs(16);
+    age_heartbeat(&mut h, "c1");
     let from = h.seen.len();
     let at = h.pump_until(from, |v| is_chat(v, "status")).await;
     let status = &h.seen[at]["data"];
@@ -717,7 +725,9 @@ async fn respawn_tells_open_conversations_to_reopen() {
 async fn opening_restarts_the_heartbeat_clock() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    h.app.claude_chat.as_mut().unwrap().last_heartbeat = Instant::now() - Duration::from_secs(16);
+    h.open("c1", 0).await;
+    age_heartbeat(&mut h, "c1");
+    // reopening the same conversation
     h.open("c1", 0).await;
     let from = h.seen.len();
     h.pump_for(Duration::from_millis(200)).await;
@@ -780,4 +790,136 @@ async fn launching_codex_sends_the_agent_list() {
     assert_eq!(codex["status"], "Unknown");
     assert!(codex.get("capabilities").is_none());
     h.stop().await;
+}
+
+#[tokio::test]
+async fn heartbeat_is_per_conversation() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    h.open("c1", 0).await;
+    h.open("c2", 0).await;
+    age_heartbeat(&mut h, "c1");
+    let from = h.seen.len();
+    let at = h.pump_until(from, |v| is_chat(v, "status")).await;
+    assert_eq!(h.seen[at]["data"]["conversationId"], "c1");
+    h.pump_for(Duration::from_millis(200)).await;
+    let statuses: Vec<&Value> = h.seen[from..]
+        .iter()
+        .filter(|v| is_chat(v, "status"))
+        .collect();
+    assert_eq!(statuses.len(), 1, "only c1 was due: {statuses:#?}");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn a_ninth_conversation_closes_the_oldest() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    for i in 1..=8 {
+        h.open(&format!("c{i}"), 0).await;
+    }
+    // reopening c1 makes it the newest
+    h.open("c1", 0).await;
+    let from = h.seen.len();
+    h.open("c9", 0).await;
+    let closes: Vec<&Value> = h.seen[from..]
+        .iter()
+        .filter(|v| is_chat(v, "close"))
+        .collect();
+    assert_eq!(closes.len(), 1, "{closes:#?}");
+    assert_eq!(closes[0]["data"]["conversationId"], "c2");
+    assert!(!h.seen[from..].iter().any(|v| is_chat(v, "error")));
+    let conversations = &h.app.claude_chat.as_ref().unwrap().conversations;
+    assert_eq!(conversations.len(), 8);
+    assert!(conversations.contains_key("c9") && conversations.contains_key("c1"));
+    assert!(!conversations.contains_key("c2"));
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn resuming_another_session_closes_conversations_and_keeps_its_history() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    let (opened, _) = h.open("c1", 0).await;
+    let generation = opened["data"]["generation"].as_str().unwrap().to_string();
+    // Claude's /resume: a SessionStart naming another session's transcript.
+    let session = "0b5f3a3c-6e86-4a8c-9a59-4b7c1f0f2d11";
+    let transcript = h
+        .root
+        .path()
+        .join("run/transcripts")
+        .join(format!("{session}.jsonl"));
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/chat/claude/session-basic.jsonl");
+    std::fs::copy(fixture, &transcript).unwrap();
+    let dir = h.chat_dirs().pop().unwrap();
+    let start = json!({
+        "hook_event_name": "SessionStart", "session_id": session,
+        "transcript_path": transcript, "source": "resume",
+    });
+    std::fs::write(dir.join("events/ev.resume.json"), start.to_string()).unwrap();
+    let from = h.seen.len();
+    let error = h
+        .pump_until(from, |v| {
+            is_chat(v, "error")
+                && v["data"]["text"] == "the conversation was switched; reopen the chat"
+        })
+        .await;
+    assert_eq!(h.seen[error]["data"]["conversationId"], "c1");
+    let close = h.pump_until(error, |v| is_chat(v, "close")).await;
+    assert_eq!(h.seen[close]["data"]["conversationId"], "c1");
+    // the old session's turns are history: no message, delta or complete was sent
+    assert!(
+        !h.seen[from..close]
+            .iter()
+            .any(|v| is_chat(v, "message") || is_chat(v, "delta") || is_chat(v, "complete")),
+        "{:#?}",
+        &h.seen[from..close]
+    );
+    assert!(h.app.claude_chat.as_ref().unwrap().conversations.is_empty());
+    // reopening shows the resumed session's history, same process generation
+    let (opened, _) = h.open("c1", 3).await;
+    assert_eq!(opened["data"]["generation"], generation.as_str());
+    let history: Vec<Value> = h.seen[from..]
+        .iter()
+        .filter(|v| v["data"]["history"] == true && v["data"]["role"] == "user")
+        .cloned()
+        .collect();
+    assert!(
+        history.iter().any(|v| v["data"]["parts"][0]["markdown"]
+            .as_str()
+            .unwrap()
+            .starts_with("run `echo hi`")),
+        "{history:#?}"
+    );
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn first_chat_sweeps_stale_directories_once() {
+    let root = tempfile::tempdir().unwrap();
+    let run = root.path().join("run");
+    let dead = || {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid.to_string()
+    };
+    let stale = |name: &str| {
+        let dir = run.join(name);
+        std::fs::create_dir_all(dir.join("events")).unwrap();
+        std::fs::write(dir.join("pid"), dead()).unwrap();
+        dir
+    };
+    let first = stale("chat-first");
+    let unrelated = run.join("transcripts");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    let mut app = App::new();
+    app.chat_root = run.clone();
+    assert!(!app.prepare_claude_chat("claude-1", &[]).is_empty());
+    assert!(!first.exists());
+    assert!(unrelated.exists());
+    let second = stale("chat-second");
+    assert!(!app.prepare_claude_chat("claude-1", &[]).is_empty());
+    assert!(second.exists(), "swept once per App");
 }

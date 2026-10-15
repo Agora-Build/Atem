@@ -3,6 +3,7 @@
 pub mod hooks;
 pub mod transcript;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,13 @@ pub struct ClaudeAdapter {
     dir: Option<PathBuf>,
     events: Option<EventReader>,
     transcript: Option<TranscriptReader>,
+    /// Events not yet returned: a switch to another log waits one poll so the
+    /// old log is read to its end first.
+    held: VecDeque<AgentEvent>,
+    /// The switch at the front of `held` already waited its poll.
+    switch_waited: bool,
+    /// Log items returned before the reader's own at the next `poll_log`.
+    queued: Vec<LogItem>,
     started_at: Instant,
     session_started: bool,
     withdrawn: Option<String>,
@@ -29,6 +37,9 @@ impl ClaudeAdapter {
             dir: None,
             events: None,
             transcript: None,
+            held: VecDeque::new(),
+            switch_waited: false,
+            queued: Vec::new(),
             started_at: Instant::now(),
             session_started: false,
             withdrawn: None,
@@ -49,6 +60,28 @@ fn resumes_or_pins(args: &[String]) -> bool {
         ) || a.starts_with("--resume=")
             || a.starts_with("--session-id=")
     })
+}
+
+impl ClaudeAdapter {
+    /// Read the old log to its end (normal items), then open `path`. Content
+    /// already there is backfill when the session was resumed rather than
+    /// started or cleared (a new or cleared session's log is live from its
+    /// first line).
+    fn switch_to(&mut self, path: PathBuf, source: &str) {
+        if let Some(old) = self.transcript.as_mut() {
+            self.queued.extend(old.poll());
+        }
+        let mut reader = TranscriptReader::new(path);
+        if !matches!(source, "startup" | "clear") {
+            for item in reader.poll() {
+                self.queued.push(match item {
+                    LogItem::Problem { .. } => item,
+                    item => LogItem::Backfill(Box::new(item)),
+                });
+            }
+        }
+        self.transcript = Some(reader);
+    }
 }
 
 impl AgentAdapter for ClaudeAdapter {
@@ -83,24 +116,53 @@ impl AgentAdapter for ClaudeAdapter {
         let Some(reader) = self.events.as_mut() else {
             return Vec::new();
         };
-        let events = reader.poll();
-        for ev in &events {
-            if let AgentEvent::SessionStarted { log_path, .. } = ev {
-                // Same path (resume/compact): keep the reader, no replay.
-                if self.transcript.as_ref().map(|r| r.path()) != Some(log_path.as_path()) {
-                    self.transcript = Some(TranscriptReader::new(log_path.clone()));
+        let mut incoming = std::mem::take(&mut self.held);
+        incoming.extend(reader.poll());
+        let mut out = Vec::new();
+        while let Some(mut event) = incoming.pop_front() {
+            if let AgentEvent::SessionStarted {
+                session_id,
+                log_path,
+                source,
+                same_log,
+            } = &mut event
+            {
+                // Claude names the transcript after the session; anything else is
+                // not a start of this session's log.
+                let expected = format!("{session_id}.jsonl");
+                if log_path.file_name() != Some(std::ffi::OsStr::new(&expected)) {
+                    self.queued.push(LogItem::Problem {
+                        detail: "ignored a session start whose transcript is not named after its session"
+                            .into(),
+                        fatal: false,
+                    });
+                    continue;
+                }
+                let current = self.transcript.as_ref().map(|r| r.path().to_path_buf());
+                *same_log = current.as_deref() == Some(log_path.as_path());
+                if !*same_log {
+                    if current.is_some() && !self.switch_waited {
+                        // Give this tick's poll_log the old log's last lines first.
+                        self.switch_waited = true;
+                        incoming.push_front(event);
+                        self.held = incoming;
+                        break;
+                    }
+                    self.switch_waited = false;
+                    self.switch_to(log_path.clone(), source);
                 }
                 self.session_started = true;
             }
+            out.push(event);
         }
-        events
+        out
     }
 
     fn poll_log(&mut self) -> Vec<LogItem> {
-        let Some(reader) = self.transcript.as_mut() else {
-            return Vec::new();
-        };
-        let items = reader.poll();
+        let mut items = std::mem::take(&mut self.queued);
+        if let Some(reader) = self.transcript.as_mut() {
+            items.extend(reader.poll());
+        }
         for item in &items {
             if let LogItem::Problem {
                 detail,
@@ -230,8 +292,8 @@ mod tests {
         let (root, mut a, _plan) = launch(&[]);
         let dir = a.dir().unwrap().to_path_buf();
         let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/claude");
-        let t1 = root.path().join("one.jsonl");
-        let t2 = root.path().join("two.jsonl");
+        let t1 = root.path().join("s1.jsonl");
+        let t2 = root.path().join("s2.jsonl");
         fs::copy(fx.join("session-basic.jsonl"), &t1).unwrap();
         fs::copy(fx.join("session-after-clear.jsonl"), &t2).unwrap();
         assert!(a.poll_log().is_empty());
@@ -240,7 +302,7 @@ mod tests {
             &dir,
             "ev.1.json",
             &format!(
-                r#"{{"hook_event_name":"SessionStart","session_id":"s1","transcript_path":"{}"}}"#,
+                r#"{{"hook_event_name":"SessionStart","session_id":"s1","transcript_path":"{}","source":"startup"}}"#,
                 t1.display()
             ),
         );
@@ -262,14 +324,169 @@ mod tests {
                 t2.display()
             ),
         );
-        a.poll_events();
+        // held one poll so the old log is read to its end first
+        assert!(a.poll_events().is_empty());
+        assert!(a.poll_log().is_empty());
+        let evs = a.poll_events();
+        assert!(
+            matches!(&evs[0], AgentEvent::SessionStarted { source, same_log: false, .. }
+            if source == "clear")
+        );
         assert_eq!(a.transcript.as_ref().unwrap().path(), t2);
+        // /clear content is live (never backfill)
         let items = a.poll_log();
         assert!(
             items
                 .iter()
                 .any(|i| matches!(i, LogItem::UserMessage { text, .. } if text == "say hi"))
         );
+        assert!(!items.iter().any(|i| matches!(i, LogItem::Backfill(_))));
+    }
+
+    fn start_event(dir: &Path, name: &str, session: &str, path: &Path, source: &str) {
+        event(
+            dir,
+            name,
+            &format!(
+                r#"{{"hook_event_name":"SessionStart","session_id":"{session}","transcript_path":"{}","source":"{source}"}}"#,
+                path.display()
+            ),
+        );
+    }
+
+    fn user_line(uuid: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","promptId":"p-{uuid}","message":{{"role":"user","content":"{text}"}}}}"#
+        ) + "\n"
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn same_path_start_says_same_log_and_passes_the_source() {
+        let (root, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let t = root.path().join("s1.jsonl");
+        start_event(&dir, "ev.1.json", "s1", &t, "startup");
+        let evs = a.poll_events();
+        assert!(
+            matches!(&evs[..], [AgentEvent::SessionStarted { source, same_log: false, .. }]
+            if source == "startup")
+        );
+        start_event(&dir, "ev.2.json", "s1", &t, "compact");
+        let evs = a.poll_events();
+        assert!(
+            matches!(&evs[..], [AgentEvent::SessionStarted { source, same_log: true, .. }]
+            if source == "compact")
+        );
+    }
+
+    #[test]
+    fn switching_logs_reads_the_old_one_to_its_end_first() {
+        let (root, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let t1 = root.path().join("s1.jsonl");
+        let t2 = root.path().join("s2.jsonl");
+        append(&t1, &user_line("u1", "one"));
+        start_event(&dir, "ev.1.json", "s1", &t1, "startup");
+        a.poll_events();
+        assert_eq!(a.poll_log().len(), 1);
+        // old-log lines written before the switch, and one more after the hold
+        append(&t1, &user_line("u2", "two"));
+        start_event(&dir, "ev.2.json", "s2", &t2, "clear");
+        event(&dir, "ev.3.json", r#"{"hook_event_name":"Stop"}"#);
+        assert!(a.poll_events().is_empty(), "held until the old log is read");
+        let items = a.poll_log();
+        assert!(matches!(&items[..], [LogItem::UserMessage { id, .. }] if id == "u2"));
+        append(&t1, &user_line("u3", "three"));
+        let evs = a.poll_events();
+        assert!(matches!(evs[0], AgentEvent::SessionStarted { .. }));
+        assert_eq!(evs[1], AgentEvent::TurnEnded, "later events follow");
+        let items = a.poll_log();
+        assert!(matches!(&items[..], [LogItem::UserMessage { id, .. }] if id == "u3"));
+        assert_eq!(a.transcript.as_ref().unwrap().path(), t2);
+    }
+
+    #[test]
+    fn resuming_another_session_reads_its_content_as_backfill() {
+        let (root, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let t1 = root.path().join("s1.jsonl");
+        let t2 = root.path().join("s2.jsonl");
+        start_event(&dir, "ev.1.json", "s1", &t1, "startup");
+        a.poll_events();
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/claude");
+        fs::copy(fx.join("session-basic.jsonl"), &t2).unwrap();
+        start_event(&dir, "ev.2.json", "s2", &t2, "resume");
+        assert!(a.poll_events().is_empty());
+        a.poll_log();
+        let evs = a.poll_events();
+        assert!(matches!(
+            &evs[..],
+            [AgentEvent::SessionStarted {
+                same_log: false,
+                ..
+            }]
+        ));
+        let items = a.poll_log();
+        assert!(!items.is_empty());
+        assert!(
+            items.iter().all(|i| matches!(i, LogItem::Backfill(_))),
+            "{items:?}"
+        );
+        assert!(items.iter().any(|i| matches!(i,
+            LogItem::Backfill(b) if matches!(**b, LogItem::TurnEnded { .. }))));
+        // what is written after the resume is live
+        append(&t2, &user_line("new", "next"));
+        let items = a.poll_log();
+        assert!(matches!(&items[..], [LogItem::UserMessage { id, .. }] if id == "new"));
+    }
+
+    #[test]
+    fn session_start_whose_log_does_not_match_its_id_is_ignored() {
+        let (root, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let good = root.path().join("s1.jsonl");
+        start_event(&dir, "ev.1.json", "s1", &good, "startup");
+        a.poll_events();
+        for (i, path) in [
+            root.path().join("other.jsonl"),
+            root.path().join("s1.jsonl.bak"),
+            root.path().join("xs1.jsonl"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            start_event(&dir, &format!("ev.{}.json", i + 2), "s1", path, "resume");
+            assert!(a.poll_events().is_empty(), "{path:?}");
+            assert_eq!(a.transcript.as_ref().unwrap().path(), good);
+            let items = a.poll_log();
+            assert!(
+                matches!(&items[..], [LogItem::Problem { fatal: false, .. }]),
+                "{items:?}"
+            );
+        }
+        assert!(a.capabilities().chat_v1);
+        // before any valid start, a mismatched one does not enable chat
+        let (root, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        start_event(
+            &dir,
+            "ev.1.json",
+            "s1",
+            &root.path().join("s2.jsonl"),
+            "startup",
+        );
+        assert!(a.poll_events().is_empty());
+        assert!(!a.capabilities().chat_v1);
     }
 
     #[test]
@@ -277,7 +494,7 @@ mod tests {
         let (root, mut a, _plan) = launch(&[]);
         let dir = a.dir().unwrap().to_path_buf();
         let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/claude");
-        let t1 = root.path().join("one.jsonl");
+        let t1 = root.path().join("s1.jsonl");
         fs::copy(fx.join("session-basic.jsonl"), &t1).unwrap();
         let start = format!(
             r#"{{"hook_event_name":"SessionStart","session_id":"s1","transcript_path":"{}"}}"#,
@@ -310,7 +527,7 @@ mod tests {
     fn fatal_problem_withdraws_chat() {
         let (root, mut a, _plan) = launch(&[]);
         let dir = a.dir().unwrap().to_path_buf();
-        let t = root.path().join("bad.jsonl");
+        let t = root.path().join("s.jsonl");
         fs::write(
             &t,
             "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",

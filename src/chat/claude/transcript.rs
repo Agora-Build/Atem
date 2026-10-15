@@ -9,6 +9,8 @@ use serde_json::Value;
 use crate::chat::adapter::{LogItem, Outcome, Part};
 
 const SEEN_CAP: usize = 10_000;
+/// Text of the user entry Claude writes when the user interrupts a turn.
+const INTERRUPT_MARKER: &str = "[Request interrupted by user";
 
 pub struct TranscriptReader {
     path: PathBuf,
@@ -159,7 +161,9 @@ impl TranscriptReader {
             if !self.remember(uuid) {
                 return;
             }
-            if v.get("interruptedMessageId").is_some() {
+            // Esc during a reply, or deny/Esc at a permission prompt ("… for tool
+            // use"); interruptedMessageId is present only in the first case.
+            if text.starts_with(INTERRUPT_MARKER) {
                 let turn_id = prompt_id
                     .map(str::to_string)
                     .unwrap_or_else(|| self.turn_id.clone());
@@ -436,6 +440,41 @@ mod tests {
         ));
         assert!(!items.iter().any(|i| matches!(i,
             L::UserMessage { text, .. } if text.contains("Request interrupted"))));
+    }
+
+    #[test]
+    fn interrupt_marker_without_message_id_ends_the_turn() {
+        // "… for tool use" (deny/Esc at a permission prompt), as a string and as an
+        // array, with no interruptedMessageId.
+        let mut s = user_line("u1", r#""promptId":"p1","#, r#""run it""#);
+        s += &user_line(
+            "u2",
+            r#""promptId":"p1","#,
+            r#""[Request interrupted by user for tool use]""#,
+        );
+        s += &user_line("u3", r#""promptId":"p3","#, r#""again""#);
+        s += &user_line(
+            "u4",
+            r#""promptId":"p3","#,
+            r#"[{"type":"text","text":"[Request interrupted by user]"}]"#,
+        );
+        let (_d, mut r) = reader_with(&s);
+        let items = r.poll();
+        assert_eq!(items.len(), 4, "{items:?}");
+        assert_eq!(
+            items[1],
+            L::TurnEnded {
+                turn_id: "p1".into(),
+                outcome: Outcome::Interrupted
+            }
+        );
+        assert_eq!(
+            items[3],
+            L::TurnEnded {
+                turn_id: "p3".into(),
+                outcome: Outcome::Interrupted
+            }
+        );
     }
 
     #[test]

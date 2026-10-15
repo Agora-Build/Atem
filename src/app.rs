@@ -161,6 +161,8 @@ pub struct App {
     pub claude_chat: Option<chat::AgentChat>,
     /// Where per-session chat directories are created (`chat-<uuid>`).
     pub chat_root: PathBuf,
+    /// Stale chat directories under `chat_root` were swept (once per App).
+    pub chat_swept: bool,
 }
 
 /// Tracks a command sent from Astation that needs output relayed back.
@@ -279,6 +281,7 @@ impl App {
             pending_voice_request: None,
             claude_chat: None,
             chat_root: crate::chat::claude::hooks::session_dir_root(),
+            chat_swept: false,
         };
         app.rebuild_menu();
         app

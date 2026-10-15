@@ -31,6 +31,12 @@ pub enum AgentEvent {
     SessionStarted {
         session_id: String,
         log_path: PathBuf,
+        /// Why the session (re)started, as the agent names it (Claude: `startup`,
+        /// `resume`, `clear`, `compact`); empty when not given.
+        source: String,
+        /// The adapter keeps reading the same log (compaction, or a resume of the
+        /// session already shown): the turn in progress continues.
+        same_log: bool,
     },
     PromptSubmitted {
         text: String,
@@ -61,6 +67,9 @@ pub enum LogItem {
     },
     /// The turn ended according to the log (end_turn or interrupt).
     TurnEnded { turn_id: String, outcome: Outcome },
+    /// Content that was already in a log the adapter switched to (a resume of
+    /// another session): history only, never live events. Never nested.
+    Backfill(Box<LogItem>),
     /// Something could not be read; `fatal` = format changed, withdraw chat.
     Problem { detail: String, fatal: bool },
 }

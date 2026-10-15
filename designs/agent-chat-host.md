@@ -57,7 +57,8 @@ trait AgentAdapter {
 }
 
 enum AgentEvent {            // neutral lifecycle
-    SessionStarted { session_id, log_path },
+    SessionStarted { session_id, log_path, source, same_log },  // source: startup|resume|clear|compact|"";
+                                                                // same_log: the adapter keeps reading that log
     PromptSubmitted { text },
     ToolStarted, ToolFinished,
     WaitingForPermission { detail },
@@ -66,6 +67,7 @@ enum AgentEvent {            // neutral lifecycle
 enum LogItem {               // neutral content, already filtered
     UserMessage { id, turn_id, text, created_at },
     AssistantPart { message_id, part, turn_id, created_at, end_of_turn: Option<Outcome> },
+    Backfill(LogItem),       // already in a log switched to (resume): history only
     Problem { detail },      // unreadable line, format change
 }
 ```
@@ -103,7 +105,12 @@ chat page is open.
    - `settings.json` (0600): hooks for `SessionStart`, `UserPromptSubmit`,
      `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, each running the
      event-file command below;
-   - `events/` (0700): one file per hook event.
+   - `events/` (0700): one file per hook event;
+   - `pid` (0600): the Atem process id. The first chat an Atem process prepares
+     removes `chat-*` directories under the same root whose `pid` names a
+     process that no longer exists, or that have no `pid` file and are older
+     than an hour (left by a crash or SIGKILL). Nothing else is touched and no
+     symlink is followed.
 2. Starts Claude in the shared terminal with `--settings <settings.json>` and,
    unless the user passed `--continue`/`--resume`, `--session-id <new uuid>`.
    With `--continue`/`--resume` the session id is taken from `SessionStart`.
@@ -150,8 +157,19 @@ work on macOS.)
 
 - Read from a saved byte offset, only up to the last complete line (a partial
   last line waits). If the file doesn't exist yet, wait for it. When
-  `SessionStart` names a new transcript (`/clear`, compaction, resume), switch
-  to it.
+  `SessionStart` names a new transcript (`/clear`, resume), switch to it:
+  - a `SessionStart` whose `transcript_path` file name isn't exactly
+    `<session_id>.jsonl` (its own `session_id`) is ignored, with a notice;
+  - the same path (compaction, or a resume of the session being read) keeps
+    the reader;
+  - before switching, the old transcript is read to its end (the switch waits
+    one poll so those lines are handled normally first);
+  - a resumed session's transcript (source not `startup`/`clear`) usually
+    already holds that session's earlier turns: that content is **backfill**,
+    added to history only (no `message`, `delta` or `complete`, no status
+    change), and open conversations get `error` "the conversation was
+    switched; reopen the chat" and `close`, so clients reload history. Later
+    lines are live.
 - Order is file order. Each transcript entry is processed once, keyed by its
   entry `uuid` (bounded record of seen uuids per session).
 - Entry kinds:
@@ -166,6 +184,11 @@ work on macOS.)
       for file tools, the first line of the command for `Bash` (both cut at
       120 characters), or empty;
     - `thinking` → not sent.
+  - A `user` entry whose text (a string, or a text block) starts with
+    `[Request interrupted by user` ends the current turn as `interrupted` and
+    is not shown: Esc during a reply (`[Request interrupted by user]`, with
+    `interruptedMessageId`) and deny/Esc at a permission prompt
+    (`[Request interrupted by user for tool use]`).
   - `isSidechain` (subagent) and `isMeta` entries, attachments, snapshots and
     other bookkeeping types → skipped.
   - A line that doesn't parse, or an unknown type → skipped, with one notice.
@@ -182,6 +205,8 @@ them as follows:
 | `UserPromptSubmit`, `PreToolUse` | `working` |
 | `Notification` asking for permission | `waiting` ("approve in the terminal") |
 | `Stop` | `ready` (and `complete`, below) |
+| `SessionStart` `startup`/`clear`, or a different transcript | `ready`; the draft mark is reset |
+| `SessionStart` `compact`/`resume` on the transcript being read (or any `SessionStart` on it while a turn is in progress) | unchanged: the turn, a prompt waiting for acceptance and the draft mark stay |
 | transcript: assistant entry with `stop_reason: "end_turn"`, or the interrupt marker after Esc | `ready` (and `complete`, outcome `interrupted` for an interrupt), even if `Stop` was missed |
 | agent process exits | `unknown`; the generation is retired |
 | no `SessionStart`, or chat withdrawn | `unknown`, capability removed |
@@ -210,16 +235,21 @@ Atem reads the transcript to its end and sends what it found before
    already knows (`accepted`, `complete`, or the earlier error);
 3. text is at most 32 768 UTF-8 bytes and contains only printable characters,
    `\n` and `\t` (anything else, including ESC, is refused, not stripped: an
-   embedded paste-end marker could otherwise inject keystrokes);
+   embedded paste-end marker could otherwise inject keystrokes), and its first
+   non-whitespace character is not `/` or `!` ("commands and shell mode are not
+   available from chat": a `/` command fires no hook, and `!` runs a shell
+   command without a permission prompt; `#` is allowed);
 4. status is `ready` and no other prompt is waiting for acceptance;
 5. **nobody typed into the terminal since the last turn ended** (local or
-   Astation terminal input both count);
+   Astation terminal input both count). Input typed while the agent is working
+   is treated as consumed when the turn ends; an unfinished draft typed during
+   a turn is not detected (v1);
 6. no Astation viewer holds terminal control.
 
 Then Atem writes the text as one bracketed paste followed by Enter, and
 records the request. It is `accepted` when **both** the `UserPromptSubmit`
 hook and the matching `user` entry in the transcript have arrived with the
-same text. No acceptance within 10 s → `error {requestId, "delivery unknown;
+same text (compared without leading and trailing whitespace). No acceptance within 10 s → `error {requestId, "delivery unknown;
 check the terminal"}`; it is never resent.
 
 Prompts typed in the terminal arrive the same way and appear as user
@@ -265,7 +295,7 @@ on the existing authenticated Astation connection.
 | `message` / `delta` | Atem → Astation | see the message model |
 | `status` | Atem → Astation | `state: ready|working|waiting|unknown`, `since`, optional `detail` |
 | `complete` | Atem → Astation | `turnId`, optional `requestId`, `outcome: "done"|"interrupted"` |
-| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId` |
+| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
 | `close` | either | `conversationId` |
 
 - `open` with `before` on an open conversation reopens it (`opened`,
@@ -279,6 +309,10 @@ on the existing authenticated Astation connection.
 - A conversation belongs to the connection that opened it; it closes when that
   connection drops or re-authenticates. Opening again restores status and
   history.
+- Each conversation gets the status again 15 s after it last got it (on
+  `opened` or a heartbeat). At most 8 conversations are open per agent:
+  opening a ninth sends the least recently opened one `close`.
+- Atem keeps the newest 500 messages, at most 8 MiB, per agent process.
 
 ## Security
 
@@ -306,6 +340,7 @@ on the existing authenticated Astation connection.
 | Atem not running when a hook fires | the event file is written and never read; Claude is unaffected; the directory goes with the session |
 | Claude exits or crashes | `unknown`, `error` to open conversations, generation retired, prompts refused |
 | Agent restarted | open conversations get `error` "the agent was restarted; reopen the chat" and `close`; the new process has a new generation |
+| Another session resumed in the same process | its earlier turns become history (no events); open conversations get `error` "the conversation was switched; reopen the chat" and `close`; same generation |
 | Bad or unknown transcript line | skipped, one notice; reading continues |
 | Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason (open conversations get `error` and `close`); terminal unaffected |
 | No acceptance within 10 s of a paste | `error` "delivery unknown"; never resent |

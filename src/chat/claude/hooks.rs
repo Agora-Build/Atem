@@ -33,13 +33,93 @@ fn private_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `root/chat-<uuid>` (0700) with an `events/` subdirectory (0700).
+/// A chat directory without a `pid` file is stale after this long.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `root/chat-<uuid>` (0700) with an `events/` subdirectory (0700) and a `pid`
+/// file (0600) naming this process, for `sweep_stale`.
 pub fn create_session_dir(root: &Path) -> anyhow::Result<PathBuf> {
     private_dir(root)?;
     let dir = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
     private_dir(&dir)?;
     private_dir(&dir.join("events"))?;
+    write_private(&dir.join("pid"), std::process::id().to_string().as_bytes())?;
     Ok(dir)
+}
+
+/// Create or replace `path` (0600) with `body`.
+fn write_private(path: &Path, body: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(body)?;
+    Ok(())
+}
+
+/// Remove chat directories left by Atem processes that are gone (crash,
+/// SIGKILL): `root/chat-*` whose `pid` file names a dead process, or that have
+/// no readable `pid` file and are older than an hour. Nothing else under `root`
+/// is touched and no symlink is followed.
+pub fn sweep_stale(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("chat-") {
+            continue;
+        }
+        let path = entry.path();
+        // symlink_metadata: a symlink is not a directory here, so it is skipped.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = match read_pid(&path.join("pid")) {
+            Some(pid) => !process_alive(pid),
+            None => meta
+                .modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age > STALE_AFTER),
+        };
+        if stale {
+            // remove_dir_all does not follow symlinks inside the directory.
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// The pid in a regular `pid` file (never through a symlink).
+fn read_pid(path: &Path) -> Option<libc::pid_t> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.by_ref().take(32).read_to_string(&mut text).ok()?;
+    let pid: libc::pid_t = text.trim().parse().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// False only when the process is known to be gone (ESRCH).
+fn process_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn shell_quote(s: &str) -> String {
@@ -57,8 +137,6 @@ pub fn hook_command(dir: &Path) -> String {
 
 /// Write `dir/settings.json` (0600) registering the hook for every event.
 pub fn write_settings(dir: &Path) -> anyhow::Result<PathBuf> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let cmd = hook_command(dir);
     let mut hooks = serde_json::Map::new();
     for ev in HOOK_EVENTS {
@@ -74,13 +152,7 @@ pub fn write_settings(dir: &Path) -> anyhow::Result<PathBuf> {
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))?;
     let path = dir.join("settings.json");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
-    f.write_all(body.as_bytes())?;
+    write_private(&path, body.as_bytes())?;
     Ok(path)
 }
 
@@ -148,6 +220,9 @@ pub fn map_hook(json: &Value) -> Option<AgentEvent> {
         "SessionStart" => Some(AgentEvent::SessionStarted {
             session_id: s("session_id")?.to_string(),
             log_path: PathBuf::from(s("transcript_path")?),
+            source: s("source").unwrap_or_default().to_string(),
+            // The adapter decides; it knows which log it is reading.
+            same_log: false,
         }),
         "UserPromptSubmit" => Some(AgentEvent::PromptSubmitted {
             text: s("prompt")?.to_string(),
@@ -216,6 +291,78 @@ mod tests {
             }
         }
         assert_eq!(v["hooks"].as_object().unwrap().len(), 6);
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn age_dir(path: &Path, secs: u64) {
+        let t = SystemTime::now() - Duration::from_secs(secs);
+        fs::File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn session_dir_records_this_process() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = create_session_dir(root.path()).unwrap();
+        let pid = dir.join("pid");
+        assert_eq!(
+            fs::read_to_string(&pid).unwrap(),
+            std::process::id().to_string()
+        );
+        assert_eq!(mode(&pid), 0o600);
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_chat_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        let mine = create_session_dir(r).unwrap();
+        let dead = create_session_dir(r).unwrap();
+        fs::write(dead.join("pid"), dead_pid().to_string()).unwrap();
+        // no pid file: removed only once older than an hour
+        let old = r.join("chat-old");
+        let young = r.join("chat-young");
+        for d in [&old, &young] {
+            fs::create_dir_all(d.join("events")).unwrap();
+        }
+        age_dir(&old, 2 * 3600);
+        // not ours to touch
+        let other = r.join("transcripts");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("pid"), dead_pid().to_string()).unwrap();
+        age_dir(&other, 2 * 3600);
+        let file = r.join("chat-file");
+        fs::write(&file, dead_pid().to_string()).unwrap();
+        // a symlink named chat-* to a stale-looking dir is never followed
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("pid"), dead_pid().to_string()).unwrap();
+        let link = r.join("chat-link");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        // a pid file that is a symlink is not read either
+        let linked_pid = r.join("chat-linkedpid");
+        fs::create_dir_all(&linked_pid).unwrap();
+        let pid_target = target.path().join("pidfile");
+        fs::write(&pid_target, dead_pid().to_string()).unwrap();
+        std::os::unix::fs::symlink(&pid_target, linked_pid.join("pid")).unwrap();
+
+        sweep_stale(r);
+        assert!(mine.exists());
+        assert!(!dead.exists());
+        assert!(!old.exists());
+        assert!(young.exists());
+        assert!(other.exists());
+        assert!(file.exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(target.path().join("pid").exists());
+        assert!(linked_pid.exists());
+        assert!(pid_target.exists());
+        // a missing root is fine
+        sweep_stale(&r.join("missing"));
     }
 
     #[test]
@@ -390,6 +537,8 @@ mod tests {
                 log_path: PathBuf::from(
                     "/home/user/.claude/projects/-home-user-proj/c142b440-2f9a-4f2e-bf30-d99335ab2e7e.jsonl"
                 ),
+                source: "startup".into(),
+                same_log: false,
             })
         );
         assert!(matches!(

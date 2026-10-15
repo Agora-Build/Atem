@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const MAX_HISTORY_MESSAGES: usize = 500;
+const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REQUESTS: usize = 1000;
 const MAX_MESSAGE_BYTES: usize = 131_072;
 const MAX_PROMPT_BYTES: usize = 32_768;
@@ -117,6 +118,8 @@ pub struct ChatSession {
     started: bool,
     exited: bool,
     history: VecDeque<ChatMessage>,
+    /// Sum of `ChatMessage::bytes` over `history`.
+    history_bytes: usize,
     requests: HashMap<String, RequestState>,
     request_order: VecDeque<String>,
     pending: Option<Pending>,
@@ -147,11 +150,16 @@ pub fn clean_prompt(text: &str) -> Result<&str, &'static str> {
     if text.trim().is_empty() {
         return Err("prompt is empty");
     }
+    // "/" runs a command (no hook fires, so no acceptance); "!" is shell mode,
+    // which runs the command without a permission prompt.
+    if matches!(text.trim_start().chars().next(), Some('/' | '!')) {
+        return Err("commands and shell mode are not available from chat");
+    }
     Ok(text)
 }
 
 fn same_prompt(a: &str, b: &str) -> bool {
-    a.trim_end() == b.trim_end()
+    a.trim() == b.trim()
 }
 
 fn truncate_at(text: &str, max: usize) -> &str {
@@ -179,6 +187,40 @@ fn redact_part(part: Part) -> Part {
     }
 }
 
+/// A user message: redacted, capped at 131 072 bytes (then a marker part).
+fn user_message(
+    id: String,
+    turn_id: String,
+    text: &str,
+    request_id: Option<String>,
+    created_at_ms: i64,
+) -> ChatMessage {
+    let mut text = redact(text);
+    let cut = truncate_at(&text, MAX_MESSAGE_BYTES).len();
+    let was_cut = cut < text.len();
+    text.truncate(cut);
+    let mut parts = vec![Part::Text {
+        id: "text".into(),
+        markdown: text,
+    }];
+    if was_cut {
+        parts.push(truncated_marker());
+    }
+    ChatMessage {
+        message_id: id,
+        role: Role::User,
+        origin: Some(if request_id.is_some() {
+            Origin::Remote
+        } else {
+            Origin::Local
+        }),
+        turn_id,
+        request_id,
+        created_at_ms,
+        parts,
+    }
+}
+
 fn truncated_marker() -> Part {
     Part::Text {
         id: TRUNCATED_ID.into(),
@@ -198,6 +240,7 @@ impl ChatSession {
             started: false,
             exited: false,
             history: VecDeque::new(),
+            history_bytes: 0,
             requests: HashMap::new(),
             request_order: VecDeque::new(),
             pending: None,
@@ -258,7 +301,23 @@ impl ChatSession {
             return out;
         }
         match event {
-            AgentEvent::SessionStarted { .. } => {
+            AgentEvent::SessionStarted {
+                source, same_log, ..
+            } => {
+                // Compaction or a resume of the session being read (or another
+                // start on that log mid-turn): the same conversation goes on, so
+                // the turn, the pending prompt and the input mark stay. Startup,
+                // /clear or another log start afresh.
+                let in_turn = matches!(self.status.state, State::Working | State::Waiting)
+                    || self.pending.is_some();
+                let continues = match source.as_str() {
+                    "startup" | "clear" => false,
+                    "compact" | "resume" => true,
+                    _ => in_turn,
+                };
+                if self.started && same_log && continues {
+                    return out;
+                }
                 self.started = true;
                 self.input_mark = input_count;
                 self.set_status(State::Ready, None, now_ms, &mut out);
@@ -379,33 +438,13 @@ impl ChatSession {
                 {
                     request_id = Some(rid);
                 }
-                let text = redact(&text);
-                let cut = truncate_at(&text, MAX_MESSAGE_BYTES).len();
-                let was_cut = cut < text.len();
-                let mut text = text;
-                text.truncate(cut);
-                let message = ChatMessage {
-                    message_id: id.clone(),
-                    role: Role::User,
-                    origin: Some(if request_id.is_some() {
-                        Origin::Remote
-                    } else {
-                        Origin::Local
-                    }),
-                    turn_id: turn_id.clone(),
-                    request_id: request_id.clone(),
+                let message = user_message(
+                    id,
+                    turn_id.clone(),
+                    &text,
+                    request_id.clone(),
                     created_at_ms,
-                    parts: {
-                        let mut parts = vec![Part::Text {
-                            id: "text".into(),
-                            markdown: text,
-                        }];
-                        if was_cut {
-                            parts.push(truncated_marker());
-                        }
-                        parts
-                    },
-                };
+                );
                 self.current_turn = Some((turn_id, request_id));
                 self.push_message(message.clone());
                 out.push(Out::Message(message));
@@ -429,6 +468,7 @@ impl ChatSession {
                 self.input_mark = input_count;
                 self.set_status(State::Ready, None, now_ms, &mut out);
             }
+            LogItem::Backfill(item) => self.on_backfill(*item),
             // The App handles problems (withdrawing chat when fatal).
             LogItem::Problem { .. } => {}
         }
@@ -436,9 +476,19 @@ impl ChatSession {
     }
 
     fn push_message(&mut self, message: ChatMessage) {
+        self.history_bytes += message.bytes();
         self.history.push_back(message);
-        while self.history.len() > MAX_HISTORY_MESSAGES {
-            self.history.pop_front();
+        self.trim_history();
+    }
+
+    /// Evict the oldest messages beyond 500 messages or 8 MiB (the newest stays).
+    fn trim_history(&mut self) {
+        while self.history.len() > 1
+            && (self.history.len() > MAX_HISTORY_MESSAGES || self.history_bytes > MAX_HISTORY_BYTES)
+        {
+            if let Some(old) = self.history.pop_front() {
+                self.history_bytes -= old.bytes();
+            }
         }
     }
 
@@ -488,12 +538,14 @@ impl ChatSession {
         match existing {
             Some(i) => {
                 for p in new_parts {
+                    self.history_bytes += part_bytes(&p);
                     self.history[i].parts.push(p.clone());
                     out.push(Out::Delta {
                         message_id: message_id.clone(),
                         part: p,
                     });
                 }
+                self.trim_history();
             }
             None => {
                 let request_id = match &self.current_turn {
@@ -669,6 +721,42 @@ impl ChatSession {
         picked
     }
 
+    /// Content that was already in a log the adapter switched to (a resume of
+    /// another session): it goes into history only. Nothing is sent, and status,
+    /// the current turn, pending prompts and request records are left alone. The
+    /// App closes open conversations afterwards so clients reload the history.
+    pub fn on_backfill(&mut self, item: LogItem) {
+        if self.exited {
+            return;
+        }
+        let mut ignored = Vec::new();
+        match item {
+            LogItem::UserMessage {
+                id,
+                turn_id,
+                text,
+                created_at_ms,
+            } => {
+                let message = user_message(id, turn_id, &text, None, created_at_ms);
+                self.push_message(message);
+            }
+            LogItem::AssistantPart {
+                message_id,
+                part,
+                turn_id,
+                created_at_ms,
+            } => {
+                let part = redact_part(part);
+                // Old turns carry no request id: pass a turn that is never current.
+                let current = self.current_turn.take();
+                self.assistant_part(message_id, part, turn_id, created_at_ms, &mut ignored);
+                self.current_turn = current;
+            }
+            LogItem::Backfill(item) => self.on_backfill(*item),
+            LogItem::TurnEnded { .. } | LogItem::Problem { .. } => {}
+        }
+    }
+
     pub fn on_process_exit(&mut self, now_ms: i64) -> Vec<Out> {
         let mut out = Vec::new();
         if self.exited {
@@ -697,6 +785,8 @@ mod tests {
         AgentEvent::SessionStarted {
             session_id: "s".into(),
             log_path: PathBuf::from("/x"),
+            source: "startup".into(),
+            same_log: false,
         }
     }
     fn ready() -> ChatSession {
@@ -1190,6 +1280,152 @@ mod tests {
         assert!(!dump.contains("abcdef1234567890"), "{dump}");
         assert!(dump.contains("[redacted]"));
         assert_eq!(redact("vault get dialf/openai"), "vault get dialf/openai");
+    }
+
+    fn restart(source: &str, same_log: bool) -> AgentEvent {
+        AgentEvent::SessionStarted {
+            session_id: "s".into(),
+            log_path: PathBuf::from("/x"),
+            source: source.into(),
+            same_log,
+        }
+    }
+
+    #[test]
+    fn compact_or_resume_on_the_same_log_keeps_the_turn() {
+        for source in ["compact", "resume"] {
+            let mut s = ready();
+            submit_ok(&mut s, "r1", "go");
+            s.on_event(AgentEvent::PromptSubmitted { text: "go".into() }, 2, 0);
+            let since = s.status().since_ms;
+            // typing during the turn moved the input count; compaction must not
+            // hide it, nor end the pending prompt or the turn
+            assert!(
+                s.on_event(restart(source, true), 3, 7).is_empty(),
+                "{source}"
+            );
+            assert_eq!(s.status().state, State::Working);
+            assert_eq!(s.status().since_ms, since);
+            let o = s.on_log(user("u1", "t1", "go"), 4, 7);
+            assert!(o.contains(&Out::Accepted {
+                request_id: "r1".into()
+            }));
+            let o = s.on_log(end("t1", Outcome::Done), 5, 7);
+            assert!(matches!(
+                completes(&o)[0],
+                Out::Complete { request_id: Some(r), .. } if r == "r1"
+            ));
+        }
+        // any SessionStarted on the same log while a turn is in progress keeps it
+        let mut s = ready();
+        s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 2, 0);
+        assert!(s.on_event(restart("", true), 3, 4).is_empty());
+        assert_eq!(s.status().state, State::Working);
+        // compact while idle keeps the input mark too
+        let mut s = ready();
+        s.on_event(restart("compact", true), 3, 4);
+        assert_eq!(
+            err_text(s.submit("r", "g1", "hi", 4, false)),
+            "the terminal has unsent input; finish or clear it there"
+        );
+    }
+
+    #[test]
+    fn startup_clear_or_a_new_log_resets_to_ready() {
+        for (source, same_log) in [("startup", true), ("clear", true), ("resume", false)] {
+            let mut s = ready();
+            s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 2, 0);
+            let o = s.on_event(restart(source, same_log), 3, 4);
+            assert_eq!(
+                o,
+                vec![Out::Status(Status {
+                    state: State::Ready,
+                    since_ms: 3,
+                    detail: None
+                })],
+                "{source} {same_log}"
+            );
+            assert!(s.submit("r", "g1", "hi", 4, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn backfill_lands_in_history_without_outs_or_status() {
+        let mut s = ready();
+        s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 2, 0);
+        // on_backfill returns nothing: no Outs by construction
+        s.on_backfill(user("u1", "t1", "old prompt"));
+        s.on_backfill(asst("m1", text_part("p1", "old reply"), "t1"));
+        s.on_backfill(asst("m1", text_part("p2", "more"), "t1"));
+        s.on_backfill(end("t1", Outcome::Done));
+        s.on_backfill(end("t1", Outcome::Interrupted));
+        // wrapped items given to on_log are backfill too
+        let wrapped = LogItem::Backfill(Box::new(user("u2", "t2", "older")));
+        assert!(s.on_log(wrapped, 3, 0).is_empty());
+        assert_eq!(s.status().state, State::Working);
+        let h = s.history(None, 10, usize::MAX);
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0].origin, Some(Origin::Local));
+        assert_eq!(h[1].parts.len(), 2);
+        assert!(h.iter().all(|m| m.request_id.is_none()));
+    }
+
+    #[test]
+    fn commands_and_shell_mode_are_refused() {
+        let mut s = ready();
+        for text in ["/clear", "  /model opus", "!rm -rf x", "\n\t!ls"] {
+            assert_eq!(
+                err_text(s.submit("r", "g1", text, 0, false)),
+                "commands and shell mode are not available from chat",
+                "{text:?}"
+            );
+        }
+        // a duplicate request id is still answered from the record first
+        submit_ok(&mut s, "r1", "go");
+        assert!(
+            s.submit("r1", "g1", "/clear", 0, false)
+                .unwrap_err()
+                .is_empty()
+        );
+        let mut s = ready();
+        submit_ok(&mut s, "r2", "# remember this");
+        let mut s = ready();
+        submit_ok(&mut s, "r3", "explain a/b and !x");
+    }
+
+    #[test]
+    fn prompt_match_ignores_leading_whitespace_too() {
+        let mut s = ready();
+        submit_ok(&mut s, "r1", "  go");
+        s.on_event(AgentEvent::PromptSubmitted { text: "go".into() }, 2, 0);
+        let o = s.on_log(user("u1", "t1", "go "), 2, 0);
+        assert!(o.contains(&Out::Accepted {
+            request_id: "r1".into()
+        }));
+    }
+
+    #[test]
+    fn history_is_bounded_to_8_mib() {
+        let mut s = ready();
+        let big = "a".repeat(120_000);
+        for i in 0..80 {
+            s.on_log(asst(&format!("m{i}"), text_part("p", &big), "t"), 2, 0);
+        }
+        let all = s.history(None, 10_000, usize::MAX);
+        let total: usize = all.iter().map(ChatMessage::bytes).sum();
+        assert!(total <= 8 * 1024 * 1024, "{total}");
+        assert_eq!(all.len(), 8 * 1024 * 1024 / 120_000);
+        assert_eq!(all.last().unwrap().message_id, "m79");
+        // growing a message by deltas counts too
+        let mut s = ready();
+        for i in 0..69 {
+            s.on_log(asst(&format!("m{i}"), text_part("p", &big), "t"), 2, 0);
+        }
+        s.on_log(asst("m68", text_part("q", "b"), "t"), 2, 0);
+        let all = s.history(None, 10_000, usize::MAX);
+        let total: usize = all.iter().map(ChatMessage::bytes).sum();
+        assert!(total <= 8 * 1024 * 1024, "{total}");
+        assert_eq!(all.last().unwrap().parts.len(), 2);
     }
 
     #[test]

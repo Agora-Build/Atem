@@ -18,6 +18,9 @@ const NOT_AVAILABLE: &str = "chat is not available for this agent";
 /// Sent instead of the OS error, which stays local.
 const PASTE_FAILED: &str = "could not write to the terminal";
 const RESTARTED: &str = "the agent was restarted; reopen the chat";
+const SWITCHED: &str = "the conversation was switched; reopen the chat";
+/// Open conversations per agent; opening one more closes the oldest.
+const MAX_CONVERSATIONS: usize = 8;
 pub const CHAT_V1: &str = "chat-v1";
 
 /// Chat for one agent process. A respawn gets a new one (new generation); the
@@ -27,13 +30,24 @@ pub struct AgentChat {
     /// `None` once the agent process has exited.
     pub adapter: Option<Box<dyn AgentAdapter>>,
     pub session: ChatSession,
-    /// Open conversations: conversationId -> next sequence.
-    pub conversations: HashMap<String, u64>,
-    pub last_heartbeat: Instant,
+    /// Open conversations by conversationId.
+    pub conversations: HashMap<String, Conversation>,
+    /// Counter for `Conversation::opened` (newest open has the largest).
+    opens: u64,
     /// chat-v1 as of the last poll (what the registry advertises).
     chat_v1: bool,
     /// The adapter's "not available" reason was shown as a notice.
     reason_noticed: bool,
+}
+
+/// One open conversation (one client page).
+pub struct Conversation {
+    /// Sequence of the next event.
+    pub next: u64,
+    /// The last time this conversation got the status (opened or heartbeat).
+    pub last_heartbeat: Instant,
+    /// Order of the last open, to close the oldest past `MAX_CONVERSATIONS`.
+    opened: u64,
 }
 
 fn now_ms() -> i64 {
@@ -62,14 +76,14 @@ fn not_available(reason: Option<&str>) -> String {
 impl AgentChat {
     /// Number `outs` for one conversation (its own sequence).
     fn for_conversation(&mut self, conversation: &str, outs: &[Out]) -> Vec<ChatEnvelope> {
-        let Some(next) = self.conversations.get_mut(conversation) else {
+        let Some(c) = self.conversations.get_mut(conversation) else {
             return Vec::new();
         };
         let generation = self.session.generation();
         outs.iter()
             .map(|out| {
-                let env = wire::event(conversation, &self.agent_id, generation, *next, out);
-                *next += 1;
+                let env = wire::event(conversation, &self.agent_id, generation, c.next, out);
+                c.next += 1;
                 env
             })
             .collect()
@@ -88,6 +102,54 @@ impl AgentChat {
             envelopes.push(wire::close(id, &self.agent_id));
         }
         self.conversations.clear();
+        envelopes
+    }
+
+    /// Re-send the status to each conversation that has not had it for 15 s.
+    fn heartbeats(&mut self) -> Vec<ChatEnvelope> {
+        let due: Vec<String> = self
+            .conversations
+            .iter()
+            .filter(|(_, c)| c.last_heartbeat.elapsed() >= HEARTBEAT)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let status = [self.session.heartbeat()];
+        let mut envelopes = Vec::new();
+        for id in due {
+            envelopes.extend(self.for_conversation(&id, &status));
+            if let Some(c) = self.conversations.get_mut(&id) {
+                c.last_heartbeat = Instant::now();
+            }
+        }
+        envelopes
+    }
+
+    /// Record an open (or reopen) of `id`, whose history ends at `next - 1`.
+    /// A new conversation past `MAX_CONVERSATIONS` closes the oldest one; its
+    /// `close` is returned.
+    fn open_conversation(&mut self, id: String, next: u64) -> Vec<ChatEnvelope> {
+        let mut envelopes = Vec::new();
+        if !self.conversations.contains_key(&id) && self.conversations.len() >= MAX_CONVERSATIONS {
+            let oldest = self
+                .conversations
+                .iter()
+                .min_by_key(|(_, c)| c.opened)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                self.conversations.remove(&oldest);
+                envelopes.push(wire::close(&oldest, &self.agent_id));
+            }
+        }
+        self.opens += 1;
+        self.conversations.insert(
+            id,
+            Conversation {
+                next,
+                // The client just got the status; its next heartbeat is in 15 s.
+                last_heartbeat: Instant::now(),
+                opened: self.opens,
+            },
+        );
         envelopes
     }
 
@@ -122,6 +184,11 @@ impl App {
     /// process) is dropped. On failure Claude starts without chat.
     pub(crate) fn prepare_claude_chat(&mut self, agent_id: &str, args: &[String]) -> Vec<String> {
         self.claude_chat = None;
+        if !self.chat_swept {
+            // Directories of Atem processes that died without cleaning up.
+            self.chat_swept = true;
+            hooks::sweep_stale(&self.chat_root);
+        }
         let dir = match hooks::create_session_dir(&self.chat_root) {
             Ok(dir) => dir,
             Err(error) => {
@@ -137,7 +204,7 @@ impl App {
                     adapter: Some(Box::new(adapter)),
                     session: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
                     conversations: HashMap::new(),
-                    last_heartbeat: Instant::now(),
+                    opens: 0,
                     chat_v1: false,
                     reason_noticed: false,
                 });
@@ -162,6 +229,8 @@ impl App {
         };
         let mut outs = Vec::new();
         let mut notice = None;
+        // History from a log switched to (resume): clients must reload it.
+        let mut backfilled = false;
         if let Some(adapter) = chat.adapter.as_mut() {
             let now = now_ms();
             // Events first (SessionStarted opens the log), then the log, then turn
@@ -182,6 +251,7 @@ impl App {
                     }
                     continue;
                 }
+                backfilled |= matches!(item, LogItem::Backfill(_));
                 outs.extend(chat.session.on_log(item, now, input_count));
             }
             for event in ended {
@@ -193,10 +263,6 @@ impl App {
             chat.adapter = None;
         }
         outs.extend(chat.session.tick(Instant::now()));
-        if !chat.conversations.is_empty() && chat.last_heartbeat.elapsed() >= HEARTBEAT {
-            outs.push(chat.session.heartbeat());
-            chat.last_heartbeat = Instant::now();
-        }
 
         let caps = chat
             .adapter
@@ -213,8 +279,11 @@ impl App {
         chat.chat_v1 = caps.chat_v1;
 
         let mut envelopes = chat.broadcast(&outs);
+        envelopes.extend(chat.heartbeats());
         if withdrawn {
             envelopes.extend(chat.end_conversations(&not_available(caps.reason.as_deref())));
+        } else if backfilled {
+            envelopes.extend(chat.end_conversations(SWITCHED));
         }
         if let Some(detail) = notice {
             crate::diagnostics::warn(format!("Chat: {detail}"));
@@ -311,7 +380,8 @@ impl App {
         let envelopes = match inbound {
             Inbound::Open { before } => {
                 let generation = chat.session.generation().to_string();
-                let mut envs = vec![wire::opened(
+                let mut envs = Vec::new();
+                let mut history_envs = vec![wire::opened(
                     &conversation,
                     &agent,
                     &generation,
@@ -322,7 +392,7 @@ impl App {
                         .history(before.as_deref(), HISTORY_MESSAGES, HISTORY_BYTES);
                 let mut sequence = 1;
                 for message in &history {
-                    envs.push(wire::history_message(
+                    history_envs.push(wire::history_message(
                         &conversation,
                         &agent,
                         &generation,
@@ -331,9 +401,8 @@ impl App {
                     ));
                     sequence += 1;
                 }
-                chat.conversations.insert(conversation, sequence);
-                // The client just got the status; the next heartbeat is 15 s from now.
-                chat.last_heartbeat = Instant::now();
+                envs.extend(chat.open_conversation(conversation, sequence));
+                envs.extend(history_envs);
                 envs
             }
             Inbound::Close => {

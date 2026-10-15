@@ -110,6 +110,14 @@ Common on conversation entries: `parentUuid`, `isSidechain`, `uuid`, `timestamp`
   plan_mode_exit), `api-request-shape`, `api-request-blob`, `api-request`.
   Many have no `uuid`.
 
+## Not recorded
+
+A permission prompt answered with deny/Esc (`[Request interrupted by user for
+tool use]`, a user entry without `interruptedMessageId`) could not be recorded
+on 2026-10-15: the Claude CLI on the recording machine was not logged in
+("Not logged in · Please run /login"). The reader's tests use hand-written
+lines for it (`transcript.rs`, `interrupt_marker_without_message_id_ends_the_turn`).
+
 ## Deviations from the spec
 
 None that break it. Notes: first-run trust dialog can delay `SessionStart`;
