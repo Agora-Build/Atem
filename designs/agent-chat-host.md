@@ -327,6 +327,8 @@ on the existing authenticated Astation connection.
   the transcript, and the interrupt marker's exact form.
 - Manual acceptance with real Claude Code and Astation's page.
 
+Verified on Claude Code 2.1.299 (fixtures in tests/fixtures/chat/claude/).
+
 ## Changes to the proposed contract (for the Astation agent)
 
 Additive to `mem_b3ccce1f`:
