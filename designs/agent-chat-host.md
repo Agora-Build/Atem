@@ -64,7 +64,7 @@ Claude runs a hook as a shell command and passes the event JSON on stdin. Each
 hook command writes that JSON to its own file, atomically:
 
 ```sh
-f=$(mktemp "<chat dir>/events/ev.XXXXXXXX") && cat > "$f" && mv "$f" "$f.json"
+{ f=$(mktemp "<chat dir>/events/ev.XXXXXXXX") && cat > "$f" && mv "$f" "$f.json"; } 2>/dev/null; exit 0
 ```
 
 (`mktemp` gives a unique name on both Linux and macOS; `date +%N` would not
@@ -77,7 +77,9 @@ work on macOS.)
   resolution on Linux and APFS), then name; handles each event and deletes
   the file. Files without `.json` are still being written and are skipped;
   leftovers older than a minute are removed.
-- The command prints nothing and exits 0, so it can never allow, deny or block
+- The command prints nothing and always exits 0, even when writing fails (for
+  Claude, exit code 2 blocks the action and other failures are shown to the
+  user), so it can never allow, deny or block
   anything, and it doesn't depend on Atem running or on the Atem binary's
   path: if Atem is gone, the file is simply never read and the directory is
   cleaned up with the session.
