@@ -1,0 +1,63 @@
+{
+ "algorithm": "sha256(RFC 8785 JCS(payload)), lowercase hex",
+ "vectors": [
+  {
+   "name": "prompt-ascii",
+   "payload": {
+    "text": "run the tests"
+   },
+   "canonical": "{\"text\":\"run the tests\"}",
+   "sha256": "51b365c654de71c69dac5afdc09dbbf06929ef6137ee7878f32937071d2923a8"
+  },
+  {
+   "name": "prompt-unicode",
+   "payload": {
+    "text": "héllo 世界"
+   },
+   "canonical": "{\"text\":\"héllo 世界\"}",
+   "sha256": "98945f882da718228730803d0d175141da947f0f1169099d47b558dd44746e8e"
+  },
+  {
+   "name": "empty",
+   "payload": {},
+   "canonical": "{}",
+   "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  {
+   "name": "nested-sorted",
+   "payload": {
+    "text": "a",
+    "b": [
+     1,
+     true,
+     null,
+     "x"
+    ]
+   },
+   "canonical": "{\"b\":[1,true,null,\"x\"],\"text\":\"a\"}",
+   "sha256": "11132adf10a49624454ea644e1582f0669cf71867b61bd12f20b80ee3cb28e02"
+  },
+  {
+   "name": "escapes",
+   "payload": {
+    "text": "line1\nline2\t\"q\"\\"
+   },
+   "canonical": "{\"text\":\"line1\\nline2\\t\\\"q\\\"\\\\\"}",
+   "sha256": "40e4b600f8bca9c4c6636065e2274854929101b360f5bc2a4d221ad42e9b450a"
+  }
+ ],
+ "must_reject": [
+  {
+   "name": "float-rejected",
+   "payload_json": "{\"n\":1.5}"
+  },
+  {
+   "name": "duplicate-key-rejected",
+   "payload_json": "{\"text\":\"a\",\"text\":\"b\"}"
+  },
+  {
+   "name": "unsafe-integer-rejected",
+   "payload_json": "{\"n\":9007199254740992}"
+  }
+ ]
+}
