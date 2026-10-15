@@ -75,6 +75,22 @@ and acceptance (`PromptSubmitted` plus the matching `UserMessage`), request-id
 records, history and the wire. Adding an agent means writing an adapter and
 its tests; the wire and the clients don't change.
 
+### Units
+
+| Unit | Responsibility |
+|---|---|
+| `src/chat/adapter.rs` | `AgentAdapter`, `AgentEvent`, `LogItem`, `Capabilities`: the neutral interface |
+| `src/chat/claude/hooks.rs` | Claude: builds the per-session directory and `settings.json`; reads, orders and deletes the event files; maps hook events to `AgentEvent` |
+| `src/chat/claude/transcript.rs` | Claude: follows the transcript and turns entries into `LogItem`s (below) |
+| `src/chat/session.rs` | Shared per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records; agent-neutral |
+| `src/chat/wire.rs` | `agentChat` v1 messages to and from Astation: encoding, decoding, validation |
+| `src/agent_registry.rs` | Status from `session.rs`; `capabilities: ["chat-v1"]` only when the agent's adapter reports it (v1: Claude with active hooks) |
+
+All of it lives in the Atem process that owns the terminal; there is no new
+daemon. Chat state belongs to the agent session, not to a browser connection:
+Claude keeps running and Atem keeps reading the transcript whether or not any
+chat page is open.
+
 ## Claude Code adapter (v1)
 
 ### Launch
@@ -128,22 +144,6 @@ work on macOS.)
   cleaned up with the session.
 - No token, socket or helper process is needed: the private directory (0700)
   already limits who can write events to the user's own account.
-
-### Units
-
-| Unit | Responsibility |
-|---|---|
-| `src/chat/adapter.rs` | `AgentAdapter`, `AgentEvent`, `LogItem`, `Capabilities`: the neutral interface |
-| `src/chat/claude/hooks.rs` | Claude: builds the per-session directory and `settings.json`; reads, orders and deletes the event files; maps hook events to `AgentEvent` |
-| `src/chat/claude/transcript.rs` | Claude: follows the transcript and turns entries into `LogItem`s (below) |
-| `src/chat/session.rs` | Shared per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records; agent-neutral |
-| `src/chat/wire.rs` | `agentChat` v1 messages to and from Astation: encoding, decoding, validation |
-| `src/agent_registry.rs` | Status from `session.rs`; `capabilities: ["chat-v1"]` only when the agent's adapter reports it (v1: Claude with active hooks) |
-
-All of it lives in the Atem process that owns the terminal; there is no new
-daemon. Chat state belongs to the agent session, not to a browser connection:
-Claude keeps running and Atem keeps reading the transcript whether or not any
-chat page is open.
 
 ### Reading the transcript
 
