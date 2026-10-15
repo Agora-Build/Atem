@@ -171,6 +171,15 @@ struct Viewer {
     writes: VecDeque<(u64, u64)>,
 }
 
+/// The whole screen as ANSI: reset, contents, input modes. A terminal of the
+/// screen's size shows the same screen after it.
+pub fn restore_bytes(screen: &vt100::Screen) -> Vec<u8> {
+    let mut bytes = b"\x1bc".to_vec();
+    bytes.extend(screen.contents_formatted());
+    bytes.extend(screen.input_mode_formatted());
+    bytes
+}
+
 pub struct SharedTerminal {
     pub id: String,
     pub generation: String,
@@ -448,10 +457,7 @@ impl SharedTerminal {
                 .as_ref()
                 .is_none_or(|prev| prev.size() != screen.size());
             let bytes = if reset {
-                let mut bytes = b"\x1bc".to_vec();
-                bytes.extend(screen.contents_formatted());
-                bytes.extend(screen.input_mode_formatted());
-                bytes
+                restore_bytes(screen)
             } else {
                 let previous = viewer.baseline.as_ref().unwrap();
                 let mut bytes = screen.contents_diff(previous);

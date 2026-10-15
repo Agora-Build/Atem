@@ -143,6 +143,7 @@ impl App {
             events: Some(receiver),
             raw_log: log,
             raw_log_start: log_offset,
+            tap,
             ..
         } = session
         else {
@@ -154,6 +155,7 @@ impl App {
             match receiver.try_recv() {
                 Ok(PtyEvent::Output(bytes)) => {
                     append_log(log, log_offset, &share.process(parser, input, &bytes));
+                    tap.record(&bytes);
                 }
                 Ok(PtyEvent::Error(error)) => {
                     self.status_message = Some(format!("{label}: {error}"))
@@ -246,7 +248,15 @@ impl App {
     }
 
     pub fn reclaim_terminal(&mut self) {
-        let Some(session) = self.focused_session_mut() else {
+        if let Some(id) = self.focused_session().map(|s| s.id.clone()) {
+            self.reclaim_session(&id);
+        }
+    }
+
+    /// Take control of session `id` back from a remote terminal-v1 viewer;
+    /// the local view regains size ownership.
+    pub fn reclaim_session(&mut self, id: &SessionId) {
+        let Some(session) = self.sessions.get_mut(id) else {
             return;
         };
         let message = match &session.input {

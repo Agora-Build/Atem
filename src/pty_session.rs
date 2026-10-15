@@ -76,13 +76,23 @@ impl PtyInput {
 
     /// Local/automation writes cannot bypass an active remote controller.
     pub fn send(&self, data: String) -> Result<()> {
+        self.send_bytes(data.into_bytes())
+    }
+
+    /// `send` for bytes that need not be UTF-8 (a local frontend's keys).
+    pub fn send_bytes(&self, data: Vec<u8>) -> Result<()> {
         let authority = self.authority.lock().unwrap();
         if authority.remote {
             bail!("Remote control is active; use Atem's Take Control command");
         }
-        self.enqueue(data.into_bytes(), Some(authority.epoch), None)?;
+        self.enqueue(data, Some(authority.epoch), None)?;
         self.inputs.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// The input queue has no room: a send now would be refused.
+    pub fn queue_full(&self) -> bool {
+        self.tx.capacity() == 0 && !self.tx.is_closed()
     }
 
     /// Count of send()/send_remote() calls (terminal input), not respond() or send_paste().

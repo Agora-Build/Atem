@@ -2,9 +2,6 @@
 //! per-user socket directories, peer checks, pid-bearing lock files, socket
 //! binding and detached spawning. Same-user only; nothing here knows a
 //! protocol.
-// The runtime daemon (next task) is the second consumer of bind_socket, DaemonFiles
-// and clear_pid.
-#![allow(dead_code)]
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -301,6 +298,28 @@ pub fn spawn_detached(
     log: &Path,
     envs: &[(OsString, OsString)],
 ) -> io::Result<u32> {
+    spawn(exe, subcommand, cwd, log, envs, false)
+}
+
+/// `spawn_detached` with exactly `envs` as the environment (nothing inherited).
+pub fn spawn_detached_clean(
+    exe: &Path,
+    subcommand: &str,
+    cwd: &Path,
+    log: &Path,
+    envs: &[(OsString, OsString)],
+) -> io::Result<u32> {
+    spawn(exe, subcommand, cwd, log, envs, true)
+}
+
+fn spawn(
+    exe: &Path,
+    subcommand: &str,
+    cwd: &Path,
+    log: &Path,
+    envs: &[(OsString, OsString)],
+    clear_env: bool,
+) -> io::Result<u32> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     if let Some(dir) = log.parent() {
@@ -316,6 +335,9 @@ pub fn spawn_detached(
     let cwd = std::ffi::CString::new(cwd.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd contains a NUL byte"))?;
     let mut command = std::process::Command::new(exe);
+    if clear_env {
+        command.env_clear();
+    }
     command
         .arg(subcommand)
         .envs(envs.iter().map(|(key, value)| (key, value)))
@@ -406,6 +428,34 @@ pub fn bind_socket(files: &DaemonFiles, uid: u32) -> io::Result<tokio::net::Unix
         held.push(lock);
     }
     Ok(listener)
+}
+
+/// A clean exit: takes this process's pid out of the lock files it holds
+/// (the locks stay held until it exits).
+pub fn clear_held_pids() {
+    if let Ok(held) = HELD.lock() {
+        for lock in held.iter() {
+            let _ = lock.clear_pid();
+        }
+    }
+}
+
+/// The socket path `record` names, if it names an absolute one.
+pub fn recorded_socket(record: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = std::fs::read(record).ok()?;
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+    path.is_absolute().then_some(path)
+}
+
+/// Removes this daemon's socket and, when it still names that socket, its record.
+pub fn remove_socket(files: &DaemonFiles) {
+    if recorded_socket(&files.record).as_deref() == Some(files.socket.as_path()) {
+        let _ = std::fs::remove_file(&files.record);
+    }
+    if std::fs::symlink_metadata(&files.socket).is_ok_and(|meta| meta.file_type().is_socket()) {
+        let _ = std::fs::remove_file(&files.socket);
+    }
 }
 
 /// Writes `bytes` to `path` through a private temporary file and a rename.

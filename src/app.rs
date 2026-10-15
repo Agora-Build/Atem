@@ -840,10 +840,73 @@ impl App {
         }
     }
 
-    /// Drain every session's PTY output.
+    /// Drain every session's PTY output. A panic while processing one session
+    /// ends that session (its process is stopped), not the others.
     pub fn process_sessions_output(&mut self) {
         for id in self.sessions.ids() {
-            self.process_terminal_output(&id);
+            let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.process_terminal_output(&id)
+            }));
+            if processed.is_err() {
+                self.end_failed_session(&id);
+            }
+        }
+    }
+
+    /// Stop session `id` after an internal error and mark it exited.
+    fn end_failed_session(&mut self, id: &SessionId) {
+        eprintln!("atem: session {id} failed while processing its output; stopping it");
+        let Some(session) = self.sessions.get_mut(id) else { return; };
+        if let Some(handle) = &session.handle {
+            let _ = handle.stop();
+        }
+        session.events = None;
+        session.exited_at.get_or_insert_with(Instant::now);
+        session.share.exit_status.get_or_insert_with(|| "ended after an internal error".into());
+        if let Some(input) = &session.input {
+            input.set_remote(false);
+        }
+        self.agent_list_dirty = true;
+        self.rebuild_menu();
+    }
+
+    /// The host part of the terminal UI's loop, run by the TUI and by `atem
+    /// runtime` every tick: the Astation connection and its messages, every
+    /// session's output, exited-session reaping, chat-v1, terminal-v1 frames,
+    /// mark tasks and RTM.
+    pub async fn tick_host(&mut self) {
+        // Check if background Astation connection has completed
+        self.poll_astation_connect();
+
+        // Check if a reconnect retry timer has elapsed (fires only while awake)
+        self.check_astation_reconnect();
+
+        // Process any pending Astation messages (also detects WS disconnect)
+        self.process_astation_messages().await;
+        self.process_sessions_output();
+        self.reap_exited_sessions(Instant::now());
+        self.poll_chat().await;
+        self.pump_terminals();
+
+        // Dispatcher: drain triage verdicts and try to send next task to main
+        self.dispatcher.poll_triage_results();
+        self.try_dispatch_main().await;
+
+        // Dispatcher: collect completed background task results
+        for result in self.dispatcher.poll_background_results() {
+            let _ = self
+                .astation_client
+                .send_mark_result(&result.task_id, result.success, &result.output)
+                .await;
+            self.work_items.remove(&result.task_id);
+        }
+
+        // Dispatcher: deferred finalize flag (set when Claude session ends mid-task)
+        if self.dispatcher.take_main_needs_finalize() {
+            self.finalize_mark_task(true).await;
+        }
+        if let Err(err) = self.process_rtm_messages().await {
+            self.status_message = Some(format!("RTM processing error: {}", err));
         }
     }
 

@@ -94,6 +94,9 @@ pub enum Commands {
     /// Runs the key agent (started automatically when keys are needed)
     #[command(hide = true)]
     KeyAgent,
+    /// Runs the agent runtime (started automatically by `atem agent`)
+    #[command(hide = true)]
+    Runtime,
 }
 
 #[derive(Subcommand)]
@@ -1037,6 +1040,9 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             {
                 anyhow::bail!("the key agent needs a Unix system")
             }
+        }
+        Commands::Runtime => {
+            crate::runtime::run_runtime(crate::config::AtemConfig::config_dir()).await
         }
     }
 }
@@ -2119,6 +2125,15 @@ mod tests {
         assert!(matches!(cli.command, Some(Commands::KeyAgent)));
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("key-agent"), "{help}");
+    }
+
+    #[test]
+    fn runtime_is_a_hidden_subcommand() {
+        use clap::CommandFactory;
+        let cli = Cli::try_parse_from(["atem", "runtime"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Runtime)));
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("runtime"), "{help}");
     }
 
     #[test]

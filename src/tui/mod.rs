@@ -215,41 +215,9 @@ async fn run_tui_loop(
         for message in diagnostics.drain() {
             app.terminal_ui.record(message);
         }
-        // Check if background Astation connection has completed
-        app.poll_astation_connect();
-
-        // Check if a reconnect retry timer has elapsed (fires only while awake)
-        app.check_astation_reconnect();
-
-        // Process any pending Astation messages (also detects WS disconnect)
-        app.process_astation_messages().await;
-        app.process_sessions_output();
-        app.reap_exited_sessions(std::time::Instant::now());
-        app.poll_chat().await;
-        // Drain bytes from the old geometry before notifying the CLI of a resize.
+        app.tick_host().await;
+        // After the host drained the old geometry's bytes, follow the local viewport.
         sync_terminal_sizes(app, terminal.size()?);
-        app.pump_terminals();
-
-        // Dispatcher: drain triage verdicts and try to send next task to main
-        app.dispatcher.poll_triage_results();
-        app.try_dispatch_main().await;
-
-        // Dispatcher: collect completed background task results
-        for result in app.dispatcher.poll_background_results() {
-            let _ = app
-                .astation_client
-                .send_mark_result(&result.task_id, result.success, &result.output)
-                .await;
-            app.work_items.remove(&result.task_id);
-        }
-
-        // Dispatcher: deferred finalize flag (set when Claude session ends mid-task)
-        if app.dispatcher.take_main_needs_finalize() {
-            app.finalize_mark_task(true).await;
-        }
-        if let Err(err) = app.process_rtm_messages().await {
-            app.status_message = Some(format!("RTM processing error: {}", err));
-        }
 
         if app.force_terminal_redraw {
             terminal.clear()?;

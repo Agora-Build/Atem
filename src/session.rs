@@ -152,6 +152,72 @@ pub fn check_env(env: &[(OsString, OsString)]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Most bytes a tap holds between two takes; beyond it they're dropped (the
+/// frontend gets a fresh restore instead).
+pub const TAP_LIMIT: usize = 1024 * 1024;
+
+/// The session's raw PTY output in order, after the canonical parser has seen
+/// it, for an attached local frontend. `offset` counts every byte the session
+/// has produced; bytes are kept only while the tap is open.
+#[derive(Default)]
+pub struct OutputTap {
+    offset: u64,
+    buf: Option<Vec<u8>>,
+    overflowed: bool,
+}
+
+/// Bytes taken from a tap: `bytes` starts at stream position `start`;
+/// `overflowed` when bytes were dropped since the last take.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TapChunk {
+    pub start: u64,
+    pub bytes: Vec<u8>,
+    pub overflowed: bool,
+}
+
+impl OutputTap {
+    pub fn record(&mut self, bytes: &[u8]) {
+        self.offset += bytes.len() as u64;
+        let Some(buf) = &mut self.buf else { return };
+        if self.overflowed {
+            return;
+        }
+        if buf.len() + bytes.len() > TAP_LIMIT {
+            buf.clear();
+            self.overflowed = true;
+        } else {
+            buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// Start keeping bytes (from now on).
+    pub fn open(&mut self) {
+        self.buf = Some(Vec::new());
+        self.overflowed = false;
+    }
+
+    pub fn close(&mut self) {
+        self.buf = None;
+        self.overflowed = false;
+    }
+
+    /// Bytes produced so far.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The bytes kept since the last take.
+    pub fn take(&mut self) -> TapChunk {
+        let bytes = self.buf.as_mut().map(std::mem::take).unwrap_or_default();
+        let overflowed = std::mem::take(&mut self.overflowed);
+        TapChunk {
+            start: self.offset - bytes.len() as u64,
+            bytes,
+            overflowed,
+        }
+    }
+}
+
 pub struct Session {
     pub id: SessionId,
     pub provider: Provider,
@@ -176,6 +242,8 @@ pub struct Session {
     /// chat-v1 state (Claude only).
     pub chat: Option<crate::app::chat::AgentChat>,
     pub exited_at: Option<Instant>,
+    /// Raw output for an attached local frontend (`atem runtime`).
+    pub tap: OutputTap,
 }
 
 impl Session {
@@ -204,6 +272,7 @@ impl Session {
             view: (0, 0),
             chat: None,
             exited_at: None,
+            tap: OutputTap::default(),
         }
     }
 
@@ -316,6 +385,41 @@ mod tests {
 
     fn session(provider: Provider) -> Session {
         Session::new(provider, 24, 80)
+    }
+
+    #[test]
+    fn a_tap_keeps_bytes_only_while_open_and_counts_every_byte() {
+        let mut tap = OutputTap::default();
+        tap.record(b"before");
+        assert_eq!(
+            tap.take(),
+            TapChunk {
+                start: 6,
+                bytes: vec![],
+                overflowed: false
+            }
+        );
+        tap.open();
+        tap.record(b"ab");
+        tap.record(b"cd");
+        assert_eq!(
+            tap.take(),
+            TapChunk {
+                start: 6,
+                bytes: b"abcd".to_vec(),
+                overflowed: false
+            }
+        );
+        tap.record(&vec![b'x'; TAP_LIMIT + 1]);
+        tap.record(b"more");
+        let chunk = tap.take();
+        assert!(chunk.overflowed && chunk.bytes.is_empty());
+        assert_eq!(tap.offset(), 10 + TAP_LIMIT as u64 + 1 + 4);
+        tap.record(b"z");
+        assert_eq!(tap.take().bytes, b"z");
+        tap.close();
+        tap.record(b"gone");
+        assert!(tap.take().bytes.is_empty());
     }
 
     #[test]
