@@ -737,6 +737,10 @@ impl ChatSession {
                 text,
                 created_at_ms,
             } => {
+                // Resuming a session read earlier must not repeat its prompts.
+                if self.history.iter().any(|m| m.message_id == id) {
+                    return;
+                }
                 let message = user_message(id, turn_id, &text, None, created_at_ms);
                 self.push_message(message);
             }
@@ -1368,6 +1372,19 @@ mod tests {
         assert_eq!(h[0].origin, Some(Origin::Local));
         assert_eq!(h[1].parts.len(), 2);
         assert!(h.iter().all(|m| m.request_id.is_none()));
+    }
+
+    #[test]
+    fn resuming_a_session_read_before_does_not_repeat_its_prompts() {
+        let mut s = ready();
+        s.on_log(user("u1", "t1", "first"), 2, 0);
+        s.on_log(asst("m1", text_part("p1", "reply"), "t1"), 3, 0);
+        // /clear, then /resume of the same session: its file is read again
+        s.on_backfill(user("u1", "t1", "first"));
+        s.on_backfill(asst("m1", text_part("p1", "reply"), "t1"));
+        let h = s.history(None, 10, usize::MAX);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[1].parts.len(), 1);
     }
 
     #[test]

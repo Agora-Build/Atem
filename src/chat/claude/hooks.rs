@@ -37,13 +37,14 @@ fn private_dir(path: &Path) -> anyhow::Result<()> {
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// `root/chat-<uuid>` (0700) with an `events/` subdirectory (0700) and a `pid`
-/// file (0600) naming this process, for `sweep_stale`.
+/// file (0600) naming this process and host, for `sweep_stale`.
 pub fn create_session_dir(root: &Path) -> anyhow::Result<PathBuf> {
     private_dir(root)?;
     let dir = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
     private_dir(&dir)?;
     private_dir(&dir.join("events"))?;
-    write_private(&dir.join("pid"), std::process::id().to_string().as_bytes())?;
+    let owner = format!("{}\n{}\n", std::process::id(), crate::auth::get_hostname());
+    write_private(&dir.join("pid"), owner.as_bytes())?;
     Ok(dir)
 }
 
@@ -62,9 +63,10 @@ fn write_private(path: &Path, body: &[u8]) -> anyhow::Result<()> {
 }
 
 /// Remove chat directories left by Atem processes that are gone (crash,
-/// SIGKILL): `root/chat-*` whose `pid` file names a dead process, or that have
-/// no readable `pid` file and are older than an hour. Nothing else under `root`
-/// is touched and no symlink is followed.
+/// SIGKILL): `root/chat-*` whose `pid` file names a dead process on this host,
+/// or that have no readable `pid` file and are older than an hour. A directory
+/// owned by another host (a shared home) is never removed. Nothing else under
+/// `root` is touched and no symlink is followed.
 pub fn sweep_stale(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -83,7 +85,8 @@ pub fn sweep_stale(root: &Path) {
             continue;
         }
         let stale = match read_pid(&path.join("pid")) {
-            Some(pid) => !process_alive(pid),
+            Some((_, Some(host))) if host != crate::auth::get_hostname() => false,
+            Some((pid, _)) => !process_alive(pid),
             None => meta
                 .modified()
                 .ok()
@@ -97,8 +100,8 @@ pub fn sweep_stale(root: &Path) {
     }
 }
 
-/// The pid in a regular `pid` file (never through a symlink).
-fn read_pid(path: &Path) -> Option<libc::pid_t> {
+/// The pid and host in a regular `pid` file (never through a symlink).
+fn read_pid(path: &Path) -> Option<(libc::pid_t, Option<String>)> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -110,9 +113,14 @@ fn read_pid(path: &Path) -> Option<libc::pid_t> {
         return None;
     }
     let mut text = String::new();
-    file.by_ref().take(32).read_to_string(&mut text).ok()?;
-    let pid: libc::pid_t = text.trim().parse().ok()?;
-    (pid > 0).then_some(pid)
+    file.by_ref().take(512).read_to_string(&mut text).ok()?;
+    let mut lines = text.lines();
+    let pid: libc::pid_t = lines.next()?.trim().parse().ok()?;
+    let host = lines
+        .next()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty());
+    (pid > 0).then_some((pid, host))
 }
 
 /// False only when the process is known to be gone (ESRCH).
@@ -312,9 +320,23 @@ mod tests {
         let pid = dir.join("pid");
         assert_eq!(
             fs::read_to_string(&pid).unwrap(),
-            std::process::id().to_string()
+            format!("{}\n{}\n", std::process::id(), crate::auth::get_hostname())
         );
         assert_eq!(mode(&pid), 0o600);
+    }
+
+    #[test]
+    fn sweep_keeps_dirs_owned_by_another_host() {
+        let root = tempfile::tempdir().unwrap();
+        let other = create_session_dir(root.path()).unwrap();
+        let dead = dead_pid();
+        fs::write(other.join("pid"), format!("{dead}\nsome-other-host\n")).unwrap();
+        let here = create_session_dir(root.path()).unwrap();
+        let host = crate::auth::get_hostname();
+        fs::write(here.join("pid"), format!("{dead}\n{host}\n")).unwrap();
+        sweep_stale(root.path());
+        assert!(other.exists(), "another host's live atem may own it");
+        assert!(!here.exists());
     }
 
     #[test]
