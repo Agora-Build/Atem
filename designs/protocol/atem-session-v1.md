@@ -1,10 +1,11 @@
-# atem-session v1: sessions, control leases and receipts (DRAFT r3 for joint review)
+# atem-session v1: sessions, control leases and receipts (DRAFT r4 for joint review)
 
-Status: Atem-side draft r3, 2026-10-15. r1 (`7a0c691`) and r2 (`9383193`) were
-reviewed by Astation ([r1 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
+Status: Atem-side draft r4, 2026-10-15. r1 (`7a0c691`), r2 (`9383193`) and r3
+(`1bf805c`, [r3 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r3-review.md))
+were reviewed by Astation ([r1 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
 [r2 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r2-review.md),
 summarised in [session-multiplexing.md](../session-multiplexing.md) §12). r2
-answered r1 items 1–7 and 9; r3 answers r2 review items 1–5. Item 8 (trust, freshness, end-to-end channel,
+answered r1 items 1–7 and 9; r3 answered r2 review items 1–5; r4 answers the three r3 corrections. Item 8 (trust, freshness, end-to-end channel,
 QR grants) stays an implementation gate (§9). Not final until both sides
 accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
 
@@ -37,11 +38,18 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
     `acquire{takeover:true}` by that connection's attachment on the same
     authority; `control{take:false}` is `release`. Its `lease_id` maps to that
     lease.
-  - Legacy unscoped mutations (`agentInput`, `agentPrompt`, voice commands,
-    `userCommand`, chat-v1 `submit` without `binding`) are rejected
-    (`forbidden`, nothing written or dispatched) whenever the session they would
-    route to has a remote lease holder, and they never acquire one. With no
-    holder they behave as today (routed per Atem's default-session rule).
+  - A session is **managed** from the moment any attachment first acquires its
+    lease (session `acquire` or legacy terminal-v1 `control`) until the session
+    ends; the flag never clears (not on release, expiry or local reclaim).
+    Legacy unscoped mutations (`agentInput`, `agentPrompt`, voice commands,
+    `userCommand`, chat-v1 `submit` without `binding`) routed to a managed
+    session are always rejected (`forbidden`, nothing written or dispatched),
+    whether or not a remote holder exists, and they never acquire. Sessions that
+    have never been managed keep today's legacy behaviour (routed per Atem's
+    default-session rule); legacy can't create a path into a managed session.
+  - Legacy terminal-v1 `control` keeps all its checks (permission, attachment,
+    exact `terminal_id`/`generation`, subscribed `stream_id`, deadline) before it
+    maps onto `acquire`/`release`.
   - On an upgraded connection every mutation must carry `binding` (§2) and the
     current lease; legacy unscoped mutations there are always `forbidden`.
   - Local terminal input on the host revokes any remote lease first (§5).
@@ -55,7 +63,7 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
 | UUID | lowercase canonical v4 (`8-4-4-4-12`), validated |
 | `session_id` | `ses-` + exactly 12 chars `[a-z2-7]` |
 | Opaque ids (`account_id`, `atem_device_id`, `client_device_id`) | 1–128 bytes, `[A-Za-z0-9._:-]` |
-| Counters (`host_trust_gen`, `lease_epoch`, `revision`) | JSON integers 0 ≤ n ≤ 2^53−1; a value that would exceed it is refused (`error{code:"unsupported_version"}` for peers, fatal for the host's own counters: it stops admitting and asks for re-pairing) — never wraps |
+| Counters (`host_trust_gen`, `lease_epoch`, `runtime_epoch`, `seq`) | JSON integers 0 ≤ n ≤ 2^53−1; a value that would exceed it is refused (`error{code:"unsupported_version"}` for peers, fatal for the host's own counters: it stops admitting and asks for re-pairing) — never wraps |
 | Times | integer milliseconds since the Unix epoch; **display/estimation only** — authority uses monotonic clocks (§5) |
 | Digest | SHA-256, lowercase hex, 64 chars |
 | Bounds | message ≤ 1 MiB after decoding; `payload` ≤ 64 KiB canonical; prompt text ≤ 32 768 bytes; `receipt_query.request_ids` ≤ 64; `detail` ≤ 512 bytes; ≤ 64 in-flight requests per attachment (excess → `busy`) |
@@ -163,6 +171,10 @@ Descriptor:
   from this host; a higher epoch replaces all state (a snapshot at `seq` 1 of
   epoch 8 replaces `seq` 100 of epoch 7); anything from a lower epoch is
   discarded, so a delayed old-runtime snapshot can never switch the client back.
+  Each accepted epoch has one fixed `runtime_gen`; the same epoch with a
+  different `runtime_gen` is rejected. After accepting a new epoch from a
+  change (not a snapshot), the client sends `list` and applies nothing from
+  that epoch until its snapshot arrives.
 - **Per-attachment sequence.** `list` subscribes the attachment. The host then
   sends, on that attachment's single ordered stream, one `sessions` snapshot
   followed only by `session_changed` events. `seq` counts the messages *this
@@ -211,15 +223,19 @@ Normative rules:
   3. Otherwise the new deadline = the request's monotonic **send** time +
      `ms_left` from the reply (never the reply's arrival time + 15 s), and never
      later than the authorization deadline.
-  4. A repeat `acquire` by the current holder returns `ms_left` of the existing
-     lease; it never extends the deadline.
+  4. For a repeat `acquire` while already holding control, the new deadline =
+     `min(previous deadline, request send time + ms_left, authorization
+     deadline)`: it never extends and honours a shorter remaining lifetime. When
+     the deadline passes, input is disabled. An explicit `acquire` after expiry is
+     a new operation (rule 2 still discards replies to requests sent before it).
   Fixture `late-renew-reply-does-not-resurrect-control` (acquire at t=0, renew
   at t=5000, reply delivered at t=17000 with no timer tick; a duplicate earlier
   reply while a later renew is pending; a repeat-acquire reply near expiry).
 - **Renew** after expiry → `stale_lease` (it never re-acquires).
 - **Repeat acquire** by the current holder on the same attachment returns the
-  current lease unchanged (same epoch, no extension); on another attachment of
-  the same controller → `stale_lease` (resume first).
+  current lease unchanged (same epoch, host deadline unchanged, `ms_left` = what
+  remains); on another attachment of the same controller → `stale_lease`
+  (resume first).
 - **Takeover** (`takeover: true`, needs `control`) moves the lease to the caller
   with a new epoch; the previous holder gets `lease_changed{reason:"takeover"}`
   and stays a viewer. Without takeover a held lease → `lease_held`.

@@ -20,7 +20,7 @@ implementation; the fixture plays the host with `deliver_to_client`).
 | step | meaning |
 |---|---|
 | `{"send": client, "json": msg}` | client sends `msg` to the host (send time = current clock) |
-| `{"expect": client, "match": {path: value}}` | next message to that client matches (dotted paths into `data`) |
+| `{"expect": client, "match": {path: value}, "capture"?: {name: path}}` | next message to that client matches (dotted paths into `data`); `capture` stores values for later steps, referenced in any string as `${name}` |
 | `{"expect_all": {…}}` | every client's next message matches |
 | `{"expect_none": client, "for_ms": n}` | nothing reaches that client while the clock advances n |
 | `{"advance_ms": n}` | advance the clock; timers may fire |
@@ -30,8 +30,8 @@ implementation; the fixture plays the host with `deliver_to_client`).
 | `{"local_input": session_id, "bytes": base64}` | local terminal input on the host |
 | `{"crash_worker": session_id}`, `{"restart_runtime": {"runtime_gen": uuid, "runtime_epoch": n}}` | failures |
 | `{"fail_next_fsync": true}`, `{"change_trust_gen": n}` | durability and trust events |
-| `{"assert": {…}}` | host counters: `pty_writes`, `resizes`, `stops`, `dispatches`, `lease_holder`, `receipts_visible: {client: n}` |
-| `{"assert_client": {…}}` | client state: `controls`, `deadline_ms`, `registry` (ids), `registry_state`, `runtime_epoch`, `seq`, `sent_list` |
+| `{"assert": {…}}` | host counters: `pty_writes` (split as `pty_writes_local`/`pty_writes_remote`), `resizes`, `stops`, `dispatches`, `lease_holder`, `receipts_visible: {client: n}` |
+| `{"assert_client": {…}}` | client state: `controls`, `deadline_ms`, `registry` (ids), `registry_state`, `runtime_epoch`, `seq`, `sent_list`, `input_enabled` |
 
 Negative scenarios assert the error and the absence of side effects
 (writes, resizes, stops, dispatch, disclosure, resurrection).
