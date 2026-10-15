@@ -71,7 +71,6 @@ authorization and relay show as `unknown (stale)`.
 ### Device keys (`atem cred`)
 
 ```bash
-atem cred status                        # Same as `atem status`
 atem cred unlock                        # Unlock this device's keys (approve with Touch ID on your Mac)
 atem cred lock                          # Wipe unlocked keys and stop the key agent
 atem cred projects                      # Send known Git projects to Astation's credential picker (keys must be unlocked)

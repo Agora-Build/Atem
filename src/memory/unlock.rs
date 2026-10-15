@@ -12,8 +12,7 @@ use std::time::Duration;
 use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::encoding::dec;
 use crate::memory::key_agent::{
-    KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, default_agent,
-    running_agent,
+    KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, default_agent, running_agent,
 };
 use crate::memory::statements::{SignedWire, StorageRotate};
 use crate::memory::storage_key::{
@@ -454,7 +453,7 @@ async fn send_rotation<L: AstationLink>(
                 Ok(reply) => reply,
                 Err(error) => {
                     if error.downcast_ref::<NoAnswer>().is_some() {
-                        // Before any escrow was confirmed, `atem cred status`
+                        // Before any escrow was confirmed, `atem status`
                         // says Astation may not take storage keys yet.
                         let path = paths.trust.clone();
                         let _ = blocking(move || {
@@ -677,22 +676,11 @@ pub fn lock_keys_message(agent: Option<&dyn KeyAgentApi>) -> Result<String> {
     }
 }
 
-/// `atem cred status`: exactly what `atem status` prints (blocking: may ask
-/// a running key agent).
-pub fn cred_status_text(src: &crate::status::Sources) -> String {
-    crate::status::text(src)
-}
-
-/// `atem cred …` (tier 2: needs a pairing with Astation; `status`, the
-/// `atem status` alias, works on any profile).
+/// `atem cred …` (tier 2: needs a pairing with Astation; the status is
+/// `atem status`).
 pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
     use crate::cli::CredCommands;
-    if let CredCommands::Status = command {
-        let src = crate::status::Sources::current()?;
-        print!("{}", blocking(move || Ok(cred_status_text(&src))).await?);
-        return Ok(());
-    }
-    let _paired = crate::auth::require_pairing("atem cred")?;
+    crate::auth::require_pairing("atem cred")?;
     let paths = KeyPaths::default_paths();
     match command {
         CredCommands::Projects => {
@@ -707,10 +695,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
             println!("Sent project suggestions to Astation.");
             Ok(())
         }
-        CredCommands::Status => unreachable!("handled above"),
-        CredCommands::Unlock => {
-            unlock_command(&paths, &crate::config::AtemConfig::load()?).await
-        }
+        CredCommands::Unlock => unlock_command(&paths, &crate::config::AtemConfig::load()?).await,
         CredCommands::Lock => {
             let message = blocking(|| lock_keys_message(running_agent().as_deref())).await?;
             println!("{message}");
@@ -721,7 +706,12 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
 
 /// Connects to the home Astation without pairing.
 async fn connect_home(home: &str) -> Result<AstationClient> {
-    connect_astation(&crate::config::AtemConfig::load()?, home, "this device's home Astation").await
+    connect_astation(
+        &crate::config::AtemConfig::load()?,
+        home,
+        "this device's home Astation",
+    )
+    .await
 }
 
 /// Connects to `astation_id` (`what` names it in errors) with the saved
@@ -755,7 +745,10 @@ pub(crate) async fn connect_astation(
 
 /// `atem cred unlock`: never pairs or verifies; an unverified device stops
 /// here, offline.
-pub(crate) async fn unlock_command(paths: &KeyPaths, config: &crate::config::AtemConfig) -> Result<()> {
+pub(crate) async fn unlock_command(
+    paths: &KeyPaths,
+    config: &crate::config::AtemConfig,
+) -> Result<()> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let home = match (trust.home(), trust.recorded_home()) {
         (Some(home), _) => home.to_string(),

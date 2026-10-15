@@ -458,7 +458,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   unlocked one is never restarted silently: the command warns that `atem
   cred lock`, then `atem cred unlock` switches to the new agent, keeps
   using the old one, and turns its rejection of a request it doesn't know
-  into the same hint. `atem cred status` marks it "(started by another atem
+  into the same hint. `atem status` marks it "(started by another atem
   build; …)". Builds are compared for equality only: a dev build and the
   npm release of the same version differ, and neither counts as newer.
 - **Home Astation.** One storage key per device, held by the device's first
@@ -484,12 +484,13 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   device keeps its plain keys, as in step 1.
 - **`escrowed_storage_kid`** in `cred_state.json` is the last storage kid
   Astation is known to hold (set at every confirmed escrow or rotation and
-  by an unlock that opened the current file). `atem cred status` uses it to
-  flag a sealed file Astation may not hold, and new storage kids never
+  by an unlock that opened the current file). It tells an escrowed sealed
+  file from one Astation may not hold, and new storage kids never
   reuse it, the current kid, or any kid the device ever abandoned
   (`abandoned_kids`). `escrow_unanswered` records that the home Astation
-  never answered the first escrow (cleared by the first confirmed one), so
-  `atem cred status` can say the key goes over once Astation supports it.
+  never answered the first escrow (cleared by the first confirmed one).
+  `atem status` flags an unlocked agent whose storage key Astation doesn't
+  hold yet ("storage key not yet held by Astation; run atem cred unlock").
 - **Rotation at every unlock, crash-safe in three phases.** (1) The agent
   writes `device_keys.sealed.next` under a new storage key and atem sends
   `storageKeyRotate`. (2) Astation stores the new key as pending, keeps the
@@ -568,7 +569,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   `data_keys.enc` are serialized into one exactly sized, wiped buffer, so
   no unwiped reallocation copy of `K` or the device keys is left behind. A client that
   gets a hang-up from a running v1 agent (for example while writing a large
-  first request) reports the stop-and-retry hint, and `atem cred status`
+  first request) reports the stop-and-retry hint, and `atem status`
   against a v1 agent prints the version-mismatch line and the same hint
   instead of failing.
 - **Mode and kid** come only from the latest signed account state in
@@ -647,7 +648,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
     be re-grantable.
   - A step-2a binary refuses a v2 `device_keys.sealed` (see above). To
     downgrade after a `K` was installed, follow the reset steps that
-    `atem cred status` prints, or wait for a fresh grant.
+    `atem status` prints, or wait for a fresh grant.
   - A key agent left running across the upgrade speaks protocol v1; the
     new atem tells you to stop it. After the upgrade a verified device needs
     `atem cred unlock` once (protocol v2 agent starts locked) before sync
@@ -1196,7 +1197,7 @@ atem cred get <name> [--project <key|short-name> | --global]
                       # value only → stdout; current project, then global
 atem cred list [--all]
                       # name, scope, version, updated; never values
-atem cred status      # verified? safety code, locked?, unlock mode, granted projects
+atem status           # verified? safety code, locked? (the only status command)
 atem cred unlock      # ask Astation to unlock now (get also triggers it)
 atem cred lock        # wipe keys from agent memory now and stop the agent
 atem cred add <name> [--global]
@@ -1519,9 +1520,10 @@ characters.
 An `unlockDenied` with `revoked: true` (or, from an Astation that doesn't
 send the flag yet, "revoked" or "does not belong to this verified device" in
 `reason`, the answer of an Astation that has forgotten the device) is recorded in `cred_state.json`;
-`atem cred status` shows it, and the next `atem pair` with the agent locked
-renames the old key files to `<name>.revoked-<stamp>` and verifies with new
-keys. The signal is unsigned too, but acting on it only renames old files
+`atem status` shows it ("revoked by <id>" for the paired Astation) and
+`atem pair verify` refuses; `atem unpair` with the agent locked renames the
+old key files to `<name>.revoked-<stamp>`, and the next `atem pair` verifies
+with new keys. Verification itself never sets keys aside. The signal is unsigned too, but acting on it only renames old files
 aside and re-verifies with a fresh safety code, so a forged "revoked" can
 cost a re-pair but never keys or trust.
 
@@ -1669,7 +1671,7 @@ Nothing new is stored.
 
 If this device's keys can't be unlocked (the sealed file or
 `unlock_auth_key` is damaged or missing, or Astation lost the storage key),
-`atem cred status` and
+`atem status` and
 `atem cred unlock` print:
 
 > To start over: delete ~/.config/atem/device_keys, device_keys.sealed,

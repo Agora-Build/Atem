@@ -1029,7 +1029,7 @@ impl KeyAgent {
         }
         if source != SealedFile::Prev {
             // The unlock proves Astation holds the key the current file is
-            // now sealed under: record it (`atem cred status` reads it).
+            // now sealed under: record it (`atem status` reads it).
             TrustStore::update(&self.paths.trust, |store| {
                 store.set_escrowed_kid(&granted.storage_kid);
                 Ok(())

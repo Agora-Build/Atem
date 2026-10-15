@@ -40,10 +40,11 @@ impl App {
             Ok(None) => {}
             Ok(Some(AuthResponse::Authenticated)) => self.finish_astation_reauth().await,
             Ok(Some(AuthResponse::Denied(reason))) => self.fail_astation_reauth(format!(
-                "Astation refused to re-authenticate this device ({reason}); run `atem pair`"
+                "Astation refused to re-authenticate this device ({reason}). {}",
+                reauth_advice()
             )),
             Ok(Some(AuthResponse::SessionExpired)) => {
-                self.fail_astation_reauth("Astation session expired; run `atem pair`".to_string())
+                self.fail_astation_reauth(format!("Astation session expired. {}", reauth_advice()))
             }
             Err(error) => {
                 self.fail_astation_reauth(format!("Astation re-authentication failed: {error}"))
@@ -127,6 +128,12 @@ impl App {
         let agents = self.agent_registry.all();
         let _ = self.astation_client.send_agent_list(agents).await;
     }
+}
+
+/// What to do after Astation refused or expired the session: `atem unpair`
+/// first on a paired profile (`atem pair` alone only shows the status).
+fn reauth_advice() -> String {
+    crate::status::pairing_advice(crate::status::current_profile_paired(), "Run `atem pair`.")
 }
 
 #[cfg(test)]

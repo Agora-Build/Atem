@@ -105,8 +105,12 @@ pub(crate) fn paired_status_line(
     use crate::memory::trust::VerificationStatus;
     let suffix = match status {
         Some(VerificationStatus::Verified) => " \u{b7} verified",
-        Some(VerificationStatus::NotVerified) => " \u{b7} not verified \u{2014} run `atem pair verify`",
-        Some(VerificationStatus::Revoked) => " \u{b7} revoked \u{2014} run `atem unpair`, then `atem pair`",
+        Some(VerificationStatus::NotVerified) => {
+            " \u{b7} not verified \u{2014} run `atem pair verify`"
+        }
+        Some(VerificationStatus::Revoked) => {
+            " \u{b7} revoked \u{2014} run `atem unpair`, then `atem pair`"
+        }
         None => "",
     };
     format!("\u{1f517} Paired (SSO: {login_id}){suffix}")

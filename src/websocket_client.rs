@@ -746,6 +746,9 @@ impl AstationClient {
         let hostname = crate::auth::get_hostname();
         let atem_id = self.resolved_atem_id(&hostname);
         if !allow_pairing {
+            if crate::status::current_profile_paired() {
+                return Err(anyhow!("Pairing required. {}", crate::status::SESSION_GONE));
+            }
             return Err(anyhow!("Pairing required; run 'atem pair'"));
         }
 
@@ -887,7 +890,13 @@ impl AstationClient {
         }
         let proof = self
             .auth_proof(&challenge)?
-            .ok_or_else(|| anyhow!("no saved session for this Astation; run `atem pair`"))?;
+            .ok_or_else(|| {
+                if crate::status::current_profile_paired() {
+                    anyhow!("no saved session for this Astation. {}", crate::status::SESSION_GONE)
+                } else {
+                    anyhow!("no saved session for this Astation; run `atem pair`")
+                }
+            })?;
         self.send_message(proof).await?;
         self.answered_challenge = Some((challenge.astation_id, challenge.challenge));
         Ok(())

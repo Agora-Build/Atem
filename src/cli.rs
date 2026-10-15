@@ -91,7 +91,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
-    /// This device's keys: unlock with Touch ID on your Mac, lock, status (see designs/e2e-encryption.md)
+    /// This device's keys: unlock with Touch ID on your Mac, lock (status: `atem status`; see designs/e2e-encryption.md)
     Cred {
         #[command(subcommand)]
         command: CredCommands,
@@ -406,8 +406,6 @@ pub enum PairCommands {
 pub enum CredCommands {
     /// Send known Git projects to Astation's credential picker (keys must be unlocked)
     Projects,
-    /// Same as `atem status`
-    Status,
     /// Unlock this device's keys (approve with Touch ID on your Mac)
     Unlock,
     /// Wipe the unlocked keys from memory and stop the key agent
@@ -924,7 +922,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 println!("Cancelled; nothing was removed.");
                 return Ok(());
             }
-            let notice = {
+            let notices = {
                 let src = src.clone();
                 crate::memory::key_agent::blocking(move || {
                     let agent = crate::memory::key_agent::running_agent();
@@ -933,7 +931,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 .await?
             };
             println!("Unpaired ({count} session{plural} removed).");
-            if let Some(notice) = notice {
+            for notice in notices {
                 println!("{notice}");
             }
             Ok(())
@@ -1189,11 +1187,13 @@ fn revocation_recorded(src: &crate::status::Sources) -> bool {
 /// entries and the saved Astation sessions (the login stays), and, when an
 /// Astation revoked this device and `agent` (the running key agent, if any)
 /// doesn't hold its keys unlocked, sets the revoked keys aside so the next
-/// `atem pair` verifies with new ones. Returns that notice. Blocking.
+/// `atem pair` verifies with new ones. Returns the notices to print: keys set
+/// aside, a revocation left recorded, or a failure to set them aside (the
+/// pairing is removed regardless). Blocking.
 fn unpair_profile(
     src: &crate::status::Sources,
     agent: Option<&dyn crate::memory::key_agent::KeyAgentApi>,
-) -> Result<Option<String>> {
+) -> Result<Vec<String>> {
     let mut store = crate::credentials::CredentialStore::load_from(&src.credentials);
     let before = store.entries.len();
     store
@@ -1207,7 +1207,27 @@ fn unpair_profile(
         sessions.clear();
         sessions.save_to(&src.sessions)?;
     }
-    crate::memory::verification::set_aside_revoked_keys(&src.keys, agent)
+    // Unpaired from here on: what happens to revoked keys is only reported.
+    let mut notices = Vec::new();
+    match crate::memory::verification::set_aside_revoked_keys(&src.keys, agent) {
+        Ok(Some(notice)) => notices.push(notice),
+        Ok(None) => {}
+        Err(error) => notices.push(format!("Couldn't set the revoked keys aside: {error:#}")),
+    }
+    if let Ok(trust) = crate::memory::trust::TrustStore::load_from(&src.keys.trust)
+        && let Some(revoked) = trust.revoked()
+    {
+        let why = if trust.recorded_home() != Some(revoked.astation_id.as_str()) {
+            "it isn't this device's home Astation"
+        } else {
+            "the key agent holds them unlocked; run `atem cred lock`, then `atem unpair` again"
+        };
+        notices.push(format!(
+            "Astation {}'s revocation of this device is still recorded and its keys were not set aside ({why}).",
+            revoked.astation_id
+        ));
+    }
+    Ok(notices)
 }
 
 /// `atem pair [--save]` — when the profile is already paired, prints its status
@@ -1386,7 +1406,9 @@ async fn run_pair_verify(src: &crate::status::Sources) -> Result<()> {
         crate::status::VerifyStart::Verify(astation_id) => astation_id,
     };
     println!("Connecting to Astation {astation_id}...");
-    let mut client = crate::memory::unlock::connect_astation(&src.config, &astation_id, "the paired Astation").await?;
+    let mut client = crate::memory::unlock::connect_astation(&src.config, &astation_id, "the paired Astation")
+        .await
+        .map_err(session_advice)?;
     let verified = crate::pair_verify::verification_result(
         run_device_verification(&mut client, &astation_id).await,
     );
@@ -1395,6 +1417,20 @@ async fn run_pair_verify(src: &crate::status::Sources) -> Result<()> {
         println!("{}", crate::memory::unlock::shown(&status));
     }
     verified
+}
+
+/// `atem pair verify`'s connection failed: when the saved session was refused
+/// or is missing, says what to do (`atem pair` alone would only show the status).
+fn session_advice(error: anyhow::Error) -> anyhow::Error {
+    let text = format!("{error:#}");
+    let refused = ["Pairing required", "Authentication denied", "no saved session"]
+        .iter()
+        .any(|sign| text.contains(sign));
+    if refused && !text.contains(crate::status::SESSION_GONE) {
+        anyhow::anyhow!("{text}. {}", crate::status::SESSION_GONE)
+    } else {
+        error
+    }
 }
 
 /// Verifies this device with Astation: commit, receive Astation's keys,
@@ -2220,7 +2256,7 @@ mod tests {
 
     #[test]
     fn cred_commands_parse() {
-        for (arg, expected) in [("status", "Status"), ("unlock", "Unlock"), ("lock", "Lock")] {
+        for (arg, expected) in [("unlock", "Unlock"), ("lock", "Lock")] {
             let cli = Cli::try_parse_from(["atem", "cred", arg]).unwrap();
             match cli.command {
                 Some(Commands::Cred { command }) => assert_eq!(format!("{command:?}"), expected),
@@ -2476,19 +2512,6 @@ mod tests {
     }
 
     #[test]
-    fn cred_status_prints_what_status_prints() {
-        let dir = tempfile::tempdir().unwrap();
-        paired_profile(dir.path());
-        trust_file(dir.path(), false);
-        let src = crate::status::Sources::in_dir(dir.path());
-        assert_eq!(
-            crate::memory::unlock::cred_status_text(&src),
-            crate::status::text(&src)
-        );
-        assert!(crate::status::text(&src).starts_with("Account:        signed in\n"));
-    }
-
-    #[test]
     fn unpair_removes_pairings_and_saved_sessions_but_keeps_the_login() {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
@@ -2512,7 +2535,7 @@ mod tests {
         manager.save_to(&sessions).unwrap();
         let src = crate::status::Sources::in_dir(dir.path());
         assert_eq!(pairings_to_remove(&src), 2);
-        unpair_profile(&src, None).unwrap();
+        assert!(unpair_profile(&src, None).unwrap().is_empty());
         assert_eq!(crate::status::pairing(&src), None);
         assert_eq!(pairings_to_remove(&src), 0);
         let store = crate::credentials::CredentialStore::load_from(&creds);
@@ -2526,11 +2549,47 @@ mod tests {
         paired_profile(dir.path());
         trust_file(dir.path(), true);
         let src = crate::status::Sources::in_dir(dir.path());
-        let notice = unpair_profile(&src, None).unwrap();
-        assert!(notice.unwrap().contains("old keys were moved aside"));
+        let notices = unpair_profile(&src, None).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("old keys were moved aside"), "{notices:?}");
         assert!(!dir.path().join("device_keys.sealed").exists());
         let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust).unwrap();
         assert!(trust.revoked().is_none());
         assert!(trust.verified("astation-1").is_none());
+    }
+
+    #[test]
+    fn unpair_says_when_a_revocation_stays_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        paired_profile(dir.path());
+        trust_file(dir.path(), false);
+        let src = crate::status::Sources::in_dir(dir.path());
+        crate::memory::trust::TrustStore::update(&src.keys.trust, |trust| {
+            trust.record_revoked("astation-9", 1_700_000_000);
+            Ok(())
+        })
+        .unwrap();
+        let notices = unpair_profile(&src, None).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("Astation astation-9's revocation of this device is still recorded"), "{notices:?}");
+        assert!(dir.path().join("device_keys.sealed").exists());
+        assert_eq!(crate::status::pairing(&src), None);
+    }
+
+    #[test]
+    fn unpair_still_unpairs_when_the_keys_cant_be_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        paired_profile(dir.path());
+        std::fs::write(dir.path().join("cred_state.json"), b"not json").unwrap();
+        let src = crate::status::Sources::in_dir(dir.path());
+        let notices = unpair_profile(&src, None).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].starts_with("Couldn't set the revoked keys aside:"), "{notices:?}");
+        assert_eq!(crate::status::pairing(&src), None);
+    }
+
+    #[test]
+    fn cred_status_is_gone() {
+        assert!(Cli::try_parse_from(["atem", "cred", "status"]).is_err());
     }
 }

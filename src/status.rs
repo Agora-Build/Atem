@@ -1,4 +1,4 @@
-//! `atem status` and its `atem cred status` alias: one read-only, offline
+//! `atem status`: one read-only, offline
 //! report of the account, the pairing, this device's verification and its
 //! credentials. It never connects anywhere, never starts the key agent (it
 //! asks only one that is already running) and never writes a file. Remote
@@ -24,6 +24,16 @@ pub const ALREADY_PAIRED: &str = "Already paired. Verify this device: atem pair 
 pub const NOT_PAIRED: &str = "Not paired. Run atem pair first.";
 /// `atem cred unlock` on a device no Astation verified.
 pub const UNVERIFIED_UNLOCK: &str = "This device isn't verified. Run atem pair verify first.";
+/// `atem pair verify` when the saved pairing doesn't name its Astation.
+pub const NO_ASTATION_ID: &str =
+    "The saved pairing has no Astation id. Run `atem unpair`, then `atem pair`.";
+/// What to do when a paired profile can't authenticate: `atem pair` alone
+/// would only print the status.
+pub const SESSION_GONE: &str =
+    "The saved Astation session expired or was refused. Run `atem unpair`, then `atem pair`.";
+/// Credentials note: the running key agent was started by another build.
+const OLDER_BUILD_NOTE: &str =
+    " (started by another atem build; run atem cred lock, then atem cred unlock)";
 
 /// `atem pair verify` on a device the Astation revoked.
 pub fn revoked_message(astation_id: &str) -> String {
@@ -69,6 +79,8 @@ pub struct StatusReport {
     pub authorization: Line,
     pub relay: Line,
     pub local_agents: Line,
+    /// Printed after the block (e.g. the reset steps for broken key files).
+    pub notes: Vec<String>,
 }
 
 /// Where the status is read from. `current()` is this user's profile;
@@ -118,12 +130,14 @@ impl Sources {
 }
 
 /// The Astation this profile is paired with: the one `require_pairing`
-/// resolves when it does, else the first paired one by id; `others` counts
-/// the other paired Astations.
+/// resolves when it does, else the first paired one by id (`None`: a paired
+/// credential entry that doesn't name its Astation); `others` counts the
+/// other pairings; `session_expired` when its saved session expired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pairing {
-    pub astation_id: String,
+    pub astation_id: Option<String>,
     pub others: usize,
+    pub session_expired: bool,
 }
 
 /// The saved sessions, read without touching the file (no permission repair).
@@ -146,14 +160,16 @@ fn paired_entries(store: &CredentialStore) -> impl Iterator<Item = &CredentialEn
 pub fn pairing(src: &Sources) -> Option<Pairing> {
     let store = CredentialStore::load_from(&src.credentials);
     let sessions = saved_sessions(&src.sessions);
-    let mut ids: BTreeSet<String> = paired_entries(&store)
-        .map(|entry| {
-            entry
-                .astation_id
-                .clone()
-                .unwrap_or_else(|| "unknown".into())
-        })
-        .collect();
+    let mut ids = BTreeSet::new();
+    let mut without_id = 0;
+    for entry in paired_entries(&store) {
+        match &entry.astation_id {
+            Some(id) => {
+                ids.insert(id.clone());
+            }
+            None => without_id += 1,
+        }
+    }
     ids.extend(
         sessions
             .active_sessions()
@@ -167,12 +183,53 @@ pub fn pairing(src: &Sources) -> Option<Pairing> {
         .as_deref()
         .filter(|id| sessions.get(id).is_some())
         .map(str::to_string);
-    let astation_id = resolved.or_else(|| ids.iter().next().cloned())?;
-    ids.insert(astation_id.clone());
+    let astation_id = resolved.or_else(|| ids.iter().next().cloned());
+    if astation_id.is_none() && without_id == 0 {
+        return None;
+    }
+    if let Some(id) = &astation_id {
+        ids.insert(id.clone());
+    }
+    let session_expired = astation_id
+        .as_deref()
+        .is_some_and(|id| sessions.expired(id));
     Some(Pairing {
         astation_id,
-        others: ids.len() - 1,
+        others: ids.len() + without_id - 1,
+        session_expired,
     })
+}
+
+/// Whether this profile holds any pairing state `atem unpair` removes: a
+/// paired credential entry or a saved session, expired ones included.
+pub fn profile_paired(src: &Sources) -> bool {
+    paired_entries(&CredentialStore::load_from(&src.credentials))
+        .next()
+        .is_some()
+        || !saved_sessions(&src.sessions).astation_ids().is_empty()
+}
+
+/// `profile_paired` for this user's profile. Tests never read the user's
+/// profile: there it is always `false`.
+pub fn current_profile_paired() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        Sources::current().is_ok_and(|src| profile_paired(&src))
+    }
+}
+
+/// The advice for a profile that can't authenticate: `SESSION_GONE` when
+/// it is paired (`atem pair` would only print the status), else `fallback`.
+pub fn pairing_advice(paired: bool, fallback: &str) -> String {
+    if paired {
+        SESSION_GONE.to_string()
+    } else {
+        fallback.to_string()
+    }
 }
 
 /// This device's verification with the paired Astation.
@@ -182,7 +239,7 @@ pub enum Verification {
         safety_code: String,
     },
     NotVerified,
-    /// Revoked by this Astation (a revocation wins over any pin).
+    /// Revoked by this Astation (its revocation wins over its pin).
     Revoked {
         by: String,
     },
@@ -195,7 +252,10 @@ pub fn verification(keys: &KeyPaths, astation_id: &str) -> Verification {
         Ok(trust) => trust,
         Err(error) => return Verification::Unknown(format!("{error:#}")),
     };
-    if let Some(revoked) = trust.revoked() {
+    if let Some(revoked) = trust
+        .revoked()
+        .filter(|revoked| revoked.astation_id == astation_id)
+    {
         return Verification::Revoked {
             by: revoked.astation_id.clone(),
         };
@@ -218,55 +278,94 @@ fn account_line(store: &CredentialStore, now: u64) -> Line {
     })
 }
 
-fn credentials_line(keys: &KeyPaths, agent: Option<&dyn KeyAgentApi>) -> Line {
-    let status = agent.map(|agent| agent.status());
-    Line::fresh(match status {
-        Some(Ok(status)) if status.unlocked => "unlocked",
-        _ if !crate::memory::verification::has_device_keys(keys) => "not set up",
-        // No running agent holds them: locked.
-        None | Some(Ok(_)) => "locked",
+/// The credentials line, and the notes printed after the block.
+fn credentials_line(keys: &KeyPaths, agent: Option<&dyn KeyAgentApi>) -> (Line, Vec<String>) {
+    let status = match agent.map(|agent| agent.status()) {
+        None => None,
+        Some(Ok(status)) => Some(status),
         Some(Err(error)) => {
-            return Line::fresh(format!("unknown (key agent not answering: {error:#})"));
+            let line = format!("unknown (key agent not answering: {error:#})");
+            return (Line::fresh(line), Vec::new());
         }
-    })
+    };
+    let older = if status.as_ref().is_some_and(|status| status.older_build) {
+        OLDER_BUILD_NOTE
+    } else {
+        ""
+    };
+    let value = match &status {
+        Some(status) if status.unlocked && !status.escrowed => {
+            "unlocked (storage key not yet held by Astation; run atem cred unlock)"
+        }
+        Some(status) if status.unlocked => "unlocked",
+        _ => {
+            let problem = TrustStore::load_from(&keys.trust)
+                .ok()
+                .and_then(|trust| crate::memory::unlock::key_file_problem(keys, &trust));
+            if let Some(problem) = problem {
+                let line = format!("broken ({problem}){older}");
+                let reset = crate::memory::key_agent::RESET.to_string();
+                return (Line::fresh(line), vec![reset]);
+            }
+            if crate::memory::verification::has_device_keys(keys) {
+                // No running agent holds them unlocked: locked.
+                "locked"
+            } else {
+                "not set up"
+            }
+        }
+    };
+    (Line::fresh(format!("{value}{older}")), Vec::new())
+}
+
+/// The pairing and verification lines.
+fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
+    let Some(pairing) = pairing else {
+        return (Line::fresh("not paired"), Line::fresh("—"));
+    };
+    let more = match pairing.others {
+        0 => String::new(),
+        n => format!(" (+{n} more)"),
+    };
+    let Some(astation_id) = &pairing.astation_id else {
+        let line = format!("paired (no Astation id){more}");
+        return (Line::fresh(line), Line::fresh("—"));
+    };
+    let expired = if pairing.session_expired {
+        ", session expired"
+    } else {
+        ""
+    };
+    let verification = match verification(&src.keys, astation_id) {
+        Verification::Verified { safety_code } => format!("verified (safety code {safety_code})"),
+        Verification::NotVerified => "not verified".into(),
+        Verification::Revoked { by } => format!("revoked by {by}"),
+        Verification::Unknown(error) => format!("unknown ({error})"),
+    };
+    (
+        Line::fresh(format!("paired ({astation_id}{expired}){more}")),
+        Line::fresh(verification),
+    )
 }
 
 /// The status from `src`, with `agent` the already running key agent (if any).
 pub fn gather_with(src: &Sources, agent: Option<&dyn KeyAgentApi>) -> StatusReport {
     let store = CredentialStore::load_from(&src.credentials);
     let paired = pairing(src);
-    let (pairing_line, verification_line) = match &paired {
-        None => (Line::fresh("not paired"), Line::fresh("—")),
-        Some(pairing) => {
-            let more = match pairing.others {
-                0 => String::new(),
-                n => format!(" (+{n} more)"),
-            };
-            let verification = match verification(&src.keys, &pairing.astation_id) {
-                Verification::Verified { safety_code } => {
-                    format!("verified (safety code {safety_code})")
-                }
-                Verification::NotVerified => "not verified".into(),
-                Verification::Revoked { by } => format!("revoked by {by}"),
-                Verification::Unknown(error) => format!("unknown ({error})"),
-            };
-            (
-                Line::fresh(format!("paired ({}){more}", pairing.astation_id)),
-                Line::fresh(verification),
-            )
-        }
-    };
+    let (pairing_line, verification_line) = pairing_lines(src, paired.as_ref());
+    let (credentials, notes) = credentials_line(&src.keys, agent);
     StatusReport {
         account: account_line(&store, CredentialEntry::now_secs()),
         pairing: pairing_line,
         verification: verification_line,
-        credentials: credentials_line(&src.keys, agent),
+        credentials,
         // No freshness contract yet: never "fresh" without proof.
         authorization: Line::stale("unknown"),
         // Status never connects.
         relay: Line::stale("unknown"),
         // No shared runtime to ask yet.
         local_agents: Line::fresh("unknown"),
+        notes,
     }
 }
 
@@ -297,10 +396,14 @@ pub fn render(report: &StatusReport) -> String {
         let stale = if line.stale { " (stale)" } else { "" };
         out.push_str(&format!("{label:<16}{}{stale}\n", line.value));
     }
+    for note in &report.notes {
+        out.push_str(note);
+        out.push('\n');
+    }
     out
 }
 
-/// `atem status` / `atem cred status` (blocking: may ask a running agent).
+/// `atem status` (blocking: may ask a running agent).
 pub fn text(src: &Sources) -> String {
     render(&gather(src))
 }
@@ -325,13 +428,14 @@ pub enum VerifyStart {
 /// not already verified with the paired Astation.
 pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
     let pairing = pairing(src).ok_or_else(|| anyhow!(NOT_PAIRED))?;
-    match verification(&src.keys, &pairing.astation_id) {
+    let astation_id = pairing.astation_id.ok_or_else(|| anyhow!(NO_ASTATION_ID))?;
+    match verification(&src.keys, &astation_id) {
         Verification::Verified { safety_code } => Ok(VerifyStart::AlreadyVerified(
             already_verified_message(&safety_code),
         )),
         Verification::Revoked { by } => Err(anyhow!(revoked_message(&by))),
         Verification::Unknown(error) => Err(anyhow!(error)),
-        Verification::NotVerified => Ok(VerifyStart::Verify(pairing.astation_id)),
+        Verification::NotVerified => Ok(VerifyStart::Verify(astation_id)),
     }
 }
 
@@ -344,32 +448,31 @@ mod tests {
 
     const ASTATION: &str = "astation-1";
 
-    struct UnlockedAgent;
+    /// A running key agent that answers `Status` as told.
+    struct StubAgent {
+        unlocked: bool,
+        escrowed: bool,
+        build: Option<String>,
+    }
 
-    impl KeyAgentApi for UnlockedAgent {
-        fn call(&self, request: Request) -> Result<Reply> {
-            match request {
-                Request::Status => Ok(Reply::Status {
-                    unlocked: true,
-                    storage_kid: Some("0a1b2c3d".into()),
-                    escrowed: true,
-                    build: None,
-                }),
-                _ => Err(anyhow!("not in this test")),
+    impl StubAgent {
+        fn new(unlocked: bool) -> Self {
+            Self {
+                unlocked,
+                escrowed: true,
+                build: Some(crate::memory::key_agent::build_id().to_string()),
             }
         }
     }
 
-    struct LockedAgent;
-
-    impl KeyAgentApi for LockedAgent {
+    impl KeyAgentApi for StubAgent {
         fn call(&self, request: Request) -> Result<Reply> {
             match request {
                 Request::Status => Ok(Reply::Status {
-                    unlocked: false,
-                    storage_kid: None,
-                    escrowed: false,
-                    build: None,
+                    unlocked: self.unlocked,
+                    storage_kid: Some("0a1b2c3d".into()),
+                    escrowed: self.escrowed,
+                    build: self.build.clone(),
                 }),
                 _ => Err(anyhow!("not in this test")),
             }
@@ -442,8 +545,10 @@ mod tests {
         sessions.save_to(&path).unwrap();
     }
 
+    /// A plain `device_keys` file: keys on disk that `key_file_problem`
+    /// accepts (the agent seals it when it starts).
     fn write_device_keys(dir: &Path) {
-        std::fs::write(dir.join("device_keys.sealed"), b"{}").unwrap();
+        std::fs::write(dir.join("device_keys"), b"{}").unwrap();
     }
 
     fn later() -> u64 {
@@ -464,6 +569,7 @@ mod tests {
             authorization: Line::stale("unknown"),
             relay: Line::stale("unknown"),
             local_agents: Line::fresh("unknown"),
+            notes: Vec::new(),
         };
         assert_eq!(
             render(&report),
@@ -517,11 +623,15 @@ mod tests {
         // No running agent holds the keys.
         assert_eq!(report.credentials.value, "locked");
         assert_eq!(
-            gather_with(&src, Some(&LockedAgent)).credentials.value,
+            gather_with(&src, Some(&StubAgent::new(false)))
+                .credentials
+                .value,
             "locked"
         );
         assert_eq!(
-            gather_with(&src, Some(&UnlockedAgent)).credentials.value,
+            gather_with(&src, Some(&StubAgent::new(true)))
+                .credentials
+                .value,
             "unlocked"
         );
     }
@@ -552,8 +662,9 @@ mod tests {
         assert_eq!(
             pairing(&src),
             Some(Pairing {
-                astation_id: "astation-0".into(),
-                others: 0
+                astation_id: Some("astation-0".into()),
+                others: 0,
+                session_expired: false,
             })
         );
         write_paired(dir.path(), "astation-2", later());
@@ -567,8 +678,9 @@ mod tests {
         assert_eq!(
             pairing(&src),
             Some(Pairing {
-                astation_id: "astation-2".into(),
-                others: 1
+                astation_id: Some("astation-2".into()),
+                others: 1,
+                session_expired: false,
             })
         );
         assert_eq!(
@@ -639,6 +751,142 @@ mod tests {
         assert_eq!(
             verify_start(&Sources::in_dir(dir.path())).unwrap(),
             VerifyStart::Verify(ASTATION.into())
+        );
+    }
+
+    #[test]
+    fn an_expired_session_is_shown_and_advises_unpair_then_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        let path = dir.path().join("sessions.json");
+        let mut session = AuthSession::new("s".into(), "t".into(), ASTATION.into(), "host".into());
+        session.last_activity = 0;
+        let mut sessions = SessionManager::default();
+        sessions.insert_session(session);
+        sessions.save_to(&path).unwrap();
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(
+            report(dir.path()).pairing.value,
+            "paired (astation-1, session expired)"
+        );
+        assert!(profile_paired(&src));
+        assert_eq!(
+            pairing_advice(true, "run `atem pair`"),
+            "The saved Astation session expired or was refused. Run `atem unpair`, then `atem pair`."
+        );
+        assert_eq!(pairing_advice(false, "run `atem pair`"), "run `atem pair`");
+        assert_eq!(
+            crate::auth::pairing_gate_message_for("Vault", true),
+            format!("Vault can't use your Astation pairing. {SESSION_GONE}")
+        );
+        assert_eq!(
+            crate::auth::pairing_gate_message_for("Vault", false),
+            crate::auth::pairing_gate_message("Vault")
+        );
+        // An expired session alone (no paired credentials) is no pairing,
+        // but still a profile to unpair first.
+        let alone = tempfile::tempdir().unwrap();
+        sessions
+            .save_to(&alone.path().join("sessions.json"))
+            .unwrap();
+        let alone = Sources::in_dir(alone.path());
+        assert_eq!(pairing(&alone), None);
+        assert!(profile_paired(&alone));
+        assert!(!profile_paired(&Sources::in_dir(
+            tempfile::tempdir().unwrap().path()
+        )));
+    }
+
+    #[test]
+    fn a_pairing_without_an_astation_id_is_never_verified_against_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.enc");
+        let mut entry = CredentialEntry::new_paired(
+            "a".into(),
+            "r".into(),
+            later(),
+            None,
+            ASTATION.into(),
+            true,
+            1,
+        );
+        entry.astation_id = None;
+        CredentialStore {
+            entries: vec![entry],
+        }
+        .save_to(&path)
+        .unwrap();
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(report(dir.path()).pairing.value, "paired (no Astation id)");
+        assert_eq!(report(dir.path()).verification.value, "—");
+        assert_eq!(
+            verify_start(&src).unwrap_err().to_string(),
+            "The saved pairing has no Astation id. Run `atem unpair`, then `atem pair`."
+        );
+    }
+
+    #[test]
+    fn a_revocation_by_another_astation_is_not_this_pairings() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        write_trust(dir.path(), Some(ASTATION), Some("astation-9"));
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(
+            report(dir.path()).verification.value,
+            "verified (safety code MN3H-A74N-FJE4)"
+        );
+        assert!(matches!(
+            verify_start(&src).unwrap(),
+            VerifyStart::AlreadyVerified(_)
+        ));
+    }
+
+    #[test]
+    fn broken_key_files_are_shown_with_the_reset_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        // Verified with a home Astation, but no key files at all.
+        write_trust(dir.path(), Some(ASTATION), None);
+        let report = report(dir.path());
+        assert_eq!(report.credentials.value, "broken (no sealed keys on disk)");
+        let text = render(&report);
+        assert!(
+            text.ends_with(&format!(
+                "Local agents:   unknown\n{}\n",
+                crate::memory::key_agent::RESET
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_running_agent_adds_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        write_trust(dir.path(), Some(ASTATION), None);
+        write_device_keys(dir.path());
+        let src = Sources::in_dir(dir.path());
+        let older = StubAgent {
+            build: Some("other".into()),
+            ..StubAgent::new(false)
+        };
+        assert_eq!(
+            gather_with(&src, Some(&older)).credentials.value,
+            "locked (started by another atem build; run atem cred lock, then atem cred unlock)"
+        );
+        let waiting = StubAgent {
+            escrowed: false,
+            ..StubAgent::new(true)
+        };
+        assert_eq!(
+            gather_with(&src, Some(&waiting)).credentials.value,
+            "unlocked (storage key not yet held by Astation; run atem cred unlock)"
+        );
+        // Unlocked keys need no reset note.
+        assert!(
+            gather_with(&src, Some(&StubAgent::new(true)))
+                .notes
+                .is_empty()
         );
     }
 

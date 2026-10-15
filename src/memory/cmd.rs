@@ -118,6 +118,26 @@ fn build_ctx(allow_tracked: bool) -> Result<Ctx> {
 const NOT_CONFIGURED_MSG: &str = "No Astation configured — set astation_relay_code (or ASTATION_RELAY_CODE); changes stay queued.";
 const NOT_PAIRED_MSG: &str = "Not paired with your Astation — run `atem pair`; changes stay queued.";
 
+/// `NOT_PAIRED_MSG`, or for a paired profile whose session expired or was
+/// refused, what to do instead (`atem pair` would only show the status).
+fn not_paired_msg(paired: bool) -> String {
+    if paired {
+        format!("{} Changes stay queued.", crate::status::SESSION_GONE)
+    } else {
+        NOT_PAIRED_MSG.to_string()
+    }
+}
+
+/// The error for skill history/restore without a usable pairing.
+fn history_unpaired() -> anyhow::Error {
+    anyhow!(not_paired_history_msg(crate::status::current_profile_paired()))
+}
+
+/// `NOT_PAIRED_HISTORY_MSG`, or the advice for a paired profile.
+fn not_paired_history_msg(paired: bool) -> String {
+    crate::status::pairing_advice(paired, NOT_PAIRED_HISTORY_MSG)
+}
+
 /// `Err` when no relay client can be built (no Astation configured, or no
 /// pairing session). `crate::auth::require_pairing` should already have
 /// caught this before any of these callers run, but `client()` resolves the
@@ -144,7 +164,7 @@ fn astation_status_line(astation_id: &str) -> String {
 fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>) -> String {
     match problem {
         Some(PairingProblem::NotConfigured) => NOT_CONFIGURED_MSG.to_string(),
-        Some(PairingProblem::NotPaired) => NOT_PAIRED_MSG.to_string(),
+        Some(PairingProblem::NotPaired) => not_paired_msg(crate::status::current_profile_paired()),
         None if out.offline => "Relay unreachable — changes stay queued and sync next time.".to_string(),
         None if out.relay_error => format!(
             "Sync incomplete — pushed {} change(s), pulled {} update(s); the rest stay queued (see notes).",
@@ -753,7 +773,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             check_history_name(&name)?;
             let scope = skill_scope(&scope)?;
             let project = project_for_scope(scope, &ctx, None)?;
-            let c = client().await.map_err(|_| anyhow!(NOT_PAIRED_HISTORY_MSG))?;
+            let c = client().await.map_err(|_| history_unpaired())?;
             let versions = c.skill_versions(scope, &project, &name).await
                 .map_err(|e| sync::skill_history_error(e, &name, None))?;
             if versions.is_empty() {
@@ -767,7 +787,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             check_history_name(&name)?;
             let scope = skill_scope(&scope)?;
             let project = project_for_scope(scope, &ctx, None)?;
-            let c = client().await.map_err(|_| anyhow!(NOT_PAIRED_HISTORY_MSG))?;
+            let c = client().await.map_err(|_| history_unpaired())?;
             let restored = sync::restore_skill(&store, &c, &ctx.atem_id, scope, &project, &name, version).await?;
             println!("Restored {} v{} as v{}.", name, version, restored.version);
             let report = best_effort_sync_report(&store, &ctx).await;
@@ -1043,6 +1063,12 @@ mod tests {
         assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired)), NOT_PAIRED_MSG);
         assert!(NOT_CONFIGURED_MSG.contains("astation_relay_code") && NOT_CONFIGURED_MSG.contains("stay queued"));
         assert!(NOT_PAIRED_MSG.contains("atem pair") && NOT_PAIRED_MSG.contains("stay queued"));
+        assert_eq!(
+            not_paired_msg(true),
+            "The saved Astation session expired or was refused. Run `atem unpair`, then `atem pair`. Changes stay queued."
+        );
+        assert_eq!(not_paired_history_msg(false), NOT_PAIRED_HISTORY_MSG);
+        assert_eq!(not_paired_history_msg(true), crate::status::SESSION_GONE);
         assert!(sync_status_line(&offline, None).starts_with("Relay unreachable"));
         let done = SyncOutcome { pushed: 2, pulled: 3, ..Default::default() };
         assert_eq!(sync_status_line(&done, None), "Pushed 2 change(s), pulled 3 update(s).");

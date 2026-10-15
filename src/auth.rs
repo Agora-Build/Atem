@@ -69,10 +69,28 @@ pub fn pairing_gate_message(feature: &str) -> String {
     )
 }
 
+/// The tier-2 gate message for `paired`: a paired profile without a usable
+/// session can't pair again with `atem pair` (it only shows the status).
+pub fn pairing_gate_message_for(feature: &str, paired: bool) -> String {
+    if paired {
+        format!(
+            "{feature} can't use your Astation pairing. {}",
+            crate::status::SESSION_GONE
+        )
+    } else {
+        pairing_gate_message(feature)
+    }
+}
+
 /// The tier-2 gate: a local check with no network. Fails with an actionable
 /// message when this machine isn't paired with an Astation.
 pub fn require_pairing(feature: &str) -> Result<PairedSession> {
-    pairing_session().map_err(|_| anyhow!(pairing_gate_message(feature)))
+    pairing_session().map_err(|_| {
+        anyhow!(pairing_gate_message_for(
+            feature,
+            crate::status::current_profile_paired()
+        ))
+    })
 }
 
 /// The tier-1 gate message: `feature` refused because there's no `atem
@@ -207,6 +225,13 @@ impl SessionManager {
     /// Every saved session's Astation id, expired ones included.
     pub(crate) fn astation_ids(&self) -> Vec<String> {
         self.sessions.keys().cloned().collect()
+    }
+
+    /// Whether the saved session for `astation_id` exists but expired.
+    pub(crate) fn expired(&self, astation_id: &str) -> bool {
+        self.sessions
+            .get(astation_id)
+            .is_some_and(|s| !s.is_valid())
     }
 
     /// Forgets every saved session (`atem unpair`).

@@ -749,7 +749,10 @@ pub fn set_aside_revoked_keys(
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let aside = path.with_file_name(format!("{name}.revoked-{stamp}"));
         if aside.symlink_metadata().is_ok() {
-            bail!("{} already exists; move it away and run `atem unpair` again", aside.display());
+            bail!(
+                "{} already exists; move it away and run `atem unpair` again",
+                aside.display()
+            );
         }
         std::fs::rename(path, &aside)
             .with_context(|| format!("couldn't move {} aside", path.display()))?;
@@ -1875,7 +1878,10 @@ mod ceremony_tests {
             verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
         escrow_first(&agent, &fake, &certificate, outcome);
         let rebooted = test_agent(&paths);
-        assert_eq!(set_aside_revoked_keys(&paths, Some(&rebooted)).unwrap(), None);
+        assert_eq!(
+            set_aside_revoked_keys(&paths, Some(&rebooted)).unwrap(),
+            None
+        );
         let error = error_of(device_keys_for_verification(&paths, &rebooted));
         assert!(error.contains("atem cred unlock"), "{error}");
         // Revoked by an Astation that isn't the home: nothing moves either.
@@ -1884,7 +1890,10 @@ mod ceremony_tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(set_aside_revoked_keys(&paths, Some(&rebooted)).unwrap(), None);
+        assert_eq!(
+            set_aside_revoked_keys(&paths, Some(&rebooted)).unwrap(),
+            None
+        );
         // An unlocked agent verifies with the keys it holds, as before.
         TrustStore::update(&paths.trust, |store| {
             store.record_revoked(ASTATION_ID, 1_700_000_000);
