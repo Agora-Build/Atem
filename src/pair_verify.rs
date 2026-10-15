@@ -219,7 +219,10 @@ pub(crate) async fn next_verify_message(client: &mut AstationClient) -> Result<A
             ) => return Ok(message),
             // Applied after the verification, against the pins it sets.
             Some(message) => client.hold_encryption(message),
-            None => anyhow::bail!("Astation connection closed during device verification"),
+            None => anyhow::bail!(
+                "Astation connection closed during device verification{}",
+                client.close_detail()
+            ),
         }
     }
 }
@@ -586,6 +589,44 @@ mod tests {
             frames[0]["data"]["reason"],
             "timed out waiting for Astation"
         );
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_says_why_and_what_could_not_be_read() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // A deviceVerified this atem can't parse is dropped, not fatal.
+            let unreadable = r#"{"type":"deviceVerified","data":{"device_verified":42}}"#;
+            socket.send(Message::Text(unreadable.into())).await.unwrap();
+            socket
+                .close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "signing failed".into(),
+                }))
+                .await
+                .unwrap();
+        });
+        let mut client = connected(&url).await;
+        let Err(failure) = await_device_verified(&mut client, Duration::from_secs(5)).await else {
+            panic!("expected a closed connection");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let error =
+            abandon_verification(&client, &dir.path().join("cred_state.json"), "a", failure).await;
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("closed by Astation: 1008 \"signing failed\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("unreadable messages from Astation: deviceVerified"),
+            "{text}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

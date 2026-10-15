@@ -468,6 +468,27 @@ pub struct AstationClient {
     /// before Astation said who it is (a pairing-code relay connection never
     /// authenticates), or during device verification.
     held_encryption: Vec<AstationMessage>,
+    /// How the current socket ended and what it couldn't read, for errors.
+    transport_notes: std::sync::Arc<std::sync::Mutex<TransportNotes>>,
+}
+
+/// What the reader saw that the caller can't: why the socket closed, and the
+/// types of messages that didn't parse (dropped). Reset at each connect.
+#[derive(Debug, Default)]
+struct TransportNotes {
+    closed: Option<String>,
+    unreadable: Vec<String>,
+}
+
+/// At most this many unreadable message types are remembered per socket.
+const MAX_UNREADABLE_NOTES: usize = 8;
+
+/// The `type` of a message that didn't parse, never its content.
+fn unreadable_type(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t.chars().take(64).collect()))
+        .unwrap_or_else(|| "not JSON".to_string())
 }
 
 /// Status of an encryption message held for later; internal, not shown.
@@ -493,7 +514,23 @@ impl AstationClient {
             connected_astation_id: None,
             answered_challenge: None,
             held_encryption: Vec::new(),
+            transport_notes: Default::default(),
         }
+    }
+
+    /// Why the last socket closed and which Astation messages couldn't be
+    /// read on it, e.g. ` (closed by Astation: 1000 "bye")`; empty when
+    /// nothing is known.
+    pub fn close_detail(&self) -> String {
+        let notes = self.transport_notes.lock().unwrap();
+        let mut parts = Vec::new();
+        if let Some(closed) = &notes.closed {
+            parts.push(closed.clone());
+        }
+        if !notes.unreadable.is_empty() {
+            parts.push(format!("unreadable messages from Astation: {}", notes.unreadable.join(", ")));
+        }
+        if parts.is_empty() { String::new() } else { format!(" ({})", parts.join("; ")) }
     }
 
     /// The Astation this client authenticated with, once it said who it is.
@@ -639,26 +676,42 @@ impl AstationClient {
         });
 
         // Spawn task to handle incoming messages
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(TransportNotes::default()));
+        self.transport_notes = notes.clone();
         let reader_task = tokio::spawn(async move {
-            while let Some(message) = read.next().await {
+            let closed = loop {
+                let Some(message) = read.next().await else { break "connection ended without a close frame".to_string() };
                 match message {
                     Ok(Message::Text(text)) => {
-                        if let Ok(astation_msg) = serde_json::from_str::<AstationMessage>(&text) {
-                            if matches!(&astation_msg, AstationMessage::Terminal(_)) && text.len() > 32 * 1024 { continue; }
-                            if tx.send(astation_msg).await.is_err() {
-                                break; // Receiver has been dropped
+                        match serde_json::from_str::<AstationMessage>(&text) {
+                            Ok(astation_msg) => {
+                                if matches!(&astation_msg, AstationMessage::Terminal(_)) && text.len() > 32 * 1024 { continue; }
+                                if tx.send(astation_msg).await.is_err() {
+                                    break "closed by atem".to_string(); // Receiver has been dropped
+                                }
+                            }
+                            Err(_) => {
+                                let mut notes = notes.lock().unwrap();
+                                if notes.unreadable.len() < MAX_UNREADABLE_NOTES { notes.unreadable.push(unreadable_type(&text)); }
                             }
                         }
                     }
-                    Ok(Message::Close(_)) => {
-                        break;
+                    Ok(Message::Close(frame)) => {
+                        break match frame {
+                            Some(frame) => {
+                                let reason: String = frame.reason.chars().take(120).collect();
+                                format!("closed by Astation: {} {reason:?}", u16::from(frame.code))
+                            }
+                            None => "closed by Astation without a reason".to_string(),
+                        };
                     }
-                    Err(_) => {
-                        break;
+                    Err(error) => {
+                        break format!("connection error: {error}");
                     }
                     _ => {}
                 }
-            }
+            };
+            notes.lock().unwrap().closed = Some(closed);
         });
 
         self.sender = Some(msg_tx);
