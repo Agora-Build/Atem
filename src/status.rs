@@ -209,17 +209,10 @@ pub fn profile_paired(src: &Sources) -> bool {
         || !saved_sessions(&src.sessions).astation_ids().is_empty()
 }
 
-/// `profile_paired` for this user's profile. Tests never read the user's
-/// profile: there it is always `false`.
+/// `profile_paired` for this user's profile (production entry points only;
+/// everything below them takes `paired` or a `Sources`).
 pub fn current_profile_paired() -> bool {
-    #[cfg(test)]
-    {
-        false
-    }
-    #[cfg(not(test))]
-    {
-        Sources::current().is_ok_and(|src| profile_paired(&src))
-    }
+    Sources::current().is_ok_and(|src| profile_paired(&src))
 }
 
 /// The advice for a profile that can't authenticate: `SESSION_GONE` when
@@ -776,7 +769,7 @@ mod tests {
         );
         assert_eq!(pairing_advice(false, "run `atem pair`"), "run `atem pair`");
         assert_eq!(
-            crate::auth::pairing_gate_message_for("Vault", true),
+            crate::auth::pairing_gate_message_for("Vault", profile_paired(&src)),
             format!("Vault can't use your Astation pairing. {SESSION_GONE}")
         );
         assert_eq!(

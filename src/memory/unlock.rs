@@ -695,7 +695,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
             println!("Sent project suggestions to Astation.");
             Ok(())
         }
-        CredCommands::Unlock => unlock_command(&paths, &crate::config::AtemConfig::load()?).await,
+        CredCommands::Unlock => unlock_command(&crate::status::Sources::current()?).await,
         CredCommands::Lock => {
             let message = blocking(|| lock_keys_message(running_agent().as_deref())).await?;
             println!("{message}");
@@ -706,23 +706,20 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
 
 /// Connects to the home Astation without pairing.
 async fn connect_home(home: &str) -> Result<AstationClient> {
-    connect_astation(
-        &crate::config::AtemConfig::load()?,
-        home,
-        "this device's home Astation",
-    )
-    .await
+    let src = crate::status::Sources::current()?;
+    connect_astation(&src, home, "this device's home Astation").await
 }
 
 /// Connects to `astation_id` (`what` names it in errors) with the saved
-/// session, never pairing: locally when the local Astation is that one,
-/// else through its relay identity room.
+/// session of the profile `src`, never pairing: locally when the local
+/// Astation is that one, else through its relay identity room.
 pub(crate) async fn connect_astation(
-    config: &crate::config::AtemConfig,
+    src: &crate::status::Sources,
     astation_id: &str,
     what: &str,
 ) -> Result<AstationClient> {
-    let mut local = AstationClient::new();
+    let config = &src.config;
+    let mut local = AstationClient::new().with_profile(src.clone());
     if local
         .connect_without_pairing(config.astation_ws())
         .await
@@ -732,7 +729,7 @@ pub(crate) async fn connect_astation(
         return Ok(local);
     }
     drop(local);
-    let mut client = AstationClient::new();
+    let mut client = AstationClient::new().with_profile(src.clone());
     client
         .connect_relay_identity_without_pairing(config.astation_relay_url(), astation_id)
         .await
@@ -745,10 +742,8 @@ pub(crate) async fn connect_astation(
 
 /// `atem cred unlock`: never pairs or verifies; an unverified device stops
 /// here, offline.
-pub(crate) async fn unlock_command(
-    paths: &KeyPaths,
-    config: &crate::config::AtemConfig,
-) -> Result<()> {
+pub(crate) async fn unlock_command(src: &crate::status::Sources) -> Result<()> {
+    let paths = &src.keys;
     let trust = TrustStore::load_from(&paths.trust)?;
     let home = match (trust.home(), trust.recorded_home()) {
         (Some(home), _) => home.to_string(),
@@ -768,12 +763,12 @@ pub(crate) async fn unlock_command(
             // Astation sends the signed state on connect; applying it finishes
             // the migration and sends the signed completion report.
             println!("Finishing the encryption migration with Astation…");
-            let mut client = connect_astation(config, &home, "this device's home Astation").await?;
+            let mut client = connect_astation(src, &home, "this device's home Astation").await?;
             finish_migration(&mut client, MIGRATION_WAIT).await;
         }
         return Ok(());
     }
-    let mut client = connect_astation(config, &home, "this device's home Astation").await?;
+    let mut client = connect_astation(src, &home, "this device's home Astation").await?;
     unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
     // The report sent on connect was skipped (the keys were still locked);
     // send it now, on the same connection. Best effort, like on connect.

@@ -468,7 +468,44 @@ pub struct AstationClient {
     /// before Astation said who it is (a pairing-code relay connection never
     /// authenticates), or during device verification.
     held_encryption: Vec<AstationMessage>,
+    /// The profile whose pairing errors advise on (`with_profile`); `None`
+    /// is this user's profile.
+    profile: Option<crate::status::Sources>,
 }
+
+/// Why a connection couldn't authenticate with the saved session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionProblem {
+    /// Astation denied the saved session.
+    Refused,
+    /// No saved session for this Astation.
+    Missing,
+    /// The session didn't authenticate and pairing isn't allowed here.
+    PairingRequired,
+}
+
+/// A `SessionProblem` with its message; `advised` when the message already
+/// says to run `atem unpair`, then `atem pair` (a paired profile).
+#[derive(Debug)]
+pub struct SessionError {
+    pub problem: SessionProblem,
+    pub advised: bool,
+    message: String,
+}
+
+impl SessionError {
+    pub fn new(problem: SessionProblem, advised: bool, message: String) -> Self {
+        Self { problem, advised, message }
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionError {}
 
 /// Status of an encryption message held for later; internal, not shown.
 pub const HOLDING_ENCRYPTION: &str = "Holding an encryption message until Astation's identity is known";
@@ -493,6 +530,21 @@ impl AstationClient {
             connected_astation_id: None,
             answered_challenge: None,
             held_encryption: Vec::new(),
+            profile: None,
+        }
+    }
+
+    /// Advise on pairing errors from `profile` instead of this user's profile.
+    pub(crate) fn with_profile(mut self, profile: crate::status::Sources) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Whether the client's profile is paired (`status::profile_paired`).
+    pub(crate) fn profile_paired(&self) -> bool {
+        match &self.profile {
+            Some(profile) => crate::status::profile_paired(profile),
+            None => crate::status::current_profile_paired(),
         }
     }
 
@@ -505,6 +557,9 @@ impl AstationClient {
     pub(crate) fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
         let mut client = Self::new();
         client.atem_id_override = Some(atem_id.to_string());
+        if let Some(dir) = session_path.parent() {
+            client.profile = Some(crate::status::Sources::in_dir(dir));
+        }
         client.relay_code_path_override = Some(session_path.with_file_name("relay-code"));
         client.session_path_override = Some(session_path);
         client
@@ -738,7 +793,8 @@ impl AstationClient {
                 // Fall through to pairing.
                 Some(AuthResponse::SessionExpired) | None => {}
                 Some(AuthResponse::Denied(msg)) => {
-                    return Err(anyhow!("Authentication denied: {}", msg));
+                    let message = format!("Authentication denied: {}", msg);
+                    return Err(SessionError::new(SessionProblem::Refused, false, message).into());
                 }
             }
         }
@@ -746,10 +802,13 @@ impl AstationClient {
         let hostname = crate::auth::get_hostname();
         let atem_id = self.resolved_atem_id(&hostname);
         if !allow_pairing {
-            if crate::status::current_profile_paired() {
-                return Err(anyhow!("Pairing required. {}", crate::status::SESSION_GONE));
-            }
-            return Err(anyhow!("Pairing required; run 'atem pair'"));
+            let paired = self.profile_paired();
+            let message = if paired {
+                format!("Pairing required. {}", crate::status::SESSION_GONE)
+            } else {
+                "Pairing required; run 'atem pair'".to_string()
+            };
+            return Err(SessionError::new(SessionProblem::PairingRequired, paired, message).into());
         }
 
         // Session auth failed or no session - use explicit pairing.
@@ -891,11 +950,13 @@ impl AstationClient {
         let proof = self
             .auth_proof(&challenge)?
             .ok_or_else(|| {
-                if crate::status::current_profile_paired() {
-                    anyhow!("no saved session for this Astation. {}", crate::status::SESSION_GONE)
+                let paired = self.profile_paired();
+                let message = if paired {
+                    format!("no saved session for this Astation. {}", crate::status::SESSION_GONE)
                 } else {
-                    anyhow!("no saved session for this Astation; run `atem pair`")
-                }
+                    "no saved session for this Astation; run `atem pair`".to_string()
+                };
+                anyhow::Error::from(SessionError::new(SessionProblem::Missing, paired, message))
             })?;
         self.send_message(proof).await?;
         self.answered_challenge = Some((challenge.astation_id, challenge.challenge));
@@ -1034,7 +1095,8 @@ impl AstationClient {
     pub async fn report_credential_projects(&self) -> Result<()> {
         use crate::memory::key_agent::{blocking, running_agent};
         let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
-        crate::auth::require_pairing("credential project discovery")?;
+        crate::auth::pairing_session()
+            .map_err(|_| anyhow!("this machine isn't paired with an Astation"))?;
         let report = blocking(move || {
             let agent = running_agent().ok_or_else(|| anyhow!("key agent is not running"))?;
             if !agent.status()?.unlocked { return Err(anyhow!("key agent is locked")); }
@@ -2188,6 +2250,74 @@ mod tests {
             .await
             .expect_err("proof-only connection unexpectedly started pairing");
         assert_eq!(error.to_string(), "Pairing required; run 'atem pair'");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_paired_profile_without_a_usable_session_is_told_to_unpair_then_pair() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test Astation");
+        let address = listener.local_addr().unwrap();
+        let astation_id = format!("astation-proof-only-{}", uuid::Uuid::new_v4());
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test Astation did not accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake failed");
+            let auth_required = AstationMessage::StatusUpdate {
+                status: "auth_required".to_string(),
+                data: std::collections::HashMap::from([
+                    ("astation_id".to_string(), astation_id),
+                    ("challenge".to_string(), "d".repeat(64)),
+                    ("transport".to_string(), "lan".to_string()),
+                    ("protocol".to_string(), "2".to_string()),
+                ]),
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&auth_required).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
+                Err(_) | Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => {}
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    panic!("background reconnect unexpectedly sent pairing data: {text}")
+                }
+                Ok(Some(other)) => panic!("unexpected WebSocket frame: {other:?}"),
+            }
+        });
+
+        let (state, mut client) = isolated_client("atem-test-proof-only");
+        // A paired credential entry in the client's profile (a temp dir).
+        let mut store = crate::credentials::CredentialStore { entries: Vec::new() };
+        store.upsert(crate::credentials::CredentialEntry::new_paired(
+            "a".into(),
+            "r".into(),
+            u64::MAX,
+            None,
+            "astation-x".into(),
+            true,
+            1,
+        ));
+        store.save_to(&state.path().join("credentials.enc")).unwrap();
+        let error = client
+            .connect_without_pairing(&format!("ws://{address}"))
+            .await
+            .expect_err("proof-only connection unexpectedly started pairing");
+        assert_eq!(
+            error.to_string(),
+            format!("Pairing required. {}", crate::status::SESSION_GONE)
+        );
+        let session = error.downcast_ref::<SessionError>().expect("typed session error");
+        assert_eq!(session.problem, SessionProblem::PairingRequired);
+        assert!(session.advised);
         server.await.unwrap();
     }
 

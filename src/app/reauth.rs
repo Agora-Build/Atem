@@ -41,11 +41,12 @@ impl App {
             Ok(Some(AuthResponse::Authenticated)) => self.finish_astation_reauth().await,
             Ok(Some(AuthResponse::Denied(reason))) => self.fail_astation_reauth(format!(
                 "Astation refused to re-authenticate this device ({reason}). {}",
-                reauth_advice()
+                reauth_advice(self.astation_client.profile_paired())
             )),
-            Ok(Some(AuthResponse::SessionExpired)) => {
-                self.fail_astation_reauth(format!("Astation session expired. {}", reauth_advice()))
-            }
+            Ok(Some(AuthResponse::SessionExpired)) => self.fail_astation_reauth(format!(
+                "Astation session expired. {}",
+                reauth_advice(self.astation_client.profile_paired())
+            )),
             Err(error) => {
                 self.fail_astation_reauth(format!("Astation re-authentication failed: {error}"))
             }
@@ -131,9 +132,9 @@ impl App {
 }
 
 /// What to do after Astation refused or expired the session: `atem unpair`
-/// first on a paired profile (`atem pair` alone only shows the status).
-fn reauth_advice() -> String {
-    crate::status::pairing_advice(crate::status::current_profile_paired(), "Run `atem pair`.")
+/// first on a `paired` profile (`atem pair` alone only shows the status).
+fn reauth_advice(paired: bool) -> String {
+    crate::status::pairing_advice(paired, "Run `atem pair`.")
 }
 
 #[cfg(test)]
@@ -464,6 +465,24 @@ mod tests {
             .send(status("error", &[("message", "Session expired")]))
             .unwrap();
         assert_fails_closed(&mut app, &mut peer, "atem pair").await;
+    }
+
+    #[tokio::test]
+    async fn a_paired_profile_is_told_to_unpair_then_pair() {
+        // The client's profile (a temp dir) holds a saved session: paired.
+        let (mut app, mut peer) = connected_app().await;
+        peer.send
+            .send(auth_required(ASTATION, &"b".repeat(64)))
+            .unwrap();
+        next_auth(&mut app, &mut peer).await;
+        peer.send
+            .send(status(
+                "auth",
+                &[("status", "denied"), ("message", "revoked")],
+            ))
+            .unwrap();
+        assert_fails_closed(&mut app, &mut peer, crate::status::SESSION_GONE).await;
+        assert_eq!(reauth_advice(false), "Run `atem pair`.");
     }
 
     #[tokio::test]

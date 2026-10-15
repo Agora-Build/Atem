@@ -1406,7 +1406,8 @@ async fn run_pair_verify(src: &crate::status::Sources) -> Result<()> {
         crate::status::VerifyStart::Verify(astation_id) => astation_id,
     };
     println!("Connecting to Astation {astation_id}...");
-    let mut client = crate::memory::unlock::connect_astation(&src.config, &astation_id, "the paired Astation")
+    let what = "the paired Astation";
+    let mut client = crate::memory::unlock::connect_astation(src, &astation_id, what)
         .await
         .map_err(session_advice)?;
     let verified = crate::pair_verify::verification_result(
@@ -1420,14 +1421,19 @@ async fn run_pair_verify(src: &crate::status::Sources) -> Result<()> {
 }
 
 /// `atem pair verify`'s connection failed: when the saved session was refused
-/// or is missing, says what to do (`atem pair` alone would only show the status).
+/// or is missing (a `SessionError` the connect path returned), says what to do
+/// (`atem pair` alone would only show the status), unless it already did.
 fn session_advice(error: anyhow::Error) -> anyhow::Error {
-    let text = format!("{error:#}");
-    let refused = ["Pairing required", "Authentication denied", "no saved session"]
-        .iter()
-        .any(|sign| text.contains(sign));
-    if refused && !text.contains(crate::status::SESSION_GONE) {
-        anyhow::anyhow!("{text}. {}", crate::status::SESSION_GONE)
+    use crate::websocket_client::{SessionError, SessionProblem};
+    let advise = error.downcast_ref::<SessionError>().is_some_and(|session| {
+        !session.advised
+            && matches!(
+                session.problem,
+                SessionProblem::Refused | SessionProblem::Missing | SessionProblem::PairingRequired
+            )
+    });
+    if advise {
+        anyhow::anyhow!("{error:#}. {}", crate::status::SESSION_GONE)
     } else {
         error
     }
@@ -2504,7 +2510,7 @@ mod tests {
         paired_profile(dir.path());
         let mut src = crate::status::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
-        let error = crate::memory::unlock::unlock_command(&src.keys, &src.config)
+        let error = crate::memory::unlock::unlock_command(&src)
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "This device isn't verified. Run atem pair verify first.");
@@ -2591,5 +2597,38 @@ mod tests {
     #[test]
     fn cred_status_is_gone() {
         assert!(Cli::try_parse_from(["atem", "cred", "status"]).is_err());
+    }
+
+    #[test]
+    fn pair_verify_adds_the_advice_only_to_session_errors() {
+        use crate::websocket_client::{SessionError, SessionProblem};
+        let refused = anyhow::Error::new(SessionError::new(
+            SessionProblem::Refused,
+            false,
+            "Authentication denied: no".into(),
+        ))
+        .context("couldn't reach the paired Astation (a-1)");
+        assert_eq!(
+            format!("{:#}", session_advice(refused)),
+            format!(
+                "couldn't reach the paired Astation (a-1): Authentication denied: no. {}",
+                crate::status::SESSION_GONE
+            )
+        );
+        let advised = anyhow::Error::new(SessionError::new(
+            SessionProblem::PairingRequired,
+            true,
+            format!("Pairing required. {}", crate::status::SESSION_GONE),
+        ));
+        assert_eq!(
+            format!("{:#}", session_advice(advised)),
+            format!("Pairing required. {}", crate::status::SESSION_GONE)
+        );
+        // Not a session problem (even if the text looks like one): unchanged.
+        let network = anyhow::anyhow!("Pairing required? WebSocket connection timed out after 5s");
+        assert_eq!(
+            format!("{:#}", session_advice(network)),
+            "Pairing required? WebSocket connection timed out after 5s"
+        );
     }
 }

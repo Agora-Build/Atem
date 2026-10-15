@@ -129,8 +129,8 @@ fn not_paired_msg(paired: bool) -> String {
 }
 
 /// The error for skill history/restore without a usable pairing.
-fn history_unpaired() -> anyhow::Error {
-    anyhow!(not_paired_history_msg(crate::status::current_profile_paired()))
+fn history_unpaired(paired: bool) -> anyhow::Error {
+    anyhow!(not_paired_history_msg(paired))
 }
 
 /// `NOT_PAIRED_HISTORY_MSG`, or the advice for a paired profile.
@@ -161,10 +161,11 @@ fn astation_status_line(astation_id: &str) -> String {
 }
 
 /// `problem`: why `client()` couldn't build a client, if it couldn't.
-fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>) -> String {
+/// `paired`: whether this profile is paired (`status::profile_paired`).
+fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>, paired: bool) -> String {
     match problem {
         Some(PairingProblem::NotConfigured) => NOT_CONFIGURED_MSG.to_string(),
-        Some(PairingProblem::NotPaired) => not_paired_msg(crate::status::current_profile_paired()),
+        Some(PairingProblem::NotPaired) => not_paired_msg(paired),
         None if out.offline => "Relay unreachable — changes stay queued and sync next time.".to_string(),
         None if out.relay_error => format!(
             "Sync incomplete — pushed {} change(s), pulled {} update(s); the rest stay queued (see notes).",
@@ -174,14 +175,14 @@ fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>) -> Stri
     }
 }
 
-fn print_outcome(out: &SyncOutcome, problem: Option<&PairingProblem>) {
+fn print_outcome(out: &SyncOutcome, problem: Option<&PairingProblem>, paired: bool) {
     if let Some(h) = &out.harvest {
         println!("Harvested from Claude: {} new, {} outdated", h.added, h.invalidated);
         for hb in &h.held_back {
             println!("  held back (possible credential): {}", hb);
         }
     }
-    println!("{}", sync_status_line(out, problem));
+    println!("{}", sync_status_line(out, problem, paired));
     for n in &out.notes {
         println!("note: {}", n);
     }
@@ -486,7 +487,7 @@ pub async fn handle_sync(no_harvest: bool, allow_tracked: bool) -> Result<()> {
     let c = client().await;
     let opts = SyncOptions { harvest: !no_harvest && harvest_enabled() };
     let out = sync::run_sync(&store, c.as_ref().ok(), &ctx, &opts).await?;
-    print_outcome(&out, c.as_ref().err());
+    print_outcome(&out, c.as_ref().err(), crate::status::current_profile_paired());
     Ok(())
 }
 
@@ -773,7 +774,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             check_history_name(&name)?;
             let scope = skill_scope(&scope)?;
             let project = project_for_scope(scope, &ctx, None)?;
-            let c = client().await.map_err(|_| history_unpaired())?;
+            let c = client().await.map_err(|_| history_unpaired(crate::status::current_profile_paired()))?;
             let versions = c.skill_versions(scope, &project, &name).await
                 .map_err(|e| sync::skill_history_error(e, &name, None))?;
             if versions.is_empty() {
@@ -787,7 +788,7 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             check_history_name(&name)?;
             let scope = skill_scope(&scope)?;
             let project = project_for_scope(scope, &ctx, None)?;
-            let c = client().await.map_err(|_| history_unpaired())?;
+            let c = client().await.map_err(|_| history_unpaired(crate::status::current_profile_paired()))?;
             let restored = sync::restore_skill(&store, &c, &ctx.atem_id, scope, &project, &name, version).await?;
             println!("Restored {} v{} as v{}.", name, version, restored.version);
             let report = best_effort_sync_report(&store, &ctx).await;
@@ -1059,8 +1060,16 @@ mod tests {
     #[test]
     fn sync_status_line_distinguishes_pairing_problems_from_offline() {
         let offline = SyncOutcome { offline: true, ..Default::default() };
-        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotConfigured)), NOT_CONFIGURED_MSG);
-        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired)), NOT_PAIRED_MSG);
+        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotConfigured), false), NOT_CONFIGURED_MSG);
+        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired), false), NOT_PAIRED_MSG);
+        // A paired profile (temp dir with a saved session) is told to unpair first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions = crate::auth::SessionManager::default();
+        sessions.insert_session(crate::auth::AuthSession::new("s".into(), "t".into(), "a-1".into(), "h".into()));
+        sessions.save_to(&dir.path().join("sessions.json")).unwrap();
+        let paired = crate::status::profile_paired(&crate::status::Sources::in_dir(dir.path()));
+        assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired), paired), not_paired_msg(true));
+        assert_eq!(history_unpaired(paired).to_string(), crate::status::SESSION_GONE);
         assert!(NOT_CONFIGURED_MSG.contains("astation_relay_code") && NOT_CONFIGURED_MSG.contains("stay queued"));
         assert!(NOT_PAIRED_MSG.contains("atem pair") && NOT_PAIRED_MSG.contains("stay queued"));
         assert_eq!(
@@ -1069,11 +1078,11 @@ mod tests {
         );
         assert_eq!(not_paired_history_msg(false), NOT_PAIRED_HISTORY_MSG);
         assert_eq!(not_paired_history_msg(true), crate::status::SESSION_GONE);
-        assert!(sync_status_line(&offline, None).starts_with("Relay unreachable"));
+        assert!(sync_status_line(&offline, None, false).starts_with("Relay unreachable"));
         let done = SyncOutcome { pushed: 2, pulled: 3, ..Default::default() };
-        assert_eq!(sync_status_line(&done, None), "Pushed 2 change(s), pulled 3 update(s).");
+        assert_eq!(sync_status_line(&done, None, false), "Pushed 2 change(s), pulled 3 update(s).");
         let partial = SyncOutcome { pushed: 1, relay_error: true, ..Default::default() };
-        assert!(sync_status_line(&partial, None).starts_with("Sync incomplete — pushed 1 change(s)"));
+        assert!(sync_status_line(&partial, None, false).starts_with("Sync incomplete — pushed 1 change(s)"));
     }
 
     #[test]
