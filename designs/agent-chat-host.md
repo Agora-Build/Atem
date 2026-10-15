@@ -42,13 +42,9 @@ differ).
    (or `~/.config/atem/run/chat-<id>/` without `XDG_RUNTIME_DIR`), mode 0700,
    holding:
    - `settings.json` (0600): hooks for `SessionStart`, `UserPromptSubmit`,
-     `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, each running
-     `<atem binary> agent-hook <event> --dir <this directory>`;
-   - `token` (0600): the per-session token, a random 256-bit value. It is
-     never on a command line (visible to other users through `ps`) and never
-     in the environment of Claude's process (inherited by every tool command);
-     the helper reads it from this file;
-   - `hook.sock`: a Unix socket Atem listens on.
+     `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, each running the
+     event-file command below;
+   - `events/` (0700): one file per hook event.
 2. Starts Claude in the shared terminal with `--settings <settings.json>` and,
    unless the user passed `--continue`/`--resume`, `--session-id <new uuid>`.
    With `--continue`/`--resume` the session id is taken from `SessionStart`.
@@ -62,18 +58,33 @@ differ).
 Nothing in the user's `~/.claude` settings changes. Hooks the user already has
 keep running; Claude merges `--settings` with them.
 
-### The hook helper (`atem agent-hook`, hidden)
+### Hook events: one file each
 
-Reads Claude's hook JSON from stdin and the token from `--dir`, connects to
-`hook.sock`, sends `{token, event, payload}` and exits. It always exits 0 and prints nothing, so
-it can never allow, deny or block anything. Connect + send is bounded at 1 s;
-if Atem is gone it just exits.
+Claude runs a hook as a shell command and passes the event JSON on stdin. Each
+hook command writes that JSON to its own file, atomically:
+
+```sh
+d=<chat dir>/events; f="$d/$(date +%s%N)-$$"; cat > "$f.tmp" && mv "$f.tmp" "$f.json"
+```
+
+- One file per event, written then renamed, because hooks can run at the same
+  time (parallel tool calls) and an event can be large (a `Write` event holds
+  the whole file being written); a shared append-only file could interleave.
+- Atem reads `events/*.json` in name order (timestamp, then process id),
+  handles each event and deletes the file. `.tmp` files are ignored; leftovers
+  older than a minute are removed.
+- The command prints nothing and exits 0, so it can never allow, deny or block
+  anything, and it doesn't depend on Atem running or on the Atem binary's
+  path: if Atem is gone, the file is simply never read and the directory is
+  cleaned up with the session.
+- No token, socket or helper process is needed: the private directory (0700)
+  already limits who can write events to the user's own account.
 
 ### Units
 
 | Unit | Responsibility |
 |---|---|
-| `src/chat/hooks.rs` | Builds the per-session directory and `settings.json`; the `agent-hook` helper; the socket listener (peer UID check, token check, session check) |
+| `src/chat/hooks.rs` | Builds the per-session directory and `settings.json`; reads, orders and deletes the event files |
 | `src/chat/transcript.rs` | Follows the transcript and turns entries into chat messages (below) |
 | `src/chat/session.rs` | Per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records |
 | `src/chat/wire.rs` | `agentChat` v1 messages to and from Astation: encoding, decoding, validation |
@@ -218,13 +229,13 @@ on the existing authenticated Astation connection.
 - `agentChat` is handled only on an authenticated Astation connection, never
   while re-authentication is pending, and every request is bound to the
   connection, agent and process generation.
-- Hook channel: private directory (0700), socket peer must have Atem's UID,
-  and every event must carry the session token (read by the helper from the
-  private `token` file; never on a command line or in Claude's environment). The trust
-  boundary is the user's own account: a process running as the user could
-  forge a hook event; that can mislabel status but cannot approve a tool, type
-  input or read anything, and acceptance additionally needs the transcript's
-  own user entry.
+- Hook events: the per-session directory is 0700 (event files are written
+  inside it), so only the user's own account can add events. The trust
+  boundary is that account: a process running as the user could forge an event
+  file; that can mislabel status but cannot approve a tool, type input or read
+  anything, and acceptance additionally needs the transcript's own user entry.
+  Event files can hold tool input (file contents); they stay in the private
+  directory and are deleted as soon as they are read.
 - Outgoing text and tool summaries pass Atem's credential detector
   (`src/memory/secrets.rs`); matches become `[redacted]`. Thinking, tool output
   and file contents are never sent.
@@ -236,7 +247,7 @@ on the existing authenticated Astation connection.
 
 | Case | Behaviour |
 |---|---|
-| Atem not running when a hook fires | helper gives up after 1 s, exits 0; Claude is unaffected |
+| Atem not running when a hook fires | the event file is written and never read; Claude is unaffected; the directory goes with the session |
 | Claude exits or crashes | `unknown`, `error` to open conversations, generation retired, prompts refused |
 | Bad or unknown transcript line | skipped, one notice; reading continues |
 | Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason; terminal unaffected |
@@ -252,12 +263,13 @@ on the existing authenticated Astation connection.
   characters, draft, terminal control); redaction; wire encode/decode and
   sequence/generation rules.
 - Integration (`tests/`, like `terminal_ui_binary`): a fake `claude` script
-  that calls `atem agent-hook` and writes a transcript, run by the real binary
+  that runs the hook commands from `settings.json` and writes a transcript, run by the real binary
   in a pseudo-terminal against a fake Astation WebSocket: open with history;
   submit → accepted → message/delta → complete; refusal after local typing;
   duplicate request; process exit → unknown; reconnect keeps state.
 - Before building on them, confirm on the installed Claude Code 2.1.x:
-  `--settings` hooks fire in interactive mode, `SessionStart` arrives before
+  `--settings` hooks fire in interactive mode and receive the event JSON on
+  stdin, `SessionStart` arrives before
   the first prompt with `session_id`/`transcript_path`, `--session-id` names
   the transcript, and the interrupt marker's exact form.
 - Manual acceptance with real Claude Code and Astation's page.
