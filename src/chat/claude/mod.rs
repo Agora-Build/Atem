@@ -52,6 +52,12 @@ fn resumes_or_pins(args: &[String]) -> bool {
 
 impl AgentAdapter for ClaudeAdapter {
     fn prepare_launch(&mut self, args: &[String], dir: &Path) -> anyhow::Result<LaunchPlan> {
+        let named = dir
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("chat-"));
+        if !named || !dir.join("events").is_dir() {
+            anyhow::bail!("not a chat session directory: {}", dir.display());
+        }
         let settings = hooks::write_settings(dir)?;
         self.dir = Some(dir.to_path_buf());
         self.events = Some(EventReader::new(dir.to_path_buf()));
@@ -79,7 +85,10 @@ impl AgentAdapter for ClaudeAdapter {
         let events = reader.poll();
         for ev in &events {
             if let AgentEvent::SessionStarted { log_path, .. } = ev {
-                self.transcript = Some(TranscriptReader::new(log_path.clone()));
+                // Same path (resume/compact): keep the reader, no replay.
+                if self.transcript.as_ref().map(|r| r.path()) != Some(log_path.as_path()) {
+                    self.transcript = Some(TranscriptReader::new(log_path.clone()));
+                }
                 self.session_started = true;
             }
         }
@@ -260,6 +269,40 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, LogItem::UserMessage { text, .. } if text == "say hi"))
         );
+    }
+
+    #[test]
+    fn same_path_session_start_keeps_the_reader() {
+        let (root, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/claude");
+        let t1 = root.path().join("one.jsonl");
+        fs::copy(fx.join("session-basic.jsonl"), &t1).unwrap();
+        let start = format!(
+            r#"{{"hook_event_name":"SessionStart","session_id":"s1","transcript_path":"{}"}}"#,
+            t1.display()
+        );
+        event(&dir, "ev.1.json", &start);
+        a.poll_events();
+        assert!(!a.poll_log().is_empty());
+        event(&dir, "ev.2.json", &start);
+        a.poll_events();
+        assert!(a.poll_log().is_empty(), "no replay after same-path start");
+    }
+
+    #[test]
+    fn prepare_launch_refuses_foreign_dirs_and_drop_leaves_them() {
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("other");
+        fs::create_dir_all(plain.join("events")).unwrap();
+        let mut a = ClaudeAdapter::new();
+        assert!(a.prepare_launch(&[], &plain).is_err());
+        let noevents = root.path().join("chat-x");
+        fs::create_dir_all(&noevents).unwrap();
+        assert!(a.prepare_launch(&[], &noevents).is_err());
+        assert!(a.dir().is_none());
+        drop(a);
+        assert!(plain.exists() && noevents.exists());
     }
 
     #[test]

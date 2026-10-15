@@ -119,14 +119,24 @@ impl EventReader {
         }
         files.sort();
         let mut out = Vec::new();
-        for (_, _, path) in files {
-            let text = std::fs::read_to_string(&path);
-            let _ = std::fs::remove_file(&path);
-            let Ok(text) = text else { continue };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            out.extend(map_hook(&v));
+        for (mtime, _, path) in files {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let _ = std::fs::remove_file(&path);
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        out.extend(map_hook(&v));
+                    }
+                }
+                Err(_) => {
+                    // Unreadable: keep it for now, drop it once it is stale.
+                    if now
+                        .duration_since(mtime)
+                        .is_ok_and(|age| age > std::time::Duration::from_secs(60))
+                    {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
         }
         out
     }
@@ -335,6 +345,28 @@ mod tests {
             vec![AgentEvent::ToolStarted, AgentEvent::TurnEnded]
         );
         assert_eq!(fs::read_dir(dir.join("events")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unreadable_event_files_stay_until_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = create_session_dir(root.path()).unwrap();
+        put(&dir, "ev.young.json", "{}", 1);
+        put(&dir, "ev.old.json", "{}", 120);
+        for n in ["ev.young.json", "ev.old.json"] {
+            fs::set_permissions(
+                dir.join("events").join(n),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+        if fs::read_to_string(dir.join("events/ev.young.json")).is_ok() {
+            return; // running as root: cannot make a file unreadable
+        }
+        let mut r = EventReader::new(dir.clone());
+        assert!(r.poll().is_empty());
+        assert!(dir.join("events/ev.young.json").exists());
+        assert!(!dir.join("events/ev.old.json").exists());
     }
 
     #[test]
