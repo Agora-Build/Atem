@@ -17,6 +17,7 @@ pub struct TranscriptReader {
     seen: HashSet<String>,
     seen_order: VecDeque<String>,
     turn_id: String,
+    seen_cap: usize,
 }
 
 impl TranscriptReader {
@@ -28,6 +29,7 @@ impl TranscriptReader {
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
             turn_id: String::new(),
+            seen_cap: SEEN_CAP,
         }
     }
 
@@ -47,6 +49,12 @@ impl TranscriptReader {
         let Ok(mut file) = std::fs::File::open(&self.path) else {
             return out;
         };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.offset {
+            // truncated or replaced: start over (the seen set prevents duplicates)
+            self.offset = 0;
+            self.pending.clear();
+        }
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return out;
         }
@@ -58,9 +66,12 @@ impl TranscriptReader {
         self.pending.extend_from_slice(&buf);
 
         let mut garbage = false;
-        while let Some(pos) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=pos).collect();
-            let line = &line[..line.len() - 1];
+        let Some(last_nl) = self.pending.iter().rposition(|b| *b == b'\n') else {
+            return out;
+        };
+        let rest = self.pending.split_off(last_nl + 1);
+        let complete = std::mem::replace(&mut self.pending, rest);
+        for line in complete[..last_nl].split(|b| *b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
@@ -86,7 +97,7 @@ impl TranscriptReader {
         }
         self.seen.insert(uuid.to_string());
         self.seen_order.push_back(uuid.to_string());
-        if self.seen_order.len() > SEEN_CAP
+        if self.seen_order.len() > self.seen_cap
             && let Some(old) = self.seen_order.pop_front()
         {
             self.seen.remove(&old);
@@ -240,10 +251,27 @@ fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !(b[10] == b'T' || b[10] == b't') {
         return None;
     }
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let d = b.get(r)?;
+        if d.is_empty() || !d.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        d.iter()
+            .try_fold(0i64, |a, c| Some(a * 10 + i64::from(c - b'0')))
+    };
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => 28 + i64::from(leap),
+        _ => return None,
+    };
+    if !(1..=dim).contains(&d) || h > 23 || mi > 59 || sec > 60 {
         return None;
     }
     let mut i = 19;
@@ -254,20 +282,21 @@ fn parse_rfc3339_ms(s: &str) -> Option<i64> {
         while i < b.len() && b[i].is_ascii_digit() {
             i += 1;
         }
-        let frac = &s[start..i];
+        let frac = &b[start..i];
         if frac.is_empty() {
             return None;
         }
-        let three: String = frac.chars().chain("000".chars()).take(3).collect();
-        ms = three.parse().ok()?;
+        for k in 0..3 {
+            ms = ms * 10 + i64::from(frac.get(k).map_or(0, |c| c - b'0'));
+        }
     }
-    let offset_min = match s.get(i..)? {
-        "Z" | "z" => 0,
-        t if t.len() == 6 && (t.starts_with('+') || t.starts_with('-')) && &t[3..4] == ":" => {
-            let hh: i64 = t[1..3].parse().ok()?;
-            let mm: i64 = t[4..6].parse().ok()?;
+    let offset_min = match b.get(i..)? {
+        b"Z" | b"z" => 0,
+        t if t.len() == 6 && (t[0] == b'+' || t[0] == b'-') && t[3] == b':' => {
+            let hh = num(i + 1..i + 3)?;
+            let mm = num(i + 4..i + 6)?;
             let v = hh * 60 + mm;
-            if t.starts_with('-') { -v } else { v }
+            if t[0] == b'-' { -v } else { v }
         }
         _ => return None,
     };
@@ -561,5 +590,90 @@ mod tests {
         assert_eq!(summarize_tool("WebSearch", &json!({"query":"q"})), "q");
         assert_eq!(summarize_tool("Task", &json!({"prompt":"p"})), "");
         assert_eq!(summarize_tool("Bash", &json!({})), "");
+    }
+
+    #[test]
+    fn multibyte_line_split_mid_codepoint() {
+        let l = user_line("u1", r#""promptId":"p","#, r#""café 😀 ok""#);
+        let pos = l.find('😀').unwrap() + 2; // inside the emoji
+        let (a, b) = l.as_bytes().split_at(pos);
+        let (_d, mut r) = reader_with("");
+        std::fs::write(r.path(), a).unwrap();
+        assert!(r.poll().is_empty());
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(r.path())
+            .unwrap();
+        f.write_all(b).unwrap();
+        drop(f);
+        let items = r.poll();
+        assert!(
+            matches!(&items[0], L::UserMessage { text, .. } if text == "café 😀 ok"),
+            "{items:?}"
+        );
+    }
+
+    #[test]
+    fn seen_set_is_bounded() {
+        let mut s = String::new();
+        for i in 0..5 {
+            s += &user_line(&format!("u{i}"), "", r#""x""#);
+        }
+        let (_d, mut r) = reader_with(&s);
+        r.seen_cap = 2;
+        assert_eq!(r.poll().len(), 5);
+        assert_eq!(r.seen.len(), 2);
+        assert!(r.seen.contains("u4") && r.seen.contains("u3"));
+        r.reread_from_start();
+        // evicted ids are accepted again (the set stays bounded)
+        let again = r.poll();
+        assert!(matches!(&again[0], L::UserMessage { id, .. } if id == "u0"));
+        assert!(r.seen.len() <= 2);
+    }
+
+    #[test]
+    fn tool_result_prompt_id_sets_turn_for_following_parts() {
+        let mut s = user_line(
+            "t1",
+            r#""promptId":"pX","#,
+            r#"[{"type":"tool_result","tool_use_id":"x","content":"ok"}]"#,
+        );
+        s += r#"{"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
+        s += "\n";
+        let (_d, mut r) = reader_with(&s);
+        let items = r.poll();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], L::AssistantPart { turn_id, .. } if turn_id == "pX"));
+    }
+
+    #[test]
+    fn truncated_file_resets_offset() {
+        let (_d, mut r) = reader_with(&user_line("u1", "", r#""hello there long""#));
+        assert_eq!(r.poll().len(), 1);
+        std::fs::write(r.path(), user_line("u2", "", r#""x""#)).unwrap();
+        let items = r.poll();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], L::UserMessage { id, .. } if id == "u2"));
+    }
+
+    #[test]
+    fn timestamp_edge_cases() {
+        assert_eq!(
+            parse_rfc3339_ms("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800_000)
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2000-03-01T00:00:00Z"),
+            Some(951_868_800_000)
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2024-01-01T00:00:00-05:00"),
+            parse_rfc3339_ms("2024-01-01T05:00:00Z")
+        );
+        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:02Z"), Some(2000));
+        assert_eq!(parse_rfc3339_ms("2023-02-29T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_ms("2024-+1-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_ms("2024-01-01T00:00:00+é:00"), None);
+        assert_eq!(parse_rfc3339_ms("2024-01-01T00:00:00éééé"), None);
     }
 }
