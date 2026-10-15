@@ -31,8 +31,7 @@ async fn conversation(provider: &'static str) {
     let mut app = App::new();
     app.chat_root = chat_root.path().join("run");
     let kind = Provider::from_alias(provider).unwrap();
-    app.ensure_session(kind).await.unwrap();
-    let id = app.session_id_for(kind).unwrap();
+    let id = app.launch_here(kind).await.unwrap();
     app.focused = Some(id.clone());
     app.mode = AppMode::Terminal;
     app.adjust_terminal_size(&id, 40, 120);
@@ -70,7 +69,7 @@ async fn conversation(provider: &'static str) {
                     let AstationMessage::Terminal(envelope) = serde_json::from_str(&json).unwrap()
                     else { continue };
                     match envelope.message {
-                        Message::Sessions { sessions } => {
+                        Message::Sessions { sessions, .. } => {
                             let session = sessions.into_iter().find(|s| s.provider == provider).unwrap();
                             socket.send(encode(Message::Subscribe {
                                 terminal_id: session.terminal_id,

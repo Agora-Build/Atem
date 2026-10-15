@@ -24,11 +24,11 @@ struct Harness {
 }
 
 fn claude_session(app: &App) -> &Session {
-    app.session_for(Provider::Claude).unwrap()
+    app.last_session(Provider::Claude).unwrap()
 }
 
 fn claude_session_mut(app: &mut App) -> &mut Session {
-    app.session_for_mut(Provider::Claude).unwrap()
+    app.last_session_mut(Provider::Claude).unwrap()
 }
 
 fn send_claude(app: &mut App, data: &str) {
@@ -84,7 +84,7 @@ async fn start() -> Harness {
         .unwrap();
     // This stand-in tests chat transport; authentication has separate tests.
     app.astation_connected = true;
-    app.ensure_session(Provider::Claude).await.unwrap();
+    app.launch_here(Provider::Claude).await.unwrap();
     Harness {
         app,
         to_atem,
@@ -285,7 +285,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         // Session logs Atem saves in the working directory when a session with output ends.
-        let Some(claude) = self.app.session_for(Provider::Claude) else {
+        let Some(claude) = self.app.last_session(Provider::Claude) else {
             return;
         };
         for path in [&claude.log_file, &claude.summary_file]
@@ -676,7 +676,7 @@ async fn codex_without_an_adapter_registers_unknown_without_chat() {
     app.chat_root = root.path().join("run");
     app.codex_client
         .set_command_for_test("cat".into(), Vec::new());
-    assert!(app.ensure_session(Provider::Codex).await.unwrap());
+    app.launch_here(Provider::Codex).await.unwrap();
     let codex = app
         .agent_registry
         .all()
@@ -686,7 +686,7 @@ async fn codex_without_an_adapter_registers_unknown_without_chat() {
     assert_eq!(codex.status, AgentStatus::Unknown);
     assert!(codex.capabilities.is_empty());
     assert!(
-        app.session_for(Provider::Claude)
+        app.last_session(Provider::Claude)
             .is_none_or(|s| s.chat.is_none())
     );
     app.poll_chat().await;
@@ -709,7 +709,7 @@ async fn claude_without_chat_registers_unknown() {
     app.chat_root = root.path().join("file/run");
     app.claude_client
         .set_command_for_test(fake_claude().to_string_lossy().into_owned(), Vec::new());
-    assert!(app.ensure_session(Provider::Claude).await.unwrap());
+    app.launch_here(Provider::Claude).await.unwrap();
     assert!(
         claude_session(&app).chat.is_none(),
         "Claude started without chat"
@@ -737,9 +737,10 @@ async fn claude_without_chat_registers_unknown() {
 }
 
 #[tokio::test]
-async fn respawn_tells_open_conversations_to_reopen() {
+async fn relaunch_is_a_new_session_and_reaping_the_old_one_tells_its_conversations_to_reopen() {
     let mut h = start().await;
     h.wait_for_chat().await;
+    let old_agent = h.agent_id();
     let (opened, _) = h.open("c1", 0).await;
     let old_generation = opened["data"]["generation"].as_str().unwrap().to_string();
     let from = h.seen.len();
@@ -749,27 +750,39 @@ async fn respawn_tells_open_conversations_to_reopen() {
     })
     .await;
     assert!(claude_session(&h.app).events.is_none());
+    let exited_at = claude_session(&h.app).exited_at.unwrap();
     let from = h.seen.len();
-    assert!(h.app.ensure_session(Provider::Claude).await.unwrap());
+    let new = h.app.launch_here(Provider::Claude).await.unwrap();
+    assert_ne!(new.as_str(), old_agent);
+    // The exited session keeps its conversations (history stays readable)
+    // until it is removed, 10 minutes after its exit.
+    h.pump_for(Duration::from_millis(200)).await;
+    assert!(!h.seen[from..].iter().any(|v| is_chat(v, "close")));
+    h.app
+        .reap_exited_sessions(exited_at + crate::session::EXITED_KEEP);
     let error = h
         .pump_until(from, |v| {
             is_chat(v, "error") && v["data"]["text"] == "the agent was restarted; reopen the chat"
         })
         .await;
     assert_eq!(h.seen[error]["data"]["conversationId"], "c1");
+    assert_eq!(h.seen[error]["data"]["agentId"], old_agent.as_str());
     assert_eq!(h.seen[error]["data"]["generation"], old_generation.as_str());
     let close = h.pump_until(from, |v| is_chat(v, "close")).await;
     assert!(error < close);
     assert_eq!(h.seen[close]["data"]["conversationId"], "c1");
-    assert!(
-        claude_session(&h.app)
-            .chat
-            .as_ref()
-            .unwrap()
-            .conversations
-            .is_empty()
-    );
-    h.wait_for_chat().await;
+    assert!(h.app.agent_registry.get(&old_agent).is_none());
+    assert_eq!(h.agent_id(), new.as_str());
+    // The new session's chat (reported any time since its launch).
+    h.pump_until(from, |v| {
+        v["type"] == "agentListResponse"
+            && v["data"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == new.as_str() && a["capabilities"] == json!(["chat-v1"]))
+    })
+    .await;
     let (opened, _) = h.open("c1", 0).await;
     assert_ne!(opened["data"]["generation"], old_generation.as_str());
     assert_eq!(h.chat_dirs().len(), 1, "the old chat directory is gone");
@@ -845,7 +858,7 @@ async fn launching_codex_sends_the_agent_list() {
         .codex_client
         .set_command_for_test("cat".into(), Vec::new());
     let from = h.seen.len();
-    assert!(h.app.ensure_session(Provider::Codex).await.unwrap());
+    h.app.launch_here(Provider::Codex).await.unwrap();
     let at = h
         .pump_until(from, |v| {
             v["type"] == "agentListResponse"

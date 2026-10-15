@@ -5,8 +5,9 @@ use crate::agent_client::AgentKind;
 use crate::pty_session::{PtyEvent, PtyHandle, PtyInput, PtySession};
 use crate::terminal_share::SharedTerminal;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use vt100::Parser as VtParser;
 
@@ -92,6 +93,51 @@ impl Provider {
     }
 }
 
+/// How long an exited session stays (final screen, logs, chat history).
+pub const EXITED_KEEP: Duration = Duration::from_secs(10 * 60);
+/// Launch environment bounds.
+pub const MAX_ENV_ENTRIES: usize = 512;
+pub const MAX_ENV_BYTES: usize = 256 * 1024;
+
+/// A new session: provider, its arguments (after `CLAUDE_CLI_ARGS`/`CODEX_CLI_ARGS`),
+/// working directory, environment (`None` = Atem's own) and screen size.
+#[derive(Clone, Debug)]
+pub struct LaunchRequest {
+    pub provider: Provider,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Option<Vec<(OsString, OsString)>>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl LaunchRequest {
+    /// Atem's own working directory and environment.
+    pub fn here(provider: Provider, args: Vec<String>, rows: u16, cols: u16) -> Self {
+        Self {
+            provider,
+            args,
+            cwd: std::env::current_dir().unwrap_or_default(),
+            env: None,
+            rows,
+            cols,
+        }
+    }
+}
+
+/// A launch environment holds at most `MAX_ENV_ENTRIES` entries and
+/// `MAX_ENV_BYTES` in total (`name=value\0` each).
+pub fn check_env(env: &[(OsString, OsString)]) -> Result<(), &'static str> {
+    if env.len() > MAX_ENV_ENTRIES {
+        return Err("The launch environment has more than 512 entries");
+    }
+    let bytes: usize = env.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+    if bytes > MAX_ENV_BYTES {
+        return Err("The launch environment is larger than 256 KiB");
+    }
+    Ok(())
+}
+
 pub struct Session {
     pub id: SessionId,
     pub provider: Provider,
@@ -121,8 +167,10 @@ pub struct Session {
 impl Session {
     /// A session without a process yet: a `rows` x `cols` screen, no PTY.
     pub fn new(provider: Provider, rows: u16, cols: u16) -> Self {
+        let id = SessionId::new();
+        let share = SharedTerminal::new(id.as_str(), provider.as_str());
         Self {
-            id: SessionId::new(),
+            id,
             provider,
             cwd: std::env::current_dir().unwrap_or_default(),
             created_at: SystemTime::now(),
@@ -131,7 +179,7 @@ impl Session {
             events: None,
             handle: None,
             terminal: VtParser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS),
-            share: SharedTerminal::new(provider.as_str()),
+            share,
             raw_log: String::new(),
             raw_log_start: 0,
             output_log: String::new(),
@@ -169,8 +217,8 @@ impl Sessions {
 
     /// Refuses a live session beyond `MAX_LIVE` live ones.
     pub fn insert(&mut self, s: Session) -> anyhow::Result<&mut Session> {
-        if s.is_live() && self.map.values().filter(|s| s.is_live()).count() >= Self::MAX_LIVE {
-            anyhow::bail!("At most {} sessions can run at once", Self::MAX_LIVE);
+        if s.is_live() {
+            self.check_room()?;
         }
         if self.map.contains_key(&s.id) {
             anyhow::bail!("Session {} already exists", s.id);
@@ -178,6 +226,19 @@ impl Sessions {
         let id = s.id.clone();
         self.order.push(id.clone());
         Ok(self.map.entry(id).or_insert(s))
+    }
+
+    /// Number of live sessions.
+    pub fn live_count(&self) -> usize {
+        self.map.values().filter(|s| s.is_live()).count()
+    }
+
+    /// Room for one more live session (checked before spawning).
+    pub fn check_room(&self) -> anyhow::Result<()> {
+        if self.live_count() >= Self::MAX_LIVE {
+            anyhow::bail!("At most {} sessions can run at once", Self::MAX_LIVE);
+        }
+        Ok(())
     }
 
     pub fn get(&self, id: &SessionId) -> Option<&Session> {
@@ -305,6 +366,29 @@ mod tests {
         exited.exited_at = Some(Instant::now());
         sessions.insert(exited).unwrap();
         assert_eq!(sessions.iter().count(), Sessions::MAX_LIVE + 2);
+    }
+
+    #[test]
+    fn launch_environment_is_bounded() {
+        let entry = |i: usize| (OsString::from(format!("V{i}")), OsString::from("x"));
+        let env: Vec<_> = (0..MAX_ENV_ENTRIES).map(entry).collect();
+        assert_eq!(check_env(&env), Ok(()));
+        let env: Vec<_> = (0..=MAX_ENV_ENTRIES).map(entry).collect();
+        assert!(check_env(&env).is_err());
+        // name + "=" + value + NUL
+        let fits = vec![(OsString::from("A"), OsString::from("v".repeat(MAX_ENV_BYTES - 3)))];
+        assert_eq!(check_env(&fits), Ok(()));
+        let over = vec![(OsString::from("A"), OsString::from("v".repeat(MAX_ENV_BYTES - 2)))];
+        assert!(check_env(&over).is_err());
+        assert_eq!(check_env(&[]), Ok(()));
+    }
+
+    #[test]
+    fn a_session_shares_its_terminal_under_its_own_id() {
+        let s = session(Provider::Codex);
+        assert_eq!(s.share.id, s.id.as_str());
+        let screen = vt100::Parser::new(24, 80, 0);
+        assert_eq!(s.share.info(screen.screen()).provider, "codex");
     }
 
     #[test]

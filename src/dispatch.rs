@@ -1,6 +1,8 @@
 use tokio::sync::mpsc;
 
 use crate::command::TaskQueue;
+use crate::session::SessionId;
+use std::path::PathBuf;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -21,6 +23,10 @@ pub struct WorkItem {
     pub received_at_ms: u64,
     pub kind: WorkKind,
     pub prompt: String,
+    /// The Claude session the task was routed to (its project).
+    pub session: SessionId,
+    /// That session's working directory; background `claude -p` runs there.
+    pub cwd: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +100,11 @@ impl TaskDispatcher {
     /// Pop next task ID for the main agent, marking it active.
     pub fn next_for_main(&mut self) -> Option<String> {
         self.main_queue.start_next()
+    }
+
+    /// The task `next_for_main` would return, without starting it.
+    pub fn peek_main(&self) -> Option<&str> {
+        self.main_queue.peek_next()
     }
 
     /// Finish the active main task, returning its ID.
@@ -188,6 +199,7 @@ async fn run_background(binary: &str, item: &WorkItem) -> (bool, String) {
         .arg(&item.prompt)
         .arg("--output-format")
         .arg("json")
+        .current_dir(&item.cwd)
         .output()
         .await;
 
@@ -244,6 +256,7 @@ async fn run_triage(binary: &str, item: &WorkItem) -> ExecTarget {
         .arg("1")
         .arg("--output-format")
         .arg("json")
+        .current_dir(&item.cwd)
         .output()
         .await;
 
@@ -268,6 +281,8 @@ mod tests {
             received_at_ms: 1000,
             kind: WorkKind::MarkTask,
             prompt: "test prompt".to_string(),
+            session: SessionId::new(),
+            cwd: std::env::temp_dir(),
         }
     }
 
@@ -382,6 +397,38 @@ mod tests {
     fn parse_triage_response_embedded_json() {
         let r = parse_triage_response(r#"Some text before {"target": "BACKGROUND"} and after"#);
         assert_eq!(r, ExecTarget::Background);
+    }
+
+    #[test]
+    fn peek_main_shows_the_next_task_without_starting_it() {
+        let mut d = TaskDispatcher::new();
+        assert_eq!(d.peek_main(), None);
+        d.submit(make_item("t1"), false);
+        d.submit(make_item("t2"), false);
+        assert_eq!(d.peek_main(), Some("t1"));
+        assert!(!d.main_is_active());
+        assert_eq!(d.next_for_main().as_deref(), Some("t1"));
+        // Nothing starts while a task is active.
+        assert_eq!(d.peek_main(), None);
+        d.complete_main();
+        assert_eq!(d.peek_main(), Some("t2"));
+    }
+
+    #[tokio::test]
+    async fn background_claude_runs_in_the_session_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("claude");
+        std::fs::write(&script, "#!/bin/sh\npwd\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut item = make_item("t1");
+        item.cwd = dir.path().to_path_buf();
+        let (success, output) = run_background(script.to_str().unwrap(), &item).await;
+        assert!(success);
+        assert_eq!(
+            output.trim(),
+            dir.path().canonicalize().unwrap().to_str().unwrap()
+        );
     }
 
     #[test]

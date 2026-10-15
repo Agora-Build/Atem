@@ -282,7 +282,7 @@ mod tests {
     }
 
     fn codex(app: &App) -> &Session {
-        app.session_for(Provider::Codex).unwrap()
+        app.last_session(Provider::Codex).unwrap()
     }
 
     /// Runs the TUI's Astation step until the peer receives an `auth` message

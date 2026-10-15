@@ -25,18 +25,6 @@ pub(super) fn log_since(log: &str, offset: usize, position: usize) -> &str {
 }
 
 impl App {
-    /// A session replaced by a new process of its provider: its remote viewer
-    /// is told to refresh. Dropping it ends what is left of its process.
-    pub(super) fn replace_terminal(&mut self, previous: Session) {
-        if previous.share.has_viewer() {
-            self.queue_terminal(Message::Exited {
-                terminal_id: previous.share.id.clone(),
-                generation: previous.share.generation.clone(),
-                status: "Session replaced; refresh the terminal list".into(),
-            });
-        }
-    }
-
     pub fn handle_terminal_legacy_rejection(&mut self) {
         self.status_message = Some("Use terminal-v1 control for an attached terminal".into());
         self.queue_terminal(Message::Error {
@@ -79,36 +67,41 @@ impl App {
             return;
         }
         if matches!(envelope.message, Message::List) {
-            // Task 2: route by id (one terminal per provider, Codex first).
-            let sessions = [Provider::Codex, Provider::Claude]
-                .into_iter()
-                .filter_map(|provider| self.session_for(provider))
-                .filter(|s| s.input.is_some())
+            // Every session with a process (exited ones carry their exit status),
+            // in creation order.
+            let sessions = self
+                .sessions
+                .iter()
+                .filter(|s| s.input.is_some() && s.handle.is_some())
                 .map(|s| s.share.info(s.terminal.screen()))
                 .collect();
-            self.queue_terminal(Message::Sessions { sessions });
+            self.queue_terminal(Message::Sessions {
+                sessions,
+                terminal_ids: Some("session".into()),
+            });
             return;
         }
-        let id = match &envelope.message {
-            Message::Subscribe { terminal_id, .. }
-            | Message::Unsubscribe { terminal_id, .. }
-            | Message::Ack { terminal_id, .. }
-            | Message::Control { terminal_id, .. }
-            | Message::Input { terminal_id, .. }
-            | Message::Resize { terminal_id, .. }
-            | Message::Stop { terminal_id, .. } => terminal_id.clone(),
-            _ => return,
+        let mut message = envelope.message;
+        let Some(requested) = message.request_terminal_id().map(str::to_string) else {
+            return;
         };
-        // Task 2: route by id
-        let Some(provider) = Provider::from_alias(&id) else {
+        // A session id, or the claude/codex alias for the most recently used
+        // live session of that provider (resolved for each request).
+        let target = match Provider::from_alias(&requested) {
+            Some(provider) => self.sessions.latest(provider),
+            None => SessionId::parse(&requested).filter(|id| self.sessions.get(id).is_some()),
+        };
+        let Some(target) = target else {
             self.queue_terminal(Message::Error {
-                terminal_id: Some(id),
+                terminal_id: Some(requested),
                 message: "Unknown terminal".into(),
             });
             return;
         };
-        let is_input = matches!(envelope.message, Message::Input { .. });
-        let result = match self.session_for_mut(provider) {
+        message.set_request_terminal_id(target.as_str());
+        let id = target.to_string();
+        let is_input = matches!(message, Message::Input { .. });
+        let result = match self.sessions.get_mut(&target) {
             Some(Session {
                 share,
                 terminal,
@@ -117,10 +110,11 @@ impl App {
                 last_used,
                 ..
             }) => {
-                if is_input {
+                let result = share.handle(message, terminal, input, handle);
+                if is_input && result.is_ok() {
                     *last_used = std::time::Instant::now();
                 }
-                share.handle(envelope.message, terminal, input, handle)
+                result
             }
             _ => Err("Terminal unavailable; launch the CLI in Atem first".into()),
         };
@@ -269,13 +263,8 @@ impl App {
 
     pub fn stop_terminal(&mut self) {
         self.reclaim_terminal();
-        let Some(session) = self.focused_session() else {
-            return;
-        };
-        if let Some(handle) = &session.handle
-            && let Err(error) = handle.stop()
-        {
-            self.status_message = Some(error.to_string());
+        if let Some(id) = self.focused_session().map(|s| s.id.clone()) {
+            self.stop_session(&id);
         }
     }
 
@@ -363,11 +352,15 @@ mod tests {
     }
 
     fn codex_id(app: &App) -> SessionId {
-        app.session_id_for(Provider::Codex).unwrap()
+        codex(app).id.clone()
     }
 
     fn codex(app: &App) -> &Session {
-        app.session_for(Provider::Codex).unwrap()
+        app.sessions
+            .iter()
+            .filter(|s| s.provider == Provider::Codex)
+            .last()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -391,8 +384,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(codex(&app).share.generation, generation);
-        assert!(!app.ensure_session(Provider::Codex).await.unwrap());
-        assert!(matches!(app.mode, AppMode::MainMenu));
+        // The menu resumes the same session.
+        app.launch_from_menu(Provider::Codex).await;
+        assert_eq!(app.focused, Some(id));
+        assert_eq!(app.sessions.iter().count(), 1);
     }
 
     #[test]
@@ -578,7 +573,7 @@ mod tests {
                     continue;
                 };
                 match envelope.message {
-                    Message::Sessions { sessions } => {
+                    Message::Sessions { sessions, .. } => {
                         assert_eq!(sessions.len(), 1);
                         socket
                             .send(encode(Message::Subscribe {

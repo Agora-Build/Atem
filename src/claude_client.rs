@@ -1,5 +1,9 @@
+#[cfg(test)]
 use crate::pty_session;
+#[cfg(test)]
 use anyhow::Result;
+use std::ffi::OsString;
+#[cfg(test)]
 pub type ClaudeSession = pty_session::PtySession;
 
 #[derive(Clone, Debug)]
@@ -9,38 +13,46 @@ pub struct ClaudeClient {
 }
 
 impl ClaudeClient {
+    /// From Atem's own environment (`CLAUDE_CLI_BIN`, `CLAUDE_CLI_ARGS`).
     pub fn new() -> Self {
-        let binary = std::env::var("CLAUDE_CLI_BIN").unwrap_or_else(|_| "claude".to_string());
-        let extra_args = std::env::var("CLAUDE_CLI_ARGS")
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    /// From a launch environment instead of Atem's own.
+    pub fn from_env(env: &[(OsString, OsString)]) -> Self {
+        Self::from_vars(|name| {
+            env.iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .and_then(|(_, value)| value.to_str().map(str::to_string))
+        })
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let binary = var("CLAUDE_CLI_BIN").unwrap_or_else(|| "claude".to_string());
+        let extra_args = var("CLAUDE_CLI_ARGS")
             .map(|raw| raw.split_whitespace().map(|s| s.to_string()).collect())
             .unwrap_or_default();
-
         Self { binary, extra_args }
     }
 
+    /// Arguments for every later spawn from this client (`atem agent launch … ARGS`).
     pub fn append_launch_args(&mut self, args: &[String]) {
         self.extra_args.extend_from_slice(args);
     }
 
+    #[cfg(test)]
     pub async fn start_session(&self) -> Result<ClaudeSession> {
         pty_session::spawn(&self.binary, &self.extra_args)
     }
 
-    /// The arguments every spawn gets (env defaults, then launch arguments).
-    pub fn launch_args(&self) -> &[String] {
-        &self.extra_args
+    pub fn binary(&self) -> &str {
+        &self.binary
     }
 
-    /// Spawn with `first` placed before the stored arguments, for this spawn only
-    /// (so they stay ahead of a user's `--`).
-    pub async fn start_session_sized(
-        &self,
-        rows: u16,
-        cols: u16,
-        first: &[String],
-    ) -> Result<ClaudeSession> {
-        let args = [first, &self.extra_args[..]].concat();
-        pty_session::spawn_sized(&self.binary, &args, rows, cols)
+    /// The arguments every spawn gets first (`CLAUDE_CLI_ARGS`, then appended ones).
+    pub fn launch_args(&self) -> &[String] {
+        &self.extra_args
     }
 
     #[cfg(test)]
@@ -62,6 +74,26 @@ mod tests {
         };
         assert_eq!(client.binary, "my-claude");
         assert_eq!(client.extra_args, vec!["--flag1", "--flag2"]);
+    }
+
+    #[test]
+    fn a_launch_environment_sets_binary_and_default_arguments() {
+        let env = [
+            (
+                OsString::from("CLAUDE_CLI_BIN"),
+                OsString::from("/opt/agent"),
+            ),
+            (
+                OsString::from("CLAUDE_CLI_ARGS"),
+                OsString::from(" --a  --b "),
+            ),
+        ];
+        let client = ClaudeClient::from_env(&env);
+        assert_eq!(client.binary(), "/opt/agent");
+        assert_eq!(client.launch_args(), ["--a", "--b"]);
+        let client = ClaudeClient::from_env(&[]);
+        assert_eq!(client.binary(), "claude");
+        assert!(client.launch_args().is_empty());
     }
 
     #[test]

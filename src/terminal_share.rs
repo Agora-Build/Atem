@@ -28,6 +28,10 @@ pub enum Message {
     List,
     Sessions {
         sessions: Vec<SessionInfo>,
+        /// `"session"`: `terminal_id` is a session id (`claude`/`codex` stay
+        /// aliases for the most recently used live session of that provider).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_ids: Option<String>,
     },
     Subscribe {
         terminal_id: String,
@@ -111,6 +115,36 @@ pub enum Message {
     },
 }
 
+impl Message {
+    /// The terminal a request names (`None` for `list` and replies).
+    pub fn request_terminal_id(&self) -> Option<&str> {
+        match self {
+            Message::Subscribe { terminal_id, .. }
+            | Message::Unsubscribe { terminal_id, .. }
+            | Message::Ack { terminal_id, .. }
+            | Message::Control { terminal_id, .. }
+            | Message::Input { terminal_id, .. }
+            | Message::Resize { terminal_id, .. }
+            | Message::Stop { terminal_id, .. } => Some(terminal_id),
+            _ => None,
+        }
+    }
+
+    /// Point a request at `id` (an alias resolved to its session id).
+    pub fn set_request_terminal_id(&mut self, id: &str) {
+        match self {
+            Message::Subscribe { terminal_id, .. }
+            | Message::Unsubscribe { terminal_id, .. }
+            | Message::Ack { terminal_id, .. }
+            | Message::Control { terminal_id, .. }
+            | Message::Input { terminal_id, .. }
+            | Message::Resize { terminal_id, .. }
+            | Message::Stop { terminal_id, .. } => *terminal_id = id.to_string(),
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub terminal_id: String,
@@ -150,9 +184,10 @@ pub struct SharedTerminal {
 }
 
 impl SharedTerminal {
-    pub fn new(provider: &str) -> Self {
+    /// `id` is the session id (the terminal id on the wire).
+    pub fn new(id: &str, provider: &str) -> Self {
         Self {
-            id: provider.into(),
+            id: id.into(),
             generation: uuid::Uuid::new_v4().to_string(),
             provider: provider.into(),
             viewer: None,
@@ -599,7 +634,7 @@ mod tests {
         crate::pty_session::PtySession,
     ) {
         (
-            SharedTerminal::new("codex"),
+            SharedTerminal::new("ses-abcdefgh2345", "codex"),
             vt100::Parser::new(24, 80, 100),
             crate::pty_session::spawn("cat", &[]).unwrap(),
         )
@@ -979,5 +1014,27 @@ mod tests {
             serde_json::json!({"type":"terminal","data":{"v":1,"op":"list"}})
         );
         serde_json::from_value::<crate::websocket_client::AstationMessage>(json).unwrap();
+    }
+
+    #[test]
+    fn sessions_say_terminal_ids_are_session_ids_and_parse_without_it() {
+        let (share, parser, _pty) = fixture();
+        let message = Message::Sessions {
+            sessions: vec![share.info(parser.screen())],
+            terminal_ids: Some("session".into()),
+        };
+        let json = serde_json::to_value(Envelope::from(message)).unwrap();
+        assert_eq!(json["op"], "sessions");
+        assert_eq!(json["terminal_ids"], "session");
+        assert_eq!(json["sessions"][0]["terminal_id"], "ses-abcdefgh2345");
+        assert_eq!(json["sessions"][0]["provider"], "codex");
+        // An older peer's list (no terminal_ids) still parses.
+        let old = serde_json::json!({"v": 1, "op": "sessions", "sessions": []});
+        let Message::Sessions { terminal_ids, .. } =
+            serde_json::from_value::<Envelope>(old).unwrap().message
+        else {
+            panic!("expected sessions")
+        };
+        assert_eq!(terminal_ids, None);
     }
 }

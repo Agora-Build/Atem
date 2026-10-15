@@ -1,7 +1,9 @@
 //! Shared byte-oriented PTY transport. Terminal data and lifecycle events never mix.
 use anyhow::{Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -232,11 +234,44 @@ pub struct PtySession {
     pub resize_handle: PtyHandle,
 }
 
+/// What to spawn: `env` `None` inherits Atem's environment; `Some` replaces it.
+#[derive(Clone, Debug)]
+pub struct SpawnSpec {
+    pub binary: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Option<Vec<(OsString, OsString)>>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[cfg(test)]
 pub fn spawn(binary: &str, args: &[String]) -> Result<PtySession> {
     spawn_sized(binary, args, DEFAULT_ROWS, DEFAULT_COLS)
 }
 
+/// In Atem's working directory with its environment.
+#[cfg(test)]
 pub fn spawn_sized(binary: &str, args: &[String], rows: u16, cols: u16) -> Result<PtySession> {
+    spawn_spec(SpawnSpec {
+        binary: binary.into(),
+        args: args.to_vec(),
+        cwd: std::env::current_dir()?,
+        env: None,
+        rows,
+        cols,
+    })
+}
+
+pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
+    let SpawnSpec {
+        binary,
+        args,
+        cwd,
+        env,
+        rows,
+        cols,
+    } = spec;
     if !(2..=200).contains(&rows) || !(2..=400).contains(&cols) {
         bail!("Terminal size must be 2..200 rows and 2..400 columns");
     }
@@ -246,9 +281,18 @@ pub fn spawn_sized(binary: &str, args: &[String], rows: u16, cols: u16) -> Resul
         pixel_width: 0,
         pixel_height: 0,
     })?;
+    if !cwd.is_dir() {
+        bail!("{} is not a directory", cwd.display());
+    }
     let mut command = CommandBuilder::new(binary);
     command.args(args);
-    command.cwd(std::env::current_dir()?);
+    command.cwd(cwd);
+    if let Some(env) = env {
+        command.env_clear();
+        for (name, value) in env {
+            command.env(name, value);
+        }
+    }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env("TERM_PROGRAM", "Atem");
@@ -423,6 +467,70 @@ mod tests {
             input.send("x".into()).unwrap();
         }
         assert!(input.send("overflow".into()).is_err());
+    }
+
+    async fn output_of(mut session: PtySession) -> String {
+        let mut output = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), session.receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                PtyEvent::Output(bytes) => output.extend(bytes),
+                PtyEvent::Exit(_) => break,
+                _ => {}
+            }
+        }
+        String::from_utf8(output).unwrap()
+    }
+
+    #[tokio::test]
+    async fn spawn_spec_uses_the_given_directory_and_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "printf '%s|%s|%s|%s' \"$PWD\" \"$ATEM_SPEC\" \"${HOME:-none}\" \"$TERM\"";
+        let spec = SpawnSpec {
+            binary: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: dir.path().to_path_buf(),
+            env: Some(vec![
+                ("ATEM_SPEC".into(), "given".into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ]),
+            rows: 24,
+            cols: 80,
+        };
+        let output = output_of(spawn_spec(spec.clone()).unwrap()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        // Only the given environment, plus the terminal variables.
+        assert_eq!(
+            output,
+            format!("{}|given|none|xterm-256color", cwd.display())
+        );
+        // None inherits Atem's environment.
+        let inherited = SpawnSpec { env: None, ..spec };
+        let output = output_of(spawn_spec(inherited).unwrap()).await;
+        let home = std::env::var("HOME").unwrap_or_else(|_| "none".into());
+        assert_eq!(output, format!("{}||{home}|xterm-256color", cwd.display()));
+    }
+
+    #[test]
+    fn spawn_spec_refuses_a_bad_size_or_directory() {
+        let spec = SpawnSpec {
+            binary: "cat".into(),
+            args: Vec::new(),
+            cwd: std::env::temp_dir(),
+            env: None,
+            rows: 1,
+            cols: 80,
+        };
+        assert!(spawn_spec(spec.clone()).is_err());
+        let missing = SpawnSpec {
+            cwd: "/nonexistent/atem-test-dir".into(),
+            rows: 24,
+            ..spec
+        };
+        assert!(spawn_spec(missing).is_err());
     }
 
     #[tokio::test]

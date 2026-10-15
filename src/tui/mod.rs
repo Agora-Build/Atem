@@ -61,13 +61,16 @@ pub async fn run_agent_tui(agent: Option<&str>, agent_args: &[String]) -> Result
         None => None,
     };
     if let Some(provider) = provider {
-        app.focus_provider(provider);
+        // Kept on the client, so a relaunch from the menu gets them too.
         match provider {
             Provider::Codex => app.codex_client.append_launch_args(agent_args),
             Provider::Claude => app.claude_client.append_launch_args(agent_args),
         }
         sync_terminal_sizes(&mut app, terminal.size()?);
-        app.ensure_session(provider).await?;
+        let (rows, cols) = app.launch_size();
+        let request = crate::session::LaunchRequest::here(provider, Vec::new(), rows, cols);
+        let id = app.launch_session(request).await?;
+        app.focus_session(&id);
     }
     terminal.clear()?;
     run_tui_loop(&mut terminal, &mut app, &diagnostics).await
@@ -77,20 +80,18 @@ fn sync_terminal_sizes(app: &mut App, size: ratatui::layout::Size) {
     let rows = size.height.saturating_sub(1).clamp(2, 200);
     let cols = size.width.clamp(2, 400);
     app.terminal_ui.viewport = (rows, cols);
-    // The focused session, and sessions without a process, follow the local viewport.
-    for id in app.sessions.ids() {
-        let no_process = app.sessions.get(&id).is_some_and(|s| s.input.is_none());
-        if app.is_focused(&id) || no_process {
-            app.adjust_terminal_size(&id, rows, cols);
-        }
+    // The focused session follows the local viewport.
+    if let Some(id) = app.focused.clone().filter(|id| app.is_focused(id)) {
+        app.adjust_terminal_size(&id, rows, cols);
     }
 }
 
-/// The session local keys go to: the focused one, else Claude's.
-// Task 2: route by id
+/// The session local keys go to: the focused one, else the latest Claude one.
 fn key_target(app: &App) -> Option<&Session> {
-    app.focused_session()
-        .or_else(|| app.session_for(Provider::Claude))
+    app.focused_session().or_else(|| {
+        let id = app.sessions.latest(Provider::Claude)?;
+        app.sessions.get(&id)
+    })
 }
 
 fn send_agent(app: &mut App, bytes: &str) {
@@ -223,6 +224,7 @@ async fn run_tui_loop(
         // Process any pending Astation messages (also detects WS disconnect)
         app.process_astation_messages().await;
         app.process_sessions_output();
+        app.reap_exited_sessions(std::time::Instant::now());
         app.poll_chat().await;
         // Drain bytes from the old geometry before notifying the CLI of a resize.
         sync_terminal_sizes(app, terminal.size()?);

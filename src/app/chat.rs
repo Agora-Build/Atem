@@ -75,6 +75,11 @@ fn not_available(reason: Option<&str>) -> String {
 }
 
 impl AgentChat {
+    /// The agent's terminal has a draft (see `ChatSession::has_unsent_input`).
+    pub fn has_unsent_input(&self, input_count: u64) -> bool {
+        self.session.has_unsent_input(input_count)
+    }
+
     /// Number `outs` for one conversation (its own sequence).
     fn for_conversation(&mut self, conversation: &str, outs: &[Out]) -> Vec<ChatEnvelope> {
         let Some(c) = self.conversations.get_mut(conversation) else {
@@ -167,17 +172,10 @@ impl AgentChat {
 }
 
 impl App {
-    /// Before a respawn: report the old process's last state (its exit), tell
-    /// its open conversations to reopen, and drop its chat (removing its directory).
-    pub(crate) async fn retire_chat(&mut self, id: &SessionId) {
-        if self.sessions.get(id).is_none_or(|s| s.chat.is_none()) {
-            return;
-        }
-        self.poll_chat().await;
-        if let Some(mut chat) = self.sessions.get_mut(id).and_then(|s| s.chat.take()) {
-            let envelopes = chat.end_conversations(RESTARTED);
-            self.send_chat(envelopes).await;
-        }
+    /// A removed session: its open conversations are told to reopen (sent by
+    /// the next `poll_chat`); dropping the chat removes its directory.
+    pub(crate) fn end_chat(&mut self, mut chat: AgentChat) {
+        self.chat_outbox.extend(chat.end_conversations(RESTARTED));
     }
 
     /// Prepares chat for the Claude process about to be spawned: the chat for
@@ -224,9 +222,16 @@ impl App {
 
     /// Each tick: read the agent's events and log, update the session, send what
     /// changed to open conversations, and keep the registry in step.
+    /// Also sends what session removal queued and, when sessions started,
+    /// exited or were removed, the agent list.
     pub async fn poll_chat(&mut self) {
+        let queued = std::mem::take(&mut self.chat_outbox);
+        self.send_chat(queued).await;
         for id in self.sessions.ids() {
             self.poll_session_chat(&id).await;
+        }
+        if std::mem::take(&mut self.agent_list_dirty) {
+            self.send_agent_list_if_connected().await;
         }
     }
 

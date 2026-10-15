@@ -567,6 +567,12 @@ impl ChatSession {
         }
     }
 
+    /// Terminal input (`input_count`) arrived since the last prompt was
+    /// submitted: a draft that a pasted prompt or legacy input would submit.
+    pub fn has_unsent_input(&self, input_count: u64) -> bool {
+        input_count != self.input_mark
+    }
+
     /// Validate and, if allowed, return the text to paste (the caller pastes it with
     /// `send_paste`). `Err` carries the `Out`s to send to the asking conversation; a
     /// repeated request that is still in flight has nothing new to report (empty vec).
@@ -622,7 +628,7 @@ impl ChatSession {
         if self.status.state != State::Ready || self.pending.is_some() {
             return err("the agent is busy; wait for the current turn to finish");
         }
-        if input_count != self.input_mark {
+        if self.has_unsent_input(input_count) {
             return err("the terminal has unsent input; finish or clear it there");
         }
         if remote_controlled {

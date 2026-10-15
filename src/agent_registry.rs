@@ -18,7 +18,14 @@ use crate::agent_client::{AgentInfo, AgentStatus};
 /// all writes are immediately visible through every clone.
 #[derive(Clone, Default)]
 pub struct AgentRegistry {
-    inner: Arc<RwLock<HashMap<String, AgentInfo>>>,
+    inner: Arc<RwLock<Entries>>,
+}
+
+/// Agents by id, each with its registration number (for `all()`'s order).
+#[derive(Default)]
+struct Entries {
+    agents: HashMap<String, (u64, AgentInfo)>,
+    next: u64,
 }
 
 impl AgentRegistry {
@@ -31,31 +38,62 @@ impl AgentRegistry {
     /// it is replaced.  Returns the agent's `id`.
     pub fn register(&self, info: AgentInfo) -> String {
         let id = info.id.clone();
-        self.inner.write().unwrap().insert(id.clone(), info);
+        let mut entries = self.inner.write().unwrap();
+        let order = match entries.agents.get(&id) {
+            Some((order, _)) => *order,
+            None => {
+                entries.next += 1;
+                entries.next
+            }
+        };
+        entries.agents.insert(id.clone(), (order, info));
         id
     }
 
     /// Retrieve a snapshot of an agent by ID.
     pub fn get(&self, id: &str) -> Option<AgentInfo> {
-        self.inner.read().unwrap().get(id).cloned()
+        self.inner
+            .read()
+            .unwrap()
+            .agents
+            .get(id)
+            .map(|(_, info)| info.clone())
     }
 
-    /// Return snapshots of all registered agents.
+    /// Return snapshots of all registered agents, in registration order (a
+    /// replaced agent keeps its place).
     pub fn all(&self) -> Vec<AgentInfo> {
-        self.inner.read().unwrap().values().cloned().collect()
+        let entries = self.inner.read().unwrap();
+        let mut agents: Vec<&(u64, AgentInfo)> = entries.agents.values().collect();
+        agents.sort_by_key(|(order, _)| *order);
+        agents.into_iter().map(|(_, info)| info.clone()).collect()
     }
 
     /// Update the status field of an existing agent.  No-ops silently if
     /// the ID is not found.
     pub fn update_status(&self, id: &str, status: AgentStatus) {
-        if let Some(entry) = self.inner.write().unwrap().get_mut(id) {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .unwrap()
+            .agents
+            .get_mut(id)
+            .map(|(_, info)| info)
+        {
             entry.status = status;
         }
     }
 
     /// Add a session ID to an agent's session list (deduplicating).
     pub fn add_session(&self, agent_id: &str, session_id: &str) {
-        if let Some(entry) = self.inner.write().unwrap().get_mut(agent_id) {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .unwrap()
+            .agents
+            .get_mut(agent_id)
+            .map(|(_, info)| info)
+        {
             if !entry.session_ids.contains(&session_id.to_string()) {
                 entry.session_ids.push(session_id.to_string());
             }
@@ -64,34 +102,38 @@ impl AgentRegistry {
 
     /// Remove a session ID from an agent's session list.
     pub fn remove_session(&self, agent_id: &str, session_id: &str) {
-        if let Some(entry) = self.inner.write().unwrap().get_mut(agent_id) {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .unwrap()
+            .agents
+            .get_mut(agent_id)
+            .map(|(_, info)| info)
+        {
             entry.session_ids.retain(|s| s != session_id);
         }
     }
 
     /// Remove an agent from the registry.  No-ops silently if not found.
     pub fn remove(&self, id: &str) {
-        self.inner.write().unwrap().remove(id);
+        self.inner.write().unwrap().agents.remove(id);
     }
 
     /// Return the number of registered agents.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().unwrap().agents.len()
     }
 
     /// Return true if no agents are registered.
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        self.inner.read().unwrap().agents.is_empty()
     }
 
     /// Return all agents that are currently connected (not Disconnected).
     pub fn connected(&self) -> Vec<AgentInfo> {
-        self.inner
-            .read()
-            .unwrap()
-            .values()
+        self.all()
+            .into_iter()
             .filter(|a| a.status != AgentStatus::Disconnected)
-            .cloned()
             .collect()
     }
 }
@@ -183,6 +225,25 @@ mod tests {
     }
 
     // ── remove ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn all_lists_agents_in_registration_order_and_a_replace_keeps_its_place() {
+        let reg = AgentRegistry::new();
+        for id in ["ses-c", "ses-a", "ses-b"] {
+            reg.register(make_info(id, AgentProtocol::Pty));
+        }
+        let ids =
+            |reg: &AgentRegistry| -> Vec<String> { reg.all().into_iter().map(|a| a.id).collect() };
+        assert_eq!(ids(&reg), ["ses-c", "ses-a", "ses-b"]);
+        let mut info = make_info("ses-a", AgentProtocol::Pty);
+        info.status = AgentStatus::Thinking;
+        reg.register(info);
+        assert_eq!(ids(&reg), ["ses-c", "ses-a", "ses-b"]);
+        assert_eq!(reg.all()[1].status, AgentStatus::Thinking);
+        reg.remove("ses-c");
+        reg.register(make_info("ses-c", AgentProtocol::Pty));
+        assert_eq!(ids(&reg), ["ses-a", "ses-b", "ses-c"]);
+    }
 
     #[test]
     fn test_remove_existing() {

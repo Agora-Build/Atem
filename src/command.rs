@@ -32,6 +32,14 @@ impl TaskQueue {
         Some(id)
     }
 
+    /// The task `start_next` would start (none while one is active).
+    pub fn peek_next(&self) -> Option<&str> {
+        if self.active.is_some() {
+            return None;
+        }
+        self.pending.front().map(String::as_str)
+    }
+
     /// Complete the active task and return its ID.
     pub fn complete_active(&mut self) -> Option<String> {
         self.active.take()
