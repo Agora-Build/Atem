@@ -614,6 +614,7 @@ impl App {
             pty_pid: None,
             capabilities: vec![],
         });
+        self.send_agent_list_if_connected().await;
         Ok(true)
     }
 
@@ -972,6 +973,8 @@ impl App {
         let agent_id = existing_id.unwrap_or_else(|| {
             format!("claude-pty-{}", uuid::Uuid::new_v4())
         });
+        // The previous process's conversations are told to reopen.
+        self.retire_claude_chat().await;
         // Chat hooks for this process (a new generation); empty when chat could not be prepared.
         let launch_args = self.claude_client.launch_args().to_vec();
         let chat_args = self.prepare_claude_chat(&agent_id, &launch_args);

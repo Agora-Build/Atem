@@ -111,7 +111,8 @@ chat page is open.
    any prompt; it carries `session_id` and `transcript_path`). None within 15 s
    → chat is withdrawn for this agent, with the reason shown in Atem's notices
    ("Claude hooks are not active: disabled, `--bare`, or an unsupported
-   version"); the terminal keeps working.
+   version"); the terminal keeps working. A late `SessionStart` (e.g. after
+   Claude's workspace-trust question in a new directory) still enables chat.
 4. The directory is removed when the agent process ends or Atem exits.
 
 Nothing in the user's `~/.claude` settings changes. Hooks the user already has
@@ -267,6 +268,8 @@ on the existing authenticated Astation connection.
 | `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId` |
 | `close` | either | `conversationId` |
 
+- `open` with `before` on an open conversation reopens it (`opened`,
+  sequence 0) and sends that older page.
 - Every Atem event in a conversation carries `generation` and the next
   `sequence` (1, 2, …; at most 2^53−1). A gap or a different generation means
   the client reopens.
@@ -302,8 +305,9 @@ on the existing authenticated Astation connection.
 |---|---|
 | Atem not running when a hook fires | the event file is written and never read; Claude is unaffected; the directory goes with the session |
 | Claude exits or crashes | `unknown`, `error` to open conversations, generation retired, prompts refused |
+| Agent restarted | open conversations get `error` "the agent was restarted; reopen the chat" and `close`; the new process has a new generation |
 | Bad or unknown transcript line | skipped, one notice; reading continues |
-| Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason; terminal unaffected |
+| Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason (open conversations get `error` and `close`); terminal unaffected |
 | No acceptance within 10 s of a paste | `error` "delivery unknown"; never resent |
 | Astation disconnects / re-authenticates | conversations close; Claude keeps running; a new `open` restores status and history |
 | Atem exits | the terminal and Claude end with it (as today); a new Atem has a new generation |

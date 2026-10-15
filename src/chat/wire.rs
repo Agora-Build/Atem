@@ -327,6 +327,11 @@ pub fn error(conv: &str, agent: &str, text: &str, request_id: Option<&str>) -> C
     envelope(conv, agent, "error", None, ErrorBody { text, request_id })
 }
 
+/// Atem ends a conversation (after an `error` saying why).
+pub fn close(conv: &str, agent: &str) -> ChatEnvelope {
+    envelope(conv, agent, "close", None, Map::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,5 +610,13 @@ mod tests {
         );
         let back: ChatEnvelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn close_carries_only_the_ids() {
+        assert_eq!(
+            serde_json::to_value(close("c1", "claude")).unwrap(),
+            json!({"v":1,"op":"close","conversationId":"c1","agentId":"claude"})
+        );
     }
 }

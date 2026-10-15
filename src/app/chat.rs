@@ -17,6 +17,7 @@ const HISTORY_BYTES: usize = 256 * 1024;
 const NOT_AVAILABLE: &str = "chat is not available for this agent";
 /// Sent instead of the OS error, which stays local.
 const PASTE_FAILED: &str = "could not write to the terminal";
+const RESTARTED: &str = "the agent was restarted; reopen the chat";
 pub const CHAT_V1: &str = "chat-v1";
 
 /// Chat for one agent process. A respawn gets a new one (new generation); the
@@ -74,6 +75,22 @@ impl AgentChat {
             .collect()
     }
 
+    /// Tell every open conversation why it ends (`error`, then `close`) and drop them.
+    fn end_conversations(&mut self, text: &str) -> Vec<ChatEnvelope> {
+        let error = [Out::Error {
+            text: text.to_string(),
+            request_id: None,
+        }];
+        let ids: Vec<String> = self.conversations.keys().cloned().collect();
+        let mut envelopes = Vec::new();
+        for id in &ids {
+            envelopes.extend(self.for_conversation(id, &error));
+            envelopes.push(wire::close(id, &self.agent_id));
+        }
+        self.conversations.clear();
+        envelopes
+    }
+
     /// Number `outs` for every open conversation.
     fn broadcast(&mut self, outs: &[Out]) -> Vec<ChatEnvelope> {
         if outs.is_empty() {
@@ -87,6 +104,19 @@ impl AgentChat {
 }
 
 impl App {
+    /// Before a Claude respawn: report the old process's last state (its exit), tell
+    /// its open conversations to reopen, and drop it (removing its directory).
+    pub(crate) async fn retire_claude_chat(&mut self) {
+        if self.claude_chat.is_none() {
+            return;
+        }
+        self.poll_chat().await;
+        if let Some(mut chat) = self.claude_chat.take() {
+            let envelopes = chat.end_conversations(RESTARTED);
+            self.send_chat(envelopes).await;
+        }
+    }
+
     /// Prepares chat for the Claude process about to be spawned and returns the
     /// arguments to put first on its command line. Any earlier chat (an older
     /// process) is dropped. On failure Claude starts without chat.
@@ -184,11 +214,7 @@ impl App {
 
         let mut envelopes = chat.broadcast(&outs);
         if withdrawn {
-            let text = not_available(caps.reason.as_deref());
-            for conversation in chat.conversations.keys() {
-                envelopes.push(wire::error(conversation, &chat.agent_id, &text, None));
-            }
-            chat.conversations.clear();
+            envelopes.extend(chat.end_conversations(&not_available(caps.reason.as_deref())));
         }
         if let Some(detail) = notice {
             crate::diagnostics::warn(format!("Chat: {detail}"));
@@ -219,6 +245,11 @@ impl App {
         info.status = status;
         info.capabilities = capabilities;
         self.agent_registry.register(info);
+        self.send_agent_list_if_connected().await;
+    }
+
+    /// The agent list to Astation, when the link is authenticated.
+    pub(crate) async fn send_agent_list_if_connected(&self) {
         if self.astation_connected {
             let agents = self.agent_registry.all();
             let _ = self.astation_client.send_agent_list(agents).await;
@@ -301,6 +332,8 @@ impl App {
                     sequence += 1;
                 }
                 chat.conversations.insert(conversation, sequence);
+                // The client just got the status; the next heartbeat is 15 s from now.
+                chat.last_heartbeat = Instant::now();
                 envs
             }
             Inbound::Close => {

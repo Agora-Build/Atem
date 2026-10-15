@@ -164,8 +164,9 @@ impl Harness {
         .await;
     }
 
-    /// Open `conversation`; returns the `opened` message and the history after it.
-    async fn open(&mut self, conversation: &str) -> (Value, Vec<Value>) {
+    /// Open `conversation` and wait for `history` history messages; returns the
+    /// `opened` message and the history after it.
+    async fn open(&mut self, conversation: &str, history: u64) -> (Value, Vec<Value>) {
         let from = self.seen.len();
         self.send_chat("open", conversation, json!({}));
         let at = self
@@ -173,8 +174,16 @@ impl Harness {
                 is_chat(v, "opened") && v["data"]["conversationId"] == conversation
             })
             .await;
-        // History is sent in the same call as `opened`.
-        self.pump_for(Duration::from_millis(50)).await;
+        if history > 0 {
+            let conversation = conversation.to_string();
+            self.pump_until(at + 1, move |v| {
+                is_chat(v, "message")
+                    && v["data"]["conversationId"] == conversation.as_str()
+                    && v["data"]["history"] == true
+                    && v["data"]["sequence"] == history
+            })
+            .await;
+        }
         let history = self.seen[at + 1..]
             .iter()
             .filter(|v| v["data"]["conversationId"] == conversation && v["data"]["history"] == true)
@@ -203,9 +212,14 @@ impl Harness {
                 is_chat(v, "complete") && v["data"]["requestId"] == rid.as_str()
             })
             .await;
-        // A status change may follow `complete` in the same poll.
-        self.pump_for(Duration::from_millis(100)).await;
-        let _ = at;
+        // The turn's end also sets status ready, right after `complete`.
+        let conv = conversation.to_string();
+        self.pump_until(at + 1, move |v| {
+            is_chat(v, "status")
+                && v["data"]["conversationId"] == conv.as_str()
+                && v["data"]["state"] == "ready"
+        })
+        .await;
         self.seen[from..]
             .iter()
             .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == conversation)
@@ -307,7 +321,7 @@ async fn agent_list_advertises_chat_v1_after_session_start() {
 async fn chat_open_submit_reply_complete() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    let (opened, history) = h.open("c1").await;
+    let (opened, history) = h.open("c1", 0).await;
     assert_eq!(opened["data"]["sequence"], 0);
     assert_eq!(opened["data"]["status"]["state"], "ready");
     assert!(history.is_empty());
@@ -371,7 +385,7 @@ async fn chat_open_submit_reply_complete() {
 async fn submit_refused_after_local_typing() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    let (opened, _) = h.open("c1").await;
+    let (opened, _) = h.open("c1", 0).await;
     let generation = opened["data"]["generation"].as_str().unwrap().to_string();
     // A key typed in Atem's own terminal view (the local input path).
     h.app.send_claude_data("x");
@@ -406,7 +420,7 @@ async fn submit_refused_after_local_typing() {
 async fn duplicate_request_is_not_executed_twice() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    let (opened, _) = h.open("c1").await;
+    let (opened, _) = h.open("c1", 0).await;
     let generation = opened["data"]["generation"].as_str().unwrap().to_string();
     h.submit_until_complete("c1", &generation, "r1", "only once")
         .await;
@@ -442,14 +456,13 @@ async fn duplicate_request_is_not_executed_twice() {
 async fn reconnect_restores_status_and_history() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    let (opened, _) = h.open("c1").await;
+    let (opened, _) = h.open("c1", 0).await;
     let generation = opened["data"]["generation"].as_str().unwrap().to_string();
     h.submit_until_complete("c1", &generation, "r1", "remember me")
         .await;
     h.send_chat("close", "c1", json!({}));
-    h.pump_for(Duration::from_millis(50)).await;
 
-    let (opened, history) = h.open("c1").await;
+    let (opened, history) = h.open("c1", 2).await;
     assert_eq!(opened["data"]["generation"], generation.as_str());
     assert_eq!(opened["data"]["sequence"], 0);
     assert_eq!(opened["data"]["status"]["state"], "ready");
@@ -471,7 +484,7 @@ async fn reconnect_restores_status_and_history() {
 async fn process_exit_reports_unknown() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    let (opened, _) = h.open("c1").await;
+    let (opened, _) = h.open("c1", 0).await;
     let generation = opened["data"]["generation"].as_str().unwrap().to_string();
     assert_eq!(h.chat_dirs().len(), 1);
     let from = h.seen.len();
@@ -492,12 +505,10 @@ async fn process_exit_reports_unknown() {
             .get("capabilities")
             .is_none()
     );
-    h.pump_for(Duration::from_millis(50)).await;
-    assert!(
-        h.seen[from..]
-            .iter()
-            .any(|v| is_chat(v, "error") && v["data"]["text"] == "the agent exited")
-    );
+    h.pump_until(from, |v| {
+        is_chat(v, "error") && v["data"]["text"] == "the agent exited"
+    })
+    .await;
     assert!(h.chat_dirs().is_empty(), "the chat directory is removed");
     // A prompt for the retired process is refused.
     let from = h.seen.len();
@@ -534,7 +545,7 @@ async fn unknown_agent_and_bad_requests_get_errors() {
 async fn disconnect_closes_conversations() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    h.open("c1").await;
+    h.open("c1", 0).await;
     assert_eq!(h.app.claude_chat.as_ref().unwrap().conversations.len(), 1);
     h.app.on_astation_disconnect();
     assert!(h.app.claude_chat.as_ref().unwrap().conversations.is_empty());
@@ -545,7 +556,7 @@ async fn disconnect_closes_conversations() {
 async fn heartbeat_resends_status_with_its_original_since() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    let (opened, _) = h.open("c1").await;
+    let (opened, _) = h.open("c1", 0).await;
     let since = opened["data"]["status"]["since"].clone();
     h.app.claude_chat.as_mut().unwrap().last_heartbeat = Instant::now() - Duration::from_secs(16);
     let from = h.seen.len();
@@ -561,7 +572,7 @@ async fn heartbeat_resends_status_with_its_original_since() {
 async fn fatal_log_problem_withdraws_chat() {
     let mut h = start().await;
     h.wait_for_chat().await;
-    h.open("c1").await;
+    h.open("c1", 0).await;
     // The fake creates its (empty) transcript at start. A user entry without a
     // uuid means the transcript format changed.
     let transcript = std::fs::read_dir(h.root.path().join("run/transcripts"))
@@ -585,6 +596,10 @@ async fn fatal_log_problem_withdraws_chat() {
         h.seen[at]["data"]["text"],
         "chat is not available for this agent: user transcript entry has no uuid"
     );
+    assert_eq!(h.seen[at]["data"]["conversationId"], "c1");
+    let close = h.pump_until(from, |v| is_chat(v, "close")).await;
+    assert!(at < close);
+    assert_eq!(h.seen[close]["data"]["conversationId"], "c1");
     let at = h
         .pump_until(from, |v| {
             v["type"] == "agentListResponse" && v["data"]["agents"][0]["status"] == "Unknown"
@@ -663,4 +678,106 @@ async fn claude_without_chat_registers_unknown() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(app.claude_receiver.is_none(), "fake claude did not exit");
+}
+
+#[tokio::test]
+async fn respawn_tells_open_conversations_to_reopen() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    let (opened, _) = h.open("c1", 0).await;
+    let old_generation = opened["data"]["generation"].as_str().unwrap().to_string();
+    let from = h.seen.len();
+    h.app.send_claude_data("exit\r");
+    h.pump_until(from, |v| {
+        is_chat(v, "status") && v["data"]["state"] == "unknown"
+    })
+    .await;
+    assert!(h.app.claude_receiver.is_none());
+    let from = h.seen.len();
+    assert!(h.app.ensure_claude_session().await.unwrap());
+    let error = h
+        .pump_until(from, |v| {
+            is_chat(v, "error") && v["data"]["text"] == "the agent was restarted; reopen the chat"
+        })
+        .await;
+    assert_eq!(h.seen[error]["data"]["conversationId"], "c1");
+    assert_eq!(h.seen[error]["data"]["generation"], old_generation.as_str());
+    let close = h.pump_until(from, |v| is_chat(v, "close")).await;
+    assert!(error < close);
+    assert_eq!(h.seen[close]["data"]["conversationId"], "c1");
+    assert!(h.app.claude_chat.as_ref().unwrap().conversations.is_empty());
+    h.wait_for_chat().await;
+    let (opened, _) = h.open("c1", 0).await;
+    assert_ne!(opened["data"]["generation"], old_generation.as_str());
+    assert_eq!(h.chat_dirs().len(), 1, "the old chat directory is gone");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn opening_restarts_the_heartbeat_clock() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    h.app.claude_chat.as_mut().unwrap().last_heartbeat = Instant::now() - Duration::from_secs(16);
+    h.open("c1", 0).await;
+    let from = h.seen.len();
+    h.pump_for(Duration::from_millis(200)).await;
+    assert!(
+        !h.seen[from..].iter().any(|v| is_chat(v, "status")),
+        "no heartbeat right after opened"
+    );
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn chat_is_ignored_while_offline_or_suspended() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    h.app.astation_connected = false;
+    let from = h.seen.len();
+    h.send_chat("open", "c1", json!({}));
+    h.pump_for(Duration::from_millis(300)).await;
+    assert!(!h.seen[from..].iter().any(|v| v["type"] == "agentChat"));
+    assert!(h.app.claude_chat.as_ref().unwrap().conversations.is_empty());
+
+    h.app.astation_connected = true;
+    h.open("c1", 0).await;
+    h.app.suspend_astation();
+    assert!(h.app.claude_chat.as_ref().unwrap().conversations.is_empty());
+    let from = h.seen.len();
+    h.send_chat("open", "c2", json!({}));
+    h.pump_for(Duration::from_millis(300)).await;
+    assert!(!h.seen[from..].iter().any(|v| v["type"] == "agentChat"));
+    assert!(h.app.claude_chat.as_ref().unwrap().conversations.is_empty());
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn launching_codex_sends_the_agent_list() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    h.app
+        .codex_client
+        .set_command_for_test("cat".into(), Vec::new());
+    let from = h.seen.len();
+    assert!(h.app.ensure_codex_session().await.unwrap());
+    let at = h
+        .pump_until(from, |v| {
+            v["type"] == "agentListResponse"
+                && v["data"]["agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["kind"] == "Codex")
+        })
+        .await;
+    let codex = h.seen[at]["data"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["kind"] == "Codex")
+        .unwrap()
+        .clone();
+    assert_eq!(codex["status"], "Unknown");
+    assert!(codex.get("capabilities").is_none());
+    h.stop().await;
 }
