@@ -92,6 +92,8 @@ pub struct Sources {
     pub config: AtemConfig,
     pub credentials: PathBuf,
     pub sessions: PathBuf,
+    /// `pairing.json`: the host trust generation and the pairing binding.
+    pub pairing: PathBuf,
     pub keys: KeyPaths,
     /// Ask an already running key agent whether the keys are unlocked
     /// (never starts one). Off in tests, so they never reach the user's agent.
@@ -106,6 +108,7 @@ impl Sources {
             config: AtemConfig::load()?,
             credentials: CredentialStore::path(),
             sessions: SessionManager::sessions_path()?,
+            pairing: AtemConfig::config_dir().join("pairing.json"),
             keys: KeyPaths::default_paths(),
             query_agent: true,
         })
@@ -123,6 +126,7 @@ impl Sources {
             config,
             credentials: dir.join("credentials.enc"),
             sessions: dir.join("sessions.json"),
+            pairing: dir.join("pairing.json"),
             keys: KeyPaths::in_dir(dir),
             query_agent: false,
         }
@@ -329,6 +333,7 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
     } else {
         ""
     };
+    let trust = trust_note(src, astation_id);
     let verification = match verification(&src.keys, astation_id) {
         Verification::Verified { safety_code } => format!("verified (safety code {safety_code})"),
         Verification::NotVerified => "not verified".into(),
@@ -336,9 +341,28 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
         Verification::Unknown(error) => format!("unknown ({error})"),
     };
     (
-        Line::fresh(format!("paired ({astation_id}{expired}){more}")),
+        Line::fresh(format!("paired ({astation_id}{trust}{expired}){more}")),
         Line::fresh(verification),
     )
+}
+
+/// The Pairing line's trust generation: `, trust gen N` for the binding with
+/// `astation_id` (a pairing from before `pairing.json` shows the generation
+/// it migrates to; nothing is written). Read-only.
+fn trust_note(src: &Sources, astation_id: &str) -> String {
+    match crate::pairing_binding::load(src) {
+        Ok(state) => match state.binding {
+            Some(binding) if binding.astation_id == astation_id => {
+                format!(", trust gen {}", binding.host_trust_gen)
+            }
+            Some(binding) => format!(
+                ", trust gen {} is with {}; run `atem unpair`, then `atem pair`",
+                binding.host_trust_gen, binding.astation_id
+            ),
+            None => ", no pairing binding; run `atem unpair`, then `atem pair`".into(),
+        },
+        Err(error) => format!(", trust gen unknown: {error:#}"),
+    }
 }
 
 /// The status from `src`, with `agent` the already running key agent (if any).
@@ -433,7 +457,7 @@ pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::auth::AuthSession;
     use crate::memory::key_agent::{Reply, Request};
@@ -596,7 +620,7 @@ mod tests {
         write_paired(dir.path(), ASTATION, later());
         let report = report(dir.path());
         assert_eq!(report.account.value, "signed in");
-        assert_eq!(report.pairing.value, "paired (astation-1)");
+        assert_eq!(report.pairing.value, "paired (astation-1, trust gen 1)");
         assert_eq!(report.verification.value, "not verified");
         assert_eq!(report.credentials.value, "not set up");
     }
@@ -678,7 +702,7 @@ mod tests {
         );
         assert_eq!(
             report(dir.path()).pairing.value,
-            "paired (astation-2) (+1 more)"
+            "paired (astation-2, trust gen 1) (+1 more)"
         );
     }
 
@@ -689,8 +713,35 @@ mod tests {
         write_session(dir.path(), ASTATION);
         write_trust(dir.path(), Some(ASTATION), None);
         let before = snapshot(dir.path());
-        let _ = text(&Sources::in_dir(dir.path()));
+        let text = text(&Sources::in_dir(dir.path()));
         assert_eq!(snapshot(dir.path()), before);
+        // A pairing from before pairing.json: its generation is computed,
+        // never recorded by status.
+        assert!(text.contains("paired (astation-1, trust gen 1)"), "{text}");
+        assert!(!dir.path().join("pairing.json").exists());
+    }
+
+    #[test]
+    fn the_pairing_line_shows_the_trust_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        // Paired, unpaired, paired again: generation 3.
+        let before = crate::pairing_binding::capture(&src).unwrap();
+        crate::pairing_binding::bind_new(&src, &before, ASTATION).unwrap();
+        crate::pairing_binding::commit_unpair(&src).unwrap();
+        let before = crate::pairing_binding::capture(&src).unwrap();
+        crate::pairing_binding::bind_new(&src, &before, ASTATION).unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        assert_eq!(
+            report(dir.path()).pairing.value,
+            "paired (astation-1, trust gen 3)"
+        );
+        // An unpair interrupted after its commit: the old binding is gone.
+        crate::pairing_binding::commit_unpair(&src).unwrap();
+        assert_eq!(
+            report(dir.path()).pairing.value,
+            "paired (astation-1, no pairing binding; run `atem unpair`, then `atem pair`)"
+        );
     }
 
     #[test]
@@ -760,7 +811,7 @@ mod tests {
         let src = Sources::in_dir(dir.path());
         assert_eq!(
             report(dir.path()).pairing.value,
-            "paired (astation-1, session expired)"
+            "paired (astation-1, trust gen 1, session expired)"
         );
         assert!(profile_paired(&src));
         assert_eq!(

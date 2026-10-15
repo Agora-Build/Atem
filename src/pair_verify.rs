@@ -231,6 +231,33 @@ pub(crate) struct DeviceVerifiedReply {
     pub grants: Vec<GrantWire>,
 }
 
+/// Applies Astation's `deviceVerified` (`complete_verification`) only while
+/// the pairing the verification started under is current, under the pairing
+/// lock: a certificate that arrives after `atem unpair` (or a new `atem
+/// pair`) is dropped and nothing is pinned. `agent` must not be a
+/// `BoundAgent` (the lock is already held).
+pub(crate) fn apply_device_verified(
+    capture: &crate::pairing_binding::Captured,
+    paths: &crate::memory::verification::KeyPaths,
+    agent: &dyn crate::memory::key_agent::KeyAgentApi,
+    astation_id: &str,
+    keys: crate::memory::verification::VerificationKeys,
+    reply: &DeviceVerifiedReply,
+) -> Result<crate::memory::verification::VerificationOutcome> {
+    capture.bound_to(astation_id)?;
+    capture.apply(|| {
+        crate::memory::verification::complete_verification(
+            paths,
+            agent,
+            astation_id,
+            keys,
+            &reply.device_verified,
+            &reply.account_state,
+            &reply.grants,
+        )
+    })
+}
+
 /// Waits up to `wait` for Astation's `deviceVerified`.
 pub(crate) async fn await_device_verified(
     client: &mut AstationClient,
@@ -639,5 +666,51 @@ mod tests {
         assert!(verification_result(Ok(())).is_ok());
         let error = verification_result(Err(anyhow!("codes didn't match"))).unwrap_err();
         assert_eq!(error.to_string(), "device verification failed");
+    }
+
+    /// Astation's certificate for a verification whose pairing was removed
+    /// (or replaced) meanwhile is never applied.
+    #[test]
+    fn a_delayed_device_verified_for_an_old_binding_is_not_applied() {
+        use crate::memory::key_agent::{KeyAgentApi, Reply, Request};
+        struct NeverCalled;
+        impl KeyAgentApi for NeverCalled {
+            fn call(&self, _: Request) -> Result<Reply> {
+                panic!("the key agent was asked to apply a stale verification")
+            }
+        }
+        let wire = || SignedWire {
+            statement: "c3RhdGVtZW50".into(),
+            signature: "c2lnbmF0dXJl".into(),
+        };
+        for re_pair in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let capture = crate::pairing_binding::tests::bound_profile(dir.path(), "astation-1");
+            let src = capture.sources().clone();
+            crate::pairing_binding::commit_unpair(&src).unwrap();
+            if re_pair {
+                let before = crate::pairing_binding::capture(&src).unwrap();
+                crate::pairing_binding::bind_new(&src, &before, "astation-1").unwrap();
+            }
+            let before = crate::status::tests::snapshot(dir.path());
+            let reply = DeviceVerifiedReply {
+                device_verified: wire(),
+                account_state: wire(),
+                grants: Vec::new(),
+            };
+            let keys = crate::memory::device_keys::DeviceKeys::generate().into();
+            let error = apply_device_verified(
+                &capture,
+                &src.keys,
+                &NeverCalled,
+                "astation-1",
+                keys,
+                &reply,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), crate::pairing_binding::CHANGED);
+            assert_eq!(crate::status::tests::snapshot(dir.path()), before);
+            assert!(!src.keys.trust.exists());
+        }
     }
 }

@@ -769,6 +769,15 @@ pub(crate) async fn unlock_command(src: &crate::status::Sources) -> Result<()> {
         return Ok(());
     }
     let mut client = connect_astation(src, &home, "this device's home Astation").await?;
+    // Every key-agent request from here on (finishing the unlock, rotation,
+    // escrow) runs only while the pairing this connection authenticated
+    // under is current: a grant or ack arriving after `atem unpair` is dropped.
+    let capture = client
+        .capture()
+        .cloned()
+        .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
+    let agent: Arc<dyn KeyAgentApi> =
+        Arc::new(crate::pairing_binding::BoundAgent::new(capture, agent)?);
     unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
     // The report sent on connect was skipped (the keys were still locked);
     // send it now, on the same connection. Best effort, like on connect.
@@ -1296,6 +1305,96 @@ mod tests {
                 .await
                 .unwrap(),
             new_kid
+        );
+    }
+
+    /// A link that runs `atem unpair` (commits the next host trust
+    /// generation) right after it sends `when`, before Astation's answer.
+    struct UnpairOnSend {
+        inner: ScriptedLink,
+        src: crate::status::Sources,
+        when: fn(&AstationMessage) -> bool,
+        confirms: usize,
+    }
+
+    impl AstationLink for UnpairOnSend {
+        async fn send(&mut self, message: AstationMessage) -> Result<()> {
+            let unpair = (self.when)(&message);
+            if matches!(message, AstationMessage::StorageKeyConfirm { .. }) {
+                self.confirms += 1;
+            }
+            self.inner.send(message).await?;
+            if unpair {
+                crate::pairing_binding::commit_unpair(&self.src)?;
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Option<AstationMessage> {
+            self.inner.recv().await
+        }
+
+        async fn apply_encryption(&mut self, message: &AstationMessage) -> Result<Option<String>> {
+            self.inner.apply_encryption(message).await
+        }
+    }
+
+    /// `agent` bound to a fresh pairing of the profile in `dir`.
+    fn bound(
+        dir: &std::path::Path,
+        agent: Arc<dyn KeyAgentApi>,
+    ) -> (Arc<dyn KeyAgentApi>, crate::status::Sources) {
+        let capture = crate::pairing_binding::tests::bound_profile(dir, ASTATION_ID);
+        let src = capture.sources().clone();
+        let agent = crate::pairing_binding::BoundAgent::new(capture, agent).unwrap();
+        (Arc::new(agent), src)
+    }
+
+    #[tokio::test]
+    async fn an_unlock_grant_for_an_old_pairing_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
+        let inner = agent(&paths);
+        let (agent, src) = bound(dir.path(), inner.clone());
+        let mut link = UnpairOnSend {
+            inner: ScriptedLink::new(server),
+            src,
+            when: |message| matches!(message, AstationMessage::UnlockRequest { .. }),
+            confirms: 0,
+        };
+        let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
+        assert!(error.contains(crate::pairing_binding::CHANGED), "{error}");
+        assert!(!inner.status().unwrap().unlocked, "the grant was dropped");
+    }
+
+    #[tokio::test]
+    async fn a_storage_key_ack_for_an_old_pairing_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, server, inner) = fresh_device(dir.path());
+        let escrow = inner.begin_rotation(ASTATION_ID).unwrap();
+        let sealed_before = std::fs::read(&paths.device_keys_sealed).unwrap();
+        let (agent, src) = bound(dir.path(), inner.clone());
+        let mut link = UnpairOnSend {
+            inner: ScriptedLink::new(server),
+            src,
+            when: |message| matches!(message, AstationMessage::StorageKeyRotate { .. }),
+            confirms: 0,
+        };
+        let error = pair_escrow(&mut link, &agent, &paths, ASTATION_ID, Some(escrow.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(crate::pairing_binding::CHANGED),
+            "{error:#}"
+        );
+        // Not promoted, not confirmed: the rotation stays pending for the
+        // next unlock to resend or abandon, and the sealed file is unchanged.
+        assert_eq!(link.confirms, 0);
+        assert_eq!(inner.pending_rotation().unwrap(), Some(escrow));
+        assert!(!inner.status().unwrap().escrowed);
+        assert_eq!(
+            std::fs::read(&paths.device_keys_sealed).unwrap(),
+            sealed_before
         );
     }
 

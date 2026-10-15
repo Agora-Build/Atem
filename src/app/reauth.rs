@@ -121,9 +121,14 @@ impl App {
     /// Back online; report state as a fresh connect does. Remote viewers
     /// subscribe again (view-only); no lease or input is resumed.
     async fn finish_astation_reauth(&mut self) {
+        // A success for a pairing or session replaced meanwhile (atem unpair,
+        // atem pair) is dropped: nothing is refreshed and the link stays down.
+        if let Err(error) = self.astation_client.reauthenticated() {
+            self.fail_astation_reauth(format!("Astation re-authentication ignored: {error:#}"));
+            return;
+        }
         self.astation_reauth = None;
         self.astation_connected = true;
-        self.astation_client.reauthenticated();
         self.rebuild_menu();
         self.status_message = Some("Astation reconnected".to_string());
         let agents = self.agent_registry.all();
@@ -594,6 +599,88 @@ mod tests {
         let session = sessions.get(ASTATION).expect("saved session kept");
         assert_eq!(session.session_id, SESSION_ID);
         assert_eq!(session.token, TOKEN);
+    }
+
+    /// A re-authentication success that arrives after `atem unpair` (and
+    /// `atem pair` again, with a new session) belongs to the old pairing: it
+    /// is dropped, the link stays down, and nothing is refreshed or written.
+    #[tokio::test]
+    async fn a_delayed_reauth_success_after_unpair_or_re_pair_is_ignored() {
+        let replies = [
+            status("authenticated", &[("method", "session_proof")]),
+            status("auth", &[("status", "granted")]),
+        ];
+        for re_pair in [false, true] {
+            for reply in replies.clone() {
+                let (mut app, mut peer) = connected_app().await;
+                peer.send
+                    .send(auth_required(ASTATION, &"b".repeat(64)))
+                    .unwrap();
+                next_auth(&mut app, &mut peer).await;
+                let dir = peer._state.path().to_path_buf();
+                let src = crate::status::Sources::in_dir(&dir);
+                crate::pairing_binding::commit_unpair(&src).unwrap();
+                let sessions_path = dir.join("sessions.json");
+                if re_pair {
+                    let before = crate::pairing_binding::capture(&src).unwrap();
+                    crate::pairing_binding::bind_new(&src, &before, ASTATION).unwrap();
+                    let mut sessions = crate::auth::SessionManager::default();
+                    sessions.insert_session(crate::auth::AuthSession::new(
+                        "new-session".into(),
+                        "new-token".into(),
+                        ASTATION.into(),
+                        "test-machine".into(),
+                    ));
+                    sessions.save_to(&sessions_path).unwrap();
+                }
+                let before = crate::status::tests::snapshot(&dir);
+                peer.send.send(reply).unwrap();
+                let frames = until_closed(&mut app, &mut peer).await;
+                assert!(!app.astation_connected);
+                assert!(app.astation_reauth.is_none());
+                assert!(
+                    !frames
+                        .iter()
+                        .any(|frame| matches!(frame, AstationMessage::AgentListResponse { .. })),
+                    "{frames:?}"
+                );
+                assert_eq!(
+                    crate::status::tests::snapshot(&dir),
+                    before,
+                    "re_pair {re_pair}"
+                );
+                assert!(
+                    app.terminal_ui
+                        .messages
+                        .iter()
+                        .any(|m| m.contains(crate::pairing_binding::CHANGED)),
+                    "{:?}",
+                    app.terminal_ui.messages
+                );
+            }
+        }
+    }
+
+    /// Credentials Astation sends for a pairing removed meanwhile are
+    /// dropped: they never re-create it.
+    #[tokio::test]
+    async fn credentials_for_a_pairing_removed_meanwhile_are_dropped() {
+        let (mut app, peer) = connected_app().await;
+        let dir = peer._state.path().to_path_buf();
+        crate::pairing_binding::commit_unpair(&crate::status::Sources::in_dir(&dir)).unwrap();
+        let before = crate::status::tests::snapshot(&dir);
+        app.handle_astation_message(AstationMessage::CredentialSync {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 1,
+            login_id: None,
+            astation_id: ASTATION.into(),
+            save_credentials: true,
+        })
+        .await;
+        let shown = app.status_message.clone().unwrap_or_default();
+        assert!(shown.contains(crate::pairing_binding::CHANGED), "{shown}");
+        assert_eq!(crate::status::tests::snapshot(&dir), before);
     }
 
     #[tokio::test]

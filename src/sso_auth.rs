@@ -169,6 +169,9 @@ async fn fetch_from_astation(astation_id: String) -> Result<PairedTokens> {
             match client.recv_message_async().await {
                 Some(AstationMessage::CredentialSync { access_token, refresh_token, expires_at, astation_id: from, .. }) => {
                     if from == astation_id {
+                        // Only tokens for the pairing this connection
+                        // authenticated under (not one removed meanwhile).
+                        client.apply_bound(&from, || Ok(()))?;
                         return Ok(PairedTokens { access_token, refresh_token, expires_at });
                     }
                     anyhow::bail!("connected to a different Astation ({})", from);

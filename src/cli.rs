@@ -1183,8 +1183,11 @@ fn revocation_recorded(src: &crate::status::Sources) -> bool {
         .is_ok_and(|trust| trust.revoked().is_some())
 }
 
-/// `atem unpair` after the confirmation: removes the paired credential
-/// entries and the saved Astation sessions (the login stays), and, when an
+/// `atem unpair` after the confirmation: first durably commits the next host
+/// trust generation without a pairing binding (so work started under the old
+/// pairing can't apply anything, even if what follows is interrupted), then
+/// removes the paired credential entries and the saved Astation sessions (the
+/// login, memory, vault data, trust pins and keys stay), and, when an
 /// Astation revoked this device and `agent` (the running key agent, if any)
 /// doesn't hold its keys unlocked, sets the revoked keys aside so the next
 /// `atem pair` verifies with new ones. Returns the notices to print: keys set
@@ -1194,6 +1197,7 @@ fn unpair_profile(
     src: &crate::status::Sources,
     agent: Option<&dyn crate::memory::key_agent::KeyAgentApi>,
 ) -> Result<Vec<String>> {
+    crate::pairing_binding::commit_unpair(src)?;
     let mut store = crate::credentials::CredentialStore::load_from(&src.credentials);
     let before = store.entries.len();
     store
@@ -1244,10 +1248,16 @@ async fn run_pair(src: &crate::status::Sources, save: bool) -> Result<()> {
         print!("{text}");
         return Ok(());
     }
+    // The trust state this pairing starts from: its binding is created only
+    // if nothing changed meanwhile (another atem pair or atem unpair).
+    let before = {
+        let src = src.clone();
+        crate::memory::key_agent::blocking(move || crate::pairing_binding::capture(&src)).await?
+    };
     let config = src.config.clone();
 
     println!("Connecting to Astation...");
-    let mut client = crate::websocket_client::AstationClient::new();
+    let mut client = crate::websocket_client::AstationClient::new().with_profile(src.clone());
 
     // Try local-first-then-relay pairing flow. Returns pairing code (or "local").
     let result = client.connect_with_pairing(&config).await?;
@@ -1335,7 +1345,8 @@ async fn run_pair(src: &crate::status::Sources, save: bool) -> Result<()> {
                 // encryption messages it held are applied on the authenticated one.
                 let held = client.take_held_encryption();
                 drop(client);
-                let mut identity_client = crate::websocket_client::AstationClient::new();
+                let mut identity_client =
+                    crate::websocket_client::AstationClient::new().with_profile(src.clone());
                 identity_client
                     .connect_relay_identity(config.astation_relay_url(), &astation_id)
                     .await
@@ -1352,19 +1363,25 @@ async fn run_pair(src: &crate::status::Sources, save: bool) -> Result<()> {
             } else {
                 client
             };
-            crate::config::AtemConfig::store_astation_relay_code(&astation_id);
-            let mut store = crate::credentials::CredentialStore::load();
-            let now = crate::credentials::CredentialEntry::now_secs();
-            store.upsert(crate::credentials::CredentialEntry::new_paired(
-                access_token,
-                refresh_token,
-                expires_at,
-                login_id.clone(),
-                astation_id,
-                requested_save_credentials,
-                now,
-            ));
-            store.save()?;
+            // The new pairing's binding, in the next host trust generation;
+            // the connection goes on under it.
+            let after = crate::pairing_binding::bind_new(src, &before, &astation_id)?;
+            active_client.adopt_binding(&before, &after)?;
+            active_client.apply_bound(&astation_id, || {
+                crate::config::AtemConfig::store_astation_relay_code(&astation_id);
+                let mut store = crate::credentials::CredentialStore::load();
+                let now = crate::credentials::CredentialEntry::now_secs();
+                store.upsert(crate::credentials::CredentialEntry::new_paired(
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    login_id.clone(),
+                    astation_id.clone(),
+                    requested_save_credentials,
+                    now,
+                ));
+                store.save()
+            })?;
             match login_id {
                 Some(id) => println!("Paired with Astation. (SSO: {})", id),
                 None => println!("Paired with Astation."),
@@ -1450,7 +1467,7 @@ async fn run_device_verification(
     use crate::memory::trust::TrustStore;
     use crate::memory::unlock::PairEscrow;
     use crate::memory::verification::{
-        AstationKeys, Handshake, KeyPaths, complete_verification, device_keys_for_verification,
+        AstationKeys, Handshake, KeyPaths, device_keys_for_verification,
     };
     use crate::websocket_client::AstationMessage;
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -1461,12 +1478,23 @@ async fn run_device_verification(
     use tokio::time::timeout;
 
     let paths = KeyPaths::default_paths();
+    // The pairing this verification runs under: every key-agent request,
+    // the pending pin, Astation's certificate and the escrow apply only while
+    // it is current.
+    let capture = client
+        .capture()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(crate::pairing_binding::NO_BINDING))?;
+    capture.bound_to(astation_id)?;
     // The device id is this atem's relay identity (`atem_id`): Astation checks it
     // equals the id the connection authenticated as.
     let device_id = crate::websocket_client::resolved_atem_id(&crate::auth::get_hostname());
     // The agent client blocks (socket I/O, autostart): call it off the runtime.
-    let agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> =
+    let raw_agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> =
         std::sync::Arc::from(crate::memory::key_agent::default_agent());
+    let agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> = std::sync::Arc::new(
+        crate::pairing_binding::BoundAgent::new(capture.clone(), raw_agent.clone())?,
+    );
     let keys = {
         let (paths, agent) = (paths.clone(), agent.clone());
         // Revoked keys are never set aside here (`atem unpair` does that):
@@ -1521,9 +1549,11 @@ async fn run_device_verification(
     let code = handshake.safety_code(&astation);
 
     let transcript = handshake.transcript(&astation);
-    TrustStore::update(&paths.trust, |trust| {
-        trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code, &transcript);
-        Ok(())
+    capture.apply(|| {
+        TrustStore::update(&paths.trust, |trust| {
+            trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code, &transcript);
+            Ok(())
+        })
     })?;
 
     // From here on every failure drops the pending pin and, unless Astation
@@ -1545,18 +1575,18 @@ async fn run_device_verification(
         }
     };
     let applied = {
-        let (paths, agent) = (paths.clone(), agent.clone());
+        // The raw agent: the whole apply holds the pairing lock already.
+        let (paths, agent, capture) = (paths.clone(), raw_agent.clone(), capture.clone());
         let astation_id = astation_id.to_string();
         let keys = handshake.into_keys();
         blocking(move || {
-            complete_verification(
+            crate::pair_verify::apply_device_verified(
+                &capture,
                 &paths,
                 agent.as_ref(),
                 &astation_id,
                 keys,
-                &reply.device_verified,
-                &reply.account_state,
-                &reply.grants,
+                &reply,
             )
         })
         .await
@@ -2592,6 +2622,44 @@ mod tests {
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].starts_with("Couldn't set the revoked keys aside:"), "{notices:?}");
         assert_eq!(crate::status::pairing(&src), None);
+    }
+
+    #[test]
+    fn unpair_commits_the_next_generation_before_removing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = crate::pairing_binding::tests::bound_profile(dir.path(), "astation-1");
+        let src = crate::status::Sources::in_dir(dir.path());
+        // Removing the sessions fails (sessions.json is a directory): the
+        // unpair is interrupted after its commit.
+        std::fs::create_dir(&src.sessions).unwrap();
+        assert!(unpair_profile(&src, None).is_err());
+        let state = crate::pairing_binding::load(&src).unwrap();
+        assert_eq!(state.host_trust_gen, 2);
+        assert_eq!(state.binding, None);
+        assert!(old.check().is_err(), "the old binding is invalidated");
+        // Retried: the next generation again, never a repeat.
+        std::fs::remove_dir(&src.sessions).unwrap();
+        unpair_profile(&src, None).unwrap();
+        assert_eq!(crate::pairing_binding::load(&src).unwrap().host_trust_gen, 3);
+        assert_eq!(crate::status::pairing(&src), None);
+    }
+
+    #[test]
+    fn unpair_keeps_keys_trust_and_memory_data() {
+        let dir = tempfile::tempdir().unwrap();
+        paired_profile(dir.path());
+        trust_file(dir.path(), false);
+        std::fs::write(dir.path().join("knowledge.db"), b"memories").unwrap();
+        std::fs::write(dir.path().join("project_names.json"), b"{}").unwrap();
+        let src = crate::status::Sources::in_dir(dir.path());
+        let kept = ["cred_state.json", "device_keys.sealed", "knowledge.db", "project_names.json"]
+            .map(|name| (name, std::fs::read(dir.path().join(name)).unwrap()));
+        assert!(unpair_profile(&src, None).unwrap().is_empty());
+        for (name, contents) in kept {
+            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), contents, "{name}");
+        }
+        // The migrated pairing was generation 1.
+        assert_eq!(crate::pairing_binding::load(&src).unwrap().host_trust_gen, 2);
     }
 
     #[test]
