@@ -64,15 +64,19 @@ Claude runs a hook as a shell command and passes the event JSON on stdin. Each
 hook command writes that JSON to its own file, atomically:
 
 ```sh
-d=<chat dir>/events; f="$d/$(date +%s%N)-$$"; cat > "$f.tmp" && mv "$f.tmp" "$f.json"
+f=$(mktemp "<chat dir>/events/ev.XXXXXXXX") && cat > "$f" && mv "$f" "$f.json"
 ```
+
+(`mktemp` gives a unique name on both Linux and macOS; `date +%N` would not
+work on macOS.)
 
 - One file per event, written then renamed, because hooks can run at the same
   time (parallel tool calls) and an event can be large (a `Write` event holds
   the whole file being written); a shared append-only file could interleave.
-- Atem reads `events/*.json` in name order (timestamp, then process id),
-  handles each event and deletes the file. `.tmp` files are ignored; leftovers
-  older than a minute are removed.
+- Atem reads `events/*.json` ordered by modification time (nanosecond
+  resolution on Linux and APFS), then name; handles each event and deletes
+  the file. Files without `.json` are still being written and are skipped;
+  leftovers older than a minute are removed.
 - The command prints nothing and exits 0, so it can never allow, deny or block
   anything, and it doesn't depend on Atem running or on the Atem binary's
   path: if Atem is gone, the file is simply never read and the directory is
