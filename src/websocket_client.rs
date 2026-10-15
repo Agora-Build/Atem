@@ -614,6 +614,34 @@ impl AstationClient {
         self.guarded(apply)
     }
 
+    /// A saved session may answer `astation_id` only when the captured
+    /// pairing binding is with it: after an `atem unpair` that stopped before
+    /// removing the sessions (or one for another Astation), it is never used.
+    fn session_usable(&self, astation_id: &str) -> bool {
+        self.capture
+            .as_ref()
+            .and_then(|capture| capture.state.binding.as_ref())
+            .is_some_and(|binding| binding.astation_id == astation_id)
+    }
+
+    /// No saved session may answer: what to do (`advised` when the message
+    /// says to unpair). `unpaired` is the message for a profile not paired.
+    fn no_session(&self, problem: SessionProblem, lead: &str, unpaired: &str) -> anyhow::Error {
+        let paired = self.profile_paired();
+        let unbound = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.state.binding.is_none());
+        let message = if paired && unbound {
+            format!("{lead}. {}", crate::pairing_binding::NO_BINDING)
+        } else if paired {
+            format!("{lead}. {}", crate::status::SESSION_GONE)
+        } else {
+            unpaired.to_string()
+        };
+        SessionError::new(problem, paired, message).into()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_capture_for_test(&mut self, capture: crate::pairing_binding::Captured) {
         self.capture = Some(capture);
@@ -907,13 +935,11 @@ impl AstationClient {
         let hostname = crate::auth::get_hostname();
         let atem_id = self.resolved_atem_id(&hostname);
         if !allow_pairing {
-            let paired = self.profile_paired();
-            let message = if paired {
-                format!("Pairing required. {}", crate::status::SESSION_GONE)
-            } else {
-                "Pairing required; run 'atem pair'".to_string()
-            };
-            return Err(SessionError::new(SessionProblem::PairingRequired, paired, message).into());
+            return Err(self.no_session(
+                SessionProblem::PairingRequired,
+                "Pairing required",
+                "Pairing required; run 'atem pair'",
+            ));
         }
 
         // Session auth failed or no session - use explicit pairing.
@@ -1007,6 +1033,9 @@ impl AstationClient {
                 device_auth_proof(&token, &challenge.challenge, astation_id, &atem_id, "local")?,
             );
         } else {
+            if !self.session_usable(astation_id) {
+                return Ok(None);
+            }
             let session_mgr = self.load_session_manager()?;
             let Some(session) = session_mgr.get(astation_id) else {
                 return Ok(None);
@@ -1078,13 +1107,11 @@ impl AstationClient {
         let (proof, _) = self
             .auth_proof(&challenge)?
             .ok_or_else(|| {
-                let paired = self.profile_paired();
-                let message = if paired {
-                    format!("no saved session for this Astation. {}", crate::status::SESSION_GONE)
-                } else {
-                    "no saved session for this Astation; run `atem pair`".to_string()
-                };
-                anyhow::Error::from(SessionError::new(SessionProblem::Missing, paired, message))
+                self.no_session(
+                    SessionProblem::Missing,
+                    "no saved session for this Astation",
+                    "no saved session for this Astation; run `atem pair`",
+                )
             })?;
         self.send_message(proof).await?;
         self.answered_challenge = Some((challenge.astation_id, challenge.challenge));
@@ -2101,6 +2128,73 @@ mod tests {
         assert!(error.to_string().contains("atem pair"), "{error}");
         drop(client);
         assert!(server.await.unwrap().is_none(), "sent something without a session");
+    }
+
+    /// `dir`'s profile after an `atem unpair` that crashed after its commit:
+    /// the paired credentials and the saved session for `astation_id` are
+    /// still on disk, but the binding is gone.
+    fn interrupted_unpair(dir: &std::path::Path, astation_id: &str) {
+        crate::pairing_binding::tests::bound_profile(dir, astation_id);
+        let mut sessions = crate::auth::SessionManager::default();
+        sessions.insert_session(crate::auth::AuthSession::new(
+            "leftover-session".into(),
+            "leftover-token".into(),
+            astation_id.into(),
+            "host".into(),
+        ));
+        sessions.save_to(&dir.join("sessions.json")).unwrap();
+        crate::pairing_binding::commit_unpair(&crate::status::Sources::in_dir(dir)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_unpair_never_authenticates_with_the_leftover_session() {
+        let (state, mut client) = isolated_client("atem-test-leftover");
+        interrupted_unpair(state.path(), "astation-a");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let challenge = reauth_challenge("astation-a", "relay");
+            socket
+                .send(Message::Text(serde_json::to_string(&challenge).unwrap()))
+                .await
+                .unwrap();
+            // Whatever Atem sends before it gives up (nothing, it should be).
+            let mut frames = Vec::new();
+            while let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+            {
+                frames.push(text);
+            }
+            frames
+        });
+        let error = client
+            .connect_without_pairing(&format!("ws://{address}"))
+            .await
+            .expect_err("authenticated with a leftover session");
+        assert!(format!("{error:#}").contains("atem unpair"), "{error:#}");
+        let frames = server.await.unwrap();
+        assert!(
+            !frames.iter().any(|frame| frame.contains("leftover-session")),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reauth_after_an_interrupted_unpair_never_uses_the_leftover_session() {
+        let (state, mut client) = isolated_client("atem-test-leftover-reauth");
+        interrupted_unpair(state.path(), "astation-a");
+        let (url, server) = recording_peer().await;
+        client.connect_raw(&url).await.unwrap();
+        client.pin_astation_for_test("astation-a");
+        let error = client
+            .answer_auth_required(&reauth_challenge("astation-a", "relay"))
+            .await
+            .expect_err("answered with a leftover session");
+        assert!(error.to_string().contains("atem unpair"), "{error}");
+        drop(client);
+        assert!(server.await.unwrap().is_none(), "sent the leftover session");
     }
 
     #[tokio::test]
