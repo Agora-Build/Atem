@@ -35,6 +35,7 @@ impl ClaudeAdapter {
         }
     }
 
+    #[cfg(test)]
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
     }

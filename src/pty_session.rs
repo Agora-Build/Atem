@@ -84,7 +84,6 @@ impl PtyInput {
     }
 
     /// Count of send()/send_remote() calls (terminal input), not respond() or send_paste().
-    #[allow(dead_code)]
     pub fn input_count(&self) -> u64 {
         self.inputs.load(Ordering::SeqCst)
     }
@@ -93,7 +92,6 @@ impl PtyInput {
     /// while holding the authority lock, so send()/send_remote() cannot interleave.
     /// Refused while remote-controlled. Does not count as terminal input. On a full
     /// queue the error is returned and nothing is resent.
-    #[allow(dead_code)]
     pub fn send_paste(&self, text: &str) -> Result<()> {
         let authority = self.authority.lock().unwrap();
         if authority.remote {

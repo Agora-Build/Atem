@@ -1,3 +1,6 @@
+mod chat;
+#[cfg(test)]
+mod chat_tests;
 mod reauth;
 mod terminal;
 
@@ -154,6 +157,10 @@ pub struct App {
     pub pending_astation_command: Option<PendingAstationCommand>,
     /// Pending voice coding request waiting for Claude to finish.
     pub pending_voice_request: Option<PendingVoiceRequest>,
+    /// Chat (chat-v1) for the Claude session launched in Atem, when its adapter is prepared.
+    pub claude_chat: Option<chat::AgentChat>,
+    /// Where per-session chat directories are created (`chat-<uuid>`).
+    pub chat_root: PathBuf,
 }
 
 /// Tracks a command sent from Astation that needs output relayed back.
@@ -270,6 +277,8 @@ impl App {
             astation_reauth: None,
             pending_astation_command: None,
             pending_voice_request: None,
+            claude_chat: None,
+            chat_root: crate::chat::claude::hooks::session_dir_root(),
         };
         app.rebuild_menu();
         app
@@ -583,6 +592,28 @@ impl App {
         self.codex_view_cols = cols;
         self.codex_terminal = VtParser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS);
         self.codex_waiting_exit = false;
+
+        // Codex has no chat adapter yet: its activity can't be detected (Unknown)
+        // and it advertises no chat capability.
+        let agent_id = self
+            .agent_registry
+            .all()
+            .into_iter()
+            .find(|a| a.kind == AgentKind::Codex && a.origin == AgentOrigin::Launched)
+            .map(|a| a.id)
+            .unwrap_or_else(|| format!("codex-pty-{}", uuid::Uuid::new_v4()));
+        self.agent_registry.register(AgentInfo {
+            id: agent_id,
+            name: "codex".to_string(),
+            kind: AgentKind::Codex,
+            protocol: AgentProtocol::Pty,
+            origin: AgentOrigin::Launched,
+            status: AgentStatus::Unknown,
+            session_ids: vec![],
+            acp_url: None,
+            pty_pid: None,
+            capabilities: vec![],
+        });
         Ok(true)
     }
 
@@ -931,7 +962,26 @@ impl App {
 
         let rows = if self.claude_view_rows == 0 { crate::pty_session::DEFAULT_ROWS } else { self.claude_view_rows };
         let cols = if self.claude_view_cols == 0 { crate::pty_session::DEFAULT_COLS } else { self.claude_view_cols };
-        let session = self.claude_client.start_session_sized(rows, cols).await?;
+        // A stable agent ID across respawns: reuse the launched Claude PTY's entry.
+        let existing_id = self
+            .agent_registry
+            .all()
+            .into_iter()
+            .find(|a| a.kind == AgentKind::ClaudeCode && a.origin == AgentOrigin::Launched)
+            .map(|a| a.id);
+        let agent_id = existing_id.unwrap_or_else(|| {
+            format!("claude-pty-{}", uuid::Uuid::new_v4())
+        });
+        // Chat hooks for this process (a new generation); empty when chat could not be prepared.
+        let launch_args = self.claude_client.launch_args().to_vec();
+        let chat_args = self.prepare_claude_chat(&agent_id, &launch_args);
+        let session = match self.claude_client.start_session_sized(rows, cols, &chat_args).await {
+            Ok(session) => session,
+            Err(error) => {
+                self.claude_chat = None;
+                return Err(error);
+            }
+        };
         self.replace_terminal("claude");
         self.claude_sender = Some(session.sender);
         self.claude_receiver = Some(session.receiver);
@@ -948,24 +998,15 @@ impl App {
         self.claude_waiting_exit = false;
 
         // Register (or re-register) the Claude PTY session in the agent registry.
-        // We generate a stable ID by checking if one already exists for a Launched
-        // Claude PTY; if not, mint a new one.
-        let existing_id = self
-            .agent_registry
-            .all()
-            .into_iter()
-            .find(|a| a.kind == AgentKind::ClaudeCode && a.origin == AgentOrigin::Launched)
-            .map(|a| a.id);
-        let agent_id = existing_id.unwrap_or_else(|| {
-            format!("claude-pty-{}", uuid::Uuid::new_v4())
-        });
+        // Status stays Unknown and chat-v1 unadvertised until Claude's hooks report
+        // the session (`poll_chat`).
         self.agent_registry.register(AgentInfo {
             id: agent_id.clone(),
             name: "claude-code".to_string(),
             kind: AgentKind::ClaudeCode,
             protocol: AgentProtocol::Pty,
             origin: AgentOrigin::Launched,
-            status: AgentStatus::Idle,
+            status: AgentStatus::Unknown,
             session_ids: vec![],
             acp_url: None,
             pty_pid: None,
@@ -1529,6 +1570,9 @@ impl App {
             AstationMessage::Terminal(envelope) => {
                 self.handle_terminal_message(envelope);
             }
+            AstationMessage::AgentChat(envelope) => {
+                self.handle_agent_chat(envelope).await;
+            }
             AstationMessage::AgentInput {
                 agent_id,
                 kind,
@@ -1585,6 +1629,7 @@ impl App {
     /// so the grace-period logic in `CredentialStore::resolve` can take effect.
     pub fn on_astation_disconnect(&mut self) {
         self.disconnect_terminals();
+        self.close_chat_conversations();
         if let Some(aid) = self.connected_astation_id.take() {
             let mut store = crate::credentials::CredentialStore::load();
             if let Some(entry) = store.find_paired_mut(&aid) {

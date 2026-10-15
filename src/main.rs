@@ -25,8 +25,6 @@ mod tui;
 mod vault_client;
 mod memory;
 mod pair_verify;
-// used from Task 6 wiring
-#[allow(dead_code)]
 mod chat;
 mod websocket_client;
 // Agent hub — PTY agents launched by `atem agent launch`

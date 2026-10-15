@@ -20,6 +20,19 @@ impl Drop for Atem {
 
 fn launch_and_capture(agent: &str, defaults: &str, arguments: &[&str]) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
+    launch_in(&dir, agent, defaults, arguments, &[], |_| {})
+}
+
+/// Launch Atem with the fixture agent, call `running` with the agent's
+/// arguments while both still run, then quit Atem and return them.
+fn launch_in(
+    dir: &tempfile::TempDir,
+    agent: &str,
+    defaults: &str,
+    arguments: &[&str],
+    env: &[(&str, &std::path::Path)],
+    running: impl FnOnce(&[String]),
+) -> Vec<String> {
     let fixture = dir.path().join("agent fixture");
     let argv = dir.path().join("argv");
     std::fs::write(
@@ -48,6 +61,9 @@ fn launch_and_capture(agent: &str, defaults: &str, arguments: &[&str]) -> Vec<St
     command.env("ASTATION_WS", "ws://127.0.0.1:1/ws");
     command.env("ASTATION_RELAY_URL", "http://127.0.0.1:1");
     command.env("ATEM_TEST_ARGV", &argv);
+    for (name, value) in env {
+        command.env(name, value);
+    }
     let prefix = if agent == "codex" { "CODEX" } else { "CLAUDE" };
     command.env(format!("{prefix}_CLI_BIN"), &fixture);
     command.env(format!("{prefix}_CLI_ARGS"), defaults);
@@ -92,12 +108,13 @@ fn launch_and_capture(agent: &str, defaults: &str, arguments: &[&str]) -> Vec<St
         std::thread::sleep(Duration::from_millis(20));
     }
     let bytes = std::fs::read(&argv).unwrap();
-    let values = bytes
+    let values: Vec<String> = bytes
         .strip_suffix(&[0])
         .expect("Missing final argument delimiter")
         .split(|byte| *byte == 0)
         .map(|value| String::from_utf8(value.to_vec()).unwrap())
         .collect();
+    running(&values);
 
     writer.write_all(b"\x1dhq").unwrap(); // Atem prefix, hide, then quit.
     writer.flush().unwrap();
@@ -145,7 +162,58 @@ fn claude_launch_forwards_options_preserving_values_and_env_defaults() {
                 arguments.insert(0, "--");
             }
             let actual = launch_and_capture(agent, "--verbose", &arguments);
-            assert_eq!(actual, [vec!["--verbose".to_string()], expected].concat());
+            // Chat hooks come first, ahead of the user's `--`.
+            assert_eq!(actual[0], "--settings");
+            assert_eq!(actual[2], "--session-id");
+            assert_eq!(
+                actual[4..],
+                [vec!["--verbose".to_string()], expected].concat()
+            );
         }
     }
+}
+
+#[test]
+fn claude_launch_adds_chat_hooks_and_removes_their_directory_on_quit() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    let mut chat_dir = None;
+    let args = launch_in(
+        &dir,
+        "claude",
+        "",
+        &["--model", "haiku"],
+        &[("XDG_RUNTIME_DIR", runtime.as_path())],
+        |args| {
+            assert_eq!(args[0], "--settings");
+            let settings = std::path::PathBuf::from(&args[1]);
+            assert!(settings.is_file(), "settings.json exists while Claude runs");
+            let parent = settings.parent().unwrap();
+            assert_eq!(parent.parent().unwrap(), runtime.join("atem"));
+            assert!(
+                parent
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("chat-")
+            );
+            assert_eq!(settings.file_name().unwrap(), "settings.json");
+            chat_dir = Some(parent.to_path_buf());
+        },
+    );
+    assert_eq!(args[2], "--session-id");
+    assert!(uuid_like(&args[3]), "{}", args[3]);
+    assert_eq!(args[4..], ["--model", "haiku"]);
+    let chat_dir = chat_dir.unwrap();
+    assert!(
+        !chat_dir.exists(),
+        "the chat directory is removed when Atem quits"
+    );
+}
+
+fn uuid_like(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.iter().map(|p| p.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
+        && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
 }
