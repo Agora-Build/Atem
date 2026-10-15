@@ -143,6 +143,47 @@ pub fn find_secrets(text: &str) -> Vec<SecretFinding> {
     out
 }
 
+/// Replaces every value `find_secrets` would flag with "[redacted]". A line with a
+/// private key header becomes "[redacted]" entirely. Line breaks are kept.
+pub fn redact_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let nl = &line[body.len()..];
+        if body.contains("-----BEGIN") && body.contains("PRIVATE KEY") {
+            out.push_str("[redacted]");
+            out.push_str(nl);
+            continue;
+        }
+        let mut secrets: Vec<&str> = url_passwords(body);
+        secrets.extend(slack_webhook_secret(body));
+        for tok in body.split(|c: char| !is_token_char(c)) {
+            if tok.is_empty() {
+                continue;
+            }
+            if classify(tok).is_some() {
+                secrets.push(tok);
+            }
+            if is_path_like(tok) {
+                for seg in tok.split(['/', '@']).filter(|s| !s.is_empty()) {
+                    if classify(seg).is_some() {
+                        secrets.push(seg);
+                    }
+                }
+            }
+        }
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.dedup();
+        let mut redacted = body.to_string();
+        for s in secrets {
+            redacted = redacted.replace(s, "[redacted]");
+        }
+        out.push_str(&redacted);
+        out.push_str(nl);
+    }
+    out
+}
+
 /// Like `find_secrets`, but for file bytes. Non-UTF-8 content can't be
 /// checked, so it is reported as a finding (fail-closed).
 pub fn check_bytes(bytes: &[u8]) -> Vec<SecretFinding> {
@@ -293,5 +334,22 @@ mod tests {
         assert_eq!(p.len(), 2, "{p:?}");
         assert!(p.iter().any(|l| l.starts_with("creds.txt:1") && !l.contains("IOSFODNN7")));
         assert!(p.iter().any(|l| l.starts_with("img.png:0") && l.contains("unreadable (binary)")));
+    }
+
+    #[test]
+    fn redact_secrets_replaces_values_and_keeps_the_rest() {
+        assert_eq!(redact_secrets("key is sk-proj-abcdef1234567890ABCDEF ok"), "key is [redacted] ok");
+        assert_eq!(redact_secrets("a AKIAIOSFODNN7EXAMPLE\nb xoxb-1234567890-abcdefghij"), "a [redacted]\nb [redacted]");
+        assert_eq!(redact_secrets("https://alice:hunter2pass@example.com/x"), "https://alice:[redacted]@example.com/x");
+        assert_eq!(redact_secrets("run `atem vault get dialf/openai`"), "run `atem vault get dialf/openai`");
+        let url = format!("https://hooks.slack.com/services/{}/{}/{}", "T00000000", "B00000000", "X".repeat(24));
+        assert!(!redact_secrets(&url).contains("XXXX"));
+        let seg = redact_secrets("https://example.com/cb/Q4mTLy5h9qtD46vrdMgotPH9WrZxDsLxThPD9vtlf+o");
+        assert!(!seg.contains("Q4mTLy5h9"), "{seg}");
+    }
+
+    #[test]
+    fn redact_secrets_blanks_a_private_key_header_line() {
+        assert_eq!(redact_secrets("x\n-----BEGIN RSA PRIVATE KEY-----\nMIIE"), "x\n[redacted]\nMIIE");
     }
 }

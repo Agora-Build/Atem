@@ -2,6 +2,7 @@
 use anyhow::{Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -55,6 +56,8 @@ fn write_request(
 pub struct PtyInput {
     tx: mpsc::Sender<WriteRequest>,
     authority: Arc<Mutex<Authority>>,
+    /// Successful send()/send_remote() calls, shared by clones.
+    inputs: Arc<AtomicU64>,
 }
 
 impl PtyInput {
@@ -75,7 +78,35 @@ impl PtyInput {
         if authority.remote {
             bail!("Remote control is active; use Atem's Take Control command");
         }
-        self.enqueue(data.into_bytes(), Some(authority.epoch), None)
+        self.enqueue(data.into_bytes(), Some(authority.epoch), None)?;
+        self.inputs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Count of send()/send_remote() calls (terminal input), not respond() or send_paste().
+    #[allow(dead_code)]
+    pub fn input_count(&self) -> u64 {
+        self.inputs.load(Ordering::SeqCst)
+    }
+
+    /// Bracketed paste plus Enter, queued as consecutive chunks of at most MAX_INPUT bytes
+    /// while holding the authority lock, so send()/send_remote() cannot interleave.
+    /// Refused while remote-controlled. Does not count as terminal input. On a full
+    /// queue the error is returned and nothing is resent.
+    #[allow(dead_code)]
+    pub fn send_paste(&self, text: &str) -> Result<()> {
+        let authority = self.authority.lock().unwrap();
+        if authority.remote {
+            bail!("Remote control is active; use Atem's Take Control command");
+        }
+        let mut bytes = Vec::with_capacity(text.len() + 7);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~\r");
+        for chunk in bytes.chunks(MAX_INPUT) {
+            self.enqueue(chunk.to_vec(), Some(authority.epoch), None)?;
+        }
+        Ok(())
     }
 
     pub fn send_remote(&self, data: Vec<u8>, epoch: u64, sequence: u64) -> Result<()> {
@@ -83,7 +114,9 @@ impl PtyInput {
         if !authority.remote || authority.epoch != epoch {
             bail!("Control lease expired");
         }
-        self.enqueue(data, Some(epoch), Some(sequence))
+        self.enqueue(data, Some(epoch), Some(sequence))?;
+        self.inputs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn respond(&self, data: Vec<u8>) -> Result<()> {
@@ -110,6 +143,7 @@ impl PtyInput {
             Self {
                 tx,
                 authority: Arc::default(),
+                inputs: Arc::default(),
             },
             TestInputReader(requests),
         )
@@ -273,7 +307,11 @@ pub fn spawn_sized(binary: &str, args: &[String], rows: u16, cols: u16) -> Resul
         let _ = output.blocking_send(PtyEvent::Exit(status));
     });
     Ok(PtySession {
-        sender: PtyInput { tx, authority },
+        sender: PtyInput {
+            tx,
+            authority,
+            inputs: Arc::default(),
+        },
         receiver,
         resize_handle: handle,
     })
@@ -282,6 +320,47 @@ pub fn spawn_sized(binary: &str, args: &[String], rows: u16, cols: u16) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_count_counts_send_and_send_remote_not_respond_or_paste() {
+        let (input, _q) = PtyInput::test_channel();
+        assert_eq!(input.input_count(), 0);
+        input.send("a".into()).unwrap();
+        assert_eq!(input.input_count(), 1);
+        input.respond(b"y".to_vec()).unwrap();
+        input.send_paste("hello").unwrap();
+        assert_eq!(input.input_count(), 1);
+        let epoch = input.set_remote(true);
+        assert!(input.send("b".into()).is_err());
+        input.send_remote(b"c".to_vec(), epoch, 1).unwrap();
+        assert_eq!(input.clone().input_count(), 2);
+    }
+
+    #[test]
+    fn send_paste_wraps_in_bracketed_paste() {
+        let (input, mut q) = PtyInput::test_channel();
+        input.send_paste("hi there").unwrap();
+        assert_eq!(q.try_recv().unwrap(), "\x1b[200~hi there\x1b[201~\r");
+        assert!(q.try_recv().is_err());
+        input.set_remote(true);
+        assert!(input.send_paste("x").is_err());
+    }
+
+    #[test]
+    fn send_paste_chunks_large_text_in_order() {
+        let (input, mut q) = PtyInput::test_channel();
+        let text = "a".repeat(32 * 1024);
+        input.send_paste(&text).unwrap();
+        let mut all = String::new();
+        let mut n = 0;
+        while let Ok(c) = q.try_recv() {
+            assert!(c.len() <= MAX_INPUT);
+            all.push_str(&c);
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert_eq!(all, format!("\x1b[200~{text}\x1b[201~\r"));
+    }
 
     #[test]
     fn queued_input_is_checked_again_at_writer_after_handoff() {
