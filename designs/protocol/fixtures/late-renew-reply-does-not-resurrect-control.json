@@ -1,0 +1,283 @@
+{
+ "name": "late-renew-reply-does-not-resurrect-control",
+ "side": "client",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222"
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "upgraded": true,
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000010",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "lease",
+     "id": "11111111-1111-4111-8111-000000000090",
+     "re": "11111111-1111-4111-8111-000000000010",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "ms_left": 15000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "controls": true,
+    "deadline_ms": 15000
+   }
+  },
+  {
+   "advance_ms": 5000
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "renew",
+     "id": "11111111-1111-4111-8111-000000000011",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "advance_ms": 12000
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "lease",
+     "id": "11111111-1111-4111-8111-000000000091",
+     "re": "11111111-1111-4111-8111-000000000011",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "ms_left": 15000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "controls": false
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000012",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "lease",
+     "id": "11111111-1111-4111-8111-000000000092",
+     "re": "11111111-1111-4111-8111-000000000012",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 3
+     },
+     "ms_left": 15000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "controls": true,
+    "deadline_ms": 32000
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "lease",
+     "id": "11111111-1111-4111-8111-000000000090",
+     "re": "11111111-1111-4111-8111-000000000010",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "ms_left": 15000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "controls": true,
+    "deadline_ms": 32000
+   }
+  },
+  {
+   "advance_ms": 14000
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000013",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "advance_ms": 500
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "lease",
+     "id": "11111111-1111-4111-8111-000000000093",
+     "re": "11111111-1111-4111-8111-000000000013",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 3
+     },
+     "ms_left": 500
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "controls": true,
+    "deadline_ms": 32000
+   }
+  }
+ ],
+ "note": "Client-side fixture: t is the fake monotonic clock (ms). The t=17000 reply to the t=5000 renew arrives after the acknowledged deadline (15000) with no timer tick and is dropped. A replayed reply to an already consumed re is dropped. A repeat-acquire reply never extends the deadline (send time 31000 + 500 = 31500 < 32000 keeps 32000)."
+}

@@ -14,9 +14,18 @@
     "permissions": [
      "view",
      "control"
-    ]
+    ],
+    "upgraded": true,
+    "client_kind": "native"
    }
-  ]
+  ],
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  }
  },
  "steps": [
   {

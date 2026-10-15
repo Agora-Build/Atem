@@ -1,9 +1,10 @@
-# atem-session v1: sessions, control leases and receipts (DRAFT r2 for joint review)
+# atem-session v1: sessions, control leases and receipts (DRAFT r3 for joint review)
 
-Status: Atem-side draft r2, 2026-10-15. r1 (`7a0c691`) was reviewed by Astation
-([review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
-summarised in [session-multiplexing.md](../session-multiplexing.md) §12); r2
-answers review items 1–7 and 9. Item 8 (trust, freshness, end-to-end channel,
+Status: Atem-side draft r3, 2026-10-15. r1 (`7a0c691`) and r2 (`9383193`) were
+reviewed by Astation ([r1 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
+[r2 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r2-review.md),
+summarised in [session-multiplexing.md](../session-multiplexing.md) §12). r2
+answered r1 items 1–7 and 9; r3 answers r2 review items 1–5. Item 8 (trust, freshness, end-to-end channel,
 QR grants) stays an implementation gate (§9). Not final until both sides
 accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
 
@@ -28,12 +29,23 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
   browser clients, no account-wide native access, and no claim of relay
   confidentiality. Admission fails closed; no placeholder trust decision is
   exposed as production authorization.
-- **Upgrade**: a connection is "upgraded" once `welcome` is received. On an
-  upgraded connection this contract's lease is the only control lifecycle:
-  terminal-v1 `control`, legacy `agentInput`, `agentPrompt`, voice commands,
-  `userCommand` and chat-v1 `submit` without a session binding are rejected with
-  `error{code:"forbidden"}` (legacy messages stay as today on non-upgraded
-  connections).
+- **One session authority, every connection.** Each session has exactly one
+  lease authority on the host (§5), whatever socket, transport or message family
+  a request uses. A connection is "upgraded" once it received `welcome`; upgrade
+  changes how a client addresses things, not who may mutate a session:
+  - terminal-v1 `control{take:true}` from a non-upgraded connection is an
+    `acquire{takeover:true}` by that connection's attachment on the same
+    authority; `control{take:false}` is `release`. Its `lease_id` maps to that
+    lease.
+  - Legacy unscoped mutations (`agentInput`, `agentPrompt`, voice commands,
+    `userCommand`, chat-v1 `submit` without `binding`) are rejected
+    (`forbidden`, nothing written or dispatched) whenever the session they would
+    route to has a remote lease holder, and they never acquire one. With no
+    holder they behave as today (routed per Atem's default-session rule).
+  - On an upgraded connection every mutation must carry `binding` (§2) and the
+    current lease; legacy unscoped mutations there are always `forbidden`.
+  - Local terminal input on the host revokes any remote lease first (§5).
+  Fixture `legacy-connection-cannot-bypass-lease`.
 
 ## 1. Representation
 
@@ -73,10 +85,34 @@ Every request that targets a session carries one **binding** object:
  "lease_epoch":7}
 ```
 
-- Session ops (§4–§6) carry it as `binding`. terminal-v1 and chat-v1 messages on
-  an upgraded connection carry it as a top-level `binding` field next to their
-  existing fields (`terminal_id`/`agentId` must equal `target.session_id`,
-  `generation` must equal `target.process_gen`).
+- Session ops (§4–§6) carry it as `data.binding`. terminal-v1 and chat-v1
+  carry it as `data.binding` too — inside `data`, next to the family's own
+  fields, never inside a nested payload and never beside the outer envelope.
+  Their own ids must agree with it: terminal-v1 `terminal_id` = chat-v1
+  `agentId` = `binding.target.session_id`; terminal-v1 `generation` = chat-v1
+  `generation` (both are the agent process's generation) =
+  `binding.target.process_gen`. A disagreement is `stale_target`. Exact
+  envelopes:
+
+```json
+{"type":"terminal","data":{"v":1,"op":"subscribe","terminal_id":"ses-aaaaaaaaaaaa","generation":"22222222-2222-4222-8222-222222222222",
+  "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
+{"type":"terminal","data":{"v":1,"op":"input","terminal_id":"ses-aaaaaaaaaaaa","generation":"22222222-…","stream_id":"…","sequence":0,"bytes":"aGkN",
+  "binding":{"target":{…},"attachment_gen":"33333333-…","lease_epoch":7}}}
+{"type":"terminal","data":{"v":1,"op":"resize","terminal_id":"ses-aaaaaaaaaaaa","generation":"22222222-…","stream_id":"…","rows":40,"cols":120,
+  "binding":{"target":{…},"attachment_gen":"33333333-…","lease_epoch":7}}}
+{"type":"terminal","data":{"v":1,"op":"stop","terminal_id":"ses-aaaaaaaaaaaa","generation":"22222222-…","stream_id":"…",
+  "binding":{"target":{…},"attachment_gen":"33333333-…","lease_epoch":7}}}
+{"type":"agentChat","data":{"v":1,"op":"open","conversationId":"…","agentId":"ses-aaaaaaaaaaaa",
+  "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
+{"type":"agentChat","data":{"v":1,"op":"submit","conversationId":"…","agentId":"ses-aaaaaaaaaaaa","generation":"22222222-…",
+  "requestId":"44444444-…","text":"run the tests",
+  "binding":{"target":{…},"attachment_gen":"33333333-…","lease_epoch":7}}}
+```
+
+  On upgraded connections the terminal-v1 `lease_id` field is not used (the
+  binding's epoch replaces it); a chat `submit` is the §6 `submit` with
+  `kind:"prompt"`, `request_id = requestId`, `payload = {"text": text}`.
 - `lease_epoch` is required for mutations, absent for reads.
 - Any mismatch → `error{code:"stale_target"}` with **no** current values; the
   client re-lists (§4). Errors never reveal another target's ids, paths or
@@ -107,8 +143,8 @@ Every request that targets a session carries one **binding** object:
 | op | dir | fields |
 |---|---|---|
 | `list` | C→H | — |
-| `sessions` | H→C | `runtime_gen`, `revision`, `sessions: [descriptor]` |
-| `session_changed` | H→C | `runtime_gen`, `revision`, `descriptor` |
+| `sessions` | H→C | `runtime_gen`, `runtime_epoch`, `seq`, `sessions: [descriptor]` |
+| `session_changed` | H→C | `runtime_gen`, `runtime_epoch`, `seq`, `descriptor` |
 
 Descriptor:
 
@@ -120,14 +156,28 @@ Descriptor:
 ```
 
 - `state`: `running`, `exited`, `interrupted`, `recovery_required`, `closed`,
-  `removed` (tombstone). `activity`: `ready`, `working`, `waiting`, `unknown`.
-- `revision` is scoped to `runtime_gen`, starts at 1, and increases by exactly 1
-  per `session_changed`. Clients: apply a `session_changed` only if
-  `revision == last + 1` (same `runtime_gen`); on a gap, a new `runtime_gen` or
-  out-of-order delivery, send `list` and replace state with a snapshot whose
-  `revision` ≥ the last applied one; discard older snapshots. A removed session
-  is sent as `state:"removed"` and kept as a tombstone for 10 minutes so a late
-  update can't resurrect it.
+  `removed`. `activity`: `ready`, `working`, `waiting`, `unknown`.
+- **Runtime fencing.** `runtime_epoch` is a host-persisted counter incremented
+  at every broker start (with `runtime_gen` its UUID). A client accepts a
+  snapshot or change only if its `runtime_epoch` ≥ the highest it has accepted
+  from this host; a higher epoch replaces all state (a snapshot at `seq` 1 of
+  epoch 8 replaces `seq` 100 of epoch 7); anything from a lower epoch is
+  discarded, so a delayed old-runtime snapshot can never switch the client back.
+- **Per-attachment sequence.** `list` subscribes the attachment. The host then
+  sends, on that attachment's single ordered stream, one `sessions` snapshot
+  followed only by `session_changed` events. `seq` counts the messages *this
+  attachment* received in this epoch (snapshot = n, next change = n+1, …), so
+  changes to sessions it can't see never create gaps. Within an epoch the client
+  applies a change only if `seq == last + 1`; `seq ≤ last` is a duplicate and is
+  ignored; `seq > last + 1` is a gap: it sends `list` and, until the new
+  snapshot arrives, discards every change with `seq` ≤ that snapshot's `seq`.
+  A snapshot whose `seq` is lower than the last applied one (same epoch) is
+  discarded.
+- **Removal.** A removed session is sent as `state:"removed"`; applying it
+  deletes the session, and a later change for that `session_id` is only accepted
+  with a higher `seq` in the same epoch and a different `process_gen` — never
+  as a resurrection of the removed one. (Tombstones are kept 10 minutes host-side
+  only to answer late requests with `unknown_session`.)
 - The registry and every response are filtered by the attachment's view
   permission. `cwd_label` is the last path component only; clients show
   `session_id` when labels repeat. Presence is never liveness evidence.
@@ -149,8 +199,23 @@ Normative rules:
   renew every 5 s and never after their own monotonic estimate of expiry.
   `ms_left` is for estimation only.
 - **Fencing**: a lease is held by one (`controller_session`, `attachment_gen`).
-  Only a `lease` reply whose binding matches the client's current attachment,
-  target and epoch advances its local deadline; any other reply is ignored.
+- **Reply correlation and the client deadline** (normative for clients):
+  1. A `lease` reply is applied only if its `re` equals one outstanding
+     `acquire`/`renew` request id, and each outstanding request consumes at most
+     one reply; replies with an unknown, already consumed or duplicate `re` are
+     dropped, even when the binding matches.
+  2. Before applying it, the client checks its previously acknowledged local
+     deadline on the monotonic clock; if that deadline has passed (whether or not
+     a UI timer fired), the reply is dropped, the client becomes a viewer, and only
+     an explicit new `acquire` can regain control.
+  3. Otherwise the new deadline = the request's monotonic **send** time +
+     `ms_left` from the reply (never the reply's arrival time + 15 s), and never
+     later than the authorization deadline.
+  4. A repeat `acquire` by the current holder returns `ms_left` of the existing
+     lease; it never extends the deadline.
+  Fixture `late-renew-reply-does-not-resurrect-control` (acquire at t=0, renew
+  at t=5000, reply delivered at t=17000 with no timer tick; a duplicate earlier
+  reply while a later renew is pending; a repeat-acquire reply near expiry).
 - **Renew** after expiry → `stale_lease` (it never re-acquires).
 - **Repeat acquire** by the current holder on the same attachment returns the
   current lease unchanged (same epoch, no extension); on another attachment of
@@ -200,13 +265,29 @@ Kinds and payloads (v1):
   `request_id` with any value different → `request_id_reused`.
 - **Admission** of a new request needs the current lease (`stale_lease`
   otherwise), `control` permission, and a session that accepts submissions.
+- **States and transitions** (all others are invalid and never happen):
+
+| from | to | when |
+|---|---|---|
+| — | `accepted` | admitted and durably recorded (fsync) — then the reply |
+| — | `rejected` | refused at admission (nothing recorded as accepted) |
+| `accepted` | `executing` | durably recorded before the first external side effect |
+| `accepted` | `rejected` | before any side effect: session closed, trust generation changed, or the durable write of `executing` failed |
+| `executing` | `completed` | the kind's completion (table above) observed |
+| `executing` | `outcome_unknown` | crash/restart and reconciliation can't establish the outcome |
+
+  `completed`, `rejected` and `outcome_unknown` are final. A receipt's
+  `request_id`, target, kind and digest never change; replies carry the same
+  values through recovery.
 - **Crash boundaries**: `accepted` is persisted (fsync) before the reply;
   `executing` is persisted before the first external side effect (e.g. the
-  paste). After a crash: `accepted` work may still run under its original target
-  and only if the host trust generation is unchanged; otherwise it becomes
-  `rejected` with `detail:"host trust changed"`. `executing` work is reconciled
-  with the worker/provider; if that can't establish the outcome it becomes
-  `outcome_unknown`. Nothing is resubmitted automatically.
+  paste). After a crash, two cases stay distinct:
+  `accepted` work has provably not started any side effect, so it may still be
+  dispatched — once, under its original target, and only if the host trust
+  generation is unchanged (else `rejected`, `detail:"host trust changed"`).
+  `executing` work may have started a side effect: it is never dispatched again;
+  it is reconciled with the worker/provider, and if that can't establish the
+  outcome it becomes `outcome_unknown`.
 - Controller disconnect and lease expiry don't cancel accepted work.
 - **Retention**: receipts live for the session's life and 7 days after it closes.
   An accepting session's receipts are never evicted; at its limit new
@@ -252,12 +333,21 @@ One JSON file per scenario in `fixtures/`, schema `fixtures/schema.md`:
    {"assert":{"pty_writes":0,"dispatches":0}}]}
 ```
 
-Actions: `send`, `expect` (structured partial match), `expect_none` (for a
-duration), `advance_ms` (fake monotonic clock), `disconnect`, `resume`,
-`local_input`, `crash_worker`, `restart_runtime`, `assert` (host-side counters:
-PTY writes, dispatches, receipts visible). Negative scenarios assert both the
+The setup fixes the host context (`account_id`, `atem_device_id`,
+`host_trust_gen`, `runtime_gen`, `runtime_epoch`) and each client's
+authenticated identity and permissions; nothing is derived from message fields.
+Actions (deterministic clock, see `fixtures/schema.md`): `send`, `expect`,
+`expect_none`, `advance_ms`, `hold`/`deliver` (delay and reorder a specific
+message), `disconnect`, `resume`, `local_input`, `crash_worker`,
+`restart_runtime`, `fail_next_fsync`, `change_trust_gen`, `assert` (host
+counters: PTY writes, resizes, stops, dispatches, receipts visible per client;
+client state for client-side fixtures: `controls`, `deadline_ms`, registry). Negative scenarios assert both the
 error and the absence of writes, dispatch, disclosure or resurrection. The
-first set: hello/welcome, list/snapshot+revision, gap recovery, tombstone,
+first set (r3 adds the r2-review cases: two-connection lease bypass, late/duplicate
+lease replies, runtime epoch snapshots, snapshot/change reordering, hidden-session
+changes, change after removal, receipt-query authorization, changed-target id
+reuse, failed durable write, local reclaim at the PTY boundary, old attachment
+and old runtime input): hello/welcome, list/snapshot+revision, gap recovery, tombstone,
 acquire/renew/expiry, repeat acquire, takeover, local input revocation, queued
 bytes dropped on transfer, stale epoch, submit accepted→executing→completed,
 duplicate submit, reused id (other target), crash after executing →
