@@ -1,10 +1,10 @@
 # Agent chat (chat-v1): Atem host side
 
-Status: design approved 2026-10-15; not implemented. Astation side (browser
-page, later a mobile app) is the Astation agent's; its proposed contract is the
-starting point (atem memory `mem_b3ccce1f`, project github.com/agora-build/atem)
-and this document lists the changes Atem needs (see "Changes to the proposed
-contract").
+Status: design approved 2026-10-15; Atem host side built (Claude adapter).
+Astation side (browser page, later a mobile app) is the Astation agent's; its
+proposed contract is the starting point (atem memory `mem_b3ccce1f`, project
+github.com/agora-build/atem) and this document lists the changes Atem needs
+(see "Changes to the proposed contract").
 
 ## Goal
 

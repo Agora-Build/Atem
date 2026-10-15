@@ -176,6 +176,15 @@ Ctrl+<letter> other than i or m are accepted. The `CLAUDE_CLI_BIN`/`CLAUDE_CLI_A
 and `CODEX_CLI_BIN`/`CODEX_CLI_ARGS` variables still override the command.
 See [`designs/terminal-v1-implementation.md`](designs/terminal-v1-implementation.md).
 
+**Chat from Astation.** Astation can open a chat view of a Claude session
+launched with `atem agent launch claude`: your prompts appear as messages and
+Claude's replies come from its own session log, with a status of ready,
+working, waiting or unknown. Atem adds its hooks with `--settings` for that run
+only; your `~/.claude` settings are not changed. Prompts from chat are refused
+while you have unsent input in the terminal, and approvals stay in the
+terminal. Codex has no chat yet (its status is unknown). See
+[`designs/agent-chat-host.md`](designs/agent-chat-host.md).
+
 ### Vault (shared cross-agent context)
 
 ```bash
