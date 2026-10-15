@@ -406,6 +406,7 @@ impl App {
         let Some(Session {
             chat: Some(chat),
             input,
+            last_used,
             ..
         }) = session_id.and_then(|id| self.sessions.get_mut(&id))
         else {
@@ -473,6 +474,8 @@ impl App {
                             };
                             match written {
                                 Ok(()) => {
+                                    // Remote input: the session is the alias target now.
+                                    *last_used = Instant::now();
                                     chat.session.mark_pasted(&request_id, Instant::now());
                                     Vec::new()
                                 }

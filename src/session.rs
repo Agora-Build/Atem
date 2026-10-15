@@ -101,7 +101,8 @@ pub const MAX_ENV_BYTES: usize = 256 * 1024;
 
 /// A new session: provider, its arguments (after `CLAUDE_CLI_ARGS`/`CODEX_CLI_ARGS`),
 /// working directory, environment (`None` = Atem's own) and screen size.
-#[derive(Clone, Debug)]
+/// `Debug` never prints the environment.
+#[derive(Clone)]
 pub struct LaunchRequest {
     pub provider: Provider,
     pub args: Vec<String>,
@@ -109,6 +110,19 @@ pub struct LaunchRequest {
     pub env: Option<Vec<(OsString, OsString)>>,
     pub rows: u16,
     pub cols: u16,
+}
+
+impl std::fmt::Debug for LaunchRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchRequest")
+            .field("provider", &self.provider)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env", &crate::pty_session::EnvSummary(&self.env))
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .finish()
+    }
 }
 
 impl LaunchRequest {
@@ -376,11 +390,30 @@ mod tests {
         let env: Vec<_> = (0..=MAX_ENV_ENTRIES).map(entry).collect();
         assert!(check_env(&env).is_err());
         // name + "=" + value + NUL
-        let fits = vec![(OsString::from("A"), OsString::from("v".repeat(MAX_ENV_BYTES - 3)))];
+        let fits = vec![(
+            OsString::from("A"),
+            OsString::from("v".repeat(MAX_ENV_BYTES - 3)),
+        )];
         assert_eq!(check_env(&fits), Ok(()));
-        let over = vec![(OsString::from("A"), OsString::from("v".repeat(MAX_ENV_BYTES - 2)))];
+        let over = vec![(
+            OsString::from("A"),
+            OsString::from("v".repeat(MAX_ENV_BYTES - 2)),
+        )];
         assert!(check_env(&over).is_err());
         assert_eq!(check_env(&[]), Ok(()));
+    }
+
+    #[test]
+    fn a_launch_request_never_prints_its_environment() {
+        let mut request = LaunchRequest::here(Provider::Claude, vec!["--x".into()], 24, 80);
+        request.env = Some(vec![("API_TOKEN".into(), "s3cr3t-value".into())]);
+        let text = format!("{request:?}");
+        assert!(!text.contains("s3cr3t-value"), "{text}");
+        assert!(!text.contains("API_TOKEN"), "{text}");
+        assert!(text.contains("env: <1 entries>"), "{text}");
+        assert!(text.contains("--x"), "{text}");
+        request.env = None;
+        assert!(format!("{request:?}").contains("env: <inherited>"));
     }
 
     #[test]

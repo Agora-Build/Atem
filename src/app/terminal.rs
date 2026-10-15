@@ -281,10 +281,9 @@ impl App {
             return;
         };
         // One paste is atomic at the writer. Never partially submit a large paste.
-        let result = sender.send(data);
-        session.last_used = std::time::Instant::now();
-        if let Err(error) = result {
-            self.status_message = Some(error.to_string());
+        match sender.send(data) {
+            Ok(()) => session.last_used = std::time::Instant::now(),
+            Err(error) => self.status_message = Some(error.to_string()),
         }
     }
 

@@ -790,6 +790,26 @@ async fn relaunch_is_a_new_session_and_reaping_the_old_one_tells_its_conversatio
 }
 
 #[tokio::test]
+async fn a_chat_prompt_makes_its_session_the_alias_target() {
+    let mut h = start().await;
+    h.wait_for_chat().await;
+    let (opened, _) = h.open("c1", 0).await;
+    let generation = opened["data"]["generation"].as_str().unwrap().to_string();
+    let chat_session = claude_session(&h.app).id.clone();
+    // A later Claude session (no process) is the most recently used one.
+    let (input, _reader) = crate::pty_session::PtyInput::test_channel();
+    let mut other = Session::new(Provider::Claude, 24, 80);
+    other.input = Some(input);
+    let other = h.app.sessions.insert(other).unwrap().id.clone();
+    assert_eq!(h.app.sessions.resolve("claude"), Some(other.clone()));
+    h.submit_until_complete("c1", &generation, "r1", "hello there")
+        .await;
+    assert_eq!(h.app.sessions.resolve("claude"), Some(chat_session));
+    h.app.sessions.remove(&other);
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn opening_restarts_the_heartbeat_clock() {
     let mut h = start().await;
     h.wait_for_chat().await;

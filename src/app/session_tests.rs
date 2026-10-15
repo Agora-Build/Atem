@@ -45,7 +45,8 @@ fn request(provider: Provider, cwd: &Path) -> LaunchRequest {
     }
 }
 
-/// A live session writing to a test channel (no process), used `offset` seconds from now.
+/// A live session writing to a test channel, used `offset` seconds from now. It
+/// has no process on purpose: routing only needs a live session's input.
 fn test_session(
     app: &mut App,
     provider: Provider,
@@ -310,6 +311,15 @@ async fn agent_input_without_an_id_goes_to_the_latest_claude_session_unless_it_h
     app.handle_agent_input(None, "text".into(), Some("over a draft".into()), None);
     assert!(status(&app).contains("unsent input"), "{}", status(&app));
     assert_eq!(written(&mut latest_rx) + &written(&mut older_rx), "");
+    // Keys are not text: they reach the session even over a draft (a prompt
+    // waiting for y/n or Esc must stay answerable), one after another.
+    app.handle_agent_input(None, "key".into(), None, Some("y".into()));
+    assert_eq!(written(&mut latest_rx), "y");
+    app.handle_agent_input(None, "key".into(), None, Some("esc".into()));
+    assert_eq!(written(&mut latest_rx), "\x1b");
+    app.handle_agent_input(None, "text".into(), Some("still a draft".into()), None);
+    assert!(status(&app).contains("unsent input"), "{}", status(&app));
+    assert_eq!(written(&mut latest_rx) + &written(&mut older_rx), "");
     // Addressed input is the caller's choice.
     app.handle_agent_input(
         Some(latest.to_string()),
@@ -318,6 +328,24 @@ async fn agent_input_without_an_id_goes_to_the_latest_claude_session_unless_it_h
         Some("enter".into()),
     );
     assert_eq!(written(&mut latest_rx), "\r");
+}
+
+#[test]
+fn local_paste_counts_as_use_only_when_written() {
+    let (mut app, root) = app();
+    let (id, mut rx) = test_session(&mut app, Provider::Claude, root.path(), 0);
+    app.focused = Some(id.clone());
+    app.mode = AppMode::Terminal;
+    let before = app.sessions.get(&id).unwrap().last_used;
+    let input = app.sessions.get(&id).unwrap().input.clone().unwrap();
+    input.set_remote(true);
+    app.terminal_paste("refused");
+    assert_eq!(app.sessions.get(&id).unwrap().last_used, before);
+    assert_eq!(written(&mut rx), "");
+    input.set_remote(false);
+    app.terminal_paste("pasted");
+    assert!(app.sessions.get(&id).unwrap().last_used > before);
+    assert!(written(&mut rx).contains("pasted"));
 }
 
 #[tokio::test]
@@ -515,6 +543,12 @@ async fn logs_are_kept_per_session_under_the_logs_directory() {
             summary.starts_with("# Claude Code Session Summary"),
             "{summary}"
         );
+        // Private: logs may hold anything the agent printed.
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&app.logs_dir), 0o700);
+        assert_eq!(mode(&dir.join("session.ansi")), 0o600);
+        assert_eq!(mode(&dir.join("summary.md")), 0o600);
     }
     assert!(!a.join("claude_logs").exists());
 }

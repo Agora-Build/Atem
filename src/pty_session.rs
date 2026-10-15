@@ -235,7 +235,8 @@ pub struct PtySession {
 }
 
 /// What to spawn: `env` `None` inherits Atem's environment; `Some` replaces it.
-#[derive(Clone, Debug)]
+/// `Debug` never prints the environment.
+#[derive(Clone)]
 pub struct SpawnSpec {
     pub binary: String,
     pub args: Vec<String>,
@@ -261,6 +262,31 @@ pub fn spawn_sized(binary: &str, args: &[String], rows: u16, cols: u16) -> Resul
         rows,
         cols,
     })
+}
+
+/// Prints how many environment entries there are, never their names or values.
+pub(crate) struct EnvSummary<'a>(pub &'a Option<Vec<(OsString, OsString)>>);
+
+impl std::fmt::Debug for EnvSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(env) => write!(f, "<{} entries>", env.len()),
+            None => f.write_str("<inherited>"),
+        }
+    }
+}
+
+impl std::fmt::Debug for SpawnSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnSpec")
+            .field("binary", &self.binary)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env", &EnvSummary(&self.env))
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .finish()
+    }
 }
 
 pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
@@ -512,6 +538,24 @@ mod tests {
         let output = output_of(spawn_spec(inherited).unwrap()).await;
         let home = std::env::var("HOME").unwrap_or_else(|_| "none".into());
         assert_eq!(output, format!("{}||{home}|xterm-256color", cwd.display()));
+    }
+
+    #[test]
+    fn a_spawn_spec_never_prints_its_environment() {
+        let spec = SpawnSpec {
+            binary: "claude".into(),
+            args: Vec::new(),
+            cwd: std::env::temp_dir(),
+            env: Some(vec![("API_TOKEN".into(), "s3cr3t-value".into())]),
+            rows: 24,
+            cols: 80,
+        };
+        let text = format!("{spec:?}");
+        assert!(
+            !text.contains("s3cr3t-value") && !text.contains("API_TOKEN"),
+            "{text}"
+        );
+        assert!(text.contains("env: <1 entries>"), "{text}");
     }
 
     #[test]

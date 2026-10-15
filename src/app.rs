@@ -248,10 +248,10 @@ impl App {
         app
     }
 
-    /// `<config dir>/logs`; tests never write there.
+    /// `<config dir>/logs`. Tests get none (logs off) unless they set a temp dir.
     fn default_logs_dir() -> PathBuf {
         if cfg!(test) {
-            std::env::temp_dir().join(format!("atem-test-logs-{}", std::process::id()))
+            PathBuf::new()
         } else {
             AtemConfig::config_dir().join("logs")
         }
@@ -650,9 +650,10 @@ impl App {
     }
 
     /// Where a request without an agent id goes: the most recently used live
-    /// session of `provider`, unless its terminal holds a draft (chat-v1's rule).
+    /// session of `provider`. With `check_draft` (text, prompts, voice) it is
+    /// refused while that terminal holds a draft (chat-v1's rule); keys pass.
     /// Atem never starts a session for it.
-    fn default_session(&self, provider: Provider) -> Result<SessionId, String> {
+    fn default_session(&self, provider: Provider, check_draft: bool) -> Result<SessionId, String> {
         let Some(id) = self.sessions.latest(provider) else {
             return Err(match provider {
                 Provider::Claude => NO_CLAUDE_SESSION.to_string(),
@@ -660,7 +661,8 @@ impl App {
             });
         };
         let session = self.sessions.get(&id).expect("latest is a session");
-        if let (Some(chat), Some(input)) = (&session.chat, &session.input)
+        if check_draft
+            && let (Some(chat), Some(input)) = (&session.chat, &session.input)
             && chat.has_unsent_input(input.input_count())
         {
             return Err(format!(
@@ -671,11 +673,11 @@ impl App {
         Ok(id)
     }
 
-    /// `agent_id` when given (and not empty), else `default_session(provider)`.
-    fn route(&self, agent_id: Option<&str>, provider: Provider) -> Result<SessionId, String> {
+    /// `agent_id` when given (and not empty), else `default_session`.
+    fn route(&self, agent_id: Option<&str>, provider: Provider, check_draft: bool) -> Result<SessionId, String> {
         match agent_id.filter(|id| !id.is_empty()) {
             Some(agent_id) => self.addressed_session(agent_id),
-            None => self.default_session(provider),
+            None => self.default_session(provider, check_draft),
         }
     }
 
@@ -755,7 +757,7 @@ impl App {
     /// `agentPrompt` from Astation: type `text` into the session `agent_id`
     /// names (without one, the latest Claude session; see `route`).
     pub async fn handle_agent_prompt(&mut self, agent_id: &str, text: &str) {
-        match self.route(Some(agent_id), Provider::Claude) {
+        match self.route(Some(agent_id), Provider::Claude, true) {
             Err(message) => self.status_message = Some(message),
             Ok(id) => {
                 if let Err(err) = self.send_prompt(&id, text) {
@@ -1042,11 +1044,34 @@ impl App {
         };
     }
 
-    /// `<logs_dir>/<session_id>/`, created on first use.
+    /// `<logs_dir>/<session_id>/`, created on first use. Both directories are
+    /// private (0700): logs hold whatever the agent printed.
     fn session_log_dir(session: &Session, logs_dir: &std::path::Path) -> Result<PathBuf> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if logs_dir.as_os_str().is_empty() {
+            anyhow::bail!("session logs are off");
+        }
         let dir = logs_dir.join(session.id.as_str());
-        fs::create_dir_all(&dir)?;
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+        for path in [logs_dir, dir.as_path()] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
         Ok(dir)
+    }
+
+    /// Write a private (0600) log file.
+    fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents)?;
+        Ok(())
     }
 
     /// Saves the raw log as `<logs_dir>/<session_id>/session.ansi` (once per session).
@@ -1059,7 +1084,7 @@ impl App {
         }
 
         let path = Self::session_log_dir(session, logs_dir)?.join("session.ansi");
-        fs::write(&path, session.raw_log.as_bytes())?;
+        Self::write_private(&path, session.raw_log.as_bytes())?;
         session.log_file = Some(path.clone());
         Ok(Some(path))
     }
@@ -1099,7 +1124,7 @@ impl App {
     /// `<logs_dir>/<session_id>/summary.md`.
     pub fn write_summary_file(session: &mut Session, logs_dir: &std::path::Path, summary: &str) -> Result<PathBuf> {
         let path = Self::session_log_dir(session, logs_dir)?.join("summary.md");
-        fs::write(&path, summary)?;
+        Self::write_private(&path, summary.as_bytes())?;
         session.summary_file = Some(path.clone());
         Ok(path)
     }
@@ -1334,7 +1359,7 @@ impl App {
                 if !active && self.voice_commands.has_content() {
                     let command = self.voice_commands.take();
                     self.status_message = Some(format!("\u{1f3a4} PTT: {}", command));
-                    match self.default_session(Provider::Claude) {
+                    match self.default_session(Provider::Claude, true) {
                         Err(message) => self.status_message = Some(message),
                         Ok(id) => {
                             if let Err(err) = self.send_prompt(&id, &command) {
@@ -1391,7 +1416,7 @@ impl App {
                     // "codex_input" goes to the latest Codex session; anything
                     // else ("cli_input", "claude_input") to the latest Claude one.
                     let provider = if action == "codex_input" { Provider::Codex } else { Provider::Claude };
-                    match self.default_session(provider) {
+                    match self.default_session(provider, true) {
                         Err(message) => {
                             self.status_message = Some(message);
                             return;
@@ -1720,7 +1745,7 @@ impl App {
             self.status_message = Some(format!("\u{1f3a4} Voice: {}", command));
 
             // Send to Claude Code (never starts a session).
-            match self.default_session(Provider::Claude) {
+            match self.default_session(Provider::Claude, true) {
                 Err(message) => self.status_message = Some(message),
                 Ok(id) => {
                     if let Err(err) = self.send_prompt(&id, &command) {
@@ -1773,7 +1798,8 @@ impl App {
             return;
         };
 
-        match self.route(agent_id.as_deref(), Provider::Claude) {
+        // Only text could submit a draft; control keys always pass.
+        match self.route(agent_id.as_deref(), Provider::Claude, kind == "text") {
             Err(message) => self.status_message = Some(message),
             Ok(target) => {
                 self.status_message = Some(format!("\u{2328} agentInput: {}", kind));
@@ -1791,7 +1817,7 @@ impl App {
         self.status_message = Some(format!("\u{1f3a4} Voice request: {}", &accumulated_text[..accumulated_text.len().min(50)]));
 
         // Send the transcribed text to Claude Code (never starts a session).
-        let target = self.default_session(Provider::Claude);
+        let target = self.default_session(Provider::Claude, true);
         let sent = match &target {
             Ok(id) => self.send_prompt(id, &accumulated_text),
             Err(message) => Err(anyhow::anyhow!("{message}")),
@@ -2025,7 +2051,8 @@ mod tests {
         assert_eq!(agent_key_to_bytes("Enter"), None); // case-sensitive by design
     }
 
-    /// A session of `provider` writing to `input` (no process), shown by the terminal view.
+    /// A session of `provider` writing to `input`, shown by the terminal view. Live
+    /// without a process on purpose: these tests only check what reaches its input.
     fn focus_test_session(app: &mut App, provider: Provider, input: crate::pty_session::PtyInput) {
         let mut session = Session::new(provider, 24, 80);
         session.input = Some(input);
