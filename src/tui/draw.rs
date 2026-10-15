@@ -508,6 +508,7 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
                 AgentStatus::Thinking => "\u{1f7e1}",        // yellow circle
                 AgentStatus::WaitingForInput => "\u{1f7e2}", // green circle
                 AgentStatus::Disconnected => "\u{1f534}",    // red circle
+                AgentStatus::Unknown => "\u{2754}",          // question mark: activity unknown
             };
 
             let active_marker = if is_active { " \u{2605}" } else { "" }; // ★

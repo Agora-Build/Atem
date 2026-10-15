@@ -30,6 +30,12 @@ impl CodexClient {
     pub async fn start_session_sized(&self, rows: u16, cols: u16) -> Result<CodexSession> {
         pty_session::spawn_sized(&self.binary, &self.extra_args, rows, cols)
     }
+
+    #[cfg(test)]
+    pub fn set_command_for_test(&mut self, binary: String, args: Vec<String>) {
+        self.binary = binary;
+        self.extra_args = args;
+    }
 }
 
 #[cfg(test)]

@@ -222,6 +222,7 @@ async fn run_tui_loop(
         app.process_astation_messages().await;
         app.process_codex_output();
         app.process_claude_output();
+        app.poll_chat().await;
         // Drain bytes from the old geometry before notifying the CLI of a resize.
         sync_terminal_sizes(app, terminal.size()?);
         app.pump_terminals();

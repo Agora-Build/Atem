@@ -27,8 +27,27 @@ impl ClaudeClient {
         pty_session::spawn(&self.binary, &self.extra_args)
     }
 
-    pub async fn start_session_sized(&self, rows: u16, cols: u16) -> Result<ClaudeSession> {
-        pty_session::spawn_sized(&self.binary, &self.extra_args, rows, cols)
+    /// The arguments every spawn gets (env defaults, then launch arguments).
+    pub fn launch_args(&self) -> &[String] {
+        &self.extra_args
+    }
+
+    /// Spawn with `first` placed before the stored arguments, for this spawn only
+    /// (so they stay ahead of a user's `--`).
+    pub async fn start_session_sized(
+        &self,
+        rows: u16,
+        cols: u16,
+        first: &[String],
+    ) -> Result<ClaudeSession> {
+        let args = [first, &self.extra_args[..]].concat();
+        pty_session::spawn_sized(&self.binary, &args, rows, cols)
+    }
+
+    #[cfg(test)]
+    pub fn set_command_for_test(&mut self, binary: String, args: Vec<String>) {
+        self.binary = binary;
+        self.extra_args = args;
     }
 }
 

@@ -92,11 +92,12 @@ impl App {
     }
 
     /// The socket is open but no longer authenticated: offline, remote
-    /// terminals revoked, Astation-routed work dropped. The local agent PTY
-    /// and anything typed into it are left alone.
-    fn suspend_astation(&mut self) {
+    /// terminals revoked, chat conversations closed, Astation-routed work
+    /// dropped. The local agent PTY and anything typed into it are left alone.
+    pub(super) fn suspend_astation(&mut self) {
         self.astation_connected = false;
         self.disconnect_terminals();
+        self.close_chat_conversations();
         self.pending_astation_command = None;
         self.pending_voice_request = None;
         self.rebuild_menu();

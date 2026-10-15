@@ -73,6 +73,9 @@ pub enum AstationMessage {
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
 
+    #[serde(rename = "agentChat")]
+    AgentChat(crate::chat::wire::ChatEnvelope),
+
     #[serde(rename = "projectListRequest")]
     ProjectListRequest,
 
@@ -2894,6 +2897,7 @@ mod tests {
             session_ids: vec![],
             acp_url: None,
             pty_pid: Some(4242),
+            capabilities: vec![],
         }
     }
 
@@ -3059,6 +3063,22 @@ mod tests {
         assert!(json.contains(r#""login_id":"u@a.io""#));
         assert!(json.contains(r#""astation_id":"ast-1""#));
         assert!(json.contains(r#""save_credentials":true"#));
+    }
+
+    #[test]
+    fn agent_chat_round_trips_through_astation_message() {
+        let json = r#"{"type":"agentChat","data":{"v":1,"op":"open","conversationId":"c1","agentId":"claude","before":"m9"}}"#;
+        let msg: AstationMessage = serde_json::from_str(json).unwrap();
+        match &msg {
+            AstationMessage::AgentChat(env) => {
+                assert_eq!(env.op, "open");
+                assert_eq!(env.conversation_id, "c1");
+                assert_eq!(env.body["before"], "m9");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let back: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(back, serde_json::from_str::<serde_json::Value>(json).unwrap());
     }
 
     #[test]

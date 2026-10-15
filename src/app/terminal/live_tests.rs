@@ -26,7 +26,10 @@ async fn live_claude_websocket_conversation() {
 }
 
 async fn conversation(provider: &'static str) {
+    // Never the real $XDG_RUNTIME_DIR/atem or ~/.config/atem/run; dropped after the App.
+    let chat_root = tempfile::tempdir().unwrap();
     let mut app = App::new();
+    app.chat_root = chat_root.path().join("run");
     if provider == "codex" {
         app.ensure_codex_session().await.unwrap();
         app.mode = AppMode::CodexChat;
