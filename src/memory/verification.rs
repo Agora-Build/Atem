@@ -489,7 +489,7 @@ pub fn complete_verification(
             }
             if staged.home_is_set() && staged.home() != Some(astation_id) {
                 bail!(
-                    "this device's home Astation is {}; verify with it, or start over (delete ~/.config/atem/cred_state.json too)",
+                    "this device's home Astation is {}; verify with it, or set the device up again (move ~/.config/atem/cred_state.json into a backup folder too, then `atem unpair` and `atem pair`)",
                     staged.recorded_home().unwrap_or_default()
                 );
             }

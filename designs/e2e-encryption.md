@@ -1674,11 +1674,16 @@ If this device's keys can't be unlocked (the sealed file or
 `atem status` and
 `atem cred unlock` print:
 
-> To start over: delete ~/.config/atem/device_keys, device_keys.sealed,
-> device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and
-> cred_state.json, then run `atem pair`. device_keys.sealed also holds the
-> memory encryption key and its older keys: Astation grants the current key
-> again, older keys may not come back.
+> To set this device up again: move ~/.config/atem/device_keys,
+> device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev,
+> unlock_auth_key and cred_state.json into a backup folder (don't delete them:
+> device_keys.sealed holds the memory encryption key and its older keys, which
+> older data may need), then run `atem unpair` and `atem pair`. Astation grants
+> the current memory key again; older keys come back only from that backup.
+
+Key files are never deleted as routine recovery: setting a device up again
+moves them aside, and `atem unpair` / `atem pair` establish the new trust
+explicitly (verification never replaces trusted keys on its own).
 
 An Astation rolled back or restored from a backup to an older storage key
 counts as having lost it: the storage key rotates at every unlock, so the

@@ -1781,7 +1781,7 @@ mod tests {
     fn the_reset_names_every_key_file_and_the_trust_state() {
         assert_eq!(
             RESET,
-            "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair verify`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back."
+            "To set this device up again: move ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json into a backup folder (don't delete them: device_keys.sealed holds the memory encryption key and its older keys, which older data may need), then run `atem unpair` and `atem pair`. Astation grants the current memory key again; older keys come back only from that backup."
         );
     }
 

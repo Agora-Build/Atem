@@ -68,7 +68,7 @@ pub fn build_id() -> &'static str {
 }
 
 /// Appended to key-file errors, which never stop the agent (it starts locked).
-pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair verify`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back.";
+pub const RESET: &str = "To set this device up again: move ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json into a backup folder (don't delete them: device_keys.sealed holds the memory encryption key and its older keys, which older data may need), then run `atem unpair` and `atem pair`. Astation grants the current memory key again; older keys come back only from that backup.";
 
 /// What the agent serves. Only the same user can reach it (agent_socket.rs).
 /// Fields that carry secrets are `Zeroizing`.
