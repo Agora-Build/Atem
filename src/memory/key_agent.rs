@@ -68,7 +68,7 @@ pub fn build_id() -> &'static str {
 }
 
 /// Appended to key-file errors, which never stop the agent (it starts locked).
-pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back.";
+pub const RESET: &str = "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair verify`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back.";
 
 /// What the agent serves. Only the same user can reach it (agent_socket.rs).
 /// Fields that carry secrets are `Zeroizing`.
@@ -872,7 +872,7 @@ impl KeyAgent {
     fn home(&self, astation_id: &str) -> Result<AstationTrust> {
         let store = TrustStore::load_from(&self.paths.trust)?;
         let home = store.home().ok_or_else(|| {
-            anyhow!("this device has no home Astation yet; run `atem pair` to verify it")
+            anyhow!("this device has no home Astation yet; run `atem pair verify` to verify it")
         })?;
         if home != astation_id {
             bail!(
@@ -882,7 +882,7 @@ impl KeyAgent {
         store
             .verified(home)
             .cloned()
-            .ok_or_else(|| anyhow!("the home Astation's pins are missing; run `atem pair`"))
+            .ok_or_else(|| anyhow!("the home Astation's pins are missing; run `atem pair verify`"))
     }
 
     fn begin_unlock(&mut self, astation_id: &str) -> Result<Reply> {
@@ -909,7 +909,7 @@ impl KeyAgent {
             (Some(file), _) => file,
             (None, Some(error)) => return Err(error),
             (None, None) => {
-                bail!("this device has no sealed keys; run `atem pair` to verify it")
+                bail!("this device has no sealed keys; run `atem pair verify` to verify it")
             }
         };
         if sealed.device_id != trust.device_id {

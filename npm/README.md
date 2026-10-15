@@ -34,9 +34,11 @@ atem repl                               # Interactive REPL with AI command inter
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
 atem logout                             # Log out from SSO
-atem pair                               # Pair with Astation, then verify this device
+atem status                             # Account, pairing, verification and credentials (offline, read-only)
+atem pair                               # Pair with Astation, then verify this device (shows the status when already paired)
 atem pair --save                        # Same, and keep credentials for offline use
-atem unpair [--yes]                     # Remove all Astation pairings (asks first)
+atem pair verify                        # Verify this device with the paired Astation (no re-pairing)
+atem unpair [--yes]                     # Remove all Astation pairings and saved sessions (asks first)
 ```
 
 `atem login` unlocks a limited set: project list, tokens for the active
@@ -52,15 +54,24 @@ atem and your Mac each show a 12-character safety code. If they match, type
 Either side can finish first. atem reads that `y` from the terminal itself,
 never from piped input or keys typed earlier, so run `atem pair` in an
 interactive terminal. If verification fails, the pairing stays saved, Astation
-is told, and `atem pair` exits nonzero; run it again to verify. A connected or SSO-paired session alone does not
-mean the device is verified; check `atem cred status`. With `--save`
+is told, and `atem pair` exits nonzero; run `atem pair verify` to retry. A connected or SSO-paired session alone does not
+mean the device is verified; check `atem status`. With `--save`
 the credentials keep working when Astation disconnects; without it they stop
 5 minutes after the disconnect (atem asks when `--save` isn't given).
+
+Once paired, `atem pair` only prints the status (`Already paired. Verify this
+device: atem pair verify · Replace the pairing: atem unpair, then atem pair`):
+it never pairs again or changes keys, trust or sessions. `atem pair verify`
+verifies the existing pairing over its saved session, does nothing when the
+device is already verified, and refuses after a revocation (run `atem unpair`,
+which sets the revoked keys aside, then `atem pair`). `atem status` reads only
+local files and an already running key agent; it never connects, so
+authorization and relay show as `unknown (stale)`.
 
 ### Device keys (`atem cred`)
 
 ```bash
-atem cred status                        # Show whether this device is verified, its home Astation and its key agent
+atem cred status                        # Same as `atem status`
 atem cred unlock                        # Unlock this device's keys (approve with Touch ID on your Mac)
 atem cred lock                          # Wipe unlocked keys and stop the key agent
 atem cred projects                      # Send known Git projects to Astation's credential picker (keys must be unlocked)
@@ -68,7 +79,9 @@ atem cred projects                      # Send known Git projects to Astation's 
 
 This device's keys are sealed on disk under a storage key that only the paired
 Mac (the home Astation) holds. `atem cred unlock` asks the Mac for it (Touch
-ID) and starts a background `atem key-agent` that holds the keys in memory.
+ID) and starts a background `atem key-agent` that holds the keys in memory;
+on a device no Astation verified it stops with `This device isn't verified.
+Run atem pair verify first.` and never starts pairing or verification.
 `atem cred lock` wipes them and stops the agent. After upgrading atem, run
 `atem cred lock` then `atem cred unlock` to pick up the new agent.
 
@@ -203,7 +216,7 @@ such as timestamps and ciphertext sizes; it is not authoritative for device
 trust or encryption state. Migration cannot prove that a server erased old
 plaintext backups.
 
-The device must be verified (`atem pair`) and unlocked (`atem cred unlock`).
+The device must be verified (`atem pair`, or `atem pair verify` to retry) and unlocked (`atem cred unlock`).
 While it is locked, `atem sync` keeps changes queued. Switching encryption on
 or off migrates existing data; each verified atem finishes its part at its next
 `atem cred unlock` (`atem sync` alone doesn't contact Astation). **Turning on**

@@ -1,4 +1,4 @@
-//! `atem pair` device verification: the safety-code confirmation (read from
+//! `atem pair` and `atem pair verify` device verification: the safety-code confirmation (read from
 //! the terminal, never from stdin) and what happens when verification fails
 //! (the pending pin is dropped and Astation is told, unless it cancelled).
 
@@ -201,7 +201,7 @@ pub(crate) fn code_failure(answer: CodeAnswer) -> Option<VerifyFailure> {
         CodeAnswer::NoTerminal(detail) => Some(VerifyFailure::local(
             "no terminal to compare the code",
             anyhow!(
-                "Device verification needs a terminal to compare the safety code ({detail}); run `atem pair` in an interactive terminal."
+                "Device verification needs a terminal to compare the safety code ({detail}); run `atem pair verify` in an interactive terminal."
             ),
         )),
     }
@@ -310,7 +310,7 @@ pub(crate) async fn request_key_after_verification(
     }
 }
 
-/// `atem pair` after the pairing was saved: a failed verification is shown
+/// `atem pair` after the pairing was saved, and `atem pair verify`: a failed verification is shown
 /// in full here, then reported as a short error so the exit status is
 /// nonzero.
 pub(crate) fn verification_result(verification: Result<()>) -> Result<()> {
@@ -318,7 +318,7 @@ pub(crate) fn verification_result(verification: Result<()>) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) => {
             eprintln!("\u{26a0}\u{fe0f}  {error}");
-            eprintln!("Pairing is saved. Run 'atem pair' again to verify this device.");
+            eprintln!("Pairing is saved. Run 'atem pair verify' to verify this device.");
             Err(anyhow!("device verification failed"))
         }
     }
@@ -441,7 +441,7 @@ mod tests {
         );
         let message = failure.error().to_string();
         assert!(message.contains("needs a terminal"), "{message}");
-        assert!(message.contains("run `atem pair` in an interactive terminal"));
+        assert!(message.contains("run `atem pair verify` in an interactive terminal"));
     }
 
     #[test]

@@ -204,13 +204,23 @@ impl SessionManager {
         self.sessions.insert(astation_id, session);
     }
 
+    /// Every saved session's Astation id, expired ones included.
+    pub(crate) fn astation_ids(&self) -> Vec<String> {
+        self.sessions.keys().cloned().collect()
+    }
+
+    /// Forgets every saved session (`atem unpair`).
+    pub(crate) fn clear(&mut self) {
+        self.sessions.clear();
+    }
+
     /// Get all active (valid) sessions.
     pub fn active_sessions(&self) -> Vec<&AuthSession> {
         self.sessions.values().filter(|s| s.is_valid()).collect()
     }
 
     /// Get the path to the sessions file.
-    fn sessions_path() -> Result<std::path::PathBuf> {
+    pub(crate) fn sessions_path() -> Result<std::path::PathBuf> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow!("Could not determine config directory"))?;
         Ok(config_dir.join("atem").join("sessions.json"))

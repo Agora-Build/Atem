@@ -484,7 +484,7 @@ pub fn complete_verification(
         VerificationKeys::Fresh(_) => {
             if has_device_keys(paths) {
                 bail!(
-                    "this device already has keys; verify with them (run `atem cred unlock`, then `atem pair` again)"
+                    "this device already has keys; verify with them (run `atem cred unlock`, then `atem pair verify`)"
                 );
             }
             if staged.home_is_set() && staged.home() != Some(astation_id) {
@@ -497,7 +497,7 @@ pub fn complete_verification(
         // Sealed keys never leave the agent: it must hold exactly these.
         VerificationKeys::Sealed(publics) => {
             if !agent.status()?.unlocked {
-                bail!("{LOCKED}, then `atem pair` again");
+                bail!("{LOCKED}, then `atem pair verify`");
             }
             if agent.public_keys()? != (publics.device_pub, publics.device_sign_pub) {
                 bail!("the key agent holds other device keys than this verification revealed");
@@ -691,7 +691,7 @@ pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) 
 
 /// Whether this device has keys on disk: a plain `device_keys` file, or any
 /// sealed file (the current one, or a rotation's `.next` / `.prev`).
-fn has_device_keys(paths: &KeyPaths) -> bool {
+pub(crate) fn has_device_keys(paths: &KeyPaths) -> bool {
     [
         &paths.device_keys,
         &paths.device_keys_sealed,
@@ -703,7 +703,8 @@ fn has_device_keys(paths: &KeyPaths) -> bool {
 }
 
 /// When the home Astation revoked this device (recorded by `atem cred
-/// unlock`) and the key agent is locked, its keys can never unlock again:
+/// unlock`) and the key agent (`agent`, the running one; `None` when none
+/// runs) is locked, its keys can never unlock again (`atem unpair` calls this):
 /// renames every key file to `<name>.revoked-<stamp>` (never deletes),
 /// forgets that Astation's verification, the home and the escrow state, so
 /// `device_keys_for_verification` then gives fresh keys. Returns the line to
@@ -714,12 +715,20 @@ fn has_device_keys(paths: &KeyPaths) -> bool {
 /// code the user compares, so a forged "revoked" can cost a re-pair but
 /// never keys (the files stay on disk) or trust (nothing new is trusted
 /// without the ceremony). Blocking: call it inside `key_agent::blocking`.
-pub fn set_aside_revoked_keys(paths: &KeyPaths, agent: &dyn KeyAgentApi) -> Result<Option<String>> {
+pub fn set_aside_revoked_keys(
+    paths: &KeyPaths,
+    agent: Option<&dyn KeyAgentApi>,
+) -> Result<Option<String>> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let Some(revoked) = trust.revoked() else {
         return Ok(None);
     };
-    if trust.recorded_home() != Some(revoked.astation_id.as_str()) || agent.status()?.unlocked {
+    if trust.recorded_home() != Some(revoked.astation_id.as_str()) {
+        return Ok(None);
+    }
+    if let Some(agent) = agent
+        && agent.status()?.unlocked
+    {
         return Ok(None);
     }
     let stamp = std::time::SystemTime::now()
@@ -740,7 +749,7 @@ pub fn set_aside_revoked_keys(paths: &KeyPaths, agent: &dyn KeyAgentApi) -> Resu
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let aside = path.with_file_name(format!("{name}.revoked-{stamp}"));
         if aside.symlink_metadata().is_ok() {
-            bail!("{} already exists; move it away and run `atem pair` again", aside.display());
+            bail!("{} already exists; move it away and run `atem unpair` again", aside.display());
         }
         std::fs::rename(path, &aside)
             .with_context(|| format!("couldn't move {} aside", path.display()))?;
@@ -750,7 +759,7 @@ pub fn set_aside_revoked_keys(paths: &KeyPaths, agent: &dyn KeyAgentApi) -> Resu
     let by = revoked.map_or_else(String::new, |revoked| format!(" by Astation {}", revoked.astation_id));
     let dir = paths.trust.parent().map(|dir| dir.display().to_string()).unwrap_or_default();
     Ok(Some(format!(
-        "This device was revoked{by}: its old keys were moved aside ({} renamed to *.revoked-{stamp} in {dir}); verifying it with new keys.",
+        "This device was revoked{by}: its old keys were moved aside ({} renamed to *.revoked-{stamp} in {dir}); the next `atem pair` verifies it with new keys.",
         if moved.is_empty() { "no key files".to_string() } else { moved.join(", ") }
     )))
 }
@@ -767,7 +776,7 @@ pub fn device_keys_for_verification(
         return Ok(VerificationKeys::Fresh(DeviceKeys::generate()));
     }
     if !agent.status()?.unlocked {
-        bail!("{LOCKED}, then `atem pair` again");
+        bail!("{LOCKED}, then `atem pair verify`");
     }
     let (device_pub, device_sign_pub) = agent.public_keys()?;
     let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?.ok_or_else(|| {
@@ -1811,7 +1820,7 @@ mod ceremony_tests {
         .unwrap();
         // After a reboot the agent is locked, and Astation won't unlock it.
         let rebooted = test_agent(&paths);
-        let notice = set_aside_revoked_keys(&paths, &rebooted)
+        let notice = set_aside_revoked_keys(&paths, Some(&rebooted))
             .unwrap()
             .expect("the old keys are moved aside");
         assert!(notice.contains("moved aside"), "{notice}");
@@ -1866,7 +1875,7 @@ mod ceremony_tests {
             verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
         escrow_first(&agent, &fake, &certificate, outcome);
         let rebooted = test_agent(&paths);
-        assert_eq!(set_aside_revoked_keys(&paths, &rebooted).unwrap(), None);
+        assert_eq!(set_aside_revoked_keys(&paths, Some(&rebooted)).unwrap(), None);
         let error = error_of(device_keys_for_verification(&paths, &rebooted));
         assert!(error.contains("atem cred unlock"), "{error}");
         // Revoked by an Astation that isn't the home: nothing moves either.
@@ -1875,14 +1884,14 @@ mod ceremony_tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(set_aside_revoked_keys(&paths, &rebooted).unwrap(), None);
+        assert_eq!(set_aside_revoked_keys(&paths, Some(&rebooted)).unwrap(), None);
         // An unlocked agent verifies with the keys it holds, as before.
         TrustStore::update(&paths.trust, |store| {
             store.record_revoked(ASTATION_ID, 1_700_000_000);
             Ok(())
         })
         .unwrap();
-        assert_eq!(set_aside_revoked_keys(&paths, &agent).unwrap(), None);
+        assert_eq!(set_aside_revoked_keys(&paths, Some(&agent)).unwrap(), None);
         assert!(matches!(
             device_keys_for_verification(&paths, &agent).unwrap(),
             VerificationKeys::Sealed(_)

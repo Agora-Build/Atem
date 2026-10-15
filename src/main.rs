@@ -25,6 +25,7 @@ mod tui;
 mod vault_client;
 mod memory;
 mod pair_verify;
+mod status;
 mod chat;
 mod websocket_client;
 // Agent hub — PTY agents launched by `atem agent launch`

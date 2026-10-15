@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::encoding::dec;
 use crate::memory::key_agent::{
-    AgentStatus, KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, default_agent,
+    KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, default_agent,
     running_agent,
 };
 use crate::memory::statements::{SignedWire, StorageRotate};
@@ -324,9 +324,10 @@ pub(crate) async fn unlock_via<L: AstationLink>(
                 bail!("Astation denied the unlock: {}", shown(&reason));
             }
             // Unsigned (it came over the relay), so all it may cause is a
-            // note in cred_state.json; `atem pair` then sets the old key files
-            // aside (renamed, never deleted) and verifies with new keys and a
-            // new safety code. A forged one costs a re-pair, never keys or trust.
+            // note in cred_state.json; `atem unpair` then sets the old key
+            // files aside (renamed, never deleted) and `atem pair` verifies with
+            // new keys and a new safety code. A forged one costs a re-pair,
+            // never keys or trust.
             let (path, astation_id, at) =
                 (paths.trust.clone(), astation_id.to_string(), now_secs());
             let recorded = blocking(move || {
@@ -341,7 +342,7 @@ pub(crate) async fn unlock_via<L: AstationLink>(
                 Err(error) => format!(" (couldn't record it: {error:#})"),
             };
             bail!(
-                "Astation denied the unlock: {}; this device was revoked; run `atem pair` to verify it again{note}",
+                "Astation denied the unlock: {}; this device was revoked; run `atem unpair`, then `atem pair`, to set it up again{note}",
                 shown(&reason)
             )
         }
@@ -613,7 +614,7 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
 pub fn escrow_failure_message(error: &anyhow::Error) -> String {
     if error.downcast_ref::<NoAnswer>().is_some() {
         return format!(
-            "Astation didn't answer the storage-key handover ({error:#}); it may not support storage keys yet. This device keeps its keys in the plain ~/.config/atem/device_keys file (re-sealed whenever the key agent starts) and hands the key over at the next `atem pair` or `atem cred unlock` once Astation does, which deletes that file."
+            "Astation didn't answer the storage-key handover ({error:#}); it may not support storage keys yet. This device keeps its keys in the plain ~/.config/atem/device_keys file (re-sealed whenever the key agent starts) and hands the key over at the next `atem cred unlock` once Astation does, which deletes that file."
         );
     }
     format!(
@@ -657,94 +658,6 @@ pub(crate) async fn unlock_and_rotate<L: AstationLink>(
     request_missing_key(link, agent, paths, home).await
 }
 
-/// What `atem cred status` learned about the key agent.
-pub enum AgentState {
-    NotRunning,
-    Running(AgentStatus),
-    Unreachable(String),
-}
-
-/// The running agent's status. An agent that can't answer (an older one
-/// speaking another protocol version, say) is reported, not an error: the
-/// report carries its message and what to do about it.
-pub fn agent_state(agent: Option<&dyn KeyAgentApi>) -> AgentState {
-    match agent {
-        None => AgentState::NotRunning,
-        Some(agent) => match agent.status() {
-            Ok(status) => AgentState::Running(status),
-            Err(error) => AgentState::Unreachable(format!("{error:#}")),
-        },
-    }
-}
-
-/// `atem cred status`, for the paired Astation `astation_id`. `key_problem`
-/// (from `key_file_problem`) adds the reset instructions.
-pub fn status_report(
-    trust: &TrustStore,
-    astation_id: &str,
-    agent: &AgentState,
-    sealed_kid: Option<&str>,
-    key_problem: Option<&str>,
-) -> String {
-    let (agent_line, storage_kid, waiting) = match agent {
-        // Without the agent, only cred_state.json tells whether Astation
-        // confirmed holding the sealed file's key (until it does, the plain
-        // device_keys file stays and the next agent re-seals it).
-        AgentState::NotRunning => (
-            "not running (starts with 'atem cred unlock')".to_string(),
-            sealed_kid.map(str::to_string),
-            sealed_kid.is_some_and(|kid| trust.escrowed_kid() != Some(kid)),
-        ),
-        AgentState::Unreachable(error) => (
-            format!("not answering ({error})"),
-            sealed_kid.map(str::to_string),
-            sealed_kid.is_some_and(|kid| trust.escrowed_kid() != Some(kid)),
-        ),
-        AgentState::Running(status) if status.unlocked => (
-            "unlocked".to_string(),
-            status.storage_kid.clone(),
-            !status.escrowed,
-        ),
-        // A locked agent vouches for nothing: cred_state.json decides, as
-        // when the agent isn't running.
-        AgentState::Running(status) => (
-            "locked (run 'atem cred unlock')".to_string(),
-            status.storage_kid.clone(),
-            status
-                .storage_kid
-                .as_deref()
-                .is_some_and(|kid| trust.escrowed_kid() != Some(kid)),
-        ),
-    };
-    let storage_line = match (storage_kid, waiting) {
-        // The first escrow went unanswered: most likely an Astation without
-        // storage-key support, where `atem cred unlock` can't help yet.
-        (Some(kid), true) if trust.escrow_unanswered() => format!(
-            "Storage key: {kid}  (not yet held by Astation: it hasn't answered storage-key requests, so it may not support them yet; the key is handed over at the next 'atem pair' or 'atem cred unlock' once it does, and until then this device keeps its plain device_keys file)"
-        ),
-        (Some(kid), true) => {
-            format!("Storage key: {kid}  (not yet held by Astation; run 'atem cred unlock')")
-        }
-        (Some(kid), false) => format!("Storage key: {kid}"),
-        (None, _) => "Storage key: none".to_string(),
-    };
-    let agent_line = match agent {
-        AgentState::Running(status) if status.older_build => {
-            format!("{agent_line} (started by another atem build; run `atem cred lock`, then `atem cred unlock`)")
-        }
-        _ => agent_line,
-    };
-    let mut report = format!(
-        "{}\nHome Astation: {}\nKey agent: {agent_line}\n{storage_line}\n",
-        trust.verification_line(astation_id),
-        trust.home().unwrap_or("none (verify with 'atem pair')"),
-    );
-    if let Some(problem) = key_problem {
-        report.push_str(&format!("Key files: {problem}\n{RESET}\n"));
-    }
-    report
-}
-
 /// `atem cred lock`: what happened, or why the agent couldn't be reached.
 /// The agent wipes its keys and exits; the next `atem cred unlock` starts
 /// this build's.
@@ -764,10 +677,22 @@ pub fn lock_keys_message(agent: Option<&dyn KeyAgentApi>) -> Result<String> {
     }
 }
 
-/// `atem cred …` (tier 2: needs a pairing with Astation).
+/// `atem cred status`: exactly what `atem status` prints (blocking: may ask
+/// a running key agent).
+pub fn cred_status_text(src: &crate::status::Sources) -> String {
+    crate::status::text(src)
+}
+
+/// `atem cred …` (tier 2: needs a pairing with Astation; `status`, the
+/// `atem status` alias, works on any profile).
 pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
     use crate::cli::CredCommands;
-    let paired = crate::auth::require_pairing("atem cred")?;
+    if let CredCommands::Status = command {
+        let src = crate::status::Sources::current()?;
+        print!("{}", blocking(move || Ok(cred_status_text(&src))).await?);
+        return Ok(());
+    }
+    let _paired = crate::auth::require_pairing("atem cred")?;
     let paths = KeyPaths::default_paths();
     match command {
         CredCommands::Projects => {
@@ -782,28 +707,10 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
             println!("Sent project suggestions to Astation.");
             Ok(())
         }
-        CredCommands::Status => {
-            let report = blocking(move || {
-                let trust = TrustStore::load_from(&paths.trust)?;
-                let sealed_kid = SealedDeviceKeys::load_from(&paths.device_keys_sealed)
-                    .ok()
-                    .flatten()
-                    .map(|sealed| sealed.storage_kid);
-                let problem = key_file_problem(&paths, &trust);
-                let agent = agent_state(running_agent().as_deref());
-                Ok(status_report(
-                    &trust,
-                    &paired.astation_id,
-                    &agent,
-                    sealed_kid.as_deref(),
-                    problem.as_deref(),
-                ))
-            })
-            .await?;
-            print!("{report}");
-            Ok(())
+        CredCommands::Status => unreachable!("handled above"),
+        CredCommands::Unlock => {
+            unlock_command(&paths, &crate::config::AtemConfig::load()?).await
         }
-        CredCommands::Unlock => unlock_command(&paths).await,
         CredCommands::Lock => {
             let message = blocking(|| lock_keys_message(running_agent().as_deref())).await?;
             println!("{message}");
@@ -812,39 +719,50 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
     }
 }
 
-/// Connects to the home Astation without pairing: locally when the local
-/// Astation is the home one, else through its relay identity room.
+/// Connects to the home Astation without pairing.
 async fn connect_home(home: &str) -> Result<AstationClient> {
-    let config = crate::config::AtemConfig::load()?;
+    connect_astation(&crate::config::AtemConfig::load()?, home, "this device's home Astation").await
+}
+
+/// Connects to `astation_id` (`what` names it in errors) with the saved
+/// session, never pairing: locally when the local Astation is that one,
+/// else through its relay identity room.
+pub(crate) async fn connect_astation(
+    config: &crate::config::AtemConfig,
+    astation_id: &str,
+    what: &str,
+) -> Result<AstationClient> {
     let mut local = AstationClient::new();
     if local
         .connect_without_pairing(config.astation_ws())
         .await
         .is_ok()
-        && local.connected_astation_id() == Some(home)
+        && local.connected_astation_id() == Some(astation_id)
     {
         return Ok(local);
     }
     drop(local);
     let mut client = AstationClient::new();
     client
-        .connect_relay_identity_without_pairing(config.astation_relay_url(), home)
+        .connect_relay_identity_without_pairing(config.astation_relay_url(), astation_id)
         .await
-        .with_context(|| format!("couldn't reach this device's home Astation ({home})"))?;
-    if client.connected_astation_id() != Some(home) {
-        bail!("connected to a different Astation than this device's home ({home})");
+        .with_context(|| format!("couldn't reach {what} ({astation_id})"))?;
+    if client.connected_astation_id() != Some(astation_id) {
+        bail!("connected to a different Astation than {what} ({astation_id})");
     }
     Ok(client)
 }
 
-async fn unlock_command(paths: &KeyPaths) -> Result<()> {
+/// `atem cred unlock`: never pairs or verifies; an unverified device stops
+/// here, offline.
+pub(crate) async fn unlock_command(paths: &KeyPaths, config: &crate::config::AtemConfig) -> Result<()> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let home = match (trust.home(), trust.recorded_home()) {
         (Some(home), _) => home.to_string(),
         (None, Some(stale)) => bail!(
             "This device's home Astation ({stale}) no longer verifies it, so its keys can't be unlocked. {RESET}"
         ),
-        (None, None) => bail!("This device isn't verified yet. Run `atem pair` first."),
+        (None, None) => bail!(crate::status::UNVERIFIED_UNLOCK),
     };
     let agent: Arc<dyn KeyAgentApi> = Arc::from(default_agent());
     let nothing_to_do = {
@@ -857,12 +775,12 @@ async fn unlock_command(paths: &KeyPaths) -> Result<()> {
             // Astation sends the signed state on connect; applying it finishes
             // the migration and sends the signed completion report.
             println!("Finishing the encryption migration with Astation…");
-            let mut client = connect_home(&home).await?;
+            let mut client = connect_astation(config, &home, "this device's home Astation").await?;
             finish_migration(&mut client, MIGRATION_WAIT).await;
         }
         return Ok(());
     }
-    let mut client = connect_home(&home).await?;
+    let mut client = connect_astation(config, &home, "this device's home Astation").await?;
     unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
     // The report sent on connect was skipped (the keys were still locked);
     // send it now, on the same connection. Best effort, like on connect.
@@ -989,7 +907,7 @@ mod tests {
         ASTATION_ID, DEVICE_ID, FakeKeyServer, captured_rotation, sealed_device, set_state,
     };
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::key_agent::{AgentStatus, RESET};
+    use crate::memory::key_agent::RESET;
     use crate::memory::key_agent::{error_of, test_agent};
     use crate::memory::statements::AccountState;
     use crate::memory::statements::{FakeAstation, SignedWire, StorageAck};
@@ -1429,7 +1347,7 @@ mod tests {
             let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
             assert!(error.contains(reason), "{error}");
             assert!(
-                error.contains("this device was revoked; run `atem pair` to verify it again"),
+                error.contains("this device was revoked; run `atem unpair`, then `atem pair`, to set it up again"),
                 "{error}"
             );
             let trust = TrustStore::load_from(&paths.trust).unwrap();
@@ -1454,22 +1372,6 @@ mod tests {
                 .unwrap()
                 .revoked()
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn status_shows_a_recorded_revocation() {
-        let dir = tempfile::tempdir().unwrap();
-        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
-        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
-        // 2025-04-01 08:50 UTC
-        trust.record_revoked(ASTATION_ID, 1743497400);
-        let report = status_report(&trust, ASTATION_ID, &AgentState::NotRunning, None, None);
-        assert!(
-            report.starts_with(
-                "Verified: revoked by Astation astation-1 (2025-04-01 08:50 UTC); run 'atem pair' to verify this device again\n"
-            ),
-            "{report}"
         );
     }
 
@@ -1687,17 +1589,6 @@ mod tests {
         (paths, server, agent)
     }
 
-    /// `atem cred status` for `paths` with the agent as it is now.
-    fn status_now(paths: &KeyPaths, agent: &Arc<dyn KeyAgentApi>) -> String {
-        status_report(
-            &TrustStore::load_from(&paths.trust).unwrap(),
-            ASTATION_ID,
-            &AgentState::Running(agent.status().unwrap()),
-            None,
-            None,
-        )
-    }
-
     #[tokio::test]
     async fn status_says_an_astation_that_never_answered_the_first_escrow_gets_it_later() {
         let dir = tempfile::tempdir().unwrap();
@@ -1709,21 +1600,17 @@ mod tests {
         let wait = Duration::from_millis(50);
         let error = error_of(rotate_via(&mut link, &agent, &paths, ASTATION_ID, wait).await);
         assert!(error.contains("timed out"), "{error}");
-        let report = status_now(&paths, &agent);
         assert!(
-            report.contains("Storage key: 0a1b2c3d  (not yet held by Astation: it hasn't answered"),
-            "{report}"
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .escrow_unanswered()
         );
-        assert!(report.contains("once it does"), "{report}");
-        assert!(!report.contains("run 'atem cred unlock'"), "{report}");
         // Once an Astation takes it, the note goes.
         link.silent = false;
         link.hang = false;
         rotate_via(&mut link, &agent, &paths, ASTATION_ID, WAIT)
             .await
             .unwrap();
-        let report = status_now(&paths, &agent);
-        assert!(!report.contains("not yet held"), "{report}");
         assert!(
             !TrustStore::load_from(&paths.trust)
                 .unwrap()
@@ -1756,17 +1643,7 @@ mod tests {
         // it can't.
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(!trust.escrow_unanswered());
-        let waiting = AgentState::Running(AgentStatus {
-            unlocked: true,
-            storage_kid: Some("4e5f6a7b".into()),
-            escrowed: false,
-            older_build: false,
-        });
-        let report = status_report(&trust, ASTATION_ID, &waiting, None, None);
-        assert!(
-            report.contains("(not yet held by Astation; run 'atem cred unlock')"),
-            "{report}"
-        );
+        assert_eq!(trust.escrowed_kid(), Some("0a1b2c3d"));
     }
 
     #[test]
@@ -1913,95 +1790,10 @@ mod tests {
     }
 
     #[test]
-    fn status_report_shows_each_agent_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
-        let trust = TrustStore::load_from(&paths.trust).unwrap();
-        assert_eq!(
-            status_report(
-                &trust,
-                ASTATION_ID,
-                &AgentState::NotRunning,
-                Some("0a1b2c3d"),
-                None
-            ),
-            "Verified: yes  (safety code AAAA-BBBB-CCCC)\n\
-             Home Astation: astation-1\n\
-             Key agent: not running (starts with 'atem cred unlock')\n\
-             Storage key: 0a1b2c3d\n"
-        );
-        let waiting = AgentState::Running(AgentStatus {
-            unlocked: true,
-            storage_kid: Some("4e5f6a7b".into()),
-            escrowed: false,
-            older_build: false,
-        });
-        let report = status_report(&trust, ASTATION_ID, &waiting, None, None);
-        assert!(report.contains("Key agent: unlocked\n"), "{report}");
-        assert!(
-            report.contains(
-                "Storage key: 4e5f6a7b  (not yet held by Astation; run 'atem cred unlock')"
-            ),
-            "{report}"
-        );
-        let locked = AgentState::Running(AgentStatus {
-            unlocked: false,
-            storage_kid: Some("0a1b2c3d".into()),
-            escrowed: false,
-            older_build: false,
-        });
-        let report = status_report(&trust, ASTATION_ID, &locked, None, None);
-        assert!(
-            report.contains("Key agent: locked (run 'atem cred unlock')"),
-            "{report}"
-        );
-        assert!(report.contains("Storage key: 0a1b2c3d\n"), "{report}");
-        // A locked agent's sealed file under a key Astation never confirmed
-        // is flagged, as when the agent isn't running.
-        let unconfirmed = AgentState::Running(AgentStatus {
-            unlocked: false,
-            storage_kid: Some("9a9b9c9d".into()),
-            escrowed: false,
-            older_build: false,
-        });
-        let report = status_report(&trust, ASTATION_ID, &unconfirmed, None, None);
-        assert!(
-            report.contains("Storage key: 9a9b9c9d  (not yet held by Astation"),
-            "{report}"
-        );
-        let broken = AgentState::Unreachable("protocol v2".into());
-        assert!(
-            status_report(&trust, ASTATION_ID, &broken, Some("0a1b2c3d"), None)
-                .contains("Key agent: not answering (protocol v2)")
-        );
-        let report = status_report(
-            &TrustStore::default(),
-            ASTATION_ID,
-            &AgentState::NotRunning,
-            None,
-            None,
-        );
-        assert!(report.starts_with("Verified: no"), "{report}");
-        assert!(report.contains("Home Astation: none (verify with 'atem pair')"));
-        assert!(report.contains("Storage key: none"));
-        let report = status_report(
-            &trust,
-            ASTATION_ID,
-            &AgentState::NotRunning,
-            None,
-            Some("unlock_auth_key is missing"),
-        );
-        assert!(
-            report.ends_with(&format!("Key files: unlock_auth_key is missing\n{RESET}\n")),
-            "{report}"
-        );
-    }
-
-    #[test]
     fn the_reset_names_every_key_file_and_the_trust_state() {
         assert_eq!(
             RESET,
-            "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back."
+            "To start over: delete ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json, then run `atem pair verify`. device_keys.sealed also holds the memory encryption key and its older keys: Astation grants the current key again, older keys may not come back."
         );
     }
 
@@ -2205,23 +1997,6 @@ mod tests {
         assert_eq!(shown(text), "abcdef");
     }
 
-    #[test]
-    fn status_without_the_agent_flags_a_storage_key_astation_never_confirmed() {
-        let dir = tempfile::tempdir().unwrap();
-        let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
-        let mut trust = TrustStore::load_from(&paths.trust).unwrap();
-        trust.set_escrowed_kid("ffffffff");
-        for agent in [AgentState::NotRunning, AgentState::Unreachable("v2".into())] {
-            let report = status_report(&trust, ASTATION_ID, &agent, Some("0a1b2c3d"), None);
-            assert!(
-                report.contains(
-                    "Storage key: 0a1b2c3d  (not yet held by Astation; run 'atem cred unlock')"
-                ),
-                "{report}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn unlock_has_nothing_to_ask_only_when_unlocked_escrowed_and_settled() {
         let dir = tempfile::tempdir().unwrap();
@@ -2275,32 +2050,6 @@ mod tests {
             lock_keys_message(Some(agent.as_ref())).unwrap(),
             "Locked: the key agent wiped this device's keys and stopped."
         );
-    }
-
-    #[test]
-    fn status_flags_an_agent_of_an_older_build() {
-        let trust = TrustStore::default();
-        for unlocked in [true, false] {
-            let older = AgentState::Running(AgentStatus {
-                unlocked,
-                storage_kid: Some("0a1b2c3d".into()),
-                escrowed: true,
-                older_build: true,
-            });
-            let report = status_report(&trust, ASTATION_ID, &older, None, None);
-            assert!(
-                report.contains("(started by another atem build; run `atem cred lock`, then `atem cred unlock`)\n"),
-                "{report}"
-            );
-        }
-        let current = AgentState::Running(AgentStatus {
-            unlocked: true,
-            storage_kid: Some("0a1b2c3d".into()),
-            escrowed: true,
-            older_build: false,
-        });
-        let report = status_report(&trust, ASTATION_ID, &current, None, None);
-        assert!(!report.contains("another atem build"), "{report}");
     }
 
     #[test]
