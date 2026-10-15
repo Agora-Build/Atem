@@ -1,6 +1,9 @@
-# atem-session v1: sessions, control leases and receipts (DRAFT r5 for joint review)
+# atem-session v1: sessions, control leases and receipts (r5, accepted for compatibility mode)
 
-Status: Atem-side draft r5, 2026-10-15. r1 (`7a0c691`), r2 (`9383193`), r3
+Status: r5 accepted by Astation on 2026-10-15 as the compatibility-mode
+implementation contract ([r5 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r5-review.md)).
+Final conformance needs the shared fixtures to pass in the Rust, Swift and
+browser implementations; §9 remains the security gate. History: r1 (`7a0c691`), r2 (`9383193`), r3
 (`1bf805c`, [r3 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r3-review.md))
 and r4 (`fd907cc`, [r4 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r4-review.md))
 were reviewed by Astation ([r1 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
