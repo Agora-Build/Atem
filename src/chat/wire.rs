@@ -1,0 +1,609 @@
+//! agentChat v1: JSON shapes exchanged with Astation (see designs/agent-chat-host.md).
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use super::adapter::{Outcome, Part};
+use super::session::{ChatMessage, Origin, Out, Role, State, Status};
+
+const MAX_ID: usize = 128;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatEnvelope {
+    pub v: u32,
+    pub op: String,
+    pub conversation_id: String,
+    pub agent_id: String,
+    #[serde(flatten)]
+    pub body: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inbound {
+    Open {
+        before: Option<String>,
+    },
+    Submit {
+        generation: String,
+        request_id: String,
+        text: String,
+    },
+    Close,
+}
+
+fn valid_id(s: &str) -> bool {
+    (1..=MAX_ID).contains(&s.len())
+}
+
+fn str_field(env: &ChatEnvelope, name: &str) -> Result<String, String> {
+    match env.body.get(name) {
+        Some(Value::String(s)) => Ok(s.clone()),
+        _ => Err(format!("missing field {name}")),
+    }
+}
+
+pub fn parse_inbound(env: &ChatEnvelope) -> Result<Inbound, String> {
+    if env.v != 1 {
+        return Err("unsupported version".into());
+    }
+    if !matches!(env.op.as_str(), "open" | "submit" | "close") {
+        return Err("unsupported op".into());
+    }
+    if !valid_id(&env.conversation_id) {
+        return Err("invalid conversationId".into());
+    }
+    if !valid_id(&env.agent_id) {
+        return Err("invalid agentId".into());
+    }
+    match env.op.as_str() {
+        "open" => {
+            let before = match env.body.get("before") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if s.len() <= MAX_ID => Some(s.clone()),
+                Some(_) => return Err("invalid before".into()),
+            };
+            Ok(Inbound::Open { before })
+        }
+        "submit" => {
+            let generation = str_field(env, "generation")?;
+            let request_id = str_field(env, "requestId")?;
+            let text = str_field(env, "text")?;
+            if !valid_id(&request_id) {
+                return Err("invalid requestId".into());
+            }
+            Ok(Inbound::Submit {
+                generation,
+                request_id,
+                text,
+            })
+        }
+        _ => Ok(Inbound::Close),
+    }
+}
+
+// ── Bodies ────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Head<'a> {
+    generation: &'a str,
+    sequence: u64,
+}
+
+#[derive(Serialize)]
+struct StatusBody<'a> {
+    state: &'static str,
+    since: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenedBody<'a> {
+    generation: &'a str,
+    sequence: u64,
+    status: StatusBody<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PartBody<'a> {
+    Text {
+        id: &'a str,
+        markdown: &'a str,
+    },
+    Tool {
+        id: &'a str,
+        name: &'a str,
+        summary: &'a str,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageBody<'a> {
+    message_id: &'a str,
+    role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'static str>,
+    turn_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<&'a str>,
+    created_at: i64,
+    parts: Vec<PartBody<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeltaBody<'a> {
+    message_id: &'a str,
+    part: PartBody<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptedBody<'a> {
+    request_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteBody<'a> {
+    turn_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<&'a str>,
+    outcome: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorBody<'a> {
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<&'a str>,
+}
+
+fn state_name(s: State) -> &'static str {
+    match s {
+        State::Ready => "ready",
+        State::Working => "working",
+        State::Waiting => "waiting",
+        State::Unknown => "unknown",
+    }
+}
+
+fn status_body(s: &Status) -> StatusBody<'_> {
+    StatusBody {
+        state: state_name(s.state),
+        since: s.since_ms,
+        detail: s.detail.as_deref(),
+    }
+}
+
+fn part_body(p: &Part) -> PartBody<'_> {
+    match p {
+        Part::Text { id, markdown } => PartBody::Text { id, markdown },
+        Part::Tool { id, name, summary } => PartBody::Tool { id, name, summary },
+    }
+}
+
+fn message_body(m: &ChatMessage, history: bool) -> MessageBody<'_> {
+    MessageBody {
+        message_id: &m.message_id,
+        role: match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        },
+        origin: m.origin.map(|o| match o {
+            Origin::Local => "local",
+            Origin::Remote => "remote",
+        }),
+        turn_id: &m.turn_id,
+        request_id: m.request_id.as_deref(),
+        created_at: m.created_at_ms,
+        parts: m.parts.iter().map(part_body).collect(),
+        history: history.then_some(true),
+    }
+}
+
+fn envelope(
+    conv: &str,
+    agent: &str,
+    op: &str,
+    head: Option<Head<'_>>,
+    body: impl Serialize,
+) -> ChatEnvelope {
+    let mut map = match serde_json::to_value(body) {
+        Ok(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+    if let Some(Ok(Value::Object(hm))) = head.map(serde_json::to_value) {
+        map.extend(hm);
+    }
+    ChatEnvelope {
+        v: 1,
+        op: op.into(),
+        conversation_id: conv.into(),
+        agent_id: agent.into(),
+        body: map,
+    }
+}
+
+pub fn opened(conv: &str, agent: &str, generation: &str, status: &Status) -> ChatEnvelope {
+    envelope(
+        conv,
+        agent,
+        "opened",
+        None,
+        OpenedBody {
+            generation,
+            sequence: 0,
+            status: status_body(status),
+        },
+    )
+}
+
+pub fn event(conv: &str, agent: &str, generation: &str, sequence: u64, out: &Out) -> ChatEnvelope {
+    let head = Head {
+        generation,
+        sequence,
+    };
+    match out {
+        Out::Message(m) => envelope(conv, agent, "message", Some(head), message_body(m, false)),
+        Out::Delta { message_id, part } => envelope(
+            conv,
+            agent,
+            "delta",
+            Some(head),
+            DeltaBody {
+                message_id,
+                part: part_body(part),
+            },
+        ),
+        Out::Status(s) => envelope(conv, agent, "status", Some(head), status_body(s)),
+        Out::Accepted { request_id } => envelope(
+            conv,
+            agent,
+            "accepted",
+            Some(head),
+            AcceptedBody { request_id },
+        ),
+        Out::Complete {
+            turn_id,
+            request_id,
+            outcome,
+        } => envelope(
+            conv,
+            agent,
+            "complete",
+            Some(head),
+            CompleteBody {
+                turn_id,
+                request_id: request_id.as_deref(),
+                outcome: match outcome {
+                    Outcome::Done => "done",
+                    Outcome::Interrupted => "interrupted",
+                },
+            },
+        ),
+        Out::Error { text, request_id } => envelope(
+            conv,
+            agent,
+            "error",
+            Some(head),
+            ErrorBody {
+                text,
+                request_id: request_id.as_deref(),
+            },
+        ),
+    }
+}
+
+pub fn history_message(
+    conv: &str,
+    agent: &str,
+    generation: &str,
+    sequence: u64,
+    m: &ChatMessage,
+) -> ChatEnvelope {
+    envelope(
+        conv,
+        agent,
+        "message",
+        Some(Head {
+            generation,
+            sequence,
+        }),
+        message_body(m, true),
+    )
+}
+
+/// For errors raised before a session exists: no generation or sequence.
+pub fn error(conv: &str, agent: &str, text: &str, request_id: Option<&str>) -> ChatEnvelope {
+    envelope(conv, agent, "error", None, ErrorBody { text, request_id })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn env(op: &str, body: Value) -> ChatEnvelope {
+        let mut v = json!({"v":1,"op":op,"conversationId":"c1","agentId":"claude"});
+        for (k, x) in body.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn msg() -> ChatMessage {
+        ChatMessage {
+            message_id: "m1".into(),
+            role: Role::User,
+            origin: Some(Origin::Remote),
+            turn_id: "t1".into(),
+            request_id: Some("r1".into()),
+            created_at_ms: 1700000000000,
+            parts: vec![
+                Part::Text {
+                    id: "p1".into(),
+                    markdown: "hi".into(),
+                },
+                Part::Tool {
+                    id: "p2".into(),
+                    name: "Bash".into(),
+                    summary: "ls".into(),
+                },
+            ],
+        }
+    }
+
+    fn body(e: &ChatEnvelope) -> Value {
+        serde_json::to_value(e).unwrap()
+    }
+
+    #[test]
+    fn parse_each_op() {
+        assert_eq!(
+            parse_inbound(&env("open", json!({}))).unwrap(),
+            Inbound::Open { before: None }
+        );
+        assert_eq!(
+            parse_inbound(&env("open", json!({"before":"m9"}))).unwrap(),
+            Inbound::Open {
+                before: Some("m9".into())
+            }
+        );
+        assert_eq!(
+            parse_inbound(&env(
+                "submit",
+                json!({"generation":"g","requestId":"r","text":"t"})
+            ))
+            .unwrap(),
+            Inbound::Submit {
+                generation: "g".into(),
+                request_id: "r".into(),
+                text: "t".into()
+            }
+        );
+        assert_eq!(
+            parse_inbound(&env("close", json!({"extra":1}))).unwrap(),
+            Inbound::Close
+        );
+    }
+
+    #[test]
+    fn parse_rejects() {
+        let mut e = env("open", json!({}));
+        e.v = 2;
+        assert_eq!(parse_inbound(&e).unwrap_err(), "unsupported version");
+        assert_eq!(
+            parse_inbound(&env("nope", json!({}))).unwrap_err(),
+            "unsupported op"
+        );
+        assert_eq!(
+            parse_inbound(&env("accepted", json!({}))).unwrap_err(),
+            "unsupported op"
+        );
+        assert_eq!(
+            parse_inbound(&env("submit", json!({"requestId":"r","text":"t"}))).unwrap_err(),
+            "missing field generation"
+        );
+        assert_eq!(
+            parse_inbound(&env("submit", json!({"generation":"g","text":"t"}))).unwrap_err(),
+            "missing field requestId"
+        );
+        assert_eq!(
+            parse_inbound(&env(
+                "submit",
+                json!({"generation":"g","requestId":"r","text":5})
+            ))
+            .unwrap_err(),
+            "missing field text"
+        );
+        let long = "x".repeat(129);
+        assert_eq!(
+            parse_inbound(&env(
+                "submit",
+                json!({"generation":"g","requestId":long,"text":"t"})
+            ))
+            .unwrap_err(),
+            "invalid requestId"
+        );
+        let mut e = env("open", json!({}));
+        e.conversation_id = long.clone();
+        assert_eq!(parse_inbound(&e).unwrap_err(), "invalid conversationId");
+        let mut e = env("open", json!({}));
+        e.agent_id = String::new();
+        assert_eq!(parse_inbound(&e).unwrap_err(), "invalid agentId");
+        assert_eq!(
+            parse_inbound(&env("open", json!({"before":long}))).unwrap_err(),
+            "invalid before"
+        );
+        // text size is not checked here
+        let big = "y".repeat(100_000);
+        assert!(
+            parse_inbound(&env(
+                "submit",
+                json!({"generation":"g","requestId":"r","text":big})
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn opened_shape() {
+        let st = Status {
+            state: State::Working,
+            since_ms: 5,
+            detail: None,
+        };
+        assert_eq!(
+            body(&opened("c1", "claude", "g", &st)),
+            json!({"v":1,"op":"opened","conversationId":"c1","agentId":"claude","generation":"g","sequence":0,
+                   "status":{"state":"working","since":5}})
+        );
+        let st = Status {
+            state: State::Waiting,
+            since_ms: 6,
+            detail: Some("Bash".into()),
+        };
+        assert_eq!(
+            body(&opened("c1", "claude", "g", &st))["status"],
+            json!({"state":"waiting","since":6,"detail":"Bash"})
+        );
+    }
+
+    #[test]
+    fn event_shapes() {
+        let b = |o: &Out| body(&event("c1", "claude", "g", 3, o));
+        let head = |op: &str| json!({"v":1,"op":op,"conversationId":"c1","agentId":"claude","generation":"g","sequence":3});
+        let merged = |op: &str, extra: Value| {
+            let mut h = head(op);
+            for (k, v) in extra.as_object().unwrap() {
+                h[k] = v.clone();
+            }
+            h
+        };
+        assert_eq!(
+            b(&Out::Message(msg())),
+            merged(
+                "message",
+                json!({"messageId":"m1","role":"user","origin":"remote","turnId":"t1","requestId":"r1",
+                "createdAt":1700000000000u64,
+                "parts":[{"id":"p1","kind":"text","markdown":"hi"},{"id":"p2","kind":"tool","name":"Bash","summary":"ls"}]})
+            )
+        );
+        let mut a = msg();
+        a.role = Role::Assistant;
+        a.origin = None;
+        a.request_id = None;
+        let v = b(&Out::Message(a));
+        assert_eq!(v["role"], "assistant");
+        assert!(v.get("origin").is_none() && v.get("requestId").is_none());
+        assert_eq!(
+            b(&Out::Delta {
+                message_id: "m1".into(),
+                part: Part::Text {
+                    id: "p3".into(),
+                    markdown: "x".into()
+                }
+            }),
+            merged(
+                "delta",
+                json!({"messageId":"m1","part":{"id":"p3","kind":"text","markdown":"x"}})
+            )
+        );
+        assert_eq!(
+            b(&Out::Status(Status {
+                state: State::Unknown,
+                since_ms: 9,
+                detail: None
+            })),
+            merged("status", json!({"state":"unknown","since":9}))
+        );
+        assert_eq!(
+            b(&Out::Status(Status {
+                state: State::Ready,
+                since_ms: 9,
+                detail: Some("d".into())
+            })),
+            merged("status", json!({"state":"ready","since":9,"detail":"d"}))
+        );
+        assert_eq!(
+            b(&Out::Accepted {
+                request_id: "r1".into()
+            }),
+            merged("accepted", json!({"requestId":"r1"}))
+        );
+        assert_eq!(
+            b(&Out::Complete {
+                turn_id: "t1".into(),
+                request_id: None,
+                outcome: Outcome::Interrupted
+            }),
+            merged("complete", json!({"turnId":"t1","outcome":"interrupted"}))
+        );
+        assert_eq!(
+            b(&Out::Complete {
+                turn_id: "t1".into(),
+                request_id: Some("r1".into()),
+                outcome: Outcome::Done
+            }),
+            merged(
+                "complete",
+                json!({"turnId":"t1","requestId":"r1","outcome":"done"})
+            )
+        );
+        assert_eq!(
+            b(&Out::Error {
+                text: "bad".into(),
+                request_id: Some("r1".into())
+            }),
+            merged("error", json!({"text":"bad","requestId":"r1"}))
+        );
+        assert_eq!(
+            b(&Out::Error {
+                text: "bad".into(),
+                request_id: None
+            }),
+            merged("error", json!({"text":"bad"}))
+        );
+    }
+
+    #[test]
+    fn history_and_pre_session_error() {
+        let v = body(&history_message("c1", "claude", "g", 4, &msg()));
+        assert_eq!(v["op"], "message");
+        assert_eq!(v["history"], true);
+        assert_eq!(v["sequence"], 4);
+        assert_eq!(v["messageId"], "m1");
+        assert_eq!(
+            body(&error("c1", "claude", "no chat", Some("r1"))),
+            json!({"v":1,"op":"error","conversationId":"c1","agentId":"claude","text":"no chat","requestId":"r1"})
+        );
+        assert_eq!(
+            body(&error("c1", "claude", "no chat", None)),
+            json!({"v":1,"op":"error","conversationId":"c1","agentId":"claude","text":"no chat"})
+        );
+    }
+
+    #[test]
+    fn envelope_round_trip() {
+        let e = event(
+            "c1",
+            "claude",
+            "g",
+            1,
+            &Out::Accepted {
+                request_id: "r".into(),
+            },
+        );
+        let back: ChatEnvelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
+    }
+}

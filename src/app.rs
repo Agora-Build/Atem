@@ -969,6 +969,7 @@ impl App {
             session_ids: vec![],
             acp_url: None,
             pty_pid: None,
+            capabilities: vec![],
         });
 
         Ok(true)

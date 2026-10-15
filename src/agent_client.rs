@@ -50,6 +50,8 @@ pub enum AgentStatus {
     Thinking,
     WaitingForInput,
     Disconnected,
+    /// Activity cannot be detected.
+    Unknown,
 }
 
 // ── AgentInfo ─────────────────────────────────────────────────────────────
@@ -69,6 +71,9 @@ pub struct AgentInfo {
     pub acp_url: Option<String>,
     /// Present for PTY agents.
     pub pty_pid: Option<u32>,
+    /// Advertised features, e.g. `chat-v1`; omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -98,6 +103,7 @@ mod tests {
             session_ids: vec!["sess-1".to_string()],
             acp_url: None,
             pty_pid: Some(4242),
+            capabilities: vec![],
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -122,10 +128,33 @@ mod tests {
             session_ids: vec![],
             acp_url: None,
             pty_pid: None,
+            capabilities: vec![],
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
             r#"{"id":"claude-pty-1","name":"claude-code","kind":"ClaudeCode","protocol":"Pty","origin":"Launched","status":"Idle","session_ids":[],"acp_url":null,"pty_pid":null}"#
         );
+    }
+
+    #[test]
+    fn test_agent_info_wire_with_capabilities_and_unknown() {
+        let info = AgentInfo {
+            id: "claude-pty-1".to_string(),
+            name: "claude-code".to_string(),
+            kind: AgentKind::ClaudeCode,
+            protocol: AgentProtocol::Pty,
+            origin: AgentOrigin::Launched,
+            status: AgentStatus::Unknown,
+            session_ids: vec![],
+            acp_url: None,
+            pty_pid: None,
+            capabilities: vec!["chat-v1".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_string(&info).unwrap(),
+            r#"{"id":"claude-pty-1","name":"claude-code","kind":"ClaudeCode","protocol":"Pty","origin":"Launched","status":"Unknown","session_ids":[],"acp_url":null,"pty_pid":null,"capabilities":["chat-v1"]}"#
+        );
+        let back: AgentInfo = serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(back.capabilities, vec!["chat-v1".to_string()]);
     }
 }
