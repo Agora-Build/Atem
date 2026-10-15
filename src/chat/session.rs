@@ -298,6 +298,7 @@ impl ChatSession {
             }
             AgentEvent::TurnEnded if !self.started => {}
             AgentEvent::TurnEnded => {
+                self.expired = None;
                 let turn = self.current_turn.as_ref().map(|(t, _)| t.clone());
                 if let Some(turn) = turn
                     && self.last_completed.as_deref() != Some(turn.as_str())
@@ -370,12 +371,13 @@ impl ChatSession {
                     p.log_seen = true;
                     request_id = Some(p.request_id.clone());
                 }
+                // The timed-out link may only match the NEXT user entry.
+                let expired = self.expired.take();
                 if request_id.is_none()
-                    && let Some((rid, t)) = &self.expired
-                    && same_prompt(t, &text)
+                    && let Some((rid, t)) = expired
+                    && same_prompt(&t, &text)
                 {
-                    request_id = Some(rid.clone());
-                    self.expired = None;
+                    request_id = Some(rid);
                 }
                 let text = redact(&text);
                 let cut = truncate_at(&text, MAX_MESSAGE_BYTES).len();
@@ -420,6 +422,7 @@ impl ChatSession {
             }
             LogItem::TurnEnded { .. } if !self.started => {}
             LogItem::TurnEnded { turn_id, outcome } => {
+                self.expired = None;
                 if self.last_completed.as_deref() != Some(turn_id.as_str()) {
                     self.complete(turn_id, outcome, &mut out);
                 }
@@ -573,6 +576,7 @@ impl ChatSession {
         if remote_controlled {
             return err("a terminal viewer has control; release it first");
         }
+        self.expired = None;
         self.pending = Some(Pending {
             request_id: request_id.to_string(),
             text: text.to_string(),
@@ -849,6 +853,21 @@ mod tests {
         ));
         let again = s.submit("r1", "g1", "go", 0, false).unwrap_err();
         assert!(matches!(again[1], Out::Complete { .. }));
+    }
+
+    #[test]
+    fn timed_out_request_only_matches_the_next_user_entry() {
+        let mut s = ready();
+        submit_ok(&mut s, "r1", "continue");
+        let t = Instant::now();
+        s.tick(t);
+        s.tick(t + Duration::from_secs(11));
+        s.on_log(user("u1", "t1", "something else"), 20, 0);
+        s.on_log(end("t1", Outcome::Done), 21, 0);
+        s.on_log(user("u2", "t2", "continue"), 22, 0);
+        let m = s.history(None, 1, usize::MAX).remove(0);
+        assert_eq!(m.origin, Some(Origin::Local));
+        assert_eq!(m.request_id, None);
     }
 
     #[test]
