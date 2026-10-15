@@ -99,12 +99,22 @@ impl PtyInput {
         if authority.remote {
             bail!("Remote control is active; use Atem's Take Control command");
         }
-        let mut bytes = Vec::with_capacity(text.len() + 7);
+        let mut bytes = Vec::with_capacity(text.len() + 13);
         bytes.extend_from_slice(b"\x1b[200~");
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(b"\x1b[201~\r");
-        for chunk in bytes.chunks(MAX_INPUT) {
-            self.enqueue(chunk.to_vec(), Some(authority.epoch), None)?;
+        let chunks: Vec<&[u8]> = bytes.chunks(MAX_INPUT).collect();
+        // Reserve every slot first: all chunks are queued or none is.
+        let permits = self
+            .tx
+            .try_reserve_many(chunks.len())
+            .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))?;
+        for (permit, chunk) in permits.zip(chunks) {
+            permit.send(WriteRequest {
+                data: chunk.to_vec(),
+                epoch: Some(authority.epoch),
+                sequence: None,
+            });
         }
         Ok(())
     }
@@ -320,6 +330,33 @@ pub fn spawn_sized(binary: &str, args: &[String], rows: u16, cols: u16) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_paste_chunk_boundaries_at_max_input() {
+        let (input, mut q) = PtyInput::test_channel();
+        input.send_paste(&"a".repeat(MAX_INPUT - 13)).unwrap();
+        assert!(q.try_recv().is_ok());
+        assert!(q.try_recv().is_err());
+        input.send_paste(&"a".repeat(MAX_INPUT - 12)).unwrap();
+        assert!(q.try_recv().is_ok());
+        assert!(q.try_recv().is_ok());
+        assert!(q.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_paste_is_all_or_nothing() {
+        let (input, mut q) = PtyInput::test_channel();
+        for _ in 0..63 {
+            input.send("x".into()).unwrap();
+        }
+        // one free slot, three chunks needed
+        assert!(input.send_paste(&"a".repeat(32 * 1024)).is_err());
+        let mut n = 0;
+        while q.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 63, "no paste chunk may be queued");
+    }
 
     #[test]
     fn input_count_counts_send_and_send_remote_not_respond_or_paste() {

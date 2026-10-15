@@ -17,7 +17,8 @@ const MAX_MESSAGE_BYTES: usize = 131_072;
 const MAX_PROMPT_BYTES: usize = 32_768;
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const TRUNCATED: &str = "… (truncated)";
-const TRUNCATED_ID: &str = "truncated";
+/// Reserved part id; adapters never produce ids with this prefix.
+const TRUNCATED_ID: &str = "atem:truncated";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -119,6 +120,9 @@ pub struct ChatSession {
     requests: HashMap<String, RequestState>,
     request_order: VecDeque<String>,
     pending: Option<Pending>,
+    /// Last request whose delivery timed out: a later matching transcript entry
+    /// proves it was delivered, so its turn may still complete with its requestId.
+    expired: Option<(String, String)>,
     input_mark: u64,
     current_turn: Option<(String, Option<String>)>,
     last_completed: Option<String>,
@@ -197,6 +201,7 @@ impl ChatSession {
             requests: HashMap::new(),
             request_order: VecDeque::new(),
             pending: None,
+            expired: None,
             input_mark: 0,
             current_turn: None,
             last_completed: None,
@@ -274,8 +279,13 @@ impl ChatSession {
                     self.set_status(State::Working, None, now_ms, &mut out);
                 }
             }
-            // Hooks can arrive out of order; a finished tool says nothing about the turn.
-            AgentEvent::ToolFinished => {}
+            // A finished tool ends a permission wait (the user approved); otherwise
+            // hooks may arrive out of order and it says nothing about the turn.
+            AgentEvent::ToolFinished => {
+                if self.live() && self.status.state == State::Waiting {
+                    self.set_status(State::Working, None, now_ms, &mut out);
+                }
+            }
             AgentEvent::WaitingForPermission { .. } => {
                 if self.live() {
                     self.set_status(
@@ -286,6 +296,7 @@ impl ChatSession {
                     );
                 }
             }
+            AgentEvent::TurnEnded if !self.started => {}
             AgentEvent::TurnEnded => {
                 let turn = self.current_turn.as_ref().map(|(t, _)| t.clone());
                 if let Some(turn) = turn
@@ -359,12 +370,18 @@ impl ChatSession {
                     p.log_seen = true;
                     request_id = Some(p.request_id.clone());
                 }
+                if request_id.is_none()
+                    && let Some((rid, t)) = &self.expired
+                    && same_prompt(t, &text)
+                {
+                    request_id = Some(rid.clone());
+                    self.expired = None;
+                }
                 let text = redact(&text);
-                let text = if text.len() > MAX_MESSAGE_BYTES {
-                    format!("{}{TRUNCATED}", truncate_at(&text, MAX_MESSAGE_BYTES))
-                } else {
-                    text
-                };
+                let cut = truncate_at(&text, MAX_MESSAGE_BYTES).len();
+                let was_cut = cut < text.len();
+                let mut text = text;
+                text.truncate(cut);
                 let message = ChatMessage {
                     message_id: id.clone(),
                     role: Role::User,
@@ -376,10 +393,16 @@ impl ChatSession {
                     turn_id: turn_id.clone(),
                     request_id: request_id.clone(),
                     created_at_ms,
-                    parts: vec![Part::Text {
-                        id: "text".into(),
-                        markdown: text,
-                    }],
+                    parts: {
+                        let mut parts = vec![Part::Text {
+                            id: "text".into(),
+                            markdown: text,
+                        }];
+                        if was_cut {
+                            parts.push(truncated_marker());
+                        }
+                        parts
+                    },
                 };
                 self.current_turn = Some((turn_id, request_id));
                 self.push_message(message.clone());
@@ -395,6 +418,7 @@ impl ChatSession {
                 let part = redact_part(part);
                 self.assistant_part(message_id, part, turn_id, created_at_ms, &mut out);
             }
+            LogItem::TurnEnded { .. } if !self.started => {}
             LogItem::TurnEnded { turn_id, outcome } => {
                 if self.last_completed.as_deref() != Some(turn_id.as_str()) {
                     self.complete(turn_id, outcome, &mut out);
@@ -402,10 +426,8 @@ impl ChatSession {
                 self.input_mark = input_count;
                 self.set_status(State::Ready, None, now_ms, &mut out);
             }
-            LogItem::Problem { detail, .. } => out.push(Out::Error {
-                text: detail,
-                request_id: None,
-            }),
+            // The App handles problems (withdrawing chat when fatal).
+            LogItem::Problem { .. } => {}
         }
         out
     }
@@ -600,6 +622,7 @@ impl ChatSession {
             return Vec::new();
         }
         let p = self.pending.take().unwrap();
+        self.expired = Some((p.request_id.clone(), p.text.clone()));
         let text = "delivery unknown; check the terminal";
         self.record(&p.request_id, RequestState::Failed(text.into()));
         vec![Out::Error {
@@ -723,6 +746,10 @@ mod tests {
         assert_eq!(s.status().state, State::Unknown);
         // events before a session started do not change status
         assert!(s.on_event(AgentEvent::ToolStarted, 1, 0).is_empty());
+        // a turn end before the session started neither sets Ready nor the input mark
+        assert!(s.on_event(AgentEvent::TurnEnded, 1, 9).is_empty());
+        assert!(s.on_log(end("t", Outcome::Done), 1, 9).is_empty());
+        assert_eq!(s.status().state, State::Unknown);
         assert!(
             s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 1, 0)
                 .is_empty()
@@ -745,7 +772,7 @@ mod tests {
             (State::Working, 20)
         );
         assert!(s.on_event(AgentEvent::ToolStarted, 21, 0).is_empty());
-        // ToolFinished never changes status
+        // ToolFinished while Working changes nothing
         assert!(s.on_event(AgentEvent::ToolFinished, 22, 0).is_empty());
         let o = s.on_event(
             AgentEvent::WaitingForPermission {
@@ -760,8 +787,13 @@ mod tests {
             Some("approve in the terminal")
         );
         assert_eq!(o.len(), 1);
-        assert!(s.on_event(AgentEvent::ToolFinished, 31, 0).is_empty());
-        assert_eq!(s.status().state, State::Waiting);
+        // approval given: the tool finished, the agent works again
+        s.on_event(AgentEvent::ToolFinished, 31, 0);
+        assert_eq!(
+            (s.status().state, s.status().since_ms),
+            (State::Working, 31)
+        );
+        assert_eq!(s.status().detail, None);
         s.on_event(AgentEvent::TurnEnded, 40, 0);
         assert_eq!((s.status().state, s.status().since_ms), (State::Ready, 40));
         assert_eq!(s.status().detail, None);
@@ -789,6 +821,46 @@ mod tests {
             }]
         );
         assert!(completes(&s.on_log(end("t2", Outcome::Interrupted), 6, 0)).is_empty());
+    }
+
+    #[test]
+    fn problem_items_produce_no_output() {
+        let mut s = ready();
+        let p = LogItem::Problem {
+            detail: "bad".into(),
+            fatal: false,
+        };
+        assert!(s.on_log(p, 2, 0).is_empty());
+    }
+
+    #[test]
+    fn late_turn_end_completes_a_request_whose_delivery_was_unknown() {
+        let mut s = ready();
+        submit_ok(&mut s, "r1", "go");
+        let t = Instant::now();
+        s.tick(t);
+        s.tick(t + Duration::from_secs(11));
+        // the transcript proves delivery after all
+        s.on_log(user("u1", "t1", "go"), 20, 0);
+        let o = s.on_log(end("t1", Outcome::Done), 21, 0);
+        assert!(matches!(
+            completes(&o)[0],
+            Out::Complete { request_id: Some(r), .. } if r == "r1"
+        ));
+        let again = s.submit("r1", "g1", "go", 0, false).unwrap_err();
+        assert!(matches!(again[1], Out::Complete { .. }));
+    }
+
+    #[test]
+    fn oversized_user_message_gets_a_separate_truncated_part() {
+        let mut s = ready();
+        s.on_log(user("u1", "t1", &"a".repeat(140_000)), 2, 0);
+        let m = &s.history(None, 1, usize::MAX)[0];
+        assert_eq!(m.parts.len(), 2);
+        assert_eq!(m.parts[1].id(), TRUNCATED_ID);
+        assert!(
+            matches!(&m.parts[0], Part::Text { markdown, .. } if markdown.len() == MAX_MESSAGE_BYTES)
+        );
     }
 
     #[test]

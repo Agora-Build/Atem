@@ -172,11 +172,25 @@ pub fn redact_secrets(text: &str) -> String {
                 }
             }
         }
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        secrets.dedup();
+        // Replace only the detected byte ranges (every slice points into `body`).
+        let mut spans: Vec<(usize, usize)> = secrets
+            .iter()
+            .map(|s| {
+                let start = s.as_ptr() as usize - body.as_ptr() as usize;
+                (start, start + s.len())
+            })
+            .collect();
+        spans.sort();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
         let mut redacted = body.to_string();
-        for s in secrets {
-            redacted = redacted.replace(s, "[redacted]");
+        for (start, end) in merged.into_iter().rev() {
+            redacted.replace_range(start..end, "[redacted]");
         }
         out.push_str(&redacted);
         out.push_str(nl);
@@ -346,6 +360,15 @@ mod tests {
         assert!(!redact_secrets(&url).contains("XXXX"));
         let seg = redact_secrets("https://example.com/cb/Q4mTLy5h9qtD46vrdMgotPH9WrZxDsLxThPD9vtlf+o");
         assert!(!seg.contains("Q4mTLy5h9"), "{seg}");
+    }
+
+    #[test]
+    fn redact_secrets_replaces_only_the_detected_position() {
+        assert_eq!(redact_secrets("https://u:p@h.example/p"), "https://u:[redacted]@h.example/p");
+        assert_eq!(
+            redact_secrets("pw hunter2pass at https://alice:hunter2pass@example.com/x"),
+            "pw hunter2pass at https://alice:[redacted]@example.com/x"
+        );
     }
 
     #[test]
