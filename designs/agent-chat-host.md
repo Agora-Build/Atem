@@ -13,14 +13,20 @@ A chat view of a coding agent that runs in Atem's shared terminal
 replies as incoming messages, with an honest activity indicator. Web first;
 a mobile app later uses the same events, so the host side is client-neutral.
 
-v1 supports **Claude Code** only. Codex reports status `unknown` and no
-`chat-v1` capability until a separate design (its rollout files and hooks
-differ).
+The host side is **adapter-based**: everything agent-specific (how Atem hooks
+in, which events mean what, how the session log is parsed) lives in one
+adapter per agent; the chat state, message model, wire protocol, security and
+reconnect handling are shared. v1 ships one adapter, **Claude Code**. Codex is
+the next adapter (its own, smaller design: rollout JSONL plus its hooks, which
+need per-installation trust); other agents (Gemini CLI, OpenCode, Copilot CLI,
+Aider, …) get an adapter only once their logs and events are checked. An agent
+without an adapter keeps the shared terminal, reports status `unknown` and has
+no `chat-v1` capability.
 
 ## Rules
 
-- **One source of content:** Claude's own transcript. Hooks only mark the
-  lifecycle. Atem never scrapes the terminal screen and never infers that a
+- **One source of content:** the agent's own session log (Claude's
+  transcript). Agent events (Claude's hooks) only mark the lifecycle. Atem never scrapes the terminal screen and never infers that a
   turn is done or waiting from silence.
 - **The original session stays.** Atem keeps using the interactive Claude CLI
   it launched; chat never starts another Claude process or session.
@@ -32,7 +38,44 @@ differ).
 - **Honest status.** States come from real events; when Atem can't tell, it
   says `unknown`.
 
-## How it works
+## Adapters
+
+An adapter turns one agent's native signals into neutral inputs for the shared
+chat state. It is the only agent-specific code.
+
+```rust
+trait AgentAdapter {
+    /// Extra launch arguments and environment, given the agent's own args
+    /// (Claude: --settings, --session-id). Errors leave chat unsupported.
+    fn prepare_launch(&self, args: &[String], dir: &Path) -> Result<LaunchPlan>;
+    /// Poll the agent's lifecycle source (Claude: hook event files).
+    fn poll_events(&mut self) -> Vec<AgentEvent>;
+    /// Poll the agent's session log from the saved position (Claude: transcript JSONL).
+    fn poll_log(&mut self) -> Vec<LogItem>;
+    /// What this agent supports right now (chat-v1 only once healthy).
+    fn capabilities(&self) -> Capabilities;
+}
+
+enum AgentEvent {            // neutral lifecycle
+    SessionStarted { session_id, log_path },
+    PromptSubmitted { text },
+    ToolStarted, ToolFinished,
+    WaitingForPermission { detail },
+    TurnEnded,
+}
+enum LogItem {               // neutral content, already filtered
+    UserMessage { id, turn_id, text, created_at },
+    AssistantPart { message_id, part, turn_id, created_at, end_of_turn: Option<Outcome> },
+    Problem { detail },      // unreadable line, format change
+}
+```
+
+The shared session (below) owns status, the draft check, prompt submission
+and acceptance (`PromptSubmitted` plus the matching `UserMessage`), request-id
+records, history and the wire. Adding an agent means writing an adapter and
+its tests; the wire and the clients don't change.
+
+## Claude Code adapter (v1)
 
 ### Launch
 
@@ -90,11 +133,12 @@ work on macOS.)
 
 | Unit | Responsibility |
 |---|---|
-| `src/chat/hooks.rs` | Builds the per-session directory and `settings.json`; reads, orders and deletes the event files |
-| `src/chat/transcript.rs` | Follows the transcript and turns entries into chat messages (below) |
-| `src/chat/session.rs` | Per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records |
+| `src/chat/adapter.rs` | `AgentAdapter`, `AgentEvent`, `LogItem`, `Capabilities`: the neutral interface |
+| `src/chat/claude/hooks.rs` | Claude: builds the per-session directory and `settings.json`; reads, orders and deletes the event files; maps hook events to `AgentEvent` |
+| `src/chat/claude/transcript.rs` | Claude: follows the transcript and turns entries into `LogItem`s (below) |
+| `src/chat/session.rs` | Shared per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records; agent-neutral |
 | `src/chat/wire.rs` | `agentChat` v1 messages to and from Astation: encoding, decoding, validation |
-| `src/agent_registry.rs` | Status from `session.rs`; `capabilities: ["chat-v1"]` only for Claude agents whose hooks are active |
+| `src/agent_registry.rs` | Status from `session.rs`; `capabilities: ["chat-v1"]` only when the agent's adapter reports it (v1: Claude with active hooks) |
 
 All of it lives in the Atem process that owns the terminal; there is no new
 daemon. Chat state belongs to the agent session, not to a browser connection:
@@ -127,9 +171,12 @@ chat page is open.
   - Required fields missing in a way that suggests a format change → chat is
     withdrawn for this agent with the reason.
 
-### Status
+### Status (shared state machine, fed by the adapter)
 
-| Source | Status |
+The session derives status from neutral inputs; the Claude adapter supplies
+them as follows:
+
+| Claude source | Status |
 |---|---|
 | `UserPromptSubmit`, `PreToolUse` | `working` |
 | `Notification` asking for permission | `waiting` ("approve in the terminal") |
@@ -299,6 +346,6 @@ Additive to `mem_b3ccce1f`:
 
 ## Out of scope (v1)
 
-Codex chat; approvals from chat; streaming token-by-token (the transcript
+Adapters other than Claude Code (Codex next, as its own design); approvals from chat; streaming token-by-token (the transcript
 holds whole content blocks); end-to-end encryption of chat; push delivery;
 attachments/images.
