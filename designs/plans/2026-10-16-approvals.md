@@ -37,3 +37,24 @@
 ### Task 4: Docs and handoff
 
 AGENTS.md, README, `designs/agent-chat-host.md` ("no approvals from chat" → lease-holder approvals bound to the exact prompt; "hooks never decide" exception), the Astation handoff (new messages, card, push trigger).
+
+## Push-based approvals (user decision, 2026-10-16) — supersedes "cards only for a lease holder"
+
+- Delivery is independent of the lease: every approval opens a card for all
+  attachments with `control`, and Atem asks the relay to push it to every device
+  on the account with `control` (APNs/FCM; Astation owns credentials, token
+  registry, delivery and the notification UI). Devices need no live connection.
+- Push request over Atem's authenticated relay link: `push_approval{approval_id,
+  atem_device_id, session_id, tool, summary, expires_at}` (redacted summary only;
+  `mutable-content` so iOS can decrypt on device once E2EE lands) and
+  `push_resolved{approval_id}` when answered elsewhere / expired / closed
+  (collapse-id / FCM tag = approval_id).
+- Tap → the app wakes, reconnects, authenticates as a member device, gets the
+  pending approval in the catch-up, and answers with `approval{…, acquire:
+  true}`: the host takes the lease (takeover allowed) and applies the decision
+  atomically. A late tap → "already answered".
+- Hook waits: Claude 600 s (its dialog stays visible; first answer wins); Codex
+  300 s (its prompt is hidden while waiting; any local key releases it first).
+- Until the device list (account trust step 1) exists only the paired Astation
+  can answer; phones join when membership lands — the push path is built so they
+  work then without further Atem changes.
