@@ -214,12 +214,30 @@ What that means for Atem with Codex:
    isn't blocked for long; on timeout Codex shows its own prompt.
 3. On Esc the runtime closes the request itself (the hook may keep running; its
    late output is ignored).
-4. **One-time trust with a stable hook entry:** the hook command must be the same
-   for every session (it finds the session directory through an environment
-   variable set by the worker), so the user trusts it once and it stays trusted.
-   Atem adds the entry to `~/.codex/hooks.json` only with the user's consent
-   (`atem agent setup codex` or on first launch), and shows how to review it in
-   Codex.
+4. **Set up by `atem agent launch codex`, once, without breaking anything**
+   (user decision, 2026-10-16 — no separate command):
+   - On the first Codex launch Atem asks once ("Allow approvals from Astation
+     for Codex? This adds one hook to ~/.codex/hooks.json") and remembers the
+     answer; declining just means Codex approvals stay terminal-only.
+   - It **merges**: the user's existing hooks are kept, one entry marked as
+     Atem's is added (idempotent; a backup `hooks.json.atem-bak` is written
+     before the first change; never overwritten wholesale).
+   - The hook command is identical for every session (it finds the session
+     through an environment variable set by the worker), so Codex's one-time
+     trust stays valid.
+   - **Outside Atem it does nothing:** in a Codex run not started by Atem the
+     variable is absent and the hook exits at once with no output, so Codex shows
+     its normal prompt — plain `codex` behaves as before (one short shell start
+     per approval prompt).
+   - Inside Atem with no remote controller it also exits at once; it never
+     auto-allows, and any failure means "no decision".
+   - Codex shows its "hooks need review" screen once after the entry is added
+     (also in plain `codex`); the user trusts it there.
+   - To verify while building: how Codex combines our hook with other
+     `PermissionRequest` hooks the user already has (ours must never override
+     their deny).
+   - Claude Code needs none of this: its hook comes per launch through
+     `--settings`, nothing global changes.
 
 
 Changes to earlier rules: chat's "no approvals from chat" becomes "approvals by
