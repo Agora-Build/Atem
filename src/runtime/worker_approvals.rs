@@ -40,9 +40,11 @@
 //! the hook's parent must be the session's agent — directly or through one
 //! shell, when its Codex session becomes the pinned one (so `/new` inside
 //! Codex keeps working) — or a non-shell child of the agent (a wrapper),
-//! when it must be the pinned session; a `codex` started inside the session
-//! through a shell never answers through it. Never an allow without the
-//! broker's decision.
+//! when it must be the pinned session; a request without a session id only
+//! when the hook's parent is the agent itself; a `codex` started inside the
+//! session through a shell never answers through it. A decision is handed
+//! over only while the hook has more than 5 s left. Never an allow without
+//! the broker's decision.
 
 use crate::chat::adapter::ToolResultKind;
 use crate::chat::approvals::{self, Agent, Request};
@@ -266,6 +268,13 @@ impl Approvals {
         self
     }
 
+    /// How close to the hook's timeout counts as "at the timeout": 5 s
+    /// (less for a short test timeout). No decision is handed over later,
+    /// and a hook that ends then timed out.
+    fn slack(&self) -> Duration {
+        (self.timeout / 10).min(Duration::from_secs(5))
+    }
+
     fn path(&self, prefix: &str, id: &str, suffix: &str) -> PathBuf {
         self.dir.join(format!("{prefix}-{id}{suffix}"))
     }
@@ -399,7 +408,12 @@ impl Approvals {
         let Some(w) = self.waiting.get(id) else {
             return refused;
         };
-        if w.state != State::Open || !w.reported {
+        // Too close to the hook's timeout: it may give up before it takes
+        // the decision, which would then be reported as applied.
+        if w.state != State::Open
+            || !w.reported
+            || w.opened.elapsed() + self.slack() >= self.timeout
+        {
             return refused;
         }
         let Some(output) = w
@@ -615,7 +629,9 @@ impl Approvals {
     /// session's agent. Started directly, its Codex session becomes the
     /// pinned one (so `/new` inside Codex keeps working); through a
     /// non-shell child (ambiguous: a wrapper, or a nested `codex`) it must be
-    /// the pinned session, or the first one seen.
+    /// the pinned session, or the first one seen. A request without a
+    /// session id can't be matched: only a hook whose parent is the agent
+    /// itself counts.
     fn codex_owns(&mut self, parent: Option<u32>, request: Option<&Value>) -> bool {
         let (Some(agent), Some(parent)) = (self.agent_pid, parent) else {
             return false;
@@ -628,7 +644,9 @@ impl Approvals {
             .and_then(|v| v.get("session_id"))
             .and_then(Value::as_str);
         match (session, ancestry) {
-            (None, _) => true,
+            // Without a session id only a hook the agent started itself.
+            (None, Ancestry::Direct) => parent == agent,
+            (None, _) => false,
             (Some(session), Ancestry::Direct) => {
                 self.codex_session = Some(session.to_string());
                 true
@@ -759,26 +777,28 @@ impl Approvals {
                     Some((pid, start)) => hook_alive(pid, start),
                     None => true,
                 };
+            let gone = if age + self.slack() >= self.timeout {
+                ApprovalCloseReason::TimedOut
+            } else {
+                ApprovalCloseReason::Interrupted
+            };
             match w.state.clone() {
                 State::Open if !alive => {
                     if w.reported {
-                        let slack = (self.timeout / 10).min(Duration::from_secs(5));
                         out.push(Event::Closed {
                             request_id: id.clone(),
-                            reason: if age + slack >= self.timeout {
-                                ApprovalCloseReason::TimedOut
-                            } else {
-                                ApprovalCloseReason::Interrupted
-                            },
+                            reason: gone,
                         });
                     }
                     done.push(id);
                 }
+                // Ended without taking our decision (killed, or at its
+                // timeout).
                 State::Decided { allow, deny } if !alive => {
                     if self.withdraw(&id) {
                         out.push(Event::Closed {
                             request_id: id.clone(),
-                            reason: ApprovalCloseReason::Interrupted,
+                            reason: gone,
                         });
                         done.push(id);
                     } else {

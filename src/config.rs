@@ -131,20 +131,14 @@ impl AtemConfig {
 
     /// `write_config_value` for the `config.toml` at `path`.
     fn write_config_value_at(path: &std::path::Path, key: &str, value: toml::Value) {
-        let path = path.to_path_buf();
-        let mut existing = fs::read_to_string(&path)
-            .ok()
-            .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
-            .unwrap_or_else(|| toml::Value::Table(Default::default()));
-        if let Some(table) = existing.as_table_mut() {
+        let _ = edit_config_file(path, |text| {
+            let mut existing = toml::from_str::<toml::Value>(text)?;
+            let table = existing
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("not a TOML table"))?;
             table.insert(key.into(), value);
-            if let Some(dir) = path.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            if let Ok(content) = toml::to_string_pretty(&existing) {
-                let _ = write_replacing(&path, content.as_bytes());
-            }
-        }
+            Ok(toml::to_string_pretty(&existing)?)
+        });
     }
 
     /// Merge a single top-level string key into `config.toml`.
@@ -217,54 +211,50 @@ impl AtemConfig {
             .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
 
         // Load existing config.toml so we don't clobber other keys
-        let mut existing = if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            toml::from_str::<toml::Value>(&content).unwrap_or(toml::Value::Table(Default::default()))
-        } else {
-            toml::Value::Table(Default::default())
-        };
+        edit_config_file(&path, |content| {
+            let mut existing = toml::from_str::<toml::Value>(content)
+                .unwrap_or(toml::Value::Table(Default::default()));
 
-        let table = existing.as_table_mut().expect("config is a TOML table");
+            let table = existing.as_table_mut().expect("config is a TOML table");
 
-        // Write non-sensitive settings
-        if let Some(ch) = &self.rtm_channel {
-            table.insert("rtm_channel".into(), toml::Value::String(ch.clone()));
-        }
-        if let Some(acc) = &self.rtm_account {
-            table.insert("rtm_account".into(), toml::Value::String(acc.clone()));
-        }
-        if let Some(ws) = &self.astation_ws {
-            table.insert("astation_ws".into(), toml::Value::String(ws.clone()));
-        }
-        if let Some(relay) = &self.astation_relay_url {
-            table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
-        }
-        if let Some(code) = &self.astation_relay_code {
-            table.insert("astation_relay_code".into(), toml::Value::String(code.clone()));
-        }
-        if let Some(bff) = &self.bff_url {
-            table.insert("bff_url".into(), toml::Value::String(bff.clone()));
-        }
-        if let Some(sso) = &self.sso_url {
-            table.insert("sso_url".into(), toml::Value::String(sso.clone()));
-        }
-        if let Some(id) = &self.instance_id {
-            table.insert("instance_id".into(), toml::Value::String(id.clone()));
-        }
-        if let Some(id) = &self.atem_id {
-            table.insert("atem_id".into(), toml::Value::String(id.clone()));
-        }
-        if self.bff_url.is_none() {
-            table.remove("bff_url");
-        }
-        if self.sso_url.is_none() {
-            table.remove("sso_url");
-        }
+            // Write non-sensitive settings
+            if let Some(ch) = &self.rtm_channel {
+                table.insert("rtm_channel".into(), toml::Value::String(ch.clone()));
+            }
+            if let Some(acc) = &self.rtm_account {
+                table.insert("rtm_account".into(), toml::Value::String(acc.clone()));
+            }
+            if let Some(ws) = &self.astation_ws {
+                table.insert("astation_ws".into(), toml::Value::String(ws.clone()));
+            }
+            if let Some(relay) = &self.astation_relay_url {
+                table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
+            }
+            if let Some(code) = &self.astation_relay_code {
+                table.insert("astation_relay_code".into(), toml::Value::String(code.clone()));
+            }
+            if let Some(bff) = &self.bff_url {
+                table.insert("bff_url".into(), toml::Value::String(bff.clone()));
+            }
+            if let Some(sso) = &self.sso_url {
+                table.insert("sso_url".into(), toml::Value::String(sso.clone()));
+            }
+            if let Some(id) = &self.instance_id {
+                table.insert("instance_id".into(), toml::Value::String(id.clone()));
+            }
+            if let Some(id) = &self.atem_id {
+                table.insert("atem_id".into(), toml::Value::String(id.clone()));
+            }
+            if self.bff_url.is_none() {
+                table.remove("bff_url");
+            }
+            if self.sso_url.is_none() {
+                table.remove("sso_url");
+            }
 
-        let content = toml::to_string_pretty(&existing)
-            .with_context(|| "Failed to serialize config")?;
-        write_replacing(&path, content.as_bytes())
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+            toml::to_string_pretty(&existing).with_context(|| "Failed to serialize config")
+        })
+        .with_context(|| format!("Failed to write config file: {}", path.display()))?;
         Ok(())
     }
 
@@ -730,30 +720,95 @@ impl crate::auth::AuthSession {
     }
 }
 
-/// Replaces `path` with `content` atomically (a temp file in the same
-/// directory, renamed over it), so a concurrent reader — e.g. the runtime
-/// reading its identity while its Astation connect stores `atem_id` — sees
-/// the old file or the new one, never a half-written one. Keeps the old
-/// file's permissions.
-fn write_replacing(path: &Path, content: &[u8]) -> std::io::Result<()> {
+/// Read-modify-write of the `config.toml` at `path`: `edit` gets the
+/// current text (empty when there is none) and returns the new one. Under
+/// an exclusive `flock` on `config.toml.lock`, so concurrent writers (the
+/// runtime storing its identity, `atem agent launch` recording a consent)
+/// never lose each other's keys. A symlinked config.toml keeps its link:
+/// the target is replaced. The file keeps its mode (a new one gets 0600)
+/// and is replaced atomically (`write_keeping`), so a concurrent reader sees
+/// the old file or the new one, never a half-written one.
+pub fn edit_config_file(
+    path: &Path,
+    edit: impl FnOnce(&str) -> Result<String>,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    // SAFETY: flock on a descriptor this function owns; released on close.
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(anyhow::anyhow!(error).context(format!("locking {}", lock_path.display())));
+        }
+    }
+    // A symlink (e.g. into a dotfiles repo) is followed, never replaced; a
+    // dangling one is an error.
+    let target = if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    let (text, mode) = match fs::read_to_string(&target) {
+        Ok(text) => {
+            let mode = fs::metadata(&target)?.permissions().mode() & 0o7777;
+            (text, mode)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), 0o600),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", target.display())),
+    };
+    let new = edit(&text)?;
+    write_keeping(&target, new.as_bytes(), mode)
+        .with_context(|| format!("writing {}", target.display()))?;
+    drop(lock);
+    Ok(())
+}
+
+/// Replaces `path` with `bytes` (permission bits `mode`) through a temp
+/// file in the same directory (unpredictable name, never through a
+/// symlink): the file is fsynced, renamed over `path`, then the directory
+/// is fsynced.
+pub fn write_keeping(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent directory"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("no file name"))?;
+    let tmp = dir.join(format!(
+        ".{}.atem-tmp-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
     let result = (|| {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp)?;
-        if let Ok(meta) = fs::metadata(path) {
-            file.set_permissions(meta.permissions())?;
-        }
-        file.write_all(content)?;
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        fs::rename(&tmp, path)?;
+        fs::File::open(if dir.as_os_str().is_empty() { Path::new(".") } else { dir })?
+            .sync_all()
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(&tmp);
     }
     result
 }
@@ -793,6 +848,63 @@ mod tests {
         }
         writer.join().unwrap();
         assert!(reads > 0);
+    }
+
+    /// A symlinked config.toml keeps its link; the target is replaced and
+    /// keeps its mode. A new file is 0600.
+    #[test]
+    fn writes_follow_a_symlink_and_keep_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("new").join("config.toml");
+        AtemConfig::write_config_value_at(&fresh, "a", toml::Value::Integer(1));
+        assert_eq!(mode(&fresh), 0o600);
+        let target = dir.path().join("dotfiles").join("atem.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "# mine\nkept = true\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        AtemConfig::write_config_value_at(&link, "atem_id", toml::Value::String("h-1".into()));
+        crate::chat::codex::write_consent(&link, true).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let text = fs::read_to_string(&target).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["kept"].as_bool(), Some(true));
+        assert_eq!(parsed["atem_id"].as_str(), Some("h-1"));
+        assert_eq!(parsed["codex"]["approvals_hook"].as_bool(), Some(true));
+        assert_eq!(mode(&target), 0o640);
+        // Malformed TOML is left as it is.
+        fs::write(&target, "not = = toml").unwrap();
+        AtemConfig::write_config_value_at(&link, "a", toml::Value::Integer(1));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "not = = toml");
+    }
+
+    /// Concurrent writers (each a read-modify-write) never lose a key.
+    #[test]
+    fn concurrent_writers_all_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        AtemConfig::write_config_value_at(
+                            &path,
+                            &format!("k{w}_{i}"),
+                            toml::Value::Integer(i),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.as_table().unwrap().len(), 100);
     }
 
     #[test]

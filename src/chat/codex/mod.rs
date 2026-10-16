@@ -23,6 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
 use crate::chat::approvals::{CODEX_TIMEOUT, ENV, shell_quote};
+use crate::config::write_keeping;
 
 /// How our entry's command starts (its mark).
 pub const MARKER: &str = ": atem-approval-hook;";
@@ -378,44 +379,6 @@ fn file_mode(path: &Path) -> Option<u32> {
         .map(|m| m.permissions().mode() & 0o7777)
 }
 
-/// Replaces `path` with `bytes` (permission bits `mode`) through a temp
-/// file in the same directory (unpredictable name, never through a
-/// symlink), fsync and rename.
-pub fn write_keeping(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("no parent directory"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("no file name"))?;
-    let tmp = dir.join(format!(
-        ".{}.atem-tmp-{}",
-        name.to_string_lossy(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
 /// What `uninstall` did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Removed {
@@ -646,61 +609,23 @@ pub fn uninstall_with(codex_home: &Path, write: Writer, restore: Writer) -> Resu
 
 /// `[codex] approvals_hook` in config.toml.
 pub fn read_consent(config: &Path) -> Result<Option<bool>> {
-    let text = match std::fs::read_to_string(config) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let value: toml::Value =
-        toml::from_str(&text).with_context(|| format!("{} isn't valid TOML", config.display()))?;
-    Ok(value
-        .get("codex")
-        .and_then(|c| c.get("approvals_hook"))
-        .and_then(toml::Value::as_bool))
+    crate::chat::approvals::read_setting(config, crate::chat::approvals::Agent::Codex)
 }
 
 /// Records the answer, keeping the rest of config.toml (and its mode) as
-/// it is: under an exclusive lock on `config.toml.lock`, written through a
-/// temp file and rename. Malformed TOML is refused, never rewritten.
+/// it is (`config::edit_config_file`: locked, atomic, a symlink followed).
+/// Malformed TOML is refused, never rewritten.
 pub fn write_consent(config: &Path, allow: bool) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(dir) = config.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let lock_path = PathBuf::from(format!("{}.lock", config.display()));
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    // SAFETY: flock on a descriptor this function owns; released on close.
-    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(anyhow!(error).context(format!("locking {}", lock_path.display())));
+    crate::config::edit_config_file(config, |text| {
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("{} isn't valid TOML", config.display()))?;
+        if !doc.get("codex").is_some_and(|c| c.is_table_like()) {
+            doc["codex"] = toml_edit::table();
         }
-    }
-    let text = match std::fs::read_to_string(config) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.into()),
-    };
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .with_context(|| format!("{} isn't valid TOML", config.display()))?;
-    if !doc.get("codex").is_some_and(|c| c.is_table_like()) {
-        doc["codex"] = toml_edit::table();
-    }
-    doc["codex"]["approvals_hook"] = toml_edit::value(allow);
-    let mode = file_mode(config).unwrap_or(0o600);
-    write_keeping(config, doc.to_string().as_bytes(), mode)
-        .with_context(|| format!("writing {}", config.display()))?;
-    drop(lock);
-    Ok(())
+        doc["codex"]["approvals_hook"] = toml_edit::value(allow);
+        Ok(doc.to_string())
+    })
 }
 
 pub struct Paths {

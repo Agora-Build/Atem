@@ -387,3 +387,21 @@ fn rules_are_the_agents_own_allow_suggestions() {
     );
     assert!(request(Agent::Claude, &serde_json::json!({})).is_none());
 }
+
+#[test]
+fn settings_default_to_claude_on_and_codex_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    assert!(enabled(&config, Agent::Claude));
+    assert!(!enabled(&config, Agent::Codex));
+    fs::write(&config, "[codex]\napprovals_hook = true\n").unwrap();
+    assert!(enabled(&config, Agent::Claude));
+    assert!(enabled(&config, Agent::Codex));
+    fs::write(&config, "[claude]\napprovals_hook = false\n").unwrap();
+    assert!(!enabled(&config, Agent::Claude));
+    assert_eq!(read_setting(&config, Agent::Claude).unwrap(), Some(false));
+    // An unreadable config.toml turns both off.
+    fs::write(&config, "not = = toml").unwrap();
+    assert!(!enabled(&config, Agent::Claude));
+    assert!(!enabled(&config, Agent::Codex));
+}

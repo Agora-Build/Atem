@@ -238,7 +238,8 @@ struct Launch {
 /// The binary, arguments and chat adapter for `spec`, exactly as the App
 /// launches a session: `CLAUDE_CLI_*`/`CODEX_CLI_*` from the launch
 /// environment (else the worker's own), the spec's arguments after them,
-/// and for Claude its chat hooks first (approvals included). A Codex
+/// and for Claude its chat hooks first (approvals included unless
+/// `claude_approvals` is off). With Codex approvals on (`script`), a Codex
 /// session gets its own session directory for the approval hook in
 /// `~/.codex/hooks.json` (`chat::codex`), whose stable script `script` is
 /// refreshed here.
@@ -246,7 +247,8 @@ fn agent_command(
     spec: &WorkerSpec,
     env: Option<&[(OsString, OsString)]>,
     chat_root: &Path,
-    script: &Path,
+    claude_approvals: bool,
+    script: Option<&Path>,
 ) -> Result<Launch> {
     let provider = Provider::from_alias(&spec.provider)
         .ok_or_else(|| anyhow!("unknown provider {:?}", spec.provider))?;
@@ -256,16 +258,20 @@ fn agent_command(
                 .map(crate::claude_client::ClaudeClient::from_env)
                 .unwrap_or_else(crate::claude_client::ClaudeClient::new);
             let launch_args = [client.launch_args(), &spec.args[..]].concat();
-            let (adapter, chat_args) =
-                match crate::chat::claude::prepare_chat(chat_root, &launch_args) {
-                    Ok((adapter, args)) => (Some(adapter), args),
-                    Err(error) => {
-                        eprintln!("atem worker: chat is off for Claude: {error}");
-                        (None, Vec::new())
-                    }
-                };
+            let (adapter, chat_args) = match crate::chat::claude::prepare_chat(
+                chat_root,
+                &launch_args,
+                claude_approvals,
+            ) {
+                Ok((adapter, args)) => (Some(adapter), args),
+                Err(error) => {
+                    eprintln!("atem worker: chat is off for Claude: {error}");
+                    (None, Vec::new())
+                }
+            };
             let approvals = adapter
                 .as_ref()
+                .filter(|_| claude_approvals)
                 .and_then(|a| a.dir())
                 .map(|d| (d.to_path_buf(), Agent::Claude));
             Launch {
@@ -280,16 +286,18 @@ fn agent_command(
             let client = env
                 .map(crate::codex_client::CodexClient::from_env)
                 .unwrap_or_else(crate::codex_client::CodexClient::new);
-            if let Err(error) = crate::chat::approvals::install_script(script) {
-                eprintln!("atem worker: could not write {}: {error}", script.display());
-            }
-            let dir = match crate::chat::claude::hooks::create_session_dir(chat_root) {
-                Ok(dir) => Some(dir),
-                Err(error) => {
-                    eprintln!("atem worker: approvals are off for Codex: {error}");
-                    None
+            let dir = script.and_then(|script| {
+                if let Err(error) = crate::chat::approvals::install_script(script) {
+                    eprintln!("atem worker: could not write {}: {error}", script.display());
                 }
-            };
+                match crate::chat::claude::hooks::create_session_dir(chat_root) {
+                    Ok(dir) => Some(dir),
+                    Err(error) => {
+                        eprintln!("atem worker: approvals are off for Codex: {error}");
+                        None
+                    }
+                }
+            });
             Launch {
                 binary: client.binary().to_string(),
                 args: [client.launch_args(), &spec.args[..]].concat(),
@@ -337,8 +345,12 @@ pub struct WorkerOptions {
     pub first_connect: Duration,
     /// After the agent exited with no broker to tell, how long to wait for one.
     pub linger: Duration,
-    /// The stable approval hook script Codex's hooks.json names.
-    pub approval_script: PathBuf,
+    /// Claude sessions register the approval hook (`[claude] approvals_hook`,
+    /// default on).
+    pub claude_approvals: bool,
+    /// The stable approval hook script Codex's hooks.json names, when Codex
+    /// approvals are on (`[codex] approvals_hook = true`).
+    pub approval_script: Option<PathBuf>,
 }
 
 /// One broker connection.
@@ -517,7 +529,8 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         &spec,
         env.as_deref(),
         &options.chat_root,
-        &options.approval_script,
+        options.claude_approvals,
+        options.approval_script.as_deref(),
     )
     .and_then(|launch| {
         let codex_dir = launch
@@ -1295,6 +1308,9 @@ pub async fn run_worker(state: PathBuf, session_id: String) -> Result<()> {
     );
     let chat_root = crate::chat::claude::hooks::session_dir_root();
     let socket = spec.socket.clone();
+    // Approvals as config.toml says at this launch.
+    let config = crate::config::AtemConfig::config_path();
+    let approvals = |agent| crate::chat::approvals::enabled(&config, agent);
     let options = WorkerOptions {
         state: state.clone(),
         pid,
@@ -1304,7 +1320,8 @@ pub async fn run_worker(state: PathBuf, session_id: String) -> Result<()> {
         uid: unsafe { libc::getuid() },
         first_connect: Duration::from_secs(30),
         linger: crate::session::EXITED_KEEP,
-        approval_script: crate::chat::codex::script_path(),
+        claude_approvals: approvals(Agent::Claude),
+        approval_script: approvals(Agent::Codex).then(crate::chat::codex::script_path),
     };
     let served = serve(spec, listener, options).await;
     if std::fs::symlink_metadata(&socket).is_ok_and(|m| {
@@ -1321,4 +1338,55 @@ pub async fn run_worker(state: PathBuf, session_id: String) -> Result<()> {
         remove_leftovers(&state, &session_id);
     }
     served
+}
+
+#[cfg(test)]
+mod approval_settings_tests {
+    use super::*;
+
+    fn spec(provider: &str) -> WorkerSpec {
+        WorkerSpec {
+            session_id: SessionId::new().to_string(),
+            process_gen: uuid::Uuid::new_v4().to_string(),
+            provider: provider.into(),
+            args: Vec::new(),
+            cwd: PathBuf::from("/"),
+            rows: 24,
+            cols: 80,
+            socket: PathBuf::from("/nonexistent.sock"),
+        }
+    }
+
+    fn settings(launch: &Launch) -> serde_json::Value {
+        let at = launch.args.iter().position(|a| a == "--settings").unwrap();
+        serde_json::from_str(&std::fs::read_to_string(&launch.args[at + 1]).unwrap()).unwrap()
+    }
+
+    /// `[claude] approvals_hook = false`: chat hooks only, nothing watched.
+    #[test]
+    fn claude_approvals_follow_the_setting() {
+        let root = tempfile::tempdir().unwrap();
+        for on in [true, false] {
+            let launch = agent_command(&spec("claude"), Some(&[]), root.path(), on, None).unwrap();
+            let v = settings(&launch);
+            assert_eq!(v["hooks"].get("PermissionRequest").is_some(), on);
+            assert_eq!(launch.approvals.is_some(), on);
+            assert!(v["hooks"].get("Stop").is_some());
+        }
+    }
+
+    /// Codex approvals off: no stable script, no session directory.
+    #[test]
+    fn codex_approvals_only_when_consented() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("hooks").join("approval-hook.sh");
+        let off = agent_command(&spec("codex"), Some(&[]), root.path(), true, None).unwrap();
+        assert!(off.approvals.is_none() && off.owned_dir.is_none());
+        assert!(!script.exists());
+        let on =
+            agent_command(&spec("codex"), Some(&[]), root.path(), true, Some(&script)).unwrap();
+        assert!(on.approvals.is_some());
+        assert!(script.exists());
+        let _ = std::fs::remove_dir_all(on.owned_dir.unwrap());
+    }
 }

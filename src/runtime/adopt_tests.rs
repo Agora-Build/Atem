@@ -72,7 +72,8 @@ async fn start_with(
         uid: unsafe { libc::getuid() },
         first_connect: Duration::from_secs(10),
         linger: Duration::from_secs(2),
-        approval_script: dir.path().join("approval-hook.sh"),
+        claude_approvals: true,
+        approval_script: Some(dir.path().join("approval-hook.sh")),
     };
     let served = tokio::spawn(worker::serve(spec.clone(), listener, options));
     let running = Running { dir, spec, served };
@@ -580,7 +581,8 @@ async fn a_silent_connection_does_not_use_up_the_first_connect_window() {
         uid: unsafe { libc::getuid() },
         first_connect: Duration::from_secs(6),
         linger: Duration::from_secs(2),
-        approval_script: dir.path().join("approval-hook.sh"),
+        claude_approvals: true,
+        approval_script: Some(dir.path().join("approval-hook.sh")),
     };
     let served = tokio::spawn(worker::serve(spec.clone(), listener, options));
     // Connects and says nothing, and stays.

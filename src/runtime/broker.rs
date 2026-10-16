@@ -895,7 +895,8 @@ impl InProcess {
             uid: unsafe { libc::getuid() },
             first_connect: std::time::Duration::from_secs(10),
             linger: std::time::Duration::from_secs(30),
-            approval_script: self.chat_root.join("approval-hook.sh"),
+            claude_approvals: true,
+            approval_script: Some(self.chat_root.join("approval-hook.sh")),
         };
         let socket = spec.socket.clone();
         tokio::spawn(worker::serve(spec, listener, options));

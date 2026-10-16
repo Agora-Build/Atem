@@ -149,12 +149,15 @@ pub fn hook_command(dir: &Path) -> String {
 }
 
 /// Write `dir/settings.json` (0600) registering the hook for every event,
-/// and the approval hook (`chat::approvals`, installed in `dir`): the
-/// `PermissionRequest` hook (600 s) and, on `PostToolUse`, its note that a
-/// tool ran (a prompt answered in the terminal).
-pub fn write_settings(dir: &Path) -> anyhow::Result<PathBuf> {
+/// and with `approvals` the approval hook (`chat::approvals`, installed in
+/// `dir`): the `PermissionRequest` hook (600 s) and, on `PostToolUse`, its
+/// note that a tool ran (a prompt answered in the terminal). Without
+/// (`[claude] approvals_hook = false`) Claude's prompts stay in its terminal.
+pub fn write_settings(dir: &Path, approvals: bool) -> anyhow::Result<PathBuf> {
     use crate::chat::approvals;
-    approvals::install_script(&dir.join(approvals::SCRIPT_NAME))?;
+    if approvals {
+        approvals::install_script(&dir.join(approvals::SCRIPT_NAME))?;
+    }
     let cmd = hook_command(dir);
     let mut hooks = serde_json::Map::new();
     for ev in HOOK_EVENTS {
@@ -163,7 +166,7 @@ pub fn write_settings(dir: &Path) -> anyhow::Result<PathBuf> {
             entry.insert("matcher".into(), "".into());
         }
         let mut commands = vec![serde_json::json!({ "type": "command", "command": cmd })];
-        if ev == "PostToolUse" {
+        if approvals && ev == "PostToolUse" {
             commands.push(serde_json::json!({
                 "type": "command",
                 "command": approvals::claude_post_command(dir),
@@ -172,17 +175,19 @@ pub fn write_settings(dir: &Path) -> anyhow::Result<PathBuf> {
         entry.insert("hooks".into(), Value::Array(commands));
         hooks.insert(ev.into(), Value::Array(vec![Value::Object(entry)]));
     }
-    hooks.insert(
-        "PermissionRequest".into(),
-        serde_json::json!([{
-            "matcher": "",
-            "hooks": [{
-                "type": "command",
-                "command": approvals::claude_command(dir),
-                "timeout": approvals::CLAUDE_TIMEOUT,
-            }]
-        }]),
-    );
+    if approvals {
+        hooks.insert(
+            "PermissionRequest".into(),
+            serde_json::json!([{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": approvals::claude_command(dir),
+                    "timeout": approvals::CLAUDE_TIMEOUT,
+                }]
+            }]),
+        );
+    }
     let body = serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))?;
     let path = dir.join("settings.json");
     write_private(&path, body.as_bytes())?;
@@ -309,7 +314,7 @@ mod tests {
     fn settings_register_every_event_with_the_command() {
         let root = tempfile::tempdir().unwrap();
         let dir = create_session_dir(root.path()).unwrap();
-        let path = write_settings(&dir).unwrap();
+        let path = write_settings(&dir, true).unwrap();
         assert_eq!(path, dir.join("settings.json"));
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let cmd = hook_command(&dir);
@@ -430,6 +435,23 @@ mod tests {
     }
 
     #[test]
+    fn settings_without_approvals_keep_only_the_chat_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = create_session_dir(root.path()).unwrap();
+        let path = write_settings(&dir, false).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let cmd = hook_command(&dir);
+        assert_eq!(v["hooks"].as_object().unwrap().len(), 6);
+        assert!(v["hooks"].get("PermissionRequest").is_none());
+        for ev in HOOK_EVENTS {
+            let hooks = v["hooks"][ev][0]["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "{ev}");
+            assert_eq!(hooks[0]["command"], cmd.as_str(), "{ev}");
+        }
+        assert!(!dir.join("approval-hook.sh").exists());
+    }
+
+    #[test]
     fn session_dir_and_files_are_private() {
         let root = tempfile::tempdir().unwrap();
         let dir = create_session_dir(root.path()).unwrap();
@@ -442,7 +464,7 @@ mod tests {
         );
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("events")), 0o700);
-        let s = write_settings(&dir).unwrap();
+        let s = write_settings(&dir, true).unwrap();
         assert_eq!(mode(&s), 0o600);
     }
 

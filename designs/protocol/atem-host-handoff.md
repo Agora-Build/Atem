@@ -319,10 +319,13 @@ Astation sees that changed since r6.2.
 - Claude: the hook runs per launch from `--settings` (600 s) while Claude
   shows its own dialog; the first answer wins. A terminal answer is seen
   from the tool running (PostToolUse) or the transcript's refusal and closes
-  the card `answered_terminal`.
+  the card `answered_terminal`. `[claude] approvals_hook = false` in Atem's
+  config.toml (default on, never asked) leaves the hook out of later
+  launches: their prompts stay in the terminal.
 - Codex: one Atem entry in `~/.codex/hooks.json`, added after the first
   `atem agent launch codex` asks once (`[codex] approvals_hook` in Atem's
-  config.toml; `false` removes it). Codex hides its prompt while the hook
+  config.toml; `false` removes it, and until it is `true` a Codex session
+  watches nothing). Codex hides its prompt while the hook
   waits, so any input to the session — local keys or the lease holder's —
   first releases the waiting hooks (`approval_closed{released}`), and Atem
   holds that input until they exited (≤ 500 ms) so it reaches Codex's own
@@ -330,6 +333,16 @@ Astation sees that changed since r6.2.
   it.
 - Approvals live in the broker's memory: after a runtime restart every
   waiting hook gets "no decision" and an `accepted` answer is `rejected`.
+  Approvals pending before a broker restart or adoption are released without
+  `push_resolved`: a phone notification may linger until its `expires_at`,
+  and a tap on it gets `stale_target`, which the app shows as "already
+  answered".
+- A decision within 5 s of the hook's timeout is `not_delivered` (the hook
+  might give up before taking it); a hook that ends that close to its
+  timeout closes `timed_out`.
+- Same-user processes that can see `ATEM_APPROVAL_DIR` can forge request
+  files: the result is a fake card, never an agent action. Same-user
+  attackers are out of scope.
 
 ### How to test
 

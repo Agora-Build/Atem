@@ -42,7 +42,11 @@ no `chat-v1` capability.
   current lease or taking it with `acquire: true`. The terminal can always
   answer instead (first answer wins), and anything else — a failure, a
   timeout, nobody answering — is "no decision": Claude asks in its own
-  dialog.
+  dialog. `[claude] approvals_hook = false` in Atem's config.toml (default
+  on, never asked) turns the hook off for later launches; the chat hooks
+  stay. Approvals pending before a broker restart or adoption are released
+  without `push_resolved`: a phone notification may linger until its
+  `expires_at`, and a tap gets `stale_target` ("already answered").
 - **Never merge with a local draft.** A chat prompt is refused when anyone
   typed into the terminal since Claude's last turn ended.
 - **Never resend.** A prompt whose delivery is unknown is reported, not retried.
@@ -115,7 +119,8 @@ chat page is open.
    holding:
    - `settings.json` (0600): hooks for `SessionStart`, `UserPromptSubmit`,
      `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, each running the
-     event-file command below;
+     event-file command below, and the approval hook (`PermissionRequest`,
+     plus a `PostToolUse` note) unless `[claude] approvals_hook = false`;
    - `events/` (0700): one file per hook event;
    - `pid` (0600): the Atem process id. The first chat an Atem process prepares
      removes `chat-*` directories under the same root whose `pid` names a
@@ -344,7 +349,9 @@ on the existing authenticated Astation connection.
   anything, and acceptance additionally needs the transcript's own user entry.
   Approval decisions go the other way (Atem writes them for the hook in the
   session's `approvals/` directory, 0700) and only for a prompt the hook
-  reported.
+  reported. A same-user process that can see `ATEM_APPROVAL_DIR` can forge
+  a request file: the result is a fake card, never an agent action
+  (same-user attackers are out of scope).
   Event files can hold tool input (file contents); they stay in the private
   directory and are deleted as soon as they are read.
 - Outgoing text and tool summaries pass Atem's credential detector

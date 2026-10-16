@@ -668,3 +668,60 @@ fn a_claimed_decision_always_reaches_the_hook_however_fast_the_worker_polls() {
     }
     assert!(s.files().is_empty(), "{:?}", s.files());
 }
+
+/// Within 5 s (here a tenth of the 2 s timeout) of the hook's timeout no
+/// decision is handed over: the hook could give up before taking it.
+#[test]
+fn a_decision_near_the_timeout_is_refused() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Claude).with_timeout(Duration::from_secs(2));
+    let mut sleeper = s.fake_request("late", SECRET_BASH);
+    let id = request_id(&events(&mut a, true)[0]);
+    std::thread::sleep(Duration::from_millis(1850));
+    assert_eq!(
+        a.decide(&id, ApprovalDecision::AllowOnce, None, None),
+        Some(applied(&id, ApplyOutcome::NotDelivered))
+    );
+    assert!(!s.files().iter().any(|f| f.starts_with("dec-")));
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
+
+/// A hook that ends at its timeout without taking our decision timed out;
+/// one killed earlier was interrupted.
+#[test]
+fn a_hook_ending_with_our_decision_untaken() {
+    for (wait_ms, reason) in [
+        (1850, ApprovalCloseReason::TimedOut),
+        (0, ApprovalCloseReason::Interrupted),
+    ] {
+        let s = Session::new();
+        let mut a = watcher(&s, Agent::Claude).with_timeout(Duration::from_secs(2));
+        let mut sleeper = s.fake_request("untaken", SECRET_BASH);
+        let id = request_id(&events(&mut a, true)[0]);
+        assert_eq!(a.decide(&id, ApprovalDecision::AllowOnce, None, None), None);
+        std::thread::sleep(Duration::from_millis(wait_ms));
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert_eq!(events(&mut a, true), vec![closed(&id, reason)]);
+        assert!(s.files().is_empty(), "{:?}", s.files());
+    }
+}
+
+/// A Codex request without a session id is this session's only when the
+/// hook's parent is the agent itself; through a wrapper it is released.
+#[test]
+fn a_codex_request_without_a_session_id_must_come_from_the_agent_itself() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let unnamed = SECRET_BASH.replace(r#""session_id":"s1","#, "");
+    let mut wrapped = s.fake_request_through_child("wrapped", &unnamed);
+    known(&mut a, 1, true);
+    let _ = wrapped.kill();
+    let _ = wrapped.wait();
+    assert!(drained(&mut a).is_empty());
+    let mut direct = s.fake_request("direct", &unnamed);
+    assert_eq!(request_id(&events(&mut a, true)[0]), "direct");
+    let _ = direct.kill();
+    let _ = direct.wait();
+}

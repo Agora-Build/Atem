@@ -224,7 +224,10 @@ always answer instead: Claude keeps its own dialog on screen (the first
 answer wins), and for Codex any key you type in the terminal hands the
 prompt back to Codex's own dialog. If nobody answers, nothing is allowed:
 after the hook's wait (Claude 10 min, Codex 5 min) the agent asks in the
-terminal as usual. Claude gets the hook with `--settings` for each launch.
+terminal as usual. Claude gets the hook with `--settings` for each launch;
+to turn it off, set `approvals_hook = false` under `[claude]` in
+`~/.config/atem/config.toml` (Claude sessions launched afterwards keep their
+prompts in the terminal).
 The first `atem agent launch codex` asks once whether to add Atem's hook to
 `~/.codex/hooks.json` (a backup is kept as `hooks.json.atem-bak`); to turn it
 off later, set `approvals_hook = false` under `[codex]` in

@@ -9,8 +9,8 @@
 #       (stamped with the claim time; once read it becomes claimed-<id>, the
 #       time kept); Atem withdraws one by renaming it too, so exactly one of
 #       them gets it, and never touches a claimed one while the hook runs.
-#       Prints it and exits 0. Gives up
-#       silently at the timeout or when Atem withdraws the request.
+#       Prints it and exits 0. Gives up silently at the timeout or when Atem
+#       withdraws the request.
 #   sh approval-hook.sh post
 #       Claude PostToolUse: tells Atem a tool ran while a request waits
 #       (post-<id>.json), so a prompt answered in the terminal closes.
@@ -45,6 +45,8 @@ dec=$a/dec-$id.json
     exit 0
 }
 
+# Polls every 100 ms: about 10 forks (sleep, and mv/cat once decided) a
+# second for as long as it waits, at most the timeout.
 n=0
 max=$((limit * 10))
 while [ "$n" -lt "$max" ]; do
