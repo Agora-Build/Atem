@@ -210,11 +210,11 @@ JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.
 | `session` | runtime | the attached session's changed summary (status, remote control, state) |
 | `astation` | runtime | `connected`, on every change of the Astation link |
 | `reclaim` | client | `session_id`: take control back from a remote lease holder (prefix `g`) |
-| `reload` | client | re-read credentials, sessions and config (after `unpair`, `logout`, config edits) |
-| `astation_op` | client | `request_id`, `kind` (`pair`, `cred_unlock`, `cred_projects`, `token`), options |
+| `reload` | client | re-read credentials, sessions and config (after `unpair`, `logout`, config edits); a link whose pairing is gone is dropped with its attachments |
+| `astation_op` | client | `request_id`, `kind` (`pair`, `pair_verify`, `cred_unlock`, `cred_projects`, `token`), `options` (`save` for `pair`; `astation_id` for `token`; `cwd` for `cred_projects`) |
 | `print` | runtime | `request_id`, `level` (info/warn/error), `text` |
-| `ask` / `answer` | runtime / client | `request_id`, `question_id`, `kind` (yes_no, text), `text` → `answer` |
-| `done` | runtime | `request_id`, `ok`, `error?` |
+| `ask` / `answer` | runtime / client | `request_id`, `question_id`, `kind` (yes_no, text), `text` → `answer` `{request_id, question_id, value}`; `value` is `{"kind":"yes"}`, `{"kind":"no"}`, `{"kind":"text","text":…}`, or why there is none: `{"kind":"no_terminal","text":…}`, `{"kind":"unanswered","text":…}` |
+| `done` | runtime | `request_id`, `ok`, `error?`; a second `astation_op` while one runs gets `done` with `ok: false` ("another pairing or unlock is in progress") |
 
 Backpressure: at most 256 KiB of unsent output per frontend; beyond that the
 runtime drops the stream and sends a fresh restore snapshot. When a session's

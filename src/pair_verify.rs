@@ -16,6 +16,9 @@ pub(crate) const FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the user has to approve on the Mac with Touch ID.
 pub(crate) const TOUCH_ID_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The question the runtime asks (the CLI adds "Type y or n: ").
+pub(crate) const CODES_QUESTION: &str = "Does the code on your Mac match?";
+#[cfg(test)]
 const PROMPT: &str = "Does the code on your Mac match? Type y or n: ";
 /// Longer answers are cut (they are never y/n anyway).
 const MAX_LINE: usize = 256;
@@ -29,6 +32,8 @@ pub(crate) enum CodeAnswer {
     Unanswered(String),
     /// There is no terminal to ask on.
     NoTerminal(String),
+    /// The CLI went away (interrupted) before it answered.
+    Interrupted,
 }
 
 /// The terminal the confirmation is read from and the prompt written to.
@@ -51,11 +56,17 @@ impl Terminal for std::fs::File {
 /// Asks until the answer is y/yes (match) or n/no (refused). Keys typed
 /// before the prompt are discarded first, and the input is read a byte at a
 /// time, so nothing beyond the answer line is consumed.
+#[cfg(test)]
 pub(crate) fn ask_codes_match<T: Terminal>(terminal: &mut T) -> CodeAnswer {
+    ask_yes_no(terminal, PROMPT)
+}
+
+/// Asks `prompt` until the answer is y/yes or n/no (`ask_codes_match`).
+pub(crate) fn ask_yes_no<T: Terminal>(terminal: &mut T, prompt: &str) -> CodeAnswer {
     terminal.discard_pending();
     loop {
         if let Err(error) = terminal
-            .write_all(PROMPT.as_bytes())
+            .write_all(prompt.as_bytes())
             .and_then(|_| terminal.flush())
         {
             return CodeAnswer::Unanswered(format!("couldn't write to the terminal ({error})"));
@@ -102,30 +113,74 @@ fn read_line<R: Read>(input: &mut R) -> io::Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&line).into_owned()))
 }
 
-/// Opens the terminal with `open` and asks on it.
-pub(crate) fn confirm_codes_with<T: Terminal>(open: impl FnOnce() -> io::Result<T>) -> CodeAnswer {
+/// Opens the terminal with `open` and asks `prompt` on it.
+pub(crate) fn confirm_with<T: Terminal>(
+    open: impl FnOnce() -> io::Result<T>,
+    prompt: &str,
+) -> CodeAnswer {
     match open() {
-        Ok(mut terminal) => ask_codes_match(&mut terminal),
+        Ok(mut terminal) => ask_yes_no(&mut terminal, prompt),
         Err(error) => CodeAnswer::NoTerminal(format!("couldn't open /dev/tty: {error}")),
     }
 }
 
-/// Asks on the controlling terminal (`/dev/tty`), never stdin: an answer
-/// piped in (`yes | atem pair`) or typed ahead is not a person comparing
-/// the codes.
+/// Asks `prompt` on the controlling terminal (`/dev/tty`), never stdin: an
+/// answer piped in (`yes | atem pair`) or typed ahead is not a person
+/// comparing the codes.
 #[cfg(unix)]
-pub(crate) fn prompt_codes_match() -> CodeAnswer {
-    confirm_codes_with(|| {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-    })
+pub(crate) fn prompt_yes_no(prompt: &str) -> CodeAnswer {
+    confirm_with(
+        || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+        },
+        prompt,
+    )
+}
+
+/// Reads one line of text from the controlling terminal (`/dev/tty`).
+#[cfg(unix)]
+pub(crate) fn prompt_text(prompt: &str) -> Result<String, CodeAnswer> {
+    let mut terminal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| CodeAnswer::NoTerminal(format!("couldn't open /dev/tty: {error}")))?;
+    terminal.discard_pending();
+    terminal
+        .write_all(prompt.as_bytes())
+        .and_then(|_| terminal.flush())
+        .map_err(|error| {
+            CodeAnswer::Unanswered(format!("couldn't write to the terminal ({error})"))
+        })?;
+    match read_line(&mut terminal) {
+        Ok(Some(line)) => Ok(line.trim().to_string()),
+        Ok(None) => Err(CodeAnswer::Unanswered(
+            "the terminal closed before you answered".to_string(),
+        )),
+        Err(error) => Err(CodeAnswer::Unanswered(format!(
+            "couldn't read your answer from the terminal ({error})"
+        ))),
+    }
 }
 
 /// atem ships for Linux and macOS only; elsewhere the answer comes from stdin.
 #[cfg(not(unix))]
-pub(crate) fn prompt_codes_match() -> CodeAnswer {
+pub(crate) fn prompt_text(prompt: &str) -> Result<String, CodeAnswer> {
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| CodeAnswer::Unanswered(error.to_string()))?;
+    Ok(line.trim().to_string())
+}
+
+/// atem ships for Linux and macOS only; elsewhere the answer comes from stdin.
+#[cfg(not(unix))]
+pub(crate) fn prompt_yes_no(prompt: &str) -> CodeAnswer {
     struct Console;
     impl Read for Console {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -143,7 +198,7 @@ pub(crate) fn prompt_codes_match() -> CodeAnswer {
     impl Terminal for Console {
         fn discard_pending(&mut self) {}
     }
-    confirm_codes_with(|| Ok(Console))
+    confirm_with(|| Ok(Console), prompt)
 }
 
 /// A device verification that failed after Astation was shown the code.
@@ -197,6 +252,10 @@ pub(crate) fn code_failure(answer: CodeAnswer) -> Option<VerifyFailure> {
             anyhow!(
                 "Device verification cancelled: {detail}, so nothing was trusted (only y confirms the code)."
             ),
+        )),
+        CodeAnswer::Interrupted => Some(VerifyFailure::local(
+            "atem was interrupted",
+            anyhow!("Device verification cancelled: atem was interrupted, so nothing was trusted."),
         )),
         CodeAnswer::NoTerminal(detail) => Some(VerifyFailure::local(
             "no terminal to compare the code",
@@ -340,12 +399,15 @@ pub(crate) async fn request_key_after_verification(
 /// `atem pair` after the pairing was saved, and `atem pair verify`: a failed verification is shown
 /// in full here, then reported as a short error so the exit status is
 /// nonzero.
-pub(crate) fn verification_result(verification: Result<()>) -> Result<()> {
+pub(crate) fn verification_result(
+    verification: Result<()>,
+    mut warn: impl FnMut(&str),
+) -> Result<()> {
     match verification {
         Ok(()) => Ok(()),
         Err(error) => {
-            eprintln!("\u{26a0}\u{fe0f}  {error}");
-            eprintln!("Pairing is saved. Run 'atem pair verify' to verify this device.");
+            warn(&format!("\u{26a0}\u{fe0f}  {error}"));
+            warn("Pairing is saved. Run 'atem pair verify' to verify this device.");
             Err(anyhow!("device verification failed"))
         }
     }
@@ -454,12 +516,15 @@ mod tests {
 
     #[test]
     fn no_terminal_is_an_actionable_error() {
-        let answer = confirm_codes_with(|| -> io::Result<FakeTerminal> {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "No such device or address",
-            ))
-        });
+        let answer = confirm_with(
+            || -> io::Result<FakeTerminal> {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "No such device or address",
+                ))
+            },
+            PROMPT,
+        );
         assert!(matches!(answer, CodeAnswer::NoTerminal(_)), "{answer:?}");
         let failure = code_failure(answer).unwrap();
         assert_eq!(
@@ -663,8 +728,13 @@ mod tests {
 
     #[test]
     fn pair_fails_after_a_failed_verification() {
-        assert!(verification_result(Ok(())).is_ok());
-        let error = verification_result(Err(anyhow!("codes didn't match"))).unwrap_err();
+        assert!(verification_result(Ok(()), |_| panic!("nothing to warn about")).is_ok());
+        let mut warned = Vec::new();
+        let error = verification_result(Err(anyhow!("codes didn't match")), |line| {
+            warned.push(line.to_string())
+        })
+        .unwrap_err();
+        assert!(warned[0].contains("codes didn't match"), "{warned:?}");
         assert_eq!(error.to_string(), "device verification failed");
     }
 

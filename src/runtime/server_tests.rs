@@ -97,6 +97,7 @@ impl Runtime {
             launcher: launcher(dir.path()),
             profile: None,
             clock: Default::default(),
+            ops: Default::default(),
         };
         let server = tokio::task::spawn_local(serve(app, listener, options, async {
             let _ = stopped.await;
@@ -675,6 +676,7 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
                     launcher: launcher(&root),
                     profile: None,
                     clock: Default::default(),
+                    ops: Default::default(),
                 },
                 async {
                     let _ = stopped.await;

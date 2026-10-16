@@ -35,6 +35,6 @@ mod e2e_tests;
 #[cfg(test)]
 mod kat_tests;
 #[cfg(test)]
-mod fake_astation;
+pub(crate) mod fake_astation;
 #[cfg(test)]
 mod k_agent_tests;

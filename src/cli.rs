@@ -960,6 +960,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             for notice in notices {
                 println!("{notice}");
             }
+            reload_runtime().await;
             Ok(())
         }
         Commands::Agent { agent_command } => match agent_command {
@@ -1192,10 +1193,6 @@ fn prompt_yes_no(question: &str) -> bool {
     }
 }
 
-fn prompt_save_credentials() -> bool {
-    prompt_yes_no("Save credentials so they keep working when Astation disconnects? [y/N]: ")
-}
-
 /// How many Astation pairings `atem unpair` removes: the distinct Astations
 /// of the paired credential entries and the saved sessions.
 fn pairings_to_remove(src: &crate::status::Sources) -> usize {
@@ -1269,12 +1266,22 @@ fn unpair_profile(
     Ok(notices)
 }
 
-/// `atem pair [--save]` — when the profile is already paired, prints its status
-/// and changes nothing (no connection). Otherwise connects to Astation, sends
-/// PairSavePreference, waits for CredentialSync, then verifies this device
-/// (`run_device_verification`).
+/// `atem pair [--save]` — when the profile is already paired, prints its
+/// status and changes nothing (no runtime, no connection). Otherwise the
+/// runtime pairs (pairing code or local), stores the credentials and the
+/// binding, makes the new connection its link and verifies this device on it.
 async fn run_pair(src: &crate::status::Sources, save: bool) -> Result<()> {
-    use tokio::time::{Duration, timeout};
+    run_pair_with(src, save, |options| {
+        crate::runtime::op_client::run(crate::runtime::protocol::OpKind::Pair, options)
+    })
+    .await
+}
+
+async fn run_pair_with<F: std::future::Future<Output = Result<()>>>(
+    src: &crate::status::Sources,
+    save: bool,
+    op: impl FnOnce(crate::runtime::protocol::OpOptions) -> F,
+) -> Result<()> {
     let already = {
         let src = src.clone();
         crate::memory::key_agent::blocking(move || Ok(crate::status::already_paired(&src))).await?
@@ -1283,397 +1290,55 @@ async fn run_pair(src: &crate::status::Sources, save: bool) -> Result<()> {
         print!("{text}");
         return Ok(());
     }
-    // The trust state this pairing starts from: its binding is created only
-    // if nothing changed meanwhile (another atem pair or atem unpair).
-    let before = {
-        let src = src.clone();
-        crate::memory::key_agent::blocking(move || crate::pairing_binding::capture(&src)).await?
-    };
-    let config = src.config.clone();
-
-    println!("Connecting to Astation...");
-    let mut client = crate::websocket_client::AstationClient::new().with_profile(src.clone());
-
-    // Try local-first-then-relay pairing flow. Returns pairing code (or "local").
-    let result = client.connect_with_pairing(&config).await?;
-    if result == "local" {
-        println!("Connected to local Astation.");
-    } else {
-        println!("Pairing code: {}", result);
-        println!("Approve the pairing in your Astation app.");
-    }
-
-    // Resolve save preference: --save skips the prompt; otherwise ask interactively.
-    let requested_save_credentials = if save {
-        true
-    } else {
-        prompt_save_credentials()
-    };
-
-    // Send the preference for peers that support it. Atem still treats the
-    // local choice as authoritative when it stores the received credentials.
-    client
-        .send_message(
-            crate::websocket_client::AstationMessage::PairSavePreference {
-                save_credentials: requested_save_credentials,
-            },
-        )
-        .await?;
-
-    println!("Waiting for Astation to send SSO credentials...");
-
-    let received = timeout(Duration::from_secs(60), async {
-        loop {
-            match client.recv_message_async().await {
-                Some(message) => {
-                    match client.handle_encryption_message(&message).await {
-                        Ok(Some(status)) => {
-                            if status != crate::websocket_client::HOLDING_ENCRYPTION {
-                                println!("{}", crate::memory::unlock::shown(&status));
-                            }
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            println!("Ignored an encryption message: {error}");
-                            continue;
-                        }
-                    }
-                    if let crate::websocket_client::AstationMessage::CredentialSync {
-                        access_token,
-                        refresh_token,
-                        expires_at,
-                        login_id,
-                        astation_id,
-                        save_credentials: server_save_credentials,
-                    } = message
-                    {
-                        return Ok::<_, anyhow::Error>((
-                            access_token,
-                            refresh_token,
-                            expires_at,
-                            login_id,
-                            astation_id,
-                            server_save_credentials,
-                        ));
-                    }
-                }
-                None => anyhow::bail!("Astation connection closed before sending credentials."),
-            }
-        }
-    })
-    .await;
-
-    match received {
-        Ok(Ok((
-            access_token,
-            refresh_token,
-            expires_at,
-            login_id,
-            astation_id,
-            _server_save_credentials,
-        ))) => {
-            let verify_astation_id = astation_id.clone();
-            let mut active_client = if result != "local" {
-                println!("Establishing an authenticated relay session...");
-                // The pairing-code connection never learns Astation's identity:
-                // encryption messages it held are applied on the authenticated one.
-                let held = client.take_held_encryption();
-                drop(client);
-                let mut identity_client =
-                    crate::websocket_client::AstationClient::new().with_profile(src.clone());
-                identity_client
-                    .connect_relay_identity(config.astation_relay_url(), &astation_id)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "Relay room paired, but device authentication failed: {}",
-                            error
-                        )
-                    })?;
-                for message in held {
-                    identity_client.hold_encryption(message);
-                }
-                identity_client
-            } else {
-                client
-            };
-            // The new pairing's binding, in the next host trust generation;
-            // the connection goes on under it.
-            let after = crate::pairing_binding::bind_new(src, &before, &astation_id)?;
-            active_client.adopt_binding(&before, &after)?;
-            active_client.apply_bound(&astation_id, || {
-                crate::config::AtemConfig::store_astation_relay_code(&astation_id);
-                let mut store = crate::credentials::CredentialStore::load();
-                let now = crate::credentials::CredentialEntry::now_secs();
-                store.upsert(crate::credentials::CredentialEntry::new_paired(
-                    access_token,
-                    refresh_token,
-                    expires_at,
-                    login_id.clone(),
-                    astation_id.clone(),
-                    requested_save_credentials,
-                    now,
-                ));
-                store.save()
-            })?;
-            match login_id {
-                Some(id) => println!("Paired with Astation. (SSO: {})", id),
-                None => println!("Paired with Astation."),
-            }
-            if requested_save_credentials {
-                println!("Credentials saved — will work offline.");
-            } else {
-                println!("Credentials are session-only (5 min grace period after disconnect).");
-            }
-            // A failed verification is shown here, then makes the exit
-            // status nonzero; the pairing stays saved.
-            let verified = crate::pair_verify::verification_result(
-                run_device_verification(&mut active_client, &verify_astation_id).await,
-            );
-            // Held until now so they are checked against the pins this run set.
-            for status in active_client.apply_held_encryption().await {
-                println!("{}", crate::memory::unlock::shown(&status));
-            }
-            verified
-        }
-        Ok(Err(e)) => Err(e),
-        Err(_) => anyhow::bail!(
-            "Pairing timed out waiting for credentials. \
-             (Astation may not yet support SSO token sync — check Astation version.)"
-        ),
-    }
+    op(crate::runtime::protocol::OpOptions { save, ..Default::default() }).await
 }
 
-/// `atem pair verify` — verifies this device with the paired Astation over a
-/// connection authenticated with the saved session (no pairing). Does nothing
-/// when that Astation already verified it, and refuses after a revocation.
-/// A cancelled or failed verification keeps the pairing.
+/// `atem pair verify` — verifies this device with the paired Astation on the
+/// runtime's authenticated link (sessions, viewers and chats stay
+/// connected). Does nothing when that Astation already verified it, and
+/// refuses after a revocation, offline. A cancelled or failed verification
+/// keeps the pairing.
 async fn run_pair_verify(src: &crate::status::Sources) -> Result<()> {
-    let astation_id = match crate::status::verify_start(src)? {
+    run_pair_verify_with(src, || {
+        crate::runtime::op_client::run(
+            crate::runtime::protocol::OpKind::PairVerify,
+            Default::default(),
+        )
+    })
+    .await
+}
+
+async fn run_pair_verify_with<F: std::future::Future<Output = Result<()>>>(
+    src: &crate::status::Sources,
+    op: impl FnOnce() -> F,
+) -> Result<()> {
+    match crate::status::verify_start(src)? {
         crate::status::VerifyStart::AlreadyVerified(message) => {
             println!("{message}");
-            return Ok(());
-        }
-        crate::status::VerifyStart::Verify(astation_id) => astation_id,
-    };
-    println!("Connecting to Astation {astation_id}...");
-    let what = "the paired Astation";
-    let mut client = crate::memory::unlock::connect_astation(src, &astation_id, what)
-        .await
-        .map_err(session_advice)?;
-    let verified = crate::pair_verify::verification_result(
-        run_device_verification(&mut client, &astation_id).await,
-    );
-    // Held until now so they are checked against the pins this run set.
-    for status in client.apply_held_encryption().await {
-        println!("{}", crate::memory::unlock::shown(&status));
-    }
-    verified
-}
-
-/// `atem pair verify`'s connection failed: when the saved session was refused
-/// or is missing (a `SessionError` the connect path returned), says what to do
-/// (`atem pair` alone would only show the status), unless it already did.
-fn session_advice(error: anyhow::Error) -> anyhow::Error {
-    use crate::websocket_client::{SessionError, SessionProblem};
-    let advise = error.downcast_ref::<SessionError>().is_some_and(|session| {
-        !session.advised
-            && matches!(
-                session.problem,
-                SessionProblem::Refused | SessionProblem::Missing | SessionProblem::PairingRequired
-            )
-    });
-    if advise {
-        anyhow::anyhow!("{error:#}. {}", crate::status::SESSION_GONE)
-    } else {
-        error
-    }
-}
-
-/// Verifies this device with Astation: commit, receive Astation's keys,
-/// reveal, compare the safety code on both sides, then wait for Astation's
-/// signed certificate. Nothing is trusted unless both sides confirm.
-async fn run_device_verification(
-    client: &mut crate::websocket_client::AstationClient,
-    astation_id: &str,
-) -> Result<()> {
-    use crate::memory::key_agent::blocking;
-    use crate::memory::trust::TrustStore;
-    use crate::memory::unlock::PairEscrow;
-    use crate::memory::verification::{
-        AstationKeys, Handshake, KeyPaths, device_keys_for_verification,
-    };
-    use crate::websocket_client::AstationMessage;
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    use crate::pair_verify::{
-        FIRST_REPLY_TIMEOUT, TOUCH_ID_TIMEOUT, abandon_verification, await_device_verified,
-        code_failure, next_verify_message, prompt_codes_match, request_key_after_verification,
-    };
-    use tokio::time::timeout;
-
-    let paths = KeyPaths::default_paths();
-    // The pairing this verification runs under: every key-agent request,
-    // the pending pin, Astation's certificate and the escrow apply only while
-    // it is current.
-    let capture = client
-        .capture()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!(crate::pairing_binding::NO_BINDING))?;
-    capture.bound_to(astation_id)?;
-    // The device id is this atem's relay identity (`atem_id`): Astation checks it
-    // equals the id the connection authenticated as.
-    let device_id = crate::websocket_client::resolved_atem_id(&crate::auth::get_hostname());
-    // The agent client blocks (socket I/O, autostart): call it off the runtime.
-    let raw_agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> =
-        std::sync::Arc::from(crate::memory::key_agent::default_agent());
-    let agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> = std::sync::Arc::new(
-        crate::pairing_binding::BoundAgent::new(capture.clone(), raw_agent.clone())?,
-    );
-    let keys = {
-        let (paths, agent) = (paths.clone(), agent.clone());
-        // Revoked keys are never set aside here (`atem unpair` does that):
-        // verification never replaces the keys an Astation trusts.
-        blocking(move || device_keys_for_verification(&paths, agent.as_ref()))
-        .await?
-    };
-    let handshake = Handshake::start(keys);
-    client
-        .send_message(AstationMessage::VerifyCommit {
-            device_id: device_id.clone(),
-            commitment: STANDARD.encode(handshake.commitment()),
-        })
-        .await?;
-
-    let astation = match timeout(FIRST_REPLY_TIMEOUT, next_verify_message(client)).await {
-        Err(_) => {
-            if TrustStore::load_from(&paths.trust)?.verified(astation_id).is_some() {
-                println!(
-                    "This Astation doesn't support device verification yet. Pairing is saved; this device stays verified with its existing keys."
-                );
-            } else {
-                println!(
-                    "This Astation doesn't support device verification yet. Pairing is saved; encrypted sync stays off on this device."
-                );
-            }
-            return Ok(());
-        }
-        Ok(result) => match result? {
-            AstationMessage::VerifyKeys {
-                sign_pub,
-                enc_pub,
-                recovery_sign_pub,
-                nonce,
-            } => AstationKeys::from_wire(&sign_pub, &enc_pub, &recovery_sign_pub, &nonce)?,
-            AstationMessage::VerifyAbort { reason } => {
-                anyhow::bail!("Astation stopped device verification: {reason}")
-            }
-            _ => anyhow::bail!("unexpected message during device verification"),
-        },
-    };
-
-    let reveal = handshake.reveal();
-    client
-        .send_message(AstationMessage::VerifyReveal {
-            device_pub: STANDARD.encode(reveal.device_pub),
-            device_sign_pub: STANDARD.encode(reveal.device_sign_pub),
-            unlock_auth_pub: STANDARD.encode(reveal.unlock_auth_pub),
-            nonce: STANDARD.encode(reveal.nonce_a),
-        })
-        .await?;
-    let code = handshake.safety_code(&astation);
-
-    let transcript = handshake.transcript(&astation);
-    capture.apply(|| {
-        TrustStore::update(&paths.trust, |trust| {
-            trust.set_pending(astation_id, &device_id, handshake.keys(), &astation, &code, &transcript);
             Ok(())
+        }
+        crate::status::VerifyStart::Verify(_) => op().await,
+    }
+}
+
+/// `atem unpair` tells a running runtime to drop the link and attachments
+/// of the removed pairing; it never starts one.
+async fn reload_runtime() {
+    let locator = crate::runtime::client::Locator::default_paths();
+    if let Ok(Some(mut client)) =
+        crate::runtime::client::RuntimeClient::existing_at(&locator, true).await
+    {
+        let _ = client.send(&crate::runtime::protocol::ClientMsg::Reload).await;
+        // Wait for its answer, so the link is gone when unpair returns.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Ok(Some(message)) = client.recv().await {
+                if matches!(message, crate::runtime::protocol::RuntimeMsg::Notice { ref text } if text == "Reloaded") {
+                    break;
+                }
+            }
         })
-    })?;
-
-    // From here on every failure drops the pending pin and, unless Astation
-    // cancelled, tells Astation (`abandon_verification`).
-    println!();
-    println!("Safety code:  {code}");
-    println!("Your Mac shows a code too. They must match exactly.");
-    println!("Confirm on both, in either order: type y here, and approve on your Mac with Touch ID.");
-    // Read from the terminal (/dev/tty), never stdin. Blocking, like before.
-    if let Some(failure) = code_failure(prompt_codes_match()) {
-        return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+        .await;
     }
-
-    println!("Waiting for your Mac (approve with Touch ID if you haven't yet)…");
-    let reply = match await_device_verified(client, TOUCH_ID_TIMEOUT).await {
-        Ok(reply) => reply,
-        Err(failure) => {
-            return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
-        }
-    };
-    let applied = {
-        // The raw agent: the whole apply holds the pairing lock already.
-        let (paths, agent, capture) = (paths.clone(), raw_agent.clone(), capture.clone());
-        let astation_id = astation_id.to_string();
-        let keys = handshake.into_keys();
-        blocking(move || {
-            crate::pair_verify::apply_device_verified(
-                &capture,
-                &paths,
-                agent.as_ref(),
-                &astation_id,
-                keys,
-                &reply,
-            )
-        })
-        .await
-    };
-    let outcome = match applied {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let failure = crate::pair_verify::VerifyFailure::local(
-                format!("atem could not apply the verification: {error:#}"),
-                error,
-            );
-            return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
-        }
-    };
-
-    // Verified: nothing below fails the verification.
-    println!("✅ Device verified with Astation (safety code {code}).");
-    // Every warning, whatever the escrow below does (e.g. K couldn't be
-    // stored in the key agent).
-    if let Some(warning) = &outcome.warning {
-        eprintln!("⚠️  {warning}");
-    }
-    // The first escrow, in this run. Until Astation holds the storage key
-    // the plain device_keys file stays on disk.
-    let escrowed = crate::memory::unlock::pair_escrow(
-        &mut *client,
-        &agent,
-        &paths,
-        astation_id,
-        outcome.escrow,
-    )
-    .await;
-    match escrowed {
-        Ok(PairEscrow::Escrowed(storage_kid)) => {
-            println!("Astation holds this device's storage key ({storage_kid}).")
-        }
-        Ok(PairEscrow::HeldByHome(home)) => println!(
-            "This device's storage key is held via your home Astation {home}; nothing to do."
-        ),
-        Ok(PairEscrow::Nothing) => {}
-        Err(error) => eprintln!(
-            "⚠️  {}",
-            crate::memory::unlock::escrow_failure_message(&error)
-        ),
-    }
-    if outcome.key_needed {
-        match request_key_after_verification(client, STANDARD.encode(reveal.device_pub)).await {
-            None => println!("Encryption key requested from Astation"),
-            Some(warning) => eprintln!("⚠️  {warning}"),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2564,13 +2229,15 @@ mod tests {
         let mut src = crate::status::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let before = files(dir.path());
-        run_pair(&src, false).await.unwrap();
+        // The runtime isn't asked either: the status is local.
+        let never = |_| async { panic!("asked the runtime to pair") };
+        run_pair_with(&src, false, never).await.unwrap();
         assert_never_dialed(&listener);
         assert_eq!(files(dir.path()), before);
         // Also while verification is incomplete or after a revocation.
         trust_file(dir.path(), true);
         let before = files(dir.path());
-        run_pair(&src, true).await.unwrap();
+        run_pair_with(&src, true, never).await.unwrap();
         assert_never_dialed(&listener);
         assert_eq!(files(dir.path()), before);
     }
@@ -2580,7 +2247,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut src = crate::status::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
-        let error = run_pair_verify(&src).await.unwrap_err();
+        let never = || async { panic!("asked the runtime to verify") };
+        let error = run_pair_verify_with(&src, never).await.unwrap_err();
         assert_eq!(error.to_string(), "Not paired. Run atem pair first.");
         assert_never_dialed(&listener);
     }
@@ -2593,7 +2261,8 @@ mod tests {
         let mut src = crate::status::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let before = files(dir.path());
-        run_pair_verify(&src).await.unwrap();
+        let never = || async { panic!("asked the runtime to verify") };
+        run_pair_verify_with(&src, never).await.unwrap();
         assert_never_dialed(&listener);
         assert_eq!(files(dir.path()), before);
     }
@@ -2606,7 +2275,8 @@ mod tests {
         let mut src = crate::status::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let before = files(dir.path());
-        let error = run_pair_verify(&src).await.unwrap_err();
+        let never = || async { panic!("asked the runtime to verify") };
+        let error = run_pair_verify_with(&src, never).await.unwrap_err();
         assert_eq!(
             error.to_string(),
             "This device was revoked by Astation astation-1. Run atem unpair, then atem pair, to set it up again."
@@ -2746,38 +2416,5 @@ mod tests {
     #[test]
     fn cred_status_is_gone() {
         assert!(Cli::try_parse_from(["atem", "cred", "status"]).is_err());
-    }
-
-    #[test]
-    fn pair_verify_adds_the_advice_only_to_session_errors() {
-        use crate::websocket_client::{SessionError, SessionProblem};
-        let refused = anyhow::Error::new(SessionError::new(
-            SessionProblem::Refused,
-            false,
-            "Authentication denied: no".into(),
-        ))
-        .context("couldn't reach the paired Astation (a-1)");
-        assert_eq!(
-            format!("{:#}", session_advice(refused)),
-            format!(
-                "couldn't reach the paired Astation (a-1): Authentication denied: no. {}",
-                crate::status::SESSION_GONE
-            )
-        );
-        let advised = anyhow::Error::new(SessionError::new(
-            SessionProblem::PairingRequired,
-            true,
-            format!("Pairing required. {}", crate::status::SESSION_GONE),
-        ));
-        assert_eq!(
-            format!("{:#}", session_advice(advised)),
-            format!("Pairing required. {}", crate::status::SESSION_GONE)
-        );
-        // Not a session problem (even if the text looks like one): unchanged.
-        let network = anyhow::anyhow!("Pairing required? WebSocket connection timed out after 5s");
-        assert_eq!(
-            format!("{:#}", session_advice(network)),
-            "Pairing required? WebSocket connection timed out after 5s"
-        );
     }
 }

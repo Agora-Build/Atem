@@ -319,6 +319,7 @@ impl Runtime {
             }),
             profile: profile_at_start.then(|| crate::status::Sources::in_dir(&profile_dir)),
             clock: clock.clone(),
+            ops: Default::default(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::task::spawn_local(serve(app, unix, options, async {

@@ -419,6 +419,9 @@ pub struct AstationClient {
     /// effects (auth success, credentials, encryption, keys) is applied only
     /// while it is still current (`pairing_binding::Captured::apply`).
     capture: Option<crate::pairing_binding::Captured>,
+    /// Shows the pairing code and its outcome (`authenticate_with_pairing`);
+    /// `None` prints them. The runtime sends them to the CLI that pairs.
+    pairing_notice: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// Why a connection couldn't authenticate with the saved session.
@@ -480,7 +483,58 @@ impl AstationClient {
             held_encryption: Vec::new(),
             profile: None,
             capture: None,
+            pairing_notice: None,
         }
+    }
+
+    /// Pairing lines go to `notice` instead of stdout.
+    pub(crate) fn with_pairing_notice(
+        mut self,
+        notice: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        self.pairing_notice = Some(notice);
+        self
+    }
+
+    fn pairing_line(&self, text: &str) {
+        match &self.pairing_notice {
+            Some(notice) => notice(text),
+            None => println!("{text}"),
+        }
+    }
+
+    /// A handle for one operation on this link (`atem runtime`'s Astation
+    /// operations): it sends through this link's writer and receives only
+    /// what the link's owner routes to it through the returned sender. It
+    /// shares the link's identity and captured pairing; dropping it leaves
+    /// the link alone.
+    pub(crate) fn op_view(&self) -> (Self, mpsc::Sender<AstationMessage>) {
+        let (tx, rx) = mpsc::channel(64);
+        let mut view = Self::new();
+        view.sender = self.sender.clone();
+        view.terminal_sender = self.terminal_sender.clone();
+        view.receiver = Some(rx);
+        view.atem_id_override = self.atem_id_override.clone();
+        view.session_path_override = self.session_path_override.clone();
+        #[cfg(test)]
+        {
+            view.relay_code_path_override = self.relay_code_path_override.clone();
+            view.local_token_path_override = self.local_token_path_override.clone();
+        }
+        view.connected_astation_id = self.connected_astation_id.clone();
+        view.profile = self.profile.clone();
+        view.capture = self.capture.clone();
+        (view, tx)
+    }
+
+    /// This atem's relay identity (`atem_id`), the device id verification uses.
+    pub(crate) fn device_atem_id(&self) -> String {
+        self.resolved_atem_id(&crate::auth::get_hostname())
+    }
+
+    /// Records `astation_id` as the relay identity room to reconnect to.
+    pub(crate) fn remember_relay_code(&self, astation_id: &str) {
+        self.remember_astation_relay_code(astation_id);
     }
 
     /// The profile this client reads and writes (`with_profile`, else this
@@ -917,9 +971,9 @@ impl AstationClient {
         let pairing_code = crate::auth::generate_otp();
         let hostname = crate::auth::get_hostname();
 
-        println!("🔐 Pairing with Astation...");
-        println!("   Code: {}", pairing_code);
-        println!("   Waiting for approval...");
+        self.pairing_line("🔐 Pairing with Astation...");
+        self.pairing_line(&format!("   Code: {}", pairing_code));
+        self.pairing_line("   Waiting for approval...");
 
         // Send pairing auth
         let mut auth_data = std::collections::HashMap::new();
@@ -943,11 +997,11 @@ impl AstationClient {
 
         match response {
             Some(AuthResponse::Authenticated) => {
-                println!("✅ Pairing approved!");
+                self.pairing_line("✅ Pairing approved!");
                 Ok(())
             }
             Some(AuthResponse::Denied(msg)) => {
-                println!("❌ Pairing denied: {}", msg);
+                self.pairing_line(&format!("❌ Pairing denied: {}", msg));
                 Err(anyhow!("Pairing denied: {}", msg))
             }
             Some(AuthResponse::SessionExpired) => {
@@ -1236,18 +1290,34 @@ impl AstationClient {
 
     /// Best effort metadata; failure never prevents the user's command.
     pub async fn report_credential_projects(&self) -> Result<()> {
-        use crate::memory::key_agent::{blocking, running_agent, KeyAgentApi};
-        let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
+        self.report_credential_projects_in(std::env::current_dir().ok()).await
+    }
+
+    /// `report_credential_projects` naming the Git project of `cwd`.
+    pub(crate) async fn report_credential_projects_in(&self, cwd: Option<std::path::PathBuf>) -> Result<()> {
+        use crate::memory::key_agent::{blocking, running_agent};
         crate::auth::pairing_session()
             .map_err(|_| anyhow!("this machine isn't paired with an Astation"))?;
+        let agent = blocking(|| running_agent().ok_or_else(|| anyhow!("key agent is not running"))).await?;
+        self.report_credential_projects_with(cwd, std::sync::Arc::from(agent)).await
+    }
+
+    /// The credential-project report signed by `agent` (`atem cred
+    /// projects` runs in the runtime, for the CLI's directory).
+    pub(crate) async fn report_credential_projects_with(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>,
+    ) -> Result<()> {
+        use crate::memory::key_agent::{blocking, KeyAgentApi};
+        let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
         // Signed only under the pairing this connection authenticated with.
         let capture = self.capture.clone().ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
         capture.bound()?;
         let report = blocking(move || {
-            let agent = running_agent().ok_or_else(|| anyhow!("key agent is not running"))?;
-            let agent = crate::pairing_binding::BoundAgent::new(capture, std::sync::Arc::from(agent))?;
+            let agent = crate::pairing_binding::BoundAgent::new(capture, agent)?;
             if !agent.status()?.unlocked { return Err(anyhow!("key agent is locked")); }
-            let project = std::env::current_dir().ok().and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.label);
+            let project = cwd.and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.label);
             agent.credential_projects(&astation_id, project)
         }).await?;
         self.send_message_flushed(AstationMessage::CredentialProjectListResponse { report }).await
@@ -1394,6 +1464,16 @@ impl AstationClient {
             }
         }
         statuses
+    }
+
+    /// Finishes this device's part of a pending migration of
+    /// `astation_id`'s account under the newest signed state (`atem cred
+    /// unlock` on an already unlocked device).
+    pub(crate) async fn finish_pending_migration(&self, astation_id: &str) -> Result<Option<String>> {
+        let trust = crate::memory::trust::TrustStore::load_from(&crate::memory::verification::KeyPaths::default_paths().trust)?;
+        let kid = crate::memory::verification::effective_state(&trust, astation_id)?
+            .and_then(|(_, state)| state).and_then(|state| state.kid);
+        self.finish_encryption_migration(astation_id, kid).await
     }
 
     async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {

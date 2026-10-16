@@ -1,4 +1,5 @@
 pub mod hosted;
+pub mod op_route;
 mod reauth;
 #[cfg(test)]
 mod session_tests;
@@ -109,6 +110,12 @@ pub struct App {
     /// Mark-task notices for `atem runtime`: those naming a session go to
     /// that session's frontend only, the others to the runtime's log.
     pub task_notices: Vec<(Option<SessionId>, String)>,
+    /// The running Astation operation's replies (`atem runtime`; see
+    /// `app/op_route.rs`).
+    pub op_route: Option<op_route::OpRoute>,
+    /// Why the last background connect failed, when the saved session was
+    /// the problem (shown to a pairing or unlock waiting for the link).
+    pub astation_connect_error: Option<String>,
 }
 
 impl App {
@@ -146,6 +153,8 @@ impl App {
             astation_reauth: None,
             main_task_session: None,
             task_notices: Vec::new(),
+            op_route: None,
+            astation_connect_error: None,
         };
         app.rebuild_menu();
         app
@@ -435,15 +444,27 @@ impl App {
             // Try local connection first
             let mut client = crate::websocket_client::AstationClient::new();
 
+            // A refused or missing saved session is worth telling a
+            // pairing or unlock that waits for this link.
+            let mut session_problem = None;
+            let mut note = |error: anyhow::Error| {
+                if error.downcast_ref::<crate::websocket_client::SessionError>().is_some() {
+                    session_problem = Some(error);
+                }
+            };
+
             // If we have a valid session, try local with session auth
             if let Some(ref sess) = session {
                 if sess.is_valid() {
-                    if let Ok(()) = client
+                    match client
                         .connect_with_session(local_url, &sess.session_id)
                         .await
                     {
-                        let _ = tx.send(Ok((client, None)));
-                        return;
+                        Ok(()) => {
+                            let _ = tx.send(Ok((client, None)));
+                            return;
+                        }
+                        Err(error) => note(error),
                     }
                 }
             }
@@ -456,7 +477,7 @@ impl App {
                     let _ = tx.send(Ok((client, Some("local".to_string()))));
                     return;
                 }
-                Err(_) => {}
+                Err(error) => note(error),
             }
 
             // Local unavailable — try relay identity if configured
@@ -471,11 +492,14 @@ impl App {
                         let _ = tx.send(Ok((relay_client, Some(relay_code))));
                         return;
                     }
-                    Err(_) => {}
+                    Err(error) => note(error),
                 }
             }
 
-            let _ = tx.send(Err(anyhow::anyhow!("Astation not reachable")));
+            let _ = tx.send(Err(match session_problem {
+                Some(error) => crate::runtime::ops::session_advice(error),
+                None => anyhow::anyhow!("Astation not reachable"),
+            }));
         });
     }
 
@@ -489,6 +513,7 @@ impl App {
                     self.astation_client = client;
                     self.astation_connected = true;
                     self.astation_link_gen += 1;
+                    self.astation_connect_error = None;
                     self.pairing_code = code;
                     self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
@@ -500,7 +525,10 @@ impl App {
                         let _ = session.save();
                     }
                 }
-                Ok(Err(_)) => {
+                Ok(Err(error)) => {
+                    self.astation_connect_error = error
+                        .downcast_ref::<crate::runtime::ops::SessionAdvice>()
+                        .map(|advice| advice.0.clone());
                     // Connection failed — schedule background retry every 30s.
                     // Instant is monotonic and pauses during system sleep, so the timer
                     // only counts awake time — no battery drain while the device sleeps.
@@ -528,6 +556,10 @@ impl App {
         if self.intercept_astation_reauth(&message).await {
             return;
         }
+        // A running pairing or unlock's replies are its own.
+        let Some(message) = self.route_to_op(message) else {
+            return;
+        };
         match self.astation_client.handle_encryption_message(&message).await {
             Ok(Some(status)) => {
                 self.status_message = Some(status);

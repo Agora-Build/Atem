@@ -8,6 +8,8 @@ pub mod broker;
 pub mod client;
 pub mod commands;
 pub mod host_bridge;
+pub mod op_client;
+pub mod ops;
 pub mod protocol;
 pub mod server;
 pub mod session_log;
@@ -15,6 +17,8 @@ pub mod worker;
 pub mod worker_chat;
 pub mod worker_protocol;
 
+#[cfg(test)]
+mod ops_tests;
 #[cfg(test)]
 mod server_tests;
 
@@ -39,6 +43,13 @@ pub fn files(config_dir: &Path, runtime_dir: Option<OsString>) -> DaemonFiles {
 /// specs under `workers/`.
 pub fn state_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("runtime")
+}
+
+static IN_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process is `atem runtime` (it holds the Astation link itself).
+pub fn in_runtime() -> bool {
+    IN_RUNTIME.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// `ATEM_RUNTIME_IDLE_SECS` (for tests), else 10 minutes.
@@ -71,6 +82,7 @@ async fn shutdown_signal() {
 pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     // Taken now, before a rebuild can replace the executable on disk.
     let build = crate::memory::key_agent::build_id();
+    IN_RUNTIME.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(home) = dirs::home_dir() {
         let _ = std::env::set_current_dir(home);
     }
@@ -102,6 +114,7 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
         launcher: broker::Launcher::Process(paths),
         profile: crate::status::Sources::current().ok(),
         clock: host_bridge::Clock::default(),
+        ops: ops::OpEnv::default(),
     };
     let served = server::serve(app, listener, options, shutdown_signal()).await;
     // A clean exit takes its pid out of the lock and removes its socket.

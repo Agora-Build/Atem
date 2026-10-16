@@ -193,6 +193,25 @@ pub fn capture(src: &Sources) -> Result<TrustState> {
     Ok(state)
 }
 
+/// The state a first pairing starts from (`capture`), recorded even when
+/// the profile never had a binding: the session the pairing saves before
+/// its binding exists must not read as a migrating pairing (which would
+/// make `bind_new` refuse it as changed).
+pub fn capture_for_pairing(src: &Sources) -> Result<TrustState> {
+    let _lock = lock(src)?;
+    let mut state = load(src)?;
+    if !state.recorded {
+        if let Some(binding) = state.binding.as_mut() {
+            binding.created_at = now_secs();
+        } else {
+            state.host_trust_gen += 1;
+        }
+        write_file(&src.pairing, &state)?;
+        state.recorded = true;
+    }
+    Ok(state)
+}
+
 /// `atem unpair`'s first step: durably commits the next generation without
 /// a binding, so every capture of the old one goes stale before anything is
 /// removed. Returns the new generation.

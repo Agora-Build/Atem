@@ -110,8 +110,92 @@ pub enum ClientMsg {
     Stop {
         session_id: String,
     },
-    /// Re-read credentials and config.
+    /// Re-read credentials and config; a link whose pairing is gone (after
+    /// `atem unpair`) is dropped with its attachments.
     Reload,
+    /// Runs an Astation operation on the runtime's link: `print`/`ask`
+    /// follow, then `done`. One at a time.
+    AstationOp {
+        request_id: String,
+        kind: OpKind,
+        #[serde(default)]
+        options: OpOptions,
+    },
+    /// The answer to an `ask`.
+    Answer {
+        request_id: String,
+        question_id: u64,
+        value: AnswerValue,
+    },
+}
+
+/// The Astation operations a client may ask the runtime to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpKind {
+    /// First pairing (`atem pair`).
+    Pair,
+    /// `atem pair verify`.
+    PairVerify,
+    CredUnlock,
+    CredProjects,
+    /// A fresh paired access token (`atem project …` near expiry).
+    Token,
+}
+
+impl OpKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpKind::Pair => "pair",
+            OpKind::PairVerify => "pair_verify",
+            OpKind::CredUnlock => "cred_unlock",
+            OpKind::CredProjects => "cred_projects",
+            OpKind::Token => "token",
+        }
+    }
+}
+
+/// An operation's options.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpOptions {
+    /// `pair --save`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub save: bool,
+    /// `token`: the paired Astation whose credentials are wanted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub astation_id: Option<String>,
+    /// `cred_projects`: the client's working directory (its Git project).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+}
+
+/// What a client answered: `yes`/`no` (yes_no), `text`, or why it couldn't
+/// (`no_terminal`: nothing to ask on; `unanswered`: the terminal closed).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "text", rename_all = "snake_case")]
+pub enum AnswerValue {
+    Yes,
+    No,
+    Text(String),
+    NoTerminal(String),
+    Unanswered(String),
+}
+
+/// How an `ask` is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    YesNo,
+    Text,
+}
+
+/// How a `print` is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrintLevel {
+    Info,
+    Warn,
+    Error,
 }
 
 impl ClientMsg {
@@ -128,6 +212,8 @@ impl ClientMsg {
             ClientMsg::List => "list",
             ClientMsg::Stop { .. } => "stop",
             ClientMsg::Reload => "reload",
+            ClientMsg::AstationOp { .. } => "astation_op",
+            ClientMsg::Answer { .. } => "answer",
         }
     }
 
@@ -234,6 +320,26 @@ pub enum RuntimeMsg {
     },
     Notice {
         text: String,
+    },
+    /// Output of the operation `request_id`.
+    Print {
+        request_id: String,
+        level: PrintLevel,
+        text: String,
+    },
+    /// A question of the operation `request_id`, answered with `answer`.
+    Ask {
+        request_id: String,
+        question_id: u64,
+        kind: AskKind,
+        text: String,
+    },
+    /// The operation `request_id` ended.
+    Done {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     Error {
         text: String,
@@ -454,6 +560,30 @@ mod tests {
                 session_id: "s".into(),
             },
             ClientMsg::Reload,
+            ClientMsg::AstationOp {
+                request_id: "r".into(),
+                kind: OpKind::PairVerify,
+                options: OpOptions::default(),
+            },
+            ClientMsg::AstationOp {
+                request_id: "r".into(),
+                kind: OpKind::Token,
+                options: OpOptions {
+                    save: true,
+                    astation_id: Some("a".into()),
+                    cwd: Some("/w".into()),
+                },
+            },
+            ClientMsg::Answer {
+                request_id: "r".into(),
+                question_id: 2,
+                value: AnswerValue::Yes,
+            },
+            ClientMsg::Answer {
+                request_id: "r".into(),
+                question_id: 3,
+                value: AnswerValue::NoTerminal("no tty".into()),
+            },
         ];
         for message in messages {
             let line = encode_client(&message);
@@ -504,6 +634,22 @@ mod tests {
             RuntimeMsg::Session { session: summary() },
             RuntimeMsg::Astation { connected: false },
             RuntimeMsg::Notice { text: "n".into() },
+            RuntimeMsg::Print {
+                request_id: "r".into(),
+                level: PrintLevel::Warn,
+                text: "t".into(),
+            },
+            RuntimeMsg::Ask {
+                request_id: "r".into(),
+                question_id: 1,
+                kind: AskKind::YesNo,
+                text: "q".into(),
+            },
+            RuntimeMsg::Done {
+                request_id: "r".into(),
+                ok: false,
+                error: Some("e".into()),
+            },
             RuntimeMsg::error("bad", Some("launch")),
             RuntimeMsg::error("bad", None),
         ];

@@ -366,6 +366,14 @@ impl HostBridge {
         SessionHost::new(ctx, config, journal, random_ids()).map_err(|e| anyhow::anyhow!(e.0))
     }
 
+    /// The link may attach now (its pairing was just verified): it is
+    /// considered again at the next pass, unless it is attached already.
+    pub fn reconsider(&mut self) {
+        if self.link.is_none() {
+            self.considered = None;
+        }
+    }
+
     /// The attachment holding `session_id`'s lease.
     pub fn lease_holder(&self, session_id: &str) -> Option<&str> {
         self.host.lease_holder(session_id)

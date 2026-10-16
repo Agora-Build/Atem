@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::encoding::dec;
 use crate::memory::key_agent::{
-    KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, default_agent, running_agent,
+    KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, running_agent,
 };
 use crate::memory::statements::{SignedWire, StorageRotate};
 use crate::memory::storage_key::{
@@ -20,6 +20,7 @@ use crate::memory::storage_key::{
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
 use crate::memory::verification::{KeyPaths, key_needed};
+use crate::runtime::protocol::PrintLevel;
 use crate::websocket_client::{AstationClient, AstationMessage};
 
 /// Touch ID may take a while: the user may have to walk to the Mac.
@@ -48,6 +49,13 @@ pub(crate) trait AstationLink {
     /// Applies a signed `encryptionMode` or `keyGrant` (checked against the
     /// pinned keys) and returns its status line; `None` for other traffic.
     async fn apply_encryption(&mut self, message: &AstationMessage) -> Result<Option<String>>;
+    /// Shows a line to the user (the runtime sends it to the CLI that asked).
+    fn print(&mut self, level: PrintLevel, text: &str) {
+        match level {
+            PrintLevel::Info => println!("{text}"),
+            PrintLevel::Warn | PrintLevel::Error => eprintln!("{text}"),
+        }
+    }
 }
 
 impl AstationLink for AstationClient {
@@ -110,11 +118,14 @@ async fn apply_encryption_message<L: AstationLink>(link: &mut L, message: &Astat
         // "…locked; run `atem cred unlock`" is noise here: this is the
         // unlock, and it asks for a missing key once the keys are unlocked.
         Ok(Some(status)) if status.contains(LOCKED) => {}
-        Ok(Some(status)) => println!("{}", shown(&status)),
+        Ok(Some(status)) => link.print(PrintLevel::Info, &shown(&status)),
         Ok(None) => {}
-        Err(error) => eprintln!(
-            "⚠️  Ignored an encryption message: {}",
-            shown(&format!("{error:#}"))
+        Err(error) => link.print(
+            PrintLevel::Warn,
+            &format!(
+                "⚠️  Ignored an encryption message: {}",
+                shown(&format!("{error:#}"))
+            ),
         ),
     }
 }
@@ -478,8 +489,11 @@ async fn send_rotation<L: AstationLink>(
                     .send(AstationMessage::StorageKeyConfirm { confirm })
                     .await
                 {
-                    eprintln!(
-                        "⚠️  The storage key was rotated ({storage_kid}), but the confirmation didn't reach Astation ({error:#}); Astation settles it at the next unlock."
+                    link.print(
+                        PrintLevel::Warn,
+                        &format!(
+                            "⚠️  The storage key was rotated ({storage_kid}), but the confirmation didn't reach Astation ({error:#}); Astation settles it at the next unlock."
+                        ),
                     );
                 }
                 return Ok(storage_kid);
@@ -636,21 +650,25 @@ pub(crate) async fn unlock_and_rotate<L: AstationLink>(
         blocking(move || agent.status()).await?
     };
     if status.unlocked {
-        match escrow_if_needed(link, agent, paths, home).await? {
-            Some(kid) => println!("Astation now holds this device's storage key ({kid})."),
-            None => println!(
+        let text = match escrow_if_needed(link, agent, paths, home).await? {
+            Some(kid) => format!("Astation now holds this device's storage key ({kid})."),
+            None => format!(
                 "Already unlocked (storage key {}).",
                 status.storage_kid.unwrap_or_default()
             ),
-        }
+        };
+        link.print(PrintLevel::Info, &text);
     } else {
-        println!("Approve on your Mac with Touch ID…");
+        link.print(PrintLevel::Info, "Approve on your Mac with Touch ID…");
         let kid = unlock_via(link, agent, paths, home, wait).await?;
-        println!("✅ Unlocked (storage key {kid}).");
+        link.print(PrintLevel::Info, &format!("✅ Unlocked (storage key {kid})."));
         match rotate_via(link, agent, paths, home, ROTATION_TIMEOUT).await {
-            Ok(kid) => println!("Storage key rotated ({kid})."),
-            Err(error) => eprintln!(
-                "⚠️  The storage key wasn't rotated ({error:#}); it rotates at the next unlock."
+            Ok(kid) => link.print(PrintLevel::Info, &format!("Storage key rotated ({kid}).")),
+            Err(error) => link.print(
+                PrintLevel::Warn,
+                &format!(
+                    "⚠️  The storage key wasn't rotated ({error:#}); it rotates at the next unlock."
+                ),
             ),
         }
     }
@@ -677,23 +695,22 @@ pub fn lock_keys_message(agent: Option<&dyn KeyAgentApi>) -> Result<String> {
 }
 
 /// `atem cred …` (tier 2: needs a pairing with Astation; the status is
-/// `atem status`).
+/// `atem status`). `projects` and `unlock` run in `atem runtime`, on its
+/// Astation link (`runtime/ops.rs`); `lock` stays local.
 pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
     use crate::cli::CredCommands;
+    use crate::runtime::protocol::{OpKind, OpOptions};
     crate::auth::require_pairing("atem cred")?;
-    let paths = KeyPaths::default_paths();
     match command {
         CredCommands::Projects => {
             crate::auth::require_pairing("credential project discovery")?;
-            let trust = TrustStore::load_from(&paths.trust)?;
-            let home = trust.home().ok_or_else(|| anyhow!("Verify this device with Astation first"))?;
-            if !blocking(|| default_agent().status().map(|status| status.unlocked)).await? { bail!(LOCKED); }
-            let client = tokio::time::timeout(Duration::from_secs(15), connect_home(home)).await
-                .map_err(|_| anyhow!("Astation connection timed out; retry project reporting"))??;
-            client.report_credential_projects().await
-                .context("Project reporting requires an updated, unlocked Atem key agent")?;
-            println!("Sent project suggestions to Astation.");
-            Ok(())
+            let trust = TrustStore::load_from(&KeyPaths::default_paths().trust)?;
+            trust.home().ok_or_else(|| anyhow!("Verify this device with Astation first"))?;
+            let options = OpOptions {
+                cwd: std::env::current_dir().ok(),
+                ..OpOptions::default()
+            };
+            crate::runtime::op_client::run(OpKind::CredProjects, options).await
         }
         CredCommands::Unlock => unlock_command(&crate::status::Sources::current()?).await,
         CredCommands::Lock => {
@@ -704,94 +721,33 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
     }
 }
 
-/// Connects to the home Astation without pairing.
-async fn connect_home(home: &str) -> Result<AstationClient> {
-    let src = crate::status::Sources::current()?;
-    connect_astation(&src, home, "this device's home Astation").await
-}
-
-/// Connects to `astation_id` (`what` names it in errors) with the saved
-/// session of the profile `src`, never pairing: locally when the local
-/// Astation is that one, else through its relay identity room.
-pub(crate) async fn connect_astation(
-    src: &crate::status::Sources,
-    astation_id: &str,
-    what: &str,
-) -> Result<AstationClient> {
-    let config = &src.config;
-    let mut local = AstationClient::new().with_profile(src.clone());
-    if local
-        .connect_without_pairing(config.astation_ws())
-        .await
-        .is_ok()
-        && local.connected_astation_id() == Some(astation_id)
-    {
-        return Ok(local);
-    }
-    drop(local);
-    let mut client = AstationClient::new().with_profile(src.clone());
-    client
-        .connect_relay_identity_without_pairing(config.astation_relay_url(), astation_id)
-        .await
-        .with_context(|| format!("couldn't reach {what} ({astation_id})"))?;
-    if client.connected_astation_id() != Some(astation_id) {
-        bail!("connected to a different Astation than {what} ({astation_id})");
-    }
-    Ok(client)
-}
-
-/// `atem cred unlock`: never pairs or verifies; an unverified device stops
-/// here, offline.
-pub(crate) async fn unlock_command(src: &crate::status::Sources) -> Result<()> {
-    let paths = &src.keys;
-    let trust = TrustStore::load_from(&paths.trust)?;
-    let home = match (trust.home(), trust.recorded_home()) {
-        (Some(home), _) => home.to_string(),
+/// The home Astation `atem cred unlock` unlocks with: never pairs or
+/// verifies, so an unverified device stops here, offline.
+pub(crate) fn unlock_home(src: &crate::status::Sources) -> Result<String> {
+    let trust = TrustStore::load_from(&src.keys.trust)?;
+    match (trust.home(), trust.recorded_home()) {
+        (Some(home), _) => Ok(home.to_string()),
         (None, Some(stale)) => bail!(
             "This device's home Astation ({stale}) no longer verifies it, so its keys can't be unlocked. {RESET}"
         ),
         (None, None) => bail!(crate::status::UNVERIFIED_UNLOCK),
-    };
-    let agent: Arc<dyn KeyAgentApi> = Arc::from(default_agent());
-    let nothing_to_do = {
-        let (agent, paths, home) = (agent.clone(), paths.clone(), home.clone());
-        blocking(move || already_unlocked(agent.as_ref(), &paths, &home)).await?
-    };
-    if let Some(message) = nothing_to_do {
-        println!("{message}");
-        if migration_pending(&TrustStore::load_from(&paths.trust)?, &home)? {
-            // Astation sends the signed state on connect; applying it finishes
-            // the migration and sends the signed completion report.
-            println!("Finishing the encryption migration with Astation…");
-            let mut client = connect_astation(src, &home, "this device's home Astation").await?;
-            finish_migration(&mut client, MIGRATION_WAIT).await;
-        }
-        return Ok(());
     }
-    let mut client = connect_astation(src, &home, "this device's home Astation").await?;
-    // Every key-agent request from here on (finishing the unlock, rotation,
-    // escrow) runs only while the pairing this connection authenticated
-    // under is current: a grant or ack arriving after `atem unpair` is dropped.
-    let capture = client
-        .capture()
-        .cloned()
-        .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
-    let agent: Arc<dyn KeyAgentApi> =
-        Arc::new(crate::pairing_binding::BoundAgent::new(capture, agent)?);
-    unlock_and_rotate(&mut client, &agent, paths, &home, UNLOCK_TIMEOUT).await?;
-    // The report sent on connect was skipped (the keys were still locked);
-    // send it now, on the same connection. Best effort, like on connect.
-    let _ = client.report_credential_projects().await;
-    Ok(())
 }
 
-/// How long an already unlocked `atem cred unlock` waits for Astation's
-/// signed state when a migration is pending.
-const MIGRATION_WAIT: Duration = Duration::from_secs(15);
+/// `atem cred unlock`: the offline checks, then the unlock in `atem
+/// runtime` on its link.
+pub(crate) async fn unlock_command(src: &crate::status::Sources) -> Result<()> {
+    unlock_home(src)?;
+    crate::runtime::op_client::run(
+        crate::runtime::protocol::OpKind::CredUnlock,
+        Default::default(),
+    )
+    .await
+}
 
 /// The newest signed state for `home`'s account is `enabling` or
 /// `disabling`: this device's part of the migration may not be reported yet.
-fn migration_pending(trust: &TrustStore, home: &str) -> Result<bool> {
+pub(crate) fn migration_pending(trust: &TrustStore, home: &str) -> Result<bool> {
     Ok(matches!(
         crate::memory::verification::effective_state(trust, home)?,
         Some((_, Some(state)))
@@ -799,32 +755,10 @@ fn migration_pending(trust: &TrustStore, home: &str) -> Result<bool> {
     ))
 }
 
-/// Applies the encryption messages Astation sends on connect until one
-/// `encryptionMode` is handled (that runs the migration and reports it), at
-/// most `wait`.
-async fn finish_migration<L: AstationLink>(link: &mut L, wait: Duration) {
-    // Only the wait for Astation's message is timed: applying an
-    // `encryptionMode` runs the migration, which may take longer.
-    let deadline = tokio::time::Instant::now() + wait;
-    loop {
-        let Ok(Some(message)) = tokio::time::timeout_at(deadline, link.recv()).await else {
-            eprintln!("⚠️  Astation didn't send the encryption state; try again in a moment.");
-            return;
-        };
-        let is_mode = matches!(message, AstationMessage::EncryptionMode { .. });
-        if is_mode || matches!(message, AstationMessage::KeyGrant { .. }) {
-            apply_encryption_message(link, &message).await;
-            if is_mode {
-                return;
-            }
-        }
-    }
-}
-
 /// "Already unlocked" when `atem cred unlock` needs no Touch ID:
 /// the keys are unlocked, Astation holds their storage key, no rotation is
 /// waiting to be resent and `K` isn't missing (blocking: agent call).
-fn already_unlocked(
+pub(crate) fn already_unlocked(
     agent: &dyn KeyAgentApi,
     paths: &KeyPaths,
     home: &str,
@@ -879,17 +813,21 @@ async fn request_missing_key<L: AstationLink>(
     };
     link.send(AstationMessage::KeyRequest { public_key })
         .await?;
-    println!("Encryption key requested from Astation…");
+    link.print(PrintLevel::Info, "Encryption key requested from Astation…");
     let grant = next_reply(link, KEY_TIMEOUT, "to send the encryption key", |message| {
         matches!(message, AstationMessage::KeyGrant { .. })
     })
     .await;
     match grant {
         Ok(grant) => apply_encryption_message(link, &grant).await,
-        Err(error) if error.downcast_ref::<NoAnswer>().is_some() => {
-            eprintln!("⚠️  Astation didn't send the key yet; it arrives on a later connection.")
-        }
-        Err(error) => eprintln!("⚠️  {}", shown(&format!("{error:#}"))),
+        Err(error) if error.downcast_ref::<NoAnswer>().is_some() => link.print(
+            PrintLevel::Warn,
+            "⚠️  Astation didn't send the key yet; it arrives on a later connection.",
+        ),
+        Err(error) => link.print(
+            PrintLevel::Warn,
+            &format!("⚠️  {}", shown(&format!("{error:#}"))),
+        ),
     }
     Ok(())
 }
@@ -1183,32 +1121,6 @@ mod tests {
                 "{mode:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn finishing_a_migration_applies_the_state_astation_sends_on_connect() {
-        let dir = tempfile::tempdir().unwrap();
-        let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
-        let agent = agent(&paths);
-        set_state(&paths, &server.astation, EncryptionMode::Off, None, 58);
-        let mut link = ScriptedLink::new(server).with_keys(&paths, &agent);
-        let mode = signed_mode(&link.server, EncryptionMode::On, 59);
-        // Unrelated traffic first, then the state.
-        link.inbox.push_back(AstationMessage::Heartbeat {
-            timestamp: "1".into(),
-        });
-        link.inbox.push_back(mode);
-        finish_migration(&mut link, WAIT).await;
-        assert_eq!(link.applied.len(), 1, "{:?}", link.applied);
-        assert!(
-            link.applied[0].starts_with("ModeChanged"),
-            "{:?}",
-            link.applied
-        );
-        assert_eq!(
-            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
-            EncryptionMode::On
-        );
     }
 
     #[tokio::test]

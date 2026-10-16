@@ -8,6 +8,7 @@
 use super::adopt::{Adoption, SpawnRequest, WorkerHandle};
 use super::broker::{BrokerSession, Launcher, SessionState};
 use super::host_bridge::{Clock, HostBridge};
+use super::ops::{BUSY, ClientUi, OpCall, OpEnv};
 use super::protocol::{
     ClientMsg, DecodeError, MAX_OUTPUT, PROTOCOL, RuntimeMsg, SessionSummary, b64, encode_runtime,
     input_bytes, paste_text,
@@ -48,6 +49,8 @@ pub struct Options {
     pub profile: Option<crate::status::Sources>,
     /// The session host's monotonic clock.
     pub clock: Clock,
+    /// What Astation operations (pairing, unlock) run with.
+    pub ops: OpEnv,
 }
 
 /// A launch that finished on its task.
@@ -148,6 +151,27 @@ struct Server {
     bridge: Option<HostBridge>,
     /// The Astation link state the clients last heard.
     astation: bool,
+    /// The running Astation operation (pairing, unlock), one at a time.
+    op: Option<ActiveOp>,
+    op_calls: mpsc::UnboundedSender<OpCall>,
+    /// The running operation waits for the link to come up.
+    op_waiting: Option<OpWaiting>,
+}
+
+/// A running operation waits for the link: (encryption, credentials, reply).
+type OpWaiting = (
+    bool,
+    bool,
+    tokio::sync::oneshot::Sender<Result<crate::websocket_client::AstationClient, String>>,
+);
+
+/// The Astation operation a client asked for (`ops.rs`).
+struct ActiveOp {
+    client: u64,
+    request_id: String,
+    answers: mpsc::UnboundedSender<(u64, super::protocol::AnswerValue)>,
+    /// Set when the client went away.
+    gone: tokio::sync::watch::Sender<bool>,
 }
 
 /// Serves frontends on `listener` with `app` as the host until `shutdown`
@@ -201,6 +225,7 @@ pub async fn serve(
         }
     };
     app.hosted = Some(crate::app::hosted::Hosted::default());
+    let (op_calls, mut op_called) = mpsc::unbounded_channel::<OpCall>();
     let mut server = Server {
         app,
         options,
@@ -217,6 +242,9 @@ pub async fn serve(
         wake: wake.clone(),
         bridge,
         astation: false,
+        op: None,
+        op_calls,
+        op_waiting: None,
     };
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -231,7 +259,9 @@ pub async fn serve(
                 server.host_pass().await;
                 server.forward_status();
                 server.forward_astation();
+                server.op_tick();
             }
+            Some(call) = op_called.recv() => server.op_call(call),
             Some(stream) = accepted.recv() => server.add_client(stream),
             Some(done) = launched.recv() => server.launched(done),
             adoption = adoptions.recv(), if server.adopting => match adoption {
@@ -400,6 +430,10 @@ impl Server {
     fn remove_client(&mut self, id: u64) {
         if let Some(mut client) = self.clients.remove(&id) {
             client.close();
+        }
+        // Its operation ends as a failure (verification tells Astation).
+        if let Some(op) = self.op.as_ref().filter(|op| op.client == id) {
+            let _ = op.gone.send(true);
         }
         let gone: Vec<SessionId> = self
             .attached
@@ -921,9 +955,39 @@ impl Server {
                     _ => self.error(id, "No such live session", "stop"),
                 }
             }
+            ClientMsg::AstationOp {
+                request_id,
+                kind,
+                options,
+            } => self.start_op(id, request_id, kind, options),
+            ClientMsg::Answer {
+                request_id,
+                question_id,
+                value,
+            } => {
+                if let Some(op) = self
+                    .op
+                    .as_ref()
+                    .filter(|op| op.client == id && op.request_id == request_id)
+                {
+                    let _ = op.answers.send((question_id, value));
+                }
+            }
             ClientMsg::Reload => {
                 if let Ok(config) = crate::config::AtemConfig::load() {
                     self.app.config = config;
+                }
+                // `atem unpair` (or a re-pair) replaced the pairing this link
+                // authenticated under: drop it and its attachments.
+                let stale = self
+                    .app
+                    .astation_client
+                    .capture()
+                    .is_some_and(|capture| capture.check().is_err());
+                if self.app.astation_connected && stale {
+                    self.app.drop_astation_link(
+                        "The Astation pairing changed; the link was dropped".into(),
+                    );
                 }
                 if !self.app.astation_connected {
                     // Credentials or pairing may have changed: try again now.
@@ -936,6 +1000,136 @@ impl Server {
                     },
                 );
             }
+        }
+    }
+
+    /// Starts an Astation operation for client `id`, unless one runs.
+    fn start_op(
+        &mut self,
+        id: u64,
+        request_id: String,
+        kind: super::protocol::OpKind,
+        options: super::protocol::OpOptions,
+    ) {
+        if self.op.is_some() {
+            self.send(
+                id,
+                &RuntimeMsg::Done {
+                    request_id,
+                    ok: false,
+                    error: Some(BUSY.into()),
+                },
+            );
+            return;
+        }
+        let Some(client) = self.clients.get(&id) else {
+            return;
+        };
+        let tx = client.tx.clone();
+        let out = std::sync::Arc::new(move |message: RuntimeMsg| {
+            let _ = tx.send(Outgoing::Line {
+                line: encode_runtime(&message),
+                cost: 0,
+                epoch: None,
+            });
+        });
+        let (answers, answered) = mpsc::unbounded_channel();
+        let (gone, gone_rx) = tokio::sync::watch::channel(false);
+        let ui = ClientUi::new(request_id.clone(), out, answered, gone_rx);
+        eprintln!("atem runtime: {} for client {id}", kind.as_str());
+        self.op = Some(ActiveOp {
+            client: id,
+            request_id: request_id.clone(),
+            answers,
+            gone,
+        });
+        super::ops::start(
+            request_id,
+            kind,
+            options,
+            ui,
+            self.op_calls.clone(),
+            self.options.ops.clone(),
+        );
+    }
+
+    fn op_call(&mut self, call: OpCall) {
+        match call {
+            OpCall::Link {
+                encryption,
+                credentials,
+                reply,
+            } => {
+                self.op_waiting = Some((encryption, credentials, reply));
+                if !self.app.astation_connected && self.app.astation_connect_rx.is_none() {
+                    // Try now rather than at the next retry; only that
+                    // attempt's failure answers this operation.
+                    self.app.astation_connect_error = None;
+                    self.app.astation_reconnect_at = Some(Instant::now());
+                }
+                self.op_tick();
+            }
+            OpCall::Install { client, reply } => {
+                self.app.install_astation_link(*client);
+                let _ = reply.send(());
+            }
+            OpCall::Finished {
+                request_id,
+                kind,
+                ok,
+            } => {
+                if self
+                    .op
+                    .as_ref()
+                    .is_some_and(|op| op.request_id == request_id)
+                {
+                    self.op = None;
+                    self.op_waiting = None;
+                    self.app.close_op_route();
+                    eprintln!(
+                        "atem runtime: {} {}",
+                        kind.as_str(),
+                        if ok { "done" } else { "failed" }
+                    );
+                    // A verification makes the link a verified pairing: the
+                    // host may attach it now.
+                    if ok
+                        && matches!(
+                            kind,
+                            super::protocol::OpKind::Pair | super::protocol::OpKind::PairVerify
+                        )
+                        && let Some(bridge) = self.bridge.as_mut()
+                    {
+                        bridge.reconsider();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The running operation's link: handed over once it is up; closed
+    /// when it went down or was replaced (the operation fails, no replay).
+    fn op_tick(&mut self) {
+        if let Some(link_gen) = self.app.op_route_gen()
+            && (!self.app.astation_connected || self.app.astation_link_gen != link_gen)
+        {
+            eprintln!("atem runtime: the Astation link went away during an operation");
+            self.app.close_op_route();
+        }
+        if !self.app.astation_connected
+            && self.op_waiting.is_some()
+            && let Some(advice) = self.app.astation_connect_error.take()
+            && let Some((_, _, reply)) = self.op_waiting.take()
+        {
+            let _ = reply.send(Err(advice));
+            return;
+        }
+        if self.app.astation_connected
+            && let Some((encryption, credentials, reply)) = self.op_waiting.take()
+            && let Some(view) = self.app.open_op_route(encryption, credentials)
+            && reply.send(Ok(view)).is_err()
+        {
+            self.app.close_op_route();
         }
     }
 

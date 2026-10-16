@@ -157,48 +157,43 @@ pub struct PairedTokens {
     pub expires_at: u64,
 }
 
-/// Connects to Astation without pairing (local first, then the relay identity
-/// room, as the TUI does) and waits for the `credentialSync` Astation sends
-/// on connect. Only accepts tokens from `astation_id`.
-async fn fetch_from_astation(astation_id: String, save: SavePaired) -> Result<PairedTokens> {
-    use crate::websocket_client::{AstationClient, AstationMessage};
-    use tokio::time::{timeout, Duration};
-
-    let config = crate::config::AtemConfig::load()?;
-    let mut client = AstationClient::new();
-    let local = client.connect_without_pairing(config.astation_ws()).await;
-    if local.is_err() {
-        let relay_code = config
-            .astation_relay_code
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Astation isn't reachable locally and no relay is configured"))?;
-        client = AstationClient::new();
-        client
-            .connect_relay_identity_without_pairing(config.astation_relay_url(), &relay_code)
-            .await?;
+/// Fresh paired tokens for `astation_id`. Only `atem runtime` talks to
+/// Astation: a CLI asks it (`token` operation; it never opens its own
+/// connection), and the runtime itself reads what its link received
+/// (Astation sends `credentialSync` on connect and whenever it refreshes;
+/// the runtime saves them under the pairing).
+async fn fetch_from_astation(astation_id: String, _save: SavePaired) -> Result<PairedTokens> {
+    let path = crate::credentials::CredentialStore::path();
+    if !crate::runtime::in_runtime() {
+        crate::runtime::op_client::run(
+            crate::runtime::protocol::OpKind::Token,
+            crate::runtime::protocol::OpOptions {
+                astation_id: Some(astation_id.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
+    fresh_paired(&path, &astation_id)
+        .ok_or_else(|| anyhow::anyhow!("Astation hasn't sent fresh credentials yet"))
+}
 
-    timeout(Duration::from_secs(15), async {
-        loop {
-            match client.recv_message_async().await {
-                Some(AstationMessage::CredentialSync { access_token, refresh_token, expires_at, astation_id: from, .. }) => {
-                    if from == astation_id {
-                        // Saved only for the pairing this connection
-                        // authenticated under (not one removed meanwhile),
-                        // under the pairing lock.
-                        let fresh = PairedTokens { access_token, refresh_token, expires_at };
-                        client.apply_bound(&from, || save(&fresh))?;
-                        return Ok(fresh);
-                    }
-                    anyhow::bail!("connected to a different Astation ({})", from);
-                }
-                Some(_) => continue,
-                None => anyhow::bail!("Astation closed the connection before sending credentials"),
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out waiting for Astation"))?
+/// The paired entry for `astation_id` at `path`, when it has time left.
+fn fresh_paired(path: &std::path::Path, astation_id: &str) -> Option<PairedTokens> {
+    let store = crate::credentials::CredentialStore::load_from(path);
+    store
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.source == crate::credentials::CredentialSource::AstationPaired
+                && entry.astation_id.as_deref() == Some(astation_id)
+                && !entry.needs_refresh()
+        })
+        .map(|entry| PairedTokens {
+            access_token: entry.access_token.clone(),
+            refresh_token: entry.refresh_token.clone(),
+            expires_at: entry.expires_at,
+        })
 }
 
 /// Exchange a refresh_token for a new SsoSession.
