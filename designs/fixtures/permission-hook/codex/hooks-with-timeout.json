@@ -1,0 +1,1 @@
+{"hooks":{"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"/home/user/t/hook/perm.sh","timeout":5}]}]}}

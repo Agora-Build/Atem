@@ -188,8 +188,39 @@ answer. Flow:
    refused as decided by the remote answer, `outcome_unknown` if the terminal
    answer and the remote answer crossed and Atem can't tell which won.
 
-Codex: the same `PermissionRequest` hook exists; behaviour to be verified the
-same way once the hook is trusted in Codex (codex-cli 0.162.1 is installed here).
+Codex (verified on codex-cli 0.162.1, interactive, `-a on-request`; fixtures:
+`designs/fixtures/permission-hook/codex/`) behaves differently in two ways:
+
+- **Codex holds its approval prompt until the hook exits** (the TUI shows
+  "Running hook"); the local user can't answer while the hook waits.
+- Esc interrupts the turn but doesn't stop the hook; a timeout shows "Hook
+  failed: hook timed out" and then the normal prompt.
+- Same answers otherwise: no output → prompt; allow → runs; deny + message →
+  "Blocked by hook", the model sees the message. Input: `session_id`,
+  `turn_id`, `transcript_path`, `cwd`, `model`, `permission_mode`, `tool_name`,
+  `tool_input` (no `prompt_id`).
+- Hooks are on by default; a non-managed hook must be **trusted once** in Codex
+  (startup review or `/hooks`), stored as a hash of the hook entry — any change
+  to the entry needs a new review.
+
+What that means for Atem with Codex:
+
+1. **Local input releases the hook.** All local keystrokes already pass through
+   the runtime, which revokes the remote lease before writing them; for Codex it
+   also answers "no decision" to a waiting hook first, so Codex shows its prompt
+   and the user answers it in the terminal (the keystroke that released it is
+   delivered after the prompt appears).
+2. **A short wait** (hook `timeout` 120 s for Codex) so an unattended terminal
+   isn't blocked for long; on timeout Codex shows its own prompt.
+3. On Esc the runtime closes the request itself (the hook may keep running; its
+   late output is ignored).
+4. **One-time trust with a stable hook entry:** the hook command must be the same
+   for every session (it finds the session directory through an environment
+   variable set by the worker), so the user trusts it once and it stays trusted.
+   Atem adds the entry to `~/.codex/hooks.json` only with the user's consent
+   (`atem agent setup codex` or on first launch), and shows how to review it in
+   Codex.
+
 
 Changes to earlier rules: chat's "no approvals from chat" becomes "approvals by
 the lease holder, bound to the exact prompt"; "hooks never decide" gains one
