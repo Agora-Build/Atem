@@ -1,0 +1,223 @@
+{
+ "name": "lease-expiry-at-the-deadline-needs-no-timer",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222"
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "binding.lease_epoch": 1,
+    "ms_left": 15000
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "subscribe",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "attached",
+    "session.terminal_id": "ses-aaaaaaaaaaaa"
+   },
+   "capture": {
+    "s": "stream_id"
+   }
+  },
+  {
+   "hold_pty_writes": true
+  },
+  {
+   "advance_ms": 14999,
+   "timers": false
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "input",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "${s}",
+     "sequence": 0,
+     "bytes": "aGkN",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "advance_ms": 1,
+   "timers": false
+  },
+  {
+   "flush_pty_writes": true
+  },
+  {
+   "assert": {
+    "pty_writes_remote": 0,
+    "pty_writes_dropped": 1
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "renew",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "code": "stale_lease"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "expired",
+    "lease_epoch": 2
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "input",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "${s}",
+     "sequence": 1,
+     "bytes": "aGkN",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "error",
+    "code": "stale_lease"
+   }
+  },
+  {
+   "assert": {
+    "lease_holder": null,
+    "pty_writes": 0
+   }
+  }
+ ],
+ "note": "Expiry is now >= deadline whether or not a timer fired: with the clock moved to exactly 15000 ms and no tick, bytes queued at 14999 are dropped at the write boundary, and renew/input are refused. The host may announce the expiry (lease_changed) when it next sees the time."
+}

@@ -394,14 +394,34 @@ impl<J: Journal> SessionHost<J> {
 
     // ── Runtime inputs ──
 
-    /// Registers an agent session (new or surviving a broker restart).
+    /// Registers a new agent session. An id is never reused: not while live
+    /// or tombstoned, not while receipts name it, and not once lease epochs
+    /// were reserved for it.
     pub fn add_session(&mut self, spec: SessionSpec) -> Result<Vec<Effect>, String> {
+        let sid = &spec.session_id;
+        let known = self.lease_floors.contains_key(sid)
+            || self
+                .receipts
+                .values()
+                .any(|e| &e.stored.target.session_id == sid);
+        if known {
+            return Err("session_id already used".into());
+        }
+        self.register(spec)
+    }
+
+    /// Re-registers a worker that survived a host restart (before
+    /// `recover`): its receipts and lease floor carry over.
+    pub fn restore_session(&mut self, spec: SessionSpec) -> Result<Vec<Effect>, String> {
+        self.register(spec)
+    }
+
+    fn register(&mut self, spec: SessionSpec) -> Result<Vec<Effect>, String> {
         if !wire::is_session_id(&spec.session_id) || !wire::is_uuid_v4(&spec.process_gen) {
             return Err("invalid session_id or process_gen".into());
         }
-        if self.sessions.contains_key(&spec.session_id)
-            || self.tombstones.contains_key(&spec.session_id)
-        {
+        let sid = &spec.session_id;
+        if self.sessions.contains_key(sid) || self.tombstones.contains_key(sid) {
             return Err("session_id already used".into());
         }
         let floor = self
@@ -719,14 +739,16 @@ impl<J: Journal> SessionHost<J> {
         session_id: &str,
         activity: Activity,
         since: u64,
-    ) -> Vec<Effect> {
-        let Some(s) = self.sessions.get_mut(session_id) else {
-            return Vec::new();
-        };
+    ) -> Result<Vec<Effect>, String> {
+        let s = self
+            .sessions
+            .get_mut(session_id)
+            .filter(|s| s.state == SessionState::Running)
+            .ok_or("no running session")?;
         s.activity = activity;
         s.activity_since = since.min(MAX_SAFE_INTEGER);
         self.registry_changed(session_id);
-        self.take()
+        Ok(self.take())
     }
 
     /// The agent process was replaced (restart/resume): a new `process_gen`.
@@ -739,6 +761,10 @@ impl<J: Journal> SessionHost<J> {
         process_gen: &str,
     ) -> Result<Vec<Effect>, String> {
         let s = self.sessions.get(session_id).ok_or("unknown session")?;
+        if s.state == SessionState::Closed {
+            // Closed is final: its receipts are on their retention clock.
+            return Err("session is closed".into());
+        }
         if !wire::is_uuid_v4(process_gen) || s.spec.process_gen == process_gen {
             return Err("process_gen must be a new UUID v4".into());
         }
@@ -760,15 +786,7 @@ impl<J: Journal> SessionHost<J> {
         s.activity_since = wall;
         s.input_epoch += 1;
         s.queued.clear();
-        for (att, a) in self.attachments.iter_mut() {
-            if let Some(stream_id) = a.streams.remove(session_id) {
-                self.out.push(Effect::StreamClosed {
-                    attachment: att.clone(),
-                    session_id: session_id.to_string(),
-                    stream_id,
-                });
-            }
-        }
+        self.close_streams(session_id);
         self.registry_changed(session_id);
         Ok(self.take())
     }
@@ -787,10 +805,21 @@ impl<J: Journal> SessionHost<J> {
         self.sessions.remove(session_id);
         self.tombstones.insert(session_id.to_string(), self.now);
         self.ended.entry(session_id.to_string()).or_insert(self.now);
-        for a in self.attachments.values_mut() {
-            a.streams.remove(session_id);
-        }
+        self.close_streams(session_id);
         self.take()
+    }
+
+    /// Ends every terminal stream on the session.
+    fn close_streams(&mut self, session_id: &str) {
+        for (att, a) in self.attachments.iter_mut() {
+            if let Some(stream_id) = a.streams.remove(session_id) {
+                self.out.push(Effect::StreamClosed {
+                    attachment: att.clone(),
+                    session_id: session_id.to_string(),
+                    stream_id,
+                });
+            }
+        }
     }
 
     /// The host trust generation moved on (unpair/rebind): every lease is
@@ -834,12 +863,19 @@ impl<J: Journal> SessionHost<J> {
         if runtime_epoch <= self.ctx.runtime_epoch || runtime_epoch > MAX_SAFE_INTEGER {
             return Err("runtime_epoch must increase".into());
         }
+        // Read the journal before changing anything: a failed restart leaves
+        // the host as it was.
+        let replayed = self
+            .journal
+            .load()
+            .and_then(journal::replay)
+            .map_err(|e| e.0)?;
         self.ctx.runtime_gen = runtime_gen.to_string();
         self.ctx.runtime_epoch = runtime_epoch;
         self.attachments.clear();
         self.retry.clear();
         self.out.clear();
-        self.reload().map_err(|e| e.0)?;
+        self.install(replayed);
         for (sid, s) in self.sessions.iter_mut() {
             let floor = self.lease_floors.get(sid).copied().unwrap_or(0);
             s.lease = None;
@@ -853,6 +889,11 @@ impl<J: Journal> SessionHost<J> {
 
     fn reload(&mut self) -> Result<(), JournalError> {
         let replayed = journal::replay(self.journal.load()?)?;
+        self.install(replayed);
+        Ok(())
+    }
+
+    fn install(&mut self, replayed: journal::Replayed) {
         self.receipts = replayed
             .receipts
             .into_iter()
@@ -875,7 +916,11 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| e.stored.order + 1)
             .max()
             .unwrap_or(0);
-        Ok(())
+    }
+
+    /// Final receipt writes waiting to be retried.
+    pub fn pending_retries(&self) -> usize {
+        self.retry.len()
     }
 
     /// §6 crash rules: `executing` work is never dispatched again, only
@@ -1662,6 +1707,8 @@ impl<J: Journal> SessionHost<J> {
             if let Some(e) = self.receipts.get_mut(rid) {
                 e.finishing = true;
             }
+            // One pending final write per request: the latest wins.
+            self.retry.retain(|(r, _, _)| r != rid);
             self.retry.push((rid.to_string(), to, detail));
         }
     }

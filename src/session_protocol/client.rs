@@ -352,6 +352,19 @@ impl RegistryClient {
         }
     }
 
+    /// A new attachment was welcomed (reconnect): `seq` counts per
+    /// attachment, so its registry starts over — the next snapshot is
+    /// awaited and applies at any `seq`. The highest accepted
+    /// `(runtime_epoch, runtime_gen)` stays as the floor.
+    pub fn new_attachment(&mut self) {
+        self.last_seq = None;
+        self.sessions.clear();
+        self.removed.clear();
+        self.buffered.clear();
+        self.list_wanted = false;
+        self.awaiting_snapshot = false;
+    }
+
     fn reset(&mut self, epoch: u64, rgen: &str) {
         self.epoch = Some((epoch, rgen.to_string()));
         self.last_seq = None;
@@ -908,6 +921,44 @@ mod tests {
 
     const A: &str = "ses-aaaaaaaaaaaa";
     const B: &str = "ses-bbbbbbbbbbbb";
+
+    #[test]
+    fn a_new_attachment_restarts_seq_but_keeps_the_epoch_floor() {
+        let s1 = || desc("ses-aaaaaaaaaaaa", PG, SessionState::Running);
+        let mut r = RegistryClient::default();
+        assert_eq!(
+            r.on_message(&snap(RG8, 8, 5, vec![s1()])),
+            RegistryOutcome::Applied
+        );
+        // Without a reset, the new attachment's snapshot (seq 1) is stale.
+        let mut frozen = r.clone();
+        assert_eq!(
+            frozen.on_message(&snap(RG8, 8, 1, vec![])),
+            RegistryOutcome::StaleSnapshot
+        );
+        r.new_attachment();
+        assert!(r.session_ids().is_empty() && r.seq().is_none());
+        assert_eq!(r.runtime_epoch(), Some(8));
+        // Older-epoch messages stay fenced.
+        assert_eq!(
+            r.on_message(&snap(RG7, 7, 9, vec![s1()])),
+            RegistryOutcome::StaleEpoch
+        );
+        assert_eq!(
+            r.on_message(&snap(RG8, 8, 1, vec![s1()])),
+            RegistryOutcome::Applied
+        );
+        assert_eq!(r.seq(), Some(1));
+        assert_eq!(
+            r.on_message(&change(
+                RG8,
+                8,
+                2,
+                desc("ses-aaaaaaaaaaaa", PG, SessionState::Exited)
+            )),
+            RegistryOutcome::Applied
+        );
+    }
 
     #[test]
     fn epochs_fence_snapshots() {

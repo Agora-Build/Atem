@@ -112,6 +112,20 @@ pub enum HostEvent {
     ChangeTrustGen(u64),
     FailNextPtyEnqueue,
     FailNextPtyWriteAfterPartial,
+    /// The runtime closes the session (it no longer accepts work).
+    CloseSession {
+        session_id: String,
+    },
+    /// The provider reports the end of the session's executing prompt turn.
+    TurnComplete {
+        session_id: String,
+        turn_id: String,
+    },
+    /// Remote PTY writes queue at the writer until `FlushPtyWrites`.
+    HoldPtyWrites,
+    /// The writer writes the queued chunks now (each checked at the write
+    /// boundary).
+    FlushPtyWrites,
 }
 
 /// The host authority under test (`fake_runtime::FakeRuntime`).
@@ -227,6 +241,9 @@ pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, 
             .step(step)
             .map_err(|e| format!("{}: step {i} {step}: {e}", scenario.name))?;
     }
+    runner
+        .all_consumed()
+        .map_err(|e| format!("{}: at the end: {e}", scenario.name))?;
     Ok(Outcome::Passed)
 }
 
@@ -313,11 +330,17 @@ fn as_u64(v: &Value, what: &str) -> Result<u64, String> {
         .ok_or(format!("{what} must be a non-negative integer"))
 }
 
-/// Dotted path into a message's `data` (`receipts.0.state`).
-fn lookup<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.').try_fold(data, |v, part| match v {
-        Value::Object(m) => m.get(part),
-        Value::Array(a) => part.parse::<usize>().ok().and_then(|i| a.get(i)),
+/// Dotted path into a message's `data` (`receipts.0.state`); `#` is an
+/// array's length (`receipts.#`).
+fn lookup(data: &Value, path: &str) -> Option<Value> {
+    path.split('.').try_fold(data.clone(), |v, part| match v {
+        Value::Object(mut m) => m.remove(part),
+        Value::Array(a) if part == "#" => Some(Value::from(a.len())),
+        Value::Array(mut a) => part
+            .parse::<usize>()
+            .ok()
+            .filter(|i| *i < a.len())
+            .map(|i| a.swap_remove(i)),
         _ => None,
     })
 }
@@ -402,7 +425,7 @@ impl Runner {
             ("expect", &["type", "match", "capture"]),
             ("expect_all", &[]),
             ("expect_none", &["for_ms"]),
-            ("advance_ms", &[]),
+            ("advance_ms", &["timers"]),
             ("hold", &[]),
             ("deliver", &[]),
             ("deliver_to_client", &["json"]),
@@ -416,6 +439,10 @@ impl Runner {
             ("change_trust_gen", &[]),
             ("fail_next_pty_enqueue", &[]),
             ("fail_next_pty_write_after_partial", &[]),
+            ("close_session", &[]),
+            ("turn_complete", &["turn_id"]),
+            ("hold_pty_writes", &[]),
+            ("flush_pty_writes", &[]),
             ("assert", &[]),
             ("assert_client", &[]),
         ];
@@ -439,7 +466,13 @@ impl Runner {
         match (*action, self.side) {
             ("advance_ms", _) => {
                 self.now += as_u64(arg, "advance_ms")?;
-                self.pump_advance()
+                match step.get("timers") {
+                    None | Some(Value::Bool(true)) => self.pump_advance(),
+                    // Only the clock moves: the host sees the time with the
+                    // next message or write check, never through a tick.
+                    Some(Value::Bool(false)) => Ok(()),
+                    Some(_) => Err("timers must be a boolean".into()),
+                }
             }
             ("send", Side::Host) => {
                 let client = self.client(arg)?.to_string();
@@ -587,11 +620,39 @@ impl Runner {
             "fail_next_pty_write_after_partial" => {
                 yes(arg).map(|_| HostEvent::FailNextPtyWriteAfterPartial)?
             }
+            "close_session" => HostEvent::CloseSession {
+                session_id: as_str(arg, "close_session")?.into(),
+            },
+            "turn_complete" => HostEvent::TurnComplete {
+                session_id: as_str(arg, "turn_complete")?.into(),
+                turn_id: as_str(take(step, "turn_id")?, "turn_id")?.into(),
+            },
+            "hold_pty_writes" => yes(arg).map(|_| HostEvent::HoldPtyWrites)?,
+            "flush_pty_writes" => yes(arg).map(|_| HostEvent::FlushPtyWrites)?,
             other => return Err(format!("{other} is not a host event")),
         })
     }
 
     // ── host side ──
+
+    /// Every host message must have been expected: nothing may be left in a
+    /// client's queue or held at the end of a scenario.
+    fn all_consumed(&self) -> Result<(), String> {
+        if let Some((client, msg)) = self.held.first() {
+            return Err(format!("held message for {client} never delivered: {msg}"));
+        }
+        let mut names: Vec<&String> = self.queues.keys().collect();
+        names.sort();
+        for client in names {
+            if let Some(m) = self.queues[client].front() {
+                return Err(format!(
+                    "{client} has {} unexpected message(s), first: {m}",
+                    self.queues[client].len()
+                ));
+            }
+        }
+        Ok(())
+    }
 
     fn pump_advance(&mut self) -> Result<(), String> {
         let now = self.now;
@@ -644,7 +705,8 @@ impl Runner {
         ))?;
         let data = msg.get("data").cloned().unwrap_or(Value::Null);
         for (path, expected) in matches {
-            same(expected, lookup(&data, path), path).map_err(|e| format!("{e} in {msg}"))?;
+            same(expected, lookup(&data, path).as_ref(), path)
+                .map_err(|e| format!("{e} in {msg}"))?;
         }
         Ok(data)
     }
@@ -743,6 +805,8 @@ impl Runner {
                 authorization_ms_left,
                 ..
             } => {
+                // A new attachment: its registry `seq` starts over.
+                m.registry.new_attachment();
                 let deadline = now.saturating_add(*authorization_ms_left);
                 m.authorization_deadline = Some(deadline);
                 m.leases
@@ -884,6 +948,28 @@ mod tests {
                 "code",
                 json!("busy"),
             ),
+            ("family-errors-and-chat-results", "code", json!("busy")),
+            (
+                "receipt-query-is-scoped-to-the-exact-target",
+                "receipts.#",
+                json!(2),
+            ),
+            ("reconnect-restarts-the-registry-sequence", "seq", json!(3)),
+            (
+                "takeover-moves-control-and-the-old-holder-becomes-a-viewer",
+                "reason",
+                json!("granted"),
+            ),
+            (
+                "exited-session-refuses-work-before-the-lease-check",
+                "code",
+                json!("stale_lease"),
+            ),
+            (
+                "lease-expiry-at-the-deadline-needs-no-timer",
+                "code",
+                json!("lease_held"),
+            ),
         ];
         for (name, key, to) in mutations {
             let mut f = fixture(name);
@@ -1006,6 +1092,29 @@ mod tests {
             run_scenario(&client_scenario(steps), None),
             Ok(Outcome::Passed)
         );
+    }
+
+    #[test]
+    fn unexpected_messages_left_at_the_end_fail_a_host_scenario() {
+        let mut f = fixture("takeover-moves-control-and-the-old-holder-becomes-a-viewer");
+        let steps = f["steps"].as_array_mut().unwrap();
+        let i = steps
+            .iter()
+            .rposition(|s| s.get("expect").is_some())
+            .unwrap();
+        steps.remove(i);
+        let err = run_scenario(&f, Some(&fake_runtime)).unwrap_err();
+        assert!(err.contains("unexpected message"), "{err}");
+    }
+
+    #[test]
+    fn lookup_paths_index_and_count_arrays() {
+        let v = json!({"a": [{"b": 1}, {"b": 2}], "c": null});
+        assert_eq!(lookup(&v, "a.#"), Some(json!(2)));
+        assert_eq!(lookup(&v, "a.1.b"), Some(json!(2)));
+        assert_eq!(lookup(&v, "a.5"), None);
+        assert_eq!(lookup(&v, "c"), Some(Value::Null));
+        assert_eq!(lookup(&v, "d"), None);
     }
 
     #[test]

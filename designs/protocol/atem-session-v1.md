@@ -188,6 +188,11 @@ Descriptor:
   snapshot arrives, discards every change with `seq` ≤ that snapshot's `seq`.
   A snapshot whose `seq` is lower than the last applied one (same epoch) is
   discarded.
+- **New attachment.** `seq` belongs to one attachment. On every `welcome`
+  (reconnect) the client clears its registry state — sessions, last `seq`,
+  removals and held changes — keeping only its highest accepted
+  (`runtime_epoch`, `runtime_gen`) as the fencing floor; the new attachment's
+  first snapshot applies at any `seq`.
 - **Removal.** A removed session is sent as `state:"removed"`; applying it
   deletes the session, and a later change for that `session_id` is only accepted
   with a higher `seq` in the same epoch and a different `process_gen` — never
@@ -293,9 +298,11 @@ Kinds and payloads (v1):
   Same `request_id` with every bound value equal → the recorded receipt (needs
   current view permission for the target; no lease, no re-execution). Same
   `request_id` with any value different → `request_id_reused`.
-- **Admission** of a new request needs `control` permission, a session that
-  accepts submissions (`session_closed` otherwise, checked before the lease)
-  and the current lease (`stale_lease` otherwise). If the durable write of
+- **Admission** of a new request — and every lease-scoped mutation
+  (terminal input/resize/stop) — is checked in this order: `control`
+  permission (`forbidden`), then a session that accepts work
+  (`session_closed`, even when the lease is also stale), then the current
+  lease (`stale_lease`). If the durable write of
   `accepted` fails, the reply is `error{code:"busy"}`, nothing is recorded and
   the client may retry with the same `request_id`.
 - A duplicate `submit` names the current target: one naming an earlier
@@ -359,6 +366,23 @@ Kinds and payloads (v1):
 
 `error{re, code, detail?}`; `detail` is human-readable, bounded, and never
 contains secrets, paths, raw OS errors or other targets' identifiers.
+
+Errors are answered in the family of the request (ruling i):
+
+- session-v1 requests: session `error{re, code, detail?}`.
+- A valid terminal-v1 request that is refused: terminal-v1
+  `error{terminal_id, stream_id?, code, message}` (`stream_id` when the
+  request carried one; `message` is fixed text per code).
+- chat-v1: `error{requestId?, code, text}` (chat-v1's `error` gains `code`).
+  A chat `submit` hears about its request only through chat-v1 ops mapped
+  from its receipt, never a session `receipt`: `accepted`/`executing` →
+  `accepted{requestId}`; `completed` → `complete{requestId, turnId?,
+  outcome:"done"}`; `rejected` → `error{requestId, code:"rejected", text:
+  detail}`; `outcome_unknown` → `error{requestId, code:"outcome_unknown",
+  text: detail}`. Refusals at admission use the §7 code.
+- Removed forms (§0) and requests that don't decode — of any family — get a
+  session `error{code:"unsupported_version"}` without `re` when the request
+  had no readable `id`, and have no effect.
 
 | code | when |
 |---|---|

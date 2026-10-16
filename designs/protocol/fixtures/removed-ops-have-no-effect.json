@@ -67,6 +67,14 @@
    }
   },
   {
+   "expect": "other",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": 1
+   }
+  },
+  {
    "send": "other",
    "json": {
     "type": "terminal",
@@ -292,6 +300,15 @@
    "expect": "up",
    "match": {
     "op": "lease_released"
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "lease_changed",
+    "reason": "released",
+    "lease_epoch": 2,
+    "controller": null
    }
   },
   {

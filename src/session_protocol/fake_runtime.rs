@@ -86,6 +86,8 @@ pub struct FakeRuntime {
     queued_writes: Vec<Effect>,
     /// How a `Reconcile` is answered.
     pub reconcile_answer: DispatchReport,
+    /// session_id → the prompt whose turn is running.
+    turns: HashMap<String, String>,
     clients: BTreeMap<String, Client>,
     /// Every attachment ever used → client name.
     names: HashMap<String, String>,
@@ -166,6 +168,7 @@ impl FakeRuntime {
             ticks: true,
             queued_writes: Vec::new(),
             reconcile_answer: DispatchReport::Unknown,
+            turns: HashMap::new(),
             clients: BTreeMap::new(),
             names: HashMap::new(),
             live: HashMap::new(),
@@ -201,6 +204,9 @@ impl FakeRuntime {
                 rt.setup_lease(&c.name, epoch)?;
             }
         }
+        // Setup traffic (e.g. other viewers' `lease_changed` for a setup
+        // lease) is not visible to the steps.
+        rt.out.clear();
         Ok(rt)
     }
 
@@ -381,7 +387,7 @@ impl FakeRuntime {
                     request_id,
                     kind,
                     payload,
-                    ..
+                    target,
                 } => {
                     self.pty.dispatch_attempts += 1;
                     let report = if std::mem::take(&mut self.pty.fail_next_enqueue) {
@@ -393,6 +399,8 @@ impl FakeRuntime {
                         if kind == ReceiptKind::Prompt {
                             let n = payload["text"].as_str().map_or(0, str::len);
                             self.pty.wrote(n);
+                            self.turns
+                                .insert(target.session_id.clone(), request_id.clone());
                         }
                         // Written; completion comes from the provider later.
                         None
@@ -501,8 +509,9 @@ impl FakeRuntime {
 }
 
 impl HostUnderTest for FakeRuntime {
+    /// The host sees the time with the message; no timer tick is run.
     fn receive(&mut self, client: &str, msg: Result<Envelope, DecodeError>, now_ms: u64) {
-        self.set_now(now_ms);
+        self.now = now_ms;
         let att = self.attachment(client);
         let fx = self.host.receive_decoded(&att, msg, now_ms);
         self.apply(fx);
@@ -512,8 +521,9 @@ impl HostUnderTest for FakeRuntime {
         self.set_now(now_ms);
     }
 
+    /// Events don't tick the host's timers either (`advance_ms` does).
     fn event(&mut self, event: &HostEvent, now_ms: u64) -> Result<(), String> {
-        self.set_now(now_ms);
+        self.now = now_ms;
         let fx = match event {
             HostEvent::Disconnect { client } => {
                 let att = self.attachment(client);
@@ -577,6 +587,26 @@ impl HostUnderTest for FakeRuntime {
                 self.pty.fail_next_partial = true;
                 Vec::new()
             }
+            HostEvent::CloseSession { session_id } => self.host.close_session(session_id, false),
+            HostEvent::TurnComplete {
+                session_id,
+                turn_id,
+            } => {
+                let rid = self.turns.remove(session_id).ok_or("no running turn")?;
+                let report = DispatchReport::Completed {
+                    detail: None,
+                    turn_id: Some(turn_id.clone()),
+                };
+                self.host.dispatch_report(&rid, report)
+            }
+            HostEvent::HoldPtyWrites => {
+                self.hold_writes = true;
+                Vec::new()
+            }
+            HostEvent::FlushPtyWrites => {
+                self.flush_writes();
+                Vec::new()
+            }
         };
         self.apply(fx);
         Ok(())
@@ -595,6 +625,7 @@ impl HostUnderTest for FakeRuntime {
             "pty_writes" => (p.writes_local + p.writes_remote).into(),
             "pty_writes_local" => p.writes_local.into(),
             "pty_writes_remote" => p.writes_remote.into(),
+            "pty_writes_dropped" => p.dropped_remote.into(),
             "resizes" => p.resizes.into(),
             "stops" => p.stops.into(),
             "lease_holder" => self.lease_holder()?,

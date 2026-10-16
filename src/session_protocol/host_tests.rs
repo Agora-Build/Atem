@@ -756,7 +756,7 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
     let mut j = MemJournal::default();
     j.append_ok(accepted_record(1, 1));
     let mut host = SessionHost::new(ctx(2), HostConfig::default(), j, random_ids()).unwrap();
-    host.add_session(spec(S1, P1)).unwrap();
+    host.restore_session(spec(S1, P1)).unwrap();
     let fx = host.recover();
     assert!(!fx.iter().any(|e| matches!(e, Effect::Dispatch { .. })));
     let r = host.receipt(&rid(1)).unwrap();
@@ -768,7 +768,7 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
     let mut j = MemJournal::default();
     j.append_ok(accepted_record(1, 1));
     let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
-    host.add_session(spec(S1, P1)).unwrap();
+    host.restore_session(spec(S1, P1)).unwrap();
     let fx = host.recover();
     let dispatches = fx
         .iter()
@@ -793,7 +793,7 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
     let mut j = MemJournal::default();
     j.append_ok(accepted_record(1, 1));
     let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
-    host.add_session(spec(S1, "33333333-3333-4333-8333-000000000001"))
+    host.restore_session(spec(S1, "33333333-3333-4333-8333-000000000001"))
         .unwrap();
     host.recover();
     assert_eq!(
@@ -1432,6 +1432,93 @@ fn prompt_payloads_are_dropped_once_past_accepted() {
     assert_eq!(only(&mut rt, "c1")["state"], "executing");
 }
 
+#[test]
+fn a_closed_session_stays_closed() {
+    let mut rt = setup();
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.close_session(S1, true);
+    let new_gen = "22222222-2222-4222-8222-000000000002";
+    assert!(rt.host.replace_process(S1, new_gen).is_err());
+    assert_eq!(
+        rt.host.descriptor_of(S1).unwrap().state,
+        wire::SessionState::Closed
+    );
+    assert!(
+        rt.host
+            .set_activity(S1, wire::Activity::Working, 1)
+            .is_err()
+    );
+    // Its receipts are evicted only after retention, and it never comes back.
+    rt.set_now(RECEIPT_RETENTION_MS - 1);
+    assert!(rt.host.receipt(&rid(1)).is_some());
+    rt.set_now(RECEIPT_RETENTION_MS);
+    assert!(rt.host.receipt(&rid(1)).is_none());
+}
+
+#[test]
+fn removal_closes_streams_and_the_id_is_never_reused() {
+    let mut rt = setup();
+    subscribe(&mut rt, "c1");
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.effects.clear();
+    rt.remove_session(S1);
+    assert!(rt.effects.iter().any(|x| matches!(x,
+        Effect::StreamClosed { attachment, session_id, .. } if attachment == C1 && session_id == S1)));
+    // After the tombstone, its receipts and lease floor still block the id.
+    rt.set_now(TOMBSTONE_MS);
+    assert!(rt.host.add_session(spec(S1, P1)).is_err());
+    rt.set_now(RECEIPT_RETENTION_MS);
+    assert!(rt.host.receipt(&rid(1)).is_none());
+    assert!(rt.host.add_session(spec(S1, P1)).is_err(), "lease floor");
+}
+
+#[test]
+fn a_restart_over_a_corrupt_journal_changes_nothing() {
+    use super::journal::Journal;
+    let mut rt = setup();
+    hold(&mut rt, "c1", S1);
+    rt.host
+        .journal_mut()
+        .append(Record::Evicted { request_id: rid(1) })
+        .unwrap();
+    rt.host
+        .journal_mut()
+        .append(Record::Transition {
+            request_id: rid(9),
+            state: ReceiptState::Executing,
+            detail: None,
+            updated_at: 0,
+        })
+        .unwrap();
+    let before = rt.host.context().clone();
+    assert!(rt.host.restart(GEN2, 8).is_err());
+    assert_eq!(rt.host.context(), &before);
+    assert_eq!(rt.host.lease_holder(S1), Some(C1));
+}
+
+#[test]
+fn durable_write_retries_are_deduplicated() {
+    let mut rt = setup();
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.host.journal_mut().fail_next_fsync();
+    rt.dispatch_report(&rid(1), DispatchReport::FailedAfterPossibleEffect);
+    rt.host.journal_mut().fail_next_fsync();
+    rt.process_exited(S1);
+    assert_eq!(rt.host.pending_retries(), 1);
+    rt.set_now(1);
+    assert_eq!(rt.host.pending_retries(), 0);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::OutcomeUnknown
+    );
+}
+
 impl FakeRuntime {
     fn event_reconnect(&mut self, client: &str, att_gen: &str) {
         self.attach(client, att_gen).unwrap();
@@ -1482,7 +1569,7 @@ impl FakeRuntime {
     }
 
     fn set_activity(&mut self, s: &str, activity: wire::Activity, since: u64) {
-        let fx = self.host.set_activity(s, activity, since);
+        let fx = self.host.set_activity(s, activity, since).unwrap();
         self.apply(fx);
     }
 

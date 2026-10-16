@@ -45,3 +45,13 @@ Files: `src/session_protocol/host.rs`, `src/session_protocol/journal.rs`, harnes
 - `Journal` trait (append receipt transition, fsync point, load on restart) + `MemJournal` with failure injection (`fail_next_fsync`); restart reloads receipts and applies the §6 crash rules.
 - Harness runs every `side:"host"` scenario (all actions in schema.md incl. hold/deliver, crash, restart, reconnect, failure injection) asserting messages and counters.
 - Commit `feat(session-protocol): host authority — registry, leases and durable receipts — with shared fixtures`.
+
+## Runtime wiring notes
+
+Left for the plan that wires `SessionHost` into the runtime (from the final review of Tasks 1–3):
+
+- **Journal compaction.** `MemJournal` drops payloads in place once a request leaves `accepted`; a file journal needs real compaction (rewrite/segment) for that, and for `Evicted` records, so the log doesn't grow without bound. After an fsync error it must stop admitting or truncate to its last durable record (see the `Journal` trait docs).
+- **Receipt indexing.** Receipts live in one map keyed by `request_id`; per-session counts, in-flight counts and the prompt queue scan it. Index by session (and by attachment) before the limits get large.
+- **Input sequence and dedup across transports.** terminal-v1 `input.sequence` is carried in `Origin::Remote` but not yet checked for order or duplicates; the same message arriving over direct and relay transports must be deduplicated (§0) before it reaches the host.
+- **`receipt_limit` per lifetime.** The bound counts every receipt retained for the session, including final ones, so a long-lived session eventually refuses submissions until it closes; decide whether final receipts older than some age count.
+- **Periodic `advance`.** Expiry is correct without ticks (messages and `admit_write` carry `now`), but `lease_changed{expired}`, observation windows (interrupt/stop 10 s), retried durable writes, tombstone and retention eviction only happen on `advance`: the runtime must call it periodically (e.g. every second) and before writing queued PTY chunks.
