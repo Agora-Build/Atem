@@ -65,6 +65,8 @@ pub struct WriteOutcome {
     pub ok: bool,
     /// Dropped for a stale input epoch: nothing was written.
     pub dropped: bool,
+    /// Refused before anything was queued: nothing was written.
+    pub no_effect: bool,
     pub error: Option<String>,
 }
 
@@ -386,11 +388,6 @@ impl BrokerSession {
         self.chat_reset.take()
     }
 
-    /// Writes are waiting for the worker's answer.
-    pub fn writes_in_flight(&self) -> bool {
-        !self.in_flight.is_empty()
-    }
-
     /// Another write may be sent now.
     pub fn can_write(&self) -> bool {
         self.in_flight.len() < MAX_IN_FLIGHT
@@ -628,6 +625,7 @@ impl BrokerSession {
                 seq,
                 ok,
                 dropped,
+                no_effect,
                 error,
                 ..
             } => {
@@ -637,6 +635,7 @@ impl BrokerSession {
                         seq,
                         ok,
                         dropped,
+                        no_effect,
                         error,
                     });
                     if dropped {
@@ -655,6 +654,24 @@ impl BrokerSession {
                 eprintln!("atem runtime: worker of {}: {text}", self.id);
             }
             WorkerMsg::Hello { .. } => {}
+            WorkerMsg::ChatSnapshot {
+                snapshot,
+                input_count,
+                chat_v1,
+                reason,
+            } => {
+                // The worker's chat session goes on here; open conversations
+                // (none for a fresh broker) reload it.
+                self.chat = ChatSession::restore(self.process_gen.clone(), snapshot);
+                if self.state != SessionState::Running {
+                    let outs = self.chat.on_process_exit(now_ms());
+                    self.chat_out.extend(outs);
+                }
+                self.input_count = input_count;
+                self.chat_v1 = chat_v1;
+                self.chat_reason = reason;
+                self.chat_reset = Some(CHAT_SWITCHED);
+            }
         }
     }
 

@@ -205,6 +205,15 @@ pub enum WorkerMsg {
         #[serde(default)]
         gap: u64,
     },
+    /// On every connection, before any `chat`: the worker's chat session
+    /// (authoritative; it read everything held back meanwhile), so a broker
+    /// that adopts this worker goes on from its status and history.
+    ChatSnapshot {
+        snapshot: crate::chat::session::ChatSnapshot,
+        input_count: u64,
+        chat_v1: bool,
+        reason: Option<String>,
+    },
     Activity {
         state: Activity,
         detail: Option<String>,
@@ -219,6 +228,11 @@ pub enum WorkerMsg {
         /// Dropped for a stale input epoch (nothing written).
         #[serde(default)]
         dropped: bool,
+        /// Refused before anything was queued (nothing written): the agent
+        /// exited, invalid bytes, a paste with control characters, a full
+        /// queue. A writer error after queueing leaves it false.
+        #[serde(default)]
+        no_effect: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -418,6 +432,7 @@ mod tests {
                 ok: false,
                 bytes_written: 0,
                 dropped: true,
+                no_effect: false,
                 error: None,
             },
             WorkerMsg::Error { text: "e".into() },

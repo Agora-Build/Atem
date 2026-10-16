@@ -80,6 +80,8 @@ pub struct App {
     /// Counts the times the Astation link became authenticated (a connect or
     /// a re-authentication): the session host gives each one its own attachment.
     pub astation_link_gen: u64,
+    /// Reconnect after the link drops (tests turn it off: they never reach a real Astation).
+    pub astation_reconnect: bool,
     /// Inside `atem runtime`: the broker's sessions and the session-family
     /// messages for its session host (see `app/hosted.rs`). `None` in the TUI,
     /// which refuses remote session, terminal and chat messages.
@@ -151,6 +153,7 @@ impl App {
             astation_client: AstationClient::new(),
             astation_connected: false,
             astation_link_gen: 0,
+            astation_reconnect: true,
             hosted: None,
             connected_astation_id: None,
             codex_client: CodexClient::new(),
@@ -1133,6 +1136,9 @@ impl App {
             AstationMessage::SessionWire(text) => {
                 self.session_wire(text);
             }
+            AstationMessage::SessionOversize { id } => {
+                self.session_refusal(id, crate::session_protocol::wire::ErrorCode::UnsupportedVersion);
+            }
             AstationMessage::VisualizeRequest { session_id, .. } => {
                 // Diagram generation was removed; answer so Astation stops waiting.
                 let _ = self
@@ -1456,6 +1462,9 @@ impl App {
         if self.astation_connected || self.astation_connect_rx.is_some() {
             // Already connected or a connect attempt is already in flight — clear retry
             self.astation_reconnect_at = None;
+            return;
+        }
+        if !self.astation_reconnect {
             return;
         }
         if let Some(reconnect_at) = self.astation_reconnect_at {

@@ -1319,7 +1319,7 @@ fn an_undecodable_worker_line_is_an_error_and_reading_goes_on() {
 }
 
 #[test]
-fn reclaim_tells_the_frontend_its_queued_input_was_dropped() {
+fn reclaim_without_a_remote_lease_keeps_queued_local_input() {
     local(async {
         let runtime = Runtime::new();
         // Raw, no echo: reads nothing for two seconds.
@@ -1336,9 +1336,9 @@ fn reclaim_tells_the_frontend_its_queued_input_was_dropped() {
         let session = launched(&mut client).await;
         let mut view = attach(&mut client, &session.id).await;
         view.until(&mut client, "SLEEPING").await;
-        for _ in 0..20 {
+        for text in ["x1 ", "x2 ", "END"] {
             client
-                .send(&ClientMsg::input(&session.id, &[b'a'; 16 * 1024]))
+                .send(&ClientMsg::input(&session.id, text.as_bytes()))
                 .await
                 .unwrap();
         }
@@ -1349,15 +1349,8 @@ fn reclaim_tells_the_frontend_its_queued_input_was_dropped() {
             })
             .await
             .unwrap();
-        let text = expect(&mut client, |m| match m {
-            RuntimeMsg::Notice { text } if text.contains("dropped") => Some(text),
-            _ => None,
-        })
-        .await;
-        assert!(
-            text.contains("typed bytes were dropped when control changed"),
-            "{text}"
-        );
+        // Nothing queued is dropped: no remote lease was held.
+        view.until(&mut client, "x1 x2 END").await;
         runtime.shutdown().await;
     });
 }

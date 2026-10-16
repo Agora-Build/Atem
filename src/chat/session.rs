@@ -8,6 +8,7 @@
 //! authoritative: it emits `Complete { Done }` and marks the turn completed; a later
 //! log `TurnEnded` for that turn is ignored, so a turn never completes twice.
 use crate::chat::adapter::{AgentEvent, LogItem, Outcome, Part};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,8 @@ const TRUNCATED: &str = "… (truncated)";
 /// Reserved part id; adapters never produce ids with this prefix.
 const TRUNCATED_ID: &str = "atem:truncated";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Ready,
     Working,
@@ -36,19 +38,21 @@ pub struct Status {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Origin {
     Local,
     Remote,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub message_id: String,
     pub role: Role,
@@ -110,6 +114,24 @@ struct Pending {
     pasted_at: Option<Instant>,
     hook_seen: bool,
     log_seen: bool,
+}
+
+/// A chat session's state, for a broker that connects to a running agent's
+/// worker (the worker's session is the authoritative one): status, the
+/// input mark, the current and last completed turn, and the newest history.
+/// Prompt acceptance in flight is not carried (it belongs to the broker that
+/// submitted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSnapshot {
+    pub started: bool,
+    pub exited: bool,
+    pub state: State,
+    pub since_ms: i64,
+    pub detail: Option<String>,
+    pub input_mark: u64,
+    pub current_turn: Option<String>,
+    pub last_completed: Option<String>,
+    pub history: Vec<ChatMessage>,
 }
 
 pub struct ChatSession {
@@ -253,6 +275,41 @@ impl ChatSession {
 
     pub fn generation(&self) -> &str {
         &self.generation
+    }
+
+    /// This session's state with at most `max_messages` / `max_bytes` of
+    /// its newest history.
+    pub fn snapshot(&self, max_messages: usize, max_bytes: usize) -> ChatSnapshot {
+        ChatSnapshot {
+            started: self.started,
+            exited: self.exited,
+            state: self.status.state,
+            since_ms: self.status.since_ms,
+            detail: self.status.detail.clone(),
+            input_mark: self.input_mark,
+            current_turn: self.current_turn.as_ref().map(|(t, _)| t.clone()),
+            last_completed: self.last_completed.clone(),
+            history: self.history(None, max_messages, max_bytes),
+        }
+    }
+
+    /// A session continuing from `snapshot` under `generation`.
+    pub fn restore(generation: String, snapshot: ChatSnapshot) -> Self {
+        let mut session = Self::new(generation, snapshot.since_ms);
+        session.started = snapshot.started;
+        session.exited = snapshot.exited;
+        session.status = Status {
+            state: snapshot.state,
+            since_ms: snapshot.since_ms,
+            detail: snapshot.detail,
+        };
+        session.input_mark = snapshot.input_mark;
+        session.current_turn = snapshot.current_turn.map(|t| (t, None));
+        session.last_completed = snapshot.last_completed;
+        for message in snapshot.history {
+            session.push_message(message);
+        }
+        session
     }
 
     pub fn status(&self) -> &Status {
@@ -789,6 +846,39 @@ impl ChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restored_session_continues_with_its_status_and_history() {
+        let mut first = ChatSession::new("g1".into(), 0);
+        first.on_event(started(), 1, 0);
+        first.on_log(
+            LogItem::UserMessage {
+                id: "u1".into(),
+                turn_id: "t1".into(),
+                text: "hello".into(),
+                created_at_ms: 2,
+            },
+            2,
+            0,
+        );
+        first.on_log(
+            LogItem::TurnEnded {
+                turn_id: "t1".into(),
+                outcome: Outcome::Done,
+            },
+            3,
+            1,
+        );
+        let snapshot = first.snapshot(50, 1024 * 1024);
+        let wire: ChatSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let mut restored = ChatSession::restore("g2".into(), wire);
+        assert_eq!(restored.generation(), "g2");
+        assert_eq!(restored.status().state, State::Ready);
+        assert_eq!(restored.history(None, 50, 1024 * 1024).len(), 1);
+        // A new prompt is accepted at once (ready, no draft).
+        assert!(restored.submit("r1", "g2", "next", 1, false).is_ok());
+    }
     use std::path::PathBuf;
 
     fn started() -> AgentEvent {

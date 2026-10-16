@@ -77,6 +77,24 @@ pub(crate) fn session_family(text: &str) -> Option<&'static str> {
     }
 }
 
+/// The `data.id` of a `session` message, when it has one (no other check).
+fn session_message_id(text: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Data {
+        id: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Outer {
+        #[serde(rename = "type")]
+        kind: String,
+        data: Option<Data>,
+    }
+    let outer: Outer = serde_json::from_str(text).ok()?;
+    (outer.kind == "session")
+        .then_some(outer.data?.id?)
+        .filter(|id| crate::session_protocol::wire::is_uuid_v4(id))
+}
+
 struct OutboundMessage {
     message: AstationMessage,
     delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -91,6 +109,12 @@ pub enum AstationMessage {
     /// as is.
     #[serde(skip)]
     SessionWire(String),
+
+    /// A `session`, `terminal` or `agentChat` message over its size bound
+    /// (not kept): answered with an `error` (`re` = its session `id`, when
+    /// it had a readable one).
+    #[serde(skip)]
+    SessionOversize { id: Option<String> },
 
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
@@ -763,8 +787,9 @@ impl AstationClient {
                 match message {
                     Ok(Message::Text(text)) => {
                         let astation_msg = match session_family(&text) {
-                            Some("terminal") if text.len() > 32 * 1024 => continue,
-                            Some(_) if text.len() > crate::session_protocol::wire::MAX_MESSAGE_BYTES => continue,
+                            Some(family) if text.len() > if family == "terminal" { 32 * 1024 } else { crate::session_protocol::wire::MAX_MESSAGE_BYTES } => {
+                                Some(AstationMessage::SessionOversize { id: session_message_id(&text) })
+                            }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };

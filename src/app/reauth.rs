@@ -769,4 +769,55 @@ mod tests {
         assert_eq!(inbox[0].0, app.astation_link_gen);
         assert!(inbox[0].1.contains("subscribe"));
     }
+
+    fn session_errors(frames: &[Option<AstationMessage>]) -> Vec<serde_json::Value> {
+        frames
+            .iter()
+            .flatten()
+            .filter_map(|frame| match frame {
+                AstationMessage::SessionWire(text) => serde_json::from_str(text).ok(),
+                _ => None,
+            })
+            .filter(|v: &serde_json::Value| v["type"] == "session" && v["data"]["op"] == "error")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_full_session_inbox_refuses_with_busy() {
+        let (mut app, mut peer) = connected_app().await;
+        let mut hosted = crate::app::hosted::Hosted::default();
+        for _ in 0..crate::app::hosted::INBOX_LIMIT {
+            hosted
+                .inbox
+                .push_back((app.astation_link_gen, String::new()));
+        }
+        app.hosted = Some(hosted);
+        let list = r#"{"type":"session","data":{"v":1,"op":"list","id":"11111111-1111-4111-8111-111111111111"}}"#;
+        app.handle_astation_message(AstationMessage::SessionWire(list.into()))
+            .await;
+        let errors = session_errors(&pump(&mut app, &mut peer).await);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["data"]["code"], "busy");
+        assert_eq!(
+            errors[0]["data"]["re"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversize_session_message_is_answered_with_an_error() {
+        let (mut app, mut peer) = connected_app().await;
+        app.hosted = Some(crate::app::hosted::Hosted::default());
+        let subscribe = Message::Subscribe {
+            terminal_id: "ses-aaaaaaaaaaaa".into(),
+            generation: "x".repeat(40 * 1024),
+        };
+        peer.send
+            .send(AstationMessage::Terminal(subscribe.into()))
+            .unwrap();
+        let errors = session_errors(&pump(&mut app, &mut peer).await);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["data"]["code"], "unsupported_version");
+        assert!(app.hosted.as_ref().unwrap().inbox.is_empty());
+    }
 }

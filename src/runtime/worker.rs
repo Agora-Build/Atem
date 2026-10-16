@@ -50,6 +50,9 @@ pub const OUTPUT_BACKLOG: usize = 1024 * 1024;
 const HANDSHAKE: Duration = Duration::from_secs(2);
 /// The refusal a second broker gets while one is connected.
 pub const ANOTHER_BROKER: &str = "another broker is connected to this worker";
+/// History a chat snapshot carries at most (well below the line bound).
+const SNAPSHOT_MESSAGES: usize = 200;
+const SNAPSHOT_BYTES: usize = 1024 * 1024;
 /// How often the chat adapter is read.
 const CHAT_POLL: Duration = Duration::from_millis(200);
 
@@ -528,7 +531,16 @@ impl Worker {
         });
         self.conn = Some(conn);
         if self.adapter.is_some() || !self.chat_backlog.is_empty() {
-            self.flush_chat(true);
+            // The snapshot covers what the backlog held (the worker's chat
+            // session read it already), so the backlog is not sent too.
+            self.chat_backlog.take();
+            let snapshot = WorkerMsg::ChatSnapshot {
+                snapshot: self.chat.snapshot(SNAPSHOT_MESSAGES, SNAPSHOT_BYTES),
+                input_count: self.input.input_count(),
+                chat_v1: self.capabilities.chat_v1,
+                reason: self.capabilities.reason.clone(),
+            };
+            self.send(&snapshot);
         }
         if let Some(status) = self.exited.clone() {
             self.send(&WorkerMsg::Exited { status });
@@ -676,6 +688,7 @@ impl Worker {
                         ok: true,
                         bytes_written: n,
                         dropped: false,
+                        no_effect: false,
                         error: None,
                     },
                     FencedOutcome::Dropped => {
@@ -687,6 +700,7 @@ impl Worker {
                         ok: false,
                         bytes_written: 0,
                         dropped: false,
+                        no_effect: false,
                         error: Some(error),
                     },
                 };
@@ -906,16 +920,19 @@ fn dropped(seq: u64) -> WorkerMsg {
         ok: false,
         bytes_written: 0,
         dropped: true,
+        no_effect: false,
         error: None,
     }
 }
 
+/// A write refused before anything was queued (no effect).
 fn failed(seq: u64, error: String) -> WorkerMsg {
     WorkerMsg::WriteResult {
         seq,
         ok: false,
         bytes_written: 0,
         dropped: false,
+        no_effect: true,
         error: Some(error),
     }
 }

@@ -256,6 +256,12 @@ impl Runtime {
 
     /// Another broker of the same state dir (a restart).
     async fn start_in(dir: Rc<tempfile::TempDir>, socket: &str) -> Self {
+        Self::start_with(dir, socket, true).await
+    }
+
+    /// `profile_at_start`: the broker reads the profile's identity at start
+    /// (else it starts unpaired and takes it from the first verified link).
+    async fn start_with(dir: Rc<tempfile::TempDir>, socket: &str, profile_at_start: bool) -> Self {
         let root = dir.path();
         let profile_dir = root.join("profile");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -299,6 +305,8 @@ impl Runtime {
         app.astation_client.pin_astation_for_test(ASTATION);
         app.astation_connected = true;
         app.astation_link_gen = 1;
+        // Never reconnect to a real Astation from a test.
+        app.astation_reconnect = false;
         let socket = root.join(socket);
         let _ = std::fs::remove_file(&socket);
         let unix = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -311,7 +319,7 @@ impl Runtime {
                 socket_dir: root.join("ws"),
                 chat_root: root.join("run"),
             }),
-            profile: Some(crate::status::Sources::in_dir(&profile_dir)),
+            profile: profile_at_start.then(|| crate::status::Sources::in_dir(&profile_dir)),
             clock: clock.clone(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -492,6 +500,15 @@ fn welcome_list_leases_terminal_input_and_local_input() {
             .filter(|v| v["data"]["re"] == id.as_str())
             .count();
         assert_eq!(replies, 1);
+        // The same id with other content is another message: it is handled.
+        peer.send(json!({"type":"session","data":{"v":1,"op":"list","id":id,"extra":1}}));
+        peer.drain(Duration::from_millis(500)).await;
+        let replies = peer
+            .seen
+            .iter()
+            .filter(|v| v["data"]["re"] == id.as_str())
+            .count();
+        assert_eq!(replies, 2);
 
         // View, then control: input goes through the worker.
         peer.terminal("subscribe", &sid, &pg, json!({}), None);
@@ -699,8 +716,7 @@ async fn submit_until_complete(
     );
     let done = peer
         .wait_from(from, |v| {
-            (is_chat(v, "complete") || is_chat(v, "error"))
-                && v["data"]["requestId"] == request_id
+            (is_chat(v, "complete") || is_chat(v, "error")) && v["data"]["requestId"] == request_id
         })
         .await;
     peer.seen[from..=done].to_vec()
@@ -819,6 +835,31 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         .await;
         assert!(is_chat(again.last().unwrap(), "complete"));
         assert!(!again.iter().any(|v| v.to_string().contains("reply 2")));
+        // Chat goes on in the adopted session: its history, and a new prompt.
+        let from = peer.seen.len();
+        open_chat(peer, "conv-3", &sid, &pg).await;
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            peer.seen[from..].iter().any(|v| is_chat(v, "message")
+                && v["data"]["conversationId"] == "conv-3"
+                && v["data"]["history"] == true
+                && v.to_string().contains("run the tests")),
+            "no history after the restart"
+        );
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let events = submit_until_complete(
+            peer,
+            "conv-3",
+            &sid,
+            &pg,
+            lease,
+            &request_id,
+            "after restart",
+        )
+        .await;
+        let complete = events.last().unwrap();
+        assert!(is_chat(complete, "complete"), "{complete}");
+        assert!(events.iter().any(|v| v.to_string().contains("reply 2")));
         rt.shutdown().await;
     });
 }
@@ -852,7 +893,7 @@ fn mark_tasks_wait_for_a_remote_lease_holder_and_are_written_without_one() {
         let agent = script(
             rt.dir.path(),
             "recorder",
-            "stty -echo\nprintf 'READY\\r\\n'\nexec cat >> typed.txt",
+            "stty -echo\nprintf 'READY\\r\\n'\nsleep 1\nexec cat >> typed.txt",
         );
         let typed = project.join("typed.txt");
         let session = rt
@@ -880,6 +921,24 @@ fn mark_tasks_wait_for_a_remote_lease_holder_and_are_written_without_one() {
             json!({"binding": peer.binding(&sid, &pg, Some(epoch))}),
         );
         assert_eq!(peer.reply(&id).await["op"], "lease_released");
+        // A local reclaim right after (no remote lease, no remote bytes)
+        // never drops the queued prompt.
+        client
+            .send(&ClientMsg::Attach {
+                session_id: sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            client
+                .send(&ClientMsg::Reclaim {
+                    session_id: sid.clone(),
+                })
+                .await
+                .unwrap();
+        }
         tokio::time::timeout(WAIT, async {
             loop {
                 let text = std::fs::read_to_string(&typed).unwrap_or_default();
@@ -911,7 +970,11 @@ fn re_authentication_fences_the_attachment_and_its_lease_expires() {
         let session = rt.launch(&mut client, "codex", &agent, None).await;
         let (sid, pg) = (session.id.clone(), session.generation.clone());
         let peer = &mut rt.peer;
-        peer.hello().await;
+        let hello_id = uuid::Uuid::new_v4().to_string();
+        let hello = json!({"type":"session","data":{"v":1,"op":"hello","id":hello_id}});
+        peer.send(hello.clone());
+        let welcome = peer.reply(&hello_id).await;
+        peer.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
         let epoch = peer.acquire(&sid, &pg).await;
         let old = peer.binding(&sid, &pg, Some(epoch));
 
@@ -927,8 +990,17 @@ fn re_authentication_fences_the_attachment_and_its_lease_expires() {
         peer.send(status("authenticated", json!({"method": "session_proof"})));
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // A new attachment: hello again; the old one is gone.
-        let welcome = peer.hello().await;
+        // A new attachment: the same hello again is a retry there, handled.
+        let from = peer.seen.len();
+        peer.send(hello);
+        let at = peer
+            .wait_from(from, |v| {
+                v["type"] == "session" && v["data"]["re"] == hello_id.as_str()
+            })
+            .await;
+        let welcome = peer.seen[at]["data"].clone();
+        assert_eq!(welcome["op"], "welcome", "{welcome}");
+        peer.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
         assert_ne!(welcome["attachment_gen"], old["attachment_gen"]);
         let id = peer.request("renew", json!({"binding": old}));
         assert_eq!(peer.reply(&id).await["code"], "stale_target");
@@ -1037,4 +1109,170 @@ async fn adoption_refuses_a_worker_epoch_beyond_the_reserved_block() {
     let again =
         super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
     assert_eq!(again.host().context().runtime_epoch, first + 1);
+}
+
+#[test]
+fn classification_follows_section_6() {
+    use super::super::broker::WriteOutcome;
+    use crate::session_protocol::host::DispatchReport;
+    let outcome = |ok, dropped, no_effect| WriteOutcome {
+        seq: 0,
+        ok,
+        dropped,
+        no_effect,
+        error: None,
+    };
+    assert_eq!(super::classify(&outcome(true, false, false)), None);
+    assert_eq!(
+        super::classify(&outcome(false, true, false)),
+        Some(DispatchReport::FailedNoEffect)
+    );
+    assert_eq!(
+        super::classify(&outcome(false, false, true)),
+        Some(DispatchReport::FailedNoEffect)
+    );
+    assert_eq!(
+        super::classify(&outcome(false, false, false)),
+        Some(DispatchReport::FailedAfterPossibleEffect)
+    );
+}
+
+#[test]
+fn the_submitter_hears_the_turns_real_outcome() {
+    let env = super::complete_envelope(
+        "c1",
+        "ses-aaaaaaaaaaaa",
+        None,
+        "r1".into(),
+        Some("t1".into()),
+        crate::chat::adapter::Outcome::Interrupted,
+    );
+    assert_eq!(env.op, "complete");
+    assert_eq!(env.body["outcome"], "interrupted");
+    assert_eq!(env.body["turnId"], "t1");
+}
+
+#[test]
+fn congestion_keeps_written_acks_and_drops_only_frames() {
+    use super::Queued;
+    let mut queue = std::collections::VecDeque::from(vec![
+        Queued::Frame("f1".into()),
+        Queued::Other("written-1".into()),
+        Queued::Frame("f2".into()),
+        Queued::Other("written-2".into()),
+    ]);
+    super::drop_frames(&mut queue);
+    let kept: Vec<String> = queue.into_iter().map(Queued::into_text).collect();
+    assert_eq!(kept, ["written-1", "written-2"]);
+}
+
+#[tokio::test]
+async fn repeated_reclaims_never_push_the_worker_epoch_past_the_block() {
+    let dir = short_dir();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    let session = broker_session(dir.path()).await;
+    let sid = session.id.clone();
+    let mut sessions = std::collections::BTreeMap::new();
+    sessions.insert(sid.clone(), session);
+    let mut app = App::new();
+    app.hosted = Some(Default::default());
+    app.astation_reconnect = false;
+    bridge.tick(&mut app, &mut sessions, false);
+    // Local writes in flight (a mark task's prompt, typing) are never dropped
+    // by a reclaim without a remote lease.
+    sessions.get_mut(&sid).unwrap().write(b"keep me\n").unwrap();
+    for _ in 0..(2 * super::LEASE_EPOCH_BLOCK) {
+        bridge
+            .local_input(&sid, Vec::new(), &app.astation_client, &mut sessions)
+            .unwrap();
+    }
+    assert_eq!(sessions[&sid].input_epoch(), 0);
+}
+
+#[test]
+fn a_new_identity_restarts_the_host_under_it() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        profile(&dir.path().join("profile"), true);
+        // Started unpaired; the first verified link names the identity.
+        let mut rt = Runtime::start_with(dir, "rt.sock", false).await;
+        let peer = &mut rt.peer;
+        let welcome = peer.hello().await;
+        assert_eq!(welcome["account_id"], ACCOUNT);
+        assert_eq!(welcome["atem_device_id"], DEVICE);
+        assert_eq!(welcome["host_trust_gen"], TRUST_GEN);
+        let id = peer.request("list", json!({}));
+        let sessions = peer.reply(&id).await;
+        // Epoch 1 at start, 2 for the new identity.
+        assert_eq!(sessions["runtime_epoch"], 2, "{sessions}");
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn interrupts_complete_at_once_without_a_turn_and_are_unknown_when_unobserved() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let claude = rt.launch(&mut client, "claude", &fake_claude(), None).await;
+        let codex = rt
+            .launch(&mut client, "codex", &echo_agent(rt.dir.path()), None)
+            .await;
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        open_chat(peer, "conv-1", &claude.id, &claude.generation).await;
+        let mut ids = Vec::new();
+        for session in [&claude, &codex] {
+            let epoch = peer.acquire(&session.id, &session.generation).await;
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let id = peer.request(
+                "submit",
+                json!({"binding": peer.binding(&session.id, &session.generation, Some(epoch)),
+                       "request_id": request_id, "kind": "interrupt", "payload": {}}),
+            );
+            assert_eq!(peer.reply(&id).await["state"], "accepted");
+            ids.push(request_id);
+        }
+        // Claude is ready: no turn runs, so the interrupt completes at once.
+        let done = peer
+            .wait_from(0, |v| {
+                is_session(v, "receipt")
+                    && v["data"]["request_id"] == ids[0].as_str()
+                    && v["data"]["state"] == "completed"
+            })
+            .await;
+        assert_eq!(peer.seen[done]["data"]["detail"], "no turn was running");
+        // Codex has no chat: nothing can observe it within 10 s.
+        rt.clock.skip(10_001);
+        let peer = &mut rt.peer;
+        let unknown = peer
+            .wait_from(0, |v| {
+                is_session(v, "receipt")
+                    && v["data"]["request_id"] == ids[1].as_str()
+                    && v["data"]["state"] == "outcome_unknown"
+            })
+            .await;
+        assert_eq!(
+            peer.seen[unknown]["data"]["detail"],
+            "no interrupt observed"
+        );
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn the_link_is_fenced_and_dropped_at_its_authorization_deadline() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        rt.peer.hello().await;
+        rt.clock.skip(super::LINK_AUTHORIZATION_MS + 1);
+        // The broker drops the link (a reconnect authenticates it again).
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("the link stayed open past its authorization");
+        rt.shutdown().await;
+    });
 }

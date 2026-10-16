@@ -62,9 +62,9 @@ const ADVANCE_EVERY: u64 = 100;
 /// Identical session messages within this window are handled once.
 const DEDUP_MS: u64 = 60_000;
 /// The authorization of an authenticated link (compatibility mode has no
-/// freshness proof yet): after this, requests on it are `paused` until the
-/// link is authenticated again.
-const LINK_AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
+/// freshness proof yet): at its end the attachment is fenced and the link
+/// dropped; the reconnect authenticates it again and gets a new attachment.
+pub(super) const LINK_AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
 /// Terminal messages waiting for the transport before streams are dropped.
 const TERMINAL_BACKLOG: usize = 128;
 const HEARTBEAT: Duration = Duration::from_secs(15);
@@ -81,6 +81,8 @@ const INTERRUPT_KEY: &[u8] = b"\x1b";
 /// authorized under it).
 const UNPAIRED: &str = "unpaired";
 const RUNTIME_EPOCH_FILE: &str = "runtime_epoch";
+/// Turn outcomes kept for duplicate submits (cleared beyond it).
+const MAX_OUTCOMES: usize = 4096;
 
 /// The broker's monotonic clock in milliseconds (tests move it forward).
 #[derive(Clone, Debug)]
@@ -264,6 +266,8 @@ struct Chats {
 struct Link {
     link_gen: u64,
     attachment: String,
+    /// The attachment's authorization ends here (monotonic ms).
+    deadline: u64,
 }
 
 pub struct HostBridge {
@@ -289,7 +293,11 @@ pub struct HostBridge {
     /// Interrupts waiting for a turn to end, per session.
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
-    terminal_out: VecDeque<String>,
+    /// terminal-v1 messages in order (frames, acks, errors) waiting for the
+    /// bounded terminal queue.
+    terminal_out: VecDeque<Queued>,
+    /// The outcome a prompt's turn ended with, until its receipt is reported.
+    outcomes: HashMap<String, crate::chat::adapter::Outcome>,
 }
 
 /// Where effects go: the link's client and the broker's sessions.
@@ -334,6 +342,7 @@ impl HostBridge {
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
+            outcomes: HashMap::new(),
         })
     }
 
@@ -381,7 +390,11 @@ impl HostBridge {
     }
 
     /// Local frontend input: revokes any remote lease (a new input epoch,
-    /// sent to the worker first), then writes `bytes` (none for a reclaim).
+    /// sent to the worker first when a lease was held or remote bytes were
+    /// sent), then writes `bytes` (none for a reclaim). Local writes in
+    /// flight — typing, a mark task's prompt — are never dropped by it, so
+    /// the worker's epoch only moves with remote control (within the
+    /// journal's reserved block).
     pub fn local_input(
         &mut self,
         sid: &SessionId,
@@ -393,27 +406,14 @@ impl HostBridge {
         if !self.per.get(sid.as_str()).is_some_and(|p| p.registered) {
             // Not a host session (yet): write as is.
             if bytes.is_empty() {
-                let session = cx
-                    .sessions
-                    .get_mut(sid)
-                    .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
-                return session.raise_input_epoch().map(|_| ());
+                // No remote lease can exist: nothing to reclaim.
+                return Ok(());
             }
             let session = cx
                 .sessions
                 .get_mut(sid)
                 .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
             return session.write(&bytes);
-        }
-        let queued = cx.sessions.get(sid).is_some_and(|s| s.writes_in_flight());
-        if bytes.is_empty()
-            && queued
-            && let Some(per) = self.per.get_mut(sid.as_str())
-        {
-            // A reclaim: control changes explicitly, so whatever is still
-            // queued at the worker (local or remote) is dropped. Only then:
-            // the worker's epoch stays within the journal's reserved block.
-            per.dirty = true;
         }
         let effects = self.host.local_input(sid.as_str(), bytes);
         let mut result = Ok(());
@@ -449,6 +449,15 @@ impl HostBridge {
         sessions: &mut BTreeMap<SessionId, BrokerSession>,
         adopting: bool,
     ) {
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|l| self.clock.now() >= l.deadline)
+        {
+            // Its authorization ended: the attachment is fenced and the link
+            // dropped, so the normal reconnect authenticates it again.
+            app.drop_astation_link("Astation link authorization expired; reconnecting".into());
+        }
         let client = &app.astation_client;
         let mut cx = Cx { client, sessions };
         self.sync_link(app_link(app), &mut cx);
@@ -532,6 +541,7 @@ impl HostBridge {
                 self.link = Some(Link {
                     link_gen: want.unwrap_or_default(),
                     attachment,
+                    deadline: self.clock.now().saturating_add(LINK_AUTHORIZATION_MS),
                 });
                 self.exec(effects, cx);
             }
@@ -641,16 +651,23 @@ impl HostBridge {
             return;
         };
         let now = self.clock.now();
-        if let Ok(Envelope::Session(m)) = &decoded
-            && self.duplicate(&m.id, now)
-        {
-            return;
+        if let Ok(Envelope::Session(m)) = &decoded {
+            // The same message on this attachment again (e.g. over both
+            // transports): same id and same content. Another content under
+            // the id, or a retry on a new attachment, is handled.
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(text.as_bytes());
+            let key = format!("{attachment} {} {digest:x}", m.id);
+            if self.duplicate(&key, now) {
+                return;
+            }
         }
         let effects = self.host.receive_decoded(&attachment, decoded, now);
         self.exec(effects, cx);
     }
 
-    /// The same session message (`id`) was handled within the window.
+    /// The same session message (attachment, `id`, content) was handled
+    /// within the window.
     fn duplicate(&mut self, id: &str, now: u64) -> bool {
         while let Some((at, old)) = self.seen_order.front() {
             if now.saturating_sub(*at) < DEDUP_MS {
@@ -676,7 +693,7 @@ impl HostBridge {
         let text = String::from_utf8(wire::encode(message)).expect("wire JSON is UTF-8");
         let terminal = matches!(message, Envelope::Family(f) if f.family == "terminal");
         if terminal {
-            self.terminal_out.push_back(text);
+            self.terminal_out.push_back(Queued::Other(text));
             self.flush_terminal(cx);
         } else {
             let _ = cx.client.try_send_wire(text, false);
@@ -684,7 +701,8 @@ impl HostBridge {
     }
 
     fn flush_terminal(&mut self, cx: &mut Cx) {
-        while let Some(text) = self.terminal_out.front() {
+        while let Some(queued) = self.terminal_out.front() {
+            let (Queued::Frame(text) | Queued::Other(text)) = queued;
             if cx.client.try_send_wire(text.clone(), true).is_err() {
                 break;
             }
@@ -991,6 +1009,9 @@ impl HostBridge {
                 }
             };
             self.interrupts.remove(sid);
+            // Nothing more is answered for this process's writes.
+            self.pending.retain(|(s, _), _| s != sid);
+            self.prompts.retain(|_, s| s != sid);
             self.exec(effects, cx);
             return;
         }
@@ -1123,7 +1144,7 @@ impl HostBridge {
     fn queue_terminal(&mut self, message: TerminalMessage, cx: &mut Cx) {
         let text = serde_json::to_string(&AstationMessage::Terminal(message.into()))
             .expect("terminal messages serialize");
-        self.terminal_out.push_back(text);
+        self.terminal_out.push_back(Queued::Other(text));
         self.flush_terminal(cx);
     }
 
@@ -1150,13 +1171,7 @@ impl HostBridge {
         let Some(pending) = self.pending.remove(&(sid.to_string(), result.seq)) else {
             return;
         };
-        let failure = if result.dropped {
-            Some(DispatchReport::FailedNoEffect)
-        } else if !result.ok {
-            Some(DispatchReport::FailedAfterPossibleEffect)
-        } else {
-            None
-        };
+        let failure = classify(&result);
         match pending {
             Pending::Input {
                 attachment,
@@ -1239,7 +1254,7 @@ impl HostBridge {
                         let text =
                             serde_json::to_string(&AstationMessage::Terminal(message.into()))
                                 .expect("terminal messages serialize");
-                        self.terminal_out.push_back(text);
+                        self.terminal_out.push_back(Queued::Frame(text));
                     }
                 }
                 Err(error) => failed.push((key, error)),
@@ -1256,10 +1271,11 @@ impl HostBridge {
         }
     }
 
-    /// The terminal transport fell behind: every stream ends (viewers
-    /// subscribe again).
+    /// The terminal transport fell behind: the frames waiting go and every
+    /// stream ends (viewers subscribe again); `written` acks and errors stay
+    /// queued, in order.
     fn congested(&mut self, cx: &mut Cx) {
-        self.terminal_out.clear();
+        drop_frames(&mut self.terminal_out);
         let streams: Vec<((String, String), FrameStream)> = self.streams.drain().collect();
         for ((_, sid), stream) in streams {
             self.terminal_error(
@@ -1272,8 +1288,9 @@ impl HostBridge {
         }
     }
 
+    /// A terminal-v1 `error`, on the terminal stream (after what is queued).
     fn terminal_error(
-        &self,
+        &mut self,
         sid: &str,
         stream_id: Option<&str>,
         code: &str,
@@ -1287,7 +1304,8 @@ impl HostBridge {
             data["stream_id"] = Value::String(stream_id.into());
         }
         let text = json!({"type": "terminal", "data": data}).to_string();
-        let _ = cx.client.try_send_wire(text, false);
+        self.terminal_out.push_back(Queued::Other(text));
+        self.flush_terminal(cx);
     }
 
     // ── chat-v1 ──
@@ -1460,13 +1478,14 @@ impl HostBridge {
                 turn_id,
             } => {
                 self.submitters.remove(&request_id);
-                let mut body = Map::new();
-                body.insert("requestId".into(), Value::String(request_id));
-                if let Some(turn_id) = turn_id {
-                    body.insert("turnId".into(), Value::String(turn_id));
-                }
-                body.insert("outcome".into(), Value::String("done".into()));
-                chat_envelope(conversation, sid, "complete", head, body)
+                // A turn ended interrupted says so (a duplicate after a
+                // restart only knows it completed).
+                let outcome = self
+                    .outcomes
+                    .get(&request_id)
+                    .copied()
+                    .unwrap_or(crate::chat::adapter::Outcome::Done);
+                complete_envelope(conversation, sid, head, request_id, turn_id, outcome)
             }
             ChatReply::Error {
                 request_id,
@@ -1505,11 +1524,15 @@ impl HostBridge {
                 Out::Complete {
                     turn_id,
                     request_id,
-                    ..
+                    outcome,
                 } => {
                     if let Some(request_id) = request_id {
                         except = self.submitters.get(request_id).map(|(_, c)| c.clone());
                         if self.prompts.remove(request_id).is_some() {
+                            if self.outcomes.len() >= MAX_OUTCOMES {
+                                self.outcomes.clear();
+                            }
+                            self.outcomes.insert(request_id.clone(), *outcome);
                             let report = DispatchReport::Completed {
                                 detail: None,
                                 turn_id: Some(turn_id.clone()),
@@ -1635,6 +1658,57 @@ impl HostBridge {
 fn app_link(app: &App) -> Option<u64> {
     (app.astation_connected && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
         .then_some(app.astation_link_gen)
+}
+
+/// §6: what a failed host write proves (`None`: it was written).
+pub(super) fn classify(result: &WriteOutcome) -> Option<DispatchReport> {
+    if result.dropped || result.no_effect {
+        Some(DispatchReport::FailedNoEffect)
+    } else if !result.ok {
+        Some(DispatchReport::FailedAfterPossibleEffect)
+    } else {
+        None
+    }
+}
+
+/// A terminal message waiting for the transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Queued {
+    Frame(String),
+    Other(String),
+}
+
+impl Queued {
+    pub(super) fn into_text(self) -> String {
+        match self {
+            Queued::Frame(t) | Queued::Other(t) => t,
+        }
+    }
+}
+
+pub(super) fn drop_frames(queue: &mut VecDeque<Queued>) {
+    queue.retain(|q| matches!(q, Queued::Other(_)));
+}
+
+pub(super) fn complete_envelope(
+    conversation: &str,
+    sid: &str,
+    head: Option<(String, u64)>,
+    request_id: String,
+    turn_id: Option<String>,
+    outcome: crate::chat::adapter::Outcome,
+) -> ChatEnvelope {
+    let mut body = Map::new();
+    body.insert("requestId".into(), Value::String(request_id));
+    if let Some(turn_id) = turn_id {
+        body.insert("turnId".into(), Value::String(turn_id));
+    }
+    let outcome = match outcome {
+        crate::chat::adapter::Outcome::Done => "done",
+        crate::chat::adapter::Outcome::Interrupted => "interrupted",
+    };
+    body.insert("outcome".into(), Value::String(outcome.into()));
+    chat_envelope(conversation, sid, "complete", head, body)
 }
 
 fn session_of<'a>(cx: &'a mut Cx, sid: &str) -> Option<&'a mut BrokerSession> {

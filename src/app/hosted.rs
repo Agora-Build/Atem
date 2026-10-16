@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 /// Messages kept for the session host per pass, at most.
-const INBOX_LIMIT: usize = 1024;
+pub const INBOX_LIMIT: usize = 1024;
 
 /// One broker session as mark tasks see it.
 #[derive(Debug, Clone)]
@@ -70,18 +70,48 @@ impl App {
             return;
         }
         let link = self.astation_link_gen;
-        if let Some(hosted) = self.hosted.as_mut() {
-            if hosted.inbox.len() < INBOX_LIMIT {
+        let full = match self.hosted.as_mut() {
+            Some(hosted) if hosted.inbox.len() < INBOX_LIMIT => {
                 hosted.inbox.push_back((link, text));
+                return;
             }
-            return;
-        }
+            Some(_) => true,
+            None => false,
+        };
         let re = match wire::decode(text.as_bytes()) {
             Ok(Envelope::Session(m)) => Some(m.id),
             Ok(Envelope::Family(_)) => None,
             Err(e) => e.id,
         };
-        let _ = self.astation_client.try_send_wire(refusal(re), false);
+        // The host's inbox is full: `busy` (the client may retry); without
+        // a runtime, no session is served at all.
+        let code = if full {
+            ErrorCode::Busy
+        } else {
+            ErrorCode::UnsupportedVersion
+        };
+        self.session_refusal(re, code);
+    }
+
+    /// A session `error` with `code` (answering `re`) on an authenticated link.
+    pub(super) fn session_refusal(&mut self, re: Option<String>, code: ErrorCode) {
+        if !self.astation_connected || self.astation_client.is_ws_closed() {
+            return;
+        }
+        let _ = self
+            .astation_client
+            .try_send_wire(error_text(re, code), false);
+    }
+
+    /// Drops the Astation link (closing its socket) and schedules the
+    /// normal reconnect, which authenticates it again.
+    pub fn drop_astation_link(&mut self, reason: String) {
+        self.astation_connected = false;
+        self.on_astation_disconnect();
+        self.astation_client = crate::websocket_client::AstationClient::new();
+        self.rebuild_menu();
+        self.status_message = Some(reason);
+        self.astation_reconnect_at = Some(Instant::now());
     }
 
     /// The broker could not write a mark task's prompt: the task fails.
@@ -98,13 +128,15 @@ impl App {
 
 /// The TUI's answer to a session-family message: it serves no sessions.
 pub fn refusal(re: Option<String>) -> String {
+    error_text(re, ErrorCode::UnsupportedVersion)
+}
+
+/// A session `error{code}` answering `re`.
+pub fn error_text(re: Option<String>, code: ErrorCode) -> String {
     let message = Envelope::Session(SessionMessage {
         id: uuid::Uuid::new_v4().to_string(),
         re,
-        op: Op::Error {
-            code: ErrorCode::UnsupportedVersion,
-            detail: Some("sessions are served by atem runtime".into()),
-        },
+        op: Op::Error { code, detail: None },
     });
     String::from_utf8(wire::encode(&message)).expect("wire JSON is UTF-8")
 }

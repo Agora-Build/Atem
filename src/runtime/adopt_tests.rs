@@ -183,14 +183,16 @@ async fn the_worker_runs_the_agent_and_drops_writes_of_a_stale_epoch() {
         ok: false,
         bytes_written: 0,
         dropped: true,
-        error: None
+        error: None,
+        no_effect: false,
     }));
     assert!(results.contains(&WorkerMsg::WriteResult {
         seq: 2,
         ok: true,
         bytes_written: 4,
         dropped: false,
-        error: None
+        error: None,
+        no_effect: false,
     }));
     assert!(results.iter().any(|r| matches!(
         r,
@@ -578,4 +580,33 @@ async fn a_silent_connection_does_not_use_up_the_first_connect_window() {
             .unwrap();
     until(&mut handle, has_output("ready")).await;
     stop(running, handle).await;
+}
+
+#[tokio::test]
+async fn synchronous_refusals_report_that_nothing_was_written() {
+    let (_running, mut handle) = start().await;
+    until(&mut handle, has_output("ready")).await;
+    // A paste with control characters is refused before anything is queued.
+    handle.paste(1, "bad\u{7}paste", 0).unwrap();
+    let mut result = None;
+    until(&mut handle, |m| {
+        if let WorkerMsg::WriteResult { seq: 1, .. } = m {
+            result = Some(m.clone());
+        }
+        result.is_some()
+    })
+    .await;
+    assert!(
+        matches!(
+            result,
+            Some(WorkerMsg::WriteResult {
+                ok: false,
+                dropped: false,
+                no_effect: true,
+                error: Some(_),
+                ..
+            })
+        ),
+        "{result:?}"
+    );
 }

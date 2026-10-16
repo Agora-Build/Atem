@@ -1,5 +1,14 @@
 # Shared terminal: first Atem build
 
+> **Status note (2026-10-16):** superseded for remote control by
+> [atem-session v1 r6](protocol/atem-session-v1.md) and the runtime host
+> (`src/runtime/host_bridge.rs`, plan
+> [runtime host integration](plans/2026-10-16-runtime-host-integration.md)):
+> only `atem runtime` serves sessions remotely; terminal-v1 and chat-v1 are
+> bound to session-v1 targets and leases (`control`, `list`, `lease_id`,
+> provider ids and the agent list are removed), and sessions outlive the
+> frontend in `atem worker`s. The plain TUI refuses remote session messages.
+
 Updated: 2026-10-13. Status: implemented in Atem; not released.
 The Astation terminal UI and its acceptance tests remain to be implemented by
 the Astation owner. This document is the integration contract for the first
