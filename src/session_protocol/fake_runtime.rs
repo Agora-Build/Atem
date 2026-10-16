@@ -14,7 +14,7 @@ use super::host::{
     Attach, ChatReply, DispatchReport, Effect, HostConfig, HostContext, Origin, SessionHost,
     SessionSpec, random_ids,
 };
-use super::journal::MemJournal;
+use super::journal::{Journal, MemJournal};
 use super::wire::{
     self, Binding, ClientKind, DecodeError, Envelope, Op, Permission, ReceiptKind, SessionMessage,
     Target,
@@ -74,8 +74,25 @@ struct Client {
     client_kind: ClientKind,
 }
 
-pub struct FakeRuntime {
-    pub host: SessionHost<MemJournal>,
+/// Fixture failure injection on a journal (`fail_next_fsync`).
+pub trait FailFsync {
+    fn fail_next_fsync(&mut self);
+}
+
+impl FailFsync for MemJournal {
+    fn fail_next_fsync(&mut self) {
+        MemJournal::fail_next_fsync(self);
+    }
+}
+
+impl FailFsync for super::file_journal::FileJournal {
+    fn fail_next_fsync(&mut self) {
+        self.inject(super::file_journal::Fault::Fsync);
+    }
+}
+
+pub struct FakeRuntime<J: Journal = MemJournal> {
+    pub host: SessionHost<J>,
     pub pty: Pty,
     /// Hold remote PTY writes in a queue instead of writing them at once
     /// (`flush_writes` writes them through the write boundary).
@@ -151,6 +168,16 @@ impl FakeRuntime {
     }
 
     pub fn with_config(setup: &Setup, config: HostConfig) -> Result<Self, String> {
+        Self::with_journal(setup, config, MemJournal::default())
+    }
+
+    pub fn from_json(setup: Value, config: HostConfig) -> Self {
+        Self::from_json_with(setup, config, MemJournal::default())
+    }
+}
+
+impl<J: Journal> FakeRuntime<J> {
+    pub fn with_journal(setup: &Setup, config: HostConfig, journal: J) -> Result<Self, String> {
         let h = &setup.host;
         let ctx = HostContext {
             account_id: h.account_id.clone(),
@@ -159,8 +186,7 @@ impl FakeRuntime {
             runtime_gen: h.runtime_gen.clone(),
             runtime_epoch: h.runtime_epoch,
         };
-        let host =
-            SessionHost::new(ctx, config, MemJournal::default(), random_ids()).map_err(|e| e.0)?;
+        let host = SessionHost::new(ctx, config, journal, random_ids()).map_err(|e| e.0)?;
         let mut rt = Self {
             host,
             pty: Pty::default(),
@@ -210,9 +236,9 @@ impl FakeRuntime {
         Ok(rt)
     }
 
-    pub fn from_json(setup: Value, config: HostConfig) -> Self {
+    pub fn from_json_with(setup: Value, config: HostConfig, journal: J) -> Self {
         let setup: Setup = serde_json::from_value(setup).expect("setup");
-        Self::with_config(&setup, config).expect("fake runtime")
+        Self::with_journal(&setup, config, journal).expect("fake runtime")
     }
 
     /// Connects `client` on a new attachment without `hello`.
@@ -508,7 +534,7 @@ impl FakeRuntime {
     }
 }
 
-impl HostUnderTest for FakeRuntime {
+impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
     /// The host sees the time with the message; no timer tick is run.
     fn receive(&mut self, client: &str, msg: Result<Envelope, DecodeError>, now_ms: u64) {
         self.now = now_ms;

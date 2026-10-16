@@ -926,6 +926,29 @@ mod tests {
         assert_eq!(hostless.passed.len(), client);
     }
 
+    /// The same fixtures with receipts in a `FileJournal` on disk.
+    #[test]
+    fn every_fixture_passes_with_the_file_journal() {
+        use super::super::fake_runtime::FakeRuntime;
+        use super::super::file_journal::FileJournal;
+        use super::super::host::HostConfig;
+        let dirs = std::cell::RefCell::new(Vec::new());
+        let factory = |setup: &Setup| -> Result<Box<dyn HostUnderTest>, String> {
+            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let journal = FileJournal::open(&dir.path().join("state")).map_err(|e| e.0)?;
+            dirs.borrow_mut().push(dir);
+            Ok(Box::new(FakeRuntime::with_journal(
+                setup,
+                HostConfig::default(),
+                journal,
+            )?))
+        };
+        let report = run_all(&fixtures_dir(), Some(&factory));
+        assert!(report.failed.is_empty(), "failed: {:#?}", report.failed);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.passed.len(), scenario_files().len());
+    }
+
     /// Each host fixture fails when one of its expectations is changed, so
     /// passing means the host produced exactly what the fixture says.
     #[test]

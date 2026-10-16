@@ -33,7 +33,7 @@ use super::wire::{
     ReceiptKind, ReceiptState, SessionMessage, SessionState, Target, TerminalRequest,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// A lease lasts this long from its grant or renewal (§5).
 pub const LEASE_MS: u64 = 15_000;
@@ -321,6 +321,9 @@ pub struct SessionHost<J: Journal> {
     ended: HashMap<String, u64>,
     attachments: BTreeMap<String, Attachment>,
     receipts: BTreeMap<String, Entry>,
+    /// session_id → its request ids (the receipts index, kept with
+    /// `receipts`): per-session scans don't walk every receipt.
+    by_session: HashMap<String, BTreeSet<String>>,
     lease_floors: HashMap<String, u64>,
     /// Admission order of the next new request.
     next_order: u64,
@@ -352,6 +355,7 @@ impl<J: Journal> SessionHost<J> {
             ended: HashMap::new(),
             attachments: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            by_session: HashMap::new(),
             lease_floors: HashMap::new(),
             next_order: 0,
             retry: Vec::new(),
@@ -399,11 +403,7 @@ impl<J: Journal> SessionHost<J> {
     /// were reserved for it.
     pub fn add_session(&mut self, spec: SessionSpec) -> Result<Vec<Effect>, String> {
         let sid = &spec.session_id;
-        let known = self.lease_floors.contains_key(sid)
-            || self
-                .receipts
-                .values()
-                .any(|e| &e.stored.target.session_id == sid);
+        let known = self.lease_floors.contains_key(sid) || self.by_session.contains_key(sid);
         if known {
             return Err("session_id already used".into());
         }
@@ -569,13 +569,7 @@ impl<J: Journal> SessionHost<J> {
     }
 
     fn evict_receipts(&mut self, sid: &str) {
-        let ids: Vec<String> = self
-            .receipts
-            .values()
-            .filter(|e| e.stored.target.session_id == sid)
-            .map(|e| e.stored.request_id.clone())
-            .collect();
-        for rid in ids {
+        for rid in self.receipt_ids(sid) {
             let record = Record::Evicted {
                 request_id: rid.clone(),
             };
@@ -583,8 +577,42 @@ impl<J: Journal> SessionHost<J> {
                 return; // retried on the next advance
             }
             self.receipts.remove(&rid);
+            self.unindex(sid, &rid);
         }
         self.ended.remove(sid);
+    }
+
+    fn index(&mut self, sid: &str, rid: &str) {
+        self.by_session
+            .entry(sid.to_string())
+            .or_default()
+            .insert(rid.to_string());
+    }
+
+    fn unindex(&mut self, sid: &str, rid: &str) {
+        if let Some(ids) = self.by_session.get_mut(sid) {
+            ids.remove(rid);
+            if ids.is_empty() {
+                self.by_session.remove(sid);
+            }
+        }
+    }
+
+    /// `sid`'s request ids, in request-id order (as `receipts` iterates).
+    fn receipt_ids(&self, sid: &str) -> Vec<String> {
+        self.by_session
+            .get(sid)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// `sid`'s receipts, in request-id order.
+    fn receipts_of<'a>(&'a self, sid: &str) -> impl Iterator<Item = &'a Entry> + 'a {
+        self.by_session
+            .get(sid)
+            .into_iter()
+            .flatten()
+            .filter_map(|rid| self.receipts.get(rid))
     }
 
     /// Local terminal input on the host: it bumps the input epoch and revokes
@@ -688,12 +716,8 @@ impl<J: Journal> SessionHost<J> {
     fn process_gone(&mut self, session_id: &str) {
         let process_gen = self.sessions[session_id].spec.process_gen.clone();
         let work: Vec<(String, ReceiptState, ReceiptKind)> = self
-            .receipts
-            .values()
-            .filter(|e| {
-                e.stored.target.session_id == session_id
-                    && e.stored.target.process_gen == process_gen
-            })
+            .receipts_of(session_id)
+            .filter(|e| e.stored.target.process_gen == process_gen)
             .map(|e| (e.stored.request_id.clone(), e.stored.state, e.stored.kind))
             .collect();
         for (rid, state, kind) in work {
@@ -768,9 +792,9 @@ impl<J: Journal> SessionHost<J> {
         if !wire::is_uuid_v4(process_gen) || s.spec.process_gen == process_gen {
             return Err("process_gen must be a new UUID v4".into());
         }
-        let used = self.receipts.values().any(|e| {
-            e.stored.target.session_id == session_id && e.stored.target.process_gen == process_gen
-        });
+        let used = self
+            .receipts_of(session_id)
+            .any(|e| e.stored.target.process_gen == process_gen);
         if used {
             return Err("process_gen already used".into());
         }
@@ -909,6 +933,20 @@ impl<J: Journal> SessionHost<J> {
                 (rid, entry)
             })
             .collect();
+        self.by_session.clear();
+        let ids: Vec<(String, String)> = self
+            .receipts
+            .values()
+            .map(|e| {
+                (
+                    e.stored.target.session_id.clone(),
+                    e.stored.request_id.clone(),
+                )
+            })
+            .collect();
+        for (sid, rid) in ids {
+            self.index(&sid, &rid);
+        }
         self.lease_floors = replayed.lease_epochs;
         self.next_order = self
             .receipts
@@ -916,6 +954,19 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| e.stored.order + 1)
             .max()
             .unwrap_or(0);
+    }
+
+    /// The per-session index lists exactly the receipts there are.
+    #[cfg(test)]
+    pub fn index_matches_receipts(&self) -> bool {
+        let mut rebuilt: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for e in self.receipts.values() {
+            rebuilt
+                .entry(e.stored.target.session_id.clone())
+                .or_default()
+                .insert(e.stored.request_id.clone());
+        }
+        rebuilt == self.by_session
     }
 
     /// Final receipt writes waiting to be retried.
@@ -1475,11 +1526,7 @@ impl<J: Journal> SessionHost<J> {
         }
         let sid = &b.target.session_id;
         self.check_mutation(att, &self.sessions[sid], b.lease_epoch)?;
-        let held = self
-            .receipts
-            .values()
-            .filter(|e| &e.stored.target.session_id == sid)
-            .count();
+        let held = self.by_session.get(sid).map_or(0, BTreeSet::len);
         if held >= self.config.max_receipts_per_session {
             return Err(ErrorCode::ReceiptLimit);
         }
@@ -1521,6 +1568,7 @@ impl<J: Journal> SessionHost<J> {
             Reply::Chat { conversation_id } => Some(conversation_id.clone()),
             Reply::Session(_) => None,
         };
+        self.index(&b.target.session_id, request_id);
         self.receipts.insert(
             request_id.to_string(),
             Entry {
@@ -1576,10 +1624,8 @@ impl<J: Journal> SessionHost<J> {
     }
 
     fn prompt_executing(&self, sid: &str) -> bool {
-        self.receipts.values().any(|e| {
-            e.stored.target.session_id == sid
-                && e.stored.kind == ReceiptKind::Prompt
-                && e.stored.state == ReceiptState::Executing
+        self.receipts_of(sid).any(|e| {
+            e.stored.kind == ReceiptKind::Prompt && e.stored.state == ReceiptState::Executing
         })
     }
 
