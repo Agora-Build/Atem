@@ -28,6 +28,7 @@ mod pair_verify;
 mod pairing_binding;
 mod status;
 mod chat;
+mod session_protocol;
 mod websocket_client;
 // Agent hub — PTY agents launched by `atem agent launch`
 mod agent_client;

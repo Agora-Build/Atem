@@ -1,0 +1,368 @@
+{
+ "name": "receipt-query-is-scoped-to-the-exact-target",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222"
+   },
+   {
+    "session_id": "ses-bbbbbbbbbbbb",
+    "process_gen": "22222222-2222-4222-8222-bbbbbbbbbbbb"
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   },
+   {
+    "name": "v",
+    "attachment_gen": "77777777-7777-4777-8777-777777777777",
+    "permissions": [
+     "view"
+    ],
+    "client_kind": "native"
+   },
+   {
+    "name": "b",
+    "attachment_gen": "88888888-8888-4888-8888-888888888888",
+    "permissions": [
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000001"
+   }
+  },
+  {
+   "expect": "v",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "session_id": "ses-aaaaaaaaaaaa"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-bbbbbbbbbbbb",
+       "process_gen": "22222222-2222-4222-8222-bbbbbbbbbbbb"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000002"
+   }
+  },
+  {
+   "expect": "v",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "session_id": "ses-bbbbbbbbbbbb"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-bbbbbbbbbbbb",
+       "process_gen": "22222222-2222-4222-8222-bbbbbbbbbbbb"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "accepted"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "executing"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000005",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001",
+      "44444444-4444-4444-8444-000000000002",
+      "44444444-4444-4444-8444-000000000099",
+      "44444444-4444-4444-8444-000000000001"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipts",
+    "re": "11111111-1111-4111-8111-000000000005",
+    "receipts.#": 1,
+    "receipts.0.request_id": "44444444-4444-4444-8444-000000000001",
+    "receipts.0.target.session_id": "ses-aaaaaaaaaaaa"
+   }
+  },
+  {
+   "send": "v",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000006",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-bbbbbbbbbbbb",
+       "process_gen": "22222222-2222-4222-8222-bbbbbbbbbbbb"
+      },
+      "attachment_gen": "77777777-7777-4777-8777-777777777777"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001",
+      "44444444-4444-4444-8444-000000000002"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "v",
+   "type": "session",
+   "match": {
+    "op": "receipts",
+    "re": "11111111-1111-4111-8111-000000000006",
+    "receipts.#": 1,
+    "receipts.0.request_id": "44444444-4444-4444-8444-000000000002"
+   }
+  },
+  {
+   "send": "b",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000007",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "88888888-8888-4888-8888-888888888888"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "b",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000007",
+    "code": "unknown_session"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000008",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 5,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000008",
+    "code": "stale_target"
+   }
+  },
+  {
+   "assert": {
+    "receipts_visible": {
+     "c1": 2,
+     "v": 2,
+     "b": 0
+    }
+   }
+  }
+ ],
+ "note": "receipt_query returns only receipts bound to exactly the binding's target (other targets' and unknown ids are absent, duplicates once); without view it is unknown_session; a wrong trust generation is stale_target."
+}
