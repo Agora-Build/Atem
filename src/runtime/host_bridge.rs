@@ -102,7 +102,10 @@ impl Default for Clock {
 
 impl Clock {
     pub fn now(&self) -> u64 {
-        self.origin.elapsed().as_millis() as u64 + self.skew.load(Ordering::SeqCst)
+        // The shared fixtures run the real runtime on their own clock.
+        let base = super::test_hooks::clock_ms()
+            .unwrap_or_else(|| self.origin.elapsed().as_millis() as u64);
+        base + self.skew.load(Ordering::SeqCst)
     }
 
     /// Moves the clock `ms` forward (tests).

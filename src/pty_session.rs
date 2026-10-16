@@ -49,6 +49,8 @@ struct WriteRequest {
     /// A fenced write: its input epoch, compared at the write boundary with
     /// the current one (`PtyInput::raise_input_epoch`).
     fence: Option<u64>,
+    /// Write half of it, then fail (`runtime::test_hooks`, debug builds).
+    partial: bool,
 }
 
 /// An unfenced write (`respond`).
@@ -66,9 +68,17 @@ fn write_fenced_request(
     current: &AtomicU64,
     fence: u64,
     data: &[u8],
+    partial: bool,
 ) -> FencedOutcome {
+    crate::runtime::test_hooks::hold_writes();
     if fence < current.load(Ordering::SeqCst) {
         return FencedOutcome::Dropped;
+    }
+    if partial {
+        let _ = writer
+            .write_all(&data[..data.len() / 2])
+            .and_then(|()| writer.flush());
+        return FencedOutcome::Failed("write interrupted (test fault)".into());
     }
     match writer.write_all(data).and_then(|()| writer.flush()) {
         Ok(()) => FencedOutcome::Written(data.len()),
@@ -131,10 +141,24 @@ impl PtyInput {
         bytes.extend_from_slice(b"\x1b[200~");
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(b"\x1b[201~\r");
-        self.enqueue_fenced(bytes, epoch, sequence)
+        if crate::runtime::test_hooks::fail_next_enqueue() {
+            bail!("Terminal input was not queued (test fault)");
+        }
+        let partial = crate::runtime::test_hooks::fail_next_partial();
+        self.enqueue_fenced_request(bytes, epoch, sequence, partial)
     }
 
     fn enqueue_fenced(&self, data: Vec<u8>, epoch: u64, sequence: u64) -> Result<()> {
+        self.enqueue_fenced_request(data, epoch, sequence, false)
+    }
+
+    fn enqueue_fenced_request(
+        &self,
+        data: Vec<u8>,
+        epoch: u64,
+        sequence: u64,
+        partial: bool,
+    ) -> Result<()> {
         if data.is_empty() || data.len() > MAX_FENCED {
             bail!("Input must contain 1..={MAX_FENCED} bytes");
         }
@@ -143,6 +167,7 @@ impl PtyInput {
                 data,
                 sequence: Some(sequence),
                 fence: Some(epoch),
+                partial,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
     }
@@ -156,6 +181,7 @@ impl PtyInput {
                 data,
                 sequence: None,
                 fence: None,
+                partial: false,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
     }
@@ -359,8 +385,13 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
     std::thread::spawn(move || {
         while let Some(request) = input.blocking_recv() {
             if let (Some(fence), Some(sequence)) = (request.fence, request.sequence) {
-                let outcome =
-                    write_fenced_request(&mut writer, &writer_epoch, fence, &request.data);
+                let outcome = write_fenced_request(
+                    &mut writer,
+                    &writer_epoch,
+                    fence,
+                    &request.data,
+                    request.partial,
+                );
                 if writer_output
                     .blocking_send(PtyEvent::Fenced { sequence, outcome })
                     .is_err()
@@ -453,6 +484,7 @@ mod tests {
                 &input.input_epoch,
                 request.fence.unwrap(),
                 &request.data,
+                request.partial,
             ));
         }
         assert_eq!(

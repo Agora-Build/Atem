@@ -13,6 +13,7 @@ pub mod ops;
 pub mod protocol;
 pub mod server;
 pub mod session_log;
+pub mod test_hooks;
 pub mod worker;
 pub mod worker_chat;
 pub mod worker_protocol;
