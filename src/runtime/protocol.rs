@@ -34,7 +34,6 @@ impl std::fmt::Debug for LaunchEnv {
 
 impl LaunchEnv {
     /// This process's environment (entries that aren't UTF-8 are left out).
-    #[allow(dead_code)] // the frontends (next task)
     pub fn current() -> Self {
         Self(
             std::env::vars_os()
@@ -119,7 +118,6 @@ impl ClientMsg {
     }
 
     /// `input` with `bytes` base64-encoded.
-    #[allow(dead_code)] // the frontends (next task)
     pub fn input(session_id: &str, bytes: &[u8]) -> Self {
         ClientMsg::Input {
             session_id: session_id.into(),
@@ -164,6 +162,10 @@ pub enum RuntimeMsg {
         protocol: u32,
         build: String,
         pid: u32,
+        /// The runtime's Astation link is authenticated (`astation` follows
+        /// on every change).
+        #[serde(default)]
+        astation: bool,
     },
     Launched {
         session: SessionSummary,
@@ -192,6 +194,15 @@ pub enum RuntimeMsg {
     Detached {
         session_id: String,
         reason: String,
+    },
+    /// The attached session's summary changed (status, remote control,
+    /// state); sent to its frontend.
+    Session {
+        session: SessionSummary,
+    },
+    /// The runtime's Astation link went up or down; sent to every client.
+    Astation {
+        connected: bool,
     },
     Notice {
         text: String,
@@ -332,7 +343,6 @@ pub fn b64(bytes: &[u8]) -> String {
 }
 
 /// Decodes base64 (`restore`, `output`).
-#[allow(dead_code)] // the frontends (next task)
 pub fn unb64(text: &str) -> Option<Vec<u8>> {
     STANDARD.decode(text).ok()
 }
@@ -413,6 +423,7 @@ mod tests {
                 protocol: 1,
                 build: "b".into(),
                 pid: 7,
+                astation: true,
             },
             RuntimeMsg::Launched { session: summary() },
             RuntimeMsg::Attached {
@@ -437,6 +448,8 @@ mod tests {
                 session_id: "s".into(),
                 reason: "attached elsewhere".into(),
             },
+            RuntimeMsg::Session { session: summary() },
+            RuntimeMsg::Astation { connected: false },
             RuntimeMsg::Notice { text: "n".into() },
             RuntimeMsg::error("bad", Some("launch")),
             RuntimeMsg::error("bad", None),

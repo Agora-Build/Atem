@@ -13,7 +13,7 @@ use super::protocol::{
     input_bytes,
 };
 use crate::app::App;
-use crate::session::{EXITED_KEEP, Provider, SessionId, Sessions};
+use crate::session::{EXITED_KEEP, Provider, SessionId};
 use futures_util::FutureExt;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -119,6 +119,8 @@ struct Attachment {
     /// the mirror is current).
     restored: bool,
     exited_sent: bool,
+    /// The summary it last got (in `attached` or `session`).
+    sent: Option<SessionSummary>,
 }
 
 struct Server {
@@ -142,6 +144,8 @@ struct Server {
     /// The session host (`None` when its journal could not be opened:
     /// remote session messages are refused then).
     bridge: Option<HostBridge>,
+    /// The Astation link state the clients last heard.
+    astation: bool,
 }
 
 /// Serves frontends on `listener` with `app` as the host until `shutdown`
@@ -210,6 +214,7 @@ pub async fn serve(
         restart: false,
         wake: wake.clone(),
         bridge,
+        astation: false,
     };
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -223,6 +228,7 @@ pub async fn serve(
                 server.app.tick_host().await;
                 server.host_pass().await;
                 server.forward_status();
+                server.forward_astation();
             }
             Some(stream) = accepted.recv() => server.add_client(stream),
             Some(done) = launched.recv() => server.launched(done),
@@ -428,6 +434,19 @@ impl Server {
         let notice = RuntimeMsg::Notice { text };
         for client in self.clients.values().filter(|c| c.greeted) {
             client.send(&notice);
+        }
+    }
+
+    /// Every greeted client hears when the Astation link goes up or down.
+    fn forward_astation(&mut self) {
+        let connected = self.app.astation_connected;
+        if connected == self.astation {
+            return;
+        }
+        self.astation = connected;
+        let message = RuntimeMsg::Astation { connected };
+        for client in self.clients.values().filter(|c| c.greeted) {
+            client.send(&message);
         }
     }
 
@@ -669,6 +688,7 @@ impl Server {
                             protocol: PROTOCOL,
                             build: crate::memory::key_agent::build_id().to_string(),
                             pid: std::process::id(),
+                            astation: self.astation,
                         });
                     }
                 }
@@ -702,10 +722,13 @@ impl Server {
                 if let Err(error) = crate::session::check_env(&env.to_os()) {
                     return self.error(id, error, "launch");
                 }
-                if self.live_count() + self.launching >= Sessions::MAX_LIVE {
+                if self.live_count() + self.launching >= crate::session::MAX_LIVE {
                     return self.error(
                         id,
-                        format!("At most {} sessions can run at once", Sessions::MAX_LIVE),
+                        format!(
+                            "At most {} sessions can run at once",
+                            crate::session::MAX_LIVE
+                        ),
                         "launch",
                     );
                 }
@@ -754,6 +777,7 @@ impl Server {
                     screen: (0, 0),
                     restored: false,
                     exited_sent: false,
+                    sent: None,
                 };
                 if let Some(previous) = self.attached.insert(sid.clone(), attachment)
                     && previous.client != id
@@ -1067,6 +1091,7 @@ impl Server {
         };
         attachment.screen = session.size();
         attachment.restored = true;
+        attachment.sent = Some(summary.clone());
         let Some(client) = self.clients.get(&attachment.client) else {
             return;
         };
@@ -1139,6 +1164,13 @@ impl Server {
             }
             if resync {
                 self.restore(&sid);
+            }
+            // A changed summary (activity, remote control, state) after the restore.
+            let summary = self.summary(&sid);
+            let attachment = self.attached.get_mut(&sid).expect("attached");
+            if attachment.restored && attachment.sent.as_ref() != Some(&summary) {
+                attachment.sent = Some(summary.clone());
+                self.send(client_id, &RuntimeMsg::Session { session: summary });
             }
             let attachment = self.attached.get_mut(&sid).expect("attached");
             // The exit follows the final screen, unless none can come any more.

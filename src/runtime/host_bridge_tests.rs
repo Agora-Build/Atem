@@ -289,8 +289,6 @@ impl Runtime {
             }
         });
         let mut app = App::new();
-        app.chat_root = root.join("run");
-        app.logs_dir = root.join("logs");
         // Never the user's sessions.json.
         app.last_session_refresh = Some(Instant::now());
         app.astation_client = AstationClient::new_with_test_state(

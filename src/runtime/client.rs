@@ -20,6 +20,8 @@ pub struct Welcome {
     pub protocol: u32,
     pub build: String,
     pub pid: u32,
+    /// The runtime's Astation link was up when it greeted.
+    pub astation: bool,
 }
 
 /// Where a runtime listens and logs.
@@ -146,6 +148,7 @@ impl RuntimeClient {
     }
 
     /// Connects to the runtime at `socket` and greets it.
+    #[cfg(test)]
     pub async fn connect_at(socket: &Path) -> Result<Self> {
         let stream = dial_at(socket)
             .await
@@ -185,6 +188,7 @@ impl RuntimeClient {
                 protocol: 0,
                 build: String::new(),
                 pid: 0,
+                astation: false,
             },
         };
         let hello = ClientMsg::Hello {
@@ -202,11 +206,13 @@ impl RuntimeClient {
                 protocol,
                 build,
                 pid,
+                astation,
             })) => {
                 client.welcome = Welcome {
                     protocol,
                     build,
                     pid,
+                    astation,
                 };
                 Ok(client)
             }
@@ -239,6 +245,55 @@ impl RuntimeClient {
         decode_runtime(text)
             .map(Some)
             .map_err(|error| anyhow!("the runtime sent an invalid message: {error}"))
+    }
+}
+
+/// The receiving half of a split client.
+pub struct RuntimeReader {
+    reader: BufReader<OwnedReadHalf>,
+    line: Vec<u8>,
+}
+
+/// The sending half of a split client.
+pub struct RuntimeWriter {
+    writer: OwnedWriteHalf,
+}
+
+impl RuntimeClient {
+    /// Halves that receive and send independently (a frontend reads on its
+    /// own task: `recv` isn't cancel-safe).
+    pub fn split(self) -> (RuntimeReader, RuntimeWriter) {
+        (
+            RuntimeReader {
+                reader: self.reader,
+                line: self.line,
+            },
+            RuntimeWriter {
+                writer: self.writer,
+            },
+        )
+    }
+}
+
+impl RuntimeReader {
+    /// The next message; `None` once the runtime closed the connection.
+    pub async fn recv(&mut self) -> Result<Option<RuntimeMsg>> {
+        if !super::server::read_line(&mut self.reader, &mut self.line).await? {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(&self.line).context("the runtime sent invalid text")?;
+        decode_runtime(text)
+            .map(Some)
+            .map_err(|error| anyhow!("the runtime sent an invalid message: {error}"))
+    }
+}
+
+impl RuntimeWriter {
+    pub async fn send(&mut self, message: &ClientMsg) -> Result<()> {
+        self.writer
+            .write_all(encode_client(message).as_bytes())
+            .await
+            .context("the atem runtime closed the connection")
     }
 }
 

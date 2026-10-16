@@ -3,11 +3,10 @@
 //! or adopted (`broker.rs`), and the broker serves local frontends behind a
 //! same-user Unix socket and holds the Astation connection. See
 //! `designs/agent-runtime.md`.
-// The frontends (`atem agent launch|attach|list|stop`, next task) use it.
 pub mod adopt;
 pub mod broker;
-#[allow(dead_code)]
 pub mod client;
+pub mod commands;
 pub mod host_bridge;
 pub mod protocol;
 pub mod server;
@@ -92,6 +91,8 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     );
     let paths =
         adopt::WorkerPaths::new(&state_dir(&config_dir), std::env::var_os("XDG_RUNTIME_DIR"))?;
+    // Chat directories of workers that are gone (a live worker's names its pid).
+    crate::chat::claude::hooks::sweep_stale(&crate::chat::claude::hooks::session_dir_root());
     let mut app = crate::app::App::new();
     app.spawn_astation_connect();
     let options = server::Options {

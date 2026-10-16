@@ -707,7 +707,6 @@ impl Worker {
                 self.send(&message);
             }
             Some(PtyEvent::Error(error)) => eprintln!("atem worker: {error}"),
-            Some(PtyEvent::Written { .. }) => {}
             Some(PtyEvent::Exit(status)) => self.agent_exited(status),
             None => self.agent_exited("PTY transport closed".into()),
         }

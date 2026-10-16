@@ -195,7 +195,7 @@ JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.
 
 | op | from | fields |
 |---|---|---|
-| `hello` / `welcome` | client / runtime | `protocol`, `build`; runtime adds its pid |
+| `hello` / `welcome` | client / runtime | `protocol`, `build`; runtime adds its pid and `astation` (link up) |
 | `launch` | client | `provider`, `args`, `cwd`, `env`, `rows`, `cols` → `launched {session}` |
 | `attach` / `detach` | client | `session_id`, `rows`, `cols` → `attached {session, restore}` |
 | `input` | client | `session_id`, `bytes` |
@@ -205,6 +205,9 @@ JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.
 | `list` / `sessions` | client / runtime | session attributes |
 | `stop` | client | `session_id` |
 | `notice` | runtime | text for the frontend |
+| `session` | runtime | the attached session's changed summary (status, remote control, state) |
+| `astation` | runtime | `connected`, on every change of the Astation link |
+| `reclaim` | client | `session_id`: take control back from a remote lease holder (prefix `g`) |
 | `reload` | client | re-read credentials, sessions and config (after `unpair`, `logout`, config edits) |
 | `astation_op` | client | `request_id`, `kind` (`pair`, `cred_unlock`, `cred_projects`, `token`), options |
 | `print` | runtime | `request_id`, `level` (info/warn/error), `text` |

@@ -232,15 +232,14 @@ impl FrameStream {
 }
 
 /// A session's terminal on the host: answers the CLI's terminal queries
-/// from the canonical screen and keeps the exit status. Remote viewers get
-/// frames through `FrameStream`s the session host opens.
+/// from the canonical screen. Remote viewers get frames through
+/// `FrameStream`s the session host opens.
 pub struct SharedTerminal {
     /// This process's generation; tests use it to tell the same process.
     #[cfg_attr(not(test), allow(dead_code))]
     pub generation: String,
     utf8: Vec<u8>,
     queries: vte::Parser,
-    pub exit_status: Option<String>,
 }
 
 impl SharedTerminal {
@@ -249,13 +248,7 @@ impl SharedTerminal {
             generation: uuid::Uuid::new_v4().to_string(),
             utf8: Vec::new(),
             queries: vte::Parser::new(),
-            exit_status: None,
         }
-    }
-
-    pub fn exited(&mut self, status: String, input: &PtyInput) {
-        self.exit_status = Some(status);
-        input.set_remote(false);
     }
 
     pub fn process(

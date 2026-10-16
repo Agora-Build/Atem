@@ -1,19 +1,9 @@
 //! Verify the full CLI, input decoder, PTY sizing and rendered ANSI without a provider.
-#![cfg(unix)]
-use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#![cfg(target_os = "linux")]
+mod support;
 
-struct Atem(Box<dyn Child + Send + Sync>);
-impl Drop for Atem {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
-    }
-}
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 #[track_caller]
 fn within(mut predicate: impl FnMut() -> bool) {
@@ -72,48 +62,23 @@ fn terminal_fixture() {
 
 #[test]
 fn compact_terminal_preserves_control_keys_paste_resize_and_copy() {
+    let sandbox = support::Sandbox::new();
     let directory = tempfile::tempdir().unwrap();
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_atem"));
-    command.args(["agent", "launch", "codex"]);
-    command.env_clear();
-    command.env("HOME", directory.path());
-    command.env("PATH", "/usr/bin:/bin");
-    command.env("TERM", "xterm-256color");
-    command.env("ASTATION_WS", "ws://127.0.0.1:1/ws");
-    command.env("ASTATION_RELAY_URL", "http://127.0.0.1:1");
-    command.env("CODEX_CLI_BIN", std::env::current_exe().unwrap());
-    command.env("CODEX_CLI_ARGS", "--exact terminal_fixture --nocapture");
-    command.env("ATEM_TERMINAL_UI_FIXTURE", directory.path());
-    command.cwd(directory.path());
-    let mut atem = Atem(pair.slave.spawn_command(command).unwrap());
-    drop(pair.slave);
-    let screen = Arc::new(Mutex::new(vt100::Parser::new(40, 120, 0)));
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let reader_screen = screen.clone();
-    let reader_bytes = bytes.clone();
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let output = std::thread::spawn(move || {
-        let mut buf = [0; 4096];
-        while let Ok(count) = reader.read(&mut buf) {
-            if count == 0 {
-                break;
-            }
-            reader_screen.lock().unwrap().process(&buf[..count]);
-            reader_bytes
-                .lock()
-                .unwrap()
-                .extend_from_slice(&buf[..count]);
-        }
-    });
-    let mut writer = pair.master.take_writer().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let mut atem = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        directory.path(),
+        &[
+            ("CODEX_CLI_BIN", exe.to_str().unwrap()),
+            ("CODEX_CLI_ARGS", "--exact terminal_fixture --nocapture"),
+            (
+                "ATEM_TERMINAL_UI_FIXTURE",
+                directory.path().to_str().unwrap(),
+            ),
+        ],
+    );
+    let screen = atem.screen.clone();
+    let bytes = atem.bytes.clone();
     within(|| {
         screen
             .lock()
@@ -122,6 +87,7 @@ fn compact_terminal_preserves_control_keys_paste_resize_and_copy() {
             .contents()
             .contains("ATEM_FIXTURE")
     });
+    sandbox.track();
     assert_eq!(
         std::fs::read_to_string(directory.path().join("size")).unwrap(),
         "39 120"
@@ -133,19 +99,10 @@ fn compact_terminal_preserves_control_keys_paste_resize_and_copy() {
 
     // Ordinary control keys and one multiline paste must reach the original CLI unchanged.
     let sent = b"\x02\x07\x03\x1b[200~one\n two\x1b[201~";
-    writer.write_all(sent).unwrap();
-    writer.flush().unwrap();
+    atem.send(sent);
     within(|| std::fs::read(directory.path().join("input")).is_ok_and(|value| value == sent));
 
-    screen.lock().unwrap().set_size(30, 90);
-    pair.master
-        .resize(PtySize {
-            rows: 30,
-            cols: 90,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
+    atem.resize(30, 90);
     within(|| {
         std::fs::read_to_string(directory.path().join("size")).is_ok_and(|value| value == "29 90")
     });
@@ -162,8 +119,7 @@ fn compact_terminal_preserves_control_keys_paste_resize_and_copy() {
     assert_eq!(text.matches("Atem |").count(), 1);
 
     // Copy is an explicit outer clipboard request, not bytes typed into the agent.
-    writer.write_all(b"\x1dc").unwrap();
-    writer.flush().unwrap();
+    atem.send(b"\x1dc");
     within(|| {
         bytes
             .lock()
@@ -173,8 +129,9 @@ fn compact_terminal_preserves_control_keys_paste_resize_and_copy() {
     });
     assert_eq!(std::fs::read(directory.path().join("input")).unwrap(), sent);
 
-    writer.write_all(b"\x1dhq").unwrap();
-    writer.flush().unwrap();
-    within(|| atem.0.try_wait().unwrap().is_some());
-    output.join().unwrap();
+    // Detach leaves the session; stopping it ends the fixture.
+    let sid = atem.detach();
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "{err}");
+    support::within("the worker to end", || sandbox.records().is_empty());
 }

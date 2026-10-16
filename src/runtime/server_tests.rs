@@ -33,14 +33,11 @@ fn own_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// An App with chat and logs under `root` (chat can't be prepared there, so
-/// Claude runs its binary as given).
+/// An App for a runtime in `root` (workers' chat can't be prepared under
+/// `root/file`, so Claude runs its binary as given).
 fn app(root: &Path) -> App {
     std::fs::write(root.join("file"), b"").unwrap();
-    let mut app = App::new();
-    app.chat_root = root.join("file/run");
-    app.logs_dir = root.join("logs");
-    app
+    App::new()
 }
 
 /// An executable sh script `name` in `dir`.
@@ -1351,6 +1348,36 @@ fn reclaim_without_a_remote_lease_keeps_queued_local_input() {
             .unwrap();
         // Nothing queued is dropped: no remote lease was held.
         view.until(&mut client, "x1 x2 END").await;
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn the_frontend_hears_the_astation_link_and_its_session_summary_changes() {
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let mut fake = FakeWorker::start(dir.path(), 0);
+        let runtime = runtime_on(dir);
+        let mut client = runtime.client().await;
+        // No pairing: the welcome says the link is down.
+        assert!(!client.welcome.astation);
+        fake.heard("request_screen").await;
+        fake.screen("HERE", 0, 24, 80);
+        let view = attach(&mut client, &fake.sid).await;
+        assert!(view.screen.screen().contents().contains("HERE"));
+        // The worker's activity reaches the attached frontend as a summary.
+        fake.send(&super::worker_protocol::WorkerMsg::Activity {
+            state: super::worker_protocol::Activity::Working,
+            detail: None,
+        });
+        let session = expect(&mut client, |m| match m {
+            RuntimeMsg::Session { session } => Some(session),
+            _ => None,
+        })
+        .await;
+        assert_eq!(session.id, fake.sid);
+        assert_eq!(session.status, "working");
+        assert!(session.attached && !session.remote_controlled);
         runtime.shutdown().await;
     });
 }

@@ -35,9 +35,8 @@ mod session_protocol;
 #[allow(dead_code)]
 mod rtm_client;
 mod websocket_client;
-// Agent hub — PTY agents launched by `atem agent launch`
+// Agent status on the Astation wire
 mod agent_client;
-mod agent_registry;
 // Shared HTTPS scaffolding
 mod web_server;
 // RTC test server

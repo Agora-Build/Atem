@@ -1,9 +1,7 @@
-pub(crate) mod chat;
 pub mod hosted;
 mod reauth;
 #[cfg(test)]
 mod session_tests;
-mod terminal;
 
 use anyhow::Result;
 use crossterm::{
@@ -25,15 +23,11 @@ use std::{
 use tokio::time::Duration;
 
 use crate::agora_api::{BffProject, format_projects};
-use crate::claude_client::ClaudeClient;
-use crate::codex_client::CodexClient;
-use crate::pty_session::SpawnSpec;
-use crate::session::{EXITED_KEEP, LaunchRequest, Provider, Session, SessionId, Sessions};
+use crate::session::SessionId;
 use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
+use crate::runtime::protocol::SessionSummary;
 use crate::websocket_client::{AstationClient, AstationMessage};
-use crate::agent_client::{AgentInfo, AgentOrigin, AgentProtocol, AgentStatus};
-use crate::agent_registry::AgentRegistry;
 
 /// The answer to every `visualizeRequest` from Astation.
 pub const VISUALIZE_REMOVED: &str = "Diagram generation was removed from atem";
@@ -45,14 +39,12 @@ pub const NO_PROJECT_SESSION: &str =
 pub enum AppMode {
     MainMenu,
     TokenGeneration,
-    /// The focused session's terminal (`App::focused`).
-    Terminal,
     CommandExecution,
     AgentPanel,
 }
 
-/// Actions available in the main menu. The menu is rebuilt dynamically
-/// based on whether Atem is paired with Astation.
+/// Actions available in the main menu. Agent entries launch and attach
+/// sessions through `atem runtime`, which owns them and the Astation link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     ListProjects,
@@ -88,31 +80,17 @@ pub struct App {
     pub hosted: Option<hosted::Hosted>,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,
-    /// Launch configuration for Codex sessions.
-    pub codex_client: CodexClient,
-    /// Launch configuration for Claude Code sessions.
-    pub claude_client: ClaudeClient,
-    /// The agent sessions launched in Atem.
-    pub sessions: Sessions,
-    /// The session the TUI shows in `AppMode::Terminal` (kept after leaving the view).
-    pub focused: Option<SessionId>,
     pub force_terminal_redraw: bool,
-    pub terminal_ui: crate::tui::terminal_view::State,
     pub show_certificates: bool,
     pub cached_projects: Vec<BffProject>,
-    pub voice_volume: f32,
-    pub voice_active: bool,
-    pub video_active: bool,
-    pub peer_atems: Vec<crate::websocket_client::AtemInstance>,
-    pub voice_fx_tick: u64,
     pub config: AtemConfig,
     pub dispatcher: TaskDispatcher,
     pub work_items: HashMap<String, WorkItem>,
     pub pairing_code: Option<String>,
-    /// Registry of the PTY agents Atem launched (Claude Code, Codex).
-    pub agent_registry: AgentRegistry,
-    /// ID of the agent currently selected as the active routing target.
-    pub active_agent_id: Option<String>,
+    /// The menu: the runtime's sessions as its last `list` gave them (the
+    /// agent panel), or why it couldn't be asked.
+    pub runtime_sessions: Vec<SessionSummary>,
+    pub runtime_note: Option<String>,
     /// Cursor position in the AgentPanel list.
     pub agent_panel_selected: usize,
     /// Background Astation connection result channel (set up at startup).
@@ -126,12 +104,6 @@ pub struct App {
     /// Deadline of a re-authentication proof sent over the open socket that
     /// Astation has not accepted yet (see `app/reauth.rs`).
     pub astation_reauth: Option<Instant>,
-    /// Where per-session chat directories are created (`chat-<uuid>`).
-    pub chat_root: PathBuf,
-    /// Stale chat directories under `chat_root` were swept (once per App).
-    pub chat_swept: bool,
-    /// Session logs: `<logs_dir>/<session_id>/{session.ansi,summary.md}`.
-    pub logs_dir: PathBuf,
     /// The session the active main mark task was sent to.
     pub main_task_session: Option<SessionId>,
 }
@@ -156,45 +128,23 @@ impl App {
             astation_reconnect: true,
             hosted: None,
             connected_astation_id: None,
-            codex_client: CodexClient::new(),
-            claude_client: ClaudeClient::new(),
-            sessions: Sessions::default(),
-            focused: None,
             force_terminal_redraw: false,
-            terminal_ui: crate::tui::terminal_view::State::new(config.terminal_prefix.as_deref()),
             show_certificates: false,
             cached_projects: Vec::new(),
-            voice_volume: 0.0,
-            voice_active: false,
-            video_active: false,
-            peer_atems: Vec::new(),
-            voice_fx_tick: 0,
             config,
             dispatcher: TaskDispatcher::new(),
             work_items: HashMap::new(),
             pairing_code: None,
-            agent_registry: AgentRegistry::new(),
-            active_agent_id: None,
+            runtime_sessions: Vec::new(),
+            runtime_note: None,
             agent_panel_selected: 0,
             astation_connect_rx: None,
             astation_reconnect_at: None,
             astation_reauth: None,
-            chat_root: crate::chat::claude::hooks::session_dir_root(),
-            chat_swept: false,
-            logs_dir: Self::default_logs_dir(),
             main_task_session: None,
         };
         app.rebuild_menu();
         app
-    }
-
-    /// `<config dir>/logs`. Tests get none (logs off) unless they set a temp dir.
-    fn default_logs_dir() -> PathBuf {
-        if cfg!(test) {
-            PathBuf::new()
-        } else {
-            AtemConfig::config_dir().join("logs")
-        }
     }
 
     pub fn next_item(&mut self) {
@@ -213,45 +163,26 @@ impl App {
         }
     }
 
-    pub fn update_voice_volume(&mut self, level: f32) {
-        self.voice_volume = level.clamp(0.0, 1.0);
-        self.voice_active = level > 0.05; // above noise floor
-        if self.voice_active {
-            self.voice_fx_tick = self.voice_fx_tick.wrapping_add(1);
-        }
-    }
-
-    /// Local terminals remain available while Astation is disconnected.
+    /// The menu: projects, the agent entries (through the runtime), the
+    /// shell, help. The agent panel lists the runtime's sessions.
     pub fn rebuild_menu(&mut self) {
         self.menu_actions.clear();
         self.main_menu_items.clear();
 
-        // Always available
         self.menu_actions.push(MenuAction::ListProjects);
         self.main_menu_items.push("\u{1f4cb} List Agora Projects".to_string());
 
         self.menu_actions.push(MenuAction::LaunchClaude);
-        let running = |p| self.sessions.latest(p).is_some();
-        let (claude_running, codex_running) = (running(Provider::Claude), running(Provider::Codex));
-        self.main_menu_items.push(if claude_running {
-            "Resume Claude Code".into()
-        } else {
-            "Launch Claude Code".into()
-        });
+        self.main_menu_items.push("Launch Claude Code".into());
         self.menu_actions.push(MenuAction::LaunchCodex);
-        self.main_menu_items.push(if codex_running {
-            "Resume Codex".into()
-        } else {
-            "Launch Codex".into()
-        });
+        self.main_menu_items.push("Launch Codex".into());
+
+        self.menu_actions.push(MenuAction::AgentPanel);
+        let running = self.runtime_sessions.iter().filter(|s| s.state == "running").count();
+        self.main_menu_items.push(format!("\u{1f916} Agent Sessions ({running} running)"));
 
         self.menu_actions.push(MenuAction::ExecuteShell);
         self.main_menu_items.push("\u{1f4bb} Execute Shell Command".to_string());
-
-        if self.astation_connected {
-            self.menu_actions.push(MenuAction::AgentPanel);
-            self.main_menu_items.push("\u{1f916} Agent Panel".to_string());
-        }
 
         self.menu_actions.push(MenuAction::Help);
         self.main_menu_items.push("\u{2753} Help".to_string());
@@ -303,13 +234,8 @@ impl App {
                     }
                 }
             }
-            Some(MenuAction::LaunchClaude) => {
-                // Launch Claude Code - always launch locally from Atem (like Codex)
-                self.launch_from_menu(Provider::Claude).await;
-            }
-            Some(MenuAction::LaunchCodex) => {
-                // Launch Codex
-                self.launch_from_menu(Provider::Codex).await;
+            Some(MenuAction::LaunchClaude | MenuAction::LaunchCodex) => {
+                // The TUI loop launches through the runtime (it owns the terminal).
             }
             Some(MenuAction::ExecuteShell) => {
                 // Execute Shell Command
@@ -352,11 +278,11 @@ impl App {
             \u{2022} q: Quit\n\n\
             Features:\n\
             \u{2022} \u{1f4cb} List Agora.io projects\n\
-            \u{2022} \u{1f916} Launch Claude Code\n\
-            \u{2022} \u{1f9e0} Send tasks to Codex\n\
+            \u{2022} \u{1f916} Launch Claude Code or Codex (sessions run in the atem runtime)\n\
+            \u{2022} \u{1f916} Agent Sessions: open a running session\n\
             \u{2022} \u{1f4bb} Execute shell commands\n\
             \u{2022} \u{1f3af} Generate RTC tokens (via shell)\n\
-            \u{2022} Press 'u' in Codex view to save a session summary\n\n\
+            \u{2022} In a session, the prefix then h detaches; it keeps running\n\n\
             Token Generation:\n\
             Use '\u{1f4bb} Execute Shell Command' and run:\n\
             atem token rtc create\n\n\
@@ -444,279 +370,9 @@ impl App {
         Ok(())
     }
 
-    // MARK: - Sessions
-
-    /// The size of a new session: the local viewport, else the default.
-    pub(crate) fn launch_size(&self) -> (u16, u16) {
-        match self.terminal_ui.viewport {
-            (0, _) | (_, 0) => (crate::pty_session::DEFAULT_ROWS, crate::pty_session::DEFAULT_COLS),
-            (rows, cols) => (rows.max(2), cols.max(2)),
-        }
-    }
-
-    /// Start a new session (Claude gets its chat adapter). Registers it (id =
-    /// session id) in the local registry. A failed launch
-    /// returns its error and leaves nothing behind.
-    pub async fn launch_session(&mut self, req: LaunchRequest) -> Result<SessionId> {
-        if let Some(env) = &req.env {
-            crate::session::check_env(env).map_err(|e| anyhow::anyhow!(e))?;
-        }
-        self.sessions.check_room()?;
-        let LaunchRequest { provider, args, cwd, env, rows, cols } = req;
-        let mut session = Session::new(provider, rows.clamp(2, 200), cols.clamp(2, 400));
-        session.cwd = cwd.clone();
-        let id = session.id.clone();
-        // CLAUDE_CLI_*/CODEX_CLI_* from the launch environment when given.
-        let (binary, spawn_args, chat) = match provider {
-            Provider::Claude => {
-                let client = match &env {
-                    Some(env) => ClaudeClient::from_env(env),
-                    None => self.claude_client.clone(),
-                };
-                let launch_args = [client.launch_args(), &args[..]].concat();
-                // Chat hooks for this process; empty when chat could not be prepared.
-                // On failure the prepared chat is dropped (removing its directory).
-                let (chat, chat_args) = self.prepare_claude_chat(id.as_str(), &launch_args);
-                (client.binary().to_string(), [chat_args, launch_args].concat(), chat)
-            }
-            Provider::Codex => {
-                let client = match &env {
-                    Some(env) => CodexClient::from_env(env),
-                    None => self.codex_client.clone(),
-                };
-                (client.binary().to_string(), [client.launch_args(), &args[..]].concat(), None)
-            }
-        };
-        let pty = crate::pty_session::spawn_spec(SpawnSpec {
-            binary,
-            args: spawn_args,
-            cwd,
-            env,
-            rows,
-            cols,
-        })?;
-        session.attach(pty);
-        session.view = (rows, cols);
-        session.chat = chat;
-        self.sessions.insert(session)?;
-
-        // Status stays Unknown and chat-v1 unadvertised until Claude's hooks report
-        // the session (`poll_chat`); Codex has no chat adapter yet: its activity
-        // can't be detected (Unknown) and it advertises no chat capability.
-        self.agent_registry.register(AgentInfo {
-            id: id.to_string(),
-            name: match provider {
-                Provider::Claude => "claude-code",
-                Provider::Codex => "codex",
-            }
-            .to_string(),
-            kind: provider.kind(),
-            protocol: AgentProtocol::Pty,
-            origin: AgentOrigin::Launched,
-            status: AgentStatus::Unknown,
-            session_ids: vec![],
-            acp_url: None,
-            pty_pid: None,
-            capabilities: vec![],
-        });
-        self.rebuild_menu();
-        Ok(id)
-    }
-
-    /// Stop a session's process; its exit is handled like any other.
-    pub fn stop_session(&mut self, id: &SessionId) {
-        if let Some(handle) = self.sessions.get(id).and_then(|s| s.handle.as_ref())
-            && let Err(error) = handle.stop()
-        {
-            self.status_message = Some(error.to_string());
-        }
-    }
-
-    /// Remove sessions that exited `EXITED_KEEP` (10 min) before `now`, with
-    /// their registry entries.
-    pub fn reap_exited_sessions(&mut self, now: Instant) {
-        let due: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|s| s.exited_at.is_some_and(|at| now.saturating_duration_since(at) >= EXITED_KEEP))
-            .map(|s| s.id.clone())
-            .collect();
-        if due.is_empty() {
-            return;
-        }
-        for id in due {
-            if self.sessions.remove(&id).is_none() { continue; }
-            self.agent_registry.remove(id.as_str());
-            if self.focused.as_ref() == Some(&id) {
-                self.focused = None;
-                if matches!(self.mode, AppMode::Terminal) {
-                    self.mode = AppMode::MainMenu;
-                    self.output_text.clear();
-                }
-            }
-        }
-        self.rebuild_menu();
-    }
-
-    /// Tests: the newest session of `provider`, live or exited.
-    #[cfg(test)]
-    pub(crate) fn last_session(&self, provider: Provider) -> Option<&Session> {
-        self.sessions.iter().filter(|s| s.provider == provider).last()
-    }
-
-    /// The session shown by the terminal view, while it is open.
-    pub fn focused_session(&self) -> Option<&Session> {
-        if !matches!(self.mode, AppMode::Terminal) {
-            return None;
-        }
-        self.sessions.get(self.focused.as_ref()?)
-    }
-
-    pub fn focused_session_mut(&mut self) -> Option<&mut Session> {
-        if !matches!(self.mode, AppMode::Terminal) {
-            return None;
-        }
-        self.sessions.get_mut(self.focused.as_ref()?)
-    }
-
-    /// The terminal view is open on `id`.
-    pub fn is_focused(&self, id: &SessionId) -> bool {
-        matches!(self.mode, AppMode::Terminal) && self.focused.as_ref() == Some(id)
-    }
-
-    /// Open the terminal view on `id`.
-    pub fn focus_session(&mut self, id: &SessionId) {
-        self.focused = Some(id.clone());
-        self.mode = AppMode::Terminal;
-        self.refresh_view(id);
-    }
-
-    /// Resume: the latest live session of `provider`. Launch: a new one when
-    /// there is none (a failure is shown as a status message).
-    async fn launch_from_menu(&mut self, provider: Provider) {
-        self.input_text.clear();
-        if let Some(id) = self.sessions.latest(provider) {
-            self.focus_session(&id);
-            return;
-        }
-        let (rows, cols) = self.launch_size();
-        match self.launch_session(LaunchRequest::here(provider, Vec::new(), rows, cols)).await {
-            Ok(id) => self.focus_session(&id),
-            Err(err) => {
-                self.status_message = Some(format!(
-                    "\u{274c} Unable to start {} CLI: {}",
-                    provider.product(),
-                    err
-                ));
-            }
-        }
-    }
-
-    pub fn update_output_from_terminal(&mut self, id: &SessionId) {
-        let focused = self.is_focused(id);
-        let Some(session) = self.sessions.get_mut(id) else { return; };
-        let screen = session.terminal.screen();
-        let (_rows, cols) = screen.size();
-
-        let mut lines: Vec<String> = screen
-            .rows(0, cols)
-            .map(|line| line.replace('\u{0000}', ""))
-            .collect();
-
-        while lines.last().is_some_and(|line| line.trim().is_empty()) {
-            lines.pop();
-        }
-
-        session.output_log = lines.join("\n");
-        if focused {
-            self.output_text = session.output_log.clone();
-        }
-    }
-
-    pub fn send_data(&mut self, id: &SessionId, data: &str) {
-        let Some(session) = self.sessions.get_mut(id) else { return; };
-        if session.share.exit_status.is_some() { return; }
-        if let Some(sender) = &session.input {
-            match sender.send(data.to_string()) {
-                Ok(()) => session.last_used = Instant::now(),
-                Err(error) => self.status_message = Some(error.to_string()),
-            }
-        }
-    }
-
-    pub fn refresh_view(&mut self, id: &SessionId) {
-        if self.is_focused(id)
-            && let Some(session) = self.sessions.get(id)
-        {
-            self.output_text = session.output_log.clone();
-        }
-    }
-
-    pub fn rebuild_terminal(&mut self, id: &SessionId) {
-        let Some(session) = self.sessions.get_mut(id) else { return; };
-        session.terminal.set_size(session.view.0.max(2), session.view.1.max(2));
-        self.update_output_from_terminal(id);
-    }
-
-    pub fn adjust_terminal_size(&mut self, id: &SessionId, rows: u16, cols: u16) {
-        let Some(session) = self.sessions.get_mut(id) else { return; };
-        if session.input.as_ref().is_some_and(|s| s.remote_controlled()) { return; }
-        let rows = rows.min(200);
-        let cols = cols.min(400);
-        if rows < 2 || cols < 2 {
-            return;
-        }
-        if session.view == (rows, cols) && session.terminal.screen().size() == (rows, cols) {
-            return;
-        }
-
-        session.view = (rows, cols);
-        self.rebuild_terminal(id);
-
-        let Some(session) = self.sessions.get(id) else { return; };
-        if let Some(handle) = &session.handle
-            && let Err(err) = handle.resize(rows, cols)
-        {
-            self.status_message = Some(format!(
-                "Failed to resize {} terminal: {}",
-                session.provider.label(),
-                err
-            ));
-        }
-    }
-
-    /// Drain every session's PTY output. A panic while processing one session
-    /// ends that session (its process is stopped), not the others.
-    pub fn process_sessions_output(&mut self) {
-        for id in self.sessions.ids() {
-            let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.process_terminal_output(&id)
-            }));
-            if processed.is_err() {
-                self.end_failed_session(&id);
-            }
-        }
-    }
-
-    /// Stop session `id` after an internal error and mark it exited.
-    fn end_failed_session(&mut self, id: &SessionId) {
-        eprintln!("atem: session {id} failed while processing its output; stopping it");
-        let Some(session) = self.sessions.get_mut(id) else { return; };
-        if let Some(handle) = &session.handle {
-            let _ = handle.stop();
-        }
-        session.events = None;
-        session.exited_at.get_or_insert_with(Instant::now);
-        session.share.exit_status.get_or_insert_with(|| "ended after an internal error".into());
-        if let Some(input) = &session.input {
-            input.set_remote(false);
-        }
-        self.rebuild_menu();
-    }
-
-    /// The host part of the terminal UI's loop, run by the TUI and by `atem
-    /// runtime` every tick: the Astation connection and its messages, every
-    /// session's output, exited-session reaping, chat state and mark tasks.
+    /// The host part of `atem runtime`'s loop, every tick: the Astation
+    /// connection and its messages, and mark tasks (the sessions are the
+    /// broker's).
     pub async fn tick_host(&mut self) {
         // Check if background Astation connection has completed
         self.poll_astation_connect();
@@ -726,9 +382,6 @@ impl App {
 
         // Process any pending Astation messages (also detects WS disconnect)
         self.process_astation_messages().await;
-        self.process_sessions_output();
-        self.reap_exited_sessions(Instant::now());
-        self.poll_chat();
 
         // Dispatcher: drain triage verdicts and try to send next task to main
         self.dispatcher.poll_triage_results();
@@ -747,163 +400,6 @@ impl App {
         if self.dispatcher.take_main_needs_finalize() {
             self.finalize_mark_task(true).await;
         }
-    }
-
-    pub fn finalize_session(&mut self, id: &SessionId) {
-        let was_focused = self.is_focused(id);
-        let Some(provider) = self.sessions.get(id).map(|s| s.provider) else { return; };
-        let label = provider.label();
-
-        if self.main_task_session.as_ref() == Some(id) {
-            // The active mark task's session ended: finalize it (async).
-            self.dispatcher.set_main_needs_finalize();
-        }
-
-        let Some(session) = self.sessions.get_mut(id) else { return; };
-        let had_activity_before_finalize = !session.raw_log.trim().is_empty();
-
-        crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("\u{2699}\u{fe0f} {} CLI session ended.\n", provider.product()));
-
-        let mut status_parts: Vec<String> = Vec::new();
-
-        if had_activity_before_finalize {
-            match Self::persist_log(session, &self.logs_dir) {
-                Ok(Some(path)) => {
-                    let msg = format!("\u{1f4dd} {} log saved to {}", label, path.display());
-                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-                Ok(None) => {
-                    status_parts
-                        .push(format!("{} session ended with no output to save.", label));
-                }
-                Err(err) => {
-                    let msg = format!("\u{26a0}\u{fe0f} Failed to save {} log: {}", label, err);
-                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-            }
-
-            let summary = Self::generate_summary(session);
-            match Self::write_summary_file(session, &self.logs_dir, &summary) {
-                Ok(path) => {
-                    let msg = format!("\u{1f4c4} Summary saved to {}", path.display());
-                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-                Err(err) => {
-                    let msg = format!("\u{26a0}\u{fe0f} Failed to save {} summary: {}", label, err);
-                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &format!("{}\n", msg));
-                    status_parts.push(msg);
-                }
-            }
-        } else {
-            status_parts.push(format!("{} session ended (no output captured).", label));
-        }
-
-        // The PTY receiver is dropped: the session has exited.
-        session.events = None;
-        session.exited_at = Some(Instant::now());
-        session.waiting_exit = false;
-        self.rebuild_menu();
-
-        if was_focused {
-            self.mode = AppMode::MainMenu;
-            self.show_popup = false;
-            self.popup_message.clear();
-            self.output_text.clear();
-            self.input_text.clear();
-        }
-        self.status_message = if status_parts.is_empty() {
-            Some(format!("{} session ended.", label))
-        } else {
-            Some(status_parts.join(" | "))
-        };
-    }
-
-    /// `<logs_dir>/<session_id>/`, created on first use. Both directories are
-    /// private (0700): logs hold whatever the agent printed.
-    fn session_log_dir(session: &Session, logs_dir: &std::path::Path) -> Result<PathBuf> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        if logs_dir.as_os_str().is_empty() {
-            anyhow::bail!("session logs are off");
-        }
-        let dir = logs_dir.join(session.id.as_str());
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
-        for path in [logs_dir, dir.as_path()] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(dir)
-    }
-
-    /// Write a private (0600) log file.
-    fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(contents)?;
-        Ok(())
-    }
-
-    /// Saves the raw log as `<logs_dir>/<session_id>/session.ansi` (once per session).
-    pub fn persist_log(session: &mut Session, logs_dir: &std::path::Path) -> Result<Option<PathBuf>> {
-        if session.raw_log.trim().is_empty() {
-            return Ok(None);
-        }
-        if let Some(path) = &session.log_file {
-            return Ok(Some(path.clone()));
-        }
-
-        let path = Self::session_log_dir(session, logs_dir)?.join("session.ansi");
-        Self::write_private(&path, session.raw_log.as_bytes())?;
-        session.log_file = Some(path.clone());
-        Ok(Some(path))
-    }
-
-    pub fn generate_summary(session: &Session) -> String {
-        let mut summary = String::new();
-        summary.push_str(&format!("# {} Session Summary\n\n", session.provider.product()));
-        summary.push_str(&format!(
-            "Commands executed: {}\n",
-            session.user_actions.len()
-        ));
-        if !session.user_actions.is_empty() {
-            summary.push_str("\n## Commands\n");
-            let max_commands = 10;
-            for cmd in session.user_actions.iter().take(max_commands) {
-                summary.push_str("- ");
-                summary.push_str(cmd);
-                summary.push('\n');
-            }
-            if session.user_actions.len() > max_commands {
-                summary.push_str("- \u{2026}\n");
-            }
-        }
-        summary.push('\n');
-        summary.push_str(&format!(
-            "Total output lines captured: {}\n",
-            session.output_log.lines().count()
-        ));
-        if let Some(path) = &session.log_file {
-            summary.push_str(&format!("Full log saved at: {}\n", path.display()));
-        } else {
-            summary.push_str("Full log has not been saved yet.\n");
-        }
-        summary
-    }
-
-    /// `<logs_dir>/<session_id>/summary.md`.
-    pub fn write_summary_file(session: &mut Session, logs_dir: &std::path::Path, summary: &str) -> Result<PathBuf> {
-        let path = Self::session_log_dir(session, logs_dir)?.join("summary.md");
-        Self::write_private(&path, summary.as_bytes())?;
-        session.summary_file = Some(path.clone());
-        Ok(path)
     }
 
     /// Spawn a background task that connects to Astation without blocking.
@@ -1098,15 +594,6 @@ impl App {
                 // `auth_required` and auth replies were handled by
                 // `intercept_astation_reauth`; other status updates need nothing.
             }
-            AstationMessage::VolumeUpdate { level } => {
-                self.update_voice_volume(level);
-            }
-            AstationMessage::VideoToggle { active } => {
-                self.video_active = active;
-            }
-            AstationMessage::AtemInstanceList { instances } => {
-                self.peer_atems = instances;
-            }
             AstationMessage::MarkTaskAssignment { task_id, received_at_ms } => {
                 self.status_message = Some(format!("\u{1f4cc} Task received: {}", task_id));
                 let Some(target) = self.mark_task_session(&task_id) else {
@@ -1214,29 +701,18 @@ impl App {
     }
 
     /// The live Claude session whose directory has the task (most recently used first).
+    /// Only inside the runtime (`hosted`): the menu TUI runs no sessions.
     pub fn mark_task_session(&self, task_id: &str) -> Option<SessionId> {
-        if let Some(hosted) = &self.hosted {
-            return hosted.mark_task_session(task_id);
-        }
-        let mut sessions: Vec<&Session> = self
-            .sessions
-            .iter()
-            .filter(|s| s.provider == Provider::Claude && s.is_live() && s.input.is_some())
-            .collect();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_used));
-        sessions
-            .into_iter()
-            .find(|s| Self::mark_task_path(&s.cwd, task_id).is_some_and(|p| p.is_file()))
-            .map(|s| s.id.clone())
+        self.hosted.as_ref()?.mark_task_session(task_id)
     }
 
     /// Load the task JSON from `session`'s directory and build a WorkItem for it.
     pub fn load_and_build_work_item(&self, task_id: &str, received_at_ms: u64, session: &SessionId) -> Result<WorkItem> {
-        let cwd = match &self.hosted {
-            Some(hosted) => hosted.session(session).map(|s| s.cwd.clone()),
-            None => self.sessions.get(session).map(|s| s.cwd.clone()),
-        };
-        let cwd = cwd
+        let cwd = self
+            .hosted
+            .as_ref()
+            .and_then(|hosted| hosted.session(session))
+            .map(|s| s.cwd.clone())
             .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
         let task_path = Self::mark_task_path(&cwd, task_id)
             .ok_or_else(|| anyhow::anyhow!("Invalid task id"))?;
@@ -1256,7 +732,8 @@ impl App {
     }
 
     /// Pop the next task from the dispatcher's main queue and send it to the
-    /// Claude session it was routed to. Waits while a viewer controls that session.
+    /// Claude session it was routed to (the broker writes it). Waits while a
+    /// remote lease holder controls that session.
     pub async fn try_dispatch_main(&mut self) {
         if self.dispatcher.main_is_active() {
             return;
@@ -1264,14 +741,8 @@ impl App {
         let Some(next) = self.dispatcher.peek_main() else { return; };
         let target = self.work_items.get(next).map(|item| item.session.clone());
         let controlled = match (&self.hosted, &target) {
-            // Inside the runtime: a remote lease holder exists.
             (Some(hosted), Some(id)) => hosted.session(id).is_some_and(|s| s.live && s.remote_controlled),
-            _ => target
-                .as_ref()
-                .and_then(|id| self.sessions.get(id))
-                .filter(|s| s.is_live())
-                .and_then(|s| s.input.as_ref())
-                .is_some_and(|input| input.remote_controlled()),
+            _ => false,
         };
         if controlled {
             return;
@@ -1292,10 +763,7 @@ impl App {
         };
 
         let id = item.session.clone();
-        let live = match &self.hosted {
-            Some(hosted) => hosted.session(&id).is_some_and(|s| s.live),
-            None => self.sessions.get(&id).is_some_and(|s| s.is_live() && s.input.is_some()),
-        };
+        let live = self.hosted.as_ref().and_then(|h| h.session(&id)).is_some_and(|s| s.live);
         if !live {
             let _ = self
                 .astation_client
@@ -1313,31 +781,8 @@ impl App {
             // input: no remote lease exists, and none is revoked).
             hosted.writes.push((task_id.clone(), id.clone(), format!("{}\n\r", item.prompt)));
             self.main_task_session = Some(id);
-            self.status_message = Some(format!("\u{1f4cc} Task {} → Claude", task_id));
-            return;
+            self.status_message = Some(format!("\u{1f4cc} Task {} \u{2192} Claude", task_id));
         }
-        self.focused = Some(id.clone());
-        self.mode = AppMode::Terminal;
-        self.input_text.clear();
-        let session = self.sessions.get_mut(&id).expect("checked above");
-        session.waiting_exit = false;
-        if session.output_log.is_empty() {
-            session.output_log = "\u{1f916} Claude Code CLI Session (Mark Task)\n\n".to_string();
-        }
-        // One queued write prevents a rejected prompt from submitting an unrelated draft.
-        let result = session.input.as_ref().unwrap().send(format!("{}\n\r", item.prompt));
-        if let Err(error) = result {
-            let _ = self.astation_client.send_mark_result(&task_id, false, &error.to_string()).await;
-            self.dispatcher.complete_main();
-            self.work_items.remove(&task_id);
-            return;
-        }
-        session.last_used = Instant::now();
-        session.user_actions.push(format!("[Mark Task {}]", task_id));
-        self.main_task_session = Some(id.clone());
-
-        self.refresh_view(&id);
-        self.status_message = Some(format!("\u{1f4cc} Task {} → Claude", task_id));
     }
 
     fn build_mark_task_prompt(&self, task: &Value) -> String {
@@ -1532,51 +977,56 @@ mod tests {
             }
             other => panic!("expected VisualizeResult, got {other:?}"),
         }
-        assert_eq!(app.sessions.iter().count(), 0, "no agent session was started");
     }
 
-    // ── Dynamic menu tests ──────────────────────────────────────────────
+    // ── Menu tests ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_menu_disconnected_keeps_local_terminals() {
-        let app = App::new(); // astation_connected defaults to false
-        assert!(!app.astation_connected);
-        // Local terminals work offline; the connected agent panel requires Astation
-        assert!(app.menu_actions.contains(&MenuAction::LaunchClaude));
-        assert!(app.menu_actions.contains(&MenuAction::LaunchCodex));
-        assert!(!app.menu_actions.contains(&MenuAction::AgentPanel));
-        // Should contain Projects, Shell, Help, Exit
-        assert!(app.menu_actions.contains(&MenuAction::ListProjects));
-        assert!(app.menu_actions.contains(&MenuAction::ExecuteShell));
-        assert!(app.menu_actions.contains(&MenuAction::Help));
-        assert!(app.menu_actions.contains(&MenuAction::Exit));
-        assert_eq!(app.menu_actions.len(), 6);
-        assert_eq!(app.main_menu_items.len(), 6);
-    }
-
-    #[test]
-    fn test_menu_connected_shows_all_items() {
-        let mut app = App::new();
-        app.astation_connected = true;
-        app.rebuild_menu();
-        assert!(app.menu_actions.contains(&MenuAction::LaunchClaude));
-        assert!(app.menu_actions.contains(&MenuAction::LaunchCodex));
-        assert!(app.menu_actions.contains(&MenuAction::AgentPanel));
-        assert_eq!(app.menu_actions.len(), 7);
+    fn the_menu_launches_and_lists_agents_through_the_runtime() {
+        let app = App::new();
+        // The menu never opens its own Astation connection.
+        assert!(!app.astation_connected && app.astation_connect_rx.is_none());
+        assert_eq!(
+            app.menu_actions,
+            [
+                MenuAction::ListProjects,
+                MenuAction::LaunchClaude,
+                MenuAction::LaunchCodex,
+                MenuAction::AgentPanel,
+                MenuAction::ExecuteShell,
+                MenuAction::Help,
+                MenuAction::Exit,
+            ]
+        );
         assert_eq!(app.main_menu_items.len(), 7);
+        assert_eq!(app.main_menu_items[3], "\u{1f916} Agent Sessions (0 running)");
     }
 
     #[test]
-    fn test_menu_rebuild_clamps_selected_index() {
+    fn the_agent_entry_counts_the_runtime_sessions() {
         let mut app = App::new();
-        app.astation_connected = true;
+        let session = |id: &str, state: &str| SessionSummary {
+            id: id.into(),
+            provider: "codex".into(),
+            cwd: "/tmp".into(),
+            created_at_ms: 1,
+            state: state.into(),
+            status: "unknown".into(),
+            attached: false,
+            remote_controlled: false,
+            exited: None,
+            rows: 24,
+            cols: 80,
+            generation: "g".into(),
+        };
+        app.runtime_sessions = vec![
+            session("ses-aaaaaaaaaaaa", "running"),
+            session("ses-bbbbbbbbbbbb", "exited"),
+            session("ses-cccccccccccc", "running"),
+        ];
+        app.selected_index = 99;
         app.rebuild_menu();
-        // Select last item (Exit at index 6)
-        app.selected_index = 6;
-        // Disconnect and rebuild - only the connected agent panel disappears
-        app.astation_connected = false;
-        app.rebuild_menu();
-        assert!(app.selected_index < app.menu_actions.len());
-        assert_eq!(app.selected_index, 5); // clamped to last valid index
+        assert_eq!(app.main_menu_items[3], "\u{1f916} Agent Sessions (2 running)");
+        assert_eq!(app.selected_index, 6); // clamped to last valid index
     }
 }

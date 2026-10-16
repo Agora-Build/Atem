@@ -107,7 +107,6 @@ impl App {
     fn fail_astation_reauth(&mut self, reason: String) {
         self.astation_reauth = None;
         self.suspend_astation();
-        self.terminal_ui.record(reason.clone());
         self.status_message = Some(reason);
         self.on_astation_disconnect();
         // Dropping the client aborts its transport, closing the socket.
@@ -141,8 +140,6 @@ fn reauth_advice(paired: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::AppMode;
-    use crate::session::{Provider, Session};
     use crate::terminal_share::Message;
     use crate::websocket_client::device_auth_proof;
     use futures_util::{SinkExt, StreamExt};
@@ -253,22 +250,6 @@ mod tests {
         )
     }
 
-    /// Adds a live `cat` PTY as Codex.
-    fn add_codex(app: &mut App) {
-        let mut session = Session::new(
-            Provider::Codex,
-            crate::pty_session::DEFAULT_ROWS,
-            crate::pty_session::DEFAULT_COLS,
-        );
-        session.attach(crate::pty_session::spawn("cat", &[]).unwrap());
-        app.sessions.insert(session).unwrap();
-        app.mode = AppMode::MainMenu;
-    }
-
-    fn codex(app: &App) -> &Session {
-        app.last_session(Provider::Codex).unwrap()
-    }
-
     /// Runs the TUI's Astation step until the peer receives an `auth` message
     /// (skipping anything else Atem sends). Panics if the socket closes.
     async fn next_auth(app: &mut App, peer: &mut Peer) -> HashMap<String, String> {
@@ -337,7 +318,6 @@ mod tests {
     #[tokio::test]
     async fn auth_required_goes_offline_and_answers_with_the_session_proof() {
         let (mut app, mut peer) = connected_app().await;
-        add_codex(&mut app);
         let link = app.astation_link_gen;
         let challenge = "b".repeat(64);
         peer.send.send(auth_required(ASTATION, &challenge)).unwrap();
@@ -361,9 +341,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_reply_restores_online_as_a_new_link() {
         let (mut app, mut peer) = connected_app().await;
-        add_codex(&mut app);
         let link = app.astation_link_gen;
-        let generation = codex(&app).share.generation.clone();
         peer.send
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();
@@ -379,24 +357,6 @@ mod tests {
         // A new link: the session host gives it a new attachment, so clients
         // `hello` again; no lease or input resumes.
         assert_eq!(app.astation_link_gen, link + 1);
-
-        // The local PTY is the same process, still running.
-        assert_eq!(codex(&app).share.generation, generation);
-        let id = codex(&app).id.clone();
-        app.send_data(&id, "still alive\n");
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !codex(&app)
-                .terminal
-                .screen()
-                .contents()
-                .contains("still alive")
-            {
-                app.process_terminal_output(&id);
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("local PTY stopped answering");
     }
 
     async fn assert_fails_closed(app: &mut App, peer: &mut Peer, notice: &str) {
@@ -408,9 +368,11 @@ mod tests {
             "normal reconnect not scheduled"
         );
         assert!(
-            app.terminal_ui.messages.iter().any(|m| m.contains(notice)),
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains(notice)),
             "no notice containing {notice:?}: {:?}",
-            app.terminal_ui.messages
+            app.status_message
         );
         // Nothing afterwards marks it online.
         app.process_astation_messages().await;
@@ -620,12 +582,11 @@ mod tests {
                     "re_pair {re_pair}"
                 );
                 assert!(
-                    app.terminal_ui
-                        .messages
-                        .iter()
-                        .any(|m| m.contains(crate::pairing_binding::CHANGED)),
+                    app.status_message
+                        .as_deref()
+                        .is_some_and(|m| m.contains(crate::pairing_binding::CHANGED)),
                     "{:?}",
-                    app.terminal_ui.messages
+                    app.status_message
                 );
             }
         }
@@ -664,10 +625,9 @@ mod tests {
         assert!(!app.astation_connected);
         assert!(app.astation_reconnect_at.is_some());
         assert!(
-            app.terminal_ui
-                .messages
-                .iter()
-                .any(|m| m.contains("astation-impostor"))
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("astation-impostor"))
         );
     }
 
@@ -725,11 +685,10 @@ mod tests {
     #[tokio::test]
     async fn the_tui_refuses_session_messages_and_the_runtime_queues_them() {
         let (mut app, mut peer) = connected_app().await;
-        add_codex(&mut app);
         let list = r#"{"type":"session","data":{"v":1,"op":"list","id":"11111111-1111-4111-8111-111111111111"}}"#;
         let subscribe = Message::Subscribe {
-            terminal_id: codex(&app).id.to_string(),
-            generation: codex(&app).share.generation.clone(),
+            terminal_id: "ses-aaaaaaaaaaaa".to_string(),
+            generation: "g".to_string(),
         };
         app.handle_astation_message(AstationMessage::SessionWire(list.into()))
             .await;

@@ -36,11 +36,6 @@ impl ClaudeClient {
         Self { binary, extra_args }
     }
 
-    /// Arguments for every later spawn from this client (`atem agent launch … ARGS`).
-    pub fn append_launch_args(&mut self, args: &[String]) {
-        self.extra_args.extend_from_slice(args);
-    }
-
     #[cfg(test)]
     pub async fn start_session(&self) -> Result<ClaudeSession> {
         pty_session::spawn(&self.binary, &self.extra_args)
@@ -142,7 +137,7 @@ mod tests {
         };
         let mut session = client.start_session().await.unwrap();
 
-        session.sender.send("ping\n".to_string()).unwrap();
+        session.sender.respond(b"ping\n".to_vec()).unwrap();
 
         // Read output — should see "ping" echoed back
         let mut combined = String::new();

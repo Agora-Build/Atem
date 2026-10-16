@@ -36,11 +36,6 @@ impl CodexClient {
         Self { binary, extra_args }
     }
 
-    /// Arguments for every later spawn from this client (`atem agent launch … ARGS`).
-    pub fn append_launch_args(&mut self, args: &[String]) {
-        self.extra_args.extend_from_slice(args);
-    }
-
     #[cfg(test)]
     pub async fn start_session(&self) -> Result<CodexSession> {
         pty_session::spawn(&self.binary, &self.extra_args)
@@ -136,7 +131,7 @@ mod tests {
         };
         let mut session = client.start_session().await.unwrap();
 
-        session.sender.send("codex_ping\n".to_string()).unwrap();
+        session.sender.respond(b"codex_ping\n".to_vec()).unwrap();
 
         let mut combined = String::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);

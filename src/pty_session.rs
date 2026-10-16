@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 pub const MAX_INPUT: usize = 16 * 1024;
+#[cfg(test)]
 pub const DEFAULT_ROWS: u16 = 40;
+#[cfg(test)]
 pub const DEFAULT_COLS: u16 = 120;
 pub const SCROLLBACK_ROWS: usize = 2000;
 
@@ -18,10 +20,6 @@ pub enum PtyEvent {
     Output(Vec<u8>),
     Exit(String),
     Error(String),
-    Written {
-        sequence: u64,
-        result: Result<(), String>,
-    },
     /// What became of a fenced write (`PtyInput::write_fenced`/`paste_fenced`).
     Fenced {
         sequence: u64,
@@ -44,33 +42,17 @@ pub enum FencedOutcome {
 /// raised epoch drops all of it or none).
 pub const MAX_FENCED: usize = 1024 * 1024;
 
-#[derive(Debug, Default)]
-struct Authority {
-    epoch: u64,
-    remote: bool,
-}
-
 #[derive(Debug)]
 struct WriteRequest {
     data: Vec<u8>,
-    epoch: Option<u64>,
     sequence: Option<u64>,
     /// A fenced write: its input epoch, compared at the write boundary with
     /// the current one (`PtyInput::raise_input_epoch`).
     fence: Option<u64>,
 }
 
-fn write_request(
-    writer: &mut impl Write,
-    authority: &Mutex<Authority>,
-    request: &WriteRequest,
-) -> Result<(), String> {
-    let valid = request
-        .epoch
-        .is_none_or(|epoch| authority.lock().unwrap().epoch == epoch);
-    if !valid {
-        return Err("Control changed before input was written".into());
-    }
+/// An unfenced write (`respond`).
+fn write_request(writer: &mut impl Write, request: &WriteRequest) -> Result<(), String> {
     writer
         .write_all(&request.data)
         .and_then(|()| writer.flush())
@@ -97,88 +79,20 @@ fn write_fenced_request(
 #[derive(Clone, Debug)]
 pub struct PtyInput {
     tx: mpsc::Sender<WriteRequest>,
-    authority: Arc<Mutex<Authority>>,
-    /// Successful send()/send_remote() calls, shared by clones.
+    /// Fenced terminal writes queued, shared by clones.
     inputs: Arc<AtomicU64>,
     /// The current input epoch for fenced writes; only ever rises.
     input_epoch: Arc<AtomicU64>,
 }
 
 impl PtyInput {
-    pub fn remote_controlled(&self) -> bool {
-        self.authority.lock().unwrap().remote
-    }
-
-    pub fn set_remote(&self, remote: bool) -> u64 {
-        let mut authority = self.authority.lock().unwrap();
-        authority.epoch += 1;
-        authority.remote = remote;
-        authority.epoch
-    }
-
-    /// Local/automation writes cannot bypass an active remote controller.
-    pub fn send(&self, data: String) -> Result<()> {
-        self.send_bytes(data.into_bytes())
-    }
-
-    /// `send` for bytes that need not be UTF-8 (a local frontend's keys).
-    pub fn send_bytes(&self, data: Vec<u8>) -> Result<()> {
-        let authority = self.authority.lock().unwrap();
-        if authority.remote {
-            bail!("Remote control is active; use Atem's Take Control command");
-        }
-        self.enqueue(data, Some(authority.epoch), None)?;
-        self.inputs.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Count of send()/send_remote() calls (terminal input), not respond() or send_paste().
+    /// Count of fenced terminal writes, not respond() or pastes.
     pub fn input_count(&self) -> u64 {
         self.inputs.load(Ordering::SeqCst)
     }
 
-    /// Bracketed paste plus Enter, queued as consecutive chunks of at most MAX_INPUT bytes
-    /// while holding the authority lock, so send()/send_remote() cannot interleave.
-    /// Refused while remote-controlled. Does not count as terminal input. On a full
-    /// queue the error is returned and nothing is resent.
-    pub fn send_paste(&self, text: &str) -> Result<()> {
-        let authority = self.authority.lock().unwrap();
-        if authority.remote {
-            bail!("Remote control is active; use Atem's Take Control command");
-        }
-        let mut bytes = Vec::with_capacity(text.len() + 13);
-        bytes.extend_from_slice(b"\x1b[200~");
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.extend_from_slice(b"\x1b[201~\r");
-        let chunks: Vec<&[u8]> = bytes.chunks(MAX_INPUT).collect();
-        // Reserve every slot first: all chunks are queued or none is.
-        let permits = self
-            .tx
-            .try_reserve_many(chunks.len())
-            .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))?;
-        for (permit, chunk) in permits.zip(chunks) {
-            permit.send(WriteRequest {
-                data: chunk.to_vec(),
-                epoch: Some(authority.epoch),
-                sequence: None,
-                fence: None,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn send_remote(&self, data: Vec<u8>, epoch: u64, sequence: u64) -> Result<()> {
-        let authority = self.authority.lock().unwrap();
-        if !authority.remote || authority.epoch != epoch {
-            bail!("Control lease expired");
-        }
-        self.enqueue(data, Some(epoch), Some(sequence))?;
-        self.inputs.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
     pub fn respond(&self, data: Vec<u8>) -> Result<()> {
-        self.enqueue(data, None, None)
+        self.enqueue(data)
     }
 
     /// Raises the input epoch fenced writes are checked against (never
@@ -203,7 +117,7 @@ impl PtyInput {
     }
 
     /// A bracketed paste plus Enter as one fenced write (not counted as
-    /// terminal input, like `send_paste`).
+    /// terminal input).
     /// Control characters other than newline and tab are refused, so no
     /// writer can end the bracketed paste early or submit early.
     pub fn paste_fenced(&self, text: &str, epoch: u64, sequence: u64) -> Result<()> {
@@ -227,22 +141,20 @@ impl PtyInput {
         self.tx
             .try_send(WriteRequest {
                 data,
-                epoch: None,
                 sequence: Some(sequence),
                 fence: Some(epoch),
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
     }
 
-    fn enqueue(&self, data: Vec<u8>, epoch: Option<u64>, sequence: Option<u64>) -> Result<()> {
+    fn enqueue(&self, data: Vec<u8>) -> Result<()> {
         if data.is_empty() || data.len() > MAX_INPUT {
             bail!("Input must contain 1..={MAX_INPUT} bytes");
         }
         self.tx
             .try_send(WriteRequest {
                 data,
-                epoch,
-                sequence,
+                sequence: None,
                 fence: None,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
@@ -254,7 +166,6 @@ impl PtyInput {
         (
             Self {
                 tx,
-                authority: Arc::default(),
                 inputs: Arc::default(),
                 input_epoch: Arc::default(),
             },
@@ -442,8 +353,6 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
     }));
     let (tx, mut input) = mpsc::channel::<WriteRequest>(64);
     let (output, receiver) = mpsc::channel(64);
-    let authority = Arc::new(Mutex::new(Authority::default()));
-    let writer_authority = authority.clone();
     let writer_output = output.clone();
     let input_epoch = Arc::new(AtomicU64::new(0));
     let writer_epoch = input_epoch.clone();
@@ -460,16 +369,7 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
                 }
                 continue;
             }
-            // Recheck at the actual write boundary, not merely when enqueueing.
-            let result = write_request(&mut writer, &writer_authority, &request);
-            if let Some(sequence) = request.sequence {
-                if writer_output
-                    .blocking_send(PtyEvent::Written { sequence, result })
-                    .is_err()
-                {
-                    break;
-                }
-            } else if let Err(error) = result {
+            if let Err(error) = write_request(&mut writer, &request) {
                 let _ = writer_output.blocking_send(PtyEvent::Error(error));
             }
         }
@@ -508,7 +408,6 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
     Ok(PtySession {
         sender: PtyInput {
             tx,
-            authority,
             inputs: Arc::default(),
             input_epoch,
         },
@@ -522,89 +421,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn send_paste_chunk_boundaries_at_max_input() {
-        let (input, mut q) = PtyInput::test_channel();
-        input.send_paste(&"a".repeat(MAX_INPUT - 13)).unwrap();
-        assert!(q.try_recv().is_ok());
-        assert!(q.try_recv().is_err());
-        input.send_paste(&"a".repeat(MAX_INPUT - 12)).unwrap();
-        assert!(q.try_recv().is_ok());
-        assert!(q.try_recv().is_ok());
-        assert!(q.try_recv().is_err());
-    }
-
-    #[test]
-    fn send_paste_is_all_or_nothing() {
-        let (input, mut q) = PtyInput::test_channel();
-        for _ in 0..63 {
-            input.send("x".into()).unwrap();
-        }
-        // one free slot, three chunks needed
-        assert!(input.send_paste(&"a".repeat(32 * 1024)).is_err());
-        let mut n = 0;
-        while q.try_recv().is_ok() {
-            n += 1;
-        }
-        assert_eq!(n, 63, "no paste chunk may be queued");
-    }
-
-    #[test]
-    fn input_count_counts_send_and_send_remote_not_respond_or_paste() {
-        let (input, _q) = PtyInput::test_channel();
-        assert_eq!(input.input_count(), 0);
-        input.send("a".into()).unwrap();
-        assert_eq!(input.input_count(), 1);
-        input.respond(b"y".to_vec()).unwrap();
-        input.send_paste("hello").unwrap();
-        assert_eq!(input.input_count(), 1);
-        let epoch = input.set_remote(true);
-        assert!(input.send("b".into()).is_err());
-        input.send_remote(b"c".to_vec(), epoch, 1).unwrap();
-        assert_eq!(input.clone().input_count(), 2);
-    }
-
-    #[test]
-    fn send_paste_wraps_in_bracketed_paste() {
-        let (input, mut q) = PtyInput::test_channel();
-        input.send_paste("hi there").unwrap();
-        assert_eq!(q.try_recv().unwrap(), "\x1b[200~hi there\x1b[201~\r");
-        assert!(q.try_recv().is_err());
-        input.set_remote(true);
-        assert!(input.send_paste("x").is_err());
-    }
-
-    #[test]
-    fn send_paste_chunks_large_text_in_order() {
-        let (input, mut q) = PtyInput::test_channel();
-        let text = "a".repeat(32 * 1024);
-        input.send_paste(&text).unwrap();
-        let mut all = String::new();
-        let mut n = 0;
-        while let Ok(c) = q.try_recv() {
-            assert!(c.len() <= MAX_INPUT);
-            all.push_str(&c);
-            n += 1;
-        }
-        assert_eq!(n, 3);
-        assert_eq!(all, format!("\x1b[200~{text}\x1b[201~\r"));
-    }
-
-    #[test]
-    fn queued_input_is_checked_again_at_writer_after_handoff() {
+    fn respond_writes_without_counting_as_terminal_input() {
         let (input, mut queued) = PtyInput::test_channel();
-        let epoch = input.set_remote(true);
-        input
-            .send_remote(b"old approval\r".to_vec(), epoch, 1)
-            .unwrap();
-        input.set_remote(false);
+        input.respond(b"\x1b[1;1R".to_vec()).unwrap();
+        assert_eq!(input.input_count(), 0);
         let request = queued.0.try_recv().unwrap();
         let mut destination = Vec::new();
-        assert!(write_request(&mut destination, &input.authority, &request).is_err());
-        assert!(destination.is_empty());
-        input.send("new local input".into()).unwrap();
-        let request = queued.0.try_recv().unwrap();
-        write_request(&mut destination, &input.authority, &request).unwrap();
-        assert_eq!(destination, b"new local input");
+        write_request(&mut destination, &request).unwrap();
+        assert_eq!(destination, b"\x1b[1;1R");
+        assert!(input.respond(Vec::new()).is_err());
+        assert!(input.respond(vec![0; MAX_INPUT + 1]).is_err());
     }
 
     #[test]
@@ -665,13 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn full_input_queue_rejects_without_partial_paste() {
+    fn a_full_input_queue_refuses_more() {
         let (input, _queued) = PtyInput::test_channel();
-        assert!(input.send("x".repeat(MAX_INPUT + 1)).is_err());
         for _ in 0..64 {
-            input.send("x".into()).unwrap();
+            input.respond(b"x".to_vec()).unwrap();
         }
-        assert!(input.send("overflow".into()).is_err());
+        assert!(input.respond(b"overflow".to_vec()).is_err());
     }
 
     async fn output_of(mut session: PtySession) -> String {
@@ -777,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_stop_terminates_the_child_and_drains_output_before_exit() {
         let mut session = spawn("cat", &[]).unwrap();
-        session.sender.send("before stop\n".into()).unwrap();
+        session.sender.respond(b"before stop\n".to_vec()).unwrap();
         while !matches!(session.receiver.recv().await.unwrap(), PtyEvent::Output(_)) {}
         session.resize_handle.stop().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {

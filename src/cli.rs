@@ -230,7 +230,8 @@ pub enum ProjectCommands {
 
 #[derive(Subcommand)]
 pub enum AgentCommands {
-    /// Open the original interactive CLI in a shareable Atem terminal
+    /// Start the original interactive CLI as a runtime session and open it
+    /// here; detaching (prefix, then h) leaves it running
     Launch {
         /// Agent type to launch (claude, claude-code or codex)
         #[arg(default_value = "claude-code")]
@@ -242,6 +243,18 @@ pub enum AgentCommands {
             value_name = "AGENT_ARGS"
         )]
         agent_args: Vec<String>,
+    },
+    /// Open a running session (`atem agent list` shows them)
+    Attach {
+        /// Session id (ses-…)
+        session_id: String,
+    },
+    /// List the runtime's sessions
+    List,
+    /// Stop a session's agent (or remove one that can't run any more)
+    Stop {
+        /// Session id (ses-…)
+        session_id: String,
     },
 }
 
@@ -953,7 +966,12 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             AgentCommands::Launch {
                 agent_type,
                 agent_args,
-            } => crate::tui::run_agent_tui(Some(&agent_type), &agent_args).await,
+            } => crate::runtime::commands::launch(&agent_type, agent_args).await,
+            AgentCommands::Attach { session_id } => {
+                crate::runtime::commands::attach(&session_id).await
+            }
+            AgentCommands::List => crate::runtime::commands::list().await,
+            AgentCommands::Stop { session_id } => crate::runtime::commands::stop(&session_id).await,
         },
         Commands::Serv { serv_command } => match serv_command {
             ServCommands::Rtc {
@@ -2023,10 +2041,31 @@ mod tests {
     }
 
     #[test]
+    fn cli_agent_attach_list_and_stop_parse() {
+        let cli = Cli::try_parse_from(["atem", "agent", "attach", "ses-abcdefghijkl"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent { agent_command: AgentCommands::Attach { ref session_id } })
+                if session_id == "ses-abcdefghijkl"
+        ));
+        let cli = Cli::try_parse_from(["atem", "agent", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent { agent_command: AgentCommands::List })
+        ));
+        let cli = Cli::try_parse_from(["atem", "agent", "stop", "ses-abcdefghijkl"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent { agent_command: AgentCommands::Stop { ref session_id } })
+                if session_id == "ses-abcdefghijkl"
+        ));
+        assert!(Cli::try_parse_from(["atem", "agent", "attach"]).is_err());
+    }
+
+    #[test]
     fn cli_removed_acp_and_diagram_subcommands_are_rejected() {
         for args in [
-            &["atem", "agent", "list"][..],
-            &["atem", "agent", "connect", "ws://localhost:8765"],
+            &["atem", "agent", "connect", "ws://localhost:8765"][..],
             &["atem", "agent", "prompt", "ws://localhost:8765", "hi"],
             &["atem", "agent", "probe", "ws://localhost:8765"],
             &["atem", "agent", "visualize", "topic"],
