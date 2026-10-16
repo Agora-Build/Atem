@@ -237,7 +237,7 @@ async fn a_new_broker_adopts_the_worker_after_the_old_one_is_gone() {
     );
     let mut adopted = adopt(&running.state()).await;
     assert_eq!(adopted.len(), 1);
-    let Adoption::Adopted(mut handle) = adopted.remove(0) else {
+    let Adoption::Adopted(mut handle, _) = adopted.remove(0) else {
         panic!("not adopted")
     };
     assert_eq!(handle.info.session_id, running.spec.session_id);
@@ -320,7 +320,7 @@ async fn a_record_with_another_start_time_or_session_is_never_adopted() {
     // The genuine record is adopted.
     worker::write_record(&running.state(), &genuine).unwrap();
     let mut adopted = adopt(&running.state()).await;
-    let Adoption::Adopted(handle) = adopted.remove(0) else {
+    let Adoption::Adopted(handle, _) = adopted.remove(0) else {
         panic!("not adopted")
     };
     stop(running, handle).await;
@@ -531,7 +531,7 @@ async fn adoption_waits_out_an_old_broker_that_is_just_closing() {
     });
     let mut adopted = adopt(&running.state()).await;
     closing.await.unwrap();
-    let Adoption::Adopted(handle) = adopted.remove(0) else {
+    let Adoption::Adopted(handle, _) = adopted.remove(0) else {
         panic!("not adopted: {adopted:?}")
     };
     stop(running, handle).await;

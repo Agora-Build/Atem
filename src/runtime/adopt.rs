@@ -158,6 +158,7 @@ impl WorkerHandle {
     }
 
     /// A bracketed paste plus Enter, under the same rule → `write_result`.
+    #[allow(dead_code)] // chat-v1 submit, with the session host
     pub fn paste(&self, seq: u64, text: &str, input_epoch: u64) -> Result<()> {
         self.send(&BrokerMsg::Paste {
             seq,
@@ -185,12 +186,15 @@ impl WorkerHandle {
     }
 
     /// The worker's next message; `None` once its connection closed.
+    #[cfg(test)]
     pub async fn recv(&mut self) -> Option<WorkerMsg> {
         self.events.recv().await
     }
 
-    pub fn try_recv(&mut self) -> Option<WorkerMsg> {
-        self.events.try_recv().ok()
+    /// The next message already received, `Empty` when there is none yet,
+    /// `Disconnected` once the connection closed and everything was read.
+    pub fn try_next(&mut self) -> Result<WorkerMsg, mpsc::error::TryRecvError> {
+        self.events.try_recv()
     }
 
     /// Connects to a worker's socket (same user; on Linux also its pid),
@@ -397,7 +401,8 @@ pub async fn spawn(
 /// One worker record, as the broker found it at start.
 #[derive(Debug)]
 pub enum Adoption {
-    Adopted(WorkerHandle),
+    /// Verified and connected; the record says what the session is.
+    Adopted(WorkerHandle, WorkerRecord),
     /// The worker or its record can't be trusted, or the agent outlived its
     /// worker: the record stays for the user to clean up.
     RecoveryRequired {
@@ -406,9 +411,7 @@ pub enum Adoption {
         reason: String,
     },
     /// The worker and its agent are gone without a recorded exit.
-    Interrupted {
-        record: WorkerRecord,
-    },
+    Interrupted { record: WorkerRecord },
     /// The worker is gone after recording the agent's exit.
     Exited {
         record: WorkerRecord,
@@ -419,7 +422,7 @@ pub enum Adoption {
 impl Adoption {
     pub fn session_id(&self) -> &str {
         match self {
-            Adoption::Adopted(handle) => &handle.info.session_id,
+            Adoption::Adopted(handle, _) => &handle.info.session_id,
             Adoption::RecoveryRequired { session_id, .. } => session_id,
             Adoption::Interrupted { record } | Adoption::Exited { record, .. } => {
                 &record.session_id
@@ -430,7 +433,7 @@ impl Adoption {
     /// The session's state name.
     pub fn status(&self) -> &'static str {
         match self {
-            Adoption::Adopted(_) => "running",
+            Adoption::Adopted(..) => "running",
             Adoption::RecoveryRequired { .. } => "recovery_required",
             Adoption::Interrupted { .. } => "interrupted",
             Adoption::Exited { .. } => "exited",
@@ -523,7 +526,7 @@ pub async fn adopt_record(path: &Path, session_id: &str) -> Adoption {
         }
     }
     match connected {
-        Ok(Ok(handle)) => Adoption::Adopted(handle),
+        Ok(Ok(handle)) => Adoption::Adopted(handle, record),
         Ok(Err(error)) => Adoption::RecoveryRequired {
             session_id: session_id.into(),
             reason: format!("{error:#}"),
@@ -537,9 +540,9 @@ pub async fn adopt_record(path: &Path, session_id: &str) -> Adoption {
     }
 }
 
-/// Every worker record under `<state>/workers/`, checked and adopted, in
+/// The worker records under `<state>/workers/` (session id, path), in
 /// session id order.
-pub async fn adopt(state: &Path) -> Vec<Adoption> {
+pub fn records(state: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(workers_dir(state)) else {
         return Vec::new();
     };
@@ -553,8 +556,15 @@ pub async fn adopt(state: &Path) -> Vec<Adoption> {
         })
         .collect();
     found.sort();
+    found
+}
+
+/// Every worker record under `<state>/workers/`, checked and adopted, in
+/// session id order.
+#[cfg(test)]
+pub async fn adopt(state: &Path) -> Vec<Adoption> {
     let mut adopted = Vec::new();
-    for (sid, path) in found {
+    for (sid, path) in records(state) {
         adopted.push(adopt_record(&path, &sid).await);
     }
     adopted

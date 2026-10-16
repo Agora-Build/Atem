@@ -1,20 +1,17 @@
-//! `atem runtime`: one background process per config directory that hosts
-//! every agent session and the Astation connection behind a same-user Unix
-//! socket. See `designs/agent-runtime.md`.
+//! `atem runtime`: one background process per config directory, the broker:
+//! every agent session runs in its own `atem worker` that the broker started
+//! or adopted (`broker.rs`), and the broker serves local frontends behind a
+//! same-user Unix socket and holds the Astation connection. See
+//! `designs/agent-runtime.md`.
 // The frontends (`atem agent launch|attach|list|stop`, next task) use it.
+pub mod adopt;
+pub mod broker;
 #[allow(dead_code)]
 pub mod client;
-// The broker drives workers from the next task on; until then it only
-// adopts them at start.
-#[allow(dead_code)]
-pub mod adopt;
 pub mod protocol;
 pub mod server;
-#[allow(dead_code)]
 pub mod worker;
-#[allow(dead_code)]
 pub mod worker_chat;
-#[allow(dead_code)]
 pub mod worker_protocol;
 
 #[cfg(test)]
@@ -43,34 +40,6 @@ pub fn state_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("runtime")
 }
 
-/// Adopts the workers an earlier broker left (see `adopt.rs`), logging what
-/// became of each, and keeps the adopted connections until they close. The
-/// broker routes sessions through them from the next task on.
-async fn adopt_workers(state: PathBuf) {
-    for adoption in adopt::adopt(&state).await {
-        let sid = adoption.session_id().to_string();
-        match adoption {
-            adopt::Adoption::Adopted(mut handle) => {
-                eprintln!(
-                    "atem runtime: adopted worker {sid} (process_gen {}, pid {})",
-                    handle.info.process_gen, handle.info.pid
-                );
-                tokio::spawn(async move {
-                    while let Some(message) = handle.recv().await {
-                        if let worker_protocol::WorkerMsg::Exited { status } = message {
-                            eprintln!("atem runtime: {sid} exited ({status})");
-                        }
-                    }
-                });
-            }
-            adopt::Adoption::RecoveryRequired { reason, .. } => {
-                eprintln!("atem runtime: {sid}: recovery_required ({reason})");
-            }
-            other => eprintln!("atem runtime: {sid}: {}", other.status()),
-        }
-    }
-}
-
 /// `ATEM_RUNTIME_IDLE_SECS` (for tests), else 10 minutes.
 fn idle_timeout() -> Duration {
     std::env::var("ATEM_RUNTIME_IDLE_SECS")
@@ -96,7 +65,8 @@ async fn shutdown_signal() {
 
 /// `atem runtime` (hidden): serves this config dir's sessions until it is
 /// idle, signalled or replaced. A runtime already serving the config dir
-/// makes this one exit successfully. Its sessions end with it.
+/// makes this one exit successfully. Its sessions' workers outlive it; the
+/// next runtime adopts them.
 pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     // Taken now, before a rebuild can replace the executable on disk.
     let build = crate::memory::key_agent::build_id();
@@ -119,12 +89,14 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
         std::process::id(),
         files.socket.display()
     );
-    tokio::spawn(adopt_workers(state_dir(&config_dir)));
+    let paths =
+        adopt::WorkerPaths::new(&state_dir(&config_dir), std::env::var_os("XDG_RUNTIME_DIR"))?;
     let mut app = crate::app::App::new();
     app.spawn_astation_connect();
     let options = server::Options {
         idle: idle_timeout(),
         uid,
+        launcher: broker::Launcher::Process(paths),
     };
     let served = server::serve(app, listener, options, shutdown_signal()).await;
     // A clean exit takes its pid out of the lock and removes its socket.

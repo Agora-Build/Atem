@@ -155,3 +155,217 @@ fn an_idle_runtime_exits_by_itself() {
     );
     assert!(child.0.wait().unwrap().success());
 }
+
+/// `/proc/<pid>/stat` field 22, or `None` when the process is gone.
+#[cfg(target_os = "linux")]
+fn start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_ascii_whitespace().nth(19)?.parse().ok()
+}
+
+/// Kills, at the end of a test, the workers and agents its runtimes started
+/// that still run: only while a pid still has the start time it had.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct Spawned(Vec<(u32, u64)>);
+
+#[cfg(target_os = "linux")]
+impl Spawned {
+    fn add(&mut self, pid: u32) {
+        if let Some(started) = start_time(pid) {
+            self.0.push((pid, started));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        for (pid, started) in &self.0 {
+            if start_time(*pid) == Some(*started) {
+                unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// A local frontend speaking the runtime protocol.
+#[cfg(target_os = "linux")]
+struct Frontend {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+    /// The restore of the last `attached` plus the output after it.
+    screen: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Frontend {
+    fn connect(socket: &Path) -> Self {
+        let mut stream = None;
+        assert!(
+            within(10, || {
+                stream = UnixStream::connect(socket).ok();
+                stream.is_some()
+            }),
+            "the runtime didn't listen"
+        );
+        let stream = stream.unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut frontend = Self {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            screen: String::new(),
+        };
+        frontend.send(serde_json::json!({"op": "hello", "protocol": 1, "build": "test"}));
+        assert_eq!(frontend.recv()["op"], "welcome");
+        frontend
+    }
+
+    fn send(&mut self, mut message: serde_json::Value) {
+        message["v"] = serde_json::json!(1);
+        self.stream.write_all(format!("{message}\n").as_bytes()).unwrap();
+    }
+
+    fn recv(&mut self) -> serde_json::Value {
+        use base64::Engine;
+        let decode = |text: &serde_json::Value| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(text.as_str().unwrap())
+                .unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "the runtime closed the connection");
+        let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+        match message["op"].as_str() {
+            Some("attached") => self.screen = decode(&message["restore"]),
+            Some("output") => self.screen.push_str(&decode(&message["bytes"])),
+            _ => {}
+        }
+        message
+    }
+
+    /// Messages until `done` holds for one (or the screen); returns it.
+    fn until(&mut self, mut done: impl FnMut(&serde_json::Value, &str) -> bool) -> serde_json::Value {
+        loop {
+            let message = self.recv();
+            assert_ne!(message["op"], "error", "{message}");
+            if done(&message, &self.screen) {
+                return message;
+            }
+        }
+    }
+
+    /// Reads until the screen shows `text` (it may already).
+    fn shows(&mut self, text: &str) {
+        while !self.screen.contains(text) {
+            let message = self.recv();
+            assert_ne!(message["op"], "error", "{message}");
+        }
+    }
+
+    fn launch(&mut self, cwd: &Path, agent: &Path) -> String {
+        self.send(serde_json::json!({
+            "op": "launch", "provider": "codex", "args": [], "cwd": cwd,
+            "env": [["PATH", "/usr/bin:/bin"], ["CODEX_CLI_BIN", agent]],
+            "rows": 24, "cols": 80,
+        }));
+        let launched = self.until(|m, _| m["op"] == "launched");
+        launched["session"]["id"].as_str().unwrap().to_string()
+    }
+
+    fn attach(&mut self, sid: &str) {
+        self.send(serde_json::json!({"op": "attach", "session_id": sid, "rows": 24, "cols": 80}));
+        self.until(|m, _| m["op"] == "attached");
+    }
+
+    fn input(&mut self, sid: &str, text: &str) {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.encode(text);
+        self.send(serde_json::json!({"op": "input", "session_id": sid, "bytes": bytes}));
+    }
+
+    fn list(&mut self) -> Vec<serde_json::Value> {
+        self.send(serde_json::json!({"op": "list"}));
+        let sessions = self.until(|m, _| m["op"] == "sessions");
+        sessions["sessions"].as_array().unwrap().clone()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sessions_run_in_workers_that_a_restarted_runtime_adopts() {
+    let dir = tempfile::Builder::new()
+        .prefix("atem-rb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let (home, run) = (dir.path().join("home"), dir.path().join("run"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let agent = dir.path().join("agent.sh");
+    std::fs::write(&agent, "#!/bin/sh\necho ready\nwhile read l; do echo \"got:$l\"; done\n").unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = run.join("atem").join("runtime.sock");
+    let workers = home.join(".config").join("atem").join("runtime").join("workers");
+    let record = |sid: &str| -> serde_json::Value {
+        let text = std::fs::read_to_string(workers.join(format!("{sid}.json"))).unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    let mut spawned = Spawned::default();
+
+    let mut first = Running(runtime(&home, &run));
+    let mut frontend = Frontend::connect(&socket);
+    // Two sessions, each in its own worker process (not the runtime).
+    let one = frontend.launch(&home, &agent);
+    let two = frontend.launch(&home, &agent);
+    let (record_one, record_two) = (record(&one), record(&two));
+    let worker_one = record_one["worker_pid"].as_u64().unwrap() as u32;
+    let worker_two = record_two["worker_pid"].as_u64().unwrap() as u32;
+    for record in [&record_one, &record_two] {
+        spawned.add(record["worker_pid"].as_u64().unwrap() as u32);
+        spawned.add(record["agent_pid"].as_u64().unwrap() as u32);
+    }
+    assert_ne!(worker_one, worker_two);
+    assert!(worker_one != first.0.id() && worker_two != first.0.id());
+    assert!(start_time(worker_one).is_some() && start_time(worker_two).is_some());
+    frontend.attach(&one);
+    frontend.shows("ready");
+    frontend.input(&one, "hello\r");
+    frontend.shows("got:hello");
+    drop(frontend);
+
+    // The runtime dies: the workers and their agents keep running.
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
+    assert!(start_time(worker_one).is_some() && start_time(worker_two).is_some());
+
+    // The next runtime adopts both; attach restores the screen and input goes on.
+    let _second = Running(runtime(&home, &run));
+    let mut frontend = Frontend::connect(&socket);
+    assert!(
+        within(15, || {
+            let sessions = frontend.list();
+            sessions.len() == 2 && sessions.iter().all(|s| s["state"] == "running")
+        }),
+        "the sessions weren't adopted"
+    );
+    frontend.attach(&one);
+    assert!(frontend.screen.contains("got:hello"), "{:?}", frontend.screen);
+    frontend.input(&one, "again\r");
+    frontend.shows("got:again");
+
+    // Stop ends each worker, which removes its record.
+    for (sid, worker) in [(&one, worker_one), (&two, worker_two)] {
+        frontend.send(serde_json::json!({"op": "stop", "session_id": sid}));
+        assert!(
+            within(10, || !workers.join(format!("{sid}.json")).exists()),
+            "the record of {sid} stayed"
+        );
+        assert!(within(10, || start_time(worker).is_none()), "worker {worker} kept running");
+    }
+    let sessions = frontend.list();
+    assert!(sessions.iter().all(|s| s["state"] == "exited"), "{sessions:?}");
+}

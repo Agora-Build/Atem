@@ -135,18 +135,25 @@ pub struct SessionSummary {
     pub provider: String,
     pub cwd: PathBuf,
     pub created_at_ms: u64,
-    /// From chat-v1 where the session has an adapter, else `unknown`.
+    /// `running`, `exited`, `interrupted` (the worker went away without a
+    /// recorded exit) or `recovery_required` (the worker or its record
+    /// can't be trusted; `stop` removes the record).
+    pub state: String,
+    /// The agent's activity as its worker reports it: `ready`, `working`,
+    /// `waiting` or `unknown` (no chat adapter, or not detectable).
     pub status: String,
     /// A local frontend is attached.
     pub attached: bool,
     /// A remote terminal-v1 viewer holds the control lease.
     pub remote_controlled: bool,
-    /// The exit status once the process has ended.
+    /// The exit status once the process has ended, or why the session
+    /// isn't running.
     pub exited: Option<String>,
     /// The canonical screen's size.
     pub rows: u16,
     pub cols: u16,
-    /// Changes with every process (terminal-v1's generation).
+    /// The process generation: changes with every process (terminal-v1's
+    /// generation).
     pub generation: String,
 }
 
@@ -340,6 +347,7 @@ mod tests {
             provider: "codex".into(),
             cwd: "/tmp/x".into(),
             created_at_ms: 1,
+            state: "running".into(),
             status: "unknown".into(),
             attached: true,
             remote_controlled: false,

@@ -1,19 +1,23 @@
-//! The runtime's host loop: one `App` (no TUI) ticked every 16 ms, and local
-//! frontends on a same-user Unix socket. Each client has a reader and a writer
-//! task; the `App` stays on the host loop, which they reach through channels.
+//! The runtime's host loop: the agent sessions (each in an `atem worker`,
+//! see broker.rs), one `App` (no TUI, the Astation connection) ticked every
+//! 16 ms, and local frontends on a same-user Unix socket. Each client has a
+//! reader and a writer task; sessions and the `App` stay on the host loop,
+//! which they reach through channels. Launches and adoptions run on their
+//! own tasks and report back, so a slow worker never stalls the loop.
 
+use super::adopt::{Adoption, SpawnRequest, WorkerHandle};
+use super::broker::{BrokerSession, Launcher, SessionState};
 use super::protocol::{
     ClientMsg, DecodeError, MAX_OUTPUT, PROTOCOL, RuntimeMsg, SessionSummary, b64, encode_runtime,
     input_bytes,
 };
-use crate::agent_client::AgentStatus;
 use crate::app::App;
-use crate::session::{LaunchRequest, Provider, SessionId};
+use crate::session::{EXITED_KEEP, Provider, SessionId, Sessions};
 use futures_util::FutureExt;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc};
@@ -36,6 +40,16 @@ pub struct Options {
     pub idle: Duration,
     /// Peers must run as this user.
     pub uid: u32,
+    /// Starts workers; its state dir holds the worker records adopted at start.
+    pub launcher: Launcher,
+}
+
+/// A launch that finished on its task.
+struct LaunchDone {
+    client: u64,
+    request: SpawnRequest,
+    /// The worker and the session's creation time.
+    result: anyhow::Result<(WorkerHandle, u64)>,
 }
 
 /// A line read from a client.
@@ -91,12 +105,21 @@ struct Attachment {
     size: (u16, u16),
     /// The canonical screen's size the frontend last got.
     screen: (u16, u16),
+    /// It got a restore of the current mirror (else one is due as soon as
+    /// the mirror is current).
+    restored: bool,
     exited_sent: bool,
 }
 
 struct Server {
     app: App,
     options: Options,
+    /// Sessions in creation (or adoption) order.
+    sessions: BTreeMap<SessionId, BrokerSession>,
+    order: Vec<SessionId>,
+    /// Launches still starting their worker.
+    launching: usize,
+    launches: mpsc::UnboundedSender<LaunchDone>,
     clients: BTreeMap<u64, Client>,
     attached: BTreeMap<SessionId, Attachment>,
     next_client: u64,
@@ -142,9 +165,19 @@ pub async fn serve(
             }
         }
     });
+    let (launches, mut launched) = mpsc::unbounded_channel::<LaunchDone>();
+    let (adoptions_tx, mut adoptions) = mpsc::unbounded_channel::<Adoption>();
+    let adopting = tokio::spawn(super::broker::adopt_all(
+        options.launcher.state().to_path_buf(),
+        adoptions_tx,
+    ));
     let mut server = Server {
         app,
         options,
+        sessions: BTreeMap::new(),
+        order: Vec::new(),
+        launching: 0,
+        launches,
         clients: BTreeMap::new(),
         attached: BTreeMap::new(),
         next_client: 0,
@@ -159,10 +192,14 @@ pub async fn serve(
         tokio::select! {
             _ = &mut shutdown => break,
             _ = tick.tick() => {
+                server.pump_workers();
+                server.reap_exited(Instant::now());
                 server.app.tick_host().await;
                 server.forward_status();
             }
             Some(stream) = accepted.recv() => server.add_client(stream),
+            Some(done) = launched.recv() => server.launched(done),
+            Some(adoption) = adoptions.recv() => server.adopted(adoption),
             _ = wake.notified() => {}
         }
         server.handle_clients().await;
@@ -172,7 +209,9 @@ pub async fn serve(
         }
     }
     acceptor.abort();
-    // Let writers send what's queued (a restart's error) before the sessions end.
+    adopting.abort();
+    // Let writers send what's queued (a restart's error) before the
+    // connections close. Workers outlive this broker: the next one adopts them.
     for client in server.clients.values_mut() {
         client.close();
     }
@@ -231,16 +270,6 @@ pub(crate) async fn read_line_max(
                 "message too long",
             ));
         }
-    }
-}
-
-fn status_name(status: &AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Idle => "idle",
-        AgentStatus::Thinking => "thinking",
-        AgentStatus::WaitingForInput => "waiting_for_input",
-        AgentStatus::Disconnected => "disconnected",
-        AgentStatus::Unknown => "unknown",
     }
 }
 
@@ -335,7 +364,7 @@ impl Server {
 
     fn detach(&mut self, sid: &SessionId) {
         self.attached.remove(sid);
-        if let Some(session) = self.app.sessions.get_mut(sid) {
+        if let Some(session) = self.sessions.get_mut(sid) {
             session.tap.close();
         }
     }
@@ -361,14 +390,134 @@ impl Server {
         }
     }
 
+    /// Sessions whose agent runs.
+    fn live_count(&self) -> usize {
+        self.sessions.values().filter(|s| s.is_live()).count()
+    }
+
+    /// No live session, no launch under way and no client: the runtime may
+    /// exit (workers that ended or can't be adopted stay on disk).
     fn idle_expired(&mut self) -> bool {
-        let idle = self.app.sessions.iter().next().is_none() && self.clients.is_empty();
+        let idle = self.live_count() == 0 && self.launching == 0 && self.clients.is_empty();
         if !idle {
             self.idle_since = None;
             return false;
         }
         let since = *self.idle_since.get_or_insert_with(Instant::now);
         since.elapsed() >= self.options.idle
+    }
+
+    fn insert_session(&mut self, session: BrokerSession) {
+        let sid = session.id.clone();
+        if self.sessions.insert(sid.clone(), session).is_none() {
+            self.order.push(sid);
+        }
+    }
+
+    fn remove_session(&mut self, sid: &SessionId) {
+        self.sessions.remove(sid);
+        self.order.retain(|id| id != sid);
+    }
+
+    /// A launch's worker started (or didn't).
+    fn launched(&mut self, done: LaunchDone) {
+        self.launching = self.launching.saturating_sub(1);
+        let LaunchDone {
+            client,
+            request,
+            result,
+        } = done;
+        match result {
+            Ok((handle, created_at_ms)) => {
+                eprintln!(
+                    "atem runtime: launched {} ({}) in worker pid {}",
+                    request.session_id,
+                    request.provider.as_str(),
+                    handle.info.pid
+                );
+                let session = BrokerSession::launched(handle, &request, created_at_ms);
+                let summary = session.summary(false);
+                self.insert_session(session);
+                self.send(client, &RuntimeMsg::Launched { session: summary });
+            }
+            Err(error) => self.error(
+                client,
+                format!("Could not start {}: {error:#}", request.provider.product()),
+                "launch",
+            ),
+        }
+    }
+
+    /// A worker record found at start became a session.
+    fn adopted(&mut self, adoption: Adoption) {
+        let sid = adoption.session_id().to_string();
+        match &adoption {
+            Adoption::Adopted(handle, _) => eprintln!(
+                "atem runtime: adopted worker {sid} (process_gen {}, pid {})",
+                handle.info.process_gen, handle.info.pid
+            ),
+            Adoption::RecoveryRequired { reason, .. } => {
+                eprintln!("atem runtime: {sid}: recovery_required ({reason})")
+            }
+            other => eprintln!("atem runtime: {sid}: {}", other.status()),
+        }
+        let exited_record = matches!(adoption, Adoption::Exited { .. });
+        let Some(session) = BrokerSession::from_adoption(adoption) else {
+            return;
+        };
+        if self.sessions.contains_key(&session.id) {
+            return;
+        }
+        if exited_record {
+            // The worker is gone after recording the exit; it is recorded now.
+            super::broker::remove_record(self.options.launcher.state(), &sid);
+        }
+        self.insert_session(session);
+    }
+
+    /// What every worker sent since the last pass.
+    fn pump_workers(&mut self) {
+        for sid in self.order.clone() {
+            let Some(session) = self.sessions.get_mut(&sid) else {
+                continue;
+            };
+            let pumped = session.pump();
+            if pumped.ended {
+                eprintln!(
+                    "atem runtime: {sid} {} ({})",
+                    session.state.as_str(),
+                    session.exit_status.as_deref().unwrap_or("")
+                );
+            }
+            let Some(attachment) = self.attached.get_mut(&sid) else {
+                continue;
+            };
+            if pumped.resync {
+                attachment.restored = false;
+            }
+            let client = attachment.client;
+            for text in pumped.failed {
+                self.error(client, text, "input");
+            }
+        }
+    }
+
+    /// Removes sessions that exited `EXITED_KEEP` (10 min) before `now`.
+    /// Interrupted and recovery-required ones stay until stopped.
+    fn reap_exited(&mut self, now: Instant) {
+        let due: Vec<SessionId> = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.state == SessionState::Exited
+                    && s.exited_at
+                        .is_some_and(|at| now.saturating_duration_since(at) >= EXITED_KEEP)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for sid in due {
+            self.remove_session(&sid);
+        }
     }
 
     async fn handle_clients(&mut self) {
@@ -467,21 +616,37 @@ impl Server {
                 if !cwd.is_absolute() {
                     return self.error(id, "The working directory must be absolute", "launch");
                 }
-                let request = LaunchRequest {
+                if let Err(error) = crate::session::check_env(&env.to_os()) {
+                    return self.error(id, error, "launch");
+                }
+                if self.live_count() + self.launching >= Sessions::MAX_LIVE {
+                    return self.error(
+                        id,
+                        format!("At most {} sessions can run at once", Sessions::MAX_LIVE),
+                        "launch",
+                    );
+                }
+                let request = SpawnRequest {
+                    session_id: SessionId::new(),
+                    process_gen: uuid::Uuid::new_v4().to_string(),
                     provider,
                     args,
                     cwd,
-                    env: Some(env.to_os()),
-                    rows,
-                    cols,
+                    rows: rows.clamp(2, 200),
+                    cols: cols.clamp(2, 400),
                 };
-                match self.app.launch_session(request).await {
-                    Ok(sid) => {
-                        let session = self.summary(&sid);
-                        self.send(id, &RuntimeMsg::Launched { session });
-                    }
-                    Err(error) => self.error(id, error.to_string(), "launch"),
-                }
+                self.launching += 1;
+                let launcher = self.options.launcher.clone();
+                let (tx, wake) = (self.launches.clone(), self.wake.clone());
+                tokio::spawn(async move {
+                    let result = launcher.spawn(request.clone(), env).await;
+                    let _ = tx.send(LaunchDone {
+                        client: id,
+                        request,
+                        result,
+                    });
+                    wake.notify_one();
+                });
             }
             ClientMsg::Attach {
                 session_id,
@@ -491,10 +656,20 @@ impl Server {
                 let Some(sid) = self.find(&session_id) else {
                     return self.error(id, "Unknown session", "attach");
                 };
+                let session = &self.sessions[&sid];
+                if !session.has_screen() {
+                    let text = format!(
+                        "Session {sid} is {} ({}); there is nothing to attach to. `atem agent stop {sid}` removes it",
+                        session.state.as_str(),
+                        session.exit_status.as_deref().unwrap_or("no worker")
+                    );
+                    return self.error(id, text, "attach");
+                }
                 let attachment = Attachment {
                     client: id,
                     size: (rows, cols),
                     screen: (0, 0),
+                    restored: false,
                     exited_sent: false,
                 };
                 if let Some(previous) = self.attached.insert(sid.clone(), attachment)
@@ -508,8 +683,8 @@ impl Server {
                         },
                     );
                 }
-                self.app.adjust_terminal_size(&sid, rows, cols);
-                if let Some(session) = self.app.sessions.get_mut(&sid) {
+                self.adjust_size(&sid, rows, cols);
+                if let Some(session) = self.sessions.get_mut(&sid) {
                     session.tap.open();
                 }
                 self.restore(&sid);
@@ -545,50 +720,56 @@ impl Server {
                 if let Some(attachment) = self.attached.get_mut(&sid) {
                     attachment.size = (rows, cols);
                 }
-                // Ignored while a remote viewer controls the size.
-                self.app.adjust_terminal_size(&sid, rows, cols);
+                self.adjust_size(&sid, rows, cols);
             }
             ClientMsg::Reclaim { session_id } => {
                 let Some(sid) = self.attached_by(id, &session_id) else {
                     return self.error(id, "Attach to the session first", "reclaim");
                 };
-                if !self.app.sessions.get(&sid).is_some_and(|s| s.is_live()) {
+                let Some(session) = self.sessions.get_mut(&sid).filter(|s| s.is_live()) else {
                     return self.send(
                         id,
                         &RuntimeMsg::Notice {
                             text: "The session has ended".into(),
                         },
                     );
+                };
+                // Control changes: writes queued under the old epoch are
+                // dropped at the worker.
+                if let Err(error) = session.raise_input_epoch() {
+                    return self.error(id, error.to_string(), "reclaim");
                 }
-                self.app.reclaim_session(&sid);
                 let (rows, cols) = self.attached[&sid].size;
-                self.app.adjust_terminal_size(&sid, rows, cols);
+                self.adjust_size(&sid, rows, cols);
                 self.restore(&sid);
             }
             ClientMsg::List => {
-                let sessions = self
-                    .app
-                    .sessions
-                    .ids()
-                    .iter()
-                    .map(|sid| self.summary(sid))
-                    .collect();
+                let sessions = self.order.iter().map(|sid| self.summary(sid)).collect();
                 self.send(id, &RuntimeMsg::Sessions { sessions });
             }
             ClientMsg::Stop { session_id } => {
-                let Some(sid) = self
-                    .find(&session_id)
-                    .filter(|sid| self.app.sessions.get(sid).is_some_and(|s| s.is_live()))
-                else {
+                let Some(sid) = self.find(&session_id) else {
                     return self.error(id, "No such live session", "stop");
                 };
-                self.app.stop_session(&sid);
-                self.send(
-                    id,
-                    &RuntimeMsg::Notice {
-                        text: format!("Stopping {sid}"),
-                    },
-                );
+                let session = &self.sessions[&sid];
+                match session.state {
+                    SessionState::Running if session.is_live() => {
+                        if let Err(error) = session.stop() {
+                            return self.error(id, error.to_string(), "stop");
+                        }
+                        self.send(
+                            id,
+                            &RuntimeMsg::Notice {
+                                text: format!("Stopping {sid}"),
+                            },
+                        );
+                    }
+                    SessionState::Interrupted | SessionState::RecoveryRequired => {
+                        let text = self.forget(&sid);
+                        self.send(id, &RuntimeMsg::Notice { text });
+                    }
+                    _ => self.error(id, "No such live session", "stop"),
+                }
             }
             ClientMsg::Reload => {
                 if let Ok(config) = crate::config::AtemConfig::load() {
@@ -608,6 +789,35 @@ impl Server {
         }
     }
 
+    /// Removes a session without a worker and its record. Nothing is
+    /// signalled: a recorded process that still runs is named instead.
+    fn forget(&mut self, sid: &SessionId) -> String {
+        let still_running = self
+            .sessions
+            .get(sid)
+            .and_then(|s| s.record())
+            .and_then(|r| {
+                let runs = |pid: Option<u32>, start: Option<u64>| {
+                    pid.filter(|pid| {
+                        start.is_some() && super::adopt::process_start_time(*pid) == start
+                    })
+                };
+                runs(Some(r.worker_pid), Some(r.start_time))
+                    .or_else(|| runs(r.agent_pid, r.agent_start_time))
+            });
+        super::broker::remove_record(self.options.launcher.state(), sid.as_str());
+        if self.attached.contains_key(sid) {
+            self.detach(sid);
+        }
+        self.remove_session(sid);
+        match still_running {
+            Some(pid) => {
+                format!("Removed {sid}; its recorded process {pid} still runs and was not stopped")
+            }
+            None => format!("Removed {sid}"),
+        }
+    }
+
     /// Sends what's queued, then closes the connection.
     fn close(&mut self, id: u64) {
         self.remove_client(id);
@@ -616,7 +826,7 @@ impl Server {
     /// Another protocol: a runtime without live sessions restarts (a client
     /// of that protocol starts its own); one with live sessions refuses.
     fn refuse_protocol(&mut self, id: u64, version: u64) {
-        let live = self.app.sessions.live_count();
+        let live = self.live_count() + self.launching;
         let text = if live == 0 {
             self.restart = true;
             format!("{RESTARTING} (protocol {PROTOCOL}, client {version})")
@@ -629,8 +839,9 @@ impl Server {
         self.close(id);
     }
 
-    /// Writes an `input` to its session. `Some(message)` back: the PTY queue
-    /// is full; keep it and read nothing more from this client meanwhile.
+    /// Local input always writes (until leases): to the session's worker,
+    /// under its current input epoch. `Some(message)` back: too many writes
+    /// are in flight; keep it and read nothing more from this client meanwhile.
     fn input(&mut self, id: u64, message: ClientMsg) -> Option<ClientMsg> {
         let ClientMsg::Input { session_id, bytes } = &message else {
             return None;
@@ -646,85 +857,61 @@ impl Server {
                 return None;
             }
         };
-        let Some(session) = self.app.sessions.get_mut(&sid).filter(|s| s.is_live()) else {
+        let Some(session) = self.sessions.get_mut(&sid).filter(|s| s.is_live()) else {
             self.error(id, "The session has ended", "input");
             return None;
         };
-        let Some(input) = &session.input else {
-            self.error(id, "The session has no terminal", "input");
-            return None;
-        };
-        if input.queue_full() {
+        if !session.can_write() {
             return Some(message);
         }
-        // Counts as terminal input (chat-v1's draft check).
-        match input.send_bytes(bytes) {
-            Ok(()) => session.last_used = Instant::now(),
-            Err(error) => self.error(id, error.to_string(), "input"),
+        if let Err(error) = session.write(&bytes) {
+            self.error(id, error.to_string(), "input");
         }
         None
     }
 
-    /// The session a session id names (live or exited).
+    /// The local frontend's size for a live session's terminal.
+    fn adjust_size(&mut self, sid: &SessionId, rows: u16, cols: u16) {
+        if let Some(session) = self.sessions.get_mut(sid)
+            && let Err(error) = session.resize(rows, cols)
+        {
+            self.app.status_message = Some(format!("Failed to resize {sid}: {error}"));
+        }
+    }
+
+    /// The session a session id names (any state).
     fn find(&self, id: &str) -> Option<SessionId> {
-        SessionId::parse(id).filter(|sid| self.app.sessions.get(sid).is_some())
+        SessionId::parse(id).filter(|sid| self.sessions.contains_key(sid))
     }
 
     /// The session `session_id` names when `client` is attached to it.
     fn attached_by(&self, client: u64, session_id: &str) -> Option<SessionId> {
-        let sid = SessionId::parse(session_id).or_else(|| self.find(session_id))?;
+        let sid = SessionId::parse(session_id)?;
         (self.attached.get(&sid)?.client == client).then_some(sid)
     }
 
     fn summary(&self, sid: &SessionId) -> SessionSummary {
-        let session = self.app.sessions.get(sid).expect("a session");
-        let (rows, cols) = session.terminal.screen().size();
-        let status = self
-            .app
-            .agent_registry
-            .get(sid.as_str())
-            .map_or("unknown", |info| status_name(&info.status));
-        SessionSummary {
-            id: sid.to_string(),
-            provider: session.provider.as_str().into(),
-            cwd: session.cwd.clone(),
-            created_at_ms: session
-                .created_at
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64),
-            status: status.into(),
-            attached: self.attached.contains_key(sid),
-            remote_controlled: session
-                .input
-                .as_ref()
-                .is_some_and(|input| input.remote_controlled()),
-            exited: session
-                .exited_at
-                .and(session.share.exit_status.clone())
-                .or_else(|| session.exited_at.map(|_| "exited".into())),
-            rows,
-            cols,
-            generation: session.share.generation.clone(),
-        }
+        self.sessions[sid].summary(self.attached.contains_key(sid))
     }
 
-    /// Sends the attached frontend a fresh restore: the canonical screen now,
-    /// and the stream position output continues from. Output queued for it
-    /// before is dropped.
+    /// Sends the attached frontend a fresh restore: the mirror of the
+    /// canonical screen now, and the stream position output continues from.
+    /// Output queued for it before is dropped. Until the mirror is current
+    /// (an adopted worker's screen is on its way) the restore waits.
     fn restore(&mut self, sid: &SessionId) {
         let summary = self.summary(sid);
         let Some(attachment) = self.attached.get_mut(sid) else {
             return;
         };
-        let Some(session) = self.app.sessions.get_mut(sid) else {
+        let Some(session) = self.sessions.get_mut(sid) else {
             return;
         };
-        let screen = session.terminal.screen();
-        let restore = crate::terminal_share::restore_bytes(screen);
-        attachment.screen = screen.size();
-        // The restore covers everything the tap holds.
-        session.tap.take();
-        let offset = session.tap.offset();
+        let Some((restore, offset)) = session.restore() else {
+            attachment.restored = false;
+            return;
+        };
+        attachment.screen = session.size();
+        attachment.restored = true;
         let Some(client) = self.clients.get(&attachment.client) else {
             return;
         };
@@ -737,12 +924,13 @@ impl Server {
     }
 
     /// Output since the last pass to each attached frontend, a fresh restore
-    /// when its backlog overflowed or the screen changed size, and the exit.
+    /// when one is due (its backlog overflowed, the screen changed size or
+    /// was replaced), and the exit.
     fn flush(&mut self) {
         let sids: Vec<SessionId> = self.attached.keys().cloned().collect();
         for sid in sids {
             let client_id = self.attached[&sid].client;
-            let Some(session) = self.app.sessions.get_mut(&sid) else {
+            let Some(session) = self.sessions.get_mut(&sid) else {
                 self.attached.remove(&sid);
                 self.send(
                     client_id,
@@ -754,12 +942,12 @@ impl Server {
                 continue;
             };
             let chunk = session.tap.take();
-            let size = session.terminal.screen().size();
-            let exited = session.exited_at.is_some().then(|| {
+            let size = session.size();
+            let synced = session.synced();
+            let exited = (session.state != SessionState::Running).then(|| {
                 (
-                    session.share.generation.clone(),
+                    session.process_gen.clone(),
                     session
-                        .share
                         .exit_status
                         .clone()
                         .unwrap_or_else(|| "exited".into()),
@@ -770,8 +958,9 @@ impl Server {
                 continue;
             };
             let attachment = &self.attached[&sid];
-            let mut resync = chunk.overflowed || size != attachment.screen;
-            if !resync {
+            let mut resync =
+                synced && (!attachment.restored || chunk.overflowed || size != attachment.screen);
+            if synced && !resync {
                 let epoch = client.epoch.load(Ordering::SeqCst);
                 let mut offset = chunk.start;
                 for piece in chunk.bytes.chunks(MAX_OUTPUT) {
@@ -796,7 +985,9 @@ impl Server {
                 self.restore(&sid);
             }
             let attachment = self.attached.get_mut(&sid).expect("attached");
+            // The exit follows the final screen.
             if let Some((generation, status)) = exited
+                && attachment.restored
                 && !attachment.exited_sent
             {
                 attachment.exited_sent = true;

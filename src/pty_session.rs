@@ -132,11 +132,6 @@ impl PtyInput {
         Ok(())
     }
 
-    /// The input queue has no room: a send now would be refused.
-    pub fn queue_full(&self) -> bool {
-        self.tx.capacity() == 0 && !self.tx.is_closed()
-    }
-
     /// Count of send()/send_remote() calls (terminal input), not respond() or send_paste().
     pub fn input_count(&self) -> u64 {
         self.inputs.load(Ordering::SeqCst)

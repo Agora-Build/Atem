@@ -1,5 +1,6 @@
 //! The runtime's server in this process: a temp socket, fake agents (sh
 //! scripts) and the async client.
+use super::broker::{InProcess, Launcher};
 use super::client::RuntimeClient;
 use super::protocol::{
     ClientMsg, LaunchEnv, PROTOCOL, RuntimeMsg, SessionSummary, decode_runtime, unb64,
@@ -61,21 +62,44 @@ fn echo_agent(dir: &Path) -> PathBuf {
 }
 
 struct Runtime {
-    dir: tempfile::TempDir,
+    dir: std::rc::Rc<tempfile::TempDir>,
     socket: PathBuf,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
+/// Workers served in this process, with their records under `<root>/state`.
+fn launcher(root: &Path) -> Launcher {
+    Launcher::InProcess(InProcess {
+        state: root.join("state"),
+        socket_dir: root.join("ws"),
+        chat_root: root.join("file/run"),
+    })
+}
+
 impl Runtime {
     /// A server for a fresh App on a temp socket (call inside `local`).
     fn start(idle: Duration, uid: u32) -> Self {
-        let dir = short_dir();
-        let socket = dir.path().join("rt.sock");
+        Self::start_in(std::rc::Rc::new(short_dir()), "rt.sock", idle, uid)
+    }
+
+    /// A server in `dir` (another broker of the same state dir).
+    fn start_in(
+        dir: std::rc::Rc<tempfile::TempDir>,
+        socket: &str,
+        idle: Duration,
+        uid: u32,
+    ) -> Self {
+        let socket = dir.path().join(socket);
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let app = app(dir.path());
-        let server = tokio::task::spawn_local(serve(app, listener, Options { idle, uid }, async {
+        let options = Options {
+            idle,
+            uid,
+            launcher: launcher(dir.path()),
+        };
+        let server = tokio::task::spawn_local(serve(app, listener, options, async {
             let _ = stopped.await;
         }));
         Self {
@@ -84,6 +108,10 @@ impl Runtime {
             stop: Some(stop),
             server,
         }
+    }
+
+    fn state(&self) -> PathBuf {
+        self.dir.path().join("state")
     }
 
     fn new() -> Self {
@@ -386,6 +414,10 @@ fn a_second_attach_moves_the_session_and_stop_reports_the_exit() {
         })
         .await;
         assert!(sessions[0].exited.is_some());
+        assert_eq!(sessions[0].state, "exited");
+        // The broker released the worker: it removed its record.
+        let record = record_file(&runtime, &session.id);
+        assert!(within(10, || !record.exists()).await, "the record stayed");
         runtime.shutdown().await;
     });
 }
@@ -641,6 +673,7 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
                 Options {
                     idle: Duration::from_secs(600),
                     uid: own_uid(),
+                    launcher: launcher(&root),
                 },
                 async {
                     let _ = stopped.await;
@@ -698,4 +731,310 @@ fn the_runtime_environment_is_sanitized() {
             "RUST_LOG"
         ]
     );
+}
+
+async fn list(client: &mut RuntimeClient) -> Vec<SessionSummary> {
+    client.send(&ClientMsg::List).await.unwrap();
+    expect(client, |m| match m {
+        RuntimeMsg::Sessions { sessions } => Some(sessions),
+        _ => None,
+    })
+    .await
+}
+
+/// The sessions once `done` holds for them (10 s at most).
+async fn list_until(
+    client: &mut RuntimeClient,
+    mut done: impl FnMut(&[SessionSummary]) -> bool,
+) -> Vec<SessionSummary> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sessions = list(client).await;
+        if done(&sessions) {
+            return sessions;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never listed as wanted: {sessions:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn attach(client: &mut RuntimeClient, sid: &str) -> View {
+    client
+        .send(&ClientMsg::Attach {
+            session_id: sid.into(),
+            rows: 24,
+            cols: 80,
+        })
+        .await
+        .unwrap();
+    let mut view = View::new();
+    let message = expect(client, |m| match m {
+        RuntimeMsg::Attached { .. } => Some(m),
+        RuntimeMsg::Error { text, .. } => panic!("attach failed: {text}"),
+        _ => None,
+    })
+    .await;
+    view.apply(&message);
+    view
+}
+
+fn record_file(runtime: &Runtime, sid: &str) -> PathBuf {
+    super::worker::record_path(&runtime.state(), sid)
+}
+
+/// `done` holds within `secs` (polled without blocking the in-process workers).
+async fn within(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[test]
+fn launch_runs_the_session_in_a_worker_that_records_it() {
+    local(async {
+        let runtime = Runtime::new();
+        let agent = echo_agent(runtime.dir.path());
+        let mut client = runtime.client().await;
+        client
+            .send(&runtime.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let session = launched(&mut client).await;
+        assert_eq!(session.state, "running");
+        let record = super::worker::read_record(&record_file(&runtime, &session.id)).unwrap();
+        assert_eq!(record.session_id, session.id);
+        assert_eq!(record.process_gen, session.generation);
+        assert_eq!(record.provider, "codex");
+        assert!(record.agent_pid.is_some());
+        // The record holds no environment.
+        let text = std::fs::read_to_string(record_file(&runtime, &session.id)).unwrap();
+        assert!(!text.contains("CODEX_CLI_BIN"), "{text}");
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn a_new_broker_adopts_the_running_session_and_attach_restores_it() {
+    local(async {
+        let first = Runtime::new();
+        let agent = echo_agent(first.dir.path());
+        let mut client = first.client().await;
+        client
+            .send(&first.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let session = launched(&mut client).await;
+        let mut view = attach(&mut client, &session.id).await;
+        view.until(&mut client, "READY one").await;
+        client
+            .send(&ClientMsg::input(&session.id, b"before restart\r"))
+            .await
+            .unwrap();
+        view.until(&mut client, "before restart").await;
+        drop(client);
+        let dir = first.dir.clone();
+        first.shutdown().await;
+
+        // The worker outlived the broker: the next one adopts it.
+        let second = Runtime::start_in(dir, "rt2.sock", Duration::from_secs(600), own_uid());
+        let mut client = second.client().await;
+        let sessions = list_until(&mut client, |s| !s.is_empty()).await;
+        assert_eq!(sessions.len(), 1);
+        let adopted = &sessions[0];
+        assert_eq!(
+            (adopted.id.as_str(), adopted.state.as_str()),
+            (session.id.as_str(), "running")
+        );
+        assert_eq!(adopted.generation, session.generation);
+        assert_eq!(adopted.provider, "codex");
+        assert_eq!(adopted.created_at_ms, session.created_at_ms);
+        let mut view = attach(&mut client, &session.id).await;
+        // The restore is the worker's screen, from before the restart.
+        assert!(
+            view.screen.screen().contents().contains("before restart"),
+            "{}",
+            view.screen.screen().contents()
+        );
+        client
+            .send(&ClientMsg::input(&session.id, b"after restart\r"))
+            .await
+            .unwrap();
+        view.until(&mut client, "after restart").await;
+        // Stop ends the worker: its record goes.
+        client
+            .send(&ClientMsg::Stop {
+                session_id: session.id.clone(),
+            })
+            .await
+            .unwrap();
+        expect(&mut client, |m| {
+            matches!(m, RuntimeMsg::Exited { .. }).then_some(())
+        })
+        .await;
+        let record = record_file(&second, &session.id);
+        assert!(within(10, || !record.exists()).await, "the record stayed");
+        second.shutdown().await;
+    });
+}
+
+#[test]
+fn an_adopted_worker_whose_agent_exited_is_released_and_its_record_removed() {
+    local(async {
+        let first = Runtime::new();
+        let agent = script(
+            first.dir.path(),
+            "quitter",
+            "printf 'READY\\r\\n'\nread line\nsleep 1\nexit 3",
+        );
+        let mut client = first.client().await;
+        client
+            .send(&first.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let session = launched(&mut client).await;
+        let mut view = attach(&mut client, &session.id).await;
+        view.until(&mut client, "READY").await;
+        client
+            .send(&ClientMsg::input(&session.id, b"bye\r"))
+            .await
+            .unwrap();
+        view.until(&mut client, "bye").await;
+        drop(client);
+        let dir = first.dir.clone();
+        first.shutdown().await;
+        // The agent exits with no broker: the worker records it and waits.
+        let record = super::worker::record_path(&dir.path().join("state"), &session.id);
+        assert!(
+            within(10, || super::worker::read_record(&record)
+                .is_ok_and(|r| r.exited.is_some()))
+            .await,
+            "the exit was never recorded"
+        );
+
+        let second = Runtime::start_in(dir, "rt2.sock", Duration::from_secs(600), own_uid());
+        let mut client = second.client().await;
+        let sessions = list_until(&mut client, |s| s.iter().any(|s| s.state == "exited")).await;
+        assert_eq!(sessions[0].id, session.id);
+        assert!(sessions[0].exited.is_some());
+        // Released: the worker removed its record and ended.
+        assert!(within(10, || !record.exists()).await, "the record stayed");
+        second.shutdown().await;
+    });
+}
+
+#[test]
+fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
+    local(async {
+        let runtime = Runtime::new();
+        let sid = crate::session::SessionId::new().to_string();
+        // A worker pid that is gone.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let record = super::worker_protocol::WorkerRecord {
+            session_id: sid.clone(),
+            process_gen: uuid::Uuid::new_v4().to_string(),
+            provider: "claude".into(),
+            cwd: runtime.dir.path().to_path_buf(),
+            created_at_ms: 1,
+            socket: runtime.dir.path().join("gone.sock"),
+            worker_pid: pid,
+            start_time: 1,
+            agent_pid: None,
+            agent_start_time: None,
+            exited: None,
+        };
+        super::worker::write_record(&runtime.state(), &record).unwrap();
+        // This broker already scanned at start: another one adopts it.
+        let dir = runtime.dir.clone();
+        runtime.shutdown().await;
+        let runtime = Runtime::start_in(dir, "rt2.sock", Duration::from_secs(600), own_uid());
+        let mut client = runtime.client().await;
+        let sessions = list_until(&mut client, |s| !s.is_empty()).await;
+        assert_eq!(
+            (sessions[0].id.as_str(), sessions[0].state.as_str()),
+            (sid.as_str(), "interrupted")
+        );
+        assert_eq!(sessions[0].provider, "claude");
+        client
+            .send(&ClientMsg::Attach {
+                session_id: sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        expect(&mut client, |m| match m {
+            RuntimeMsg::Error { op, text } => {
+                assert_eq!(op.as_deref(), Some("attach"));
+                assert!(text.contains("interrupted"), "{text}");
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        client
+            .send(&ClientMsg::Stop {
+                session_id: sid.clone(),
+            })
+            .await
+            .unwrap();
+        expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text } if text.starts_with("Removed") => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(!record_file(&runtime, &sid).exists());
+        assert!(list(&mut client).await.is_empty());
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn two_sessions_run_concurrently_each_in_its_own_worker() {
+    local(async {
+        let runtime = Runtime::new();
+        let agent = echo_agent(runtime.dir.path());
+        let mut one = runtime.client().await;
+        let mut two = runtime.client().await;
+        one.send(&runtime.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        two.send(&runtime.launch("claude", "two", &agent))
+            .await
+            .unwrap();
+        let (first, second) = (launched(&mut one).await, launched(&mut two).await);
+        let records = [&first, &second]
+            .map(|s| super::worker::read_record(&record_file(&runtime, &s.id)).unwrap());
+        assert_ne!(records[0].agent_pid, records[1].agent_pid);
+        let mut view_one = attach(&mut one, &first.id).await;
+        let mut view_two = attach(&mut two, &second.id).await;
+        view_one.until(&mut one, "READY one").await;
+        view_two.until(&mut two, "READY two").await;
+        one.send(&ClientMsg::input(&first.id, b"to the first\r"))
+            .await
+            .unwrap();
+        two.send(&ClientMsg::input(&second.id, b"to the second\r"))
+            .await
+            .unwrap();
+        view_one.until(&mut one, "to the first").await;
+        view_two.until(&mut two, "to the second").await;
+        assert!(
+            !view_one
+                .screen
+                .screen()
+                .contents()
+                .contains("to the second")
+        );
+        assert!(!view_two.screen.screen().contents().contains("to the first"));
+        runtime.shutdown().await;
+    });
 }

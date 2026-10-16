@@ -7,7 +7,7 @@ use crate::terminal_share::SharedTerminal;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use vt100::Parser as VtParser;
 
@@ -201,7 +201,18 @@ impl OutputTap {
         self.overflowed = false;
     }
 
+    /// Continue the stream at `offset` (a worker's screen replaced the bytes
+    /// before it): whatever was kept is dropped.
+    pub fn restart_at(&mut self, offset: u64) {
+        self.offset = offset;
+        if let Some(buf) = &mut self.buf {
+            buf.clear();
+        }
+        self.overflowed = false;
+    }
+
     /// Bytes produced so far.
+    #[cfg(test)]
     pub fn offset(&self) -> u64 {
         self.offset
     }
@@ -222,7 +233,6 @@ pub struct Session {
     pub id: SessionId,
     pub provider: Provider,
     pub cwd: PathBuf,
-    pub created_at: SystemTime,
     /// Bumped by local/remote input and launch.
     pub last_used: Instant,
     pub input: Option<PtyInput>,
@@ -242,8 +252,6 @@ pub struct Session {
     /// chat-v1 state (Claude only).
     pub chat: Option<crate::app::chat::AgentChat>,
     pub exited_at: Option<Instant>,
-    /// Raw output for an attached local frontend (`atem runtime`).
-    pub tap: OutputTap,
 }
 
 impl Session {
@@ -255,7 +263,6 @@ impl Session {
             id,
             provider,
             cwd: std::env::current_dir().unwrap_or_default(),
-            created_at: SystemTime::now(),
             last_used: Instant::now(),
             input: None,
             events: None,
@@ -272,7 +279,6 @@ impl Session {
             view: (0, 0),
             chat: None,
             exited_at: None,
-            tap: OutputTap::default(),
         }
     }
 

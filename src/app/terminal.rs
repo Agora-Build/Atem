@@ -113,7 +113,6 @@ impl App {
             events: Some(receiver),
             raw_log: log,
             raw_log_start: log_offset,
-            tap,
             ..
         } = session
         else {
@@ -124,7 +123,6 @@ impl App {
             match receiver.try_recv() {
                 Ok(PtyEvent::Output(bytes)) => {
                     append_log(log, log_offset, &share.process(parser, input, &bytes));
-                    tap.record(&bytes);
                 }
                 Ok(PtyEvent::Error(error)) => {
                     self.status_message = Some(format!("{label}: {error}"))
