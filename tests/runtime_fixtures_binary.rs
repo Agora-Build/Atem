@@ -63,7 +63,7 @@
 //! dispatches), and what the link carried: `approval_request`/`approval_closed`
 //! (pending approvals), the relay's push requests, and the receipts the
 //! client was told about (`receipts_visible`). Counters are re-read for up
-//! to 15 s until they match (the processes act asynchronously).
+//! to 5 s until they match (`SETTLE_COUNTERS`).
 #![cfg(target_os = "linux")]
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -83,6 +83,13 @@ const ASTATION: &str = "astation-fixtures";
 const WAIT: Duration = Duration::from_secs(15);
 /// Time the runtime gets to act on what it was sent before the next event.
 const SETTLE: Duration = Duration::from_millis(400);
+/// How long a counter may take to reach its expected value. The slowest
+/// chain a counter waits for is a decision reaching the agent: the worker
+/// writes it at once, the hook polls every 100 ms, the worker's approval
+/// poll runs every 200 ms and the fake agent's every 20 ms — about 0.4 s in
+/// all. 5 s leaves more than 10× for a loaded machine; a counter that should
+/// stay unchanged is compared at once either way.
+const SETTLE_COUNTERS: Duration = Duration::from_secs(5);
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~\r";
 
@@ -1264,10 +1271,10 @@ impl Host {
         decisions
     }
 
-    /// `counter` until it equals `expected` (`WAIT` at most): the processes
-    /// act asynchronously.
+    /// `counter` until it equals `expected` (`SETTLE_COUNTERS` at most): the
+    /// processes act asynchronously.
     fn counter_settled(&mut self, key: &str, expected: &Value) -> Result<Value, String> {
-        let deadline = Instant::now() + WAIT;
+        let deadline = Instant::now() + SETTLE_COUNTERS;
         loop {
             let got = self.counter(key)?;
             if &got == expected || Instant::now() > deadline {

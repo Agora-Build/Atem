@@ -102,8 +102,6 @@ const CAPTURE_CHECK: Duration = Duration::from_secs(5);
 const MAX_SEEN: usize = 4096;
 /// Turn outcomes kept for duplicate submits (cleared beyond it).
 const MAX_OUTCOMES: usize = 4096;
-/// Push requests kept for the relay while the link is down (the oldest go).
-pub(super) const MAX_PUSHES: usize = 64;
 
 /// The broker's monotonic clock in milliseconds, and wall time (tests move
 /// either forward).
@@ -302,19 +300,6 @@ struct OpenApproval {
     card: Option<ApprovalCard>,
 }
 
-/// A push request for the relay (§6a), kept until it went out.
-struct PushEntry {
-    approval_id: String,
-    /// `push_approval`'s data.
-    request: Value,
-    /// Wall ms when the agent's hook gives up.
-    expires_at: u64,
-    /// `push_approval` went out.
-    sent: bool,
-    /// No longer pending: `push_resolved` is due (only once `sent`).
-    resolved: Option<ApprovalCloseReason>,
-}
-
 struct Conversation {
     attachment: String,
     /// Sequence of the next event.
@@ -371,8 +356,8 @@ pub struct HostBridge {
     outcomes: HashMap<String, crate::chat::adapter::Outcome>,
     /// approval_id → open approvals.
     approvals: HashMap<String, OpenApproval>,
-    /// Push requests for the relay, in order.
-    pushes: VecDeque<PushEntry>,
+    /// Push requests for the relay (`push_queue`).
+    pushes: super::push_queue::PushQueue,
 }
 
 /// Where effects go: the link's client and the broker's sessions.
@@ -420,7 +405,7 @@ impl HostBridge {
             terminal_out: VecDeque::new(),
             outcomes: HashMap::new(),
             approvals: HashMap::new(),
-            pushes: VecDeque::new(),
+            pushes: Default::default(),
         })
     }
 
@@ -582,6 +567,7 @@ impl HostBridge {
             self.last_advance = now;
             let effects = self.host.advance(now);
             self.exec(effects, &mut cx);
+            self.finished_hand_offs(&mut cx);
         }
         self.sync_all(&mut cx);
         self.drain_remote(&mut cx);
@@ -636,7 +622,7 @@ impl HostBridge {
                 .unwrap_or_default()
                 .to_string(),
             attachment_gen: attachment.clone(),
-            permissions: vec![Permission::View, Permission::Control],
+            permissions: link_permissions(),
             client_kind: ClientKind::Native,
             authorization_ms: LINK_AUTHORIZATION_MS,
         };
@@ -1435,6 +1421,31 @@ impl HostBridge {
         }
     }
 
+    /// Handed-off answers the host finished without the worker's report
+    /// (the 630 s deadline: `outcome_unknown`): the card closes and the
+    /// approval is forgotten.
+    fn finished_hand_offs(&mut self, cx: &mut Cx) {
+        use crate::session_protocol::wire::ReceiptState;
+        let finished: Vec<(String, ReceiptState)> = self
+            .approvals
+            .iter()
+            .filter_map(|(id, a)| {
+                let state = self.host.receipt(a.receipt.as_ref()?)?.state;
+                matches!(
+                    state,
+                    ReceiptState::Completed | ReceiptState::Rejected | ReceiptState::OutcomeUnknown
+                )
+                .then(|| (id.clone(), state))
+            })
+            .collect();
+        for (id, state) in finished {
+            if state != ReceiptState::Completed {
+                self.card_state(&id, ApprovalCardState::Closed, cx);
+            }
+            self.approvals.remove(&id);
+        }
+    }
+
     /// The host approval id of `sid`'s worker request `worker_id`.
     fn approval_of(&self, sid: &str, worker_id: &str) -> Option<String> {
         self.approvals
@@ -1562,16 +1573,9 @@ impl HostBridge {
             "summary": request.summary,
             "expires_at": expires_at,
         });
-        self.pushes.push_back(PushEntry {
-            approval_id: request.approval_id,
-            request: data,
-            expires_at,
-            sent: false,
-            resolved: None,
-        });
-        while self.pushes.len() > MAX_PUSHES {
-            self.pushes.pop_front();
-        }
+        let wall = self.clock.wall();
+        self.pushes
+            .open(&request.approval_id, data, expires_at, wall);
         self.flush_pushes(cx);
     }
 
@@ -1587,59 +1591,18 @@ impl HostBridge {
         if let Some(state) = state {
             self.card_state(approval_id, state, cx);
         }
-        if let Some(i) = self
-            .pushes
-            .iter()
-            .position(|p| p.approval_id == approval_id)
-        {
-            if self.pushes[i].sent {
-                self.pushes[i].resolved = Some(reason);
-            } else {
-                // Never pushed: nothing to replace.
-                self.pushes.remove(i);
-            }
-        }
+        self.pushes.resolve(approval_id, reason);
         self.flush_pushes(cx);
     }
 
-    /// Sends what the relay should know, in order, over the verified link:
-    /// `push_approval` only for approvals still pending (and not expired),
-    /// `push_resolved` only for ones whose `push_approval` went out. Stops
-    /// at the first failure (kept for the next pass).
+    /// Sends the due push requests over the verified link (`push_queue`).
     fn flush_pushes(&mut self, cx: &mut Cx) {
-        if self.link.is_none() {
-            return;
-        }
+        let link_up = self.link.is_some();
         let wall = self.clock.wall();
-        self.pushes
-            .retain(|p| p.sent || p.resolved.is_some() || p.expires_at > wall);
-        let mut i = 0;
-        while i < self.pushes.len() {
-            let p = &self.pushes[i];
-            let data = match (p.sent, p.resolved) {
-                (false, None) => p.request.clone(),
-                (true, Some(reason)) => json!({
-                    "v": 1,
-                    "op": "push_resolved",
-                    "approval_id": p.approval_id,
-                    "reason": reason,
-                }),
-                _ => {
-                    i += 1;
-                    continue;
-                }
-            };
-            let text = json!({"type": "relay", "data": data}).to_string();
-            if cx.client.try_send_wire(text, false).is_err() {
-                return;
-            }
-            if self.pushes[i].sent {
-                self.pushes.remove(i);
-            } else {
-                self.pushes[i].sent = true;
-                i += 1;
-            }
-        }
+        let client = cx.client;
+        self.pushes.flush(link_up, wall, &mut |text| {
+            client.try_send_wire(text, false).is_ok()
+        });
     }
 
     /// The card of `approval_id` in a new state.
@@ -1673,7 +1636,7 @@ impl HostBridge {
             return;
         };
         let out = session.chat.approval_card(card, wall_ms() as i64);
-        self.broadcast(&sid, &out, None, cx);
+        self.broadcast_to(&sid, &out, None, true, cx);
     }
 
     /// The approvals this bridge holds open (tests).
@@ -1863,7 +1826,9 @@ impl HostBridge {
             .chat
             .history(before, HISTORY_MESSAGES, HISTORY_BYTES);
         let mut sequence = 1;
-        for message in &history {
+        // Approval cards only for an attachment that may answer them.
+        let control = self.host.attachment_can(attachment, Permission::Control);
+        for message in history.iter().filter(|m| control || !is_card(m)) {
             envelopes.push(chat_wire::history_message(
                 conversation,
                 sid,
@@ -2027,6 +1992,19 @@ impl HostBridge {
     }
 
     fn broadcast(&mut self, sid: &str, out: &Out, except: Option<&str>, cx: &mut Cx) {
+        self.broadcast_to(sid, out, except, false, cx);
+    }
+
+    /// `broadcast`; with `control`, only to conversations of attachments
+    /// with `control` (approval cards, §6a).
+    fn broadcast_to(
+        &mut self,
+        sid: &str,
+        out: &Out,
+        except: Option<&str>,
+        control: bool,
+        cx: &mut Cx,
+    ) {
         let ids: Vec<String> = self
             .chats
             .get(sid)
@@ -2034,6 +2012,9 @@ impl HostBridge {
                 c.conversations
                     .iter()
                     .filter(|(id, c)| Some(id.as_str()) != except && self.current(&c.attachment))
+                    .filter(|(_, c)| {
+                        !control || self.host.attachment_can(&c.attachment, Permission::Control)
+                    })
                     .map(|(id, _)| id.clone())
                     .collect()
             })
@@ -2118,6 +2099,29 @@ impl HostBridge {
 }
 
 /// The link the App holds now: its generation while authenticated.
+/// What the link's attachment may do: `view` and `control` (tests can make
+/// it view-only).
+fn link_permissions() -> Vec<Permission> {
+    #[cfg(test)]
+    if VIEW_ONLY_LINK.with(std::cell::Cell::get) {
+        return vec![Permission::View];
+    }
+    vec![Permission::View, Permission::Control]
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next link attaches view-only.
+    pub(super) static VIEW_ONLY_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A chat-v1 approval card message.
+fn is_card(m: &crate::chat::session::ChatMessage) -> bool {
+    m.parts
+        .iter()
+        .any(|p| matches!(p, crate::chat::adapter::Part::Approval(_)))
+}
+
 fn app_link(app: &App) -> Option<u64> {
     (app.astation_connected && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
         .then_some(app.astation_link_gen)

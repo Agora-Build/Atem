@@ -1915,9 +1915,19 @@ fn input_to_codex_releases_its_waiting_hooks_first() {
             .await;
         assert_eq!(closed["data"]["reason"], "released");
         agent_event(&fake, "answer 2 none ").await;
-        // Both inputs reached Codex, after the releases.
+        // Both inputs reached Codex, each only after its released hook had
+        // exited (so Codex's own prompt, not its hook wait, gets the keys).
         let input = std::fs::read(fake.join("input")).unwrap_or_default();
         assert!(input.contains(&b'L') && input.contains(&b'R'), "{input:?}");
+        let events = std::fs::read_to_string(fake.join("events")).unwrap();
+        let lines: Vec<&str> = events.lines().collect();
+        let at = |prefix: &str| lines.iter().position(|l| l.starts_with(prefix)).unwrap();
+        let inputs: Vec<usize> = (0..lines.len())
+            .filter(|i| lines[*i].starts_with("input "))
+            .collect();
+        assert_eq!(inputs.len(), 2, "{events}");
+        assert!(at("answer 1 none") < inputs[0], "{events}");
+        assert!(at("answer 2 none") < inputs[1], "{events}");
         rt.shutdown().await;
     });
 }
@@ -1999,4 +2009,85 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
     );
     assert!(bridge.open_approvals().is_empty());
     let _ = session.stop();
+}
+
+#[test]
+fn a_view_only_link_gets_no_approval_requests_and_no_cards() {
+    local(async {
+        super::VIEW_ONLY_LINK.with(|v| v.set(true));
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        let welcome = peer.hello().await;
+        assert_eq!(welcome["permissions"], json!(["view"]));
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        ask(&fake, 1, npm_test());
+        // The push still goes out (the account's devices with control).
+        let push = peer.wait(|v| v["type"] == "relay").await;
+        assert_eq!(push["data"]["op"], "push_approval");
+        let aid = push["data"]["approval_id"].as_str().unwrap().to_string();
+        peer.drain(Duration::from_millis(800)).await;
+        assert!(
+            !peer.seen.iter().any(|v| is_session(v, "approval_request")),
+            "{:#?}",
+            peer.seen
+        );
+        assert!(!peer.seen.iter().any(|v| is_card(v, &aid, "pending")));
+        // Nor in the history of a conversation opened now.
+        let from = peer.seen.len();
+        open_chat(peer, "conv-2", &sid, &pg).await;
+        peer.drain(Duration::from_millis(500)).await;
+        assert!(
+            !peer.seen[from..]
+                .iter()
+                .any(|v| v.to_string().contains(&format!("approval-{aid}")))
+        );
+        super::VIEW_ONLY_LINK.with(|v| v.set(false));
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        ask(&fake, 1, npm_test());
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        // The hook stops: the decision is handed over but never taken.
+        std::fs::write(fake.join("stop-1"), "").unwrap();
+        agent_event(&fake, "stopped 1").await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": request_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        rt.clock
+            .skip(crate::session_protocol::host::APPROVAL_HANDOFF_MS + 1);
+        let peer = &mut rt.peer;
+        let rid = request_id.clone();
+        let done = peer
+            .wait(move |v| is_chat(v, "error") && v["data"]["requestId"] == rid.as_str())
+            .await;
+        assert_eq!(done["data"]["code"], "outcome_unknown", "{done}");
+        peer.wait_from(0, |v| is_card(v, &aid, "closed")).await;
+        rt.shutdown().await;
+    });
 }

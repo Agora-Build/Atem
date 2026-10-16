@@ -283,11 +283,14 @@ impl Approvals {
         ok
     }
 
-    /// The claim time of a taken decision (its file goes), when taken.
+    /// The claim time of a taken decision, when taken: the mtime of
+    /// `taken-<id>.json` (or `claimed-<id>` once the hook read it). Never
+    /// removes anything: the hook may be between its `mv` and its `cat`;
+    /// the files go once the hook is gone (`ended`).
     fn take_claim(&self, id: &str) -> Option<i64> {
         let taken = self.path("taken", id, ".json");
-        if let Some(at) = mtime_ms(&taken) {
-            let _ = std::fs::remove_file(&taken);
+        let claimed = self.path("claimed", id, "");
+        if let Some(at) = mtime_ms(&taken).or_else(|| mtime_ms(&claimed)) {
             return Some(at);
         }
         // Gone without a trace of the claim: it was claimed (now at the latest).
@@ -341,13 +344,30 @@ impl Approvals {
         self.release_one(id);
     }
 
-    /// `release_approvals` (local input), or no broker: every waiting hook
-    /// gets "no decision".
-    pub fn release_all(&mut self) {
-        let ids: Vec<String> = self.waiting.keys().cloned().collect();
-        for id in ids {
-            self.release_one(&id);
+    /// `release_approvals` (input to Codex), or no broker: every waiting
+    /// hook gets "no decision". The ones released now (their hooks may still
+    /// be running for a moment).
+    pub fn release_all(&mut self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .waiting
+            .iter()
+            .filter(|(_, w)| matches!(w.state, State::Open | State::Decided { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            self.release_one(id);
         }
+        ids
+    }
+
+    /// One of the hooks of `ids` is still running.
+    pub fn hooks_running(&self, ids: &[String]) -> bool {
+        ids.iter().any(|id| {
+            self.waiting.get(id).is_some_and(|w| match w.pid {
+                Some((pid, start)) => hook_alive(pid, start),
+                None => false,
+            })
+        })
     }
 
     /// A broker (after adoption) knows only `known`: the rest are released.
@@ -773,7 +793,8 @@ impl Approvals {
                     });
                     self.set(&id, State::Released);
                 }
-                State::Released if !alive || self.path("taken", &id, ".json").exists() => {
+                // Only once the hook is gone: it may still be reading.
+                State::Released if !alive => {
                     done.push(id);
                 }
                 _ => {}
@@ -786,6 +807,7 @@ impl Approvals {
                 ("pid", ""),
                 ("dec", ".json"),
                 ("taken", ".json"),
+                ("claimed", ""),
             ] {
                 let _ = std::fs::remove_file(self.path(prefix, &id, suffix));
             }

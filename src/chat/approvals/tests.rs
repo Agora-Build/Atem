@@ -101,10 +101,13 @@ fn claude_round(output: &str) -> String {
         !approvals_dir(s.path())
             .join(format!("dec-{id}.json"))
             .exists()
-            && approvals_dir(s.path())
+            && !approvals_dir(s.path())
                 .join(format!("taken-{id}.json"))
+                .exists()
+            && approvals_dir(s.path())
+                .join(format!("claimed-{id}"))
                 .exists(),
-        "the hook claimed the decision"
+        "the hook claimed the decision, read it and set it aside"
     );
     stdout
 }

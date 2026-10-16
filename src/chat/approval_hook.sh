@@ -6,8 +6,10 @@
 #       agent's hook from a nested one) and waits for Atem's decision
 #       dec-<id>.json, which holds the exact output for the agent (empty: no
 #       decision). It claims the decision by renaming it to taken-<id>.json
-#       (stamped with the claim time); Atem withdraws one by renaming it too,
-#       so exactly one of them gets it. Prints it and exits 0. Gives up
+#       (stamped with the claim time; once read it becomes claimed-<id>, the
+#       time kept); Atem withdraws one by renaming it too, so exactly one of
+#       them gets it, and never touches a claimed one while the hook runs.
+#       Prints it and exits 0. Gives up
 #       silently at the timeout or when Atem withdraws the request.
 #   sh approval-hook.sh post
 #       Claude PostToolUse: tells Atem a tool ran while a request waits
@@ -49,6 +51,8 @@ while [ "$n" -lt "$max" ]; do
     if [ -f "$dec" ] && [ ! -h "$dec" ] && mv "$dec" "$a/taken-$id.json" 2>/dev/null; then
         touch "$a/taken-$id.json" 2>/dev/null
         out=$(cat "$a/taken-$id.json" 2>/dev/null) || exit 0
+        # Read: out of the way, its time (the claim's) kept for Atem.
+        mv "$a/taken-$id.json" "$a/claimed-$id" 2>/dev/null
         [ -n "$out" ] && printf '%s' "$out"
         exit 0
     fi

@@ -13,9 +13,10 @@
 #   terminal-no-<n>     the user refuses it in the dialog (Claude writes its
 #                       rejection tool_result; the turn is interrupted)
 #   kill-<n>            the hook is killed (the prompt was interrupted)
+#   stop-<n>            the hook is stopped (SIGSTOP): it never takes a decision
 #   exit                the agent exits
 # What it saw, in $FAKE_DIR: input (every byte its terminal delivered),
-# events (one line per thing it did: "started", "asked <n>", "answer <n>
+# events (one line per thing it did: "started", "input <bytes>", "asked <n>", "answer <n>
 # <allow|deny|none> <message>", "ran <n>", "refused <n>", "completed <turn>",
 # "winch", "signal <n> worker_alive=<bool>"), answer-<n>.json (the hook's raw
 # output).
@@ -91,16 +92,44 @@ fire("SessionStart", {"transcript_path": transcript, "source": "startup"})
 events.write("started\n")
 os.write(1, b"READY\r\n")
 
+def answered(n, ask):
+    """The hook ended: what it answered, and what the agent does about it."""
+    if ask["done"] or ask["proc"].poll() is None:
+        return
+    request = ask["request"]
+    tool = {"tool_name": request["tool_name"], "tool_input": request["tool_input"]}
+    ask["done"] = True
+    out = ask["proc"].stdout.read().decode("utf-8", "replace")
+    with open(os.path.join(ctl, "answer-%d.json" % n), "w") as f:
+        f.write(out)
+    decision = {}
+    if out.strip():
+        decision = json.loads(out)["hookSpecificOutput"]["decision"]
+    behavior = decision.get("behavior", "none")
+    message = decision.get("message", "")
+    events.write("answer %d %s %s\n" % (n, behavior, message))
+    if behavior == "allow":
+        fire("PostToolUse", dict(tool, tool_response={"stdout": "ok"}))
+        tool_result(n, "ok", False)
+    elif behavior == "deny":
+        # Claude Code writes the hook's message as it is (checked live).
+        tool_result(n, message, True)
+
 asks = {}  # n -> {"proc", "request", "done"}
 START, END = b"\x1b[200~", b"\x1b[201~\r"
 buf = b""
 while True:
     ready, _, _ = select.select([0], [], [], 0.02)
     if ready:
+        # Hooks that ended before this input arrived are logged first, so
+        # the events show which came first.
+        for n, ask in asks.items():
+            answered(n, ask)
         data = os.read(0, 65536)
         if not data:
             break
         log_in.write(data)
+        events.write("input %d\n" % len(data))
         buf += data
         while settings:
             s = buf.find(START)
@@ -146,7 +175,7 @@ while True:
     for n, ask in asks.items():
         request = ask["request"]
         tool = {"tool_name": request["tool_name"], "tool_input": request["tool_input"]}
-        for what in ("terminal-yes", "terminal-no", "kill"):
+        for what in ("terminal-yes", "terminal-no", "kill", "stop"):
             path = os.path.join(ctl, "%s-%d" % (what, n))
             if not os.path.exists(path):
                 continue
@@ -160,23 +189,9 @@ while True:
                 log({"type": "user", "uuid": "i-%d" % n, "promptId": turn_id(), "message": {
                     "role": "user", "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}})
                 events.write("refused %d\n" % n)
-            else:
+            elif what == "kill":
                 ask["proc"].kill()
-        if ask["done"] or ask["proc"].poll() is None:
-            continue
-        ask["done"] = True
-        out = ask["proc"].stdout.read().decode("utf-8", "replace")
-        with open(os.path.join(ctl, "answer-%d.json" % n), "w") as f:
-            f.write(out)
-        decision = {}
-        if out.strip():
-            decision = json.loads(out)["hookSpecificOutput"]["decision"]
-        behavior = decision.get("behavior", "none")
-        message = decision.get("message", "")
-        events.write("answer %d %s %s\n" % (n, behavior, message))
-        if behavior == "allow":
-            fire("PostToolUse", dict(tool, tool_response={"stdout": "ok"}))
-            tool_result(n, "ok", False)
-        elif behavior == "deny":
-            # Claude Code writes the hook's message as it is (checked live).
-            tool_result(n, message, True)
+            else:
+                ask["proc"].send_signal(signal.SIGSTOP)
+                events.write("stopped %d\n" % n)
+        answered(n, ask)

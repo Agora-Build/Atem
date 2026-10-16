@@ -11,6 +11,7 @@ pub mod host_bridge;
 pub mod op_client;
 pub mod ops;
 pub mod protocol;
+pub mod push_queue;
 pub mod server;
 pub mod session_log;
 pub mod test_hooks;
@@ -108,13 +109,16 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
         adopt::WorkerPaths::new(&state_dir(&config_dir), std::env::var_os("XDG_RUNTIME_DIR"))?;
     // Chat directories of workers that are gone (a live worker's names its pid).
     crate::chat::claude::hooks::sweep_stale(&crate::chat::claude::hooks::session_dir_root());
+    // The identity the host starts under, read before the Astation connect
+    // starts writing to the profile (`instance_id`, `atem_id`).
+    let profile = crate::status::Sources::current().ok();
     let mut app = crate::app::App::new();
     app.spawn_astation_connect();
     let options = server::Options {
         idle: idle_timeout(),
         uid,
         launcher: broker::Launcher::Process(paths),
-        profile: crate::status::Sources::current().ok(),
+        profile,
         clock: host_bridge::Clock::default(),
         ops: ops::OpEnv::for_user(),
     };

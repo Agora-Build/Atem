@@ -142,7 +142,7 @@ impl AtemConfig {
                 let _ = fs::create_dir_all(dir);
             }
             if let Ok(content) = toml::to_string_pretty(&existing) {
-                let _ = fs::write(&path, content);
+                let _ = write_replacing(&path, content.as_bytes());
             }
         }
     }
@@ -263,7 +263,7 @@ impl AtemConfig {
 
         let content = toml::to_string_pretty(&existing)
             .with_context(|| "Failed to serialize config")?;
-        fs::write(&path, content)
+        write_replacing(&path, content.as_bytes())
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
         Ok(())
     }
@@ -730,9 +730,70 @@ impl crate::auth::AuthSession {
     }
 }
 
+/// Replaces `path` with `content` atomically (a temp file in the same
+/// directory, renamed over it), so a concurrent reader — e.g. the runtime
+/// reading its identity while its Astation connect stores `atem_id` — sees
+/// the old file or the new one, never a half-written one. Keeps the old
+/// file's permissions.
+fn write_replacing(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        if let Ok(meta) = fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.write_all(content)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader never sees a half-written `config.toml` while a key is
+    /// merged in (the runtime read its identity while its own Astation
+    /// connect stored `instance_id`/`atem_id`, and fell back to unpaired).
+    #[test]
+    fn a_merged_key_is_never_seen_half_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let filler = "x".repeat(64 * 1024);
+        AtemConfig::write_config_value_at(&path, "filler", toml::Value::String(filler));
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..300 {
+                    AtemConfig::write_config_value_at(
+                        &path,
+                        "atem_id",
+                        toml::Value::String(format!("host-{i}")),
+                    );
+                }
+            })
+        };
+        let mut reads = 0;
+        while !writer.is_finished() {
+            let text = fs::read_to_string(&path).unwrap();
+            let parsed: toml::Value = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("read {reads}: a half-written file: {e}"));
+            assert!(parsed.get("filler").is_some(), "read {reads}: a truncated file");
+            reads += 1;
+        }
+        writer.join().unwrap();
+        assert!(reads > 0);
+    }
 
     #[test]
     fn terminal_prefix_is_read_from_config_toml() {

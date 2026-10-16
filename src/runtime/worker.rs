@@ -57,6 +57,11 @@ const SNAPSHOT_MESSAGES: usize = 200;
 const SNAPSHOT_BYTES: usize = 1024 * 1024;
 /// How often the chat adapter is read.
 const CHAT_POLL: Duration = Duration::from_millis(200);
+/// Input after `release_approvals` waits at most this long for the released
+/// hooks to exit (they notice within ~100 ms).
+const HOLD_INPUT: Duration = Duration::from_millis(500);
+/// How often held input checks the released hooks.
+const HOLD_CHECK: Duration = Duration::from_millis(10);
 
 /// `<state>/workers`.
 pub fn workers_dir(state: &Path) -> PathBuf {
@@ -445,6 +450,11 @@ struct Worker {
     approvals: Option<Approvals>,
     /// What the chat adapter saw that may end a waiting prompt.
     approval_evidence: Vec<super::worker_approvals::Evidence>,
+    /// After `release_approvals`: input waits here (in order) until the
+    /// released hooks exited, or until the deadline, so the agent's own
+    /// prompt — not its hook wait — gets the keys.
+    held_input: std::collections::VecDeque<BrokerMsg>,
+    hold: Option<(Instant, Vec<String>)>,
     /// The Codex session directory, removed when the agent exited.
     owned_dir: Option<PathBuf>,
     chat: ChatSession,
@@ -588,6 +598,8 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         adapter,
         approvals: approvals.map(|(dir, agent)| Approvals::new(&dir, agent, agent_pid)),
         approval_evidence: Vec::new(),
+        held_input: std::collections::VecDeque::new(),
+        hold: None,
         owned_dir,
         chat: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
         capabilities: Capabilities::default(),
@@ -693,6 +705,7 @@ impl Worker {
                             // The broker went away; the agent keeps running.
                             // Its approvals went with it: the agent asks.
                             self.release_approvals();
+                            self.drop_held_input();
                             let heard = self.conn.take().is_some_and(|c| c.exit_sent);
                             if heard {
                                 return true;
@@ -716,6 +729,9 @@ impl Worker {
                             self.connected(Conn::open(stream));
                         }
                     }
+                }
+                _ = tokio::time::sleep(HOLD_CHECK), if self.hold.is_some() => {
+                    self.check_hold();
                 }
                 _ = poll.tick() => {
                     self.poll_chat();
@@ -748,6 +764,7 @@ impl Worker {
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.release_approvals();
+                    self.drop_held_input();
                     return self.conn.take().is_some_and(|c| c.exit_sent);
                 }
             }
@@ -859,6 +876,12 @@ impl Worker {
 
     /// Handles one broker message; true when the worker should end now.
     fn broker_message(&mut self, message: BrokerMsg) -> bool {
+        if self.hold.is_some()
+            && matches!(message, BrokerMsg::Write { .. } | BrokerMsg::Paste { .. })
+        {
+            self.held_input.push_back(message);
+            return false;
+        }
         match message {
             BrokerMsg::Start { .. } => self.send(&WorkerMsg::Error {
                 text: "the agent already started".into(),
@@ -950,7 +973,20 @@ impl Worker {
                     a.release(&request_id);
                 }
             }
-            BrokerMsg::ReleaseApprovals => self.release_approvals(),
+            BrokerMsg::ReleaseApprovals => {
+                // Input follows: it waits for the released hooks to exit.
+                let released = self.release_approvals();
+                let running = self
+                    .approvals
+                    .as_ref()
+                    .is_some_and(|a| a.hooks_running(&released));
+                if running {
+                    match &mut self.hold {
+                        Some((_, ids)) => ids.extend(released),
+                        None => self.hold = Some((Instant::now() + HOLD_INPUT, released)),
+                    }
+                }
+            }
             BrokerMsg::KnownApprovals { request_ids } => {
                 if let Some(a) = self.approvals.as_mut() {
                     a.keep_only(&request_ids);
@@ -960,10 +996,39 @@ impl Worker {
         false
     }
 
-    /// Every waiting hook gets "no decision".
-    fn release_approvals(&mut self) {
-        if let Some(a) = self.approvals.as_mut() {
-            a.release_all();
+    /// Every waiting hook gets "no decision"; the ones released now.
+    fn release_approvals(&mut self) -> Vec<String> {
+        match self.approvals.as_mut() {
+            Some(a) => a.release_all(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Input held for a broker that went away is never written.
+    fn drop_held_input(&mut self) {
+        self.held_input.clear();
+        self.hold = None;
+    }
+
+    /// Writes held input once the released hooks exited (or at the
+    /// deadline: then anyway).
+    fn check_hold(&mut self) {
+        let Some((until, ids)) = &self.hold else {
+            return;
+        };
+        let running = self
+            .approvals
+            .as_ref()
+            .is_some_and(|a| a.hooks_running(ids));
+        if running && Instant::now() < *until {
+            return;
+        }
+        self.hold = None;
+        while let Some(message) = self.held_input.pop_front() {
+            self.broker_message(message);
+            if self.hold.is_some() {
+                break;
+            }
         }
     }
 

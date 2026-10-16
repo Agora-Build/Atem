@@ -432,7 +432,9 @@ takes the lease with the answer (`acquire`).
 - **Recipients.** `approval_request` and `approval_closed` go to every
   attachment subscribed by `list` with `control` (a view-only attachment
   gets neither); after each `sessions` snapshot the pending ones are sent
-  again to such an attachment (§4). An approval belongs to one
+  again to such an attachment (§4); the chat-v1 card likewise appears only
+  in conversations of attachments with `control`, live and in history — the
+  same audience the push targets. An approval belongs to one
   (`session_id`, `process_gen`).
 - **Push (host → relay).** On opening, the host asks the relay over its own
   authenticated Astation link to push the approval to every device on the
@@ -449,7 +451,10 @@ takes the lease with the answer (`acquire`).
   them; while it is down the host keeps the latest state per approval
   (bounded) and on reconnect sends `push_approval` only for approvals still
   pending and `push_resolved` only for ones whose `push_approval` went out.
-  Relay messages are not session messages: no `id`, no reply.
+  Beyond 64 kept entries an unsent one is dropped (an expired one first,
+  else the oldest); one already pushed is never dropped, so its
+  `push_resolved` still goes out. Relay messages are not session messages:
+  no `id`, no reply.
 - **Payload** (strict; anything else is `unsupported_version`): `approval_id`
   a UUID; `decision` one of `allow_once`, `allow_always`, `deny`; `rule_id`
   present iff `allow_always` (an opaque id); `message` only with `deny` (≤ 512
@@ -490,7 +495,9 @@ takes the lease with the answer (`acquire`).
   (the hook's limit), `released` (Atem gave the prompt back to the agent:
   input reached a Codex session, which hides its prompt while the hook
   waits, so any input — local, or the lease holder's — first answers the
-  hook "no decision"; or the runtime restarted), `process_ended` (the process
+  hook "no decision", and that input waits until the released hooks exited,
+  at most 500 ms, so it reaches Codex's own prompt; or the runtime
+  restarted), `process_ended` (the process
   exited, was replaced, or the session closed or was removed).
   `answered_remote` is the host's own reason; the runtime reports the
   others. After a hand-off, a lost lease doesn't cancel the answer (§6:
@@ -518,7 +525,8 @@ takes the lease with the answer (`acquire`).
   `always_allowed`, `denied` (answered remotely: set when the answer is
   handed over), `answered_terminal`, `expired` (timed out), or `closed`
   (interrupted, released, the process ended, or a remote answer the agent
-  didn't take or whose outcome is unknown). A
+  didn't take or whose outcome is unknown, including at the 630 s hand-off
+  deadline). A
   state change re-sends the whole `message` (same `messageId`; the client
   replaces it). Answering from chat is a chat-v1 `submit` with `approval`
   (the payload above) instead of `text`, its `binding` without `lease_epoch`

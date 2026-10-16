@@ -631,3 +631,40 @@ fn a_request_it_cannot_read_is_released() {
     assert_eq!(printed(hook), "");
     assert!(drained(&mut a).is_empty());
 }
+
+/// The worker polling as fast as it can while the hook claims and reads its
+/// decision never takes the decision away from the hook (it once deleted
+/// `taken-<id>.json` between the hook's `mv` and its `cat`).
+#[test]
+fn a_claimed_decision_always_reaches_the_hook_however_fast_the_worker_polls() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    for i in 0..50 {
+        let hook = s.hook("codex", 30, SECRET_BASH);
+        let id = request_id(&events(&mut a, true)[0]);
+        assert_eq!(a.decide(&id, ApprovalDecision::AllowOnce, None, None), None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = hook.wait_with_output().unwrap();
+            let _ = tx.send(String::from_utf8(out.stdout).unwrap());
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let printed = loop {
+            a.poll(true, Vec::new());
+            if let Ok(out) = rx.try_recv() {
+                break out;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "iteration {i}: the hook didn't end"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(
+            printed.contains(r#""behavior":"allow""#),
+            "iteration {i}: the hook printed {printed:?}"
+        );
+        drained(&mut a);
+    }
+    assert!(s.files().is_empty(), "{:?}", s.files());
+}

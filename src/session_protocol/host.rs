@@ -1231,6 +1231,13 @@ impl<J: Journal> SessionHost<J> {
             .map(|l| l.deadline)
     }
 
+    /// The live attachment `attachment` was granted `permission`.
+    pub fn attachment_can(&self, attachment: &str, permission: Permission) -> bool {
+        self.attachments
+            .get(attachment)
+            .is_some_and(|a| a.can(permission))
+    }
+
     pub fn lease_epoch(&self, session_id: &str) -> Option<u64> {
         self.sessions.get(session_id).map(|s| s.lease_epoch)
     }
