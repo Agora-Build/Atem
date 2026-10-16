@@ -309,7 +309,7 @@ fn all_ops() -> Vec<Value> {
             "welcome",
             json!({"re":RE,"account_id":"account-a","atem_device_id":"host-a",
             "host_trust_gen":1,"runtime_gen":PG,"controller_session":RE,"attachment_gen":AG,
-            "client_kind":"native","permissions":["view","control","approve"],
+            "client_kind":"native","permissions":["view","control"],
             "authorization_ms_left":86400000,"server_time":1760500000000u64}),
         ),
         session("list", json!({})),

@@ -476,7 +476,7 @@ fn welcome_list_leases_terminal_input_and_local_input() {
         assert_eq!(welcome["client_kind"], "native");
         assert_eq!(
             welcome["permissions"],
-            json!(["view", "control", "approve"])
+            json!(["view", "control"])
         );
 
         let descriptor = listed(peer, &sid).await;

@@ -518,7 +518,7 @@ fn an_answer_must_name_this_sessions_pending_approval_and_an_offered_rule() {
 
 #[test]
 fn losing_the_lease_closes_pending_approvals_and_releases_the_hook() {
-    for how in ["expired", "local_input", "released", "takeover", "trust"] {
+    for how in ["expired", "local_input", "released", "trust"] {
         let mut rt = setup();
         let e = list_and_hold(&mut rt, "c1");
         rt.send("v", &msg("list", json!({})));
@@ -531,23 +531,6 @@ fn losing_the_lease_closes_pending_approvals_and_releases_the_hook() {
             "released" => {
                 let m = msg("release", json!({"binding": binding(&rt, "c1", Some(e))}));
                 rt.send("c1", &m);
-                Vec::new()
-            }
-            "takeover" => {
-                // A second controller takes over.
-                rt.connect_only(
-                    "c2",
-                    "66666666-6666-4666-8666-666666666666",
-                    vec![wire::Permission::View, wire::Permission::Control],
-                    1_000_000,
-                );
-                rt.send("c2", &msg("hello", json!({})));
-                let m = msg(
-                    "acquire",
-                    json!({"binding": binding(&rt, "c2", None), "takeover": true}),
-                );
-                rt.send("c2", &m);
-                got(&mut rt, "c2");
                 Vec::new()
             }
             _ => rt.host.change_trust_gen(2).unwrap(),
@@ -848,4 +831,143 @@ fn a_handed_off_answer_still_completes_after_the_session_closes() {
     );
     let fx = rt.host.approval_applied(&id, true);
     assert!(fx.is_empty());
+}
+
+#[test]
+fn a_takeover_keeps_the_pending_approval_for_the_new_holder() {
+    let mut rt = setup();
+    let e1 = list_and_hold(&mut rt, "c1");
+    let id = open(&mut rt, vec![]);
+    let c2 = "66666666-6666-4666-8666-666666666666";
+    rt.connect_only(
+        "c2",
+        c2,
+        vec![wire::Permission::View, wire::Permission::Control],
+        1_000_000,
+    );
+    rt.send("c2", &msg("hello", json!({})));
+    rt.send("c2", &msg("list", json!({})));
+    let caught = got(&mut rt, "c2");
+    assert_eq!(ops(&caught), ["welcome", "sessions", "approval_request"]);
+    let m = msg(
+        "acquire",
+        json!({"binding": binding(&rt, "c2", None), "takeover": true}),
+    );
+    rt.send("c2", &m);
+    let e2 = got(&mut rt, "c2")
+        .into_iter()
+        .find(|m| m["op"] == "lease")
+        .unwrap()["binding"]["lease_epoch"]
+        .as_u64()
+        .unwrap();
+    assert!(e2 > e1);
+    // Still pending, nothing released, no close.
+    assert_eq!(rt.host.pending_approvals(S1), std::slice::from_ref(&id));
+    assert!(released(&rt).is_empty());
+    assert!(!ops(&got(&mut rt, "c1")).contains(&"approval_closed".to_string()));
+    // The old holder's epoch is stale; the new holder answers with its own.
+    let old = answer(
+        &rt,
+        "c1",
+        e1,
+        1,
+        json!({"approval_id": id, "decision": "deny"}),
+    );
+    rt.send("c1", &old);
+    assert_eq!(got(&mut rt, "c1")[0]["code"], "stale_lease");
+    let new = answer(
+        &rt,
+        "c2",
+        e2,
+        2,
+        json!({"approval_id": id, "decision": "allow_once"}),
+    );
+    rt.send("c2", &new);
+    assert_eq!(
+        ops(&got(&mut rt, "c2")),
+        ["receipt", "receipt", "approval_closed"]
+    );
+    assert_eq!(approval_effects(&rt).len(), 1);
+}
+
+#[test]
+fn the_runtime_can_not_close_an_approval_for_a_lost_lease() {
+    let mut rt = setup();
+    list_and_hold(&mut rt, "c1");
+    let id = open(&mut rt, vec![]);
+    got(&mut rt, "c1");
+    let fx = rt.host.close_approval(&id, ApprovalCloseReason::LeaseLost);
+    assert!(fx.is_empty());
+    assert_eq!(rt.host.pending_approvals(S1), std::slice::from_ref(&id));
+}
+
+#[test]
+fn a_failed_hand_off_releases_the_waiting_prompt() {
+    let mut rt = setup();
+    let e = list_and_hold(&mut rt, "c1");
+    let id = open(&mut rt, vec![]);
+    let m = answer(
+        &rt,
+        "c1",
+        e,
+        1,
+        json!({"approval_id": id, "decision": "allow_once"}),
+    );
+    rt.send("c1", &m);
+    assert!(released(&rt).is_empty());
+    let fx = rt
+        .host
+        .dispatch_report(&rid(1), DispatchReport::FailedNoEffect);
+    assert!(fx.iter().any(|e| matches!(e,
+        Effect::ApprovalReleased { approval_id, session_id } if *approval_id == id && session_id == S1)));
+    rt.apply(fx);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Rejected
+    );
+}
+
+#[test]
+fn a_handed_off_answer_the_agent_never_confirms_ends_at_the_deadline() {
+    let mut rt = setup();
+    let e = list_and_hold(&mut rt, "c1");
+    // Renewals keep the lease; the deadline doesn't depend on it.
+    let id = open(&mut rt, vec![]);
+    rt.set_now(1000);
+    let m = answer(
+        &rt,
+        "c1",
+        e,
+        1,
+        json!({"approval_id": id, "decision": "allow_once"}),
+    );
+    rt.send("c1", &m);
+    const { assert!(APPROVAL_HANDOFF_MS > 600_000) };
+    rt.set_now(1000 + APPROVAL_HANDOFF_MS - 1);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    rt.set_now(1000 + APPROVAL_HANDOFF_MS);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (
+            ReceiptState::OutcomeUnknown,
+            Some(DETAIL_APPROVAL_UNCONFIRMED)
+        )
+    );
+    // Forgotten: a late report changes nothing.
+    assert!(rt.host.approval_applied(&id, true).is_empty());
+}
+
+#[test]
+fn welcome_permissions_have_no_approve() {
+    let m = msg(
+        "welcome",
+        json!({"account_id":"account-a","atem_device_id":"host-a","host_trust_gen":1,
+            "runtime_gen":P1,"controller_session":C1,"attachment_gen":C1,"client_kind":"native",
+            "permissions":["view","control","approve"],"authorization_ms_left":1,"server_time":1}),
+    );
+    assert!(!decodes(&m));
 }

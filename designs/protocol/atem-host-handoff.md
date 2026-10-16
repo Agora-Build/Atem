@@ -82,8 +82,8 @@ Attachments and identity:
   sessions disabled: <path> is damaged; move it aside to reset the runtime
   epoch".
 - Only the paired Astation the link authenticated with, verified in this
-  profile's `cred_state.json`, gets an attachment (`view`, `control`,
-  `approve`; `client_kind: native`). Any other link (unpaired, unverified,
+  profile's `cred_state.json`, gets an attachment (`view`, `control`;
+  `client_kind: native`). Any other link (unpaired, unverified,
   another Astation) gets none: its session-family messages are answered
   `error{code:"unauthorized"}`.
 - Every connect and every re-authentication (`auth_required` over an open

@@ -141,8 +141,8 @@ pub enum ClientKind {
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
     View,
+    /// Leases and every lease-scoped mutation, including approval answers.
     Control,
-    Approve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

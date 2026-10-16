@@ -133,7 +133,7 @@ Every request that targets a session carries one **binding** object:
 | `hello` | C→H | `resume?: {controller_session}` |
 | `challenge` | H→C | `nonce` (32 bytes, base64url) — only when resuming |
 | `resume_proof` | C→H | `proof` (§9: signature by the client's authenticated key over the transcript) |
-| `welcome` | H→C | `account_id`, `atem_device_id`, `host_trust_gen`, `runtime_gen`, `controller_session`, `attachment_gen`, `client_kind` (`native`/`browser`, as authenticated), `permissions` (`view`, `control`, `approve`), `authorization_ms_left`, `server_time` |
+| `welcome` | H→C | `account_id`, `atem_device_id`, `host_trust_gen`, `runtime_gen`, `controller_session`, `attachment_gen`, `client_kind` (`native`/`browser`, as authenticated), `permissions` (`view`, `control`; `control` also answers approvals, §6a), `authorization_ms_left`, `server_time` |
 
 - The client's device and kind come from the authenticated channel, never from
   `hello` fields or relay labels. A `controller_session` UUID is not a credential.
@@ -441,13 +441,27 @@ missing remote holder means "no decision" — the agent's own prompt asks.
 
 - **Closing without the remote answer** (`approval_closed`, the card goes
   away): `answered_terminal` (answered in the agent's own prompt first),
-  `interrupted` (Esc), `timed_out` (the hook's limit), `lease_lost` (the
-  lease ended for any reason — expiry, release, takeover, local input,
-  revocation, trust change — so a pending approval is never answered by a
-  controller that didn't see it come; the agent gets "no decision"),
+  `interrupted` (Esc), `timed_out` (the hook's limit), `lease_lost` (no
+  remote controller is left: the lease expired, was released, was revoked by
+  local input or by a trust change; the agent gets "no decision"),
   `process_ended` (the process exited, was replaced, or the session closed or
-  was removed). After a hand-off, a lost lease doesn't cancel the answer
-  (§6: lease expiry doesn't cancel accepted work).
+  was removed). `answered_remote` and `lease_lost` are the host's own
+  reasons; the runtime reports only the others. After a hand-off, a lost
+  lease doesn't cancel the answer (§6: lease expiry doesn't cancel accepted
+  work).
+- **Takeover keeps the approval.** A remote takeover moves the lease but the
+  approval stays pending: the new holder saw it (it follows every snapshot)
+  and answers under its own lease epoch; the previous holder's epoch is
+  `stale_lease`.
+- **Hand-off deadline.** A handed-off answer the agent hasn't confirmed
+  within 630 s (above Claude Code's 600 s hook timeout) becomes
+  `outcome_unknown` ("the agent did not confirm the decision"), which frees
+  its in-flight slot. A decision that could not be handed over (`rejected`)
+  also releases the waiting prompt ("no decision").
+- **Broker restart.** Approvals live in the broker's memory only. After a
+  restart the worker answers "no decision" to any waiting hook whose
+  approval the new broker doesn't know, and an `accepted` answer is
+  `rejected` (the approval closed before the hand-off).
 - A later answer to a closed approval is `stale_target` and is never applied;
   a duplicate of the answer that was handed over returns its receipt.
 - Local input: Codex hides its prompt while the hook waits, so local input
@@ -481,7 +495,7 @@ Errors are answered in the family of the request (ruling i):
 | `unsupported_version` | unknown `v`, out-of-range representation, or a removed op (§0) |
 | `unauthorized` | not authenticated, attachment fenced, or authorization expired |
 | `forbidden` | missing permission |
-| `stale_target` | trust generation, session or process generation mismatch |
+| `stale_target` | trust generation, session or process generation mismatch; approval not pending (closed, answered or unknown) or `rule_id` not offered (§6a) |
 | `unknown_session` | unknown or not visible to this attachment |
 | `lease_held` | another controller holds the lease (no takeover) |
 | `stale_lease` | wrong, expired or other-attachment lease epoch |

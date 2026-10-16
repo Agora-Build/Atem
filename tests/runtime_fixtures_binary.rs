@@ -1340,6 +1340,7 @@ const NOT_RUN: &[&str] = &[
     "approval-duplicate-submit-returns-the-receipt",
     "approval-needs-control-and-the-lease",
     "approval-pending-is-sent-again-after-list",
+    "approval-survives-takeover",
     "closed-session-refuses-work-before-the-lease-check",
     "receipt-query-is-scoped-to-the-exact-target",
     "removed-ops-have-no-effect",

@@ -1079,6 +1079,7 @@ mod tests {
                 "reason",
                 json!("answered_remote"),
             ),
+            ("approval-survives-takeover", "code", json!("forbidden")),
         ];
         for (name, key, to) in mutations {
             let mut f = fixture(name);

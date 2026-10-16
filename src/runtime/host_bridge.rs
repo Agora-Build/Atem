@@ -7,7 +7,7 @@
 //! authenticated (`App::astation_link_gen` counts those) and fenced when it
 //! drops or Astation re-authenticates it. Only the Astation this profile is
 //! paired with (the pairing binding the link captured) and verified with
-//! (`cred_state.json`) gets one, with `view`, `control` and `approve`; any
+//! (`cred_state.json`) gets one, with `view` and `control`; any
 //! other link — unpaired, unverified, or another Astation — gets no
 //! attachment at all, so its session-family messages are answered
 //! `unauthorized`. `welcome` names the verified account (`data_account`), this
@@ -585,7 +585,7 @@ impl HostBridge {
                 .unwrap_or_default()
                 .to_string(),
             attachment_gen: attachment.clone(),
-            permissions: vec![Permission::View, Permission::Control, Permission::Approve],
+            permissions: vec![Permission::View, Permission::Control],
             client_kind: ClientKind::Native,
             authorization_ms: LINK_AUTHORIZATION_MS,
         };

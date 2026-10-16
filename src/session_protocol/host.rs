@@ -62,6 +62,9 @@ pub const LEASE_EPOCH_BLOCK: u64 = 64;
 pub const DEFAULT_MAX_RECEIPTS: usize = 4096;
 /// Pending approvals per session; `open_approval` refuses beyond it.
 pub const MAX_PENDING_APPROVALS: usize = 16;
+/// A handed-off answer the agent hasn't confirmed by then (above Claude
+/// Code's 600 s hook timeout) is `outcome_unknown`.
+pub const APPROVAL_HANDOFF_MS: u64 = 630_000;
 
 pub const DETAIL_APPROVAL_CLOSED: &str = "the approval closed before the answer was handed over";
 pub const DETAIL_APPROVAL_CROSSED: &str = "the terminal answered too; which answer won is unknown";
@@ -273,9 +276,11 @@ pub enum DispatchReport {
     Unknown,
 }
 
-/// What the runtime knows of an agent permission prompt (r7). `tool` and
-/// `summary` are already redacted (never full inputs); `always_rules` are
-/// the agent's own suggestions, offered as they are.
+/// What the runtime knows of an agent permission prompt (r7). The runtime
+/// redacts before opening: `summary` is the command's first line or the
+/// file path (never full inputs such as file contents) and rule labels are
+/// stripped of secrets the same way; the host only checks the bounds.
+/// `always_rules` are the agent's own suggestions, offered as they are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalInfo {
     pub tool: String,
@@ -292,6 +297,8 @@ struct Approval {
     order: u64,
     /// The remote answer handed to the agent, awaiting its report.
     handed_off: Option<String>,
+    /// Monotonic time by which the agent must confirm a handed-off answer.
+    handoff_deadline: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -619,6 +626,20 @@ impl<J: Journal> SessionHost<J> {
             .filter(|e| e.observe_deadline.is_some_and(|d| now >= d))
             .map(|e| (e.stored.request_id.clone(), e.stored.kind))
             .collect();
+        let unconfirmed: Vec<(String, String)> = self
+            .approvals
+            .iter()
+            .filter(|(_, a)| a.handoff_deadline.is_some_and(|d| now >= d))
+            .filter_map(|(id, a)| Some((id.clone(), a.handed_off.clone()?)))
+            .collect();
+        for (approval_id, rid) in unconfirmed {
+            self.approvals.remove(&approval_id);
+            self.finish(
+                &rid,
+                ReceiptState::OutcomeUnknown,
+                Some(DETAIL_APPROVAL_UNCONFIRMED),
+            );
+        }
         for (rid, kind) in unobserved {
             let detail = match kind {
                 ReceiptKind::Stop => DETAIL_STILL_RUNNING,
@@ -758,10 +779,25 @@ impl<J: Journal> SessionHost<J> {
                 Some(DETAIL_UNRECONCILED.to_string()),
             ),
         };
+        let no_effect = state == ReceiptState::Rejected;
         self.finish(request_id, state, detail.as_deref());
         if kind == ReceiptKind::Approval {
-            self.approvals
-                .retain(|_, a| a.handed_off.as_deref() != Some(request_id));
+            let ids: Vec<String> = self
+                .approvals
+                .iter()
+                .filter(|(_, a)| a.handed_off.as_deref() == Some(request_id))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for approval_id in ids {
+                let a = self.approvals.remove(&approval_id).unwrap();
+                if no_effect {
+                    // The decision never reached the prompt: stop its wait.
+                    self.out.push(Effect::ApprovalReleased {
+                        session_id: a.request.session_id,
+                        approval_id,
+                    });
+                }
+            }
         }
         self.take()
     }
@@ -1613,10 +1649,8 @@ impl<J: Journal> SessionHost<J> {
         };
         self.lease_changed(&sid, reason, Some(att));
         self.registry_changed(&sid);
-        if previous.is_some() {
-            // Asked of the previous holder: the new one didn't see it come.
-            self.close_pending(&sid, ApprovalCloseReason::LeaseLost);
-        }
+        // A takeover keeps pending approvals: the new holder saw them (they
+        // follow every snapshot) and answers under its own epoch.
         Ok(())
     }
 
@@ -1945,6 +1979,7 @@ impl<J: Journal> SessionHost<J> {
                 request: request.clone(),
                 order: self.approvals_opened,
                 handed_off: None,
+                handoff_deadline: None,
             },
         );
         for att in self.subscribers() {
@@ -1964,7 +1999,11 @@ impl<J: Journal> SessionHost<J> {
         approval_id: &str,
         reason: ApprovalCloseReason,
     ) -> Vec<Effect> {
-        if reason == ApprovalCloseReason::AnsweredRemote {
+        // The host owns these: the remote hand-off and lease-driven closes.
+        if matches!(
+            reason,
+            ApprovalCloseReason::AnsweredRemote | ApprovalCloseReason::LeaseLost
+        ) {
             return Vec::new();
         }
         let Some(a) = self.approvals.remove(approval_id) else {
@@ -2040,8 +2079,10 @@ impl<J: Journal> SessionHost<J> {
     /// `executing` is durable: the approval closes for viewers
     /// (`answered_remote`) and the decision goes to the agent.
     fn hand_off(&mut self, rid: &str, target: &Target, a: ApprovalAnswer) {
+        let deadline = self.now.saturating_add(APPROVAL_HANDOFF_MS);
         if let Some(entry) = self.approvals.get_mut(&a.approval_id) {
             entry.handed_off = Some(rid.to_string());
+            entry.handoff_deadline = Some(deadline);
         }
         self.approval_closed(&a.approval_id, ApprovalCloseReason::AnsweredRemote);
         self.out.push(Effect::Approval {
