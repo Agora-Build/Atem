@@ -46,6 +46,8 @@ pub struct Pty {
     pub approval_decisions: Vec<Value>,
     /// Approvals the host released ("no decision").
     pub approvals_released: u64,
+    /// Push requests to the relay, in order: `{op, approval_id, reason?}`.
+    pub pushes: Vec<Value>,
 }
 
 impl Default for Pty {
@@ -63,6 +65,7 @@ impl Default for Pty {
             stops: 0,
             approval_decisions: Vec::new(),
             approvals_released: 0,
+            pushes: Vec::new(),
         }
     }
 }
@@ -464,6 +467,18 @@ impl<J: Journal> FakeRuntime<J> {
                     self.pty.approval_decisions.push(d);
                 }
                 Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
+                Effect::PushApproval { request } => self
+                    .pty
+                    .pushes
+                    .push(json!({"op": "push_approval", "approval_id": request.approval_id})),
+                Effect::PushResolved {
+                    approval_id,
+                    reason,
+                } => self.pty.pushes.push(json!({
+                    "op": "push_resolved",
+                    "approval_id": approval_id,
+                    "reason": reason,
+                })),
                 Effect::Reconcile { request_id, .. } => {
                     let answer = self.reconcile_answer.clone();
                     work.extend(self.host.dispatch_report(&request_id, answer));
@@ -708,6 +723,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             "lease_holder" => self.lease_holder()?,
             "approval_decisions" => Value::from(p.approval_decisions.clone()),
             "approvals_released" => p.approvals_released.into(),
+            "pushes" => Value::from(p.pushes.clone()),
             "approvals_pending" => self
                 .host
                 .pending_approvals(&self.only_session()?)

@@ -7,7 +7,7 @@
 //! (the log is in hand first). A hook `TurnEnded` that arrives alone is still
 //! authoritative: it emits `Complete { Done }` and marks the turn completed; a later
 //! log `TurnEnded` for that turn is ignored, so a turn never completes twice.
-use crate::chat::adapter::{AgentEvent, LogItem, Outcome, Part};
+use crate::chat::adapter::{AgentEvent, ApprovalCard, LogItem, Outcome, Part};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -74,6 +74,7 @@ fn part_bytes(part: &Part) -> usize {
     match part {
         Part::Text { markdown, .. } => markdown.len(),
         Part::Tool { name, summary, .. } => name.len() + summary.len(),
+        Part::Approval(card) => card.tool.len() + card.summary.len(),
     }
 }
 
@@ -206,6 +207,8 @@ fn redact_part(part: Part) -> Part {
             name: redact(&name),
             summary: redact(&summary),
         },
+        // Redacted by the runtime before the approval opened.
+        Part::Approval(card) => Part::Approval(card),
     }
 }
 
@@ -582,7 +585,7 @@ impl ChatSession {
                     let cut = truncate_at(markdown, room).len();
                     markdown.truncate(cut);
                 }
-                Part::Tool { .. } => {}
+                Part::Tool { .. } | Part::Approval(_) => {}
             }
         }
         let mut new_parts = Vec::new();
@@ -623,6 +626,36 @@ impl ChatSession {
                 out.push(Out::Message(message));
             }
         }
+    }
+
+    /// An approval card (r7 §6a) for this conversation: a new assistant
+    /// message `approval-<approval_id>`, or the same message again with the
+    /// card's new state (clients replace a message they have by its id).
+    pub fn approval_card(&mut self, card: ApprovalCard, created_at_ms: i64) -> Out {
+        let message_id = format!("approval-{}", card.approval_id);
+        if let Some(m) = self.history.iter_mut().find(|m| m.message_id == message_id) {
+            let old = m.bytes();
+            m.parts = vec![Part::Approval(card)];
+            let new = m.bytes();
+            let message = m.clone();
+            self.history_bytes = self.history_bytes - old + new;
+            return Out::Message(message);
+        }
+        let turn_id = self
+            .current_turn
+            .as_ref()
+            .map_or_else(|| "approval".to_string(), |(t, _)| t.clone());
+        let message = ChatMessage {
+            message_id,
+            role: Role::Assistant,
+            origin: None,
+            turn_id,
+            request_id: None,
+            created_at_ms,
+            parts: vec![Part::Approval(card)],
+        };
+        self.push_message(message.clone());
+        Out::Message(message)
     }
 
     /// Terminal input (`input_count`) arrived since the last prompt was
@@ -933,6 +966,40 @@ mod tests {
             Out::Error { text, .. } => text,
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn an_approval_card_is_one_message_replaced_as_its_state_changes() {
+        use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
+        let mut s = ready();
+        let card = |state| ApprovalCard {
+            id: "approval".into(),
+            approval_id: "a1".into(),
+            tool: "Bash".into(),
+            summary: "npm test".into(),
+            always_rules: vec![],
+            state,
+        };
+        let Out::Message(first) = s.approval_card(card(ApprovalCardState::Pending), 5) else {
+            panic!()
+        };
+        assert_eq!(first.message_id, "approval-a1");
+        assert_eq!(first.role, Role::Assistant);
+        let Out::Message(again) = s.approval_card(card(ApprovalCardState::Denied), 9) else {
+            panic!()
+        };
+        assert_eq!(again.message_id, first.message_id);
+        assert_eq!(again.created_at_ms, 5, "the same message");
+        let history = s.history(None, 50, 1 << 20);
+        let cards: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|m| m.message_id == "approval-a1")
+            .collect();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0].parts,
+            vec![Part::Approval(card(ApprovalCardState::Denied))]
+        );
     }
 
     #[test]

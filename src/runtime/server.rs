@@ -1273,6 +1273,10 @@ impl Server {
             Some(bridge) => bridge.tick(&mut self.app, &mut self.sessions, self.adopting),
             None => {
                 super::host_bridge::refuse_all(&mut self.app);
+                // No session host: the agents ask in their own prompts.
+                for session in self.sessions.values_mut() {
+                    session.release_untaken();
+                }
                 if let Some(hosted) = self.app.hosted.as_mut() {
                     hosted.sessions = self
                         .sessions

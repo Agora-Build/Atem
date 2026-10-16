@@ -13,13 +13,41 @@ pub enum Part {
         name: String,
         summary: String,
     },
+    /// An approval card (r7 §6a): the agent's permission prompt and where it
+    /// stands. Made by the broker, never by an adapter.
+    Approval(ApprovalCard),
 }
 impl Part {
     pub fn id(&self) -> &str {
         match self {
             Part::Text { id, .. } | Part::Tool { id, .. } => id,
+            Part::Approval(card) => &card.id,
         }
     }
+}
+
+/// What a chat-v1 approval card shows: the tool, the redacted summary, the
+/// agent's own "always allow" rules and the card's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalCard {
+    pub id: String,
+    pub approval_id: String,
+    pub tool: String,
+    pub summary: String,
+    pub always_rules: Vec<crate::session_protocol::wire::AlwaysRule>,
+    pub state: ApprovalCardState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalCardState {
+    Pending,
+    Allowed,
+    AlwaysAllowed,
+    Denied,
+    AnsweredTerminal,
+    Expired,
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -33,13 +33,16 @@
 //!
 //! "No decision" (an empty decision: the agent asks as usual) goes to every
 //! waiting hook when the broker releases it, says which approvals it knows
-//! (adoption), asks for `release_approvals` (local input), or goes away; a
-//! request arriving with no broker connected is released at once, as is one
-//! that isn't this session's: for Codex (whose hook command is the same for
-//! every session) the hook's parent must be the session's agent — directly
-//! or through one shell — and its Codex session the first one seen, so a
-//! `codex` started inside the session never answers through it. Never an
-//! allow without the broker's decision.
+//! (adoption), asks for `release_approvals` (any input to Codex), or goes
+//! away; a reported one then closes `released`. A request arriving with no
+//! broker connected is released at once, as is one that isn't this
+//! session's: for Codex (whose hook command is the same for every session)
+//! the hook's parent must be the session's agent — directly or through one
+//! shell, when its Codex session becomes the pinned one (so `/new` inside
+//! Codex keeps working) — or a non-shell child of the agent (a wrapper),
+//! when it must be the pinned session; a `codex` started inside the session
+//! through a shell never answers through it. Never an allow without the
+//! broker's decision.
 
 use crate::chat::adapter::ToolResultKind;
 use crate::chat::approvals::{self, Agent, Request};
@@ -195,28 +198,38 @@ fn is_shell(name: &str) -> bool {
     SHELLS.contains(&name)
 }
 
-/// The hook was started by `agent`: its parent is the agent, or a shell
-/// (that didn't exec) whose parent is; or a non-shell child of the agent
-/// (a wrapper such as npm's `codex`, which runs the real binary as its
-/// child). A `codex` started inside the session is deeper: refused.
-fn started_by(parent: u32, agent: u32) -> bool {
+/// How a hook relates to the session's agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ancestry {
+    /// Its parent is the agent, or a shell (that didn't exec) whose parent is.
+    Direct,
+    /// Through a non-shell child of the agent: a wrapper such as npm's
+    /// `codex`, which runs the real binary as its child — or a `codex` the
+    /// agent itself started without a shell. Ambiguous.
+    Wrapped,
+    /// Not started by the agent (e.g. a `codex` started inside the session
+    /// through a shell is deeper).
+    Foreign,
+}
+
+fn started_by(parent: u32, agent: u32) -> Ancestry {
     use super::adopt::process_parent_and_name;
     let mut q = parent;
     if q == agent {
-        return true;
+        return Ancestry::Direct;
     }
     let Some((up, name)) = process_parent_and_name(q) else {
-        return false;
+        return Ancestry::Foreign;
     };
     if is_shell(&name) {
         q = up;
         if q == agent {
-            return true;
+            return Ancestry::Direct;
         }
     }
     match process_parent_and_name(q) {
-        Some((up, name)) => !is_shell(&name) && up == agent,
-        None => false,
+        Some((up, name)) if !is_shell(&name) && up == agent => Ancestry::Wrapped,
+        _ => Ancestry::Foreign,
     }
 }
 
@@ -288,15 +301,24 @@ impl Approvals {
     }
 
     /// "No decision" for `id`; a decision not taken yet is withdrawn first
-    /// (`not_delivered`), a taken one is judged as it is.
+    /// (`not_delivered`), a taken one is judged as it is. A reported open
+    /// one closes `released`, so the broker drops its card even when the
+    /// request crossed the release on the way.
     fn release_one(&mut self, id: &str) {
         let Some(w) = self.waiting.get(id) else {
             return;
         };
+        let reported = w.reported;
         match w.state.clone() {
             State::Open => {
                 self.write_decision(id, "");
                 self.set(id, State::Released);
+                if reported {
+                    self.queued.push(Event::Closed {
+                        request_id: id.into(),
+                        reason: ApprovalCloseReason::Released,
+                    });
+                }
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
@@ -570,26 +592,34 @@ impl Approvals {
     }
 
     /// A Codex request is this session's: its hook was started by the
-    /// session's agent and it is the first Codex session seen (pinned).
+    /// session's agent. Started directly, its Codex session becomes the
+    /// pinned one (so `/new` inside Codex keeps working); through a
+    /// non-shell child (ambiguous: a wrapper, or a nested `codex`) it must be
+    /// the pinned session, or the first one seen.
     fn codex_owns(&mut self, parent: Option<u32>, request: Option<&Value>) -> bool {
         let (Some(agent), Some(parent)) = (self.agent_pid, parent) else {
             return false;
         };
-        if !started_by(parent, agent) {
+        let ancestry = started_by(parent, agent);
+        if ancestry == Ancestry::Foreign {
             return false;
         }
-        match request
+        let session = request
             .and_then(|v| v.get("session_id"))
-            .and_then(Value::as_str)
-        {
-            Some(session) => match &self.codex_session {
+            .and_then(Value::as_str);
+        match (session, ancestry) {
+            (None, _) => true,
+            (Some(session), Ancestry::Direct) => {
+                self.codex_session = Some(session.to_string());
+                true
+            }
+            (Some(session), _) => match &self.codex_session {
                 Some(pinned) => pinned == session,
                 None => {
                     self.codex_session = Some(session.to_string());
                     true
                 }
             },
-            None => true,
         }
     }
 

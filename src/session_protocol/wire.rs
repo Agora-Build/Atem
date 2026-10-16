@@ -204,7 +204,10 @@ pub enum ApprovalCloseReason {
     AnsweredTerminal,
     Interrupted,
     TimedOut,
-    LeaseLost,
+    /// Atem gave the prompt back to the agent's own terminal prompt ("no
+    /// decision"): local input to a Codex session (which hides its prompt
+    /// while the hook waits), or a runtime restart.
+    Released,
     ProcessEnded,
 }
 
@@ -312,7 +315,9 @@ pub struct ApprovalRequest {
 }
 
 /// The payload of a `kind:"approval"` submission. Exactly these fields:
-/// `rule_id` iff `allow_always`, `message` only with `deny`.
+/// `rule_id` iff `allow_always`, `message` only with `deny`; `acquire:
+/// true` takes the session's lease for the answering attachment together
+/// with the answer (its binding then carries no `lease_epoch`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalAnswer {
@@ -330,9 +335,20 @@ pub struct ApprovalAnswer {
         skip_serializing_if = "Option::is_none"
     )]
     pub message: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub acquire: Option<bool>,
 }
 
 impl ApprovalAnswer {
+    /// The answer takes the lease with it.
+    pub fn acquires(&self) -> bool {
+        self.acquire == Some(true)
+    }
+
     /// The validated answer in an approval payload.
     pub fn parse(payload: &Value) -> Result<Self, String> {
         let a: Self =
@@ -705,6 +721,17 @@ impl Receipt {
     }
 }
 
+/// A submission's binding is a mutation's (`lease_epoch` required), except
+/// an approval answer with `acquire: true`, which takes the lease with it.
+pub fn submit_binding_use(kind: ReceiptKind, payload: &Value) -> BindingUse {
+    let acquire = payload.get("acquire") == Some(&Value::Bool(true));
+    if kind == ReceiptKind::Approval && acquire {
+        BindingUse::Read
+    } else {
+        BindingUse::Mutation
+    }
+}
+
 /// v1 payload shapes (§6): `prompt` is exactly `{"text": string}` (≤ 32 768
 /// bytes), `interrupt`/`stop` exactly `{}`, `approval` an `ApprovalAnswer`
 /// (r7). The canonical form is ≤ 64 KiB.
@@ -806,7 +833,7 @@ impl Op {
                 kind,
                 payload,
             } => {
-                binding.validate(Mutation)?;
+                binding.validate(submit_binding_use(*kind, payload))?;
                 uuid(request_id, "request_id")?;
                 validate_payload(*kind, payload)
             }
@@ -1015,7 +1042,11 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
         .map_err(|e| fail(None, format!("agentChat: {e}")))?;
     let use_ = match op {
         "open" | "close" => BindingUse::Read,
-        "submit" => BindingUse::Mutation,
+        // An approval answer (r7) may take the lease with it.
+        "submit" => match m.get("approval") {
+            Some(answer) => submit_binding_use(ReceiptKind::Approval, answer),
+            None => BindingUse::Mutation,
+        },
         _ if binding.is_some() => {
             return Err(fail(None, format!("agentChat {op} cannot carry a binding")));
         }
@@ -1034,6 +1065,9 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
         };
         uuid(field("requestId"), "requestId").map_err(bad)?;
         uuid(field("generation"), "generation").map_err(bad)?;
+        if let Some(answer) = env.body.get("approval") {
+            ApprovalAnswer::parse(answer).map_err(bad)?;
+        }
     }
     Ok(())
 }

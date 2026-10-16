@@ -86,6 +86,19 @@ impl Session {
         sleeper
     }
 
+    /// As `fake_request`, with the `sleep` itself as the hook's parent: a
+    /// non-shell child of this process (the agent).
+    fn fake_request_through_child(&self, id: &str, stdin: &str) -> Child {
+        let sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(
+            self.approvals().join(format!("pid-{id}")),
+            format!("{} {}\n", sleeper.id(), sleeper.id()),
+        )
+        .unwrap();
+        std::fs::write(self.approvals().join(format!("req-{id}.json")), stdin).unwrap();
+        sleeper
+    }
+
     fn files(&self) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(self.approvals())
             .unwrap()
@@ -380,24 +393,32 @@ fn adoption_releases_what_the_new_broker_does_not_know() {
     let s = Session::new();
     let mut a = watcher(&s, Agent::Codex);
     let first = s.hook("codex", 30, SECRET_BASH);
-    events(&mut a, true);
+    let one = request_id(&events(&mut a, true)[0]);
     let second = s.hook("codex", 30, SECRET_BASH);
     let two = request_id(&events(&mut a, true)[0]);
     a.keep_only(std::slice::from_ref(&two));
     assert_eq!(printed(first), "");
     a.decide(&two, ApprovalDecision::AllowOnce, None, None);
     assert!(printed(second).contains(r#""behavior":"allow""#));
-    assert_eq!(drained(&mut a), vec![applied(&two, ApplyOutcome::Ok)]);
+    // The released one closes `released`, so the broker drops its card.
+    assert_eq!(
+        drained(&mut a),
+        vec![
+            closed(&one, ApprovalCloseReason::Released),
+            applied(&two, ApplyOutcome::Ok)
+        ]
+    );
 }
 
 #[test]
 fn release_approvals_answers_every_waiting_hook_with_no_decision() {
     let s = Session::new();
     let mut a = watcher(&s, Agent::Codex);
+    let mut ids = Vec::new();
     let hooks: Vec<Child> = (0..2)
         .map(|_| {
             let h = s.hook("codex", 30, SECRET_BASH);
-            events(&mut a, true);
+            ids.push(request_id(&events(&mut a, true)[0]));
             h
         })
         .collect();
@@ -405,7 +426,12 @@ fn release_approvals_answers_every_waiting_hook_with_no_decision() {
     for h in hooks {
         assert_eq!(printed(h), "");
     }
-    assert!(drained(&mut a).is_empty());
+    ids.sort();
+    let closes: Vec<Event> = ids
+        .iter()
+        .map(|id| closed(id, ApprovalCloseReason::Released))
+        .collect();
+    assert_eq!(drained(&mut a), closes);
     assert!(s.files().is_empty());
 }
 
@@ -543,18 +569,34 @@ fn a_nested_codex_is_released_without_a_report() {
 }
 
 #[test]
-fn the_first_codex_session_is_pinned() {
+fn a_direct_codex_hook_follows_new_sessions_and_a_wrapped_one_must_match() {
     let s = Session::new();
     let mut a = watcher(&s, Agent::Codex);
+    // Started directly by the agent: reported, and its session pinned.
     let first = s.hook("codex", 30, SECRET_BASH);
     let id = request_id(&events(&mut a, true)[0]);
-    let other = SECRET_BASH.replace(r#""session_id":"s1""#, r#""session_id":"s2""#);
-    let second = s.hook("codex", 30, &other);
-    known(&mut a, 2, true);
-    assert_eq!(printed(second), "", "another Codex session's prompt");
     a.release(&id);
     assert_eq!(printed(first), "");
-    assert!(drained(&mut a).is_empty());
+    drained(&mut a);
+    // `/new` inside Codex: another session, still started directly: reported
+    // (R4), and now the pinned one.
+    let other = SECRET_BASH.replace(r#""session_id":"s1""#, r#""session_id":"s2""#);
+    let second = s.hook("codex", 30, &other);
+    let id = request_id(&events(&mut a, true)[0]);
+    a.release(&id);
+    assert_eq!(printed(second), "");
+    drained(&mut a);
+    // Through a non-shell child of the agent (a wrapper, or a nested codex
+    // started without a shell): only the pinned session is this one's.
+    let mut stale = s.fake_request_through_child("wrapped1", SECRET_BASH);
+    known(&mut a, 1, true);
+    let mut pinned = s.fake_request_through_child("wrapped2", &other);
+    let got = events(&mut a, true);
+    assert_eq!(request_id(&got[0]), "wrapped2");
+    for child in [&mut stale, &mut pinned] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 #[test]

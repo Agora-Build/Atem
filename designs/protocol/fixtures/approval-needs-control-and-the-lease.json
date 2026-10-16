@@ -117,29 +117,6 @@
    }
   },
   {
-   "expect": "v",
-   "match": {
-    "op": "approval_request",
-    "session_id": "ses-aaaaaaaaaaaa",
-    "process_gen": "22222222-2222-4222-8222-222222222222",
-    "tool": "Bash",
-    "summary": "npm test",
-    "always_rules": [
-     {
-      "rule_id": "r-npm-test",
-      "label": "Bash(npm test:*)",
-      "scope": "this project"
-     },
-     {
-      "rule_id": "r-npm",
-      "label": "Bash(npm:*)",
-      "scope": "this project"
-     }
-    ],
-    "approval_id": "${aid}"
-   }
-  },
-  {
    "send": "v",
    "json": {
     "type": "session",
@@ -187,5 +164,5 @@
    }
   }
  ],
- "note": "Every subscribed viewer sees the approval, but answering needs control and the current lease: a view-only attachment is forbidden and nothing changes."
+ "note": "Approvals go only to attachments with control: a view-only attachment that listed gets no approval_request, and answering needs control (forbidden) — nothing changes."
 }

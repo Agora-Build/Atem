@@ -1060,9 +1060,24 @@ mod tests {
                 json!("forbidden"),
             ),
             (
-                "approval-closes-when-the-lease-is-lost",
+                "approval-stays-pending-when-the-lease-ends",
                 "reason",
                 json!("timed_out"),
+            ),
+            (
+                "approval-opens-without-a-lease-holder",
+                "reason",
+                json!("takeover"),
+            ),
+            (
+                "approval-answer-with-acquire-takes-control-from-the-holder",
+                "code",
+                json!("forbidden"),
+            ),
+            (
+                "approval-late-answer-after-push-resolved-is-stale-target",
+                "code",
+                json!("stale_lease"),
             ),
             (
                 "approval-needs-control-and-the-lease",
@@ -1115,6 +1130,16 @@ mod tests {
             .find(|s| s["assert"].get("approval_decisions").is_some())
             .unwrap();
         step["assert"]["approval_decisions"][0]["message"] = json!("something else");
+        assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
+        // And on a changed push request.
+        let mut f = fixture("approval-late-answer-after-push-resolved-is-stale-target");
+        let step = f["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["assert"].get("pushes").is_some())
+            .unwrap();
+        step["assert"]["pushes"][1]["reason"] = json!("answered_remote");
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
     }
 

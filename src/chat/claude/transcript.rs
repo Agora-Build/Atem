@@ -688,7 +688,7 @@ mod tests {
             .filter(|i| matches!(i, LogItem::ToolResult { .. }))
             .collect();
         let input = r#"{"command":"rm -rf build","description":"Remove the build directory"}"#;
-        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results.len(), 3, "{results:?}");
         match &results[0] {
             LogItem::ToolResult {
                 tool_name,
@@ -716,7 +716,16 @@ mod tests {
             } => {
                 assert_eq!(i, input, "the same input in another key order");
                 assert_eq!(*kind, ToolResultKind::Failed);
-                assert!(text.contains("Denied from Astation"));
+                assert_eq!(text, "Denied from Astation", "the hook's message as it is");
+            }
+            other => panic!("{other:?}"),
+        }
+        // "No" with a typed instruction (text checked against a live Claude
+        // Code 2.1.301): still a refusal at the dialog.
+        match &results[2] {
+            LogItem::ToolResult { kind, text, .. } => {
+                assert_eq!(*kind, ToolResultKind::Rejected);
+                assert!(text.ends_with("the user said:\nuse echo instead"), "{text}");
             }
             other => panic!("{other:?}"),
         }

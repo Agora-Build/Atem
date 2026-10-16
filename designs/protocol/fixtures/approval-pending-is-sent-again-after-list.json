@@ -163,13 +163,39 @@
    }
   },
   {
+   "assert": {
+    "approvals_pending": 1,
+    "approvals_released": 0
+   }
+  },
+  {
+   "close_approval": "${aid}",
+   "reason": "answered_terminal"
+  },
+  {
    "expect": "c1",
    "match": {
     "op": "approval_closed",
     "approval_id": "${aid}",
-    "reason": "lease_lost"
+    "reason": "answered_terminal"
+   }
+  },
+  {
+   "assert": {
+    "approvals_pending": 0,
+    "pushes": [
+     {
+      "op": "push_approval",
+      "approval_id": "${aid}"
+     },
+     {
+      "op": "push_resolved",
+      "approval_id": "${aid}",
+      "reason": "answered_terminal"
+     }
+    ]
    }
   }
  ],
- "note": "Pending approvals follow every sessions snapshot: a reconnected attachment (new attachment_gen, no lease) sees nothing until it lists, then gets the snapshot and the pending approval; it then hears the approval close when the old attachment's lease expires."
+ "note": "Pending approvals follow every sessions snapshot: a reconnected attachment (new attachment_gen, no lease) sees nothing until it lists, then gets the snapshot and the pending approval. The old attachment's lease expiring doesn't close it (delivery is independent of the lease); it closes when the terminal answers, and the push is resolved."
 }

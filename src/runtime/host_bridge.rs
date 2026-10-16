@@ -33,10 +33,24 @@
 //! ends (or at once when none runs). A stop stops the agent; its exit
 //! completes it. Duplicate session messages (same `id`) within 60 s are
 //! handled once, whatever link they came on.
+//!
+//! Approvals (§6a): a worker's `approval_request` opens an approval in the
+//! host (whoever holds the lease); the host's effects become `approval_request`
+//! for attachments with `control`, a chat-v1 card in the session's
+//! conversations, and push requests for the relay (`push_approval`, then
+//! `push_resolved` when it stops being pending), sent over the verified link
+//! and kept (latest state per approval, bounded) while it is down. The
+//! host's hand-off goes to the worker as `approval_decision`, a release as
+//! `release_approval`; the worker's `approval_closed`/`approval_applied`
+//! finish them (`not_delivered` → the hand-off failed with no effect). An
+//! adopted worker is told the approvals this broker knows (none), so it
+//! releases what it held for the previous broker.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
-use super::worker_protocol::Activity as WorkerActivity;
+use super::worker_approvals::Event as ApprovalEvent;
+use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome};
 use crate::app::App;
 use crate::app::hosted::{HostedSession, refusal};
+use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
 use crate::chat::session::{Out, State as ChatState};
 use crate::chat::wire::{self as chat_wire, ChatEnvelope, Inbound};
 use crate::session::{Provider, SessionId};
@@ -46,7 +60,8 @@ use crate::session_protocol::host::{
     SessionHost, SessionSpec, random_ids,
 };
 use crate::session_protocol::wire::{
-    self, Activity, ClientKind, Envelope, FamilyMessage, Permission, ReceiptKind, SessionState,
+    self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
+    FamilyMessage, Permission, ReceiptKind, SessionState,
 };
 use crate::terminal_share::{FrameStream, Message as TerminalMessage};
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -87,6 +102,8 @@ const CAPTURE_CHECK: Duration = Duration::from_secs(5);
 const MAX_SEEN: usize = 4096;
 /// Turn outcomes kept for duplicate submits (cleared beyond it).
 const MAX_OUTCOMES: usize = 4096;
+/// Push requests kept for the relay while the link is down (the oldest go).
+pub(super) const MAX_PUSHES: usize = 64;
 
 /// The broker's monotonic clock in milliseconds, and wall time (tests move
 /// either forward).
@@ -274,6 +291,30 @@ struct PerSession {
     remote: VecDeque<RemoteWrite>,
 }
 
+/// An approval the host opened, as the worker knows it.
+struct OpenApproval {
+    sid: String,
+    /// The worker's request id (its hook's files).
+    worker_id: String,
+    /// The receipt whose answer was handed to the worker.
+    receipt: Option<String>,
+    /// The chat-v1 card (sessions with chat).
+    card: Option<ApprovalCard>,
+}
+
+/// A push request for the relay (§6a), kept until it went out.
+struct PushEntry {
+    approval_id: String,
+    /// `push_approval`'s data.
+    request: Value,
+    /// Wall ms when the agent's hook gives up.
+    expires_at: u64,
+    /// `push_approval` went out.
+    sent: bool,
+    /// No longer pending: `push_resolved` is due (only once `sent`).
+    resolved: Option<ApprovalCloseReason>,
+}
+
 struct Conversation {
     attachment: String,
     /// Sequence of the next event.
@@ -328,6 +369,10 @@ pub struct HostBridge {
     terminal_out: VecDeque<Queued>,
     /// The outcome a prompt's turn ended with, until its receipt is reported.
     outcomes: HashMap<String, crate::chat::adapter::Outcome>,
+    /// approval_id → open approvals.
+    approvals: HashMap<String, OpenApproval>,
+    /// Push requests for the relay, in order.
+    pushes: VecDeque<PushEntry>,
 }
 
 /// Where effects go: the link's client and the broker's sessions.
@@ -374,6 +419,8 @@ impl HostBridge {
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
             outcomes: HashMap::new(),
+            approvals: HashMap::new(),
+            pushes: VecDeque::new(),
         })
     }
 
@@ -424,6 +471,9 @@ impl HostBridge {
             } else if floor > hello {
                 let _ = session.raise_input_epoch_to(floor);
             }
+            // Approvals live in a broker's memory: this one knows none of
+            // what the worker held for the previous one, so it releases them.
+            let _ = session.known_approvals(Vec::new());
         }
         self.restore.insert(sid);
     }
@@ -537,6 +587,7 @@ impl HostBridge {
         self.drain_remote(&mut cx);
         self.frames(&mut cx);
         self.heartbeats(&mut cx);
+        self.flush_pushes(&mut cx);
         if let Some(hosted) = app.hosted.as_mut() {
             hosted.sessions = cx
                 .sessions
@@ -884,16 +935,37 @@ impl HostBridge {
                         .dispatch_report(&request_id, DispatchReport::Unknown);
                     self.exec(effects, cx);
                 }
-                // The runtime opens no approvals yet (no permission hooks are
-                // wired), so neither effect can occur; were one to, the answer
-                // is refused before reaching any agent.
-                Effect::Approval { request_id, .. } => {
-                    let effects = self
-                        .host
-                        .dispatch_report(&request_id, DispatchReport::FailedNoEffect);
-                    self.exec(effects, cx);
+                Effect::Approval {
+                    request_id,
+                    session_id,
+                    approval_id,
+                    decision,
+                    rule_id,
+                    message,
+                } => self.hand_off(
+                    &request_id,
+                    &session_id,
+                    &approval_id,
+                    decision,
+                    rule_id,
+                    message,
+                    cx,
+                ),
+                Effect::ApprovalReleased {
+                    session_id,
+                    approval_id,
+                } => {
+                    if let Some(open) = self.approvals.remove(&approval_id)
+                        && let Some(session) = session_of(cx, &session_id)
+                    {
+                        let _ = session.release_approval(&open.worker_id);
+                    }
                 }
-                Effect::ApprovalReleased { .. } => {}
+                Effect::PushApproval { request } => self.approval_opened(request, cx),
+                Effect::PushResolved {
+                    approval_id,
+                    reason,
+                } => self.approval_resolved(&approval_id, reason, cx),
                 Effect::Chat {
                     attachment,
                     conversation_id,
@@ -991,6 +1063,7 @@ impl HostBridge {
             .cloned()
             .collect();
         for sid in gone {
+            self.approvals.retain(|_, a| a.sid != sid);
             let registered = self.per.remove(&sid).is_some_and(|p| p.registered);
             if registered {
                 let effects = self.host.remove_session(&sid);
@@ -1243,9 +1316,11 @@ impl HostBridge {
             let results = session.take_results();
             let outs = session.take_chat();
             let reset = session.take_chat_reset();
+            let approvals = session.take_approvals();
             for result in results {
                 self.write_result(&sid, result, cx);
             }
+            self.worker_approvals(&sid, approvals, cx);
             self.chat_outs(&sid, outs, cx);
             if let Some(reason) = reset {
                 self.end_conversations(&sid, reason, cx);
@@ -1303,6 +1378,308 @@ impl HostBridge {
                 }
             }
         }
+    }
+
+    // ── Approvals (§6a) ──
+
+    /// What a worker reported about its waiting hooks.
+    fn worker_approvals(&mut self, sid: &str, events: Vec<ApprovalEvent>, cx: &mut Cx) {
+        for event in events {
+            match event {
+                ApprovalEvent::Request { request_id, info } => {
+                    self.open_approval(sid, request_id, info, cx)
+                }
+                ApprovalEvent::Closed { request_id, reason } => {
+                    let Some(id) = self.approval_of(sid, &request_id) else {
+                        continue;
+                    };
+                    let handed_off = self.approvals.get(&id).is_some_and(|o| o.receipt.is_some());
+                    if handed_off {
+                        // The answers crossed, or the agent ended first.
+                        self.card_state(&id, ApprovalCardState::Closed, cx);
+                    }
+                    // A pending one's card follows the host's close.
+                    let effects = self.host.close_approval(&id, reason);
+                    self.exec(effects, cx);
+                    self.approvals.remove(&id);
+                }
+                ApprovalEvent::Applied {
+                    request_id,
+                    outcome,
+                } => {
+                    let Some(id) = self.approval_of(sid, &request_id) else {
+                        continue;
+                    };
+                    let effects = match outcome {
+                        ApplyOutcome::Ok => self.host.approval_applied(&id, true),
+                        ApplyOutcome::Unknown => {
+                            self.card_state(&id, ApprovalCardState::Closed, cx);
+                            self.host.approval_applied(&id, false)
+                        }
+                        // Nothing reached the agent: the hand-off failed with
+                        // no effect (and its prompt is released).
+                        ApplyOutcome::NotDelivered => {
+                            self.card_state(&id, ApprovalCardState::Closed, cx);
+                            match self.approvals.get(&id).and_then(|a| a.receipt.clone()) {
+                                Some(rid) => self
+                                    .host
+                                    .dispatch_report(&rid, DispatchReport::FailedNoEffect),
+                                None => Vec::new(),
+                            }
+                        }
+                    };
+                    self.exec(effects, cx);
+                    self.approvals.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// The host approval id of `sid`'s worker request `worker_id`.
+    fn approval_of(&self, sid: &str, worker_id: &str) -> Option<String> {
+        self.approvals
+            .iter()
+            .find(|(_, a)| a.sid == sid && a.worker_id == worker_id)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// A worker's waiting hook: opened in the host, or "no decision" at once
+    /// (an unregistered or ended session, a refusal).
+    fn open_approval(
+        &mut self,
+        sid: &str,
+        worker_id: String,
+        info: crate::session_protocol::host::ApprovalInfo,
+        cx: &mut Cx,
+    ) {
+        let process_gen = session_of(cx, sid).map(|s| s.process_gen.clone());
+        let registered = self.per.get(sid).is_some_and(|p| p.registered);
+        let opened = match process_gen.filter(|_| registered) {
+            Some(process_gen) => {
+                let now = self.clock.now();
+                let (opened, effects) = self.host.open_approval(sid, &process_gen, info, now);
+                if let Ok(id) = &opened {
+                    self.approvals.insert(
+                        id.clone(),
+                        OpenApproval {
+                            sid: sid.to_string(),
+                            worker_id: worker_id.clone(),
+                            receipt: None,
+                            card: None,
+                        },
+                    );
+                }
+                self.exec(effects, cx);
+                opened
+            }
+            None => Err("not a host session".into()),
+        };
+        if let Err(error) = opened {
+            eprintln!("atem runtime: {sid}: approval not offered remotely: {error}");
+            if let Some(session) = session_of(cx, sid) {
+                let _ = session.release_approval(&worker_id);
+            }
+        }
+    }
+
+    /// The host handed an answer over: to the worker's waiting hook.
+    #[allow(clippy::too_many_arguments)]
+    fn hand_off(
+        &mut self,
+        request_id: &str,
+        sid: &str,
+        approval_id: &str,
+        decision: ApprovalDecision,
+        rule_id: Option<String>,
+        message: Option<String>,
+        cx: &mut Cx,
+    ) {
+        let worker_id = self.approvals.get(approval_id).map(|a| a.worker_id.clone());
+        let sent = match (worker_id, session_of(cx, sid)) {
+            (Some(worker_id), Some(session)) => session
+                .approval_decision(&worker_id, decision, rule_id, message)
+                .is_ok(),
+            _ => false,
+        };
+        if !sent {
+            self.card_state(approval_id, ApprovalCardState::Closed, cx);
+            let effects = self
+                .host
+                .dispatch_report(request_id, DispatchReport::FailedNoEffect);
+            self.exec(effects, cx);
+            self.approvals.remove(approval_id);
+            return;
+        }
+        if let Some(open) = self.approvals.get_mut(approval_id) {
+            open.receipt = Some(request_id.to_string());
+        }
+        let state = match decision {
+            ApprovalDecision::AllowOnce => ApprovalCardState::Allowed,
+            ApprovalDecision::AllowAlways => ApprovalCardState::AlwaysAllowed,
+            ApprovalDecision::Deny => ApprovalCardState::Denied,
+        };
+        self.card_state(approval_id, state, cx);
+    }
+
+    /// A new pending approval: its card in the session's conversations, and
+    /// a push request for the relay.
+    fn approval_opened(&mut self, request: ApprovalRequest, cx: &mut Cx) {
+        let sid = request.session_id.clone();
+        let codex = session_of(cx, &sid).is_some_and(|s| s.provider == Provider::Codex.as_str());
+        let timeout = if codex {
+            crate::chat::approvals::CODEX_TIMEOUT
+        } else {
+            crate::chat::approvals::CLAUDE_TIMEOUT
+        };
+        let expires_at = request.created_at.saturating_add(timeout * 1000);
+        let chat = self
+            .host
+            .descriptor_of(&sid)
+            .is_some_and(|d| d.capabilities.iter().any(|c| c == "chat-v1"));
+        if chat {
+            let card = ApprovalCard {
+                id: "approval".into(),
+                approval_id: request.approval_id.clone(),
+                tool: request.tool.clone(),
+                summary: request.summary.clone(),
+                always_rules: request.always_rules.clone(),
+                state: ApprovalCardState::Pending,
+            };
+            self.card(
+                &request.approval_id,
+                Some(card),
+                ApprovalCardState::Pending,
+                cx,
+            );
+        }
+        let data = json!({
+            "v": 1,
+            "op": "push_approval",
+            "approval_id": request.approval_id,
+            "atem_device_id": self.host.context().atem_device_id,
+            "session_id": sid,
+            "tool": request.tool,
+            "summary": request.summary,
+            "expires_at": expires_at,
+        });
+        self.pushes.push_back(PushEntry {
+            approval_id: request.approval_id,
+            request: data,
+            expires_at,
+            sent: false,
+            resolved: None,
+        });
+        while self.pushes.len() > MAX_PUSHES {
+            self.pushes.pop_front();
+        }
+        self.flush_pushes(cx);
+    }
+
+    /// No longer pending: the card says how it ended (a remote answer: its
+    /// decision, set at the hand-off) and the push is resolved.
+    fn approval_resolved(&mut self, approval_id: &str, reason: ApprovalCloseReason, cx: &mut Cx) {
+        let state = match reason {
+            ApprovalCloseReason::AnsweredRemote => None,
+            ApprovalCloseReason::AnsweredTerminal => Some(ApprovalCardState::AnsweredTerminal),
+            ApprovalCloseReason::TimedOut => Some(ApprovalCardState::Expired),
+            _ => Some(ApprovalCardState::Closed),
+        };
+        if let Some(state) = state {
+            self.card_state(approval_id, state, cx);
+        }
+        if let Some(i) = self
+            .pushes
+            .iter()
+            .position(|p| p.approval_id == approval_id)
+        {
+            if self.pushes[i].sent {
+                self.pushes[i].resolved = Some(reason);
+            } else {
+                // Never pushed: nothing to replace.
+                self.pushes.remove(i);
+            }
+        }
+        self.flush_pushes(cx);
+    }
+
+    /// Sends what the relay should know, in order, over the verified link:
+    /// `push_approval` only for approvals still pending (and not expired),
+    /// `push_resolved` only for ones whose `push_approval` went out. Stops
+    /// at the first failure (kept for the next pass).
+    fn flush_pushes(&mut self, cx: &mut Cx) {
+        if self.link.is_none() {
+            return;
+        }
+        let wall = self.clock.wall();
+        self.pushes
+            .retain(|p| p.sent || p.resolved.is_some() || p.expires_at > wall);
+        let mut i = 0;
+        while i < self.pushes.len() {
+            let p = &self.pushes[i];
+            let data = match (p.sent, p.resolved) {
+                (false, None) => p.request.clone(),
+                (true, Some(reason)) => json!({
+                    "v": 1,
+                    "op": "push_resolved",
+                    "approval_id": p.approval_id,
+                    "reason": reason,
+                }),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let text = json!({"type": "relay", "data": data}).to_string();
+            if cx.client.try_send_wire(text, false).is_err() {
+                return;
+            }
+            if self.pushes[i].sent {
+                self.pushes.remove(i);
+            } else {
+                self.pushes[i].sent = true;
+                i += 1;
+            }
+        }
+    }
+
+    /// The card of `approval_id` in a new state.
+    fn card_state(&mut self, approval_id: &str, state: ApprovalCardState, cx: &mut Cx) {
+        let card = self.approvals.get(approval_id).and_then(|a| a.card.clone());
+        self.card(approval_id, card, state, cx);
+    }
+
+    /// Shows `card` (in `state`) in the session's conversations and history.
+    fn card(
+        &mut self,
+        approval_id: &str,
+        card: Option<ApprovalCard>,
+        state: ApprovalCardState,
+        cx: &mut Cx,
+    ) {
+        let Some(mut card) = card else {
+            return;
+        };
+        if card.state == state && state != ApprovalCardState::Pending {
+            return;
+        }
+        card.state = state;
+        let Some(sid) = self.approvals.get(approval_id).map(|a| a.sid.clone()) else {
+            return;
+        };
+        if let Some(open) = self.approvals.get_mut(approval_id) {
+            open.card = Some(card.clone());
+        }
+        let Some(session) = session_of(cx, &sid) else {
+            return;
+        };
+        let out = session.chat.approval_card(card, wall_ms() as i64);
+        self.broadcast(&sid, &out, None, cx);
+    }
+
+    /// The approvals this bridge holds open (tests).
+    #[cfg(test)]
+    pub(super) fn open_approvals(&self) -> Vec<String> {
+        self.approvals.keys().cloned().collect()
     }
 
     // ── Frames ──
@@ -1436,7 +1813,7 @@ impl HostBridge {
                             chats.conversations.remove(&conversation);
                         }
                     }
-                    Ok(Inbound::Submit { .. }) => {}
+                    Ok(Inbound::Submit { .. } | Inbound::Answer { .. }) => {}
                     Err(text) => {
                         let env = chat_error(
                             &conversation,

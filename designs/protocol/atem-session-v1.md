@@ -1,9 +1,11 @@
 # atem-session v1: sessions, control leases, receipts and approvals (r7: r6 plus approvals — for review)
 
-Status: r7 (2026-10-16) adds approvals (§6a): the lease holder answers the
-agent's own permission prompts — allow once, always allow (one of the rules
-the agent itself suggested) or deny — bound to the exact prompt, while the
-terminal can always answer instead. Needs Astation's review.
+Status: r7 (2026-10-16) adds approvals (§6a): any device with `control`
+gets the agent's own permission prompts (pushed through the relay, whoever
+holds the lease) and answers them — allow once, always allow (one of the
+rules the agent itself suggested) or deny — bound to the exact prompt,
+taking the lease with the answer (`acquire`), while the terminal can always
+answer instead. Needs Astation's review.
 r6 (2026-10-16) removes every legacy path from r5 at the user's
 direction (no backward compatibility; Atem and Astation update together) —
 needs Astation's review. r5 was accepted by Astation on 2026-10-15 as the
@@ -382,16 +384,21 @@ Kinds and payloads (v1):
 ## 6a. Approvals (r7)
 
 The agent's permission prompt (Claude Code's and Codex's `PermissionRequest`
-hook) can be answered by the session's lease holder, bound to that exact
-prompt. The terminal always keeps its own prompt: whichever answers first
-wins, and the host never auto-allows. Any failure, timeout, missing runtime or
-missing remote holder means "no decision" — the agent's own prompt asks.
+hook) can be answered remotely, bound to that exact prompt. The terminal
+always keeps its own prompt: whichever answers first wins, and the host never
+auto-allows. Any failure, timeout or missing runtime means "no decision" — the
+agent's own prompt asks. Delivery is independent of control (user decision,
+2026-10-16): every approval opens a card for all attachments with `control`
+and is pushed to the account's devices, whoever holds the lease; answering
+takes the lease with the answer (`acquire`).
 
 | op | dir | fields |
 |---|---|---|
 | `approval_request` | H→C | `approval_id` (UUID), `session_id`, `process_gen`, `tool`, `summary`, `created_at`, `always_rules: [{rule_id, label, scope}]` |
-| `approval_closed` | H→C | `approval_id`, `reason`: `answered_remote`, `answered_terminal`, `interrupted`, `timed_out`, `lease_lost`, `process_ended` |
-| `submit` | C→H | §6 with `kind:"approval"`, `payload: {approval_id, decision, rule_id?, message?}` |
+| `approval_closed` | H→C | `approval_id`, `reason`: `answered_remote`, `answered_terminal`, `interrupted`, `timed_out`, `released`, `process_ended` |
+| `submit` | C→H | §6 with `kind:"approval"`, `payload: {approval_id, decision, rule_id?, message?, acquire?}` |
+| `push_approval` | H→relay | `approval_id`, `atem_device_id`, `session_id`, `tool`, `summary`, `expires_at` |
+| `push_resolved` | H→relay | `approval_id`, `reason` (an `approval_closed` reason) |
 
 ```json
 {"type":"session","data":{"v":1,"op":"approval_request","id":"…","approval_id":"88888888-…",
@@ -401,11 +408,19 @@ missing remote holder means "no decision" — the agent's own prompt asks.
 {"type":"session","data":{"v":1,"op":"submit","id":"…","binding":{…,"lease_epoch":7},
   "request_id":"44444444-…","kind":"approval",
   "payload":{"approval_id":"88888888-…","decision":"allow_always","rule_id":"r-npm-test"}}}
+{"type":"session","data":{"v":1,"op":"submit","id":"…","binding":{…},
+  "request_id":"45454545-…","kind":"approval",
+  "payload":{"approval_id":"88888888-…","decision":"allow_once","acquire":true}}}
+{"type":"relay","data":{"v":1,"op":"push_approval","approval_id":"88888888-…",
+  "atem_device_id":"host-a","session_id":"ses-aaaaaaaaaaaa","tool":"Bash","summary":"npm test",
+  "expires_at":1760500600000}}
+{"type":"relay","data":{"v":1,"op":"push_resolved","approval_id":"88888888-…","reason":"answered_terminal"}}
 ```
 
-- **Opening.** The host opens an approval only while a remote controller holds
-  the session's live lease, for the session's current process; otherwise the
-  agent gets "no decision" at once. ≤ 16 pending per session.
+- **Opening.** The host opens an approval for the session's current process
+  whoever holds the lease (or nobody); ≤ 16 pending per session. Lease
+  changes — expiry, release, takeover, local input, a trust change — never
+  close one.
 - **What it shows.** `tool` and a short redacted `summary` (the command's
   first line or the file path) — never full inputs such as file contents.
   `always_rules` are the agent's own suggested rules, exactly as the agent
@@ -415,58 +430,100 @@ missing remote holder means "no decision" — the agent's own prompt asks.
   can't take a persistent decision; the card then offers Allow once and Deny
   only and says why). Bounds §1.
 - **Recipients.** `approval_request` and `approval_closed` go to every
-  attachment subscribed by `list` with `view`; after each `sessions` snapshot
-  the pending ones are sent again (§4). An approval belongs to one
+  attachment subscribed by `list` with `control` (a view-only attachment
+  gets neither); after each `sessions` snapshot the pending ones are sent
+  again to such an attachment (§4). An approval belongs to one
   (`session_id`, `process_gen`).
+- **Push (host → relay).** On opening, the host asks the relay over its own
+  authenticated Astation link to push the approval to every device on the
+  account with `control`, online or not (APNs/FCM; the relay and Astation
+  own credentials, device tokens, delivery and the notification UI):
+  `{"type":"relay","data":{"v":1,"op":"push_approval",…}}` with the redacted
+  `tool`/`summary` only (never full inputs), this host's `atem_device_id`
+  and `expires_at` (wall ms when the agent's hook gives up: Claude 600 s,
+  Codex 300 s). When it stops being pending — answered here or in the
+  terminal, interrupted, timed out, released, the process ended — the host
+  sends `push_resolved{approval_id, reason}`; the relay replaces the
+  notification (collapse id / FCM tag = `approval_id`). Best effort: a push
+  never blocks or changes an approval. Only a verified pairing's link carries
+  them; while it is down the host keeps the latest state per approval
+  (bounded) and on reconnect sends `push_approval` only for approvals still
+  pending and `push_resolved` only for ones whose `push_approval` went out.
+  Relay messages are not session messages: no `id`, no reply.
 - **Payload** (strict; anything else is `unsupported_version`): `approval_id`
   a UUID; `decision` one of `allow_once`, `allow_always`, `deny`; `rule_id`
   present iff `allow_always` (an opaque id); `message` only with `deny` (≤ 512
-  bytes; given to the agent with the denial). No other field.
-- **Admission**, in order: the §6 checks (`control` → `forbidden`, a session
-  that accepts work → `session_closed`, the current lease → `stale_lease`;
-  a duplicate `request_id` returns its receipt first, needing only view), then
-  the approval must be pending for exactly the binding's `session_id` and
-  `process_gen`, and an `allow_always` `rule_id` must be one it offered —
-  otherwise `stale_target` (nothing recorded, nothing handed over). A closed,
-  answered or unknown approval is `stale_target`.
+  bytes; given to the agent with the denial); `acquire` a boolean. No other
+  field. With `acquire: true` the binding carries no `lease_epoch` (like
+  `acquire`); otherwise it must.
+- **Admission**, in order: a duplicate `request_id` returns its receipt first
+  (needing only view; it takes no lease). Without `acquire`: the §6 checks
+  (`control` → `forbidden`, a session that accepts work → `session_closed`,
+  the current lease → `stale_lease`). With `acquire: true`: `control` →
+  `forbidden`, a session that accepts work → `session_closed`, no lease
+  needed. Then the approval must be pending for exactly the binding's
+  `session_id` and `process_gen`, and an `allow_always` `rule_id` must be one
+  it offered — otherwise `stale_target` (nothing recorded, nothing handed
+  over, no lease taken). A closed, answered or unknown approval is
+  `stale_target` (a late tap on a resolved notification: "already
+  answered").
+- **Acquire is atomic.** Once the answer is durably `accepted`, the host gives
+  the answering attachment the lease — a takeover when another attachment
+  holds it, nothing new when it already holds it live — and announces it with
+  `lease_changed` (`granted`/`takeover`, to every viewer including the
+  answering one) and `session_changed`, then reports `accepted` and hands the
+  answer over. The lease is taken only when the user acts, and never for an
+  answer that was refused. The new holder renews it as usual (§5).
 - **Lifecycle of the receipt:**
 
 | state | when |
 |---|---|
 | `accepted` | admitted and durable (§6) |
-| `executing` | durable, then the approval closes for every viewer (`approval_closed{answered_remote}`) and the decision is handed to the agent's waiting prompt |
+| `executing` | durable, then the approval closes for every attachment with `control` (`approval_closed{answered_remote}`, push resolved) and the decision is handed to the agent's waiting prompt |
 | `completed` | the agent reported it applied the decision |
 | `rejected` | the approval closed before the hand-off (e.g. an `accepted` answer after a restart: approvals don't survive one), or the decision could not be handed over |
 | `outcome_unknown` | the terminal's answer and the remote answer crossed (`detail:"the terminal answered too; which answer won is unknown"`), the agent ended (`"agent exited"`), or it never confirmed (`"the agent did not confirm the decision"`) |
 
 - **Closing without the remote answer** (`approval_closed`, the card goes
-  away): `answered_terminal` (answered in the agent's own prompt first),
-  `interrupted` (Esc), `timed_out` (the hook's limit), `lease_lost` (no
-  remote controller is left: the lease expired, was released, was revoked by
-  local input or by a trust change; the agent gets "no decision"),
-  `process_ended` (the process exited, was replaced, or the session closed or
-  was removed). `answered_remote` and `lease_lost` are the host's own
-  reasons; the runtime reports only the others. After a hand-off, a lost
-  lease doesn't cancel the answer (§6: lease expiry doesn't cancel accepted
-  work).
+  away, push resolved): `answered_terminal` (answered in the agent's own
+  prompt first), `interrupted` (Esc, or the hook was killed), `timed_out`
+  (the hook's limit), `released` (Atem gave the prompt back to the agent:
+  input reached a Codex session, which hides its prompt while the hook
+  waits, so any input — local, or the lease holder's — first answers the
+  hook "no decision"; or the runtime restarted), `process_ended` (the process
+  exited, was replaced, or the session closed or was removed).
+  `answered_remote` is the host's own reason; the runtime reports the
+  others. After a hand-off, a lost lease doesn't cancel the answer (§6:
+  lease expiry doesn't cancel accepted work).
 - **Takeover keeps the approval.** A remote takeover moves the lease but the
-  approval stays pending: the new holder saw it (it follows every snapshot)
-  and answers under its own lease epoch; the previous holder's epoch is
-  `stale_lease`.
+  approval stays pending: the previous holder's epoch is `stale_lease`.
 - **Hand-off deadline.** A handed-off answer the agent hasn't confirmed
   within 630 s (above Claude Code's 600 s hook timeout) becomes
   `outcome_unknown` ("the agent did not confirm the decision"), which frees
   its in-flight slot. A decision that could not be handed over (`rejected`)
   also releases the waiting prompt ("no decision").
 - **Broker restart.** Approvals live in the broker's memory only. After a
-  restart the worker answers "no decision" to any waiting hook whose
-  approval the new broker doesn't know, and an `accepted` answer is
-  `rejected` (the approval closed before the hand-off).
+  restart the broker tells each adopted worker which approvals it knows
+  (none), so the worker answers "no decision" to every waiting hook, and an
+  `accepted` answer is `rejected` (the approval closed before the hand-off).
 - A later answer to a closed approval is `stale_target` and is never applied;
   a duplicate of the answer that was handed over returns its receipt.
-- Local input: Codex hides its prompt while the hook waits, so local input
-  first answers the hook "no decision" (Codex then shows its prompt) — this
-  happens anyway, because local input ends the remote lease (`lease_lost`).
+- Local input to Claude needs no release (its dialog stays visible; first
+  answer wins); it still revokes the remote lease (§5) without closing the
+  approval.
+- **chat-v1 card.** A chat-v1 conversation shows each approval of its session
+  as an assistant `message` (`messageId` `approval-<approval_id>`) with one
+  part `{id:"approval", kind:"approval", approval_id, tool, summary,
+  always_rules, state}`; `state` is `pending`, then `allowed`,
+  `always_allowed`, `denied` (answered remotely: set when the answer is
+  handed over), `answered_terminal`, `expired` (timed out), or `closed`
+  (interrupted, released, the process ended, or a remote answer the agent
+  didn't take or whose outcome is unknown). A
+  state change re-sends the whole `message` (same `messageId`; the client
+  replaces it). Answering from chat is a chat-v1 `submit` with `approval`
+  (the payload above) instead of `text`, its `binding` without `lease_epoch`
+  when `acquire` is true; its `accepted`/`complete`/`error` follow the
+  receipt as for prompts.
 
 ## 7. Errors
 
@@ -546,8 +603,11 @@ duplicate submit, reused id (other target), crash after executing →
 outcome_unknown, trust change before dispatch → rejected, closed session,
 receipt query scoped to target. r7 adds approvals (§6a): allow once, allow
 always with an offered and an unknown rule, deny with a message, the terminal
-answering first, lease loss, a viewer without control, a duplicate answer, and
-pending approvals after `list` on a new attachment.
+answering first, an approval staying pending when the lease ends, one opened
+with no lease holder and answered with `acquire`, an answer with `acquire`
+taking control from the holder, a late answer after `push_resolved`, a
+view-only attachment, a duplicate answer, and pending approvals after `list`
+on a new attachment.
 
 ## 9. Gate: trust, freshness, channel and browser grants (joint)
 

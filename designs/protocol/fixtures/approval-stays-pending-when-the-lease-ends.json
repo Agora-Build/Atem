@@ -1,5 +1,5 @@
 {
- "name": "approval-closes-when-the-lease-is-lost",
+ "name": "approval-stays-pending-when-the-lease-ends",
  "setup": {
   "sessions": [
    {
@@ -109,17 +109,15 @@
    }
   },
   {
-   "expect": "c1",
-   "match": {
-    "op": "approval_closed",
-    "approval_id": "${aid}",
-    "reason": "lease_lost"
-   }
-  },
-  {
    "assert": {
-    "approvals_pending": 0,
-    "approvals_released": 1
+    "approvals_pending": 1,
+    "approvals_released": 0,
+    "pushes": [
+     {
+      "op": "push_approval",
+      "approval_id": "${aid}"
+     }
+    ]
    }
   },
   {
@@ -161,10 +159,115 @@
   {
    "assert": {
     "approval_decisions": [],
-    "dispatches": 0,
+    "approvals_pending": 1,
     "lease_holder": null
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${aid}",
+      "decision": "allow_once",
+      "acquire": true
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": 3
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "session_changed",
+    "descriptor.controller.lease_epoch": 3
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "kind": "approval",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000003"
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "kind": "approval",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${aid}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "assert": {
+    "approval_decisions": [
+     {
+      "approval_id": "${aid}",
+      "decision": "allow_once"
+     }
+    ],
+    "lease_holder": "c1",
+    "pushes": [
+     {
+      "op": "push_approval",
+      "approval_id": "${aid}"
+     },
+     {
+      "op": "push_resolved",
+      "approval_id": "${aid}",
+      "reason": "answered_remote"
+     }
+    ]
+   }
+  },
+  {
+   "approval_applied": "${aid}",
+   "ok": true
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "kind": "approval",
+    "state": "completed"
    }
   }
  ],
- "note": "An approval is answerable only by the lease holder: when the lease ends (here: expiry at the deadline) the pending approval closes lease_lost for viewers and the runtime is told to answer the agent 'no decision' (its own prompt asks); a late answer is refused."
+ "note": "Delivery is independent of the lease: when the lease ends (here: expiry at the deadline) the pending approval stays and nothing is released. An answer under the ended lease is stale_lease; the same attachment answers with acquire: true, which takes the lease and hands the decision over atomically."
 }

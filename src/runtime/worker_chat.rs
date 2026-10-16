@@ -59,6 +59,7 @@ fn cut_item(item: &mut LogItem, max: usize) {
                 cut(name, max);
                 cut(summary, max);
             }
+            Part::Approval(_) => {}
         },
         LogItem::Backfill(inner) => cut_item(inner, max),
         LogItem::Problem { detail, .. } => {

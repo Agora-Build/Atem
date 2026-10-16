@@ -22,6 +22,15 @@
 //! worker's write boundary. The broker never tags a write with an epoch it
 //! didn't grant.
 //!
+//! Approvals: the worker's `approval_request`/`approval_closed`/
+//! `approval_applied` are queued for the session host (`take_approvals`),
+//! which answers through `approval_decision`/`release_approval`. Codex hides
+//! its prompt while its hook waits, so every write to a Codex session first
+//! asks the worker to release its waiting hooks (`release_approvals`, in
+//! order on the same connection): any input — local or the lease holder's —
+//! goes to Codex's own prompt. Without a session host every request gets "no
+//! decision" at once (`release_untaken`).
+//!
 //! Exit: once the broker recorded a worker's `exited` it sends the release
 //! `stop`, and the worker removes its record and ends; the session stays
 //! (final screen) until reaped `EXITED_KEEP` later. A worker connection that
@@ -29,6 +38,7 @@
 
 use super::adopt::{self, Adoption, SpawnRequest, WorkerHandle};
 use super::protocol::{LaunchEnv, SessionSummary};
+use super::worker_approvals::Event as ApprovalEvent;
 use super::worker_protocol::{Activity, WorkerMsg, WorkerRecord, unb64};
 use crate::chat::adapter::{AgentEvent, LogItem};
 use crate::chat::session::{ChatSession, Out};
@@ -160,6 +170,8 @@ pub struct BrokerSession {
     pub chat_reason: Option<String>,
     pub activity: Activity,
     pub activity_detail: Option<String>,
+    /// The worker's approval reports, not taken by the session host yet.
+    approval_events: Vec<ApprovalEvent>,
 }
 
 /// What one pass over a worker's messages changed.
@@ -218,6 +230,7 @@ impl BrokerSession {
             chat_reason: None,
             activity: Activity::Unknown,
             activity_detail: None,
+            approval_events: Vec::new(),
         }
     }
 
@@ -402,6 +415,65 @@ impl BrokerSession {
         self.write_tagged(bytes, WriteTag::Local, None).map(|_| ())
     }
 
+    /// The worker's approval reports since the last call.
+    pub fn take_approvals(&mut self) -> Vec<ApprovalEvent> {
+        std::mem::take(&mut self.approval_events)
+    }
+
+    /// No session host takes approvals: every request gets "no decision".
+    pub fn release_untaken(&mut self) {
+        for event in self.take_approvals() {
+            if let ApprovalEvent::Request { request_id, .. } = event {
+                let _ = self.release_approval(&request_id);
+            }
+        }
+    }
+
+    /// Hands the session host's answer to the worker's waiting hook.
+    pub fn approval_decision(
+        &self,
+        request_id: &str,
+        decision: crate::session_protocol::wire::ApprovalDecision,
+        rule_id: Option<String>,
+        message: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) if self.is_live() => {
+                worker.approval_decision(request_id, decision, rule_id, message)
+            }
+            _ => anyhow::bail!("The session has ended"),
+        }
+    }
+
+    /// "No decision" for one waiting hook.
+    pub fn release_approval(&self, request_id: &str) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.release_approval(request_id),
+            None => Ok(()),
+        }
+    }
+
+    /// After adoption: the approvals this broker knows; the worker answers
+    /// every other waiting hook "no decision".
+    pub fn known_approvals(&self, request_ids: Vec<String>) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.known_approvals(request_ids),
+            None => Ok(()),
+        }
+    }
+
+    /// Before any input to Codex: its waiting hooks are released first
+    /// (Codex hides its prompt while one waits), so the input reaches
+    /// Codex's own prompt. Claude shows its dialog meanwhile: nothing to do.
+    fn release_before_input(&self) -> anyhow::Result<()> {
+        if self.provider == crate::session::Provider::Codex.as_str()
+            && let Some(worker) = &self.worker
+        {
+            worker.release_approvals()?;
+        }
+        Ok(())
+    }
+
     /// Writes `bytes` under the current input epoch; its sequence number.
     /// A remote write carries `not_after`, its lease's deadline
     /// (`pty_session::monotonic_ns`): the worker drops it at the PTY write
@@ -415,6 +487,7 @@ impl BrokerSession {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
+        self.release_before_input()?;
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
         worker.write_until(seq, bytes, self.input_epoch, not_after)?;
@@ -431,6 +504,7 @@ impl BrokerSession {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
+        self.release_before_input()?;
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
         worker.paste_until(seq, text, self.input_epoch, not_after)?;
@@ -672,14 +746,35 @@ impl BrokerSession {
                 eprintln!("atem runtime: worker of {}: {text}", self.id);
             }
             WorkerMsg::Notice { text } => pumped.notices.push(text),
-            // Until the session host takes approvals (Task 3), every request
-            // gets "no decision" at once: the agent asks in the terminal.
-            WorkerMsg::ApprovalRequest { request_id, .. } => {
-                if let Some(worker) = &self.worker {
+            // For the session host (`take_approvals`).
+            WorkerMsg::ApprovalRequest {
+                request_id,
+                tool,
+                summary,
+                always_rules,
+            } => {
+                let info = crate::session_protocol::host::ApprovalInfo {
+                    tool,
+                    summary,
+                    always_rules,
+                };
+                if self.state == SessionState::Running {
+                    self.approval_events
+                        .push(ApprovalEvent::Request { request_id, info });
+                } else if let Some(worker) = &self.worker {
                     let _ = worker.release_approval(&request_id);
                 }
             }
-            WorkerMsg::ApprovalClosed { .. } | WorkerMsg::ApprovalApplied { .. } => {}
+            WorkerMsg::ApprovalClosed { request_id, reason } => self
+                .approval_events
+                .push(ApprovalEvent::Closed { request_id, reason }),
+            WorkerMsg::ApprovalApplied {
+                request_id,
+                outcome,
+            } => self.approval_events.push(ApprovalEvent::Applied {
+                request_id,
+                outcome,
+            }),
             WorkerMsg::Hello { .. } => {}
             WorkerMsg::ChatSnapshot {
                 snapshot,

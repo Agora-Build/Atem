@@ -26,15 +26,20 @@
 //! (`Effect::Chat`); removed forms get a session `error` without `re`.
 //!
 //! Approvals (r7): the runtime opens an agent permission prompt with
-//! `open_approval` only while a remote controller holds the session's lease;
-//! subscribed viewers get `approval_request` (again after every `list`). The
-//! lease holder answers with a `kind:"approval"` submission; once it is
-//! `executing` the approval closes (`answered_remote`) and `Effect::Approval`
-//! hands the decision to the agent, whose report (`approval_applied`,
-//! `close_approval`, `dispatch_report`) finishes the receipt. Lease loss or
-//! the process ending closes a pending approval and tells the runtime to
-//! answer "no decision" (`Effect::ApprovalReleased`); the terminal can always
-//! answer instead (`close_approval(answered_terminal)`).
+//! `open_approval`, whoever holds the lease (delivery is independent of
+//! control): subscribed attachments with `control` get `approval_request`
+//! (again after every `list`) and `Effect::PushApproval` asks the relay to
+//! push it to the account's devices. The lease holder answers with a
+//! `kind:"approval"` submission, or any attachment with `control` answers
+//! with `acquire: true`, which takes the lease (takeover allowed) together
+//! with the answer. Once the answer is `executing` the approval closes
+//! (`answered_remote`) and `Effect::Approval` hands the decision to the
+//! agent, whose report (`approval_applied`, `close_approval`,
+//! `dispatch_report`) finishes the receipt. Every close also resolves the
+//! push (`Effect::PushResolved`). The process ending closes a pending
+//! approval and tells the runtime to answer "no decision"
+//! (`Effect::ApprovalReleased`); the terminal can always answer instead
+//! (`close_approval(answered_terminal)`), and lease changes never close one.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 use super::journal::{self, Journal, JournalError, Record, Stored};
@@ -219,12 +224,22 @@ pub enum Effect {
         rule_id: Option<String>,
         message: Option<String>,
     },
-    /// The host closed a pending approval (lease lost, process ended,
-    /// restart): answer the agent's waiting prompt with "no decision" so its
-    /// own prompt asks.
+    /// The host closed a pending approval (process ended, restart): answer
+    /// the agent's waiting prompt with "no decision" so its own prompt asks.
     ApprovalReleased {
         session_id: String,
         approval_id: String,
+    },
+    /// A new pending approval: ask the relay to push it to the account's
+    /// devices with `control` (best effort; never blocks the approval).
+    PushApproval {
+        request: ApprovalRequest,
+    },
+    /// The approval is no longer pending (answered, closed, released): the
+    /// relay replaces its notification.
+    PushResolved {
+        approval_id: String,
+        reason: ApprovalCloseReason,
     },
     /// A chat-v1 reply to the conversation that submitted (or was refused).
     /// The runtime's chat stream renders it with its own `generation` and
@@ -1047,6 +1062,10 @@ impl<J: Journal> SessionHost<J> {
         // decision" (nobody is attached to answer them any more).
         for (approval_id, a) in std::mem::take(&mut self.approvals) {
             if a.handed_off.is_none() {
+                self.out.push(Effect::PushResolved {
+                    approval_id: approval_id.clone(),
+                    reason: ApprovalCloseReason::Released,
+                });
                 self.out.push(Effect::ApprovalReleased {
                     session_id: a.request.session_id,
                     approval_id,
@@ -1484,7 +1503,11 @@ impl<J: Journal> SessionHost<J> {
             sessions,
         };
         self.send(att, re, op);
-        // Catch-up: every pending approval, after the snapshot.
+        // Catch-up: every pending approval, after the snapshot, for an
+        // attachment that may answer it.
+        if !self.attachments[att].can(Permission::Control) {
+            return Ok(());
+        }
         let mut pending: Vec<&Approval> = self
             .approvals
             .values()
@@ -1570,7 +1593,8 @@ impl<J: Journal> SessionHost<J> {
         s.lease_epoch += 1;
         self.lease_changed(sid, reason, except);
         self.registry_changed(sid);
-        self.close_pending(sid, ApprovalCloseReason::LeaseLost);
+        // Pending approvals stay: any attachment with `control` may answer
+        // them with `acquire`.
     }
 
     /// Makes sure epochs up to `need` are durably reserved.
@@ -1627,12 +1651,24 @@ impl<J: Journal> SessionHost<J> {
         if !self.reserve_epochs(&sid, need) {
             return Err(ErrorCode::Busy);
         }
+        self.grant(att, &sid, previous.is_some());
+        self.lease_reply(att, re, b);
+        self.lease_announced(&sid, previous.is_some(), Some(att));
+        // A takeover keeps pending approvals: the new holder saw them (they
+        // follow every snapshot) and answers under its own epoch.
+        Ok(())
+    }
+
+    /// Gives `att` the lease of `sid` (epochs reserved): a new epoch, and a
+    /// new input epoch when it was taken from another holder.
+    fn grant(&mut self, att: &str, sid: &str, takeover: bool) {
+        let controller = self.attachments[att].controller_session.clone().unwrap();
         let deadline = self
             .now
             .saturating_add(LEASE_MS)
             .min(self.attachments[att].authorization_deadline);
-        let s = self.sessions.get_mut(&sid).unwrap();
-        if previous.is_some() {
+        let s = self.sessions.get_mut(sid).unwrap();
+        if takeover {
             s.input_epoch += 1;
         }
         s.lease_epoch += 1;
@@ -1641,17 +1677,34 @@ impl<J: Journal> SessionHost<J> {
             controller_session: controller,
             deadline,
         });
-        self.lease_reply(att, re, b);
-        let reason = if previous.is_some() {
+    }
+
+    fn lease_announced(&mut self, sid: &str, takeover: bool, except: Option<&str>) {
+        let reason = if takeover {
             LeaseChangeReason::Takeover
         } else {
             LeaseChangeReason::Granted
         };
-        self.lease_changed(&sid, reason, Some(att));
-        self.registry_changed(&sid);
-        // A takeover keeps pending approvals: the new holder saw them (they
-        // follow every snapshot) and answers under its own epoch.
-        Ok(())
+        self.lease_changed(sid, reason, except);
+        self.registry_changed(sid);
+    }
+
+    /// An approval answer with `acquire`: `att` needs the lease unless it
+    /// holds it live already. `Some(takeover)` when it must be granted (the
+    /// epochs it needs are reserved first: `busy` if that fails).
+    fn lease_to_acquire(&mut self, att: &str, sid: &str) -> Checked<Option<bool>> {
+        let s = &self.sessions[sid];
+        let live = s.lease.as_ref().filter(|l| self.now < l.deadline);
+        match live {
+            Some(l) if l.attachment == att => return Ok(None),
+            _ => {}
+        }
+        let takeover = live.is_some();
+        let need = s.lease_epoch + 2;
+        if !self.reserve_epochs(sid, need) {
+            return Err(ErrorCode::Busy);
+        }
+        Ok(Some(takeover))
     }
 
     fn holds(&self, att: &str, b: &Binding) -> Checked<()> {
@@ -1724,13 +1777,29 @@ impl<J: Journal> SessionHost<J> {
             return Ok(());
         }
         let sid = &b.target.session_id;
-        self.check_mutation(att, &self.sessions[sid], b.lease_epoch)?;
-        if kind == ReceiptKind::Approval {
-            let answer =
-                ApprovalAnswer::parse(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?;
-            if !self.answerable(&b.target, &answer) {
-                return Err(ErrorCode::StaleTarget);
+        let answer = match kind {
+            ReceiptKind::Approval => {
+                Some(ApprovalAnswer::parse(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?)
             }
+            _ => None,
+        };
+        let acquire = answer.as_ref().is_some_and(ApprovalAnswer::acquires);
+        if acquire {
+            // Takes the lease with the answer: `control` and a session that
+            // accepts work, but no current lease needed.
+            if !self.attachments[att].can(Permission::Control) {
+                return Err(ErrorCode::Forbidden);
+            }
+            if self.sessions[sid].state != SessionState::Running {
+                return Err(ErrorCode::SessionClosed);
+            }
+        } else {
+            self.check_mutation(att, &self.sessions[sid], b.lease_epoch)?;
+        }
+        if let Some(answer) = &answer
+            && !self.answerable(&b.target, answer)
+        {
+            return Err(ErrorCode::StaleTarget);
         }
         let held = self.by_session.get(sid).map_or(0, BTreeSet::len);
         if held >= self.config.max_receipts_per_session {
@@ -1745,6 +1814,12 @@ impl<J: Journal> SessionHost<J> {
         if in_flight >= MAX_IN_FLIGHT {
             return Err(ErrorCode::Busy);
         }
+        let sid = sid.clone();
+        let grant = if acquire {
+            self.lease_to_acquire(att, &sid)?
+        } else {
+            None
+        };
         let updated_at = self.wall();
         let record = Record::Accepted {
             request_id: request_id.to_string(),
@@ -1757,6 +1832,12 @@ impl<J: Journal> SessionHost<J> {
         // `accepted` is durable before the reply; if it can't be, nothing
         // was recorded and the client may retry the same request.
         self.journal.append(record).map_err(|_| ErrorCode::Busy)?;
+        // Atomic with the answer: the lease is taken only now that the
+        // answer is recorded, and only by the attachment answering.
+        if let Some(takeover) = grant {
+            self.grant(att, &sid, takeover);
+            self.lease_announced(&sid, takeover, None);
+        }
         let order = self.next_order;
         self.next_order += 1;
         let stored = Stored {
@@ -1920,9 +2001,10 @@ impl<J: Journal> SessionHost<J> {
     /// The runtime opens an agent permission prompt for `session_id`'s
     /// process `process_gen` at monotonic `now` (timers due by then fire
     /// first). Refused (`Err`: the agent's own prompt asks) unless the
-    /// session runs that process and a remote controller holds a live lease,
-    /// the info is within bounds and fewer than `MAX_PENDING_APPROVALS` are
-    /// pending. Subscribed viewers get `approval_request`. The effects are
+    /// session runs that process, the info is within bounds and fewer than
+    /// `MAX_PENDING_APPROVALS` are pending — whoever holds the lease.
+    /// Subscribed attachments with `control` get `approval_request`, and the
+    /// relay is asked to push it (`Effect::PushApproval`). The effects are
     /// returned either way.
     pub fn open_approval(
         &mut self,
@@ -1946,14 +2028,10 @@ impl<J: Journal> SessionHost<J> {
         if self.halted {
             return Err("host halted".into());
         }
-        let s = self
-            .sessions
+        self.sessions
             .get(session_id)
             .filter(|s| s.state == SessionState::Running && s.spec.process_gen == process_gen)
             .ok_or("no running session with that process")?;
-        if s.lease.as_ref().is_none_or(|l| self.now >= l.deadline) {
-            return Err("no remote controller".into());
-        }
         let pending = self
             .approvals
             .values()
@@ -1982,9 +2060,10 @@ impl<J: Journal> SessionHost<J> {
                 handoff_deadline: None,
             },
         );
-        for att in self.subscribers() {
+        for att in self.approval_viewers() {
             self.send(&att, None, Op::ApprovalRequest(request.clone()));
         }
+        self.out.push(Effect::PushApproval { request });
         Ok(approval_id)
     }
 
@@ -1999,11 +2078,8 @@ impl<J: Journal> SessionHost<J> {
         approval_id: &str,
         reason: ApprovalCloseReason,
     ) -> Vec<Effect> {
-        // The host owns these: the remote hand-off and lease-driven closes.
-        if matches!(
-            reason,
-            ApprovalCloseReason::AnsweredRemote | ApprovalCloseReason::LeaseLost
-        ) {
+        // The host owns the remote hand-off.
+        if reason == ApprovalCloseReason::AnsweredRemote {
             return Vec::new();
         }
         let Some(a) = self.approvals.remove(approval_id) else {
@@ -2095,19 +2171,32 @@ impl<J: Journal> SessionHost<J> {
         });
     }
 
-    /// Tells every subscribed viewer the approval closed.
+    /// Tells every attachment that got the approval that it closed, and
+    /// resolves its push.
     fn approval_closed(&mut self, approval_id: &str, reason: ApprovalCloseReason) {
-        for att in self.subscribers() {
+        for att in self.approval_viewers() {
             let op = Op::ApprovalClosed {
                 approval_id: approval_id.to_string(),
                 reason,
             };
             self.send(&att, None, op);
         }
+        self.out.push(Effect::PushResolved {
+            approval_id: approval_id.to_string(),
+            reason,
+        });
     }
 
-    /// Closes `sid`'s pending approvals (the host's decision: lease lost) and
-    /// has the runtime answer them "no decision".
+    /// Subscribed attachments that may answer approvals (`control`).
+    fn approval_viewers(&self) -> Vec<String> {
+        self.subscribers()
+            .into_iter()
+            .filter(|id| self.attachments[id].can(Permission::Control))
+            .collect()
+    }
+
+    /// Closes `sid`'s pending approvals (the host's decision: the process
+    /// ended) and has the runtime answer them "no decision".
     fn close_pending(&mut self, sid: &str, reason: ApprovalCloseReason) {
         let ids = self.pending_approvals(sid);
         for id in ids {
@@ -2460,6 +2549,21 @@ impl<J: Journal> SessionHost<J> {
         let sid = s.spec.session_id.clone();
         let data = f.data.as_ref().ok_or(ErrorCode::UnsupportedVersion)?;
         match data["op"].as_str() {
+            // An approval card answered from chat: the §6a submission.
+            Some("submit") if data.get("approval").is_some() => {
+                let request_id = data["requestId"]
+                    .as_str()
+                    .ok_or(ErrorCode::UnsupportedVersion)?
+                    .to_string();
+                let payload = data["approval"].clone();
+                let reply = Reply::Chat {
+                    conversation_id: data["conversationId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                self.submit(att, reply, b, &request_id, ReceiptKind::Approval, payload)
+            }
             Some("submit") => {
                 let text = data["text"].as_str().ok_or(ErrorCode::UnsupportedVersion)?;
                 let request_id = data["requestId"]

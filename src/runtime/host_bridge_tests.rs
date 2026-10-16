@@ -474,10 +474,7 @@ fn welcome_list_leases_terminal_input_and_local_input() {
         assert_eq!(welcome["atem_device_id"], DEVICE);
         assert_eq!(welcome["host_trust_gen"], TRUST_GEN);
         assert_eq!(welcome["client_kind"], "native");
-        assert_eq!(
-            welcome["permissions"],
-            json!(["view", "control"])
-        );
+        assert_eq!(welcome["permissions"], json!(["view", "control"]));
 
         let descriptor = listed(peer, &sid).await;
         assert_eq!(descriptor["process_gen"], pg.as_str());
@@ -1569,4 +1566,437 @@ fn the_duplicate_window_is_bounded() {
     // The newest is still remembered; the oldest was evicted.
     assert!(bridge.duplicate(&format!("m{}", super::MAX_SEEN), 0));
     assert!(!bridge.duplicate("m0", 0));
+}
+
+// ── Approvals (§6a): the real hook script under a fake agent ──
+
+/// `tests/fixtures/approvals/fake-agent.py`: runs the real permission hook.
+fn approval_agent() -> PathBuf {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approvals/fake-agent.py");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    if perms.mode() & 0o111 != 0o111 {
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+/// The fake agent's next tool call `n` needing permission.
+fn ask(fake: &Path, n: u32, request: Value) {
+    let tmp = fake.join(format!("tmp-ask-{n}"));
+    std::fs::write(&tmp, request.to_string()).unwrap();
+    std::fs::rename(&tmp, fake.join(format!("ask-{n}.json"))).unwrap();
+}
+
+fn npm_test() -> Value {
+    json!({"tool_name": "Bash",
+           "tool_input": {"command": "npm test\nnpm run lint", "description": "run the tests"},
+           "permission_suggestions": [{"type": "addRules", "behavior": "allow",
+               "rules": [{"toolName": "Bash", "ruleContent": "npm test:*"}],
+               "destination": "localSettings"}]})
+}
+
+/// Waits until the fake agent's events show `line`.
+async fn agent_event(fake: &Path, line: &str) {
+    let events = fake.join("events");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let text = std::fs::read_to_string(&events).unwrap_or_default();
+            if text.lines().any(|l| l.trim_end() == line.trim_end()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the agent never showed {line:?}: {}",
+            std::fs::read_to_string(&events).unwrap_or_default()
+        )
+    });
+}
+
+fn is_relay(v: &Value, op: &str, approval_id: &str) -> bool {
+    v["type"] == "relay" && v["data"]["op"] == op && v["data"]["approval_id"] == approval_id
+}
+
+/// The chat-v1 card of `approval_id` in `state`.
+fn is_card(v: &Value, approval_id: &str, state: &str) -> bool {
+    is_chat(v, "message")
+        && v["data"]["messageId"] == format!("approval-{approval_id}")
+        && v["data"]["parts"][0]["kind"] == "approval"
+        && v["data"]["parts"][0]["state"] == state
+}
+
+impl Runtime {
+    /// Launches `provider` running the approval fake agent (control files
+    /// in `fake`).
+    async fn launch_approval_agent(
+        &self,
+        client: &mut RuntimeClient,
+        provider: &str,
+        fake: &Path,
+    ) -> SessionSummary {
+        let var = if provider == "claude" {
+            "CLAUDE_CLI_BIN"
+        } else {
+            "CODEX_CLI_BIN"
+        };
+        let hook = crate::chat::codex::hook_command(&self.dir.path().join("run/approval-hook.sh"));
+        client
+            .send(&ClientMsg::Launch {
+                provider: provider.into(),
+                args: vec![],
+                cwd: self.dir.path().to_path_buf(),
+                env: LaunchEnv(vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (var.into(), approval_agent().display().to_string()),
+                    ("FAKE_DIR".into(), fake.display().to_string()),
+                    ("FAKE_CODEX_HOOK".into(), hook),
+                ]),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        let session = expect(client, |m| match m {
+            RuntimeMsg::Launched { session } => Some(session),
+            RuntimeMsg::Error { text, .. } => panic!("launch failed: {text}"),
+            _ => None,
+        })
+        .await;
+        agent_event(fake, "started").await;
+        session
+    }
+}
+
+#[test]
+fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
+        open_chat(peer, "conv-1", &sid, &pg).await;
+
+        ask(&fake, 1, npm_test());
+        let request = peer.wait(|v| is_session(v, "approval_request")).await["data"].clone();
+        assert_eq!(request["session_id"], sid.as_str());
+        assert_eq!(request["process_gen"], pg.as_str());
+        assert_eq!(request["tool"], "Bash");
+        assert_eq!(request["summary"], "npm test", "the first line only");
+        let rules = request["always_rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["label"], "Allow Bash(npm test:*)");
+        let aid = request["approval_id"].as_str().unwrap().to_string();
+        // Pushed to the account's devices over the link: redacted only.
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_approval", &aid))
+            .await;
+        let push = peer.seen[at]["data"].clone();
+        assert_eq!(push["atem_device_id"], DEVICE);
+        assert_eq!(push["session_id"], sid.as_str());
+        assert_eq!(push["tool"], "Bash");
+        assert_eq!(push["summary"], "npm test");
+        assert_eq!(
+            push["expires_at"].as_u64().unwrap(),
+            request["created_at"].as_u64().unwrap() + 600_000
+        );
+        assert!(!push.to_string().contains("npm run lint"), "{push}");
+        // The chat card, pending.
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "pending")).await;
+        let card = peer.seen[at]["data"]["parts"][0].clone();
+        assert_eq!(card["tool"], "Bash");
+        assert_eq!(card["summary"], "npm test");
+        assert_eq!(card["always_rules"], request["always_rules"]);
+
+        // Answered from chat with acquire: the lease and the answer together.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": request_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        let granted = peer.wait(|v| is_session(v, "lease_changed")).await;
+        assert_eq!(granted["data"]["reason"], "granted");
+        let rid = request_id.clone();
+        peer.wait(move |v| is_chat(v, "accepted") && v["data"]["requestId"] == rid.as_str())
+            .await;
+        agent_event(&fake, "answer 1 allow ").await;
+        let rid = request_id.clone();
+        let done = peer
+            .wait(move |v| {
+                (is_chat(v, "complete") || is_chat(v, "error"))
+                    && v["data"]["requestId"] == rid.as_str()
+            })
+            .await;
+        assert_eq!(done["data"]["op"], "complete", "{done}");
+        peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
+            .await;
+        assert_eq!(peer.seen[at]["data"]["reason"], "answered_remote");
+        let closed = peer
+            .seen
+            .iter()
+            .find(|v| is_session(v, "approval_closed"))
+            .unwrap();
+        assert_eq!(closed["data"]["reason"], "answered_remote");
+        assert!(listed(peer, &sid).await["controller"].is_object());
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        let lease = peer.acquire(&sid, &pg).await;
+
+        // The lease holder denies with a message: a session-v1 submission.
+        ask(&fake, 1, npm_test());
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)), "request_id": request_id,
+                   "kind": "approval",
+                   "payload": {"approval_id": aid, "decision": "deny",
+                               "message": "use the staging config"}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+        agent_event(&fake, "answer 1 deny use the staging config").await;
+        let rid = request_id.clone();
+        let done = peer
+            .wait(move |v| {
+                is_session(v, "receipt")
+                    && v["data"]["request_id"] == rid.as_str()
+                    && !matches!(v["data"]["state"].as_str(), Some("accepted" | "executing"))
+            })
+            .await;
+        assert_eq!(done["data"]["state"], "completed", "{done}");
+        peer.wait_from(0, |v| is_card(v, &aid, "denied")).await;
+
+        // Answered in the agent's own dialog first: the card and the push
+        // resolve, and the hook gets no decision.
+        ask(&fake, 2, npm_test());
+        let from = peer.seen.len();
+        let at = peer
+            .wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        let aid = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
+        let a = aid.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "answered_terminal");
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
+            .await;
+        assert_eq!(peer.seen[at]["data"]["reason"], "answered_terminal");
+        peer.wait_from(0, |v| is_card(v, &aid, "answered_terminal"))
+            .await;
+        agent_event(&fake, "answer 2 none ").await;
+        // A late answer is refused and takes no lease.
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval",
+                   "payload": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        assert_eq!(peer.reply(&id).await["code"], "stale_target");
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn input_to_codex_releases_its_waiting_hooks_first() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "codex", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+
+        // Local input: Codex hides its prompt while the hook waits, so the
+        // hook is released first and the card closes `released`.
+        ask(
+            &fake,
+            1,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo build"}}),
+        );
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            request["data"]["always_rules"],
+            json!([]),
+            "Codex offers none"
+        );
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_approval", &aid))
+            .await;
+        assert_eq!(
+            peer.seen[at]["data"]["expires_at"].as_u64().unwrap(),
+            request["data"]["created_at"].as_u64().unwrap() + 300_000
+        );
+        attach_client(&mut client, &sid, 24, 80).await;
+        client.send(&ClientMsg::input(&sid, b"L")).await.unwrap();
+        let peer = &mut rt.peer;
+        let a = aid.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "released");
+        agent_event(&fake, "answer 1 none ").await;
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
+            .await;
+        assert_eq!(peer.seen[at]["data"]["reason"], "released");
+
+        // The lease holder's terminal input releases it the same way.
+        ask(
+            &fake,
+            2,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo test"}}),
+        );
+        let from = peer.seen.len();
+        let at = peer
+            .wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        let aid = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let lease = peer.acquire(&sid, &pg).await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        peer.terminal(
+            "input",
+            &sid,
+            &pg,
+            json!({"stream_id": stream, "sequence": 0, "bytes": STANDARD.encode("R")}),
+            Some(lease),
+        );
+        let a = aid.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "released");
+        agent_event(&fake, "answer 2 none ").await;
+        // Both inputs reached Codex, after the releases.
+        let input = std::fs::read(fake.join("input")).unwrap_or_default();
+        assert!(input.contains(&b'L') && input.contains(&b'R'), "{input:?}");
+        rt.shutdown().await;
+    });
+}
+
+#[tokio::test]
+async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
+    use crate::runtime::adopt::SpawnRequest;
+    use crate::runtime::worker_approvals::Event;
+    let dir = short_dir();
+    let fake = dir.path().join("fake");
+    let launcher = Launcher::InProcess(InProcess {
+        state: dir.path().join("state"),
+        socket_dir: dir.path().join("ws"),
+        chat_root: dir.path().join("chat"),
+    });
+    let request = SpawnRequest {
+        session_id: crate::session::SessionId::new(),
+        process_gen: uuid::Uuid::new_v4().to_string(),
+        provider: crate::session::Provider::Codex,
+        args: vec![],
+        cwd: dir.path().to_path_buf(),
+        rows: 24,
+        cols: 80,
+    };
+    let hook = crate::chat::codex::hook_command(&dir.path().join("chat/approval-hook.sh"));
+    let env = LaunchEnv(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        (
+            "CODEX_CLI_BIN".into(),
+            approval_agent().display().to_string(),
+        ),
+        ("FAKE_DIR".into(), fake.display().to_string()),
+        ("FAKE_CODEX_HOOK".into(), hook),
+    ]);
+    let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
+    let mut session =
+        crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
+    agent_event(&fake, "started").await;
+    ask(
+        &fake,
+        1,
+        json!({"tool_name": "shell", "tool_input": {"command": "ls"}}),
+    );
+    // The worker reports it to this connection (as it did to a broker that
+    // went away without answering).
+    let worker_id = tokio::time::timeout(WAIT, async {
+        loop {
+            session.pump();
+            if let Some(Event::Request { request_id, .. }) = session.take_approvals().pop() {
+                return request_id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no approval request");
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.check_adoption(&mut session);
+    agent_event(&fake, "answer 1 none ").await;
+    // The worker closes it `released`.
+    let closed = tokio::time::timeout(WAIT, async {
+        loop {
+            session.pump();
+            if let Some(event) = session.take_approvals().pop() {
+                return event;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no close");
+    assert_eq!(
+        closed,
+        Event::Closed {
+            request_id: worker_id,
+            reason: crate::session_protocol::wire::ApprovalCloseReason::Released
+        }
+    );
+    assert!(bridge.open_approvals().is_empty());
+    let _ = session.stop();
 }

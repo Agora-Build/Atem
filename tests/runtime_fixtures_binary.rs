@@ -29,12 +29,22 @@
 //!   reads (`ATEM_TEST_PTY_FAULTS`, debug builds; `src/runtime/test_hooks.rs`).
 //! - `turn_complete`: the fake Claude ends its running turn (its prompt ids
 //!   are `turn-<n>`, which the chat adapter reports as turn ids).
+//! - `open_approval`: the fake Claude (a scenario with approvals runs its
+//!   session as Claude) asks for a tool call: the real `PermissionRequest`
+//!   hook Atem configured runs with it (rules from the fixture's labels
+//!   `Tool(content)`; the runtime's rule ids, labels — "Allow …" — and scopes
+//!   are translated like other identifiers). `close_approval` with
+//!   `answered_terminal`: the user allows it in the agent's own dialog (the
+//!   tool runs); `approval_applied` with `ok: true`: nothing to do, the agent
+//!   acts on the decision its hook got by itself.
 //!
 //! Not honoured (the scenario is reported, with the reason, and not run):
 //! more than one client (the runtime holds one Astation link, so one
 //! attachment at a time), `close_session` (the runtime never closes a
 //! running session), `disconnect`/`resume` (no resume in compatibility
-//! mode), `fail_next_fsync` and `change_trust_gen`.
+//! mode), `fail_next_fsync`, `change_trust_gen`, and approval closes other
+//! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
+//! false`.
 //!
 //! A scenario the real runtime fails would be listed in `KNOWN_DEVIATIONS`
 //! with the failure it must keep showing, and why (none today).
@@ -48,8 +58,12 @@
 //! byte its PTY delivered (pastes are dispatches; other bytes are matched
 //! against the terminal input the fixture sent, in order), the fault markers
 //! used, the `written` acks, the agent's signals (a stop reaches it while its
-//! worker lives; SIGWINCH is a resize), and the runtime's local `list` (lease
-//! holder).
+//! worker lives; SIGWINCH is a resize), the runtime's local `list` (lease
+//! holder), what the hooks answered (decisions handed over, which are also
+//! dispatches), and what the link carried: `approval_request`/`approval_closed`
+//! (pending approvals), the relay's push requests, and the receipts the
+//! client was told about (`receipts_visible`). Counters are re-read for up
+//! to 15 s until they match (the processes act asynchronously).
 #![cfg(target_os = "linux")]
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -72,90 +86,15 @@ const SETTLE: Duration = Duration::from_millis(400);
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~\r";
 
-/// Stands in for the Claude and Codex CLIs. Logs every byte read from its
-/// terminal (raw mode) to `$FAKE_DIR/input` and its signals to
-/// `$FAKE_DIR/events`. With `--settings` (Claude with Atem's chat hooks) each
-/// bracketed paste is a prompt `turn-<n>`: it fires the hooks and writes the
-/// transcript as Claude Code does, and the turn ends when `$FAKE_DIR/complete`
-/// appears.
-const FAKE_AGENT: &str = r#"#!/usr/bin/python3 -I
-import json, os, select, signal, subprocess, sys, time, tty
-args = sys.argv[1:]
-settings = session = None
-i = 0
-while i < len(args):
-    if args[i] == "--settings":
-        settings = args[i + 1]; i += 1
-    elif args[i] == "--session-id":
-        session = args[i + 1]; i += 1
-    i += 1
-ctl = os.environ["FAKE_DIR"]
-os.makedirs(ctl, exist_ok=True)
-log_in = open(os.path.join(ctl, "input"), "ab", buffering=0)
-events = open(os.path.join(ctl, "events"), "a", buffering=1)
-parent = os.getppid()
-def ended(signum, frame):
-    time.sleep(0.1)
-    events.write("signal %d worker_alive=%s\n" % (signum, os.getppid() == parent))
-    os._exit(0)
-signal.signal(signal.SIGWINCH, lambda signum, frame: events.write("winch\n"))
-signal.signal(signal.SIGHUP, ended)
-signal.signal(signal.SIGTERM, ended)
-try:
-    tty.setraw(0)
-except Exception:
-    pass
-hook = transcript = None
-if settings:
-    hook = json.load(open(settings))["hooks"]["Stop"][0]["hooks"][0]["command"]
-    session = session or "fake-session"
-    transcript = os.path.join(os.path.dirname(os.path.dirname(settings)), "transcripts", session + ".jsonl")
-    os.makedirs(os.path.dirname(transcript), exist_ok=True)
-    open(transcript, "a").close()
-def fire(event):
-    event["session_id"] = session
-    subprocess.run(["sh", "-c", hook], input=json.dumps(event).encode(), check=False)
-def log(record):
-    with open(transcript, "a") as f:
-        f.write(json.dumps(record) + "\n")
-TS = "2026-10-16T00:00:00.000Z"
-if hook:
-    fire({"hook_event_name": "SessionStart", "transcript_path": transcript, "source": "startup"})
-events.write("started\n")
-os.write(1, b"READY\r\n")
-START, END = b"\x1b[200~", b"\x1b[201~\r"
-buf, n, turns = b"", 0, []
-while True:
-    ready, _, _ = select.select([0], [], [], 0.02)
-    if ready:
-        data = os.read(0, 65536)
-        if not data:
-            break
-        log_in.write(data)
-        buf += data
-        while hook:
-            s = buf.find(START)
-            e = buf.find(END, s + 1) if s >= 0 else -1
-            if e < 0:
-                break
-            text = buf[s + len(START):e].decode("utf-8", "replace")
-            buf = buf[e + len(END):]
-            n += 1
-            turn = "turn-%d" % n
-            fire({"hook_event_name": "UserPromptSubmit", "prompt": text, "prompt_id": turn})
-            log({"type": "user", "uuid": "u-%d" % n, "promptId": turn, "timestamp": TS,
-                 "message": {"role": "user", "content": text}})
-            turns.append(turn)
-    complete = os.path.join(ctl, "complete")
-    if turns and os.path.exists(complete):
-        os.remove(complete)
-        turn = turns.pop(0)
-        log({"type": "assistant", "uuid": "a-" + turn, "promptId": turn, "timestamp": TS,
-             "message": {"id": "msg-" + turn, "role": "assistant",
-                         "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"}})
-        fire({"hook_event_name": "Stop"})
-        events.write("completed %s\n" % turn)
-"#;
+/// Stands in for the Claude and Codex CLIs (`tests/fixtures/approvals/
+/// fake-agent.py`). Logs every byte read from its terminal (raw mode) to
+/// `$FAKE_DIR/input` and its signals to `$FAKE_DIR/events`. With
+/// `--settings` (Claude with Atem's chat hooks) each bracketed paste is a
+/// prompt `turn-<n>`: it fires the hooks and writes the transcript as Claude
+/// Code does, and the turn ends when `$FAKE_DIR/complete` appears. A tool
+/// call asked for in `$FAKE_DIR/ask-<n>.json` runs the real
+/// `PermissionRequest` hook Atem configured and acts on its answer.
+const FAKE_AGENT: &str = include_str!("fixtures/approvals/fake-agent.py");
 
 // ── The fake Astation ─────────────────────────────────────────────────────
 
@@ -356,6 +295,19 @@ struct Session {
     chat: bool,
     dir: PathBuf,
 }
+
+/// A tool call the fake agent asked for (`ask-<n>.json`).
+struct Ask {
+    n: usize,
+    dir: PathBuf,
+    approval_id: String,
+    /// The suggestions it offered, and the runtime's rule ids for them.
+    suggestions: Vec<Value>,
+    rule_ids: Vec<String>,
+}
+
+/// What Atem says a deny without a message tells the agent.
+const DEFAULT_DENY: &str = "Denied from Astation";
 
 struct Sandbox {
     dir: tempfile::TempDir,
@@ -570,6 +522,14 @@ struct Host {
     /// Terminal input sent, in order: (real session id, local, bytes).
     chunks: Vec<(String, bool, Vec<u8>)>,
     dropped_acks: u64,
+    asks: Vec<Ask>,
+    /// Approval ids the link opened, and how each closed.
+    approvals_opened: Vec<String>,
+    approvals_closed: HashMap<String, String>,
+    /// Push requests the link carried for the relay.
+    pushes: Vec<Value>,
+    /// Request ids of the receipts the client was told about.
+    receipts_seen: Vec<String>,
 }
 
 fn replace_strings(v: &mut Value, pairs: &[(String, String)], forward: bool) {
@@ -679,14 +639,21 @@ fn unsupported(scenario: &Value) -> Option<String> {
                 "change_trust_gen",
                 "trust generations change only by pairing",
             ),
-            (
-                "open_approval",
-                "approvals are core-only until the runtime wires permission hooks",
-            ),
         ] {
             if step.get(action).is_some() {
                 return Some(format!("{action}: {why}"));
             }
+        }
+        let reason = step["reason"].as_str().unwrap_or_default();
+        if step.get("close_approval").is_some()
+            && !matches!(reason, "answered_terminal" | "interrupted")
+        {
+            return Some(format!(
+                "close_approval {reason}: only the terminal's answer or an interrupt"
+            ));
+        }
+        if step.get("approval_applied").is_some() && step["ok"] != true {
+            return Some("approval_applied ok:false: the fake agent never contradicts".into());
         }
     }
     None
@@ -711,13 +678,19 @@ impl Host {
         std::fs::create_dir_all(&work).unwrap();
         let mut sessions = Vec::new();
         let mut ids = Vec::new();
+        // Approvals (rules, the terminal's answer) are Claude's.
+        let approvals = scenario["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|s| s.get("open_approval").is_some());
         for (i, s) in setup["sessions"]
             .as_array()
             .into_iter()
             .flatten()
             .enumerate()
         {
-            let chat = s["chat"].as_bool().unwrap_or(false);
+            let chat = s["chat"].as_bool().unwrap_or(false) || approvals;
             let dir = sandbox.dir.path().join(format!("agent-{i}"));
             let (provider, bin) = if chat {
                 ("claude", "CLAUDE_CLI_BIN")
@@ -770,6 +743,11 @@ impl Host {
             vars: HashMap::new(),
             chunks: Vec::new(),
             dropped_acks: 0,
+            asks: Vec::new(),
+            approvals_opened: Vec::new(),
+            approvals_closed: HashMap::new(),
+            pushes: Vec::new(),
+            receipts_seen: Vec::new(),
         };
         me.wait_sessions_ready()?;
         let attachment = me.client_setup["attachment_gen"]
@@ -914,10 +892,37 @@ impl Host {
     /// A message from the runtime: translated, filtered, held or queued.
     fn incoming(&mut self, mut value: Value) {
         let family = value["type"].as_str().unwrap_or_default().to_string();
+        let op = value["data"]["op"].as_str().unwrap_or_default().to_string();
+        if family == "relay" {
+            let mut push = json!({"op": op, "approval_id": value["data"]["approval_id"]});
+            if op == "push_resolved" {
+                push["reason"] = value["data"]["reason"].clone();
+            }
+            replace_strings(&mut push, &self.ids, false);
+            self.pushes.push(push);
+            return;
+        }
         if !matches!(family.as_str(), "session" | "terminal" | "agentChat") {
             return;
         }
-        let op = value["data"]["op"].as_str().unwrap_or_default().to_string();
+        let data = &value["data"];
+        let id = data["approval_id"].as_str().unwrap_or_default().to_string();
+        match (family.as_str(), op.as_str()) {
+            ("session", "approval_request") if !self.approvals_opened.contains(&id) => {
+                self.approvals_opened.push(id)
+            }
+            ("session", "approval_closed") => {
+                let reason = data["reason"].as_str().unwrap_or_default().to_string();
+                self.approvals_closed.insert(id, reason);
+            }
+            ("session", "receipt") => {
+                let rid = data["request_id"].as_str().unwrap_or_default().to_string();
+                if !self.receipts_seen.contains(&rid) {
+                    self.receipts_seen.push(rid);
+                }
+            }
+            _ => {}
+        }
         if family == "terminal" && op == "frame" {
             return;
         }
@@ -1091,10 +1096,185 @@ impl Host {
                 let turn = step["turn_id"].as_str().ok_or("turn_id")?;
                 std::fs::write(dir.join("complete"), turn).unwrap();
             }
+            "open_approval" => self.open_approval(arg, step)?,
+            "close_approval" => {
+                let ask = self.ask(arg.as_str().unwrap_or_default())?;
+                let what = match step["reason"].as_str() {
+                    Some("answered_terminal") => "terminal-yes",
+                    Some("interrupted") => "kill",
+                    other => return Err(format!("close_approval {other:?} is not supported")),
+                };
+                std::fs::write(ask.dir.join(format!("{what}-{}", ask.n)), "").unwrap();
+            }
+            // The agent acts on the decision its hook got by itself.
+            "approval_applied" if step["ok"] == true => {
+                self.ask(arg.as_str().unwrap_or_default())?;
+            }
             other => return Err(format!("{other} is not supported against the real runtime")),
         }
         self.pump(SETTLE);
         Ok(())
+    }
+
+    /// The fake agent asks for a tool call that needs permission; its hook
+    /// reports it and the runtime's `approval_request` arrives (its rule ids,
+    /// labels and scopes are then translated to the fixture's).
+    fn open_approval(&mut self, arg: &Value, step: &Map<String, Value>) -> Result<(), String> {
+        let session = self.session(arg.as_str().unwrap_or_default())?;
+        if !session.chat {
+            return Err("approvals need the Claude session".into());
+        }
+        let dir = session.dir.clone();
+        let tool = step["tool"].as_str().ok_or("tool")?;
+        let summary = step["summary"].as_str().ok_or("summary")?;
+        let rules = step
+            .get("always_rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut suggestions = Vec::new();
+        for rule in &rules {
+            let label = rule["label"].as_str().ok_or("label")?;
+            let (rule_tool, content) = label
+                .strip_suffix(')')
+                .and_then(|l| l.split_once('('))
+                .ok_or(format!("label {label:?} is not Tool(content)"))?;
+            suggestions.push(json!({"type": "addRules", "behavior": "allow",
+                "rules": [{"toolName": rule_tool, "ruleContent": content}],
+                "destination": "localSettings"}));
+        }
+        let n = self.asks.len() + 1;
+        let request = json!({"tool_name": tool, "tool_input": {"command": summary},
+                             "permission_suggestions": suggestions});
+        let temp = dir.join(format!("tmp-ask-{n}"));
+        std::fs::write(&temp, request.to_string()).unwrap();
+        std::fs::rename(&temp, dir.join(format!("ask-{n}.json"))).unwrap();
+        let deadline = Instant::now() + WAIT;
+        let known: Vec<String> = self.asks.iter().map(|a| a.approval_id.clone()).collect();
+        let at = loop {
+            let found = self.queue.iter().position(|m| {
+                m["data"]["op"] == "approval_request"
+                    && m["data"]["approval_id"]
+                        .as_str()
+                        .is_some_and(|id| !known.iter().any(|k| k == id))
+            });
+            if let Some(at) = found {
+                break at;
+            }
+            if Instant::now() > deadline {
+                return Err(format!("no approval_request; queued: {:?}", self.queue));
+            }
+            self.pump(Duration::from_millis(50));
+        };
+        let real = self.queue[at]["data"].clone();
+        let real_rules = real["always_rules"].as_array().cloned().unwrap_or_default();
+        if real_rules.len() != rules.len() {
+            return Err(format!("rules offered: {real}"));
+        }
+        let mut rule_ids = Vec::new();
+        for (fixture, real) in rules.iter().zip(&real_rules) {
+            rule_ids.push(real["rule_id"].as_str().unwrap_or_default().to_string());
+            for key in ["rule_id", "label", "scope"] {
+                let pair = (
+                    fixture[key].as_str().unwrap_or_default().to_string(),
+                    real[key].as_str().unwrap_or_default().to_string(),
+                );
+                if pair.0 != pair.1 && !self.ids.contains(&pair) {
+                    self.ids.push(pair);
+                }
+            }
+        }
+        replace_strings(&mut self.queue[at], &self.ids, false);
+        self.asks.push(Ask {
+            n,
+            dir,
+            approval_id: real["approval_id"].as_str().unwrap_or_default().to_string(),
+            suggestions,
+            rule_ids,
+        });
+        Ok(())
+    }
+
+    fn ask(&self, approval_id: &str) -> Result<&Ask, String> {
+        self.asks
+            .iter()
+            .find(|a| a.approval_id == approval_id)
+            .ok_or(format!("unknown approval {approval_id}"))
+    }
+
+    /// What each hook answered, in order: `(ask, behavior, decision)`.
+    fn answers(&self) -> Vec<(&Ask, String, Value)> {
+        let mut out = Vec::new();
+        let mut lines = Vec::new();
+        for s in &self.sessions {
+            let events = std::fs::read_to_string(s.dir.join("events")).unwrap_or_default();
+            lines.extend(events.lines().map(|l| (s.dir.clone(), l.to_string())));
+        }
+        for (dir, line) in lines {
+            let mut parts = line.splitn(3, ' ');
+            if parts.next() != Some("answer") {
+                continue;
+            }
+            let n: usize = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let behavior = parts.next().unwrap_or_default();
+            let behavior = behavior.split(' ').next().unwrap_or_default().to_string();
+            let Some(ask) = self.asks.iter().find(|a| a.n == n && a.dir == dir) else {
+                continue;
+            };
+            let raw =
+                std::fs::read_to_string(dir.join(format!("answer-{n}.json"))).unwrap_or_default();
+            let decision = serde_json::from_str::<Value>(&raw)
+                .map(|v| v["hookSpecificOutput"]["decision"].clone())
+                .unwrap_or(Value::Null);
+            out.push((ask, behavior, decision));
+        }
+        out
+    }
+
+    /// Decisions the hooks got, as the fixture writes them.
+    fn approval_decisions(&self) -> Value {
+        let mut decisions = Vec::new();
+        for (ask, behavior, decision) in self.answers() {
+            let mut d = json!({"approval_id": ask.approval_id});
+            match behavior.as_str() {
+                "allow" => match decision["updatedPermissions"].as_array() {
+                    Some(rules) => {
+                        let i = ask
+                            .suggestions
+                            .iter()
+                            .position(|s| Some(s) == rules.first());
+                        d["decision"] = json!("allow_always");
+                        d["rule_id"] = json!(i.map_or("?", |i| ask.rule_ids[i].as_str()));
+                    }
+                    None => d["decision"] = json!("allow_once"),
+                },
+                "deny" => {
+                    d["decision"] = json!("deny");
+                    let message = decision["message"].as_str().unwrap_or_default();
+                    if message != DEFAULT_DENY {
+                        d["message"] = json!(message);
+                    }
+                }
+                _ => continue,
+            }
+            decisions.push(d);
+        }
+        let mut decisions = Value::from(decisions);
+        replace_strings(&mut decisions, &self.ids, false);
+        decisions
+    }
+
+    /// `counter` until it equals `expected` (`WAIT` at most): the processes
+    /// act asynchronously.
+    fn counter_settled(&mut self, key: &str, expected: &Value) -> Result<Value, String> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let got = self.counter(key)?;
+            if &got == expected || Instant::now() > deadline {
+                return Ok(got);
+            }
+            self.pump(Duration::from_millis(100));
+        }
     }
 
     fn counter(&mut self, key: &str) -> Result<Value, String> {
@@ -1140,9 +1320,39 @@ impl Host {
             resizes += events.matches("winch").count() as u64;
         }
         let enqueue_faults = used.matches("fail_next_enqueue").count() as u64;
+        // A decision handed to the agent counts as a dispatch.
+        let answers = self.answers();
+        dispatches += answers.iter().filter(|(_, b, _)| b != "none").count() as u64;
         Ok(match key {
             "dispatches" => json!(dispatches),
             "dispatch_attempts" => json!(dispatches + enqueue_faults),
+            "approval_decisions" => self.approval_decisions(),
+            "approvals_pending" => json!(
+                self.approvals_opened
+                    .iter()
+                    .filter(|id| !self.approvals_closed.contains_key(*id))
+                    .count()
+            ),
+            // Hooks answered "no decision" the host chose (not the
+            // terminal's answer, an interrupt, a timeout or a release).
+            "approvals_released" => json!(
+                answers
+                    .iter()
+                    .filter(|(ask, b, _)| {
+                        b == "none"
+                            && !matches!(
+                                self.approvals_closed
+                                    .get(&ask.approval_id)
+                                    .map(String::as_str),
+                                Some(
+                                    "answered_terminal" | "interrupted" | "timed_out" | "released"
+                                )
+                            )
+                    })
+                    .count()
+            ),
+            "pushes" => json!(self.pushes),
+            "receipts_visible" => json!({self.client.clone(): self.receipts_seen.len()}),
             "pty_bytes_written" if used.contains("fail_next_partial") => json!("unknown"),
             "pty_bytes_written" => json!(paste_bytes),
             "pty_writes" => json!(local + remote),
@@ -1180,6 +1390,11 @@ impl Host {
             "bytes",
             "attachment_gen",
             "turn_id",
+            "tool",
+            "summary",
+            "always_rules",
+            "reason",
+            "ok",
         ];
         let actions: Vec<&String> = step
             .keys()
@@ -1255,7 +1470,7 @@ impl Host {
             "assert" => {
                 self.pump(SETTLE);
                 for (key, expected) in arg.as_object().ok_or("assert must be an object")? {
-                    let got = self.counter(key)?;
+                    let got = self.counter_settled(key, expected)?;
                     if &got != expected {
                         let all: Vec<String> = [
                             "pty_writes_local",
@@ -1308,7 +1523,17 @@ fn run(scenario: &Value) -> Result<(), String> {
         }
         host.finish()
     })();
-    result.map_err(|e| format!("{e}\n--- runtime log ---\n{}", host.sandbox.logs()))
+    result.map_err(|e| {
+        let agents: String = host
+            .sessions
+            .iter()
+            .map(|s| {
+                let events = std::fs::read_to_string(s.dir.join("events")).unwrap_or_default();
+                format!("--- agent {} events ---\n{events}", s.fixture_id)
+            })
+            .collect();
+        format!("{e}\n--- runtime log ---\n{}{agents}", host.sandbox.logs())
+    })
 }
 
 fn scenarios() -> Vec<Value> {
@@ -1330,16 +1555,8 @@ fn scenarios() -> Vec<Value> {
 /// The host scenarios that can't be honoured against real processes (the
 /// reason is printed); every other scenario runs.
 const NOT_RUN: &[&str] = &[
-    // Approvals (contract r7) run in the core harness only until the runtime
-    // opens approvals from the agents' permission hooks.
-    "approval-allow-always-must-name-an-offered-rule",
-    "approval-allow-once-is-handed-to-the-agent-and-completes",
-    "approval-answered-in-the-terminal-first-refuses-the-late-remote-answer",
-    "approval-closes-when-the-lease-is-lost",
-    "approval-deny-carries-the-message-to-the-agent",
-    "approval-duplicate-submit-returns-the-receipt",
+    "approval-answer-with-acquire-takes-control-from-the-holder",
     "approval-needs-control-and-the-lease",
-    "approval-pending-is-sent-again-after-list",
     "approval-survives-takeover",
     "closed-session-refuses-work-before-the-lease-check",
     "receipt-query-is-scoped-to-the-exact-target",
@@ -1432,7 +1649,16 @@ fn a_changed_expectation_fails_against_the_real_runtime() {
         .last_mut()
         .unwrap();
     last["assert"]["dispatch_attempts"] = json!(2);
-    let results = run_named(&[lease, dispatch], None);
+    // The decision the real hook got is checked, message included.
+    let mut deny = named("approval-deny-carries-the-message-to-the-agent");
+    let step = deny["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["assert"].get("approval_decisions").is_some())
+        .unwrap();
+    step["assert"]["approval_decisions"][0]["message"] = json!("something else");
+    let results = run_named(&[lease, dispatch, deny], None);
     for (name, result) in results {
         let error = result.expect_err(&name);
         assert!(error.contains("expected"), "{name}: {error}");

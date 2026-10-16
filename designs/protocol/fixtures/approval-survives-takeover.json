@@ -327,5 +327,5 @@
    }
   }
  ],
- "note": "A remote takeover keeps the pending approval: the new holder saw it after list and answers under its own lease epoch; the previous holder's epoch is stale_lease. lease_lost closes only on expiry, release, local input or a trust change."
+ "note": "A remote takeover keeps the pending approval: the new holder saw it after list and answers under its own lease epoch; the previous holder's epoch is stale_lease. Lease changes never close an approval."
 }

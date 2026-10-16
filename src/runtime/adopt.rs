@@ -268,7 +268,6 @@ impl WorkerHandle {
     }
 
     /// The lease holder's answer to a waiting approval → `approval_applied`.
-    #[allow(dead_code)] // the session host's approvals (Task 3)
     pub fn approval_decision(
         &self,
         request_id: &str,
@@ -292,13 +291,11 @@ impl WorkerHandle {
     }
 
     /// "No decision" for every waiting approval (before local input).
-    #[allow(dead_code)] // the broker's local input (Task 3)
     pub fn release_approvals(&self) -> Result<()> {
         self.send(&BrokerMsg::ReleaseApprovals)
     }
 
     /// After adoption: the approvals this broker knows (the rest released).
-    #[allow(dead_code)] // the session host's approvals (Task 3)
     pub fn known_approvals(&self, request_ids: Vec<String>) -> Result<()> {
         self.send(&BrokerMsg::KnownApprovals { request_ids })
     }
