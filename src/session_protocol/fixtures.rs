@@ -5,9 +5,10 @@
 //! needs no Rust change. Wire messages in both directions go through the strict
 //! `wire::decode`. `side:"client"` scenarios run against `LeaseClient` and
 //! `RegistryClient` with the fixture playing the host; host scenarios run
-//! against a `HostUnderTest` (the host authority, plan Task 3) with the fixture
-//! playing the clients. Without a host every host scenario is reported as
-//! skipped, by name, and the test pins that count so none is skipped silently.
+//! against a `HostUnderTest` (`SessionHost` inside `fake_runtime::FakeRuntime`)
+//! with the fixture playing the clients. `run_all` without a host reports host
+//! scenarios as skipped, by name; the fixture test runs them all and asserts
+//! that nothing was skipped.
 //!
 //! Unknown actions, unknown assertion keys and unknown `setup` fields fail the
 //! scenario instead of being ignored.
@@ -76,7 +77,9 @@ pub struct Scenario {
     pub side: Side,
     pub setup: Setup,
     pub steps: Vec<Value>,
+    /// Documentation for readers; not interpreted.
     #[serde(default)]
+    #[allow(dead_code)]
     pub note: Option<String>,
 }
 
@@ -111,7 +114,7 @@ pub enum HostEvent {
     FailNextPtyWriteAfterPartial,
 }
 
-/// The host authority under test (implemented by plan Task 3).
+/// The host authority under test (`fake_runtime::FakeRuntime`).
 pub trait HostUnderTest {
     /// A client's message arrives at `now_ms` (monotonic). It already went
     /// through the strict decoder; a decode failure is passed on so the host
@@ -128,7 +131,7 @@ pub trait HostUnderTest {
     fn counter(&self, key: &str) -> Result<Value, String>;
 }
 
-pub type HostFactory<'a> = &'a dyn Fn(&Setup) -> Box<dyn HostUnderTest>;
+pub type HostFactory<'a> = &'a dyn Fn(&Setup) -> Result<Box<dyn HostUnderTest>, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -198,7 +201,11 @@ pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, 
     let mut runner = match scenario.side {
         Side::Host => match host {
             None => return Ok(Outcome::Skipped),
-            Some(factory) => Runner::new(&scenario, Some(factory(&scenario.setup))),
+            Some(factory) => {
+                let host = factory(&scenario.setup)
+                    .map_err(|e| format!("{}: setup: {e}", scenario.name))?;
+                Runner::new(&scenario, Some(host))
+            }
         },
         Side::Client => {
             if scenario
@@ -819,8 +826,14 @@ mod tests {
             .collect()
     }
 
+    fn fake_runtime(setup: &Setup) -> Result<Box<dyn HostUnderTest>, String> {
+        Ok(Box::new(super::super::fake_runtime::FakeRuntime::new(
+            setup,
+        )?))
+    }
+
     #[test]
-    fn every_fixture_runs_client_scenarios_pass_and_host_scenarios_are_counted() {
+    fn every_fixture_runs_and_passes_with_none_skipped() {
         let files = scenario_files();
         let host: Vec<String> = files
             .iter()
@@ -830,21 +843,73 @@ mod tests {
         let client = files.len() - host.len();
         assert!(client >= 2 && host.len() >= 5, "fixtures missing");
 
-        let report = run_all(&fixtures_dir(), None);
+        let report = run_all(&fixtures_dir(), Some(&fake_runtime));
         assert!(report.failed.is_empty(), "failed: {:#?}", report.failed);
-        eprintln!("fixtures passed: {:?}", report.passed);
         eprintln!(
-            "host scenarios skipped (no host yet): {} {:?}",
-            report.skipped.len(),
-            report.skipped
+            "fixtures passed ({}): {:?}",
+            report.passed.len(),
+            report.passed
         );
-        assert_eq!(report.passed.len(), client);
-        // Task 3 passes a host factory here and asserts `skipped` is empty.
-        assert_eq!(
-            report.skipped, host,
-            "every host scenario, and only those, skipped"
-        );
-        assert_eq!(report.passed.len() + report.skipped.len(), files.len());
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.passed.len(), files.len());
+        for name in &host {
+            assert!(report.passed.contains(name), "host scenario {name} ran");
+        }
+
+        // Without a host, exactly the host scenarios are reported as skipped.
+        let hostless = run_all(&fixtures_dir(), None);
+        assert_eq!(hostless.skipped, host);
+        assert_eq!(hostless.passed.len(), client);
+    }
+
+    /// Each host fixture fails when one of its expectations is changed, so
+    /// passing means the host produced exactly what the fixture says.
+    #[test]
+    fn host_fixtures_fail_on_a_changed_expectation() {
+        let mutations: &[(&str, &str, Value)] = &[
+            ("lease-expires-without-renewal", "lease_epoch", json!(3)),
+            ("removed-ops-have-no-effect", "code", json!("stale_lease")),
+            (
+                "dispatch-failure-before-any-effect-is-rejected",
+                "detail",
+                json!("write interrupted"),
+            ),
+            (
+                "dispatch-failure-after-partial-write-is-outcome-unknown",
+                "state",
+                json!("rejected"),
+            ),
+            (
+                "duplicate-submit-returns-receipt-and-reuse-is-rejected",
+                "code",
+                json!("busy"),
+            ),
+        ];
+        for (name, key, to) in mutations {
+            let mut f = fixture(name);
+            assert_eq!(
+                run_scenario(&f, Some(&fake_runtime)),
+                Ok(Outcome::Passed),
+                "{name}"
+            );
+            let step = f["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .rev()
+                .find(|s| s.get("match").is_some_and(|m| m.get(*key).is_some()))
+                .unwrap();
+            step["match"][*key] = to.clone();
+            assert!(
+                run_scenario(&f, Some(&fake_runtime)).is_err(),
+                "{name} {key}"
+            );
+        }
+        // And on a changed counter.
+        let mut f = fixture("dispatch-failure-before-any-effect-is-rejected");
+        let last = f["steps"].as_array_mut().unwrap().last_mut().unwrap();
+        last["assert"]["dispatch_attempts"] = json!(2);
+        assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
     }
 
     fn fixture(name: &str) -> Value {
@@ -1025,12 +1090,12 @@ mod tests {
             {"restart_runtime": {"runtime_gen": "99999999-9999-4999-8999-999999999999", "runtime_epoch": 8}},
             {"assert": {"events": 2, "now": 10, "receipts_visible": {"c2": 3}}}
         ]);
-        let factory = |_: &Setup| -> Box<dyn HostUnderTest> {
-            Box::new(EchoHost {
+        let factory = |_: &Setup| -> Result<Box<dyn HostUnderTest>, String> {
+            Ok(Box::new(EchoHost {
                 out: vec![],
                 events: 0,
                 now: 0,
-            })
+            }))
         };
         assert_eq!(run_scenario(&f, Some(&factory)), Ok(Outcome::Passed));
         assert_eq!(run_scenario(&f, None), Ok(Outcome::Skipped));
@@ -1053,12 +1118,12 @@ mod tests {
         let list = json!({"type": "session", "data": {"v": 1, "op": "list",
             "id": "11111111-1111-4111-8111-000000000001"}});
         let beat = json!({"type": "heartbeat", "data": {"ts": 1}});
-        let factory = |_: &Setup| -> Box<dyn HostUnderTest> {
-            Box::new(EchoHost {
+        let factory = |_: &Setup| -> Result<Box<dyn HostUnderTest>, String> {
+            Ok(Box::new(EchoHost {
                 out: vec![],
                 events: 0,
                 now: 0,
-            })
+            }))
         };
         let run = |steps: Value| {
             let mut f = fixture("lease-expires-without-renewal");
