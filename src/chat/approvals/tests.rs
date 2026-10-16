@@ -87,20 +87,24 @@ fn claude_round(output: &str) -> String {
     let id = wait_request(s.path());
     let req = approvals_dir(s.path()).join(format!("req-{id}.json"));
     assert_eq!(fs::read_to_string(&req).unwrap(), input);
-    let pid: u32 = fs::read_to_string(approvals_dir(s.path()).join(format!("pid-{id}")))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(pid, child.id(), "the pid is the process the agent started");
+    let ids = fs::read_to_string(approvals_dir(s.path()).join(format!("pid-{id}"))).unwrap();
+    let ids: Vec<u32> = ids.split_whitespace().map(|p| p.parse().unwrap()).collect();
+    assert_eq!(
+        ids,
+        [child.id(), std::process::id()],
+        "the hook's pid (the process the agent started) and its parent's"
+    );
     decide(s.path(), &id, output);
     let (ok, stdout, stderr) = finish(child);
     assert!(ok && stderr.is_empty(), "{stderr}");
     assert!(
         !approvals_dir(s.path())
             .join(format!("dec-{id}.json"))
-            .exists(),
-        "the hook consumed the decision"
+            .exists()
+            && approvals_dir(s.path())
+                .join(format!("taken-{id}.json"))
+                .exists(),
+        "the hook claimed the decision"
     );
     stdout
 }
@@ -196,7 +200,7 @@ fn outside_atem_the_hook_exits_at_once_without_output() {
     let s = session();
     let script = s.path().join(SCRIPT_NAME);
     let cmd = format!(
-        "/bin/sh {} codex 120",
+        "/bin/sh {} codex 300",
         shell_quote(&script.to_string_lossy())
     );
     let input = fixture("codex-permission-request.json");

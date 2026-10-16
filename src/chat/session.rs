@@ -526,8 +526,9 @@ impl ChatSession {
                 self.set_status(State::Ready, None, now_ms, &mut out);
             }
             LogItem::Backfill(item) => self.on_backfill(*item),
-            // The App handles problems (withdrawing chat when fatal).
-            LogItem::Problem { .. } => {}
+            // The App handles problems (withdrawing chat when fatal); tool
+            // results are the worker's (approvals).
+            LogItem::Problem { .. } | LogItem::ToolResult { .. } => {}
         }
         out
     }
@@ -820,7 +821,7 @@ impl ChatSession {
                 self.current_turn = current;
             }
             LogItem::Backfill(item) => self.on_backfill(*item),
-            LogItem::TurnEnded { .. } | LogItem::Problem { .. } => {}
+            LogItem::TurnEnded { .. } | LogItem::Problem { .. } | LogItem::ToolResult { .. } => {}
         }
     }
 

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::runtime::worker::{self, WorkerOptions, record_path};
-use crate::runtime::worker_protocol::{WorkerMsg, WorkerSpec, unb64};
+use crate::runtime::worker_protocol::{ApplyOutcome, WorkerMsg, WorkerSpec, unb64};
 use std::time::Duration;
 
 const AGENT: &str = "echo ready; while read l; do echo got:$l; done";
@@ -684,8 +684,15 @@ async fn a_codex_hook_waits_for_the_brokers_decision() {
     until(&mut handle, |m| {
         all.push_str(&output_text(std::slice::from_ref(m)));
         printed |= all.contains(r#""behavior":"deny","message":"not on prod""#);
-        if let WorkerMsg::ApprovalApplied { request_id, ok } = m {
-            assert_eq!((request_id.as_str(), *ok), (id.as_str(), true));
+        if let WorkerMsg::ApprovalApplied {
+            request_id,
+            outcome,
+        } = m
+        {
+            assert_eq!(
+                (request_id.as_str(), *outcome),
+                (id.as_str(), ApplyOutcome::Ok)
+            );
             applied = true;
         }
         applied && printed && all.contains("hook-done")
@@ -701,7 +708,13 @@ async fn a_codex_hook_waits_for_the_brokers_decision() {
         )
         .unwrap();
     until(&mut handle, |m| {
-        matches!(m, WorkerMsg::ApprovalApplied { ok: false, .. })
+        matches!(
+            m,
+            WorkerMsg::ApprovalApplied {
+                outcome: ApplyOutcome::NotDelivered,
+                ..
+            }
+        )
     })
     .await;
     stop(running, handle).await;

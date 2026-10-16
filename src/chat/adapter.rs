@@ -77,6 +77,26 @@ pub enum LogItem {
     Backfill(Box<LogItem>),
     /// Something could not be read; `fatal` = format changed, withdraw chat.
     Problem { detail: String, fatal: bool },
+    /// A tool call that ended in an error result (Claude's transcript): the
+    /// user refused it in the terminal (`Rejected`), or it failed or a hook
+    /// denied it (`Failed`). For the worker's approvals only (it ends a
+    /// waiting permission prompt); never forwarded or shown. `input` is the
+    /// tool input as compact JSON (keys sorted), `text` the result's text
+    /// (bounded), `at_ms` the entry's time.
+    ToolResult {
+        tool_name: String,
+        input: String,
+        kind: ToolResultKind,
+        text: String,
+        at_ms: i64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultKind {
+    Rejected,
+    Failed,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

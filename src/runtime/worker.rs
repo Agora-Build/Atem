@@ -443,6 +443,8 @@ struct Worker {
     adapter: Option<crate::chat::claude::ClaudeAdapter>,
     /// The agent's waiting permission prompts (`worker_approvals`).
     approvals: Option<Approvals>,
+    /// What the chat adapter saw that may end a waiting prompt.
+    approval_evidence: Vec<super::worker_approvals::Evidence>,
     /// The Codex session directory, removed when the agent exited.
     owned_dir: Option<PathBuf>,
     chat: ChatSession,
@@ -584,7 +586,8 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         offset: 0,
         dropped: 0,
         adapter,
-        approvals: approvals.map(|(dir, agent)| Approvals::new(&dir, agent)),
+        approvals: approvals.map(|(dir, agent)| Approvals::new(&dir, agent, agent_pid)),
+        approval_evidence: Vec::new(),
         owned_dir,
         chat: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
         capabilities: Capabilities::default(),
@@ -937,7 +940,7 @@ impl Worker {
                     ),
                     None => Some(ApprovalEvent::Applied {
                         request_id,
-                        ok: false,
+                        outcome: super::worker_protocol::ApplyOutcome::NotDelivered,
                     }),
                 };
                 self.send_approval_events(refused.into_iter().collect());
@@ -971,7 +974,8 @@ impl Worker {
         let Some(a) = self.approvals.as_mut() else {
             return;
         };
-        let events = a.poll(connected);
+        let evidence = std::mem::take(&mut self.approval_evidence);
+        let events = a.poll(connected, evidence);
         self.send_approval_events(events);
     }
 
@@ -987,9 +991,13 @@ impl Worker {
                 ApprovalEvent::Closed { request_id, reason } => {
                     WorkerMsg::ApprovalClosed { request_id, reason }
                 }
-                ApprovalEvent::Applied { request_id, ok } => {
-                    WorkerMsg::ApprovalApplied { request_id, ok }
-                }
+                ApprovalEvent::Applied {
+                    request_id,
+                    outcome,
+                } => WorkerMsg::ApprovalApplied {
+                    request_id,
+                    outcome,
+                },
             };
             self.send(&message);
         }
@@ -1034,20 +1042,55 @@ impl Worker {
         let input_count = self.input.input_count();
         let now = now_ms();
         let events = adapter.poll_events();
-        let log = adapter.poll_log();
+        let mut log = adapter.poll_log();
         let capabilities = adapter.capabilities();
-        // Claude went on (a new prompt, the turn ended): a prompt still
-        // waiting was answered (or interrupted) in the terminal.
-        let moved_on = events.iter().any(|e| {
-            matches!(
-                e,
-                AgentEvent::PromptSubmitted { .. } | AgentEvent::TurnEnded
-            )
-        }) || log.iter().any(|i| matches!(i, LogItem::TurnEnded { .. }));
-        if moved_on && let Some(a) = self.approvals.as_mut() {
-            let closed = a.turn_moved_on();
-            self.send_approval_events(closed);
+        // What may end a waiting permission prompt (applied with the next
+        // approvals poll): a new prompt or the turn's end, a tool refused in
+        // the terminal. Tool results are the worker's only: never forwarded.
+        if self.approvals.is_some() {
+            use super::worker_approvals::Evidence;
+            for e in &events {
+                if matches!(
+                    e,
+                    AgentEvent::PromptSubmitted { .. } | AgentEvent::TurnEnded
+                ) {
+                    self.approval_evidence
+                        .push(Evidence::TurnEnded { interrupted: false });
+                }
+            }
+            for item in &log {
+                match item {
+                    LogItem::TurnEnded { outcome, .. } => {
+                        self.approval_evidence.push(Evidence::TurnEnded {
+                            interrupted: *outcome == crate::chat::adapter::Outcome::Interrupted,
+                        })
+                    }
+                    LogItem::ToolResult {
+                        tool_name,
+                        input,
+                        kind,
+                        text,
+                        at_ms,
+                    } => {
+                        if let Ok(input) = serde_json::from_str(input) {
+                            self.approval_evidence.push(Evidence::Tool {
+                                tool_name: tool_name.clone(),
+                                input,
+                                kind: *kind,
+                                text: text.clone(),
+                                at_ms: *at_ms,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
+        log.retain(|item| match item {
+            LogItem::ToolResult { .. } => false,
+            LogItem::Backfill(inner) => !matches!(**inner, LogItem::ToolResult { .. }),
+            _ => true,
+        });
         let (ends, others): (Vec<_>, Vec<_>) = events
             .iter()
             .cloned()

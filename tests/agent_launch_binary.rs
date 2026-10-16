@@ -454,7 +454,7 @@ fn codex_launch_asks_once_and_merges_the_approval_hook() {
     assert_eq!(groups[0]["hooks"][0]["command"], "/mine.sh");
     let ours = groups[1]["hooks"][0]["command"].as_str().unwrap();
     assert!(ours.starts_with(": atem-approval-hook;"), "{ours}");
-    assert_eq!(groups[1]["hooks"][0]["timeout"], 120);
+    assert_eq!(groups[1]["hooks"][0]["timeout"], 300);
     assert_eq!(
         std::fs::read_to_string(codex_home.join("hooks.json.atem-bak")).unwrap(),
         mine

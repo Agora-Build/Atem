@@ -354,19 +354,294 @@ pub fn install(codex_home: &Path, script: &Path) -> Result<Installed> {
     let Merge::Changed(text) = merged else {
         return Ok(Installed::Unchanged);
     };
+    let mode = file_mode(&path).unwrap_or(0o600);
     let mut backup = None;
     if let Some(original) = &existing {
         let bak = codex_home.join(BACKUP);
         if std::fs::symlink_metadata(&bak).is_err() {
-            crate::runtime::worker::write_atomic(&bak, original.as_bytes())
+            write_keeping(&bak, original.as_bytes(), mode)
                 .with_context(|| format!("writing {}", bak.display()))?;
         }
         backup = Some(bak);
     }
     std::fs::create_dir_all(codex_home)?;
-    crate::runtime::worker::write_atomic(&path, text.as_bytes())
+    write_keeping(&path, text.as_bytes(), mode)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(Installed::Changed { backup })
+}
+
+/// The permission bits of `path`, when it exists.
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777)
+}
+
+/// Replaces `path` with `bytes` (permission bits `mode`) through a temp
+/// file in the same directory (unpredictable name, never through a
+/// symlink), fsync and rename.
+pub fn write_keeping(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent directory"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("no file name"))?;
+    let tmp = dir.join(format!(
+        ".{}.atem-tmp-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// What `uninstall` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Removed {
+    /// No Atem entry (or no file): nothing written.
+    Nothing,
+    /// Our entries are gone; `backup` holds the file as it was.
+    Removed { backup: PathBuf },
+}
+
+/// Paths of every string starting with our marker.
+fn marked_paths(v: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    match v {
+        Value::String(s) if s.starts_with(MARKER) => out.push(path.clone()),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                path.push(i.to_string());
+                marked_paths(item, path, out);
+                path.pop();
+            }
+        }
+        Value::Object(map) => {
+            for (k, item) in map {
+                path.push(k.clone());
+                marked_paths(item, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The item spans of an object (key start .. value end) or array.
+fn spans(node: &Node) -> Vec<(usize, usize)> {
+    match &node.kind {
+        Kind::Object(m) => m.iter().map(|(_, k, v)| (*k, v.end)).collect(),
+        Kind::Array(items) => items.iter().map(|v| (v.start, v.end)).collect(),
+        Kind::Other => Vec::new(),
+    }
+}
+
+/// `text` without item `k` of `node` (and the comma that separated it).
+fn remove_item(text: &str, node: &Node, k: usize) -> String {
+    let items = spans(node);
+    let (from, to) = if items.len() == 1 {
+        items[0]
+    } else if k + 1 == items.len() {
+        (items[k - 1].1, items[k].1)
+    } else {
+        (items[k].0, items[k + 1].0)
+    };
+    format!("{}{}", &text[..from], &text[to..])
+}
+
+/// `text` without Atem's `PermissionRequest` groups, and without the
+/// containers left empty that `original` (the file before Atem's first
+/// change; `None`: unknown) didn't have. `Ok(None)` when there is nothing
+/// of ours; `Err` for anything unexpected (never guessed at).
+pub fn remove_ours(text: &str, original: Option<&str>) -> Result<Option<(String, Value)>> {
+    let mut want: Value = serde_json::from_str(text).context("it isn't valid JSON")?;
+    if !want.is_object() {
+        bail!("it isn't a JSON object");
+    }
+    if let Some(hooks) = want.get("hooks") {
+        let hooks = hooks
+            .as_object()
+            .ok_or_else(|| anyhow!("its \"hooks\" isn't an object"))?;
+        if hooks
+            .get("PermissionRequest")
+            .is_some_and(|l| !l.is_array())
+        {
+            bail!("its \"hooks.PermissionRequest\" isn't a list");
+        }
+    }
+    let mut found = Vec::new();
+    marked_paths(&want, &mut Vec::new(), &mut found);
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let groups = want
+        .get("hooks")
+        .and_then(|h| h.get("PermissionRequest"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("its Atem entry isn't in hooks.PermissionRequest"))?;
+    let mut ours = Vec::new();
+    for path in &found {
+        let i = match path.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            ["hooks", "PermissionRequest", i, "hooks", _, "command"] => i.parse::<usize>()?,
+            _ => bail!(
+                "it has Atem's marker in an unexpected place ({})",
+                path.join(".")
+            ),
+        };
+        if !ours.contains(&i) {
+            ours.push(i);
+        }
+    }
+    for &i in &ours {
+        let all_ours = groups[i]
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|hooks| {
+                hooks.iter().all(|h| {
+                    h.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.starts_with(MARKER))
+                })
+            });
+        if !all_ours {
+            bail!("Atem's entry shares its group with other hooks");
+        }
+    }
+    ours.sort_unstable();
+    // What existed before Atem: unknown → keep every container.
+    let before: Option<Value> = original.and_then(|t| serde_json::from_str(t).ok());
+    let had = |pointer: &str| before.as_ref().is_none_or(|b| b.pointer(pointer).is_some());
+
+    let mut out = text.to_string();
+    for &i in ours.iter().rev() {
+        let tree = Scanner { text: &out, i: 0 }.value()?;
+        let list = member(&tree, "hooks")
+            .and_then(|h| member(h, "PermissionRequest"))
+            .ok_or_else(|| anyhow!("hooks.PermissionRequest moved"))?;
+        out = remove_item(&out, list, i);
+    }
+    let hooks = want["hooks"].as_object_mut().unwrap();
+    let list = hooks["PermissionRequest"].as_array_mut().unwrap();
+    for &i in ours.iter().rev() {
+        list.remove(i);
+    }
+    if list.is_empty() && !had("/hooks/PermissionRequest") {
+        hooks.remove("PermissionRequest");
+        let tree = Scanner { text: &out, i: 0 }.value()?;
+        let h = member(&tree, "hooks").unwrap();
+        let k = match &h.kind {
+            Kind::Object(m) => m.iter().rposition(|(k, _, _)| k == "PermissionRequest"),
+            _ => None,
+        }
+        .ok_or_else(|| anyhow!("hooks.PermissionRequest moved"))?;
+        out = remove_item(&out, h, k);
+        if hooks.is_empty() && !had("/hooks") {
+            want.as_object_mut().unwrap().remove("hooks");
+            let tree = Scanner { text: &out, i: 0 }.value()?;
+            let k = match &tree.kind {
+                Kind::Object(m) => m.iter().rposition(|(k, _, _)| k == "hooks"),
+                _ => None,
+            }
+            .ok_or_else(|| anyhow!("hooks moved"))?;
+            out = remove_item(&out, &tree, k);
+        }
+    }
+    let check: Value = serde_json::from_str(&out).context("the removal went wrong")?;
+    if check != want {
+        bail!("Atem's entry couldn't be removed safely");
+    }
+    Ok(Some((out, want)))
+}
+
+/// A free backup name: `hooks.json.atem-bak`, else `….atem-bak.<seconds>`.
+fn backup_path(codex_home: &Path) -> PathBuf {
+    let first = codex_home.join(BACKUP);
+    if std::fs::symlink_metadata(&first).is_err() {
+        return first;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut n = 0;
+    loop {
+        let name = if n == 0 {
+            format!("{BACKUP}.{secs}")
+        } else {
+            format!("{BACKUP}.{secs}-{n}")
+        };
+        let p = codex_home.join(name);
+        if std::fs::symlink_metadata(&p).is_err() {
+            return p;
+        }
+        n += 1;
+    }
+}
+
+type Writer<'a> = &'a dyn Fn(&Path, &[u8], u32) -> std::io::Result<()>;
+
+/// Removes Atem's entries from `codex_home/hooks.json` (`approvals_hook =
+/// false`): only groups made of hooks with our marker; a backup first; the
+/// result read back and checked, else the file is restored. Codex's trust
+/// state (in its config.toml) is never touched.
+pub fn uninstall(codex_home: &Path) -> Result<Removed> {
+    uninstall_with(codex_home, &write_keeping, &write_keeping)
+}
+
+pub fn uninstall_with(codex_home: &Path, write: Writer, restore: Writer) -> Result<Removed> {
+    let path = codex_home.join("hooks.json");
+    let text = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.is_file() => bail!("{} isn't a regular file", path.display()),
+        Ok(_) => {
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removed::Nothing),
+        Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
+    };
+    let original = std::fs::read_to_string(codex_home.join(BACKUP)).ok();
+    let Some((new, want)) = remove_ours(&text, original.as_deref())
+        .with_context(|| format!("{} was left as it is", path.display()))?
+    else {
+        return Ok(Removed::Nothing);
+    };
+    let mode = file_mode(&path).unwrap_or(0o600);
+    let backup = backup_path(codex_home);
+    write(&backup, text.as_bytes(), mode)
+        .with_context(|| format!("writing {}", backup.display()))?;
+    write(&path, new.as_bytes(), mode).with_context(|| format!("writing {}", path.display()))?;
+    let landed = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    if landed.as_ref() != Some(&want) {
+        restore(&path, text.as_bytes(), mode)
+            .with_context(|| format!("restoring {} from {}", path.display(), backup.display()))?;
+        bail!(
+            "{} didn't read back as intended; the original was restored (a copy is in {})",
+            path.display(),
+            backup.display()
+        );
+    }
+    Ok(Removed::Removed { backup })
 }
 
 /// `[codex] approvals_hook` in config.toml.
@@ -384,8 +659,31 @@ pub fn read_consent(config: &Path) -> Result<Option<bool>> {
         .and_then(toml::Value::as_bool))
 }
 
-/// Records the answer, keeping the rest of config.toml as it is.
+/// Records the answer, keeping the rest of config.toml (and its mode) as
+/// it is: under an exclusive lock on `config.toml.lock`, written through a
+/// temp file and rename. Malformed TOML is refused, never rewritten.
 pub fn write_consent(config: &Path, allow: bool) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = config.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock_path = PathBuf::from(format!("{}.lock", config.display()));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    // SAFETY: flock on a descriptor this function owns; released on close.
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(anyhow!(error).context(format!("locking {}", lock_path.display())));
+        }
+    }
     let text = match std::fs::read_to_string(config) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -398,10 +696,10 @@ pub fn write_consent(config: &Path, allow: bool) -> Result<()> {
         doc["codex"] = toml_edit::table();
     }
     doc["codex"]["approvals_hook"] = toml_edit::value(allow);
-    if let Some(dir) = config.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(config, doc.to_string())?;
+    let mode = file_mode(config).unwrap_or(0o600);
+    write_keeping(config, doc.to_string().as_bytes(), mode)
+        .with_context(|| format!("writing {}", config.display()))?;
+    drop(lock);
     Ok(())
 }
 
@@ -459,6 +757,20 @@ pub fn setup(
         }
     };
     if !allow {
+        // Declined (now or earlier): an entry Atem added before goes.
+        match uninstall(&paths.codex_home) {
+            Ok(Removed::Nothing) => {}
+            Ok(Removed::Removed { backup }) => writeln!(
+                out,
+                "Removed Atem's approval hook from {} (approvals_hook = false; the file as it was is in {}).",
+                hooks.display(),
+                backup.display()
+            )?,
+            Err(error) => writeln!(
+                out,
+                "Atem's approval hook could not be removed: {error:#}. Remove the entry whose command starts with \"{MARKER}\" yourself."
+            )?,
+        }
         return Ok(Setup::Declined);
     }
     crate::chat::approvals::install_script(&paths.script)

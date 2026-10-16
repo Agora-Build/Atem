@@ -64,6 +64,9 @@ fn cut_item(item: &mut LogItem, max: usize) {
         LogItem::Problem { detail, .. } => {
             cut(detail, max);
         }
+        LogItem::ToolResult { text, .. } => {
+            cut(text, max);
+        }
         LogItem::TurnEnded { .. } => {}
     }
 }

@@ -317,12 +317,27 @@ pub enum WorkerMsg {
         request_id: String,
         reason: ApprovalCloseReason,
     },
-    /// The hook took the broker's decision (`ok`), or it couldn't be
-    /// handed over (`ok: false`).
+    /// What became of the broker's decision (see `ApplyOutcome`).
     ApprovalApplied {
         request_id: String,
-        ok: bool,
+        outcome: ApplyOutcome,
     },
+}
+
+/// What became of a decision the broker sent for a waiting approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyOutcome {
+    /// The hook took it and nothing contradicts it: the agent applied it
+    /// (the contract's `completed`).
+    Ok,
+    /// The hook took it, but the terminal may have answered first: the tool
+    /// ran after a deny, was refused after an allow, or the terminal's
+    /// answer predates the claim (`outcome_unknown`).
+    Unknown,
+    /// Never handed over: unknown or closed request, a rule that wasn't
+    /// offered, or the file couldn't be written (nothing reached the agent).
+    NotDelivered,
 }
 
 impl WorkerMsg {
@@ -573,7 +588,7 @@ mod tests {
             },
             WorkerMsg::ApprovalApplied {
                 request_id: "a1".into(),
-                ok: true,
+                outcome: ApplyOutcome::Unknown,
             },
         ];
         for message in messages {

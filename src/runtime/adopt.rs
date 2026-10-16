@@ -70,6 +70,63 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     }
 }
 
+/// Process `pid`'s parent pid and command name, as the OS reports them
+/// (Linux `/proc/<pid>/stat`, macOS `proc_pidinfo`). `None` when the
+/// process is gone or can't be read.
+pub fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        parse_stat_parent_and_name(&stat)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer is a proc_bsdinfo of the size passed.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        let name: String = info
+            .pbi_comm
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8 as char)
+            .collect();
+        Some((info.pbi_ppid, name))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Field 4 (`ppid`) and the name (field 2, in parentheses) of a
+/// `/proc/<pid>/stat` line.
+pub fn parse_stat_parent_and_name(stat: &str) -> Option<(u32, String)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let name = stat.get(open + 1..close)?.to_string();
+    let ppid = stat[close + 1..]
+        .split_ascii_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some((ppid, name))
+}
+
 /// Field 22 (`starttime`) of a `/proc/<pid>/stat` line. The command name
 /// (field 2) is in parentheses and may hold spaces and parentheses itself,
 /// so fields are counted after its last `)`.

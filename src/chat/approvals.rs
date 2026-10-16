@@ -31,9 +31,9 @@ pub const ENV: &str = "ATEM_APPROVAL_DIR";
 /// The script's file name in a Claude session directory.
 pub const SCRIPT_NAME: &str = "approval-hook.sh";
 /// Hook timeouts (seconds): Claude shows its dialog meanwhile, Codex holds
-/// its prompt until the hook returns, so its wait is short.
+/// its prompt until the hook returns, so its wait is shorter.
 pub const CLAUDE_TIMEOUT: u64 = 600;
-pub const CODEX_TIMEOUT: u64 = 120;
+pub const CODEX_TIMEOUT: u64 = 300;
 /// What a deny without a message tells the agent.
 pub const DEFAULT_DENY: &str = "Denied from Astation";
 
