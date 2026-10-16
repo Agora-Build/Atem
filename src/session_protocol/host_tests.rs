@@ -716,19 +716,6 @@ fn prompt_runs_to_completion_and_duplicates_return_the_receipt() {
 }
 
 #[test]
-fn approval_answers_are_forbidden_in_v1() {
-    let mut rt = setup();
-    let e = hold(&mut rt, "c1", S1);
-    let mut m = submit(&rt, "c1", S1, e, 1, "interrupt");
-    m["data"]["kind"] = json!("approval");
-    rt.send("c1", &m);
-    let err = only(&mut rt, "c1");
-    assert_error(&err, "forbidden");
-    assert_eq!(err["detail"], DETAIL_APPROVAL);
-    assert!(rt.host.receipt(&rid(1)).is_none());
-}
-
-#[test]
 fn trust_change_before_dispatch_rejects_and_revokes() {
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);

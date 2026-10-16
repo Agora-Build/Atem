@@ -14,7 +14,9 @@
 //! scenario instead of being ignored.
 
 use super::client::{LeaseClient, LeaseRequest, RegistryClient};
-use super::wire::{self, ClientKind, DecodeError, Envelope, Op, Permission};
+use super::wire::{
+    self, AlwaysRule, ApprovalCloseReason, ClientKind, DecodeError, Envelope, Op, Permission,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -126,6 +128,24 @@ pub enum HostEvent {
     /// The writer writes the queued chunks now (each checked at the write
     /// boundary).
     FlushPtyWrites,
+    /// The agent asks a permission prompt the runtime offers for remote
+    /// answers (r7); refused silently when the host won't open it.
+    OpenApproval {
+        session_id: String,
+        tool: String,
+        summary: String,
+        always_rules: Vec<AlwaysRule>,
+    },
+    /// The runtime saw the approval end without the remote answer.
+    CloseApproval {
+        approval_id: String,
+        reason: ApprovalCloseReason,
+    },
+    /// The agent's report on a handed-over answer.
+    ApprovalApplied {
+        approval_id: String,
+        ok: bool,
+    },
 }
 
 /// The host authority under test (`fake_runtime::FakeRuntime`).
@@ -443,6 +463,9 @@ impl Runner {
             ("turn_complete", &["turn_id"]),
             ("hold_pty_writes", &[]),
             ("flush_pty_writes", &[]),
+            ("open_approval", &["tool", "summary", "always_rules"]),
+            ("close_approval", &["reason"]),
+            ("approval_applied", &["ok"]),
             ("assert", &[]),
             ("assert_client", &[]),
         ];
@@ -629,6 +652,25 @@ impl Runner {
             },
             "hold_pty_writes" => yes(arg).map(|_| HostEvent::HoldPtyWrites)?,
             "flush_pty_writes" => yes(arg).map(|_| HostEvent::FlushPtyWrites)?,
+            "open_approval" => HostEvent::OpenApproval {
+                session_id: as_str(arg, "open_approval")?.into(),
+                tool: as_str(take(step, "tool")?, "tool")?.into(),
+                summary: as_str(take(step, "summary")?, "summary")?.into(),
+                always_rules: match step.get("always_rules") {
+                    None => Vec::new(),
+                    Some(v) => serde_json::from_value(v.clone())
+                        .map_err(|e| format!("always_rules: {e}"))?,
+                },
+            },
+            "close_approval" => HostEvent::CloseApproval {
+                approval_id: as_str(arg, "close_approval")?.into(),
+                reason: serde_json::from_value(take(step, "reason")?.clone())
+                    .map_err(|e| format!("reason: {e}"))?,
+            },
+            "approval_applied" => HostEvent::ApprovalApplied {
+                approval_id: as_str(arg, "approval_applied")?.into(),
+                ok: take(step, "ok")?.as_bool().ok_or("ok must be a boolean")?,
+            },
             other => return Err(format!("{other} is not a host event")),
         })
     }
@@ -794,7 +836,10 @@ impl Runner {
                     l.on_lease_changed(session_id, process_gen, *lease_epoch);
                 }
             }
-            Op::Sessions { .. } | Op::SessionChanged { .. } => {
+            Op::Sessions { .. }
+            | Op::SessionChanged { .. }
+            | Op::ApprovalRequest(_)
+            | Op::ApprovalClosed { .. } => {
                 m.registry.on_message(&msg.op);
                 if m.registry.take_list_request() {
                     m.lists_requested += 1;
@@ -864,6 +909,12 @@ impl Runner {
                     }
                     continue;
                 }
+                "approvals" => Value::from(
+                    m.registry
+                        .pending_approvals()
+                        .map(|a| Value::from(a.approval_id.clone()))
+                        .collect::<Vec<_>>(),
+                ),
                 "runtime_epoch" => m.registry.runtime_epoch().map_or(Value::Null, Value::from),
                 "seq" => m.registry.seq().map_or(Value::Null, Value::from),
                 "sent_list" => Value::Bool(m.lists_requested > 0),
@@ -993,6 +1044,41 @@ mod tests {
                 "code",
                 json!("lease_held"),
             ),
+            (
+                "approval-allow-once-is-handed-to-the-agent-and-completes",
+                "state",
+                json!("outcome_unknown"),
+            ),
+            (
+                "approval-allow-always-must-name-an-offered-rule",
+                "code",
+                json!("forbidden"),
+            ),
+            (
+                "approval-answered-in-the-terminal-first-refuses-the-late-remote-answer",
+                "code",
+                json!("forbidden"),
+            ),
+            (
+                "approval-closes-when-the-lease-is-lost",
+                "reason",
+                json!("timed_out"),
+            ),
+            (
+                "approval-needs-control-and-the-lease",
+                "code",
+                json!("stale_lease"),
+            ),
+            (
+                "approval-duplicate-submit-returns-the-receipt",
+                "code",
+                json!("busy"),
+            ),
+            (
+                "approval-pending-is-sent-again-after-list",
+                "reason",
+                json!("answered_remote"),
+            ),
         ];
         for (name, key, to) in mutations {
             let mut f = fixture(name);
@@ -1018,6 +1104,16 @@ mod tests {
         let mut f = fixture("dispatch-failure-before-any-effect-is-rejected");
         let last = f["steps"].as_array_mut().unwrap().last_mut().unwrap();
         last["assert"]["dispatch_attempts"] = json!(2);
+        assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
+        // And on a changed decision handed to the agent.
+        let mut f = fixture("approval-deny-carries-the-message-to-the-agent");
+        let step = f["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["assert"].get("approval_decisions").is_some())
+            .unwrap();
+        step["assert"]["approval_decisions"][0]["message"] = json!("something else");
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
     }
 

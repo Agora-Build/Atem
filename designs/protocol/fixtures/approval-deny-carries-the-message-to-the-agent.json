@@ -1,0 +1,176 @@
+{
+ "name": "approval-deny-carries-the-message-to-the-agent",
+ "setup": {
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222"
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "holds_lease_epoch": 1,
+    "client_kind": "native"
+   }
+  ],
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  }
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000001"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "sessions.#": 1
+   }
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "npm test",
+   "always_rules": [
+    {
+     "rule_id": "r-npm-test",
+     "label": "Bash(npm test:*)",
+     "scope": "this project"
+    },
+    {
+     "rule_id": "r-npm",
+     "label": "Bash(npm:*)",
+     "scope": "this project"
+    }
+   ]
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "npm test",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     },
+     {
+      "rule_id": "r-npm",
+      "label": "Bash(npm:*)",
+      "scope": "this project"
+     }
+    ]
+   },
+   "capture": {
+    "aid": "approval_id"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${aid}",
+      "decision": "deny",
+      "message": "not on main; use the staging database"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "kind": "approval",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000002"
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "kind": "approval",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${aid}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "assert": {
+    "approval_decisions": [
+     {
+      "approval_id": "${aid}",
+      "decision": "deny",
+      "message": "not on main; use the staging database"
+     }
+    ],
+    "approvals_pending": 0,
+    "dispatches": 1
+   }
+  },
+  {
+   "approval_applied": "${aid}",
+   "ok": true
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "kind": "approval",
+    "state": "completed"
+   }
+  }
+ ],
+ "note": "deny with an optional message (<= 512 bytes): the agent gets the message with the denial; the receipt completes when the agent reports it applied."
+}

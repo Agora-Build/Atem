@@ -1,4 +1,4 @@
-//! The host authority for atem-session v1 (contract r6, compatibility mode):
+//! The host authority for atem-session v1 (contract r7, compatibility mode):
 //! attachments and hello/welcome (§3), the session registry with a
 //! per-attachment `seq` (§4), control leases with input-epoch fencing (§5),
 //! submissions with durable receipts (§6) and errors without disclosure (§7).
@@ -24,11 +24,23 @@
 //! Refused terminal-v1 requests are answered with terminal-v1 `error`, and a
 //! chat-v1 `submit` hears about its request through chat-v1 ops
 //! (`Effect::Chat`); removed forms get a session `error` without `re`.
+//!
+//! Approvals (r7): the runtime opens an agent permission prompt with
+//! `open_approval` only while a remote controller holds the session's lease;
+//! subscribed viewers get `approval_request` (again after every `list`). The
+//! lease holder answers with a `kind:"approval"` submission; once it is
+//! `executing` the approval closes (`answered_remote`) and `Effect::Approval`
+//! hands the decision to the agent, whose report (`approval_applied`,
+//! `close_approval`, `dispatch_report`) finishes the receipt. Lease loss or
+//! the process ending closes a pending approval and tells the runtime to
+//! answer "no decision" (`Effect::ApprovalReleased`); the terminal can always
+//! answer instead (`close_approval(answered_terminal)`).
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 use super::journal::{self, Journal, JournalError, Record, Stored};
 use super::wire::{
-    self, Activity, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
+    self, Activity, AlwaysRule, ApprovalAnswer, ApprovalCloseReason, ApprovalDecision,
+    ApprovalRequest, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
     FamilyMessage, LeaseChangeReason, MAX_IN_FLIGHT, MAX_PROMPT_BYTES, Op, Permission, Receipt,
     ReceiptKind, ReceiptState, SessionMessage, SessionState, Target, TerminalRequest,
 };
@@ -48,8 +60,13 @@ pub const OBSERVE_MS: u64 = 10_000;
 pub const LEASE_EPOCH_BLOCK: u64 = 64;
 /// Default per-session receipt bound (`receipt_limit` beyond it).
 pub const DEFAULT_MAX_RECEIPTS: usize = 4096;
+/// Pending approvals per session; `open_approval` refuses beyond it.
+pub const MAX_PENDING_APPROVALS: usize = 16;
 
-pub const DETAIL_APPROVAL: &str = "approval answers are not supported in v1";
+pub const DETAIL_APPROVAL_CLOSED: &str = "the approval closed before the answer was handed over";
+pub const DETAIL_APPROVAL_CROSSED: &str = "the terminal answered too; which answer won is unknown";
+pub const DETAIL_APPROVAL_UNCONFIRMED: &str = "the agent did not confirm the decision";
+pub const DETAIL_DECISION_NOT_DELIVERED: &str = "could not hand the decision to the agent";
 pub const DETAIL_TRUST_CHANGED: &str = "host trust changed";
 pub const DETAIL_SESSION_CLOSED: &str = "session closed";
 pub const DETAIL_NOT_RECORDED: &str = "could not record the request";
@@ -187,6 +204,25 @@ pub enum Effect {
         target: Target,
         kind: ReceiptKind,
     },
+    /// Hand the lease holder's answer to the agent's waiting permission
+    /// prompt (`executing` is already durable). Report back with
+    /// `approval_applied` (or `close_approval`, or `dispatch_report` with
+    /// `FailedNoEffect` when the decision could not be delivered).
+    Approval {
+        request_id: String,
+        session_id: String,
+        approval_id: String,
+        decision: ApprovalDecision,
+        rule_id: Option<String>,
+        message: Option<String>,
+    },
+    /// The host closed a pending approval (lease lost, process ended,
+    /// restart): answer the agent's waiting prompt with "no decision" so its
+    /// own prompt asks.
+    ApprovalReleased {
+        session_id: String,
+        approval_id: String,
+    },
     /// A chat-v1 reply to the conversation that submitted (or was refused).
     /// The runtime's chat stream renders it with its own `generation` and
     /// `sequence` head.
@@ -237,7 +273,26 @@ pub enum DispatchReport {
     Unknown,
 }
 
+/// What the runtime knows of an agent permission prompt (r7). `tool` and
+/// `summary` are already redacted (never full inputs); `always_rules` are
+/// the agent's own suggestions, offered as they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalInfo {
+    pub tool: String,
+    pub summary: String,
+    pub always_rules: Vec<AlwaysRule>,
+}
+
 // ── State ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Approval {
+    request: ApprovalRequest,
+    /// Opening order (catch-up after `list` goes in this order).
+    order: u64,
+    /// The remote answer handed to the agent, awaiting its report.
+    handed_off: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 struct Lease {
@@ -325,6 +380,10 @@ pub struct SessionHost<J: Journal> {
     /// `receipts`): per-session scans don't walk every receipt.
     by_session: HashMap<String, BTreeSet<String>>,
     lease_floors: HashMap<String, u64>,
+    /// approval_id → open approvals (pending, or handed off and awaiting the
+    /// agent's report). Not persisted: a restart releases them.
+    approvals: BTreeMap<String, Approval>,
+    approvals_opened: u64,
     /// Admission order of the next new request.
     next_order: u64,
     /// Final transitions whose durable write failed, retried on `advance`.
@@ -357,6 +416,8 @@ impl<J: Journal> SessionHost<J> {
             receipts: BTreeMap::new(),
             by_session: HashMap::new(),
             lease_floors: HashMap::new(),
+            approvals: BTreeMap::new(),
+            approvals_opened: 0,
             next_order: 0,
             retry: Vec::new(),
             out: Vec::new(),
@@ -672,7 +733,8 @@ impl<J: Journal> SessionHost<J> {
                 ReceiptState::Rejected,
                 Some(
                     match kind {
-                        ReceiptKind::Prompt | ReceiptKind::Approval => DETAIL_NO_TERMINAL_WRITE,
+                        ReceiptKind::Prompt => DETAIL_NO_TERMINAL_WRITE,
+                        ReceiptKind::Approval => DETAIL_DECISION_NOT_DELIVERED,
                         ReceiptKind::Interrupt => DETAIL_INTERRUPT_NOT_SENT,
                         ReceiptKind::Stop => DETAIL_STOP_FAILED,
                     }
@@ -683,7 +745,8 @@ impl<J: Journal> SessionHost<J> {
                 ReceiptState::OutcomeUnknown,
                 Some(
                     match kind {
-                        ReceiptKind::Prompt | ReceiptKind::Approval => DETAIL_WRITE_INTERRUPTED,
+                        ReceiptKind::Prompt => DETAIL_WRITE_INTERRUPTED,
+                        ReceiptKind::Approval => DETAIL_APPROVAL_UNCONFIRMED,
                         ReceiptKind::Interrupt => DETAIL_NO_INTERRUPT,
                         ReceiptKind::Stop => DETAIL_STILL_RUNNING,
                     }
@@ -696,6 +759,10 @@ impl<J: Journal> SessionHost<J> {
             ),
         };
         self.finish(request_id, state, detail.as_deref());
+        if kind == ReceiptKind::Approval {
+            self.approvals
+                .retain(|_, a| a.handed_off.as_deref() != Some(request_id));
+        }
         self.take()
     }
 
@@ -740,6 +807,7 @@ impl<J: Journal> SessionHost<J> {
         s.activity = Activity::Unknown;
         s.exit_status = exit_status;
         s.activity_since = wall;
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
         self.process_gone(session_id);
         self.registry_changed(session_id);
@@ -772,6 +840,7 @@ impl<J: Journal> SessionHost<J> {
                 _ => {}
             }
         }
+        self.forget_finished_approvals();
     }
 
     /// The session no longer accepts submissions; its receipts are kept for
@@ -783,6 +852,7 @@ impl<J: Journal> SessionHost<J> {
         };
         s.state = SessionState::Closed;
         self.ended.entry(session_id.to_string()).or_insert(self.now);
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         if process_gone {
@@ -834,6 +904,7 @@ impl<J: Journal> SessionHost<J> {
         if used {
             return Err("process_gen already used".into());
         }
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         self.process_gone(session_id);
@@ -857,6 +928,7 @@ impl<J: Journal> SessionHost<J> {
         if !self.sessions.contains_key(session_id) {
             return Vec::new();
         }
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         self.process_gone(session_id);
@@ -935,6 +1007,16 @@ impl<J: Journal> SessionHost<J> {
         self.attachments.clear();
         self.retry.clear();
         self.out.clear();
+        // Approvals live in memory only: the waiting prompts get "no
+        // decision" (nobody is attached to answer them any more).
+        for (approval_id, a) in std::mem::take(&mut self.approvals) {
+            if a.handed_off.is_none() {
+                self.out.push(Effect::ApprovalReleased {
+                    session_id: a.request.session_id,
+                    approval_id,
+                });
+            }
+        }
         self.install(replayed);
         for (sid, s) in self.sessions.iter_mut() {
             let floor = self.lease_floors.get(sid).copied().unwrap_or(0);
@@ -944,7 +1026,9 @@ impl<J: Journal> SessionHost<J> {
             s.input_epoch += 1;
             s.queued.clear();
         }
-        Ok(self.recover())
+        let mut fx = self.take();
+        fx.extend(self.recover());
+        Ok(fx)
     }
 
     /// The host's identity changed (a pairing verified under another
@@ -1364,6 +1448,18 @@ impl<J: Journal> SessionHost<J> {
             sessions,
         };
         self.send(att, re, op);
+        // Catch-up: every pending approval, after the snapshot.
+        let mut pending: Vec<&Approval> = self
+            .approvals
+            .values()
+            .filter(|a| a.handed_off.is_none())
+            .collect();
+        pending.sort_by_key(|a| a.order);
+        let requests: Vec<ApprovalRequest> =
+            pending.into_iter().map(|a| a.request.clone()).collect();
+        for r in requests {
+            self.send(att, None, Op::ApprovalRequest(r));
+        }
         Ok(())
     }
 
@@ -1372,13 +1468,7 @@ impl<J: Journal> SessionHost<J> {
         let Some(descriptor) = self.sessions.get(sid).map(|s| self.descriptor(s)) else {
             return;
         };
-        let subscribers: Vec<String> = self
-            .attachments
-            .iter()
-            .filter(|(_, a)| a.registry_seq.is_some() && a.can(Permission::View))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for att in subscribers {
+        for att in self.subscribers() {
             let Some(seq) = self.next_seq(&att) else {
                 continue;
             };
@@ -1444,6 +1534,7 @@ impl<J: Journal> SessionHost<J> {
         s.lease_epoch += 1;
         self.lease_changed(sid, reason, except);
         self.registry_changed(sid);
+        self.close_pending(sid, ApprovalCloseReason::LeaseLost);
     }
 
     /// Makes sure epochs up to `need` are durably reserved.
@@ -1522,6 +1613,10 @@ impl<J: Journal> SessionHost<J> {
         };
         self.lease_changed(&sid, reason, Some(att));
         self.registry_changed(&sid);
+        if previous.is_some() {
+            // Asked of the previous holder: the new one didn't see it come.
+            self.close_pending(&sid, ApprovalCloseReason::LeaseLost);
+        }
         Ok(())
     }
 
@@ -1568,11 +1663,6 @@ impl<J: Journal> SessionHost<J> {
         kind: ReceiptKind,
         payload: Value,
     ) -> Checked {
-        if kind == ReceiptKind::Approval && !self.receipts.contains_key(request_id) {
-            self.check_binding(att, b)?;
-            self.error(att, re, ErrorCode::Forbidden, Some(DETAIL_APPROVAL));
-            return Ok(());
-        }
         self.submit(att, Reply::Session(re), b, request_id, kind, payload)
     }
 
@@ -1601,6 +1691,13 @@ impl<J: Journal> SessionHost<J> {
         }
         let sid = &b.target.session_id;
         self.check_mutation(att, &self.sessions[sid], b.lease_epoch)?;
+        if kind == ReceiptKind::Approval {
+            let answer =
+                ApprovalAnswer::parse(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?;
+            if !self.answerable(&b.target, &answer) {
+                return Err(ErrorCode::StaleTarget);
+            }
+        }
         let held = self.by_session.get(sid).map_or(0, BTreeSet::len);
         if held >= self.config.max_receipts_per_session {
             return Err(ErrorCode::ReceiptLimit);
@@ -1747,6 +1844,20 @@ impl<J: Journal> SessionHost<J> {
             .payload
             .clone()
             .unwrap_or(Value::Null);
+        let kind = self.receipts[rid].stored.kind;
+        let answer = if kind == ReceiptKind::Approval {
+            // Handed over only while its approval is still pending (after a
+            // restart it never is).
+            match ApprovalAnswer::parse(&payload) {
+                Ok(a) if self.answerable(&target, &a) => Some(a),
+                _ => {
+                    self.finish(rid, ReceiptState::Rejected, Some(DETAIL_APPROVAL_CLOSED));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if !self.transition(rid, ReceiptState::Executing, None) {
             self.finish(rid, ReceiptState::Rejected, Some(DETAIL_NOT_RECORDED));
             return;
@@ -1757,6 +1868,10 @@ impl<J: Journal> SessionHost<J> {
             e.observe_deadline = Some(now.saturating_add(OBSERVE_MS));
         }
         let s = &e.stored;
+        if let Some(a) = answer {
+            self.hand_off(rid, &target, a);
+            return;
+        }
         let effect = Effect::Dispatch {
             request_id: rid.to_string(),
             target: s.target.clone(),
@@ -1764,6 +1879,226 @@ impl<J: Journal> SessionHost<J> {
             payload,
         };
         self.out.push(effect);
+    }
+
+    // ── Approvals (r7) ──
+
+    /// The runtime opens an agent permission prompt for `session_id`'s
+    /// process `process_gen` at monotonic `now` (timers due by then fire
+    /// first). Refused (`Err`: the agent's own prompt asks) unless the
+    /// session runs that process and a remote controller holds a live lease,
+    /// the info is within bounds and fewer than `MAX_PENDING_APPROVALS` are
+    /// pending. Subscribed viewers get `approval_request`. The effects are
+    /// returned either way.
+    pub fn open_approval(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+        info: ApprovalInfo,
+        now: u64,
+    ) -> (Result<String, String>, Vec<Effect>) {
+        self.tick(now);
+        let opened = self.open_checked(session_id, process_gen, info);
+        (opened, self.take())
+    }
+
+    fn open_checked(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+        info: ApprovalInfo,
+    ) -> Result<String, String> {
+        wire::validate_approval_info(&info.tool, &info.summary, &info.always_rules)?;
+        if self.halted {
+            return Err("host halted".into());
+        }
+        let s = self
+            .sessions
+            .get(session_id)
+            .filter(|s| s.state == SessionState::Running && s.spec.process_gen == process_gen)
+            .ok_or("no running session with that process")?;
+        if s.lease.as_ref().is_none_or(|l| self.now >= l.deadline) {
+            return Err("no remote controller".into());
+        }
+        let pending = self
+            .approvals
+            .values()
+            .filter(|a| a.request.session_id == session_id && a.handed_off.is_none())
+            .count();
+        if pending >= MAX_PENDING_APPROVALS {
+            return Err("too many pending approvals".into());
+        }
+        let approval_id = self.new_id();
+        let request = ApprovalRequest {
+            approval_id: approval_id.clone(),
+            session_id: session_id.to_string(),
+            process_gen: process_gen.to_string(),
+            tool: info.tool,
+            summary: info.summary,
+            created_at: self.wall(),
+            always_rules: info.always_rules,
+        };
+        self.approvals_opened += 1;
+        self.approvals.insert(
+            approval_id.clone(),
+            Approval {
+                request: request.clone(),
+                order: self.approvals_opened,
+                handed_off: None,
+            },
+        );
+        for att in self.subscribers() {
+            self.send(&att, None, Op::ApprovalRequest(request.clone()));
+        }
+        Ok(approval_id)
+    }
+
+    /// The runtime saw the approval end without the remote answer: answered
+    /// in the terminal, interrupted (Esc), timed out, or the process ended.
+    /// A pending one closes for viewers; one whose remote answer was already
+    /// handed over finishes `outcome_unknown` (the answers crossed, or the
+    /// agent never confirmed it). `answered_remote` is the host's own reason
+    /// and is ignored here, as are unknown ids.
+    pub fn close_approval(
+        &mut self,
+        approval_id: &str,
+        reason: ApprovalCloseReason,
+    ) -> Vec<Effect> {
+        if reason == ApprovalCloseReason::AnsweredRemote {
+            return Vec::new();
+        }
+        let Some(a) = self.approvals.remove(approval_id) else {
+            return Vec::new();
+        };
+        match a.handed_off {
+            Some(rid) => {
+                let detail = match reason {
+                    ApprovalCloseReason::AnsweredTerminal => DETAIL_APPROVAL_CROSSED,
+                    ApprovalCloseReason::ProcessEnded => DETAIL_AGENT_EXITED,
+                    _ => DETAIL_APPROVAL_UNCONFIRMED,
+                };
+                self.finish(&rid, ReceiptState::OutcomeUnknown, Some(detail));
+            }
+            None => self.approval_closed(approval_id, reason),
+        }
+        self.take()
+    }
+
+    /// The agent's report on a handed-over answer: applied (`completed`), or
+    /// not known to be (`outcome_unknown`: the terminal's answer may have
+    /// won). Ignored for anything not handed over.
+    pub fn approval_applied(&mut self, approval_id: &str, ok: bool) -> Vec<Effect> {
+        let rid = match self.approvals.get(approval_id) {
+            Some(Approval {
+                handed_off: Some(rid),
+                ..
+            }) => rid.clone(),
+            _ => return Vec::new(),
+        };
+        self.approvals.remove(approval_id);
+        if ok {
+            self.finish(&rid, ReceiptState::Completed, None);
+        } else {
+            self.finish(
+                &rid,
+                ReceiptState::OutcomeUnknown,
+                Some(DETAIL_APPROVAL_CROSSED),
+            );
+        }
+        self.take()
+    }
+
+    /// Pending (not yet answered) approvals of `session_id`, in opening order.
+    pub fn pending_approvals(&self, session_id: &str) -> Vec<String> {
+        let mut pending: Vec<&Approval> = self
+            .approvals
+            .values()
+            .filter(|a| a.request.session_id == session_id && a.handed_off.is_none())
+            .collect();
+        pending.sort_by_key(|a| a.order);
+        pending
+            .into_iter()
+            .map(|a| a.request.approval_id.clone())
+            .collect()
+    }
+
+    /// The answer names an approval pending for exactly this target's
+    /// session and process, and (for `allow_always`) one of its rules.
+    fn answerable(&self, t: &Target, answer: &ApprovalAnswer) -> bool {
+        self.approvals.get(&answer.approval_id).is_some_and(|a| {
+            let r = &a.request;
+            a.handed_off.is_none()
+                && r.session_id == t.session_id
+                && r.process_gen == t.process_gen
+                && answer
+                    .rule_id
+                    .as_ref()
+                    .is_none_or(|id| r.always_rules.iter().any(|x| &x.rule_id == id))
+        })
+    }
+
+    /// `executing` is durable: the approval closes for viewers
+    /// (`answered_remote`) and the decision goes to the agent.
+    fn hand_off(&mut self, rid: &str, target: &Target, a: ApprovalAnswer) {
+        if let Some(entry) = self.approvals.get_mut(&a.approval_id) {
+            entry.handed_off = Some(rid.to_string());
+        }
+        self.approval_closed(&a.approval_id, ApprovalCloseReason::AnsweredRemote);
+        self.out.push(Effect::Approval {
+            request_id: rid.to_string(),
+            session_id: target.session_id.clone(),
+            approval_id: a.approval_id,
+            decision: a.decision,
+            rule_id: a.rule_id,
+            message: a.message,
+        });
+    }
+
+    /// Tells every subscribed viewer the approval closed.
+    fn approval_closed(&mut self, approval_id: &str, reason: ApprovalCloseReason) {
+        for att in self.subscribers() {
+            let op = Op::ApprovalClosed {
+                approval_id: approval_id.to_string(),
+                reason,
+            };
+            self.send(&att, None, op);
+        }
+    }
+
+    /// Closes `sid`'s pending approvals (the host's decision: lease lost) and
+    /// has the runtime answer them "no decision".
+    fn close_pending(&mut self, sid: &str, reason: ApprovalCloseReason) {
+        let ids = self.pending_approvals(sid);
+        for id in ids {
+            self.approvals.remove(&id);
+            self.approval_closed(&id, reason);
+            self.out.push(Effect::ApprovalReleased {
+                session_id: sid.to_string(),
+                approval_id: id,
+            });
+        }
+    }
+
+    /// Forgets handed-off approvals whose receipt is final (e.g. finished
+    /// with the process); the agent's report on them would change nothing.
+    fn forget_finished_approvals(&mut self) {
+        let receipts = &self.receipts;
+        self.approvals.retain(|_, a| {
+            a.handed_off.as_ref().is_none_or(|rid| {
+                receipts
+                    .get(rid)
+                    .is_some_and(|e| !journal::is_final(e.stored.state))
+            })
+        });
+    }
+
+    /// Welcomed attachments subscribed to the registry (`list`) with `view`.
+    fn subscribers(&self) -> Vec<String> {
+        self.attachments
+            .iter()
+            .filter(|(_, a)| a.registry_seq.is_some() && a.can(Permission::View))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Persists and applies one transition, then tells the submitter.

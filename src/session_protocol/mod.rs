@@ -1,4 +1,4 @@
-//! atem-session v1 (designs/protocol/atem-session-v1.md, r6, compatibility mode):
+//! atem-session v1 (designs/protocol/atem-session-v1.md, r7, compatibility mode):
 //! wire types, strict decoding and the canonical payload digest (`wire`,
 //! `canonical`), the client lease/registry state machines (`client`), the host
 //! authority (`host`) and its durable receipt journal (`journal`, on disk
@@ -29,6 +29,8 @@ pub mod journal;
 #[allow(dead_code)]
 pub mod wire;
 
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 mod fake_runtime;
 #[cfg(test)]

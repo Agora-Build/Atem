@@ -32,6 +32,13 @@ pub const MAX_PROMPT_BYTES: usize = 32_768;
 pub const MAX_REQUEST_IDS: usize = 64;
 pub const MAX_DETAIL_BYTES: usize = 512;
 pub const MAX_OPAQUE_ID_BYTES: usize = 128;
+/// Approvals (r7): `tool` 1–128 bytes, `summary` ≤ 512 bytes, each offered
+/// rule's `label`/`scope` 1–256 bytes, ≤ 8 rules, a deny `message` ≤ 512 bytes.
+pub const MAX_APPROVAL_TOOL_BYTES: usize = 128;
+pub const MAX_APPROVAL_SUMMARY_BYTES: usize = 512;
+pub const MAX_RULE_TEXT_BYTES: usize = 256;
+pub const MAX_ALWAYS_RULES: usize = 8;
+pub const MAX_APPROVAL_MESSAGE_BYTES: usize = 512;
 /// In-flight requests per attachment (enforced by the host; excess → `busy`).
 pub const MAX_IN_FLIGHT: usize = 64;
 
@@ -88,6 +95,13 @@ fn uuid(s: &str, what: &str) -> Result<(), String> {
 /// Counters and times: JSON integers 0 ≤ n ≤ 2^53−1 (§1).
 fn safe(n: u64, what: &str) -> Result<(), String> {
     check(n <= MAX_SAFE_INTEGER, what)
+}
+
+/// Display text: bounded, and no control characters (C0, DEL, C1) except
+/// the ones `allowed` (none for one-line text).
+fn text(s: &str, min: usize, max: usize, allowed: &[char], what: &str) -> Result<(), String> {
+    let clean = s.chars().all(|c| !c.is_control() || allowed.contains(&c));
+    check((min..=max).contains(&s.len()) && clean, what)
 }
 
 fn detail(d: &Option<String>) -> Result<(), String> {
@@ -169,8 +183,29 @@ pub enum ReceiptKind {
     Prompt,
     Interrupt,
     Stop,
-    /// Reserved for v1.1; the host rejects it with `forbidden`.
+    /// The answer to a pending approval (r7).
     Approval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    AllowOnce,
+    /// Applies one of the rules the agent offered (`rule_id`).
+    AllowAlways,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalCloseReason {
+    /// The lease holder's answer was handed to the agent.
+    AnsweredRemote,
+    AnsweredTerminal,
+    Interrupted,
+    TimedOut,
+    LeaseLost,
+    ProcessEnded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +287,104 @@ pub struct Receipt {
     )]
     pub detail: Option<String>,
     pub updated_at: u64,
+}
+
+/// One "always allow" rule the agent itself suggested, shown before the tap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlwaysRule {
+    pub rule_id: String,
+    pub label: String,
+    pub scope: String,
+}
+
+/// `approval_request` (r7): an agent permission prompt the lease holder may
+/// answer, bound to one session and process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub approval_id: String,
+    pub session_id: String,
+    pub process_gen: String,
+    pub tool: String,
+    /// Redacted: the command's first line or the file path, never full inputs.
+    pub summary: String,
+    pub created_at: u64,
+    pub always_rules: Vec<AlwaysRule>,
+}
+
+/// The payload of a `kind:"approval"` submission. Exactly these fields:
+/// `rule_id` iff `allow_always`, `message` only with `deny`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalAnswer {
+    pub approval_id: String,
+    pub decision: ApprovalDecision,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rule_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message: Option<String>,
+}
+
+impl ApprovalAnswer {
+    /// The validated answer in an approval payload.
+    pub fn parse(payload: &Value) -> Result<Self, String> {
+        let a: Self =
+            serde_json::from_value(payload.clone()).map_err(|e| format!("approval: {e}"))?;
+        uuid(&a.approval_id, "approval_id")?;
+        match (a.decision, &a.rule_id) {
+            (ApprovalDecision::AllowAlways, Some(r)) => check(is_opaque_id(r), "rule_id")?,
+            (ApprovalDecision::AllowAlways, None) => return Err("rule_id missing".into()),
+            (_, Some(_)) => return Err("rule_id only with allow_always".into()),
+            (_, None) => {}
+        }
+        match (a.decision, &a.message) {
+            (ApprovalDecision::Deny, Some(m)) => {
+                text(m, 0, MAX_APPROVAL_MESSAGE_BYTES, &['\n'], "message")?
+            }
+            (_, Some(_)) => return Err("message only with deny".into()),
+            (_, None) => {}
+        }
+        Ok(a)
+    }
+}
+
+/// The bounds of what an approval shows (r7): one-line `tool` and
+/// `summary`, ≤ 8 rules with unique ids and one-line labels and scopes.
+pub fn validate_approval_info(
+    tool: &str,
+    summary: &str,
+    always_rules: &[AlwaysRule],
+) -> Result<(), String> {
+    text(tool, 1, MAX_APPROVAL_TOOL_BYTES, &[], "tool")?;
+    text(summary, 0, MAX_APPROVAL_SUMMARY_BYTES, &[], "summary")?;
+    check(always_rules.len() <= MAX_ALWAYS_RULES, "always_rules count")?;
+    for (i, r) in always_rules.iter().enumerate() {
+        check(is_opaque_id(&r.rule_id), "rule_id")?;
+        check(
+            always_rules[..i].iter().all(|o| o.rule_id != r.rule_id),
+            "duplicate rule_id",
+        )?;
+        text(&r.label, 1, MAX_RULE_TEXT_BYTES, &[], "rule label")?;
+        text(&r.scope, 1, MAX_RULE_TEXT_BYTES, &[], "rule scope")?;
+    }
+    Ok(())
+}
+
+impl ApprovalRequest {
+    fn validate(&self) -> Result<(), String> {
+        uuid(&self.approval_id, "approval_id")?;
+        check(is_session_id(&self.session_id), "session_id")?;
+        uuid(&self.process_gen, "process_gen")?;
+        safe(self.created_at, "created_at")?;
+        validate_approval_info(&self.tool, &self.summary, &self.always_rules)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +472,11 @@ pub enum Op {
     },
     Receipts {
         receipts: Vec<Receipt>,
+    },
+    ApprovalRequest(ApprovalRequest),
+    ApprovalClosed {
+        approval_id: String,
+        reason: ApprovalCloseReason,
     },
     Error {
         code: ErrorCode,
@@ -568,8 +706,8 @@ impl Receipt {
 }
 
 /// v1 payload shapes (§6): `prompt` is exactly `{"text": string}` (≤ 32 768
-/// bytes), `interrupt`/`stop` exactly `{}`; `approval` is accepted here so the
-/// host can answer it with `forbidden`. The canonical form is ≤ 64 KiB.
+/// bytes), `interrupt`/`stop` exactly `{}`, `approval` an `ApprovalAnswer`
+/// (r7). The canonical form is ≤ 64 KiB.
 fn validate_payload(kind: ReceiptKind, payload: &Value) -> Result<(), String> {
     let canonical = canonical::jcs(payload).map_err(|e| format!("payload: {e:?}"))?;
     check(canonical.len() <= MAX_PAYLOAD_BYTES, "payload size")?;
@@ -584,7 +722,7 @@ fn validate_payload(kind: ReceiptKind, payload: &Value) -> Result<(), String> {
         ReceiptKind::Interrupt | ReceiptKind::Stop => {
             check(obj.is_some_and(|o| o.is_empty()), "payload (must be {})")
         }
-        ReceiptKind::Approval => Ok(()),
+        ReceiptKind::Approval => ApprovalAnswer::parse(payload).map(|_| ()),
     }
 }
 
@@ -682,6 +820,8 @@ impl Op {
                 request_ids.iter().try_for_each(|r| uuid(r, "request_id"))
             }
             Op::Receipts { receipts } => receipts.iter().try_for_each(Receipt::validate),
+            Op::ApprovalRequest(r) => r.validate(),
+            Op::ApprovalClosed { approval_id, .. } => uuid(approval_id, "approval_id"),
             Op::Error { detail: d, .. } => detail(d),
         }
     }

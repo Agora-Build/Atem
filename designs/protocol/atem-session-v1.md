@@ -1,6 +1,10 @@
-# atem-session v1: sessions, control leases and receipts (r6: r5 accepted for compatibility mode, minus legacy paths — for review)
+# atem-session v1: sessions, control leases, receipts and approvals (r7: r6 plus approvals — for review)
 
-Status: r6 (2026-10-16) removes every legacy path from r5 at the user's
+Status: r7 (2026-10-16) adds approvals (§6a): the lease holder answers the
+agent's own permission prompts — allow once, always allow (one of the rules
+the agent itself suggested) or deny — bound to the exact prompt, while the
+terminal can always answer instead. Needs Astation's review.
+r6 (2026-10-16) removes every legacy path from r5 at the user's
 direction (no backward compatibility; Atem and Astation update together) —
 needs Astation's review. r5 was accepted by Astation on 2026-10-15 as the
 compatibility-mode implementation contract ([r5 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r5-review.md)).
@@ -61,7 +65,8 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
 | Counters (`host_trust_gen`, `lease_epoch`, `runtime_epoch`, `seq`) | JSON integers 0 ≤ n ≤ 2^53−1; a value that would exceed it is refused (`error{code:"unsupported_version"}` for peers, fatal for the host's own counters: it stops admitting and asks for re-pairing) — never wraps |
 | Times | integer milliseconds since the Unix epoch; **display/estimation only** — authority uses monotonic clocks (§5) |
 | Digest | SHA-256, lowercase hex, 64 chars |
-| Bounds | message ≤ 1 MiB after decoding; `payload` ≤ 64 KiB canonical; prompt text ≤ 32 768 bytes; `receipt_query.request_ids` ≤ 64; `detail` ≤ 512 bytes; ≤ 64 in-flight requests per attachment (excess → `busy`) |
+| Bounds | message ≤ 1 MiB after decoding; `payload` ≤ 64 KiB canonical; prompt text ≤ 32 768 bytes; `receipt_query.request_ids` ≤ 64; `detail` ≤ 512 bytes; ≤ 64 in-flight requests per attachment (excess → `busy`); approvals (§6a): `tool` 1–128 bytes, `summary` ≤ 512 bytes, ≤ 8 `always_rules`, rule `label`/`scope` 1–256 bytes each, deny `message` ≤ 512 bytes |
+| Display text | approval `tool`, `summary`, rule `label`/`scope` are one line: no control characters (C0, DEL, C1); a deny `message` may contain `\n` and no other control character |
 | Unknown fields | ignored; unknown `v` → `unsupported_version` |
 | Parsing | bounds checked before allocation; duplicate object keys, non-integer numbers where integers are required, and out-of-range values are rejected |
 
@@ -198,6 +203,12 @@ Descriptor:
   with a higher `seq` in the same epoch and a different `process_gen` — never
   as a resurrection of the removed one. (Tombstones are kept 10 minutes host-side
   only to answer late requests with `unknown_session`.)
+- **Pending approvals** (§6a) follow the snapshot: after every `sessions`
+  reply the host sends one `approval_request` per pending approval, so a
+  viewer that (re)connects and lists sees them; while subscribed it gets new
+  ones and their `approval_closed` live. They are not registry messages and
+  carry no `seq`; a client keys them by `approval_id` (a repeat replaces) and
+  keeps only those of a session process it holds.
 - The registry and every response are filtered by the attachment's view
   permission: `list` without `view` is `forbidden`; an op with a `binding`
   from an attachment without `view` is `unknown_session`. `cwd_label` is the last path component only; clients show
@@ -287,7 +298,7 @@ Kinds and payloads (v1):
 | `prompt` | `{"text": string}` | the provider confirms the turn ended (chat-v1 `complete`) |
 | `interrupt` | `{}` | the provider reports the turn interrupted, or the turn was already over (`detail`) |
 | `stop` | `{}` | the agent process exits |
-| `approval` | reserved for v1.1 (needs an approval identity); rejected with `forbidden` + `detail:"approval answers are not supported in v1"` |
+| `approval` | `{"approval_id", "decision", "rule_id"?, "message"?}` (§6a) | the agent reports it applied the decision |
 
 - **Digest**: the host computes `payload_digest = sha256(JCS(payload))`, JCS =
   RFC 8785 over the supported domain (objects, arrays, strings, booleans, null,
@@ -313,7 +324,7 @@ Kinds and payloads (v1):
   that earlier target still returns its receipts.
 - **Scheduling**: `prompt`s are serialized per session (one paste at a time;
   later ones stay `accepted` until the previous one leaves `executing`);
-  `interrupt` and `stop` are dispatched immediately.
+  `interrupt`, `stop` and `approval` are dispatched immediately.
 - **States and transitions** (all others are invalid and never happen):
 
 | from | to | when |
@@ -343,6 +354,9 @@ Kinds and payloads (v1):
     process is still alive → `rejected`, `detail:"stop failed"`; delivered but
     the process hasn't exited within 10 s → `outcome_unknown`,
     `detail:"process still running"` (a later observed exit doesn't change it).
+  - `approval`: the decision could not be handed to the agent's waiting
+    prompt → `rejected`, `detail:"could not hand the decision to the agent"`;
+    see §6a for the other outcomes.
   - A failure that cannot be classified as "no side effect" is
     `outcome_unknown`. Neither final failure state is ever retried
     automatically; a duplicate `submit` returns the recorded final receipt. A receipt's
@@ -364,6 +378,81 @@ Kinds and payloads (v1):
 - chat-v1: its `submit.requestId` is this
   `request_id`, it carries `binding`, and its `accepted`/`complete` follow this
   receipt's `accepted`/`completed`.
+
+## 6a. Approvals (r7)
+
+The agent's permission prompt (Claude Code's and Codex's `PermissionRequest`
+hook) can be answered by the session's lease holder, bound to that exact
+prompt. The terminal always keeps its own prompt: whichever answers first
+wins, and the host never auto-allows. Any failure, timeout, missing runtime or
+missing remote holder means "no decision" — the agent's own prompt asks.
+
+| op | dir | fields |
+|---|---|---|
+| `approval_request` | H→C | `approval_id` (UUID), `session_id`, `process_gen`, `tool`, `summary`, `created_at`, `always_rules: [{rule_id, label, scope}]` |
+| `approval_closed` | H→C | `approval_id`, `reason`: `answered_remote`, `answered_terminal`, `interrupted`, `timed_out`, `lease_lost`, `process_ended` |
+| `submit` | C→H | §6 with `kind:"approval"`, `payload: {approval_id, decision, rule_id?, message?}` |
+
+```json
+{"type":"session","data":{"v":1,"op":"approval_request","id":"…","approval_id":"88888888-…",
+  "session_id":"ses-aaaaaaaaaaaa","process_gen":"22222222-…","tool":"Bash","summary":"npm test",
+  "created_at":1760500000000,
+  "always_rules":[{"rule_id":"r-npm-test","label":"Bash(npm test:*)","scope":"this project"}]}}
+{"type":"session","data":{"v":1,"op":"submit","id":"…","binding":{…,"lease_epoch":7},
+  "request_id":"44444444-…","kind":"approval",
+  "payload":{"approval_id":"88888888-…","decision":"allow_always","rule_id":"r-npm-test"}}}
+```
+
+- **Opening.** The host opens an approval only while a remote controller holds
+  the session's live lease, for the session's current process; otherwise the
+  agent gets "no decision" at once. ≤ 16 pending per session.
+- **What it shows.** `tool` and a short redacted `summary` (the command's
+  first line or the file path) — never full inputs such as file contents.
+  `always_rules` are the agent's own suggested rules, exactly as the agent
+  proposes them (Claude: the hook's `permission_suggestions`); `label` says
+  what the rule allows and `scope` where it is saved, so the card shows both
+  before the tap. `[]` when the agent offers none (e.g. Codex when its hook
+  can't take a persistent decision; the card then offers Allow once and Deny
+  only and says why). Bounds §1.
+- **Recipients.** `approval_request` and `approval_closed` go to every
+  attachment subscribed by `list` with `view`; after each `sessions` snapshot
+  the pending ones are sent again (§4). An approval belongs to one
+  (`session_id`, `process_gen`).
+- **Payload** (strict; anything else is `unsupported_version`): `approval_id`
+  a UUID; `decision` one of `allow_once`, `allow_always`, `deny`; `rule_id`
+  present iff `allow_always` (an opaque id); `message` only with `deny` (≤ 512
+  bytes; given to the agent with the denial). No other field.
+- **Admission**, in order: the §6 checks (`control` → `forbidden`, a session
+  that accepts work → `session_closed`, the current lease → `stale_lease`;
+  a duplicate `request_id` returns its receipt first, needing only view), then
+  the approval must be pending for exactly the binding's `session_id` and
+  `process_gen`, and an `allow_always` `rule_id` must be one it offered —
+  otherwise `stale_target` (nothing recorded, nothing handed over). A closed,
+  answered or unknown approval is `stale_target`.
+- **Lifecycle of the receipt:**
+
+| state | when |
+|---|---|
+| `accepted` | admitted and durable (§6) |
+| `executing` | durable, then the approval closes for every viewer (`approval_closed{answered_remote}`) and the decision is handed to the agent's waiting prompt |
+| `completed` | the agent reported it applied the decision |
+| `rejected` | the approval closed before the hand-off (e.g. an `accepted` answer after a restart: approvals don't survive one), or the decision could not be handed over |
+| `outcome_unknown` | the terminal's answer and the remote answer crossed (`detail:"the terminal answered too; which answer won is unknown"`), the agent ended (`"agent exited"`), or it never confirmed (`"the agent did not confirm the decision"`) |
+
+- **Closing without the remote answer** (`approval_closed`, the card goes
+  away): `answered_terminal` (answered in the agent's own prompt first),
+  `interrupted` (Esc), `timed_out` (the hook's limit), `lease_lost` (the
+  lease ended for any reason — expiry, release, takeover, local input,
+  revocation, trust change — so a pending approval is never answered by a
+  controller that didn't see it come; the agent gets "no decision"),
+  `process_ended` (the process exited, was replaced, or the session closed or
+  was removed). After a hand-off, a lost lease doesn't cancel the answer
+  (§6: lease expiry doesn't cancel accepted work).
+- A later answer to a closed approval is `stale_target` and is never applied;
+  a duplicate of the answer that was handed over returns its receipt.
+- Local input: Codex hides its prompt while the hook waits, so local input
+  first answers the hook "no decision" (Codex then shows its prompt) — this
+  happens anyway, because local input ends the remote lease (`lease_lost`).
 
 ## 7. Errors
 
@@ -441,7 +530,10 @@ effect (→ outcome_unknown), each followed by a duplicate submit and recovery
 after restart returning the same final receipt,
 duplicate submit, reused id (other target), crash after executing →
 outcome_unknown, trust change before dispatch → rejected, closed session,
-receipt query scoped to target.
+receipt query scoped to target. r7 adds approvals (§6a): allow once, allow
+always with an offered and an unknown rule, deny with a message, the terminal
+answering first, lease loss, a viewer without control, a duplicate answer, and
+pending approvals after `list` on a new attachment.
 
 ## 9. Gate: trust, freshness, channel and browser grants (joint)
 

@@ -1,12 +1,13 @@
 //! Client-side state machines for atem-session v1: the control-lease client
-//! (§5 reply-correlation rules 1–5) and the session registry client (§4).
+//! (§5 reply-correlation rules 1–5) and the session registry client (§4),
+//! which also keeps the pending approvals (r7) of the processes it holds.
 //!
 //! Both are pure: the caller passes a monotonic `now_ms` with every event and
 //! performs any I/O they ask for (`RegistryClient::take_list_request`).
 //! Neither relies on a timer having fired: every query and every reply checks
 //! `now >= deadline` itself.
 
-use super::wire::{Binding, Descriptor, Op, SessionMessage, SessionState, Target};
+use super::wire::{ApprovalRequest, Binding, Descriptor, Op, SessionMessage, SessionState, Target};
 use std::collections::{BTreeMap, HashMap};
 
 // ── Control lease (§5) ────────────────────────────────────────────────────
@@ -93,6 +94,9 @@ pub enum RegistryOutcome {
     Buffered,
     /// A change that would revive a removed session's `process_gen`.
     Resurrection,
+    /// An approval for a session or process the registry doesn't hold, or a
+    /// close of an approval it doesn't know.
+    Ignored,
     /// Not a registry message.
     NotARegistryMessage,
 }
@@ -115,6 +119,8 @@ pub struct RegistryClient {
     /// session_id → (seq of the removal, removed process_gen), per epoch.
     removed: HashMap<String, (u64, String)>,
     buffered: BTreeMap<u64, Descriptor>,
+    /// approval_id → pending approval of a session process held here.
+    approvals: BTreeMap<String, ApprovalRequest>,
 }
 
 impl LeaseClient {
@@ -359,6 +365,7 @@ impl RegistryClient {
     pub fn new_attachment(&mut self) {
         self.last_seq = None;
         self.sessions.clear();
+        self.approvals.clear();
         self.removed.clear();
         self.buffered.clear();
         self.list_wanted = false;
@@ -369,6 +376,7 @@ impl RegistryClient {
         self.epoch = Some((epoch, rgen.to_string()));
         self.last_seq = None;
         self.sessions.clear();
+        self.approvals.clear();
         self.removed.clear();
         self.buffered.clear();
         self.list_wanted = false;
@@ -388,6 +396,22 @@ impl RegistryClient {
                 seq,
                 descriptor,
             } => self.on_change(runtime_gen, *runtime_epoch, *seq, descriptor),
+            // Pending approvals follow the snapshot (`list`) and arrive live;
+            // they're kept only for a process the registry holds.
+            Op::ApprovalRequest(r) => {
+                let held = self.sessions.get(&r.session_id).is_some_and(|d| {
+                    d.process_gen == r.process_gen && d.state == SessionState::Running
+                });
+                if !held {
+                    return RegistryOutcome::Ignored;
+                }
+                self.approvals.insert(r.approval_id.clone(), r.clone());
+                RegistryOutcome::Applied
+            }
+            Op::ApprovalClosed { approval_id, .. } => match self.approvals.remove(approval_id) {
+                Some(_) => RegistryOutcome::Applied,
+                None => RegistryOutcome::Ignored,
+            },
             _ => RegistryOutcome::NotARegistryMessage,
         }
     }
@@ -420,6 +444,7 @@ impl RegistryClient {
         self.last_seq = Some(seq);
         self.awaiting_snapshot = false;
         self.list_wanted = false;
+        self.drop_stale_approvals();
         // Held changes: those at or below the snapshot are discarded, the rest
         // apply in order; one still ahead is a new gap.
         let held = std::mem::take(&mut self.buffered);
@@ -483,6 +508,7 @@ impl RegistryClient {
             self.sessions.remove(&d.session_id);
             self.removed
                 .insert(d.session_id.clone(), (seq, d.process_gen.clone()));
+            self.drop_stale_approvals();
             return RegistryOutcome::Applied;
         }
         if let Some((removed_at, pg)) = self.removed.get(&d.session_id) {
@@ -492,7 +518,23 @@ impl RegistryClient {
             self.removed.remove(&d.session_id);
         }
         self.sessions.insert(d.session_id.clone(), d.clone());
+        self.drop_stale_approvals();
         RegistryOutcome::Applied
+    }
+
+    /// Approvals of a session no longer held, or of an older process, go.
+    fn drop_stale_approvals(&mut self) {
+        let sessions = &self.sessions;
+        self.approvals.retain(|_, a| {
+            sessions
+                .get(&a.session_id)
+                .is_some_and(|d| d.process_gen == a.process_gen && d.state == SessionState::Running)
+        });
+    }
+
+    /// Pending approvals, by `approval_id`.
+    pub fn pending_approvals(&self) -> impl Iterator<Item = &ApprovalRequest> {
+        self.approvals.values()
     }
 
     pub fn runtime_epoch(&self) -> Option<u64> {

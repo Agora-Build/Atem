@@ -42,6 +42,10 @@ pub struct Pty {
     pub dropped_remote: u64,
     pub resizes: u64,
     pub stops: u64,
+    /// Decisions handed to the agent (`Effect::Approval`), as wire JSON.
+    pub approval_decisions: Vec<Value>,
+    /// Approvals the host released ("no decision").
+    pub approvals_released: u64,
 }
 
 impl Default for Pty {
@@ -57,6 +61,8 @@ impl Default for Pty {
             dropped_remote: 0,
             resizes: 0,
             stops: 0,
+            approval_decisions: Vec::new(),
+            approvals_released: 0,
         }
     }
 }
@@ -438,6 +444,26 @@ impl<J: Journal> FakeRuntime<J> {
                         work.extend(self.host.dispatch_report(&request_id, report));
                     }
                 }
+                Effect::Approval {
+                    approval_id,
+                    decision,
+                    rule_id,
+                    message,
+                    ..
+                } => {
+                    // Handed to the agent; it reports later (`approval_applied`).
+                    self.pty.dispatch_attempts += 1;
+                    self.pty.dispatches += 1;
+                    let mut d = json!({"approval_id": approval_id, "decision": decision});
+                    if let Some(r) = rule_id {
+                        d["rule_id"] = Value::String(r);
+                    }
+                    if let Some(m) = message {
+                        d["message"] = Value::String(m);
+                    }
+                    self.pty.approval_decisions.push(d);
+                }
+                Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
                 Effect::Reconcile { request_id, .. } => {
                     let answer = self.reconcile_answer.clone();
                     work.extend(self.host.dispatch_report(&request_id, answer));
@@ -633,6 +659,31 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 self.flush_writes();
                 Vec::new()
             }
+            HostEvent::OpenApproval {
+                session_id,
+                tool,
+                summary,
+                always_rules,
+            } => {
+                let info = super::host::ApprovalInfo {
+                    tool: tool.clone(),
+                    summary: summary.clone(),
+                    always_rules: always_rules.clone(),
+                };
+                let process_gen = self.process_gen(session_id);
+                // Refused: the agent's own prompt asks; nothing is sent.
+                let (_, fx) = self
+                    .host
+                    .open_approval(session_id, &process_gen, info, now_ms);
+                fx
+            }
+            HostEvent::CloseApproval {
+                approval_id,
+                reason,
+            } => self.host.close_approval(approval_id, *reason),
+            HostEvent::ApprovalApplied { approval_id, ok } => {
+                self.host.approval_applied(approval_id, *ok)
+            }
         };
         self.apply(fx);
         Ok(())
@@ -655,6 +706,13 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             "resizes" => p.resizes.into(),
             "stops" => p.stops.into(),
             "lease_holder" => self.lease_holder()?,
+            "approval_decisions" => Value::from(p.approval_decisions.clone()),
+            "approvals_released" => p.approvals_released.into(),
+            "approvals_pending" => self
+                .host
+                .pending_approvals(&self.only_session()?)
+                .len()
+                .into(),
             "receipts_visible" => Value::Object(
                 self.clients
                     .iter()

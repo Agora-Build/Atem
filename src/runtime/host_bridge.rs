@@ -884,6 +884,16 @@ impl HostBridge {
                         .dispatch_report(&request_id, DispatchReport::Unknown);
                     self.exec(effects, cx);
                 }
+                // The runtime opens no approvals yet (no permission hooks are
+                // wired), so neither effect can occur; were one to, the answer
+                // is refused before reaching any agent.
+                Effect::Approval { request_id, .. } => {
+                    let effects = self
+                        .host
+                        .dispatch_report(&request_id, DispatchReport::FailedNoEffect);
+                    self.exec(effects, cx);
+                }
+                Effect::ApprovalReleased { .. } => {}
                 Effect::Chat {
                     attachment,
                     conversation_id,
@@ -966,6 +976,7 @@ impl HostBridge {
                 Ok(()) => None,
                 Err(_) => Some(DispatchReport::FailedNoEffect),
             },
+            // Approval answers are handed over with `Effect::Approval`.
             ReceiptKind::Approval => Some(DispatchReport::FailedNoEffect),
         }
     }

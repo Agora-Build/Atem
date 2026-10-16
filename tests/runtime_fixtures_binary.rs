@@ -679,6 +679,10 @@ fn unsupported(scenario: &Value) -> Option<String> {
                 "change_trust_gen",
                 "trust generations change only by pairing",
             ),
+            (
+                "open_approval",
+                "approvals are core-only until the runtime wires permission hooks",
+            ),
         ] {
             if step.get(action).is_some() {
                 return Some(format!("{action}: {why}"));
@@ -1326,6 +1330,16 @@ fn scenarios() -> Vec<Value> {
 /// The host scenarios that can't be honoured against real processes (the
 /// reason is printed); every other scenario runs.
 const NOT_RUN: &[&str] = &[
+    // Approvals (contract r7) run in the core harness only until the runtime
+    // opens approvals from the agents' permission hooks.
+    "approval-allow-always-must-name-an-offered-rule",
+    "approval-allow-once-is-handed-to-the-agent-and-completes",
+    "approval-answered-in-the-terminal-first-refuses-the-late-remote-answer",
+    "approval-closes-when-the-lease-is-lost",
+    "approval-deny-carries-the-message-to-the-agent",
+    "approval-duplicate-submit-returns-the-receipt",
+    "approval-needs-control-and-the-lease",
+    "approval-pending-is-sent-again-after-list",
     "closed-session-refuses-work-before-the-lease-check",
     "receipt-query-is-scoped-to-the-exact-target",
     "removed-ops-have-no-effect",
