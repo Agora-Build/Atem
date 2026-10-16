@@ -1274,3 +1274,231 @@ fn the_link_is_fenced_and_dropped_at_its_authorization_deadline() {
         rt.shutdown().await;
     });
 }
+
+/// Every message `client` gets within `time`.
+async fn collect(client: &mut RuntimeClient, time: Duration) -> Vec<RuntimeMsg> {
+    let mut messages = Vec::new();
+    let deadline = tokio::time::Instant::now() + time;
+    while let Ok(Ok(Some(message))) = tokio::time::timeout_at(deadline, client.recv()).await {
+        messages.push(message);
+    }
+    messages
+}
+
+async fn attach_client(
+    client: &mut RuntimeClient,
+    sid: &str,
+    rows: u16,
+    cols: u16,
+) -> SessionSummary {
+    client
+        .send(&ClientMsg::Attach {
+            session_id: sid.to_string(),
+            rows,
+            cols,
+        })
+        .await
+        .unwrap();
+    expect(client, |m| match m {
+        RuntimeMsg::Attached { session, .. } => Some(session),
+        _ => None,
+    })
+    .await
+}
+
+#[test]
+fn a_local_paste_is_written_whole_while_astation_types() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let typed = rt.dir.path().join("typed.bin");
+        // Raw, bracketed paste on: records every byte it is typed.
+        let agent = script(
+            rt.dir.path(),
+            "recorder",
+            &format!(
+                "stty raw -echo\nprintf '\\033[?2004hREADY\\r\\n'\nexec cat > '{}'",
+                typed.display()
+            ),
+        );
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        screen_until(peer, &sid, &pg, "READY").await;
+        attach_client(&mut client, &sid, 24, 80).await;
+
+        // Astation holds the lease and types.
+        let epoch = peer.acquire(&sid, &pg).await;
+        let remote = STANDARD.encode([b'R'; 1000]);
+        for sequence in 0..4 {
+            peer.terminal(
+                "input",
+                &sid,
+                &pg,
+                json!({"stream_id": stream, "sequence": sequence, "bytes": remote}),
+                Some(epoch),
+            );
+        }
+        // A local paste larger than one input, while Astation keeps
+        // taking the lease back and typing.
+        let text = "P".repeat(40 * 1024);
+        client
+            .send(&ClientMsg::Paste {
+                session_id: sid.clone(),
+                bytes: STANDARD.encode(&text),
+            })
+            .await
+            .unwrap();
+        let peer = &mut rt.peer;
+        for round in 0..5u64 {
+            let id = peer.request(
+                "acquire",
+                json!({"binding": peer.binding(&sid, &pg, None), "takeover": false}),
+            );
+            let lease = peer.reply(&id).await;
+            if lease["op"] == "lease" {
+                let epoch = lease["binding"]["lease_epoch"].as_u64().unwrap();
+                peer.terminal(
+                    "input",
+                    &sid,
+                    &pg,
+                    json!({"stream_id": stream, "sequence": 10 + round, "bytes": remote}),
+                    Some(epoch),
+                );
+            }
+        }
+        let changed = peer
+            .wait_from(0, |v| {
+                is_session(v, "lease_changed") && v["data"]["reason"] == "local_input"
+            })
+            .await;
+        assert!(changed > 0);
+        let expected = format!("\x1b[200~{text}\x1b[201~");
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let written = std::fs::read(&typed).unwrap_or_default();
+                if String::from_utf8_lossy(&written).contains("\x1b[201~") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the paste never arrived");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let written = String::from_utf8(std::fs::read(&typed).unwrap()).unwrap();
+        // Intact and contiguous: no remote byte inside it.
+        assert!(
+            written.contains(&expected),
+            "the paste was split or interleaved"
+        );
+        assert_eq!(written.matches('P').count(), text.len());
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_local_resize_under_a_remote_lease_waits_for_the_reclaim() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        peer.wait(|v| is_terminal(v, "attached")).await;
+        screen_until(peer, &sid, &pg, "READY").await;
+        let attached = attach_client(&mut client, &sid, 24, 80).await;
+        assert_eq!((attached.rows, attached.cols), (24, 80));
+        peer.acquire(&sid, &pg).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The remote controller owns the size: a local resize is kept for later.
+        client
+            .send(&ClientMsg::Resize {
+                session_id: sid.clone(),
+                rows: 30,
+                cols: 100,
+            })
+            .await
+            .unwrap();
+        let heard = collect(&mut client, Duration::from_millis(500)).await;
+        assert!(
+            !heard
+                .iter()
+                .any(|m| matches!(m, RuntimeMsg::Attached { session, .. } if session.rows == 30)),
+            "{heard:?}"
+        );
+        client.send(&ClientMsg::List).await.unwrap();
+        let sessions = expect(&mut client, |m| match m {
+            RuntimeMsg::Sessions { sessions } => Some(sessions),
+            _ => None,
+        })
+        .await;
+        let listed = sessions.iter().find(|s| s.id == sid).unwrap();
+        assert_eq!((listed.rows, listed.cols), (24, 80));
+
+        // Reclaim: the local size applies.
+        client
+            .send(&ClientMsg::Reclaim {
+                session_id: sid.clone(),
+            })
+            .await
+            .unwrap();
+        let session = expect(&mut client, |m| match m {
+            RuntimeMsg::Attached { session, .. } if session.rows == 30 => Some(session),
+            _ => None,
+        })
+        .await;
+        assert_eq!((session.rows, session.cols), (30, 100));
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn mark_task_notices_reach_only_the_frontend_of_their_session() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let mut other = rt.client().await;
+        let project = rt.dir.path().join("project");
+        std::fs::create_dir_all(project.join(".chisel/tasks")).unwrap();
+        std::fs::write(
+            project.join(".chisel/tasks/t1.json"),
+            json!({"title": "Project B"}).to_string(),
+        )
+        .unwrap();
+        let agent = echo_agent(rt.dir.path());
+        let claude = rt
+            .launch(&mut client, "claude", &agent, Some(&project))
+            .await;
+        let codex = rt.launch(&mut other, "codex", &agent, None).await;
+        attach_client(&mut client, &claude.id, 24, 80).await;
+        attach_client(&mut other, &codex.id, 24, 80).await;
+        rt.peer.hello().await;
+        rt.peer
+            .send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
+        let notice = expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text } if text.contains("t1") && text.contains("Claude") => {
+                Some(text)
+            }
+            _ => None,
+        })
+        .await;
+        assert!(notice.contains("t1"));
+        let heard = collect(&mut other, Duration::from_millis(800)).await;
+        assert!(
+            !heard
+                .iter()
+                .any(|m| matches!(m, RuntimeMsg::Notice { text } if text.contains("t1"))),
+            "another session's frontend got the task's notice: {heard:?}"
+        );
+        rt.shutdown().await;
+    });
+}

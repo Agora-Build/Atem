@@ -106,6 +106,9 @@ pub struct App {
     pub astation_reauth: Option<Instant>,
     /// The session the active main mark task was sent to.
     pub main_task_session: Option<SessionId>,
+    /// Mark-task notices for `atem runtime`: those naming a session go to
+    /// that session's frontend only, the others to the runtime's log.
+    pub task_notices: Vec<(Option<SessionId>, String)>,
 }
 
 impl App {
@@ -142,6 +145,7 @@ impl App {
             astation_reconnect_at: None,
             astation_reauth: None,
             main_task_session: None,
+            task_notices: Vec::new(),
         };
         app.rebuild_menu();
         app
@@ -370,6 +374,11 @@ impl App {
         Ok(())
     }
 
+    /// A mark-task notice about session `sid` (`None`: no session's).
+    fn task_notice(&mut self, sid: Option<SessionId>, text: String) {
+        self.task_notices.push((sid, text));
+    }
+
     /// The host part of `atem runtime`'s loop, every tick: the Astation
     /// connection and its messages, and mark tasks (the sessions are the
     /// broker's).
@@ -595,9 +604,9 @@ impl App {
                 // `intercept_astation_reauth`; other status updates need nothing.
             }
             AstationMessage::MarkTaskAssignment { task_id, received_at_ms } => {
-                self.status_message = Some(format!("\u{1f4cc} Task received: {}", task_id));
+                self.task_notice(None, format!("\u{1f4cc} Task received: {}", task_id));
                 let Some(target) = self.mark_task_session(&task_id) else {
-                    self.status_message = Some(format!("\u{274c} Task {}: {}", task_id, NO_PROJECT_SESSION));
+                    self.task_notice(None, format!("\u{274c} Task {}: {}", task_id, NO_PROJECT_SESSION));
                     let _ = self
                         .astation_client
                         .send_mark_result(&task_id, false, NO_PROJECT_SESSION)
@@ -612,7 +621,7 @@ impl App {
                         self.try_dispatch_main().await;
                     }
                     Err(err) => {
-                        self.status_message = Some(format!("\u{274c} Failed to load task {}: {}", task_id, err));
+                        self.task_notice(Some(target.clone()), format!("\u{274c} Failed to load task {}: {}", task_id, err));
                         let _ = self
                             .astation_client
                             .send_mark_result(&task_id, false, &format!("Failed to load task: {}", err))
@@ -756,7 +765,7 @@ impl App {
         let item = match self.work_items.get(&task_id) {
             Some(item) => item.clone(),
             None => {
-                self.status_message = Some(format!("\u{274c} Task item not found: {}", task_id));
+                self.task_notice(None, format!("\u{274c} Task item not found: {}", task_id));
                 self.dispatcher.complete_main();
                 return;
             }
@@ -780,8 +789,8 @@ impl App {
             // The broker writes it through the session's worker (local-origin
             // input: no remote lease exists, and none is revoked).
             hosted.writes.push((task_id.clone(), id.clone(), format!("{}\n\r", item.prompt)));
-            self.main_task_session = Some(id);
-            self.status_message = Some(format!("\u{1f4cc} Task {} \u{2192} Claude", task_id));
+            self.main_task_session = Some(id.clone());
+            self.task_notice(Some(id), format!("\u{1f4cc} Task {} \u{2192} Claude", task_id));
         }
     }
 

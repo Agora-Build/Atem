@@ -464,6 +464,11 @@ impl BrokerSession {
         }
     }
 
+    /// The agent asked for bracketed paste (as the mirror shows it).
+    pub fn bracketed_paste(&self) -> bool {
+        self.screen.screen().bracketed_paste()
+    }
+
     pub fn size(&self) -> (u16, u16) {
         self.screen.screen().size()
     }

@@ -10,12 +10,15 @@ use std::path::PathBuf;
 /// The protocol version both sides speak.
 pub const PROTOCOL: u32 = 1;
 /// Longest line either side accepts (a launch carries up to 256 KiB of
-/// environment, JSON-escaped).
-pub const MAX_LINE: usize = 1024 * 1024;
+/// environment, JSON-escaped; a paste up to `MAX_PASTE` bytes in base64).
+pub const MAX_LINE: usize = 2 * 1024 * 1024;
 /// Most raw bytes in one `input` (the PTY's own bound).
 pub const MAX_INPUT: usize = crate::pty_session::MAX_INPUT;
 /// Most raw bytes in one `output`.
 pub const MAX_OUTPUT: usize = 16 * 1024;
+/// Most bytes of text in one `paste` (bracketed, it still fits one fenced
+/// PTY write).
+pub const MAX_PASTE: usize = crate::pty_session::MAX_FENCED - 16;
 /// Launch arguments: at most this many, and this many bytes in total.
 pub const MAX_ARGS: usize = 256;
 pub const MAX_ARGS_BYTES: usize = 64 * 1024;
@@ -56,6 +59,10 @@ pub enum ClientMsg {
     Hello {
         protocol: u32,
         build: String,
+        /// A passive client (the menu looking at the sessions) never keeps
+        /// an idle runtime running.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        passive: bool,
     },
     /// → `launched`
     Launch {
@@ -80,6 +87,12 @@ pub enum ClientMsg {
     Input {
         session_id: String,
         /// base64
+        bytes: String,
+    },
+    /// Pasted text (base64, at most `MAX_PASTE` bytes): one local input,
+    /// written whole (bracketed when the agent asked for it).
+    Paste {
+        session_id: String,
         bytes: String,
     },
     Resize {
@@ -109,6 +122,7 @@ impl ClientMsg {
             ClientMsg::Attach { .. } => "attach",
             ClientMsg::Detach { .. } => "detach",
             ClientMsg::Input { .. } => "input",
+            ClientMsg::Paste { .. } => "paste",
             ClientMsg::Resize { .. } => "resize",
             ClientMsg::Reclaim { .. } => "reclaim",
             ClientMsg::List => "list",
@@ -122,6 +136,14 @@ impl ClientMsg {
         ClientMsg::Input {
             session_id: session_id.into(),
             bytes: STANDARD.encode(bytes),
+        }
+    }
+
+    /// `paste` of `text`.
+    pub fn paste(session_id: &str, text: &str) -> Self {
+        ClientMsg::Paste {
+            session_id: session_id.into(),
+            bytes: STANDARD.encode(text),
         }
     }
 }
@@ -194,6 +216,12 @@ pub enum RuntimeMsg {
     Detached {
         session_id: String,
         reason: String,
+    },
+    /// `stop` was done: the agent is stopping (its exit follows), or a
+    /// session without a worker was `removed`.
+    Stopped {
+        session_id: String,
+        removed: bool,
     },
     /// The attached session's summary changed (status, remote control,
     /// state); sent to its frontend.
@@ -308,6 +336,19 @@ pub fn decode_runtime(line: &str) -> Result<RuntimeMsg, DecodeError> {
     serde_json::from_value(value).map_err(|e| DecodeError::Invalid(format!("invalid message: {e}")))
 }
 
+/// `paste` text decoded (UTF-8, 1..=MAX_PASTE bytes).
+pub fn paste_text(encoded: &str) -> Result<String, DecodeError> {
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| DecodeError::Invalid("paste bytes aren't base64".into()))?;
+    if bytes.is_empty() || bytes.len() > MAX_PASTE {
+        return Err(DecodeError::Invalid(format!(
+            "a paste must hold 1..={MAX_PASTE} bytes"
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| DecodeError::Invalid("a paste must be UTF-8".into()))
+}
+
 /// `input` bytes decoded (1..=MAX_INPUT of them).
 pub fn input_bytes(encoded: &str) -> Result<Vec<u8>, DecodeError> {
     let bytes = STANDARD
@@ -333,6 +374,7 @@ fn check_bounds(message: &ClientMsg) -> Result<(), DecodeError> {
             crate::session::check_env(&env.to_os()).map_err(|e| DecodeError::Invalid(e.to_string()))
         }
         ClientMsg::Input { bytes, .. } => input_bytes(bytes).map(|_| ()),
+        ClientMsg::Paste { bytes, .. } => paste_text(bytes).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -374,7 +416,14 @@ mod tests {
             ClientMsg::Hello {
                 protocol: PROTOCOL,
                 build: "b".into(),
+                passive: false,
             },
+            ClientMsg::Hello {
+                protocol: PROTOCOL,
+                build: "b".into(),
+                passive: true,
+            },
+            ClientMsg::paste("s", "one\ntwo"),
             ClientMsg::Launch {
                 provider: "codex".into(),
                 args: vec!["--x".into()],
@@ -448,6 +497,10 @@ mod tests {
                 session_id: "s".into(),
                 reason: "attached elsewhere".into(),
             },
+            RuntimeMsg::Stopped {
+                session_id: "s".into(),
+                removed: true,
+            },
             RuntimeMsg::Session { session: summary() },
             RuntimeMsg::Astation { connected: false },
             RuntimeMsg::Notice { text: "n".into() },
@@ -505,6 +558,24 @@ mod tests {
             )))
             .is_ok()
         );
+        // Paste: UTF-8, 1..=MAX_PASTE bytes, in one message.
+        assert!(
+            decode_client(&encode_client(&ClientMsg::paste(
+                "s",
+                &"p".repeat(MAX_PASTE)
+            )))
+            .is_ok()
+        );
+        for bad in [
+            ClientMsg::paste("s", ""),
+            ClientMsg::paste("s", &"p".repeat(MAX_PASTE + 1)),
+            ClientMsg::Paste {
+                session_id: "s".into(),
+                bytes: STANDARD.encode([0xff, 0xfe]),
+            },
+        ] {
+            assert!(decode_client(&encode_client(&bad)).is_err());
+        }
         // Launch environment: at most 512 entries and 256 KiB.
         let launch = |env: Vec<(String, String)>| ClientMsg::Launch {
             provider: "codex".into(),

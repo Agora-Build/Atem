@@ -86,7 +86,7 @@ its tests; the wire and the clients don't change.
 | `src/chat/claude/transcript.rs` | Claude: follows the transcript and turns entries into `LogItem`s (below) |
 | `src/chat/session.rs` | Shared per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records; agent-neutral |
 | `src/chat/wire.rs` | `agentChat` v1 messages to and from Astation: encoding, decoding, validation |
-| `src/agent_registry.rs` | Status from `session.rs`; `capabilities: ["chat-v1"]` only when the agent's adapter reports it (v1: Claude with active hooks) |
+| `src/runtime/` (session-v1 descriptor; `agent_registry.rs` was removed) | Status from `session.rs` as the session's `activity`; chat-v1 advertised only when the agent's adapter reports it (v1: Claude with active hooks) |
 
 All of it lives in the Atem process that owns the terminal; there is no new
 daemon. Chat state belongs to the agent session, not to a browser connection:
@@ -214,9 +214,9 @@ them as follows:
 Every status carries `since` (time of the event that set it). Every 15 s Atem
 re-sends the current state with its original `since`; it never invents a new
 state. A long `working` stays `working` and `since` shows how long.
-`AgentRegistry` status uses the same state (`ready`→`Idle`,
-`working`→`Thinking`, `waiting`→`WaitingForInput`, plus `Unknown`), replacing
-today's hard-coded `Idle`.
+The session-v1 descriptor's `activity` (and `STATUS` in `atem agent list`)
+uses the same state (`ready`, `working`, `waiting`, `unknown`); the former
+`AgentRegistry` and its hard-coded `Idle` are removed.
 
 `complete` means **Claude's execution turn has ended** (by `Stop`,
 `end_turn` or an interrupt). It does not promise that no more transcript

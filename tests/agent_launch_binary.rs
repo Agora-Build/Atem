@@ -349,3 +349,55 @@ fn the_menu_launches_and_attaches_through_the_runtime() {
     assert!(ok, "{err}");
     within("the worker to end", || sandbox.records().is_empty());
 }
+
+#[test]
+fn launch_runs_the_agent_in_the_launching_directory_and_never_logs_its_environment() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.dir.path().join("elsewhere project");
+    std::fs::create_dir_all(&project).unwrap();
+    let agent = sandbox.script(
+        "pwd-agent",
+        "echo \"CWD=[$(pwd)]\"\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let secret = "sk-launch-env-7f3a9c2e";
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &project,
+        &[
+            ("CODEX_CLI_BIN", agent.to_str().unwrap()),
+            ("ATEM_TEST_PROVIDER_KEY", secret),
+            ("PROVIDER_API_KEY", secret),
+        ],
+    );
+    frontend.shows(&format!("CWD=[{}]", project.display()));
+    let sid = frontend.detach();
+    let rows = sandbox.list();
+    assert!(
+        rows.iter()
+            .any(|r| r[0] == sid && r[5..].join(" ") == project.display().to_string()),
+        "{rows:?}"
+    );
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "{err}");
+    within("the worker to end", || sandbox.records().is_empty());
+    // No log or state file of the runtime or its workers holds the environment.
+    let mut checked = 0;
+    let mut stack = vec![sandbox.config()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                checked += 1;
+                assert!(
+                    !String::from_utf8_lossy(&bytes).contains(secret),
+                    "{} holds the launch environment",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(sandbox.config().join("runtime.log").exists());
+    assert!(checked > 0);
+}

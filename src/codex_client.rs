@@ -49,12 +49,6 @@ impl CodexClient {
     pub fn launch_args(&self) -> &[String] {
         &self.extra_args
     }
-
-    #[cfg(test)]
-    pub fn set_command_for_test(&mut self, binary: String, args: Vec<String>) {
-        self.binary = binary;
-        self.extra_args = args;
-    }
 }
 
 #[cfg(test)]

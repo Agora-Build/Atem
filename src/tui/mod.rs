@@ -20,6 +20,7 @@ use tokio::time::Duration;
 use crate::agora_api::format_projects;
 use crate::app::{App, AppMode, MenuAction};
 use crate::runtime::client::RuntimeClient;
+use crate::runtime::protocol::SessionSummary;
 use draw::draw_ui;
 
 /// How often the menu asks the runtime for its sessions.
@@ -60,33 +61,86 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// The runtime's sessions and Astation link for the menu, when a runtime
-/// answers (the menu never starts one just to look).
-async fn refresh_runtime(app: &mut App) {
-    match RuntimeClient::existing().await {
-        Ok(Some(mut client)) => match crate::runtime::commands::sessions(&mut client).await {
-            Ok(sessions) => {
-                app.astation_connected = client.welcome.astation;
-                app.runtime_sessions = sessions;
-                app.runtime_note = None;
-            }
-            Err(error) => app.runtime_note = Some(format!("The atem runtime didn't list its sessions: {error:#}")),
-        },
+/// How long the menu waits for the runtime's answer.
+const LOOK_WAIT: Duration = Duration::from_secs(2);
+
+/// What the menu learned from the runtime: its Astation link and sessions,
+/// `None` when none runs, or why it couldn't be asked.
+type Look = Result<Option<(bool, Vec<SessionSummary>)>, String>;
+
+/// Asks the runtime at `locator` for its sessions as a passive client (it
+/// never keeps the runtime running, and none is started), within `wait`.
+async fn look_at(locator: crate::runtime::client::Locator, wait: Duration) -> Look {
+    let looked = tokio::time::timeout(wait, async {
+        match RuntimeClient::existing_at(&locator, true).await {
+            Ok(Some(mut client)) => crate::runtime::commands::sessions(&mut client)
+                .await
+                .map(|sessions| Some((client.welcome.astation, sessions)))
+                .map_err(|e| format!("The atem runtime didn't list its sessions: {e:#}")),
+            Ok(None) => Ok(None),
+            Err(error) => Err(format!("The atem runtime can't be reached: {error:#}")),
+        }
+    })
+    .await;
+    looked.unwrap_or_else(|_| Err("The atem runtime didn't answer".into()))
+}
+
+fn apply_look(app: &mut App, look: Look) {
+    match look {
+        Ok(Some((astation, sessions))) => {
+            app.astation_connected = astation;
+            app.runtime_sessions = sessions;
+            app.runtime_note = None;
+        }
         Ok(None) => {
             app.astation_connected = false;
             app.runtime_sessions.clear();
-            app.runtime_note = Some("No atem runtime is running; launching an agent starts one.".into());
+            app.runtime_note =
+                Some("No atem runtime is running; launching an agent starts one.".into());
         }
-        Err(error) => {
+        Err(note) => {
             app.astation_connected = false;
             app.runtime_sessions.clear();
-            app.runtime_note = Some(format!("The atem runtime can't be reached: {error:#}"));
+            app.runtime_note = Some(note);
         }
     }
     if app.agent_panel_selected >= app.runtime_sessions.len() {
         app.agent_panel_selected = app.runtime_sessions.len().saturating_sub(1);
     }
     app.rebuild_menu();
+}
+
+/// The menu's looks at the runtime, on their own task so the UI loop never
+/// waits for them: one at a time, every `RUNTIME_REFRESH` while the menu
+/// shows, and at once when asked.
+#[derive(Default)]
+struct Looks {
+    task: Option<tokio::task::JoinHandle<Look>>,
+    last: Option<Instant>,
+    due: bool,
+}
+
+impl Looks {
+    fn request(&mut self) {
+        self.due = true;
+    }
+
+    fn poll(&mut self, app: &mut App) {
+        use futures_util::FutureExt;
+        if self.task.as_ref().is_some_and(|t| t.is_finished())
+            && let Some(Ok(look)) = self.task.take().and_then(|t| t.now_or_never())
+        {
+            apply_look(app, look);
+        }
+        let shown = matches!(app.mode, AppMode::MainMenu | AppMode::AgentPanel);
+        let stale = self.last.is_none_or(|at| at.elapsed() >= RUNTIME_REFRESH);
+        if self.task.is_none() && (self.due || (shown && stale)) {
+            self.due = false;
+            self.last = Some(Instant::now());
+            let locator = crate::runtime::client::Locator::default_paths();
+            self.task = Some(tokio::spawn(look_at(locator, LOOK_WAIT)));
+        }
+    }
 }
 
 /// Launches `provider` (or attaches to `attach`) through the runtime and
@@ -119,7 +173,6 @@ async fn open_session(
         Err(error) => format!("\u{274c} {error:#}"),
     });
     let _ = terminal.clear();
-    refresh_runtime(app).await;
 }
 
 async fn run_tui_loop(
@@ -127,19 +180,13 @@ async fn run_tui_loop(
     app: &mut App,
     diagnostics: &crate::diagnostics::Capture,
 ) -> Result<()> {
-    refresh_runtime(app).await;
-    let mut refreshed = Instant::now();
+    let mut looks = Looks::default();
     loop {
         terminal.autoresize()?;
         for message in diagnostics.drain() {
             app.status_message = Some(message);
         }
-        if refreshed.elapsed() >= RUNTIME_REFRESH
-            && matches!(app.mode, AppMode::MainMenu | AppMode::AgentPanel)
-        {
-            refresh_runtime(app).await;
-            refreshed = Instant::now();
-        }
+        looks.poll(app);
 
         if app.force_terminal_redraw {
             terminal.clear()?;
@@ -204,11 +251,11 @@ async fn run_tui_loop(
                                         if let Some(sid) = selected {
                                             open_session(terminal, app, diagnostics, None, Some(sid))
                                                 .await;
+                                            looks.request();
                                         }
                                     }
                                     KeyCode::Char('r') if !ctrl => {
-                                        refresh_runtime(app).await;
-                                        refreshed = Instant::now();
+                                        looks.request();
                                     }
                                     _ => {}
                                 },
@@ -221,15 +268,16 @@ async fn run_tui_loop(
                                             Some(MenuAction::LaunchClaude) => {
                                                 open_session(terminal, app, diagnostics, Some("claude"), None)
                                                     .await;
+                                                looks.request();
                                             }
                                             Some(MenuAction::LaunchCodex) => {
                                                 open_session(terminal, app, diagnostics, Some("codex"), None)
                                                     .await;
+                                                looks.request();
                                             }
                                             Some(MenuAction::AgentPanel) => {
                                                 app.handle_selection().await?;
-                                                refresh_runtime(app).await;
-                                                refreshed = Instant::now();
+                                                looks.request();
                                             }
                                             _ => app.handle_selection().await?,
                                         }
@@ -271,5 +319,46 @@ async fn run_tui_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_look_at_a_runtime_that_never_answers_ends_within_its_wait() {
+        let dir = tempfile::Builder::new()
+            .prefix("atem-look")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("rt.sock");
+        // Accepts connections (the backlog) but never answers a hello.
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let locator = crate::runtime::client::Locator {
+            socket: socket.clone(),
+            record: dir.path().join("none"),
+            log: dir.path().join("log"),
+        };
+        let started = Instant::now();
+        let look = look_at(locator, Duration::from_millis(300)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(look, Err("The atem runtime didn't answer".to_string()));
+        let mut app = App::new();
+        apply_look(&mut app, look);
+        assert_eq!(app.runtime_note.as_deref(), Some("The atem runtime didn't answer"));
+        assert!(!app.astation_connected && app.runtime_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_runtime_the_menu_says_launching_starts_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let locator = crate::runtime::client::Locator {
+            socket: dir.path().join("rt.sock"),
+            record: dir.path().join("none"),
+            log: dir.path().join("log"),
+        };
+        let look = look_at(locator, Duration::from_secs(2)).await;
+        assert_eq!(look, Ok(None));
     }
 }

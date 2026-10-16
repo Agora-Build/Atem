@@ -168,12 +168,19 @@ pub async fn stop(sid: &str) -> Result<()> {
             session_id: sid.to_string(),
         })
         .await?;
-    let text = reply(&mut client, "stop", |m| match m {
-        RuntimeMsg::Notice { text } => Some(text),
+    let removed = reply(&mut client, "stop", |m| match m {
+        RuntimeMsg::Stopped {
+            session_id,
+            removed,
+        } if session_id == sid => Some(removed),
         _ => None,
     })
     .await?;
-    println!("{text}");
+    if removed {
+        println!("Removed {sid}");
+    } else {
+        println!("Stopping {sid}");
+    }
     Ok(())
 }
 

@@ -195,7 +195,9 @@ JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.
 
 | op | from | fields |
 |---|---|---|
-| `hello` / `welcome` | client / runtime | `protocol`, `build`; runtime adds its pid and `astation` (link up) |
+| `hello` / `welcome` | client / runtime | `protocol`, `build`, `passive` (a client that never keeps an idle runtime running, e.g. the menu's look); runtime adds its pid and `astation` (link up) |
+| `paste` | client | `session_id`, `bytes` (base64 UTF-8, ≤ 1 MiB): one local input, written whole (bracketed when the agent asked for it) |
+| `stopped` | runtime | `session_id`, `removed`: the answer to `stop` |
 | `launch` | client | `provider`, `args`, `cwd`, `env`, `rows`, `cols` → `launched {session}` |
 | `attach` / `detach` | client | `session_id`, `rows`, `cols` → `attached {session, restore}` |
 | `input` | client | `session_id`, `bytes` |

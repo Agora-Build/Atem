@@ -20,8 +20,9 @@ pub const WORKER_PROTOCOL: u32 = 1;
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Most raw bytes in one `output`.
 pub const MAX_OUTPUT: usize = 16 * 1024;
-/// Most raw bytes in one `write` (the PTY's bound).
-pub const MAX_WRITE: usize = crate::pty_session::MAX_INPUT;
+/// Most raw bytes in one `write` (a fenced PTY write: a local paste is
+/// written whole, so nothing can come between its pieces).
+pub const MAX_WRITE: usize = crate::pty_session::MAX_FENCED;
 /// Most bytes of text in one `paste`.
 pub const MAX_PASTE: usize = 256 * 1024;
 

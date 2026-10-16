@@ -6,7 +6,9 @@
 
 use super::{clipboard, draw, terminal_view};
 use crate::runtime::client::{RuntimeClient, RuntimeWriter};
-use crate::runtime::protocol::{ClientMsg, MAX_INPUT, RuntimeMsg, SessionSummary, unb64};
+use crate::runtime::protocol::{
+    ClientMsg, MAX_INPUT, MAX_PASTE, RuntimeMsg, SessionSummary, unb64,
+};
 use crate::session::Provider;
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -21,8 +23,6 @@ use std::time::{Duration, Instant};
 use terminal_view::Action;
 use tokio::sync::mpsc;
 
-/// Largest paste sent (in pieces of at most `MAX_INPUT` bytes).
-pub const MAX_PASTE: usize = 1024 * 1024;
 /// How long a detach waits for the runtime's confirmation.
 const DETACH_WAIT: Duration = Duration::from_secs(2);
 
@@ -237,13 +237,13 @@ impl View {
         }
     }
 
-    /// Paste as the agent's terminal expects it, in `input`-sized pieces.
-    pub fn paste(&self, text: &str) -> Result<Vec<Vec<u8>>, String> {
-        let data = crate::terminal_keys::paste(text, self.parser.screen().bracketed_paste());
-        if data.len() > MAX_PASTE {
+    /// A paste as one `paste` message: the runtime writes it whole
+    /// (bracketed when the agent asked for it), revoking a remote lease once.
+    pub fn paste(&self, text: &str) -> Result<ClientMsg, String> {
+        if text.len() > MAX_PASTE {
             return Err("Paste exceeds 1 MiB; it was not sent".into());
         }
-        Ok(pieces(data.as_bytes()))
+        Ok(ClientMsg::paste(&self.sid, text))
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -447,11 +447,7 @@ async fn handle_event(
                     send_bytes(view, writer, view.ui.prefix.bytes().as_bytes()).await?;
                 }
                 match view.paste(&text) {
-                    Ok(pieces) => {
-                        for piece in pieces {
-                            writer.send(&ClientMsg::input(&view.sid, &piece)).await?;
-                        }
-                    }
+                    Ok(message) => writer.send(&message).await?,
                     Err(text) => view.notice(text),
                 }
             }
@@ -737,15 +733,10 @@ mod tests {
     }
 
     #[test]
-    fn a_large_paste_goes_in_input_sized_pieces_and_a_huge_one_is_refused() {
-        let mut view = View::new(SID, false, None);
-        attached(&mut view, "\x1b[?2004h", 0);
+    fn a_large_paste_is_one_paste_message_and_a_huge_one_is_refused() {
+        let view = View::new(SID, false, None);
         let text = "x".repeat(MAX_INPUT * 2 + 5);
-        let pieces = view.paste(&text).unwrap();
-        assert_eq!(pieces.len(), 3);
-        assert!(pieces.iter().all(|p| p.len() <= MAX_INPUT));
-        let joined: Vec<u8> = pieces.concat();
-        assert!(joined.starts_with(b"\x1b[200~") && joined.ends_with(b"\x1b[201~"));
+        assert_eq!(view.paste(&text).unwrap(), ClientMsg::paste(SID, &text));
         assert!(view.paste(&"y".repeat(MAX_PASTE + 1)).is_err());
     }
 

@@ -683,7 +683,7 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
             Ok(())
         };
         assert!(
-            RuntimeClient::existing_at(&locator)
+            RuntimeClient::existing_at(&locator, false)
                 .await
                 .unwrap()
                 .is_none(),
@@ -694,7 +694,7 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
             .unwrap();
         assert_eq!(client.welcome.pid, std::process::id());
         assert!(
-            RuntimeClient::existing_at(&locator)
+            RuntimeClient::existing_at(&locator, false)
                 .await
                 .unwrap()
                 .is_some()
@@ -971,7 +971,10 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
             .await
             .unwrap();
         expect(&mut client, |m| match m {
-            RuntimeMsg::Notice { text } if text.starts_with("Removed") => Some(()),
+            RuntimeMsg::Stopped {
+                session_id,
+                removed: true,
+            } if session_id == sid => Some(()),
             _ => None,
         })
         .await;
@@ -1378,6 +1381,52 @@ fn the_frontend_hears_the_astation_link_and_its_session_summary_changes() {
         assert_eq!(session.id, fake.sid);
         assert_eq!(session.status, "working");
         assert!(session.attached && !session.remote_controlled);
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn a_passive_client_never_keeps_the_runtime_up() {
+    local(async {
+        let mut runtime = Runtime::start(Duration::from_secs(1), own_uid());
+        // The menu's lightweight look: connected, but not counted.
+        let _menu = RuntimeClient::connect_passive_at(&runtime.socket)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut runtime.server)
+            .await
+            .expect("a passive client kept the idle runtime up")
+            .unwrap()
+            .unwrap();
+    });
+}
+
+#[test]
+fn stop_answers_stopped_for_that_session() {
+    local(async {
+        let runtime = Runtime::new();
+        let agent = echo_agent(runtime.dir.path());
+        let mut client = runtime.client().await;
+        client
+            .send(&runtime.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let sid = launched(&mut client).await.id;
+        client
+            .send(&ClientMsg::Stop {
+                session_id: sid.clone(),
+            })
+            .await
+            .unwrap();
+        let (stopped, removed) = expect(&mut client, |m| match m {
+            RuntimeMsg::Stopped {
+                session_id,
+                removed,
+            } => Some((session_id, removed)),
+            _ => None,
+        })
+        .await;
+        assert_eq!((stopped, removed), (sid, false));
         runtime.shutdown().await;
     });
 }

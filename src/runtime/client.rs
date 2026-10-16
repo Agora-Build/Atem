@@ -101,13 +101,10 @@ impl RuntimeClient {
         Self::connect_or_start_with(&locator, move || start_runtime(&log), START_WAIT).await
     }
 
-    /// The running runtime, if one answers.
-    pub async fn existing() -> Result<Option<Self>> {
-        Self::existing_at(&Locator::default_paths()).await
-    }
-
-    pub(crate) async fn existing_at(locator: &Locator) -> Result<Option<Self>> {
-        match Self::connect(locator).await {
+    /// The runtime at `locator`, if one answers; `passive`: a client that
+    /// never keeps an idle runtime running (the menu's look at the sessions).
+    pub(crate) async fn existing_at(locator: &Locator, passive: bool) -> Result<Option<Self>> {
+        match Self::connect_as(locator, passive).await {
             Ok(client) => Ok(Some(client)),
             Err(Failure::Absent | Failure::Restarting) => Ok(None),
             Err(Failure::Other(error)) => Err(error),
@@ -147,13 +144,24 @@ impl RuntimeClient {
         }
     }
 
+    /// A passive client of the runtime at `socket`.
+    #[cfg(test)]
+    pub async fn connect_passive_at(socket: &Path) -> Result<Self> {
+        let stream = dial_at(socket).await?;
+        match Self::greet(stream, true).await {
+            Ok(client) => Ok(client),
+            Err(Failure::Other(error)) => Err(error),
+            Err(_) => bail!("the atem runtime at {} is restarting", socket.display()),
+        }
+    }
+
     /// Connects to the runtime at `socket` and greets it.
     #[cfg(test)]
     pub async fn connect_at(socket: &Path) -> Result<Self> {
         let stream = dial_at(socket)
             .await
             .with_context(|| format!("no atem runtime at {}", socket.display()))?;
-        match Self::greet(stream).await {
+        match Self::greet(stream, false).await {
             Ok(client) => Ok(client),
             Err(Failure::Other(error)) => Err(error),
             Err(_) => bail!("the atem runtime at {} is restarting", socket.display()),
@@ -161,8 +169,12 @@ impl RuntimeClient {
     }
 
     async fn connect(locator: &Locator) -> Result<Self, Failure> {
+        Self::connect_as(locator, false).await
+    }
+
+    async fn connect_as(locator: &Locator, passive: bool) -> Result<Self, Failure> {
         match dial(locator).await {
-            Ok(stream) => Self::greet(stream).await,
+            Ok(stream) => Self::greet(stream, passive).await,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -178,7 +190,7 @@ impl RuntimeClient {
         }
     }
 
-    async fn greet(stream: UnixStream) -> Result<Self, Failure> {
+    async fn greet(stream: UnixStream, passive: bool) -> Result<Self, Failure> {
         let (read, writer) = stream.into_split();
         let mut client = Self {
             reader: BufReader::new(read),
@@ -194,6 +206,7 @@ impl RuntimeClient {
         let hello = ClientMsg::Hello {
             protocol: PROTOCOL,
             build: crate::memory::key_agent::build_id().to_string(),
+            passive,
         };
         let reply = tokio::time::timeout(Duration::from_secs(10), async {
             client.send(&hello).await?;

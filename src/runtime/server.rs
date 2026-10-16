@@ -10,7 +10,7 @@ use super::broker::{BrokerSession, Launcher, SessionState};
 use super::host_bridge::{Clock, HostBridge};
 use super::protocol::{
     ClientMsg, DecodeError, MAX_OUTPUT, PROTOCOL, RuntimeMsg, SessionSummary, b64, encode_runtime,
-    input_bytes,
+    input_bytes, paste_text,
 };
 use crate::app::App;
 use crate::session::{EXITED_KEEP, Provider, SessionId};
@@ -83,6 +83,8 @@ struct Client {
     /// Output of earlier epochs is skipped by the writer.
     epoch: Arc<AtomicU64>,
     greeted: bool,
+    /// Greeted as passive: never keeps an idle runtime running.
+    passive: bool,
     /// Input waiting for room in its session's PTY queue; nothing more is
     /// read from this client until it's written.
     pending: Option<ClientMsg>,
@@ -387,6 +389,7 @@ impl Server {
                 backlog,
                 epoch,
                 greeted: false,
+                passive: false,
                 pending: None,
                 held: None,
                 closing: false,
@@ -426,13 +429,28 @@ impl Server {
         self.send(client, &RuntimeMsg::error(text, Some(op)));
     }
 
-    /// Status messages the host would have shown become notices for every frontend.
+    /// A notice for the frontend attached to `sid` only.
+    fn session_notice(&self, sid: &SessionId, text: String) {
+        if let Some(attachment) = self.attached.get(sid) {
+            self.send(attachment.client, &RuntimeMsg::Notice { text });
+        }
+    }
+
+    /// The App's Astation link messages concern every session: a notice for
+    /// every frontend. Mark-task notices go to their session's frontend
+    /// only; those of no session to the log.
     fn forward_status(&mut self) {
+        for (sid, text) in std::mem::take(&mut self.app.task_notices) {
+            match sid {
+                Some(sid) => self.session_notice(&sid, text),
+                None => eprintln!("atem runtime: {text}"),
+            }
+        }
         let Some(text) = self.app.status_message.take() else {
             return;
         };
         let notice = RuntimeMsg::Notice { text };
-        for client in self.clients.values().filter(|c| c.greeted) {
+        for client in self.clients.values().filter(|c| c.greeted && !c.passive) {
             client.send(&notice);
         }
     }
@@ -461,7 +479,7 @@ impl Server {
         let idle = self.live_count() == 0
             && self.launching == 0
             && !self.adopting
-            && self.clients.is_empty();
+            && self.clients.values().all(|c| c.greeted && c.passive);
         if !idle {
             self.idle_since = None;
             return false;
@@ -567,7 +585,7 @@ impl Server {
                 // A new screen: a fresh restore, at the frontend's size (the
                 // worker's screen may have another one, e.g. after adoption).
                 attachment.restored = false;
-                self.adjust_size(&sid, size.0, size.1);
+                self.local_size(&sid, size.0, size.1);
             }
             for text in pumped.failed {
                 self.error(client, text, "input");
@@ -681,9 +699,10 @@ impl Server {
         };
         if !greeted {
             match message {
-                ClientMsg::Hello { .. } => {
+                ClientMsg::Hello { passive, .. } => {
                     if let Some(client) = self.clients.get_mut(&id) {
                         client.greeted = true;
+                        client.passive = passive;
                         client.send(&RuntimeMsg::Welcome {
                             protocol: PROTOCOL,
                             build: crate::memory::key_agent::build_id().to_string(),
@@ -790,7 +809,7 @@ impl Server {
                         },
                     );
                 }
-                self.adjust_size(&sid, rows, cols);
+                self.local_size(&sid, rows, cols);
                 if let Some(session) = self.sessions.get_mut(&sid) {
                     session.tap.open();
                 }
@@ -809,7 +828,7 @@ impl Server {
                     },
                 );
             }
-            message @ ClientMsg::Input { .. } => {
+            message @ (ClientMsg::Input { .. } | ClientMsg::Paste { .. }) => {
                 if let Some(message) = self.input(id, message)
                     && let Some(client) = self.clients.get_mut(&id)
                 {
@@ -827,7 +846,7 @@ impl Server {
                 if let Some(attachment) = self.attached.get_mut(&sid) {
                     attachment.size = (rows, cols);
                 }
-                self.adjust_size(&sid, rows, cols);
+                self.local_size(&sid, rows, cols);
             }
             ClientMsg::Reclaim { session_id } => {
                 let Some(sid) = self.attached_by(id, &session_id) else {
@@ -875,14 +894,21 @@ impl Server {
                         }
                         self.send(
                             id,
-                            &RuntimeMsg::Notice {
-                                text: format!("Stopping {sid}"),
+                            &RuntimeMsg::Stopped {
+                                session_id: sid.to_string(),
+                                removed: false,
                             },
                         );
                     }
                     SessionState::Interrupted | SessionState::RecoveryRequired => {
                         match self.forget(&sid) {
-                            Ok(text) => self.send(id, &RuntimeMsg::Notice { text }),
+                            Ok(()) => self.send(
+                                id,
+                                &RuntimeMsg::Stopped {
+                                    session_id: sid.to_string(),
+                                    removed: true,
+                                },
+                            ),
                             Err(text) => self.error(id, text, "stop"),
                         }
                     }
@@ -911,7 +937,7 @@ impl Server {
     /// signalled: while a process the record names still runs (its pid with
     /// the recorded start time), the session and record stay and the error
     /// names it.
-    fn forget(&mut self, sid: &SessionId) -> Result<String, String> {
+    fn forget(&mut self, sid: &SessionId) -> Result<(), String> {
         let state = self.options.launcher.state();
         // The record on disk: a session that ran in this broker has none in memory.
         let record = super::worker::read_record(&super::worker::record_path(state, sid.as_str()))
@@ -936,7 +962,7 @@ impl Server {
             self.detach(sid);
         }
         self.remove_session(sid);
-        Ok(format!("Removed {sid}"))
+        Ok(())
     }
 
     /// Sends what's queued, then closes the connection.
@@ -965,24 +991,39 @@ impl Server {
     /// input epoch. `Some(message)` back: too many writes are in flight;
     /// keep it and read nothing more from this client meanwhile.
     fn input(&mut self, id: u64, message: ClientMsg) -> Option<ClientMsg> {
-        let ClientMsg::Input { session_id, bytes } = &message else {
-            return None;
+        let (session_id, op) = match &message {
+            ClientMsg::Input { session_id, .. } => (session_id, "input"),
+            ClientMsg::Paste { session_id, .. } => (session_id, "paste"),
+            _ => return None,
         };
         let Some(sid) = self.attached_by(id, session_id) else {
-            self.error(id, "Attach to the session first", "input");
+            self.error(id, "Attach to the session first", op);
             return None;
         };
-        let bytes = match input_bytes(bytes) {
+        let Some(bracketed) = self
+            .sessions
+            .get(&sid)
+            .filter(|s| s.is_live())
+            .map(|s| s.bracketed_paste())
+        else {
+            self.error(id, "The session has ended", op);
+            return None;
+        };
+        let bytes = match &message {
+            ClientMsg::Input { bytes, .. } => input_bytes(bytes),
+            // One write, so nothing (no remote byte) comes between its pieces.
+            ClientMsg::Paste { bytes, .. } => paste_text(bytes)
+                .map(|text| crate::terminal_keys::paste(&text, bracketed).into_bytes()),
+            _ => return None,
+        };
+        let bytes = match bytes {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.error(id, error.to_string(), "input");
+                self.error(id, error.to_string(), op);
                 return None;
             }
         };
-        let Some(session) = self.sessions.get_mut(&sid).filter(|s| s.is_live()) else {
-            self.error(id, "The session has ended", "input");
-            return None;
-        };
+        let session = self.sessions.get_mut(&sid).expect("checked above");
         if !session.can_write() {
             return Some(message);
         }
@@ -993,7 +1034,7 @@ impl Server {
             None => session.write(&bytes),
         };
         if let Err(error) = written {
-            self.error(id, error.to_string(), "input");
+            self.error(id, error.to_string(), op);
         }
         None
     }
@@ -1044,12 +1085,25 @@ impl Server {
         }
     }
 
+    /// The local frontend's size, unless a remote lease holder owns the
+    /// size: then it waits in the attachment until a reclaim.
+    fn local_size(&mut self, sid: &SessionId, rows: u16, cols: u16) {
+        if self
+            .bridge
+            .as_ref()
+            .is_some_and(|b| b.lease_holder(sid.as_str()).is_some())
+        {
+            return;
+        }
+        self.adjust_size(sid, rows, cols);
+    }
+
     /// The local frontend's size for a live session's terminal.
     fn adjust_size(&mut self, sid: &SessionId, rows: u16, cols: u16) {
         if let Some(session) = self.sessions.get_mut(sid)
             && let Err(error) = session.resize(rows, cols)
         {
-            self.app.status_message = Some(format!("Failed to resize {sid}: {error}"));
+            self.session_notice(sid, format!("Failed to resize {sid}: {error}"));
         }
     }
 
