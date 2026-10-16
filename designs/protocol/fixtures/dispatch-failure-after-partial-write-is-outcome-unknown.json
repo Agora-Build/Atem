@@ -23,7 +23,6 @@
      "view",
      "control"
     ],
-    "upgraded": true,
     "client_kind": "native",
     "holds_lease_epoch": 1
    }

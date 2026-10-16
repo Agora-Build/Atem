@@ -1,7 +1,9 @@
-# atem-session v1: sessions, control leases and receipts (r5, accepted for compatibility mode)
+# atem-session v1: sessions, control leases and receipts (r6: r5 accepted for compatibility mode, minus legacy paths — for review)
 
-Status: r5 accepted by Astation on 2026-10-15 as the compatibility-mode
-implementation contract ([r5 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r5-review.md)).
+Status: r6 (2026-10-16) removes every legacy path from r5 at the user's
+direction (no backward compatibility; Atem and Astation update together) —
+needs Astation's review. r5 was accepted by Astation on 2026-10-15 as the
+compatibility-mode implementation contract ([r5 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r5-review.md)).
 Final conformance needs the shared fixtures to pass in the Rust, Swift and
 browser implementations; §9 remains the security gate. History: r1 (`7a0c691`), r2 (`9383193`), r3
 (`1bf805c`, [r3 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r3-review.md))
@@ -34,30 +36,18 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
   browser clients, no account-wide native access, and no claim of relay
   confidentiality. Admission fails closed; no placeholder trust decision is
   exposed as production authorization.
-- **One session authority, every connection.** Each session has exactly one
-  lease authority on the host (§5), whatever socket, transport or message family
-  a request uses. A connection is "upgraded" once it received `welcome`; upgrade
-  changes how a client addresses things, not who may mutate a session:
-  - terminal-v1 `control{take:true}` from a non-upgraded connection is an
-    `acquire{takeover:true}` by that connection's attachment on the same
-    authority; `control{take:false}` is `release`. Its `lease_id` maps to that
-    lease.
-  - A session is **managed** from the moment any attachment first acquires its
-    lease (session `acquire` or legacy terminal-v1 `control`) until the session
-    ends; the flag never clears (not on release, expiry or local reclaim).
-    Legacy unscoped mutations (`agentInput`, `agentPrompt`, voice commands,
-    `userCommand`, chat-v1 `submit` without `binding`) routed to a managed
-    session are always rejected (`forbidden`, nothing written or dispatched),
-    whether or not a remote holder exists, and they never acquire. Sessions that
-    have never been managed keep today's legacy behaviour (routed per Atem's
-    default-session rule); legacy can't create a path into a managed session.
-  - Legacy terminal-v1 `control` keeps all its checks (permission, attachment,
-    exact `terminal_id`/`generation`, subscribed `stream_id`, deadline) before it
-    maps onto `acquire`/`release`.
-  - On an upgraded connection every mutation must carry `binding` (§2) and the
-    current lease; legacy unscoped mutations there are always `forbidden`.
+- **One session authority, no legacy paths** (r6). Atem and Astation are
+  updated together; there is no backward compatibility. Every remote mutation
+  of a session — terminal input/resize/stop, chat submit, interrupt — is a
+  session-v1 message carrying `binding` and the current lease, after `welcome`.
+  The old ops are removed from the host and answered with
+  `error{code:"unsupported_version"}` and no effect: `agentInput`,
+  `agentPrompt`, `voiceCommand`/`voiceToggle` prompts, `userCommand`,
+  terminal-v1 `control` and its `lease_id` field, chat-v1 `submit` without
+  `binding`, and any session op before `welcome`. Terminal ids are session ids
+  only (no `claude`/`codex` aliases).
   - Local terminal input on the host revokes any remote lease first (§5).
-  Fixture `legacy-connection-cannot-bypass-lease`.
+  Fixture `removed-ops-have-no-effect`.
 
 ## 1. Representation
 
@@ -122,8 +112,8 @@ Every request that targets a session carries one **binding** object:
   "binding":{"target":{…},"attachment_gen":"33333333-…","lease_epoch":7}}}
 ```
 
-  On upgraded connections the terminal-v1 `lease_id` field is not used (the
-  binding's epoch replaces it); a chat `submit` is the §6 `submit` with
+  terminal-v1 has no `lease_id` field (the binding's epoch is the lease); a
+  chat `submit` is the §6 `submit` with
   `kind:"prompt"`, `request_id = requestId`, `payload = {"text": text}`.
 - `lease_epoch` is required for mutations, absent for reads.
 - Any mismatch → `error{code:"stale_target"}` with **no** current values; the
@@ -340,7 +330,7 @@ Kinds and payloads (v1):
 - **Retention**: receipts live for the session's life and 7 days after it closes.
   An accepting session's receipts are never evicted; at its limit new
   submissions get `receipt_limit`. Closed sessions answer `session_closed`.
-- chat-v1 on an upgraded connection: its `submit.requestId` is this
+- chat-v1: its `submit.requestId` is this
   `request_id`, it carries `binding`, and its `accepted`/`complete` follow this
   receipt's `accepted`/`completed`.
 
@@ -351,9 +341,9 @@ contains secrets, paths, raw OS errors or other targets' identifiers.
 
 | code | when |
 |---|---|
-| `unsupported_version` | unknown `v` or out-of-range representation |
+| `unsupported_version` | unknown `v`, out-of-range representation, or a removed op (§0) |
 | `unauthorized` | not authenticated, attachment fenced, or authorization expired |
-| `forbidden` | missing permission, or a legacy op on an upgraded connection |
+| `forbidden` | missing permission |
 | `stale_target` | trust generation, session or process generation mismatch |
 | `unknown_session` | unknown or not visible to this attachment |
 | `lease_held` | another controller holds the lease (no takeover) |
@@ -391,7 +381,7 @@ message), `disconnect`, `resume`, `local_input`, `crash_worker`,
 counters: PTY writes, resizes, stops, dispatches, receipts visible per client;
 client state for client-side fixtures: `controls`, `deadline_ms`, registry). Negative scenarios assert both the
 error and the absence of writes, dispatch, disclosure or resurrection. The
-first set (r3 adds the r2-review cases: two-connection lease bypass, late/duplicate
+first set (r3 adds the r2-review cases: removed ops have no effect, late/duplicate
 lease replies, runtime epoch snapshots, snapshot/change reordering, hidden-session
 changes, change after removal, receipt-query authorization, changed-target id
 reuse, failed durable write, local reclaim at the PTY boundary, old attachment

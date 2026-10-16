@@ -1,4 +1,4 @@
-# Fixture format (atem-session v1, r3)
+# Fixture format (atem-session v1, r6)
 
 One scenario per `*.json` file; `digest-vectors.json` holds the canonical-digest
 known-answer vectors (`vectors`: payload → canonical string → sha256;
@@ -13,7 +13,7 @@ implementation; the fixture plays the host with `deliver_to_client`).
 
 - `host`: `{account_id, atem_device_id, host_trust_gen, runtime_gen, runtime_epoch}` — the host's own context.
 - `sessions[]`: `{session_id, process_gen, chat?}`.
-- `clients[]`: `{name, attachment_gen, permissions, upgraded, client_kind, holds_lease_epoch?}` — the client's authenticated identity, permissions and connection mode, set by the harness (never derived from message fields).
+- `clients[]`: `{name, attachment_gen, permissions, client_kind, holds_lease_epoch?}` — the client's authenticated identity, permissions and connection mode, set by the harness (never derived from message fields).
 
 `steps[]`, in order, on a deterministic monotonic clock starting at 0 ms:
 

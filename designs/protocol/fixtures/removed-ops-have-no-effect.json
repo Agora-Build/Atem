@@ -1,0 +1,420 @@
+{
+ "name": "removed-ops-have-no-effect",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "up",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   },
+   {
+    "name": "other",
+    "attachment_gen": "66666666-6666-4666-8666-666666666666",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "up",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "up",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000001"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "subscribe",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     }
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "attached"
+   },
+   "capture": {
+    "s2": "stream_id"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentInput",
+    "data": {
+     "agent_id": null,
+     "kind": "text",
+     "text": "rm -rf x"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentInput",
+    "data": {
+     "agent_id": "ses-aaaaaaaaaaaa",
+     "kind": "key",
+     "key": "enter"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentPrompt",
+    "data": {
+     "agent_id": "ses-aaaaaaaaaaaa",
+     "session_id": null,
+     "text": "hi"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "voiceCommand",
+    "data": {
+     "text": "run the tests",
+     "is_final": true
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "userCommand",
+    "data": {
+     "command": "ls",
+     "action": "cli_input"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "c",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-444444444445",
+     "text": "hi"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "control",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "${s2}",
+     "take": true
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "subscribe",
+     "terminal_id": "claude",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     }
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "assert": {
+    "pty_writes": 0,
+    "resizes": 0,
+    "stops": 0,
+    "dispatches": 0,
+    "lease_holder": "up"
+   }
+  },
+  {
+   "send": "up",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "release",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "up",
+   "match": {
+    "op": "lease_released"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentInput",
+    "data": {
+     "agent_id": null,
+     "kind": "text",
+     "text": "rm -rf x"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentInput",
+    "data": {
+     "agent_id": "ses-aaaaaaaaaaaa",
+     "kind": "key",
+     "key": "enter"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentPrompt",
+    "data": {
+     "agent_id": "ses-aaaaaaaaaaaa",
+     "session_id": null,
+     "text": "hi"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "voiceCommand",
+    "data": {
+     "text": "run the tests",
+     "is_final": true
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "userCommand",
+    "data": {
+     "command": "ls",
+     "action": "cli_input"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "other",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "c",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-444444444445",
+     "text": "hi"
+    }
+   }
+  },
+  {
+   "expect": "other",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "local_input": "ses-aaaaaaaaaaaa",
+   "bytes": "eA=="
+  },
+  {
+   "assert": {
+    "pty_writes_local": 1,
+    "pty_writes_remote": 0,
+    "dispatches": 0
+   }
+  }
+ ],
+ "note": "r6: no legacy paths. Old ops (agentInput, agentPrompt, voice, userCommand, unbound chat submit, terminal-v1 control) and provider-name terminal ids are refused with unsupported_version and no effect, whether or not a lease is held; only session-v1 acquire grants control; local input still works."
+}

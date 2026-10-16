@@ -17,7 +17,6 @@
     "permissions": [
      "view"
     ],
-    "upgraded": true,
     "client_kind": "native"
    }
   ]
