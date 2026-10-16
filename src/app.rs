@@ -661,7 +661,15 @@ impl App {
                 self.session_wire(text);
             }
             AstationMessage::SessionOversize { id } => {
-                self.session_refusal(id, crate::session_protocol::wire::ErrorCode::UnsupportedVersion);
+                self.session_refusal(id, crate::session_protocol::wire::ErrorCode::UnsupportedVersion, None);
+            }
+            AstationMessage::RemovedOp => {
+                // r6 §0: refused, with no effect.
+                self.session_refusal(
+                    None,
+                    crate::session_protocol::wire::ErrorCode::UnsupportedVersion,
+                    Some(hosted::REMOVED_OP),
+                );
             }
             AstationMessage::VisualizeRequest { session_id, .. } => {
                 // Diagram generation was removed; answer so Astation stops waiting.

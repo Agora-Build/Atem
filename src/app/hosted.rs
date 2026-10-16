@@ -85,22 +85,26 @@ impl App {
         };
         // The host's inbox is full: `busy` (the client may retry); without
         // a runtime, no session is served at all.
-        let code = if full {
-            ErrorCode::Busy
+        if full {
+            self.session_refusal(re, ErrorCode::Busy, None);
         } else {
-            ErrorCode::UnsupportedVersion
-        };
-        self.session_refusal(re, code);
+            self.session_refusal(re, ErrorCode::UnsupportedVersion, Some(NOT_SERVED_HERE));
+        }
     }
 
     /// A session `error` with `code` (answering `re`) on an authenticated link.
-    pub(super) fn session_refusal(&mut self, re: Option<String>, code: ErrorCode) {
+    pub(super) fn session_refusal(
+        &mut self,
+        re: Option<String>,
+        code: ErrorCode,
+        detail: Option<&str>,
+    ) {
         if !self.astation_connected || self.astation_client.is_ws_closed() {
             return;
         }
         let _ = self
             .astation_client
-            .try_send_wire(error_text(re, code), false);
+            .try_send_wire(error_detail_text(re, code, detail), false);
     }
 
     /// Drops the Astation link (closing its socket) and schedules the
@@ -131,12 +135,25 @@ pub fn refusal(re: Option<String>) -> String {
     error_text(re, ErrorCode::UnsupportedVersion)
 }
 
+/// The detail of the TUI's refusal of a session-family message.
+pub const NOT_SERVED_HERE: &str = "sessions are served by atem runtime";
+/// The detail of the refusal of an op removed in atem-session r6.
+pub const REMOVED_OP: &str = "removed in atem-session r6";
+
 /// A session `error{code}` answering `re`.
 pub fn error_text(re: Option<String>, code: ErrorCode) -> String {
+    error_detail_text(re, code, None)
+}
+
+/// A session `error{code, detail}` answering `re`.
+pub fn error_detail_text(re: Option<String>, code: ErrorCode, detail: Option<&str>) -> String {
     let message = Envelope::Session(SessionMessage {
         id: uuid::Uuid::new_v4().to_string(),
         re,
-        op: Op::Error { code, detail: None },
+        op: Op::Error {
+            code,
+            detail: detail.map(str::to_string),
+        },
     });
     String::from_utf8(wire::encode(&message)).expect("wire JSON is UTF-8")
 }

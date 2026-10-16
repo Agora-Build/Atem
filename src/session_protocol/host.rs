@@ -1082,6 +1082,16 @@ impl<J: Journal> SessionHost<J> {
         self.sessions.get(session_id).map(|s| self.descriptor(s))
     }
 
+    /// The deadline (monotonic ms) of the session's current lease, if one is
+    /// held.
+    pub fn lease_deadline(&self, session_id: &str) -> Option<u64> {
+        self.sessions
+            .get(session_id)?
+            .lease
+            .as_ref()
+            .map(|l| l.deadline)
+    }
+
     pub fn lease_epoch(&self, session_id: &str) -> Option<u64> {
         self.sessions.get(session_id).map(|s| s.lease_epoch)
     }

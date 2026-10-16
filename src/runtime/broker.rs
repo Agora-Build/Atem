@@ -397,17 +397,25 @@ impl BrokerSession {
 
     /// Writes `bytes` under the current input epoch (local input).
     pub fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.write_tagged(bytes, WriteTag::Local).map(|_| ())
+        self.write_tagged(bytes, WriteTag::Local, None).map(|_| ())
     }
 
     /// Writes `bytes` under the current input epoch; its sequence number.
-    pub fn write_tagged(&mut self, bytes: &[u8], tag: WriteTag) -> anyhow::Result<u64> {
+    /// A remote write carries `not_after`, its lease's deadline
+    /// (`pty_session::monotonic_ns`): the worker drops it at the PTY write
+    /// boundary once that has passed.
+    pub fn write_tagged(
+        &mut self,
+        bytes: &[u8],
+        tag: WriteTag,
+        not_after: Option<u64>,
+    ) -> anyhow::Result<u64> {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
-        worker.write(seq, bytes, self.input_epoch)?;
+        worker.write_until(seq, bytes, self.input_epoch, not_after)?;
         self.next_seq += 1;
         self.in_flight.insert(seq, (bytes.len(), tag));
         self.last_used = Instant::now();
@@ -415,14 +423,15 @@ impl BrokerSession {
     }
 
     /// A bracketed paste of `text` plus Enter for the session host, under
-    /// the current input epoch; its sequence number.
-    pub fn paste(&mut self, text: &str) -> anyhow::Result<u64> {
+    /// the current input epoch (and `not_after`, as `write_tagged`); its
+    /// sequence number.
+    pub fn paste(&mut self, text: &str, not_after: Option<u64>) -> anyhow::Result<u64> {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
-        worker.paste(seq, text, self.input_epoch)?;
+        worker.paste_until(seq, text, self.input_epoch, not_after)?;
         self.next_seq += 1;
         self.in_flight.insert(seq, (text.len(), WriteTag::Host));
         self.last_used = Instant::now();

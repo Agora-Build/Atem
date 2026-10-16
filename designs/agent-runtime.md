@@ -28,7 +28,8 @@ below disagrees, this section wins.
    process generation. Transcripts are never replayed into a new process.
 2. **CLI workflow.** `atem status` (read-only, offline, stale marks; labels
    Account / Pairing / Verification / Credentials / Authorization / Relay /
-   Local agents; `atem cred status` is an alias). `atem pair` reports status and
+   Local agents; the user removed the `atem cred status` alias that
+   session-multiplexing.md §1 still lists). `atem pair` reports status and
    changes nothing when already paired; `atem pair verify` verifies the existing
    binding (no-op when validly verified; interruption keeps the pairing);
    `atem cred unlock` never starts pairing or verification (unverified → "run
@@ -104,16 +105,18 @@ Deviations from the text below:
 - `atem pair` on an already paired profile only prints the status (Alignment
   item 2); re-pairing over a live connection ("`atem pair` cases" 1–3) does not
   exist: `atem unpair`, then `atem pair`.
-- `atem cred status` is not an alias: `atem status` is the only status
-  command.
+- `atem status` is the only status command: the user removed the `atem cred
+  status` alias (session-multiplexing.md §1, maintained by Astation, still
+  lists it).
 - Remote viewers and controllers are not limited to "one viewer per session"
   by the runtime; the limit is the one link (one attachment).
-- Shared fixtures (`tests/runtime_fixtures_binary.rs`): eight host fixtures
-  pass against the real runtime; `lease-expiry-at-the-deadline-needs-no-timer`
-  fails as a known deviation (a chunk admitted before the deadline but still
-  waiting at the worker's PTY writer is cut only when the host's 100 ms
-  `advance` raises the worker's epoch); four can't run against one link. See
-  `designs/protocol/atem-host-handoff.md`.
+- Shared fixtures (`tests/runtime_fixtures_binary.rs`): nine host fixtures
+  pass against the real runtime, and `removed-ops-have-no-effect` passes
+  folded onto one attachment; the multi-attachment fixtures run only in the
+  core harness (one Astation link today) and closed-session has no runtime
+  trigger yet. A remote write carries its lease's deadline (`not_after`, on
+  CLOCK_MONOTONIC) and the worker drops it at the PTY write boundary once
+  that has passed. See `designs/protocol/atem-host-handoff.md`.
 
 ## Problem
 

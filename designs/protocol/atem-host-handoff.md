@@ -62,11 +62,12 @@ Removed, no compatibility (atem-session r6):
 
 - `agentListRequest`/`agentListResponse` are gone: the registry is session-v1
   `list` → `sessions`, then `session_changed` (per-attachment `seq`).
-- `agentInput`, `agentPrompt`, `voiceCommand`, `voice_toggle`,
-  `voiceRequest`/`voiceResponse`, `userCommand`/`commandResponse`,
-  `codexTaskRequest`/`codexTaskResponse` no longer parse. **They are dropped
-  without a reply** (r6 §0 and the fixture `removed-ops-have-no-effect` expect
-  `error{code:"unsupported_version"}`; see "Shared fixtures").
+- `agentInput`, `agentPrompt`, `voiceCommand`, `voiceToggle`/`voice_toggle`,
+  `voiceRequest`, `userCommand`, `codexTaskRequest` and `agentListRequest`
+  no longer parse. Each is answered with a session
+  `error{code:"unsupported_version", detail:"removed in atem-session r6"}`
+  (no `re`: they have no session id) and has no effect, in the runtime and in
+  the plain TUI (r6 §0).
 - terminal-v1 `list`/`sessions`, `control`/`controller`, `lease_id`, the
   `terminal_ids` marker and provider-name ids (`claude`, `codex`) are gone;
   chat-v1 `submit` without `binding` is refused. These family messages are
@@ -76,7 +77,8 @@ Attachments and identity:
 
 - The plain TUI (bare `atem` without a runtime) serves no sessions: any
   `session`, `terminal` or `agentChat` message is answered with
-  `error{code:"unsupported_version"}`. Bare `atem` no longer opens an
+  `error{code:"unsupported_version", detail:"sessions are served by atem
+  runtime"}`. Bare `atem` no longer opens an
   Astation connection at all; the runtime does.
 - Only the paired Astation the link authenticated with, verified in this
   profile's `cred_state.json`, gets an attachment (`view`, `control`,
@@ -109,7 +111,13 @@ terminal-v1:
   current lease.
 - Each `input` is answered with `written` (no `error`, or an error text;
   `"control changed; not written"` when the bytes were dropped at the write
-  boundary because control moved).
+  boundary because control moved or the lease's deadline passed).
+- Lease deadline at the write boundary: every remote write and paste the
+  broker hands a worker carries `not_after`, the lease's deadline on
+  `CLOCK_MONOTONIC`; the worker's PTY writer drops a chunk whose deadline has
+  passed when its turn comes, so nothing remote is written at or after the
+  deadline even if the host's 100 ms `advance` hasn't run yet. (A chunk queued
+  before a `renew` keeps the deadline it was sent with.)
 - A slow transport: frames are dropped and every stream ends with
   `error{code:"busy"}` ("Terminal transport congested; subscribe again");
   `written` acks and errors keep their order.
@@ -176,6 +184,7 @@ and `written` acks are not queued for `expect` (the acks count toward
 | Fixture | Result |
 |---|---|
 | dispatch-failure-after-partial-write-is-outcome-unknown | pass (incl. `restart_runtime` + `reconnect`) |
+| lease-expiry-at-the-deadline-needs-no-timer | pass (the remote chunk held at the PTY writer past the deadline is dropped by its `not_after`) |
 | dispatch-failure-before-any-effect-is-rejected | pass (incl. `restart_runtime` + `reconnect`) |
 | duplicate-submit-returns-receipt-and-reuse-is-rejected | pass |
 | exited-session-refuses-work-before-the-lease-check | pass (`crash_worker` = SIGKILL to the worker) |
@@ -183,11 +192,16 @@ and `written` acks are not queued for `expect` (the acks count toward
 | lease-expires-without-renewal | pass |
 | local-input-revokes-the-lease-and-drops-queued-bytes | pass |
 | reconnect-restarts-the-registry-sequence | pass |
-| lease-expiry-at-the-deadline-needs-no-timer | **fails (known deviation)**: a chunk admitted at 14 999 ms and still waiting at the worker's PTY writer is written at 15 000 ms. The broker checks the lease (`admit_write`) when it hands bytes to the worker; the worker checks only the input epoch, which the broker raises when the host's `advance` notices the expiry — every 100 ms of the session clock. Bytes queued at the worker can therefore be written up to ~100 ms after the deadline |
-| closed-session-refuses-work-before-the-lease-check | not run: the runtime never closes a running session (no `close_session` operation) |
-| receipt-query-is-scoped-to-the-exact-target | not run: 3 clients; the runtime holds one Astation link, so one attachment at a time |
-| removed-ops-have-no-effect | not run: 2 clients. Also checked with one client: `agentInput` gets **no reply** (expected `error{code:"unsupported_version"}`) |
-| takeover-moves-control-and-the-old-holder-becomes-a-viewer | not run: 3 clients |
+| removed-ops-have-no-effect | pass folded onto one attachment (the lease holder itself sends every removed op, with and without the lease; `lease_changed` for the second client left out); the two-attachment original runs in the core harness |
+| receipt-query-is-scoped-to-the-exact-target | core harness only (3 attachments) |
+| takeover-moves-control-and-the-old-holder-becomes-a-viewer | core harness only (3 attachments) |
+| closed-session-refuses-work-before-the-lease-check | core harness only: the runtime has no trigger that closes a running session yet |
+
+The multi-attachment fixtures (receipt-query, removed-ops, takeover) run
+only in the core harness (`SessionHost` in `src/session_protocol/fixtures.rs`)
+because the runtime holds one Astation link, so one attachment, at a time
+today; closed-session runs only there because nothing in the runtime closes
+a running session yet.
 
 The same fixtures all pass against the in-process `SessionHost`
 (`src/session_protocol/fixtures.rs`, with the memory and the file journal).
@@ -196,6 +210,12 @@ Not honoured against real processes: `timers: false` (the broker's loop runs
 `advance` whenever the clock moved 100 ms), `close_session`,
 `disconnect`/`resume` (no resume in compatibility mode), `fail_next_fsync`,
 `change_trust_gen`, and more than one client per scenario.
+
+## Differences from session-multiplexing.md
+
+- §1 lists `atem cred status` as a compatibility alias of `atem status`; the
+  user removed it. `atem status` is the only status command. (Astation
+  maintains session-multiplexing.md.)
 
 ## Still gated by §9
 

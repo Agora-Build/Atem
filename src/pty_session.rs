@@ -49,8 +49,29 @@ struct WriteRequest {
     /// A fenced write: its input epoch, compared at the write boundary with
     /// the current one (`PtyInput::raise_input_epoch`).
     fence: Option<u64>,
+    /// A remote write: dropped at the write boundary once `monotonic_ns()`
+    /// reached it (its lease's deadline). Local writes have none.
+    not_after: Option<u64>,
     /// Write half of it, then fail (`runtime::test_hooks`, debug builds).
     partial: bool,
+}
+
+/// Nanoseconds on `CLOCK_MONOTONIC`, which every process of the machine
+/// shares: the base of a remote write's `not_after`. In debug builds the
+/// fixture clock (`runtime::test_hooks`) replaces it when one is set.
+pub fn monotonic_ns() -> u64 {
+    if let Some(ms) = crate::runtime::test_hooks::clock_ms() {
+        return ms.saturating_mul(1_000_000);
+    }
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec for the call to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 /// An unfenced write (`respond`).
@@ -62,16 +83,20 @@ fn write_request(writer: &mut impl Write, request: &WriteRequest) -> Result<(), 
 }
 
 /// A fenced write at the write boundary: dropped when `fence` is older than
-/// the current input epoch.
+/// the current input epoch, or when its `not_after` has passed.
 fn write_fenced_request(
     writer: &mut impl Write,
     current: &AtomicU64,
     fence: u64,
+    not_after: Option<u64>,
     data: &[u8],
     partial: bool,
 ) -> FencedOutcome {
     crate::runtime::test_hooks::hold_writes();
     if fence < current.load(Ordering::SeqCst) {
+        return FencedOutcome::Dropped;
+    }
+    if not_after.is_some_and(|deadline| monotonic_ns() >= deadline) {
         return FencedOutcome::Dropped;
     }
     if partial {
@@ -118,10 +143,17 @@ impl PtyInput {
         self.input_epoch.load(Ordering::SeqCst)
     }
 
-    /// Terminal input (counted) written only if `epoch` is still current at
+    /// Terminal input (counted) written only if `epoch` is still current
+    /// (and `not_after`, a remote write's lease deadline, not reached) at
     /// the write boundary; the outcome comes back as `PtyEvent::Fenced`.
-    pub fn write_fenced(&self, data: Vec<u8>, epoch: u64, sequence: u64) -> Result<()> {
-        self.enqueue_fenced(data, epoch, sequence)?;
+    pub fn write_fenced(
+        &self,
+        data: Vec<u8>,
+        epoch: u64,
+        sequence: u64,
+        not_after: Option<u64>,
+    ) -> Result<()> {
+        self.enqueue_fenced_request(data, epoch, sequence, not_after, false)?;
         self.inputs.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -130,7 +162,13 @@ impl PtyInput {
     /// terminal input).
     /// Control characters other than newline and tab are refused, so no
     /// writer can end the bracketed paste early or submit early.
-    pub fn paste_fenced(&self, text: &str, epoch: u64, sequence: u64) -> Result<()> {
+    pub fn paste_fenced(
+        &self,
+        text: &str,
+        epoch: u64,
+        sequence: u64,
+        not_after: Option<u64>,
+    ) -> Result<()> {
         if text
             .chars()
             .any(|c| c.is_control() && c != '\n' && c != '\t')
@@ -145,11 +183,7 @@ impl PtyInput {
             bail!("Terminal input was not queued (test fault)");
         }
         let partial = crate::runtime::test_hooks::fail_next_partial();
-        self.enqueue_fenced_request(bytes, epoch, sequence, partial)
-    }
-
-    fn enqueue_fenced(&self, data: Vec<u8>, epoch: u64, sequence: u64) -> Result<()> {
-        self.enqueue_fenced_request(data, epoch, sequence, false)
+        self.enqueue_fenced_request(bytes, epoch, sequence, not_after, partial)
     }
 
     fn enqueue_fenced_request(
@@ -157,6 +191,7 @@ impl PtyInput {
         data: Vec<u8>,
         epoch: u64,
         sequence: u64,
+        not_after: Option<u64>,
         partial: bool,
     ) -> Result<()> {
         if data.is_empty() || data.len() > MAX_FENCED {
@@ -167,6 +202,7 @@ impl PtyInput {
                 data,
                 sequence: Some(sequence),
                 fence: Some(epoch),
+                not_after,
                 partial,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
@@ -181,6 +217,7 @@ impl PtyInput {
                 data,
                 sequence: None,
                 fence: None,
+                not_after: None,
                 partial: false,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
@@ -389,6 +426,7 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
                     &mut writer,
                     &writer_epoch,
                     fence,
+                    request.not_after,
                     &request.data,
                     request.partial,
                 );
@@ -468,14 +506,14 @@ mod tests {
     fn a_fenced_write_older_than_the_current_epoch_is_dropped_at_the_writer() {
         let (input, mut queued) = PtyInput::test_channel();
         assert_eq!(input.raise_input_epoch(3), 3);
-        input.write_fenced(b"old".to_vec(), 3, 1).unwrap();
-        input.paste_fenced("hi", 3, 2).unwrap();
+        input.write_fenced(b"old".to_vec(), 3, 1, None).unwrap();
+        input.paste_fenced("hi", 3, 2, None).unwrap();
         // Raised after they were queued: both are dropped when written.
         assert_eq!(input.raise_input_epoch(4), 4);
         // Never lowered.
         assert_eq!(input.raise_input_epoch(2), 4);
         assert_eq!(input.input_epoch(), 4);
-        input.write_fenced(b"new".to_vec(), 4, 3).unwrap();
+        input.write_fenced(b"new".to_vec(), 4, 3, None).unwrap();
         let mut destination = Vec::new();
         let mut outcomes = Vec::new();
         while let Ok(request) = queued.0.try_recv() {
@@ -483,6 +521,7 @@ mod tests {
                 &mut destination,
                 &input.input_epoch,
                 request.fence.unwrap(),
+                request.not_after,
                 &request.data,
                 request.partial,
             ));
@@ -498,8 +537,49 @@ mod tests {
         assert_eq!(destination, b"new");
         // Writes count as terminal input; pastes don't.
         assert_eq!(input.input_count(), 2);
-        assert!(input.write_fenced(Vec::new(), 4, 4).is_err());
-        assert!(input.write_fenced(vec![0; MAX_FENCED + 1], 4, 4).is_err());
+        assert!(input.write_fenced(Vec::new(), 4, 4, None).is_err());
+        assert!(
+            input
+                .write_fenced(vec![0; MAX_FENCED + 1], 4, 4, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_remote_write_past_its_deadline_is_dropped_at_the_writer() {
+        let (input, mut queued) = PtyInput::test_channel();
+        let now = monotonic_ns();
+        let later = now + 60_000_000_000;
+        input
+            .write_fenced(b"late".to_vec(), 0, 1, Some(now))
+            .unwrap();
+        input
+            .write_fenced(b"on time".to_vec(), 0, 2, Some(later))
+            .unwrap();
+        input.paste_fenced("late", 0, 3, Some(now - 1)).unwrap();
+        input.write_fenced(b"local".to_vec(), 0, 4, None).unwrap();
+        let mut destination = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Ok(request) = queued.0.try_recv() {
+            outcomes.push(write_fenced_request(
+                &mut destination,
+                &input.input_epoch,
+                request.fence.unwrap(),
+                request.not_after,
+                &request.data,
+                request.partial,
+            ));
+        }
+        assert_eq!(
+            outcomes,
+            [
+                FencedOutcome::Dropped,
+                FencedOutcome::Written(7),
+                FencedOutcome::Dropped,
+                FencedOutcome::Written(5)
+            ]
+        );
+        assert_eq!(destination, b"on timelocal");
     }
 
     #[test]
@@ -512,10 +592,12 @@ mod tests {
             "\u{9b}201~",
             "\x7f",
         ] {
-            assert!(input.paste_fenced(bad, 0, 1).is_err(), "{bad:?}");
+            assert!(input.paste_fenced(bad, 0, 1, None).is_err(), "{bad:?}");
         }
         assert!(queued.try_recv().is_err(), "nothing was queued");
-        input.paste_fenced("line one\n\tline two", 0, 2).unwrap();
+        input
+            .paste_fenced("line one\n\tline two", 0, 2, None)
+            .unwrap();
         assert_eq!(
             queued.try_recv().unwrap(),
             "\x1b[200~line one\n\tline two\x1b[201~\r"

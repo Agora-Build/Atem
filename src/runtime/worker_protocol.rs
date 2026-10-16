@@ -77,17 +77,23 @@ pub enum BrokerMsg {
         env: Option<LaunchEnv>,
     },
     /// Raw terminal input (base64), written only if `input_epoch` is not
-    /// older than the worker's current one → `write_result`.
+    /// older than the worker's current one and, for a remote write,
+    /// `not_after` (its lease's deadline, `pty_session::monotonic_ns`) has
+    /// not passed at the PTY write boundary → `write_result`.
     Write {
         seq: u64,
         bytes: String,
         input_epoch: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        not_after: Option<u64>,
     },
-    /// A bracketed paste plus Enter, under the same epoch rule → `write_result`.
+    /// A bracketed paste plus Enter, under the same rules → `write_result`.
     Paste {
         seq: u64,
         text: String,
         input_epoch: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        not_after: Option<u64>,
     },
     /// Raises the current input epoch (a lower one is ignored).
     SetInputEpoch {
@@ -114,6 +120,7 @@ impl std::fmt::Debug for BrokerMsg {
                 seq,
                 bytes,
                 input_epoch,
+                ..
             } => write!(
                 f,
                 "Write(seq {seq}, epoch {input_epoch}, {} b64 chars)",
@@ -123,6 +130,7 @@ impl std::fmt::Debug for BrokerMsg {
                 seq,
                 text,
                 input_epoch,
+                ..
             } => write!(
                 f,
                 "Paste(seq {seq}, epoch {input_epoch}, {} bytes)",
@@ -137,11 +145,18 @@ impl std::fmt::Debug for BrokerMsg {
 }
 
 impl BrokerMsg {
+    #[cfg(test)]
     pub fn write(seq: u64, bytes: &[u8], input_epoch: u64) -> Self {
+        Self::write_until(seq, bytes, input_epoch, None)
+    }
+
+    /// A write that must not reach the PTY at or after `not_after`.
+    pub fn write_until(seq: u64, bytes: &[u8], input_epoch: u64, not_after: Option<u64>) -> Self {
         BrokerMsg::Write {
             seq,
             bytes: STANDARD.encode(bytes),
             input_epoch,
+            not_after,
         }
     }
 }
@@ -354,6 +369,14 @@ mod tests {
                 seq: 2,
                 text: "fix it".into(),
                 input_epoch: 3,
+                not_after: None,
+            },
+            BrokerMsg::write_until(5, b"x", 3, Some(123_456_789)),
+            BrokerMsg::Paste {
+                seq: 6,
+                text: "go".into(),
+                input_epoch: 3,
+                not_after: Some(987_654_321),
             },
             BrokerMsg::SetInputEpoch { epoch: 4 },
             BrokerMsg::Resize {
@@ -474,6 +497,7 @@ mod tests {
             seq: 1,
             text: "a".repeat(n),
             input_epoch: 0,
+            not_after: None,
         };
         assert!(decode_broker(&encode_broker(&paste(MAX_PASTE))).is_ok());
         assert!(decode_broker(&encode_broker(&paste(MAX_PASTE + 1))).is_err());
@@ -496,6 +520,7 @@ mod tests {
             seq: 1,
             text: "my password is hunter2".into(),
             input_epoch: 0,
+            not_after: None,
         };
         let text = format!(
             "{start:?} {paste:?} {:?}",

@@ -153,17 +153,42 @@ impl WorkerHandle {
 
     /// Terminal input, written if `input_epoch` is still current at the
     /// worker's write boundary → `write_result`.
+    #[cfg(test)]
     pub fn write(&self, seq: u64, bytes: &[u8], input_epoch: u64) -> Result<()> {
-        self.send(&BrokerMsg::write(seq, bytes, input_epoch))
+        self.write_until(seq, bytes, input_epoch, None)
+    }
+
+    /// A remote write: dropped at the worker's PTY write boundary once
+    /// `not_after` (`pty_session::monotonic_ns`) has passed.
+    pub fn write_until(
+        &self,
+        seq: u64,
+        bytes: &[u8],
+        input_epoch: u64,
+        not_after: Option<u64>,
+    ) -> Result<()> {
+        self.send(&BrokerMsg::write_until(seq, bytes, input_epoch, not_after))
     }
 
     /// A bracketed paste plus Enter, under the same rule → `write_result`.
     #[allow(dead_code)] // chat-v1 submit, with the session host
     pub fn paste(&self, seq: u64, text: &str, input_epoch: u64) -> Result<()> {
+        self.paste_until(seq, text, input_epoch, None)
+    }
+
+    /// `paste` with the remote write's deadline (see `write_until`).
+    pub fn paste_until(
+        &self,
+        seq: u64,
+        text: &str,
+        input_epoch: u64,
+        not_after: Option<u64>,
+    ) -> Result<()> {
         self.send(&BrokerMsg::Paste {
             seq,
             text: text.into(),
             input_epoch,
+            not_after,
         })
     }
 

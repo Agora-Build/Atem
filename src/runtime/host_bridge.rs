@@ -852,6 +852,7 @@ impl HostBridge {
         payload: &Value,
         cx: &mut Cx,
     ) -> Option<DispatchReport> {
+        let not_after = self.not_after(sid);
         let Some(session) = session_of(cx, sid).filter(|s| s.is_live()) else {
             return Some(DispatchReport::FailedNoEffect);
         };
@@ -872,7 +873,7 @@ impl HostBridge {
                         Ok(text) => text,
                         Err(_) => return Some(DispatchReport::FailedNoEffect),
                     };
-                match session.paste(&text) {
+                match session.paste(&text, not_after) {
                     Ok(seq) => {
                         session.chat.mark_pasted(request_id, Instant::now());
                         self.pending
@@ -894,7 +895,7 @@ impl HostBridge {
                         turn_id: None,
                     });
                 }
-                match session.write_tagged(INTERRUPT_KEY, WriteTag::Host) {
+                match session.write_tagged(INTERRUPT_KEY, WriteTag::Host, not_after) {
                     Ok(seq) => {
                         self.pending.insert(
                             (sid.to_string(), seq),
@@ -1039,6 +1040,17 @@ impl HostBridge {
 
     // ── Input epochs and remote writes ──
 
+    /// Where a remote write for `sid` stops being valid at the worker's PTY
+    /// write boundary: its lease's deadline, as `pty_session::monotonic_ns`
+    /// (the base every process shares). `None` without a lease.
+    fn not_after(&self, sid: &str) -> Option<u64> {
+        let left_ms = self
+            .host
+            .lease_deadline(sid)?
+            .saturating_sub(self.clock.now());
+        Some(crate::pty_session::monotonic_ns().saturating_add(left_ms.saturating_mul(1_000_000)))
+    }
+
     fn sync_all(&mut self, cx: &mut Cx) {
         let sids: Vec<String> = self.per.keys().cloned().collect();
         for sid in sids {
@@ -1093,8 +1105,9 @@ impl HostBridge {
                 // The PTY write boundary: the lease that admitted it still holds.
                 let error = if self.host.admit_write(&sid, write.host_epoch, now) {
                     self.sync_epoch(&sid, cx);
+                    let not_after = self.not_after(&sid);
                     let session = session_of(cx, &sid).expect("checked above");
-                    match session.write_tagged(&write.bytes, WriteTag::Host) {
+                    match session.write_tagged(&write.bytes, WriteTag::Host, not_after) {
                         Ok(seq) => {
                             if let Some(per) = self.per.get_mut(&sid) {
                                 per.dirty = true;

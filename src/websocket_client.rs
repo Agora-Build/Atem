@@ -77,6 +77,33 @@ pub(crate) fn session_family(text: &str) -> Option<&'static str> {
     }
 }
 
+/// Message types removed in atem-session r6 (§0): no compatibility, but
+/// still answered, so a sender learns they are gone.
+pub(crate) const REMOVED_OPS: &[&str] = &[
+    "agentInput",
+    "agentPrompt",
+    "voiceCommand",
+    "voiceToggle",
+    "voice_toggle",
+    "voiceRequest",
+    "userCommand",
+    "codexTaskRequest",
+    "agentListRequest",
+];
+
+/// `text` is one of the `REMOVED_OPS`.
+pub(crate) fn is_removed_op(text: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Peek {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    serde_json::from_str::<Peek>(text)
+        .ok()
+        .and_then(|p| p.kind)
+        .is_some_and(|kind| REMOVED_OPS.contains(&kind.as_str()))
+}
+
 /// The `data.id` of a `session` message, when it has one (no other check).
 fn session_message_id(text: &str) -> Option<String> {
     #[derive(Deserialize)]
@@ -115,6 +142,11 @@ pub enum AstationMessage {
     /// it had a readable one).
     #[serde(skip)]
     SessionOversize { id: Option<String> },
+
+    /// An op removed in atem-session r6 (`REMOVED_OPS`): answered with an
+    /// `error` `unsupported_version` and no effect.
+    #[serde(skip)]
+    RemovedOp,
 
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
@@ -881,6 +913,7 @@ impl AstationClient {
                                 Some(AstationMessage::SessionOversize { id: session_message_id(&text) })
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
+                            None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };
                         if let Some(astation_msg) = astation_msg

@@ -763,13 +763,16 @@ impl Worker {
                 seq,
                 bytes,
                 input_epoch,
+                not_after,
             } => {
                 let result = write_bytes(&bytes)
                     .map_err(|e| anyhow!(e))
                     .and_then(|bytes| self.admit(input_epoch).map(|()| bytes));
                 match result {
                     Ok(bytes) => {
-                        if let Err(error) = self.input.write_fenced(bytes, input_epoch, seq) {
+                        if let Err(error) =
+                            self.input.write_fenced(bytes, input_epoch, seq, not_after)
+                        {
                             self.send(&failed(seq, error.to_string()));
                         }
                     }
@@ -780,9 +783,11 @@ impl Worker {
                 seq,
                 text,
                 input_epoch,
+                not_after,
             } => match self.admit(input_epoch) {
                 Ok(()) => {
-                    if let Err(error) = self.input.paste_fenced(&text, input_epoch, seq) {
+                    if let Err(error) = self.input.paste_fenced(&text, input_epoch, seq, not_after)
+                    {
                         self.send(&failed(seq, error.to_string()));
                     }
                 }

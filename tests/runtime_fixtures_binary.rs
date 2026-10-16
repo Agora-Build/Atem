@@ -36,8 +36,8 @@
 //! running session), `disconnect`/`resume` (no resume in compatibility
 //! mode), `fail_next_fsync` and `change_trust_gen`.
 //!
-//! A scenario the real runtime fails is listed in `KNOWN_DEVIATIONS` with the
-//! failure it must keep showing, and why.
+//! A scenario the real runtime fails would be listed in `KNOWN_DEVIATIONS`
+//! with the failure it must keep showing, and why (none today).
 //!
 //! Messages the fixtures don't model are not queued for `expect`: terminal-v1
 //! `frame`s and `written` acknowledgements (the latter are counted for
@@ -48,7 +48,8 @@
 //! byte its PTY delivered (pastes are dispatches; other bytes are matched
 //! against the terminal input the fixture sent, in order), the fault markers
 //! used, the `written` acks, the agent's signals (a stop reaches it while its
-//! worker lives), and the runtime's local `list` (lease holder).
+//! worker lives; SIGWINCH is a resize), and the runtime's local `list` (lease
+//! holder).
 #![cfg(target_os = "linux")]
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -97,6 +98,7 @@ def ended(signum, frame):
     time.sleep(0.1)
     events.write("signal %d worker_alive=%s\n" % (signum, os.getppid() == parent))
     os._exit(0)
+signal.signal(signal.SIGWINCH, lambda signum, frame: events.write("winch\n"))
 signal.signal(signal.SIGHUP, ended)
 signal.signal(signal.SIGTERM, ended)
 try:
@@ -1097,6 +1099,7 @@ impl Host {
         let mut paste_bytes = 0usize;
         let (mut local, mut remote) = (0u64, 0u64);
         let mut stops = 0u64;
+        let mut resizes = 0u64;
         for s in &self.sessions {
             let input = std::fs::read(s.dir.join("input")).unwrap_or_default();
             let mut terminal = Vec::new();
@@ -1130,6 +1133,7 @@ impl Host {
             }
             let events = std::fs::read_to_string(s.dir.join("events")).unwrap_or_default();
             stops += events.matches("worker_alive=True").count() as u64;
+            resizes += events.matches("winch").count() as u64;
         }
         let enqueue_faults = used.matches("fail_next_enqueue").count() as u64;
         Ok(match key {
@@ -1142,6 +1146,7 @@ impl Host {
             "pty_writes_remote" => json!(remote),
             "pty_writes_dropped" => json!(self.dropped_acks),
             "stops" => json!(stops),
+            "resizes" => json!(resizes),
             "lease_holder" => {
                 let listed = self.frontend.list();
                 let held = listed.iter().any(|s| s["remote_controlled"] == true);
@@ -1328,19 +1333,8 @@ const NOT_RUN: &[&str] = &[
 ];
 
 /// Scenarios the real runtime fails, each with the failure it must still
-/// show (a fix makes the test fail until the entry is removed).
-///
-/// lease-expiry-at-the-deadline-needs-no-timer: the runtime checks a remote
-/// chunk against the lease (`admit_write`) when the broker hands it to the
-/// worker; the worker's write boundary checks only the input epoch, which
-/// the broker raises when the host's `advance` notices the expiry — at most
-/// every 100 ms of the session clock. A chunk admitted at 14999 ms that
-/// waits at the PTY writer is therefore written at 15000 ms instead of
-/// being dropped.
-const KNOWN_DEVIATIONS: &[(&str, &str)] = &[(
-    "lease-expiry-at-the-deadline-needs-no-timer",
-    "pty_writes_dropped: expected 1, got 0 (pty_writes_local=0, pty_writes_remote=1",
-)];
+/// show (a fix makes the test fail until the entry is removed). None today.
+const KNOWN_DEVIATIONS: &[(&str, &str)] = &[];
 
 fn run_named(scenarios: &[Value], only: Option<&str>) -> Vec<(String, Result<(), String>)> {
     std::thread::scope(|scope| {
@@ -1427,5 +1421,64 @@ fn a_changed_expectation_fails_against_the_real_runtime() {
     for (name, result) in results {
         let error = result.expect_err(&name);
         assert!(error.contains("expected"), "{name}: {error}");
+    }
+}
+
+/// `scenario` with client `from` folded into client `into`: one attachment
+/// plays both (their sends and expectations, with `from`'s attachment
+/// generation replaced by `into`'s), minus what only a second attachment
+/// would hear (`lease_changed` for `from`).
+fn one_attachment(scenario: &Value, into: &str, from: &str) -> Value {
+    let mut s = scenario.clone();
+    let clients = s["setup"]["clients"].as_array().unwrap().clone();
+    let gen_of = |name: &str| {
+        clients.iter().find(|c| c["name"] == name).unwrap()["attachment_gen"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (keep, drop) = (gen_of(into), gen_of(from));
+    s["setup"]["clients"] = json!(
+        clients
+            .into_iter()
+            .filter(|c| c["name"] == into)
+            .collect::<Vec<_>>()
+    );
+    let steps: Vec<Value> = s["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| !(step["expect"] == from && step["match"]["op"] == "lease_changed"))
+        .map(|step| {
+            let text = step
+                .to_string()
+                .replace(&drop, &keep)
+                .replace(
+                    &format!("\"send\":\"{from}\""),
+                    &format!("\"send\":\"{into}\""),
+                )
+                .replace(
+                    &format!("\"expect\":\"{from}\""),
+                    &format!("\"expect\":\"{into}\""),
+                );
+            serde_json::from_str(&text).unwrap()
+        })
+        .collect();
+    s["steps"] = json!(steps);
+    s
+}
+
+/// removed-ops-have-no-effect needs two clients; one attachment can still
+/// express it: the lease holder itself sends every removed op, with and
+/// without the lease, and local input still works.
+#[test]
+fn removed_ops_have_no_effect_on_one_attachment() {
+    let scenario = scenarios()
+        .into_iter()
+        .find(|s| s["name"] == "removed-ops-have-no-effect")
+        .unwrap();
+    let single = one_attachment(&scenario, "up", "other");
+    if let Err(e) = run(&single) {
+        panic!("{e}");
     }
 }
