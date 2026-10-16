@@ -115,7 +115,8 @@ pub struct BrokerSession {
     /// The input epoch writes are tagged with.
     input_epoch: u64,
     next_seq: u64,
-    in_flight: usize,
+    /// Writes sent and not yet answered: seq → bytes.
+    in_flight: std::collections::BTreeMap<u64, usize>,
     /// Writes the worker dropped for a stale epoch.
     pub dropped_writes: u64,
     /// chat-v1 state, fed from the worker's `chat` batches.
@@ -133,6 +134,8 @@ pub struct Pumped {
     pub resync: bool,
     /// Errors of writes the worker failed (not dropped).
     pub failed: Vec<String>,
+    /// Bytes of writes dropped for a stale input epoch.
+    pub dropped_bytes: usize,
     /// The agent exited, or the worker went away, in this pass.
     pub ended: bool,
 }
@@ -166,7 +169,7 @@ impl BrokerSession {
             tap: OutputTap::default(),
             input_epoch: 0,
             next_seq: 0,
-            in_flight: 0,
+            in_flight: Default::default(),
             dropped_writes: 0,
             chat,
             chat_v1: false,
@@ -279,7 +282,7 @@ impl BrokerSession {
         self.state = state;
         self.exit_status = Some(status);
         self.exited_at = Some(Instant::now());
-        self.in_flight = 0;
+        self.in_flight.clear();
         self.chat.on_process_exit(now_ms());
         self.activity = Activity::Unknown;
         self.activity_detail = None;
@@ -315,7 +318,7 @@ impl BrokerSession {
 
     /// Another write may be sent now.
     pub fn can_write(&self) -> bool {
-        self.in_flight < MAX_IN_FLIGHT
+        self.in_flight.len() < MAX_IN_FLIGHT
     }
 
     /// Writes `bytes` under the current input epoch.
@@ -327,7 +330,7 @@ impl BrokerSession {
         let seq = self.next_seq;
         worker.write(seq, bytes, self.input_epoch)?;
         self.next_seq += 1;
-        self.in_flight += 1;
+        self.in_flight.insert(seq, bytes.len());
         Ok(())
     }
 
@@ -346,7 +349,8 @@ impl BrokerSession {
     /// Resizes the agent's terminal and the mirror (a live session, a new size).
     pub fn resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()> {
         let (rows, cols) = (rows.min(200), cols.min(400));
-        if rows < 2 || cols < 2 || !self.is_live() || self.size() == (rows, cols) {
+        // Until the screen arrives the mirror's size says nothing: always sent.
+        if rows < 2 || cols < 2 || !self.is_live() || (self.synced && self.size() == (rows, cols)) {
             return Ok(());
         }
         self.worker.as_ref().expect("live").resize(rows, cols)?;
@@ -368,6 +372,12 @@ impl BrokerSession {
 
     pub fn synced(&self) -> bool {
         self.synced
+    }
+
+    /// A screen is still to come from the worker (it isn't current yet and
+    /// the worker is connected).
+    pub fn screen_pending(&self) -> bool {
+        !self.synced && self.worker.is_some()
     }
 
     /// A fresh restore of the mirror and the stream position output
@@ -502,11 +512,16 @@ impl BrokerSession {
                 pumped.ended |= was_running;
             }
             WorkerMsg::WriteResult {
-                ok, dropped, error, ..
+                seq,
+                ok,
+                dropped,
+                error,
+                ..
             } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
+                let bytes = self.in_flight.remove(&seq).unwrap_or(0);
                 if dropped {
                     self.dropped_writes += 1;
+                    pumped.dropped_bytes += bytes;
                 } else if !ok {
                     pumped
                         .failed

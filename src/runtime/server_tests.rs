@@ -742,25 +742,6 @@ async fn list(client: &mut RuntimeClient) -> Vec<SessionSummary> {
     .await
 }
 
-/// The sessions once `done` holds for them (10 s at most).
-async fn list_until(
-    client: &mut RuntimeClient,
-    mut done: impl FnMut(&[SessionSummary]) -> bool,
-) -> Vec<SessionSummary> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let sessions = list(client).await;
-        if done(&sessions) {
-            return sessions;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "never listed as wanted: {sessions:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 async fn attach(client: &mut RuntimeClient, sid: &str) -> View {
     client
         .send(&ClientMsg::Attach {
@@ -846,7 +827,7 @@ fn a_new_broker_adopts_the_running_session_and_attach_restores_it() {
         // The worker outlived the broker: the next one adopts it.
         let second = Runtime::start_in(dir, "rt2.sock", Duration::from_secs(600), own_uid());
         let mut client = second.client().await;
-        let sessions = list_until(&mut client, |s| !s.is_empty()).await;
+        let sessions = list(&mut client).await;
         assert_eq!(sessions.len(), 1);
         let adopted = &sessions[0];
         assert_eq!(
@@ -921,7 +902,8 @@ fn an_adopted_worker_whose_agent_exited_is_released_and_its_record_removed() {
 
         let second = Runtime::start_in(dir, "rt2.sock", Duration::from_secs(600), own_uid());
         let mut client = second.client().await;
-        let sessions = list_until(&mut client, |s| s.iter().any(|s| s.state == "exited")).await;
+        let sessions = list(&mut client).await;
+        assert_eq!(sessions[0].state, "exited");
         assert_eq!(sessions[0].id, session.id);
         assert!(sessions[0].exited.is_some());
         // Released: the worker removed its record and ended.
@@ -958,7 +940,7 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
         runtime.shutdown().await;
         let runtime = Runtime::start_in(dir, "rt2.sock", Duration::from_secs(600), own_uid());
         let mut client = runtime.client().await;
-        let sessions = list_until(&mut client, |s| !s.is_empty()).await;
+        let sessions = list(&mut client).await;
         assert_eq!(
             (sessions[0].id.as_str(), sessions[0].state.as_str()),
             (sid.as_str(), "interrupted")
@@ -1035,6 +1017,343 @@ fn two_sessions_run_concurrently_each_in_its_own_worker() {
                 .contains("to the second")
         );
         assert!(!view_two.screen.screen().contents().contains("to the first"));
+        runtime.shutdown().await;
+    });
+}
+
+/// A worker this test plays: its record (this process's pid and start time,
+/// so adoption verifies it) and its socket, speaking the worker protocol.
+struct FakeWorker {
+    sid: String,
+    /// Raw lines to send; an empty one closes the connection.
+    lines: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// What the broker sent.
+    heard: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+}
+
+impl FakeWorker {
+    /// Records a running worker in `root`'s state dir (adopted by the next
+    /// broker there) whose output stream is at `offset`.
+    fn start(root: &Path, offset: u64) -> Self {
+        use super::worker_protocol::{WorkerMsg, WorkerRecord, encode_worker};
+        let sid = crate::session::SessionId::new().to_string();
+        let process_gen = uuid::Uuid::new_v4().to_string();
+        let socket = root.join("ws").join(format!("{sid}.sock"));
+        let listener = super::worker::listen(&socket).unwrap();
+        let pid = std::process::id();
+        let start_time = super::adopt::process_start_time(pid).unwrap();
+        let record = WorkerRecord {
+            session_id: sid.clone(),
+            process_gen: process_gen.clone(),
+            provider: "codex".into(),
+            cwd: root.to_path_buf(),
+            created_at_ms: 7,
+            socket,
+            worker_pid: pid,
+            start_time,
+            agent_pid: None,
+            agent_start_time: None,
+            exited: None,
+        };
+        super::worker::write_record(&root.join("state"), &record).unwrap();
+        let hello = encode_worker(&WorkerMsg::Hello {
+            session_id: sid.clone(),
+            process_gen,
+            pid,
+            start_time,
+            agent_pid: None,
+            offset,
+            input_epoch: 0,
+            dropped: 0,
+            exited: None,
+        });
+        let (lines, mut to_send) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (heard_tx, heard) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(hello.as_bytes()).await.unwrap();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            loop {
+                tokio::select! {
+                    next = to_send.recv() => match next {
+                        Some(bytes) if !bytes.is_empty() => {
+                            if write.write_all(&bytes).await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => return,
+                    },
+                    read = reader.read_line(&mut line) => {
+                        if !matches!(read, Ok(n) if n > 0) {
+                            return;
+                        }
+                        let _ = heard_tx.send(serde_json::from_str(&line).unwrap());
+                        line.clear();
+                    }
+                }
+            }
+        });
+        Self { sid, lines, heard }
+    }
+
+    fn send(&self, message: &super::worker_protocol::WorkerMsg) {
+        let line = super::worker_protocol::encode_worker(message);
+        self.lines.send(line.into_bytes()).unwrap();
+    }
+
+    fn screen(&self, text: &str, offset: u64, rows: u16, cols: u16) {
+        self.send(&super::worker_protocol::WorkerMsg::Screen {
+            restore: super::worker_protocol::b64(format!("\x1bc{text}").as_bytes()),
+            offset,
+            rows,
+            cols,
+        });
+    }
+
+    fn output(&self, text: &str, offset: u64) {
+        self.send(&super::worker_protocol::WorkerMsg::output(
+            text.as_bytes(),
+            offset,
+        ));
+    }
+
+    /// Closes the connection (the worker "process", this one, still runs).
+    fn close(&self) {
+        let _ = self.lines.send(Vec::new());
+    }
+
+    /// The broker's next message with `op` (others skipped), within 10 s.
+    async fn heard(&mut self, op: &str) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = self.heard.recv().await.expect("the broker closed");
+                if message["op"] == op {
+                    return message;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the broker never sent {op}"))
+    }
+}
+
+/// A runtime started on `dir` after `prepare` put fake workers there.
+fn runtime_on(dir: std::rc::Rc<tempfile::TempDir>) -> Runtime {
+    Runtime::start_in(dir, "rt.sock", Duration::from_secs(600), own_uid())
+}
+
+#[test]
+fn list_waits_for_adoption_and_attach_before_the_screen_gets_the_exit_if_the_worker_goes() {
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let fake = FakeWorker::start(dir.path(), 100);
+        let runtime = runtime_on(dir);
+        let mut client = runtime.client().await;
+        // Held until adoption finished: the adopted session is there.
+        let sessions = list(&mut client).await;
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].state, "running");
+        client
+            .send(&ClientMsg::Attach {
+                session_id: fake.sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        // No screen yet; the worker goes away: the frontend hears of it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fake.close();
+        let status = expect(&mut client, |m| match m {
+            RuntimeMsg::Exited { status, .. } => Some(status),
+            RuntimeMsg::Attached { .. } => panic!("restored without a screen"),
+            _ => None,
+        })
+        .await;
+        assert_eq!(status, "interrupted");
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn an_adopted_session_takes_the_frontend_size_once_its_screen_arrives() {
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let mut fake = FakeWorker::start(dir.path(), 100);
+        let runtime = runtime_on(dir);
+        let mut client = runtime.client().await;
+        fake.heard("request_screen").await;
+        client
+            .send(&ClientMsg::Attach {
+                session_id: fake.sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        // Unsynced: forwarded even though it equals the placeholder size.
+        let resize = fake.heard("resize").await;
+        assert_eq!(
+            (resize["rows"].as_u64(), resize["cols"].as_u64()),
+            (Some(24), Some(80))
+        );
+        // The screen arrives at the worker's own (old) size: the frontend's
+        // size is applied again, and the restore has it.
+        fake.screen("WIDE", 100, 50, 200);
+        let resize = fake.heard("resize").await;
+        assert_eq!(
+            (resize["rows"].as_u64(), resize["cols"].as_u64()),
+            (Some(24), Some(80))
+        );
+        let (session, restore, _) = attached(&mut client).await;
+        assert_eq!((session.rows, session.cols), (24, 80));
+        assert!(String::from_utf8_lossy(&restore).contains("WIDE"));
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn an_output_gap_asks_for_the_screen_and_resyncs_the_frontend() {
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let mut fake = FakeWorker::start(dir.path(), 0);
+        let runtime = runtime_on(dir);
+        let mut client = runtime.client().await;
+        fake.heard("request_screen").await;
+        fake.screen("FIRST", 0, 24, 80);
+        let mut view = attach(&mut client, &fake.sid).await;
+        assert!(view.screen.screen().contents().contains("FIRST"));
+        fake.output(" more", 0);
+        view.until(&mut client, "FIRST more").await;
+        // Bytes 5..100 never came: the broker asks for the screen again.
+        fake.output("lost", 100);
+        fake.heard("request_screen").await;
+        fake.screen("RESYNCED", 200, 24, 80);
+        let (_, restore, offset) = attached(&mut client).await;
+        assert!(String::from_utf8_lossy(&restore).contains("RESYNCED"));
+        assert_eq!(offset, 200);
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn stop_after_the_worker_went_away_names_a_worker_that_still_runs() {
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let mut fake = FakeWorker::start(dir.path(), 0);
+        let runtime = runtime_on(dir);
+        let mut client = runtime.client().await;
+        fake.heard("request_screen").await;
+        fake.close();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while list(&mut client).await[0].state != "interrupted" {
+            assert!(Instant::now() < deadline, "never interrupted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        client
+            .send(&ClientMsg::Stop {
+                session_id: fake.sid.clone(),
+            })
+            .await
+            .unwrap();
+        // The recorded worker pid (this process) still runs: named, kept.
+        let text = expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text } => Some(text),
+            RuntimeMsg::Error { text, .. } => Some(text),
+            _ => None,
+        })
+        .await;
+        assert!(text.contains(&std::process::id().to_string()), "{text}");
+        assert!(record_file(&runtime, &fake.sid).exists());
+        assert_eq!(list(&mut client).await.len(), 1);
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn an_undecodable_worker_line_is_an_error_and_reading_goes_on() {
+    local(async {
+        let dir = short_dir();
+        let mut fake = FakeWorker::start(dir.path(), 0);
+        let record = super::worker::read_record(&super::worker::record_path(
+            &dir.path().join("state"),
+            &fake.sid,
+        ))
+        .unwrap();
+        let expect_hello = super::adopt::Expect {
+            session_id: record.session_id.clone(),
+            process_gen: record.process_gen.clone(),
+            pid: record.worker_pid,
+            start_time: Some(record.start_time),
+        };
+        let mut handle = super::adopt::WorkerHandle::connect(&record.socket, &expect_hello, None)
+            .await
+            .unwrap();
+        fake.lines.send(b"\xff\xfe not text\n".to_vec()).unwrap();
+        fake.output("still here", 0);
+        let first = tokio::time::timeout(Duration::from_secs(5), handle.recv())
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, Some(super::worker_protocol::WorkerMsg::Error { .. })),
+            "{first:?}"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(5), handle.recv())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                second,
+                Some(super::worker_protocol::WorkerMsg::Output { .. })
+            ),
+            "{second:?}"
+        );
+        drop(fake.heard.try_recv());
+    });
+}
+
+#[test]
+fn reclaim_tells_the_frontend_its_queued_input_was_dropped() {
+    local(async {
+        let runtime = Runtime::new();
+        // Raw, no echo: reads nothing for two seconds.
+        let agent = script(
+            runtime.dir.path(),
+            "sleepy",
+            "stty raw -echo\nprintf 'SLEEPING\\r\\n'\nsleep 2\nexec cat",
+        );
+        let mut client = runtime.client().await;
+        client
+            .send(&runtime.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let session = launched(&mut client).await;
+        let mut view = attach(&mut client, &session.id).await;
+        view.until(&mut client, "SLEEPING").await;
+        for _ in 0..20 {
+            client
+                .send(&ClientMsg::input(&session.id, &[b'a'; 16 * 1024]))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client
+            .send(&ClientMsg::Reclaim {
+                session_id: session.id.clone(),
+            })
+            .await
+            .unwrap();
+        let text = expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text } if text.contains("dropped") => Some(text),
+            _ => None,
+        })
+        .await;
+        assert!(
+            text.contains("typed bytes were dropped when control changed"),
+            "{text}"
+        );
         runtime.shutdown().await;
     });
 }

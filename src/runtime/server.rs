@@ -80,6 +80,10 @@ struct Client {
     /// Input waiting for room in its session's PTY queue; nothing more is
     /// read from this client until it's written.
     pending: Option<ClientMsg>,
+    /// A message that waits until the workers found at start are adopted
+    /// (`list`, `attach`, `stop`, a protocol refusal); nothing more is read
+    /// from this client meanwhile.
+    held: Option<Incoming>,
     closing: bool,
 }
 
@@ -119,6 +123,8 @@ struct Server {
     order: Vec<SessionId>,
     /// Launches still starting their worker.
     launching: usize,
+    /// The workers found at start are still being adopted.
+    adopting: bool,
     launches: mpsc::UnboundedSender<LaunchDone>,
     clients: BTreeMap<u64, Client>,
     attached: BTreeMap<SessionId, Attachment>,
@@ -177,6 +183,7 @@ pub async fn serve(
         sessions: BTreeMap::new(),
         order: Vec::new(),
         launching: 0,
+        adopting: true,
         launches,
         clients: BTreeMap::new(),
         attached: BTreeMap::new(),
@@ -199,7 +206,10 @@ pub async fn serve(
             }
             Some(stream) = accepted.recv() => server.add_client(stream),
             Some(done) = launched.recv() => server.launched(done),
-            Some(adoption) = adoptions.recv() => server.adopted(adoption),
+            adoption = adoptions.recv(), if server.adopting => match adoption {
+                Some(adoption) => server.adopted(adoption),
+                None => server.adopting = false,
+            },
             _ = wake.notified() => {}
         }
         server.handle_clients().await;
@@ -217,6 +227,16 @@ pub async fn serve(
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
+}
+
+/// Waits until the workers found at start are adopted, so its answer
+/// includes them.
+fn waits_for_adoption(incoming: &Incoming) -> bool {
+    matches!(
+        incoming,
+        Incoming::Message(ClientMsg::List | ClientMsg::Attach { .. } | ClientMsg::Stop { .. })
+            | Incoming::Bad(DecodeError::Version(_))
+    )
 }
 
 /// Runs `task`; a panic is logged with `what` and ends only that task.
@@ -342,6 +362,7 @@ impl Server {
                 epoch,
                 greeted: false,
                 pending: None,
+                held: None,
                 closing: false,
             },
         );
@@ -398,7 +419,10 @@ impl Server {
     /// No live session, no launch under way and no client: the runtime may
     /// exit (workers that ended or can't be adopted stay on disk).
     fn idle_expired(&mut self) -> bool {
-        let idle = self.live_count() == 0 && self.launching == 0 && self.clients.is_empty();
+        let idle = self.live_count() == 0
+            && self.launching == 0
+            && !self.adopting
+            && self.clients.is_empty();
         if !idle {
             self.idle_since = None;
             return false;
@@ -492,12 +516,22 @@ impl Server {
             let Some(attachment) = self.attached.get_mut(&sid) else {
                 continue;
             };
+            let (client, size) = (attachment.client, attachment.size);
             if pumped.resync {
+                // A new screen: a fresh restore, at the frontend's size (the
+                // worker's screen may have another one, e.g. after adoption).
                 attachment.restored = false;
+                self.adjust_size(&sid, size.0, size.1);
             }
-            let client = attachment.client;
             for text in pumped.failed {
                 self.error(client, text, "input");
+            }
+            if pumped.dropped_bytes > 0 {
+                let text = format!(
+                    "{} typed bytes were dropped when control changed",
+                    pumped.dropped_bytes
+                );
+                self.send(client, &RuntimeMsg::Notice { text });
             }
         }
     }
@@ -530,6 +564,16 @@ impl Server {
                 if client.closing {
                     break;
                 }
+                if let Some(incoming) = client.held.take() {
+                    if self.adopting {
+                        client.held = Some(incoming);
+                        break;
+                    }
+                    if !self.handle_caught(id, incoming).await {
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(message) = client.pending.take() {
                     if let Some(message) = self.input(id, message) {
                         if let Some(client) = self.clients.get_mut(&id) {
@@ -547,18 +591,30 @@ impl Server {
                         break;
                     }
                 };
-                let handled = std::panic::AssertUnwindSafe(self.handle(id, incoming))
-                    .catch_unwind()
-                    .await;
-                if handled.is_err() {
-                    eprintln!(
-                        "atem runtime: handling a message of client {id} panicked; closing it"
-                    );
-                    self.remove_client(id);
+                if self.adopting && waits_for_adoption(&incoming) {
+                    if let Some(client) = self.clients.get_mut(&id) {
+                        client.held = Some(incoming);
+                    }
+                    break;
+                }
+                if !self.handle_caught(id, incoming).await {
                     break;
                 }
             }
         }
+    }
+
+    /// `handle`, closing the client when it panics; false then.
+    async fn handle_caught(&mut self, id: u64, incoming: Incoming) -> bool {
+        let handled = std::panic::AssertUnwindSafe(self.handle(id, incoming))
+            .catch_unwind()
+            .await;
+        if handled.is_err() {
+            eprintln!("atem runtime: handling a message of client {id} panicked; closing it");
+            self.remove_client(id);
+            return false;
+        }
+        true
     }
 
     async fn handle(&mut self, id: u64, incoming: Incoming) {
@@ -765,8 +821,10 @@ impl Server {
                         );
                     }
                     SessionState::Interrupted | SessionState::RecoveryRequired => {
-                        let text = self.forget(&sid);
-                        self.send(id, &RuntimeMsg::Notice { text });
+                        match self.forget(&sid) {
+                            Ok(text) => self.send(id, &RuntimeMsg::Notice { text }),
+                            Err(text) => self.error(id, text, "stop"),
+                        }
                     }
                     _ => self.error(id, "No such live session", "stop"),
                 }
@@ -790,32 +848,35 @@ impl Server {
     }
 
     /// Removes a session without a worker and its record. Nothing is
-    /// signalled: a recorded process that still runs is named instead.
-    fn forget(&mut self, sid: &SessionId) -> String {
-        let still_running = self
-            .sessions
-            .get(sid)
-            .and_then(|s| s.record())
-            .and_then(|r| {
-                let runs = |pid: Option<u32>, start: Option<u64>| {
-                    pid.filter(|pid| {
-                        start.is_some() && super::adopt::process_start_time(*pid) == start
-                    })
-                };
-                runs(Some(r.worker_pid), Some(r.start_time))
-                    .or_else(|| runs(r.agent_pid, r.agent_start_time))
-            });
-        super::broker::remove_record(self.options.launcher.state(), sid.as_str());
+    /// signalled: while a process the record names still runs (its pid with
+    /// the recorded start time), the session and record stay and the error
+    /// names it.
+    fn forget(&mut self, sid: &SessionId) -> Result<String, String> {
+        let state = self.options.launcher.state();
+        // The record on disk: a session that ran in this broker has none in memory.
+        let record = super::worker::read_record(&super::worker::record_path(state, sid.as_str()))
+            .ok()
+            .filter(|r| r.session_id == sid.as_str())
+            .or_else(|| self.sessions.get(sid).and_then(|s| s.record()).cloned());
+        let runs = |pid: Option<u32>, start: Option<u64>| {
+            pid.filter(|pid| start.is_some() && super::adopt::process_start_time(*pid) == start)
+        };
+        let still_running = record.as_ref().and_then(|r| {
+            runs(Some(r.worker_pid), Some(r.start_time))
+                .map(|pid| ("worker", pid))
+                .or_else(|| runs(r.agent_pid, r.agent_start_time).map(|pid| ("agent", pid)))
+        });
+        if let Some((what, pid)) = still_running {
+            return Err(format!(
+                "The {what} of {sid} (pid {pid}) still runs; it was not stopped and {sid} was kept. Stop that process, then stop {sid} again"
+            ));
+        }
+        super::broker::remove_record(state, sid.as_str());
         if self.attached.contains_key(sid) {
             self.detach(sid);
         }
         self.remove_session(sid);
-        match still_running {
-            Some(pid) => {
-                format!("Removed {sid}; its recorded process {pid} still runs and was not stopped")
-            }
-            None => format!("Removed {sid}"),
-        }
+        Ok(format!("Removed {sid}"))
     }
 
     /// Sends what's queued, then closes the connection.
@@ -944,6 +1005,7 @@ impl Server {
             let chunk = session.tap.take();
             let size = session.size();
             let synced = session.synced();
+            let screen_pending = session.screen_pending();
             let exited = (session.state != SessionState::Running).then(|| {
                 (
                     session.process_gen.clone(),
@@ -985,9 +1047,9 @@ impl Server {
                 self.restore(&sid);
             }
             let attachment = self.attached.get_mut(&sid).expect("attached");
-            // The exit follows the final screen.
+            // The exit follows the final screen, unless none can come any more.
             if let Some((generation, status)) = exited
-                && attachment.restored
+                && (attachment.restored || !screen_pending)
                 && !attachment.exited_sent
             {
                 attachment.exited_sent = true;

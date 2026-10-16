@@ -80,14 +80,14 @@ async fn input_reaches_the_agent_through_the_worker_under_the_current_epoch() {
     assert_eq!(session.input_epoch(), 0, "the worker's epoch at start");
     session.write(b"one\r").unwrap();
     pump_until(&mut session, &mut output, |s, o| {
-        contains(o, "got:one") && s.in_flight == 0
+        contains(o, "got:one") && s.in_flight.is_empty()
     })
     .await;
     // Control changes: a new epoch, and writes go on under it.
     assert_eq!(session.raise_input_epoch().unwrap(), 1);
     session.write(b"two\r").unwrap();
     pump_until(&mut session, &mut output, |s, o| {
-        contains(o, "got:two") && s.in_flight == 0
+        contains(o, "got:two") && s.in_flight.is_empty()
     })
     .await;
     assert_eq!(session.dropped_writes, 0);
@@ -116,11 +116,11 @@ async fn a_raised_epoch_drops_writes_still_queued_under_the_old_one() {
     session.raise_input_epoch().unwrap();
     session.write(b"AFTER").unwrap();
     pump_until(&mut session, &mut output, |s, o| {
-        contains(o, "AFTER") && s.in_flight == 0
+        contains(o, "AFTER") && s.in_flight.is_empty()
     })
     .await;
     assert!(
-        session.dropped_writes > 0,
+        session.dropped_writes > 0 && session.in_flight.is_empty(),
         "nothing queued under the old epoch was dropped"
     );
     let written = output.iter().filter(|b| **b == b'a').count();

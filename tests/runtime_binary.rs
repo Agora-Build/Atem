@@ -345,13 +345,10 @@ fn sessions_run_in_workers_that_a_restarted_runtime_adopts() {
     // The next runtime adopts both; attach restores the screen and input goes on.
     let _second = Running(runtime(&home, &run));
     let mut frontend = Frontend::connect(&socket);
-    assert!(
-        within(15, || {
-            let sessions = frontend.list();
-            sessions.len() == 2 && sessions.iter().all(|s| s["state"] == "running")
-        }),
-        "the sessions weren't adopted"
-    );
+    // `list` waits until the runtime adopted what it found at start.
+    let sessions = frontend.list();
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert!(sessions.iter().all(|s| s["state"] == "running"), "{sessions:?}");
     frontend.attach(&one);
     assert!(frontend.screen.contains("got:hello"), "{:?}", frontend.screen);
     frontend.input(&one, "again\r");

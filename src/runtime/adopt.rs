@@ -282,12 +282,14 @@ impl WorkerHandle {
             while let Ok(true) =
                 super::server::read_line_max(&mut reader, &mut line, MAX_LINE).await
             {
-                let Ok(text) = std::str::from_utf8(&line) else {
-                    break;
-                };
-                let message = match decode_worker(text) {
-                    Ok(message) => message,
-                    Err(text) => WorkerMsg::Error { text },
+                // A line that isn't a message is reported, and reading goes on.
+                let message = match std::str::from_utf8(&line) {
+                    Ok(text) => {
+                        decode_worker(text).unwrap_or_else(|text| WorkerMsg::Error { text })
+                    }
+                    Err(_) => WorkerMsg::Error {
+                        text: "the worker sent a line that isn't UTF-8".into(),
+                    },
                 };
                 if event_tx.send(message).await.is_err() {
                     break;
