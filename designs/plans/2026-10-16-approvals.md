@@ -1,0 +1,36 @@
+# Approvals from chat and mobile (step 1b) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
+
+**Goal:** The session's lease holder can answer Claude Code's and Codex's permission prompts from Astation's chat view or a phone notification — one tap, bound to the exact prompt — while the terminal can always still answer.
+
+**Architecture:** Each agent's `PermissionRequest` hook writes the request into the session's private directory and waits for a decision file (Claude: per-launch `--settings`; Codex: one Atem entry merged into `~/.codex/hooks.json`, consent asked once by `atem agent launch codex`). The worker reports it; the broker's `SessionHost` turns it into an `approval_request` for viewers; the lease holder answers with an `approval` submission (§6 receipt); the broker writes the decision file. No remote holder → immediate "no decision". Terminal answer / Esc / timeout / lease loss → the request closes and late answers are refused.
+
+**Spec:** `designs/account-trust.md` §6a (branch `docs/account-trust`, PR #70) — verified behaviour of both hooks with fixtures in `designs/fixtures/permission-hook/`; `designs/protocol/atem-session-v1.md` (r6.2) §5–§7.
+
+## Global Constraints
+
+- Branch `feat/approvals` from `feat/runtime`. Commits end with a blank line and `🤖 Built with SMT <smt@agora.build>`. Never push without the user asking.
+- No backward compatibility; Chisel unchanged; tests can't reach the real profile (`src/test_profile.rs`), the real `~/.claude`, `~/.codex` or `~/.config/atem` — Codex hook installation tests use a temp CODEX_HOME.
+- Never auto-allow. Any failure, timeout, missing runtime or missing remote holder = "no decision" (the agent's own prompt appears).
+- The terminal can always answer: Claude shows its dialog during the wait (first answer wins); for Codex, any local input releases the hook first (Codex hides its prompt while a hook runs).
+- Hook timeouts: Claude 600 s, Codex 120 s. The hook command is identical for every session (session dir from an env var set by the worker) so Codex's trust hash stays valid.
+- Codex `hooks.json`: merge, never overwrite; one entry marked as Atem's; backup `hooks.json.atem-bak` before the first change; idempotent; consent asked once and remembered; outside an Atem session the hook exits immediately with no output.
+- Never rustfmt `src/app.rs`, `src/main.rs`, `src/cli.rs`, `src/websocket_client.rs`, `src/memory/{mod,crypto,secrets}.rs`. No new deps without need.
+- Every task: full `cargo test` twice reading every result line + a before/after snapshot of `~/.config/atem` (unchanged); clippy not above the branch baseline.
+
+### Task 1: Contract r7 — approvals
+
+`designs/protocol/atem-session-v1.md` (+ fixtures): `approval_request{approval_id, session_id, process_gen, tool, summary, created_at}` (host → viewers with `view`), `approval_closed{approval_id, reason: answered_remote|answered_terminal|interrupted|timed_out|lease_lost|process_ended}`, submission `kind:"approval"` payload `{approval_id, decision: allow|deny, message?}` (admission: current lease + `control`; the approval must be pending for that exact session/process; else `stale_target`), receipt states for approvals (`completed` when the agent applied the remote decision, `rejected` if the request closed first, `outcome_unknown` if the terminal and remote answers crossed). Remove "approval reserved" text. Fixtures: remote allow; remote deny with message; terminal first → late remote refused; lease lost → closed; duplicate approval submit; viewer without control refused. Core implementation in `src/session_protocol/` (host + wire + client hooks) with the fixtures passing.
+
+### Task 2: Hooks and the worker
+
+`src/chat/claude/hooks.rs`: add the `PermissionRequest` hook (600 s timeout) to the per-launch settings; the hook script writes `permission-<id>.json` to the session dir and polls for `decision-<id>.json` (allow / deny+message / none) — POSIX sh, no deps, exits 0 with no output on none/timeout/missing dir. `src/chat/codex/` (new): the Codex hook entry, consent prompt in `atem agent launch codex` (remembered in config), merge into `$CODEX_HOME/hooks.json` (default `~/.codex`), backup, idempotence, the env var the worker sets. Worker: watch for permission files, report `approval_request` to the broker, write decision files on the broker's command, detect resolution (Claude: PostToolUse / transcript tool result / Esc; Codex: hook exit / turn events) and report `approval_closed`. Tests with fake agents that run the real hook script; Codex install tests on a temp CODEX_HOME (merge with existing hooks, backup, idempotence, declined consent).
+
+### Task 3: Broker wiring and chat card
+
+`src/runtime/host_bridge.rs`: worker approval events → `SessionHost` approvals → `approval_request`/`approval_closed` to attachments; approval submissions → decision to the worker; no remote holder → immediate "no decision"; local input (Codex) → release first; lease loss → close; chat-v1 shows an approval card part (`{kind:"approval", approval_id, tool, summary, state}`) in the conversation. Tests: in-process broker + fake worker; real-runtime binary test with a fake agent running the real hook script.
+
+### Task 4: Docs and handoff
+
+AGENTS.md, README, `designs/agent-chat-host.md` ("no approvals from chat" → lease-holder approvals bound to the exact prompt; "hooks never decide" exception), the Astation handoff (new messages, card, push trigger).
