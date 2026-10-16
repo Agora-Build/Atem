@@ -254,7 +254,9 @@ terminal session with an app-server conversation.
 
 1. **Who can add devices:** only devices marked "can manage devices" (role
    `manage`). The approval screen asks for it; off by default for phones. The
-   first Astation (genesis) is a manager.
+   first Astation (genesis, e.g. the Mac) starts as the **only** manager;
+   further devices become managers only when the user marks them (confirmed by
+   the user, 2026-10-16).
 2. **Freshness heartbeat:** besides on-demand attestations for Atem's nonce,
    every online manager re-signs the current head every 6 h, so a device can
    connect with a fresh-enough list even when no manager is reachable at that
