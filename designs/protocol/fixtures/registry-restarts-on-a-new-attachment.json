@@ -1,0 +1,177 @@
+{
+ "name": "registry-restarts-on-a-new-attachment",
+ "side": "client",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "sessions",
+     "id": "11111111-1111-4111-8111-000000000101",
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "runtime_epoch": 7,
+     "seq": 5,
+     "sessions": [
+      {
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222",
+       "provider": "claude",
+       "cwd_label": "Atem",
+       "state": "running",
+       "activity": "unknown",
+       "activity_since": 1760500000000,
+       "controller": null,
+       "capabilities": [
+        "terminal-v1",
+        "chat-v1"
+       ],
+       "created_at": 1760490000000
+      }
+     ]
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "registry": [
+     "ses-aaaaaaaaaaaa"
+    ],
+    "seq": 5
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "welcome",
+     "id": "11111111-1111-4111-8111-000000000102",
+     "account_id": "account-a",
+     "atem_device_id": "host-a",
+     "host_trust_gen": 1,
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "controller_session": "12121212-1212-4212-8212-121212121212",
+     "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+     "client_kind": "native",
+     "permissions": [
+      "view"
+     ],
+     "authorization_ms_left": 86400000,
+     "server_time": 1760500000000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "registry": [],
+    "runtime_epoch": 7
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "sessions",
+     "id": "11111111-1111-4111-8111-000000000103",
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "runtime_epoch": 7,
+     "seq": 1,
+     "sessions": []
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "registry": [],
+    "seq": 1
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "session_changed",
+     "id": "11111111-1111-4111-8111-000000000104",
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "runtime_epoch": 7,
+     "seq": 2,
+     "descriptor": {
+      "session_id": "ses-aaaaaaaaaaaa",
+      "process_gen": "22222222-2222-4222-8222-222222222222",
+      "provider": "claude",
+      "cwd_label": "Atem",
+      "state": "running",
+      "activity": "unknown",
+      "activity_since": 1760500000000,
+      "controller": null,
+      "capabilities": [
+       "terminal-v1",
+       "chat-v1"
+      ],
+      "created_at": 1760490000000
+     }
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "registry": [
+     "ses-aaaaaaaaaaaa"
+    ],
+    "seq": 2
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "sessions",
+     "id": "11111111-1111-4111-8111-000000000105",
+     "runtime_gen": "77777777-7777-4777-8777-777777777777",
+     "runtime_epoch": 6,
+     "seq": 9,
+     "sessions": []
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "registry": [
+     "ses-aaaaaaaaaaaa"
+    ],
+    "runtime_epoch": 7,
+    "seq": 2
+   }
+  }
+ ],
+ "note": "Client side: a welcome starts a new attachment, so the registry clears and the next snapshot applies at any seq (here 1 after 5), while the highest runtime epoch stays the floor."
+}
