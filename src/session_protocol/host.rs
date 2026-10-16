@@ -45,7 +45,7 @@ pub const RECEIPT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const OBSERVE_MS: u64 = 10_000;
 /// Lease epochs are reserved durably in blocks, so an epoch is never issued
 /// twice across restarts without an fsync per grant.
-const LEASE_EPOCH_BLOCK: u64 = 64;
+pub const LEASE_EPOCH_BLOCK: u64 = 64;
 /// Default per-session receipt bound (`receipt_limit` beyond it).
 pub const DEFAULT_MAX_RECEIPTS: usize = 4096;
 
@@ -377,6 +377,16 @@ impl<J: Journal> SessionHost<J> {
         &mut self.journal
     }
 
+    /// The journal back, to build a host with another context over it.
+    pub fn into_journal(self) -> J {
+        self.journal
+    }
+
+    /// The durable lease-epoch floor of `session_id` (0 when none was reserved).
+    pub fn lease_floor(&self, session_id: &str) -> u64 {
+        self.lease_floors.get(session_id).copied().unwrap_or(0)
+    }
+
     pub fn now(&self) -> u64 {
         self.now
     }
@@ -693,6 +703,32 @@ impl<J: Journal> SessionHost<J> {
     /// executing work is `outcome_unknown` ("agent exited") and accepted work
     /// is rejected.
     pub fn process_exited(&mut self, session_id: &str, exit_status: Option<String>) -> Vec<Effect> {
+        self.process_ended(session_id, SessionState::Exited, exit_status)
+    }
+
+    /// The agent process can no longer be reached: its worker went away
+    /// without an exit (`Interrupted`) or can't be trusted
+    /// (`RecoveryRequired`). As `process_exited`, with that state.
+    pub fn process_lost(
+        &mut self,
+        session_id: &str,
+        state: SessionState,
+        status: Option<String>,
+    ) -> Vec<Effect> {
+        match state {
+            SessionState::Interrupted | SessionState::RecoveryRequired => {
+                self.process_ended(session_id, state, status)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn process_ended(
+        &mut self,
+        session_id: &str,
+        state: SessionState,
+        exit_status: Option<String>,
+    ) -> Vec<Effect> {
         let wall = self.wall();
         let Some(s) = self.sessions.get_mut(session_id) else {
             return Vec::new();
@@ -700,7 +736,7 @@ impl<J: Journal> SessionHost<J> {
         if s.state != SessionState::Running {
             return Vec::new();
         }
-        s.state = SessionState::Exited;
+        s.state = state;
         s.activity = Activity::Unknown;
         s.exit_status = exit_status;
         s.activity_since = wall;
@@ -909,6 +945,35 @@ impl<J: Journal> SessionHost<J> {
             s.queued.clear();
         }
         Ok(self.recover())
+    }
+
+    /// The host's identity changed (a pairing verified under another
+    /// account or device while the runtime runs): as `restart` (new
+    /// `runtime_gen`, higher `runtime_epoch`), under the new identity and a
+    /// trust generation that never decreases. Nothing changes on failure.
+    pub fn rebind(
+        &mut self,
+        account_id: &str,
+        atem_device_id: &str,
+        host_trust_gen: u64,
+        runtime_gen: &str,
+        runtime_epoch: u64,
+    ) -> Result<Vec<Effect>, String> {
+        if !wire::is_opaque_id(account_id) || !wire::is_opaque_id(atem_device_id) {
+            return Err("invalid account or device id".into());
+        }
+        if host_trust_gen < self.ctx.host_trust_gen || host_trust_gen > MAX_SAFE_INTEGER {
+            return Err("host_trust_gen must not decrease".into());
+        }
+        let previous = self.ctx.clone();
+        self.ctx.account_id = account_id.to_string();
+        self.ctx.atem_device_id = atem_device_id.to_string();
+        self.ctx.host_trust_gen = host_trust_gen;
+        let restarted = self.restart(runtime_gen, runtime_epoch);
+        if restarted.is_err() {
+            self.ctx = previous;
+        }
+        restarted
     }
 
     fn reload(&mut self) -> Result<(), JournalError> {

@@ -264,7 +264,6 @@ impl Captured {
         })
     }
 
-    #[cfg(test)]
     pub fn sources(&self) -> &Sources {
         &self.src
     }

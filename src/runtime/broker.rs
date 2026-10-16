@@ -30,7 +30,7 @@ use super::adopt::{self, Adoption, SpawnRequest, WorkerHandle};
 use super::protocol::{LaunchEnv, SessionSummary};
 use super::worker_protocol::{Activity, WorkerMsg, WorkerRecord, unb64};
 use crate::chat::adapter::{AgentEvent, LogItem};
-use crate::chat::session::ChatSession;
+use crate::chat::session::{ChatSession, Out};
 use crate::session::{OutputTap, SessionId};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -45,6 +45,28 @@ pub const MAX_IN_FLIGHT: usize = 32;
 const PER_PASS: usize = 256;
 /// The mirror's size until an adopted worker's screen arrives.
 const UNKNOWN_SIZE: (u16, u16) = (24, 80);
+/// chat-v1 conversations must be reopened: the chat was withdrawn.
+pub const CHAT_WITHDRAWN: &str = "chat is not available for this agent";
+/// chat-v1 conversations must be reopened: another conversation was resumed.
+pub const CHAT_SWITCHED: &str = "the conversation was switched; reopen the chat";
+
+/// Who a write is for: local ones are reported in `Pumped`, the session
+/// host's (remote input, prompts, interrupts) through `take_results`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteTag {
+    Local,
+    Host,
+}
+
+/// The worker's answer to a session host's write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub seq: u64,
+    pub ok: bool,
+    /// Dropped for a stale input epoch: nothing was written.
+    pub dropped: bool,
+    pub error: Option<String>,
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -112,11 +134,21 @@ pub struct BrokerSession {
     offset: u64,
     /// Raw output for an attached local frontend.
     pub tap: OutputTap,
+    /// The last write (mark tasks go to the most recently used session).
+    pub last_used: Instant,
     /// The input epoch writes are tagged with.
     input_epoch: u64,
     next_seq: u64,
-    /// Writes sent and not yet answered: seq → bytes.
-    in_flight: std::collections::BTreeMap<u64, usize>,
+    /// Writes sent and not yet answered: seq → bytes and whose they are.
+    in_flight: std::collections::BTreeMap<u64, (usize, WriteTag)>,
+    /// Answers to the session host's writes, not taken yet.
+    host_results: Vec<WriteOutcome>,
+    /// What the chat session produced since the session host last took it.
+    chat_out: Vec<Out>,
+    /// Open chat-v1 conversations must end (why), e.g. chat was withdrawn.
+    chat_reset: Option<&'static str>,
+    /// The terminal input count of the worker's last chat batch.
+    pub input_count: u64,
     /// Writes the worker dropped for a stale epoch.
     pub dropped_writes: u64,
     /// chat-v1 state, fed from the worker's `chat` batches.
@@ -167,9 +199,14 @@ impl BrokerSession {
             screen_requested: false,
             offset: 0,
             tap: OutputTap::default(),
+            last_used: Instant::now(),
             input_epoch: 0,
             next_seq: 0,
             in_flight: Default::default(),
+            host_results: Vec::new(),
+            chat_out: Vec::new(),
+            chat_reset: None,
+            input_count: 0,
             dropped_writes: 0,
             chat,
             chat_v1: false,
@@ -282,8 +319,10 @@ impl BrokerSession {
         self.state = state;
         self.exit_status = Some(status);
         self.exited_at = Some(Instant::now());
+        // The host's writes in flight get no answer now (the agent exited).
         self.in_flight.clear();
-        self.chat.on_process_exit(now_ms());
+        let outs = self.chat.on_process_exit(now_ms());
+        self.chat_out.extend(outs);
         self.activity = Activity::Unknown;
         self.activity_detail = None;
     }
@@ -311,9 +350,45 @@ impl BrokerSession {
             && (self.worker.is_some() || self.synced)
     }
 
-    #[cfg(test)]
+    /// The input epoch writes are tagged with (the worker's current one).
     pub fn input_epoch(&self) -> u64 {
         self.input_epoch
+    }
+
+    /// The canonical screen's mirror.
+    pub fn screen(&self) -> &vt100::Screen {
+        self.screen.screen()
+    }
+
+    /// An adopted worker whose state the broker can't vouch for: the
+    /// connection is dropped (the worker waits for another broker) and the
+    /// session is `recovery_required`.
+    pub fn refuse_adoption(&mut self, reason: &str) {
+        self.worker = None;
+        self.end(
+            SessionState::RecoveryRequired,
+            format!("recovery required: {reason}"),
+        );
+    }
+
+    /// Answers to the session host's writes since the last call.
+    pub fn take_results(&mut self) -> Vec<WriteOutcome> {
+        std::mem::take(&mut self.host_results)
+    }
+
+    /// What the chat session produced since the last call.
+    pub fn take_chat(&mut self) -> Vec<Out> {
+        std::mem::take(&mut self.chat_out)
+    }
+
+    /// Why open chat-v1 conversations must end, once.
+    pub fn take_chat_reset(&mut self) -> Option<&'static str> {
+        self.chat_reset.take()
+    }
+
+    /// Writes are waiting for the worker's answer.
+    pub fn writes_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
     }
 
     /// Another write may be sent now.
@@ -321,8 +396,13 @@ impl BrokerSession {
         self.in_flight.len() < MAX_IN_FLIGHT
     }
 
-    /// Writes `bytes` under the current input epoch.
+    /// Writes `bytes` under the current input epoch (local input).
     pub fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.write_tagged(bytes, WriteTag::Local).map(|_| ())
+    }
+
+    /// Writes `bytes` under the current input epoch; its sequence number.
+    pub fn write_tagged(&mut self, bytes: &[u8], tag: WriteTag) -> anyhow::Result<u64> {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
@@ -330,17 +410,38 @@ impl BrokerSession {
         let seq = self.next_seq;
         worker.write(seq, bytes, self.input_epoch)?;
         self.next_seq += 1;
-        self.in_flight.insert(seq, bytes.len());
-        Ok(())
+        self.in_flight.insert(seq, (bytes.len(), tag));
+        self.last_used = Instant::now();
+        Ok(seq)
+    }
+
+    /// A bracketed paste of `text` plus Enter for the session host, under
+    /// the current input epoch; its sequence number.
+    pub fn paste(&mut self, text: &str) -> anyhow::Result<u64> {
+        if !self.is_live() {
+            anyhow::bail!("The session has ended");
+        }
+        let worker = self.worker.as_ref().expect("live");
+        let seq = self.next_seq;
+        worker.paste(seq, text, self.input_epoch)?;
+        self.next_seq += 1;
+        self.in_flight.insert(seq, (text.len(), WriteTag::Host));
+        self.last_used = Instant::now();
+        Ok(seq)
     }
 
     /// Control changed: a new epoch, sent to the worker before any write
     /// under it, so writes queued under the old one are dropped.
     pub fn raise_input_epoch(&mut self) -> anyhow::Result<u64> {
+        self.raise_input_epoch_to(0)
+    }
+
+    /// As `raise_input_epoch`, to at least `at_least`.
+    pub fn raise_input_epoch_to(&mut self, at_least: u64) -> anyhow::Result<u64> {
         let Some(worker) = self.worker.as_ref().filter(|_| self.is_live()) else {
             anyhow::bail!("The session has ended");
         };
-        let epoch = self.input_epoch + 1;
+        let epoch = (self.input_epoch + 1).max(at_least);
         worker.set_epoch(epoch)?;
         self.input_epoch = epoch;
         Ok(epoch)
@@ -441,7 +542,8 @@ impl BrokerSession {
                 }
             }
         }
-        self.chat.tick(Instant::now());
+        let outs = self.chat.tick(Instant::now());
+        self.chat_out.extend(outs);
         pumped
     }
 
@@ -486,17 +588,28 @@ impl BrokerSession {
                 let (ends, others): (Vec<_>, Vec<_>) = events
                     .into_iter()
                     .partition(|e| matches!(e, AgentEvent::TurnEnded));
+                let mut outs = Vec::new();
                 for event in others {
-                    self.chat.on_event(event, now, input_count);
+                    outs.extend(self.chat.on_event(event, now, input_count));
                 }
+                let mut backfilled = false;
                 for item in log {
                     if !matches!(item, LogItem::Problem { .. }) {
-                        self.chat.on_log(item, now, input_count);
+                        backfilled |= matches!(item, LogItem::Backfill(_));
+                        outs.extend(self.chat.on_log(item, now, input_count));
                     }
                 }
                 for event in ends {
-                    self.chat.on_event(event, now, input_count);
+                    outs.extend(self.chat.on_event(event, now, input_count));
                 }
+                self.chat_out.extend(outs);
+                if self.chat_v1 && !chat_v1 {
+                    self.chat_reset = Some(CHAT_WITHDRAWN);
+                } else if backfilled {
+                    // History from a log switched to (resume): clients reload it.
+                    self.chat_reset = Some(CHAT_SWITCHED);
+                }
+                self.input_count = input_count;
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
             }
@@ -518,8 +631,18 @@ impl BrokerSession {
                 error,
                 ..
             } => {
-                let bytes = self.in_flight.remove(&seq).unwrap_or(0);
-                if dropped {
+                let (bytes, tag) = self.in_flight.remove(&seq).unwrap_or((0, WriteTag::Local));
+                if tag == WriteTag::Host {
+                    self.host_results.push(WriteOutcome {
+                        seq,
+                        ok,
+                        dropped,
+                        error,
+                    });
+                    if dropped {
+                        self.dropped_writes += 1;
+                    }
+                } else if dropped {
                     self.dropped_writes += 1;
                     pumped.dropped_bytes += bytes;
                 } else if !ok {

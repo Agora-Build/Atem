@@ -60,6 +60,23 @@ pub(crate) fn is_auth_required(message: &AstationMessage) -> bool {
     matches!(message, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
 }
 
+/// The family of a message the session host decodes itself (`session`,
+/// `terminal`, `agentChat`), from its `type`.
+pub(crate) fn session_family(text: &str) -> Option<&'static str> {
+    #[derive(Deserialize)]
+    struct Peek {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    let peek: Peek = serde_json::from_str(text).ok()?;
+    match peek.kind.as_deref()? {
+        "session" => Some("session"),
+        "terminal" => Some("terminal"),
+        "agentChat" => Some("agentChat"),
+        _ => None,
+    }
+}
+
 struct OutboundMessage {
     message: AstationMessage,
     delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -68,6 +85,13 @@ struct OutboundMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AstationMessage {
+    /// A `session`, `terminal` or `agentChat` message as its raw JSON text:
+    /// the session host decodes those strictly itself. Inbound messages of
+    /// those families always arrive as this; outbound, the text is written
+    /// as is.
+    #[serde(skip)]
+    SessionWire(String),
+
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
 
@@ -161,21 +185,11 @@ pub enum AstationMessage {
 
     // ── Agent hub messages ────────────────────────────────────────────────
 
-    /// Astation → Atem: request the list of connected agents.
-    #[serde(rename = "agentListRequest")]
-    AgentListRequest,
-
     #[serde(rename = "credentialProjectListRequest")]
     CredentialProjectListRequest,
 
     #[serde(rename = "credentialProjectListResponse")]
     CredentialProjectListResponse { report: crate::memory::credential_projects::ProjectReportWire },
-
-    /// Atem → Astation: snapshot of all registered agents.
-    #[serde(rename = "agentListResponse")]
-    AgentListResponse {
-        agents: Vec<crate::agent_client::AgentInfo>,
-    },
 
     /// Atem → Astation: a streaming event from an agent.
     ///
@@ -729,7 +743,11 @@ impl AstationClient {
                     outbound = terminal_rx.recv() => outbound,
                 };
                 let Some(outbound) = outbound else { break; };
-                let result = match serde_json::to_string(&outbound.message) {
+                let encoded = match &outbound.message {
+                    AstationMessage::SessionWire(text) => Ok(text.clone()),
+                    message => serde_json::to_string(message),
+                };
+                let result = match encoded {
                     Ok(json) => write.send(Message::Text(json)).await.map_err(|_| "WebSocket write failed".to_string()),
                     Err(_) => Err("WebSocket message encoding failed".to_string()),
                 };
@@ -744,11 +762,16 @@ impl AstationClient {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
-                        if let Ok(astation_msg) = serde_json::from_str::<AstationMessage>(&text) {
-                            if matches!(&astation_msg, AstationMessage::Terminal(_)) && text.len() > 32 * 1024 { continue; }
-                            if tx.send(astation_msg).await.is_err() {
-                                break; // Receiver has been dropped
-                            }
+                        let astation_msg = match session_family(&text) {
+                            Some("terminal") if text.len() > 32 * 1024 => continue,
+                            Some(_) if text.len() > crate::session_protocol::wire::MAX_MESSAGE_BYTES => continue,
+                            Some(_) => Some(AstationMessage::SessionWire(text)),
+                            None => serde_json::from_str::<AstationMessage>(&text).ok(),
+                        };
+                        if let Some(astation_msg) = astation_msg
+                            && tx.send(astation_msg).await.is_err()
+                        {
+                            break; // Receiver has been dropped
                         }
                     }
                     Ok(Message::Close(_)) => {
@@ -1162,6 +1185,20 @@ impl AstationClient {
             .map_err(|_| anyhow!("Terminal transport queue full or closed"))
     }
 
+    /// A session-family message as raw JSON: terminal-v1 ones on the bounded
+    /// terminal queue (in order with the frames), the rest on the control queue.
+    pub fn try_send_wire(&self, text: String, terminal: bool) -> Result<()> {
+        let outbound = OutboundMessage { message: AstationMessage::SessionWire(text), delivered: None };
+        if terminal {
+            return self.terminal_sender.as_ref().ok_or_else(|| anyhow!("Not connected"))?
+                .try_send(outbound)
+                .map_err(|_| anyhow!("Terminal transport queue full or closed"));
+        }
+        self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?
+            .send(outbound)
+            .map_err(|e| anyhow!("Failed to send message: {}", e))
+    }
+
     pub async fn send_message(&self, message: AstationMessage) -> Result<()> {
         if let AstationMessage::Terminal(envelope) = message {
             return self.try_send_terminal(envelope);
@@ -1430,13 +1467,6 @@ impl AstationClient {
         self.send_message(msg).await
     }
 
-    /// Reply to an `agentListRequest` with all currently registered agents.
-    pub async fn send_agent_list(
-        &self,
-        agents: Vec<crate::agent_client::AgentInfo>,
-    ) -> Result<()> {
-        self.send_message(AstationMessage::AgentListResponse { agents }).await
-    }
 
 
     /// Connect to Astation for pairing.
@@ -1846,7 +1876,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
-        assert!(matches!(client.recv_message(), Some(AstationMessage::Terminal(_))));
+        assert!(matches!(client.recv_message(), Some(AstationMessage::SessionWire(text)) if text.contains("subscribe")));
         server.await.unwrap();
     }
 
@@ -3040,59 +3070,6 @@ mod tests {
 
     // ── Agent hub message tests ───────────────────────────────────────────
 
-    fn make_agent_info(id: &str) -> crate::agent_client::AgentInfo {
-        use crate::agent_client::{AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
-        crate::agent_client::AgentInfo {
-            id: id.to_string(),
-            name: format!("agent-{id}"),
-            kind: AgentKind::ClaudeCode,
-            protocol: AgentProtocol::Pty,
-            origin: AgentOrigin::Launched,
-            status: AgentStatus::Idle,
-            session_ids: vec![],
-            acp_url: None,
-            pty_pid: Some(4242),
-            capabilities: vec![],
-        }
-    }
-
-    #[test]
-    fn agent_list_request_roundtrip() {
-        let msg = AstationMessage::AgentListRequest;
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"agentListRequest\""));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, AstationMessage::AgentListRequest));
-    }
-
-    #[test]
-    fn agent_list_response_roundtrip() {
-        let msg = AstationMessage::AgentListResponse {
-            agents: vec![make_agent_info("abc"), make_agent_info("def")],
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentListResponse { agents } = parsed {
-            assert_eq!(agents.len(), 2);
-            assert_eq!(agents[0].id, "abc");
-            assert_eq!(agents[1].id, "def");
-        } else {
-            panic!("expected AgentListResponse");
-        }
-    }
-
-    #[test]
-    fn agent_list_response_empty() {
-        let msg = AstationMessage::AgentListResponse { agents: vec![] };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentListResponse { agents } = parsed {
-            assert!(agents.is_empty());
-        } else {
-            panic!("expected AgentListResponse");
-        }
-    }
-
     #[test]
     fn agent_event_text_delta_roundtrip() {
         let msg = AstationMessage::AgentEventMsg {
@@ -3155,25 +3132,6 @@ mod tests {
             assert_eq!(status, AgentStatus::Thinking);
         } else {
             panic!("expected AgentStatusUpdate");
-        }
-    }
-
-    #[test]
-    fn agent_list_response_preserves_all_info_fields() {
-        let info = make_agent_info("test-id");
-        let msg = AstationMessage::AgentListResponse {
-            agents: vec![info],
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentListResponse { agents } = parsed {
-            let a = &agents[0];
-            assert_eq!(a.id, "test-id");
-            assert_eq!(a.protocol, crate::agent_client::AgentProtocol::Pty);
-            assert!(a.acp_url.is_none());
-            assert_eq!(a.pty_pid, Some(4242));
-        } else {
-            panic!("expected AgentListResponse");
         }
     }
 

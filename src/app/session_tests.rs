@@ -125,49 +125,7 @@ async fn sessions_have_their_own_ids_in_the_agent_list() {
 }
 
 #[tokio::test]
-async fn terminal_requests_take_only_a_session_id() {
-    let (mut app, root) = app();
-    let a = dir(&root, "a");
-    let first = app
-        .launch_session(request(Provider::Claude, &a))
-        .await
-        .unwrap();
-    app.astation_connected = true;
-    let generation = app.sessions.get(&first).unwrap().share.generation.clone();
-    let subscribe = |app: &mut App, terminal_id: &str, generation: String| {
-        app.handle_terminal_message(
-            Message::Subscribe {
-                terminal_id: terminal_id.into(),
-                generation,
-            }
-            .into(),
-        );
-        app.terminal_outbox.pop_front().unwrap()
-    };
-
-    let Message::Attached { session, .. } = subscribe(&mut app, first.as_str(), generation.clone())
-    else {
-        panic!("expected attachment")
-    };
-    assert_eq!(session.terminal_id, first.as_str());
-
-    // Provider names are not terminal ids.
-    for unknown in ["ses-aaaaaaaaaaaa", "claude", "codex", "gemini"] {
-        let Message::Error {
-            terminal_id,
-            message,
-        } = subscribe(&mut app, unknown, generation.clone())
-        else {
-            panic!("expected an error for {unknown}")
-        };
-        assert_eq!(terminal_id.as_deref(), Some(unknown));
-        assert_eq!(message, "Unknown terminal");
-    }
-    assert!(app.terminal_outbox.is_empty());
-}
-
-#[tokio::test]
-async fn remote_terminal_mutations_are_refused_without_effect() {
+async fn the_tui_refuses_remote_terminal_requests_without_effect() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     let (mut app, root) = app();
     let a = dir(&root, "a");
@@ -175,55 +133,42 @@ async fn remote_terminal_mutations_are_refused_without_effect() {
         .launch_session(request(Provider::Codex, &a))
         .await
         .unwrap();
+    let _rx = astation(&mut app).await;
     app.astation_connected = true;
     let generation = app.sessions.get(&id).unwrap().share.generation.clone();
-    app.handle_terminal_message(
+    let requests = [
         Message::Subscribe {
             terminal_id: id.to_string(),
             generation: generation.clone(),
-        }
-        .into(),
-    );
-    let Some(Message::Attached { stream_id, .. }) = app.terminal_outbox.pop_front() else {
-        panic!("expected attachment")
-    };
-    let requests = [
+        },
         Message::Input {
             terminal_id: id.to_string(),
             generation: generation.clone(),
-            stream_id: stream_id.clone(),
+            stream_id: "s".into(),
             sequence: 0,
             bytes: STANDARD.encode(b"REMOTE\n"),
         },
         Message::Resize {
             terminal_id: id.to_string(),
             generation: generation.clone(),
-            stream_id: stream_id.clone(),
+            stream_id: "s".into(),
             rows: 30,
             cols: 90,
         },
         Message::Stop {
             terminal_id: id.to_string(),
             generation: generation.clone(),
-            stream_id: stream_id.clone(),
+            stream_id: "s".into(),
         },
     ];
     for request in requests {
-        app.handle_terminal_message(request.into());
-        let Some(Message::Error {
-            terminal_id,
-            message,
-        }) = app.terminal_outbox.pop_front()
-        else {
-            panic!("expected a refusal")
-        };
-        assert_eq!(terminal_id.as_deref(), Some(id.as_str()));
-        assert_eq!(message, super::terminal::REMOTE_MUTATION_REFUSED);
+        let text = serde_json::to_string(&AstationMessage::Terminal(request.into())).unwrap();
+        app.handle_astation_message(AstationMessage::SessionWire(text))
+            .await;
     }
-    // No effect: the viewer stays view-only, nothing was typed, the size is the
-    // local one and the process still answers local input.
+    // No effect: nothing was typed, the size is the local one and the process
+    // still answers local input.
     let session = app.sessions.get(&id).unwrap();
-    assert!(session.share.has_viewer());
     assert!(!session.input.as_ref().unwrap().remote_controlled());
     assert_eq!(session.terminal.screen().size(), (24, 80));
     app.send_data(&id, "local\n");

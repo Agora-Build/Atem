@@ -7,6 +7,7 @@
 
 use super::adopt::{Adoption, SpawnRequest, WorkerHandle};
 use super::broker::{BrokerSession, Launcher, SessionState};
+use super::host_bridge::{Clock, HostBridge};
 use super::protocol::{
     ClientMsg, DecodeError, MAX_OUTPUT, PROTOCOL, RuntimeMsg, SessionSummary, b64, encode_runtime,
     input_bytes,
@@ -42,6 +43,11 @@ pub struct Options {
     pub uid: u32,
     /// Starts workers; its state dir holds the worker records adopted at start.
     pub launcher: Launcher,
+    /// The profile whose pairing names the session host at start (`None`:
+    /// unpaired until an authenticated, verified link names it).
+    pub profile: Option<crate::status::Sources>,
+    /// The session host's monotonic clock.
+    pub clock: Clock,
 }
 
 /// A launch that finished on its task.
@@ -133,13 +139,16 @@ struct Server {
     /// Exit at the end of this pass (a restart for another protocol).
     restart: bool,
     wake: Arc<Notify>,
+    /// The session host (`None` when its journal could not be opened:
+    /// remote session messages are refused then).
+    bridge: Option<HostBridge>,
 }
 
 /// Serves frontends on `listener` with `app` as the host until `shutdown`
 /// completes, the runtime has been idle for `options.idle`, or a client of
 /// another protocol asks a runtime without live sessions to restart.
 pub async fn serve(
-    app: App,
+    mut app: App,
     listener: tokio::net::UnixListener,
     options: Options,
     shutdown: impl std::future::Future<Output = ()>,
@@ -177,6 +186,15 @@ pub async fn serve(
         options.launcher.state().to_path_buf(),
         adoptions_tx,
     ));
+    let journal = options.launcher.state().join("journal");
+    let bridge = match HostBridge::open(&journal, options.profile.as_ref(), options.clock.clone()) {
+        Ok(bridge) => Some(bridge),
+        Err(error) => {
+            eprintln!("atem runtime: no session host ({error:#}); remote sessions are refused");
+            None
+        }
+    };
+    app.hosted = Some(crate::app::hosted::Hosted::default());
     let mut server = Server {
         app,
         options,
@@ -191,6 +209,7 @@ pub async fn serve(
         idle_since: None,
         restart: false,
         wake: wake.clone(),
+        bridge,
     };
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -202,6 +221,7 @@ pub async fn serve(
                 server.pump_workers();
                 server.reap_exited(Instant::now());
                 server.app.tick_host().await;
+                server.host_pass().await;
                 server.forward_status();
             }
             Some(stream) = accepted.recv() => server.add_client(stream),
@@ -486,11 +506,14 @@ impl Server {
             other => eprintln!("atem runtime: {sid}: {}", other.status()),
         }
         let exited_record = matches!(adoption, Adoption::Exited { .. });
-        let Some(session) = BrokerSession::from_adoption(adoption) else {
+        let Some(mut session) = BrokerSession::from_adoption(adoption) else {
             return;
         };
         if self.sessions.contains_key(&session.id) {
             return;
+        }
+        if let Some(bridge) = self.bridge.as_mut() {
+            bridge.check_adoption(&mut session);
         }
         if exited_record {
             // The worker is gone after recording the exit; it is recorded now.
@@ -506,6 +529,10 @@ impl Server {
                 continue;
             };
             let pumped = session.pump();
+            if pumped.ended && self.app.main_task_session.as_ref() == Some(&sid) {
+                // The active mark task's session ended: finalize it.
+                self.app.dispatcher.set_main_needs_finalize();
+            }
             if pumped.ended {
                 eprintln!(
                     "atem runtime: {sid} {} ({})",
@@ -790,9 +817,18 @@ impl Server {
                         },
                     );
                 };
-                // Control changes: writes queued under the old epoch are
-                // dropped at the worker.
-                if let Err(error) = session.raise_input_epoch() {
+                // Control changes: a remote lease is revoked and writes
+                // queued under the old epoch are dropped at the worker.
+                let reclaimed = match self.bridge.as_mut() {
+                    Some(bridge) => bridge.local_input(
+                        &sid,
+                        Vec::new(),
+                        &self.app.astation_client,
+                        &mut self.sessions,
+                    ),
+                    None => session.raise_input_epoch().map(|_| ()),
+                };
+                if let Err(error) = reclaimed {
                     return self.error(id, error.to_string(), "reclaim");
                 }
                 let (rows, cols) = self.attached[&sid].size;
@@ -900,9 +936,10 @@ impl Server {
         self.close(id);
     }
 
-    /// Local input always writes (until leases): to the session's worker,
-    /// under its current input epoch. `Some(message)` back: too many writes
-    /// are in flight; keep it and read nothing more from this client meanwhile.
+    /// Local input always writes: through the session host, which revokes
+    /// any remote lease first, to the session's worker under its current
+    /// input epoch. `Some(message)` back: too many writes are in flight;
+    /// keep it and read nothing more from this client meanwhile.
     fn input(&mut self, id: u64, message: ClientMsg) -> Option<ClientMsg> {
         let ClientMsg::Input { session_id, bytes } = &message else {
             return None;
@@ -925,10 +962,62 @@ impl Server {
         if !session.can_write() {
             return Some(message);
         }
-        if let Err(error) = session.write(&bytes) {
+        let written = match self.bridge.as_mut() {
+            Some(bridge) => {
+                bridge.local_input(&sid, bytes, &self.app.astation_client, &mut self.sessions)
+            }
+            None => session.write(&bytes),
+        };
+        if let Err(error) = written {
             self.error(id, error.to_string(), "input");
         }
         None
+    }
+
+    /// The session host's pass (after the App's): mark-task prompts the App
+    /// queued, then the host itself.
+    async fn host_pass(&mut self) {
+        let writes = self
+            .app
+            .hosted
+            .as_mut()
+            .map(|h| std::mem::take(&mut h.writes))
+            .unwrap_or_default();
+        for (task_id, sid, text) in writes {
+            // Local-origin input under the current epoch; no lease is revoked
+            // (the App only sends a task while no remote lease is held).
+            let written = match self.sessions.get_mut(&sid) {
+                Some(session) => session.write(text.as_bytes()),
+                None => Err(anyhow::anyhow!("The session has ended")),
+            };
+            if let Err(error) = written {
+                self.app
+                    .mark_write_failed(&task_id, &error.to_string())
+                    .await;
+            }
+        }
+        match self.bridge.as_mut() {
+            Some(bridge) => bridge.tick(&mut self.app, &mut self.sessions, self.adopting),
+            None => {
+                super::host_bridge::refuse_all(&mut self.app);
+                if let Some(hosted) = self.app.hosted.as_mut() {
+                    hosted.sessions = self
+                        .sessions
+                        .values()
+                        .filter_map(|s| {
+                            Some(crate::app::hosted::HostedSession {
+                                id: s.id.clone(),
+                                provider: Provider::from_alias(&s.provider)?,
+                                cwd: s.cwd.clone(),
+                                live: s.is_live(),
+                                remote_controlled: false,
+                                last_used: s.last_used,
+                            })
+                        })
+                        .collect();
+                }
+            }
+        }
     }
 
     /// The local frontend's size for a live session's terminal.
@@ -952,7 +1041,12 @@ impl Server {
     }
 
     fn summary(&self, sid: &SessionId) -> SessionSummary {
-        self.sessions[sid].summary(self.attached.contains_key(sid))
+        let mut summary = self.sessions[sid].summary(self.attached.contains_key(sid));
+        summary.remote_controlled = self
+            .bridge
+            .as_ref()
+            .is_some_and(|b| b.lease_holder(sid.as_str()).is_some());
+        summary
     }
 
     /// Sends the attached frontend a fresh restore: the mirror of the

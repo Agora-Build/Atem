@@ -470,7 +470,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         bail!("could not write the worker record: {error}");
     }
     let mut worker = Worker {
-        share: SharedTerminal::new(&spec.session_id, &spec.provider),
+        share: SharedTerminal::new(),
         spec,
         record,
         input: pty.sender,

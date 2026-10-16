@@ -1,0 +1,1716 @@
+//! The session host inside `atem runtime` (designs/protocol/atem-session-v1.md,
+//! compatibility mode): the broker owns `SessionHost` over a `FileJournal`
+//! and performs its effects on the workers.
+//!
+//! Attachment: the App's authenticated Astation link (direct or relay; the
+//! App holds one at a time) is one attachment, created when the link becomes
+//! authenticated (`App::astation_link_gen` counts those) and fenced when it
+//! drops or Astation re-authenticates it. Only the Astation this profile is
+//! paired with (the pairing binding the link captured) and verified with
+//! (`cred_state.json`) gets one, with `view`, `control` and `approve`; any
+//! other link — unpaired, unverified, or another Astation — gets no
+//! attachment at all, so its session-family messages are answered
+//! `unauthorized`. `welcome` names the verified account (`data_account`), this
+//! device's id from its verification, and the host trust generation from
+//! `pairing.json`; a new identity (a pairing verified after the broker
+//! started) restarts the host over the same journal with a new runtime
+//! generation and epoch.
+//!
+//! Writes: every byte the host lets through reaches the worker tagged with
+//! the worker's current input epoch. When the host's input epoch for a
+//! session moves (a lease ends, is taken over or revoked, local input) after
+//! remote bytes were sent or while a lease was held, the broker raises the
+//! worker's epoch first (`set_input_epoch`, at least the session's lease
+//! epoch), so bytes queued under the old lease are dropped at the worker's
+//! write boundary; remote bytes are also checked with `admit_write` right
+//! before they are sent. Local frontend input goes through `local_input`
+//! (it revokes any remote lease) before it is written. Mark tasks write as
+//! local-origin input without revoking: they only run with no lease holder.
+//!
+//! Dispatch: a prompt is pasted through the worker once the chat session
+//! accepted it (`ChatSession::submit`); its receipt completes when the chat
+//! reports that turn's end. An interrupt writes Esc and completes when a turn
+//! ends (or at once when none runs). A stop stops the agent; its exit
+//! completes it. Duplicate session messages (same `id`) within 60 s are
+//! handled once, whatever link they came on.
+use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
+use super::worker_protocol::Activity as WorkerActivity;
+use crate::app::App;
+use crate::app::hosted::{HostedSession, refusal};
+use crate::chat::session::{Out, State as ChatState};
+use crate::chat::wire::{self as chat_wire, ChatEnvelope, Inbound};
+use crate::session::{Provider, SessionId};
+use crate::session_protocol::file_journal::FileJournal;
+use crate::session_protocol::host::{
+    Attach, ChatReply, DispatchReport, Effect, HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin,
+    SessionHost, SessionSpec, random_ids,
+};
+use crate::session_protocol::wire::{
+    self, Activity, ClientKind, Envelope, FamilyMessage, Permission, ReceiptKind, SessionState,
+};
+use crate::terminal_share::{FrameStream, Message as TerminalMessage};
+use crate::websocket_client::{AstationClient, AstationMessage};
+use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// `advance` runs this often.
+const ADVANCE_EVERY: u64 = 100;
+/// Identical session messages within this window are handled once.
+const DEDUP_MS: u64 = 60_000;
+/// The authorization of an authenticated link (compatibility mode has no
+/// freshness proof yet): after this, requests on it are `paused` until the
+/// link is authenticated again.
+const LINK_AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
+/// Terminal messages waiting for the transport before streams are dropped.
+const TERMINAL_BACKLOG: usize = 128;
+const HEARTBEAT: Duration = Duration::from_secs(15);
+const HISTORY_MESSAGES: usize = 50;
+const HISTORY_BYTES: usize = 256 * 1024;
+/// Open conversations per session; opening one more closes the oldest.
+const MAX_CONVERSATIONS: usize = 8;
+const RESTARTED: &str = "the agent was restarted; reopen the chat";
+const NOT_AVAILABLE: &str = "chat is not available for this agent";
+const NO_TURN: &str = "no turn was running";
+/// Esc interrupts Claude Code's and Codex's current turn.
+const INTERRUPT_KEY: &[u8] = b"\x1b";
+/// Identity of a host without a verified pairing (no attachment is ever
+/// authorized under it).
+const UNPAIRED: &str = "unpaired";
+const RUNTIME_EPOCH_FILE: &str = "runtime_epoch";
+
+/// The broker's monotonic clock in milliseconds (tests move it forward).
+#[derive(Clone, Debug)]
+pub struct Clock {
+    origin: Instant,
+    skew: Arc<AtomicU64>,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            skew: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Clock {
+    pub fn now(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64 + self.skew.load(Ordering::SeqCst)
+    }
+
+    /// Moves the clock `ms` forward (tests).
+    #[cfg(test)]
+    pub fn skip(&self, ms: u64) {
+        self.skew.fetch_add(ms, Ordering::SeqCst);
+    }
+}
+
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Who this host is (§2): the verified account and device, and the host
+/// trust generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub account_id: String,
+    pub atem_device_id: String,
+    pub host_trust_gen: u64,
+}
+
+/// The identity `src` is verified under with `astation_id`, if it is.
+fn verified_identity(
+    src: &crate::status::Sources,
+    astation_id: &str,
+    host_trust_gen: u64,
+) -> Option<Identity> {
+    let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust).ok()?;
+    let entry = trust.verified(astation_id)?;
+    let identity = Identity {
+        account_id: entry.data_account.clone(),
+        atem_device_id: entry.device_id.clone(),
+        host_trust_gen,
+    };
+    (wire::is_opaque_id(&identity.account_id) && wire::is_opaque_id(&identity.atem_device_id))
+        .then_some(identity)
+}
+
+/// The identity of the profile's current pairing (at start), else none.
+fn start_identity(src: &crate::status::Sources) -> Identity {
+    let state = crate::pairing_binding::load(src).ok();
+    let trust_gen = state.as_ref().map_or(0, |s| s.host_trust_gen);
+    state
+        .and_then(|s| s.binding)
+        .and_then(|b| verified_identity(src, &b.astation_id, trust_gen))
+        .unwrap_or(Identity {
+            account_id: UNPAIRED.into(),
+            atem_device_id: UNPAIRED.into(),
+            host_trust_gen: trust_gen,
+        })
+}
+
+/// The identity an authenticated link may attach under: the paired Astation
+/// it authenticated with, verified. `None` for any other link.
+fn link_identity(client: &AstationClient) -> Option<Identity> {
+    let astation_id = client.connected_astation_id()?;
+    let capture = client.capture()?;
+    capture
+        .state
+        .binding
+        .as_ref()
+        .filter(|b| b.astation_id == astation_id)?;
+    verified_identity(capture.sources(), astation_id, capture.state.host_trust_gen)
+}
+
+/// The next runtime epoch, durably (a counter in `dir`, incremented each start).
+fn next_runtime_epoch(dir: &Path) -> anyhow::Result<u64> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(RUNTIME_EPOCH_FILE);
+    let previous = match std::fs::read_to_string(&path) {
+        Ok(text) => text
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("{} is damaged", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    let next = previous
+        .checked_add(1)
+        .filter(|n| *n <= crate::session_protocol::canonical::MAX_SAFE_INTEGER)
+        .ok_or_else(|| anyhow::anyhow!("the runtime epoch is exhausted"))?;
+    let temp = dir.join(format!("{RUNTIME_EPOCH_FILE}.tmp"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)?;
+    file.write_all(next.to_string().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&temp, &path)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(next)
+}
+
+fn host_activity(activity: WorkerActivity) -> Activity {
+    match activity {
+        WorkerActivity::Ready => Activity::Ready,
+        WorkerActivity::Working => Activity::Working,
+        WorkerActivity::Waiting => Activity::Waiting,
+        WorkerActivity::Unknown => Activity::Unknown,
+    }
+}
+
+/// Remote terminal input admitted by the host, waiting for room at the worker.
+struct RemoteWrite {
+    bytes: Vec<u8>,
+    host_epoch: u64,
+    attachment: String,
+    stream_id: String,
+    sequence: u64,
+}
+
+/// What a write the broker sent for the host was.
+enum Pending {
+    Input {
+        attachment: String,
+        stream_id: String,
+        sequence: u64,
+        process_gen: String,
+    },
+    Prompt(String),
+    Interrupt(String),
+}
+
+/// The broker's view of one session the host knows.
+struct PerSession {
+    /// Registered with the host (an invalid id or generation never is).
+    registered: bool,
+    /// The host input epoch the worker's epoch was last synced to.
+    host_epoch: u64,
+    /// Remote bytes were sent under the worker's current epoch.
+    dirty: bool,
+    /// A lease was held at the last sync.
+    held: bool,
+    state: BrokerState,
+    activity: Option<WorkerActivity>,
+    remote: VecDeque<RemoteWrite>,
+}
+
+struct Conversation {
+    attachment: String,
+    /// Sequence of the next event.
+    next: u64,
+    last_heartbeat: Instant,
+    opened: u64,
+}
+
+#[derive(Default)]
+struct Chats {
+    conversations: HashMap<String, Conversation>,
+    opens: u64,
+}
+
+struct Link {
+    link_gen: u64,
+    attachment: String,
+}
+
+pub struct HostBridge {
+    host: SessionHost<FileJournal>,
+    dir: std::path::PathBuf,
+    clock: Clock,
+    /// The link generation last considered (attached or refused).
+    considered: Option<u64>,
+    link: Option<Link>,
+    last_advance: u64,
+    recovered: bool,
+    seen: HashMap<String, u64>,
+    seen_order: VecDeque<(u64, String)>,
+    per: BTreeMap<String, PerSession>,
+    /// Adopted sessions to register with `restore_session`.
+    restore: HashSet<String>,
+    streams: HashMap<(String, String), FrameStream>,
+    chats: HashMap<String, Chats>,
+    /// request id → (session, conversation) of chat submits.
+    submitters: HashMap<String, (String, String)>,
+    /// Prompts pasted and not reported yet: request id → session.
+    prompts: HashMap<String, String>,
+    /// Interrupts waiting for a turn to end, per session.
+    interrupts: HashMap<String, Vec<String>>,
+    pending: HashMap<(String, u64), Pending>,
+    terminal_out: VecDeque<String>,
+}
+
+/// Where effects go: the link's client and the broker's sessions.
+struct Cx<'a> {
+    client: &'a AstationClient,
+    sessions: &'a mut BTreeMap<SessionId, BrokerSession>,
+}
+
+impl HostBridge {
+    /// Opens the journal in `dir` (one broker per config dir: another
+    /// process holding it is an error), takes the next runtime epoch and
+    /// builds the host under `profile`'s current identity.
+    pub fn open(
+        dir: &Path,
+        profile: Option<&crate::status::Sources>,
+        clock: Clock,
+    ) -> anyhow::Result<Self> {
+        let journal = FileJournal::open(dir).map_err(|e| anyhow::anyhow!(e.0))?;
+        let epoch = next_runtime_epoch(dir)?;
+        let identity = profile.map(start_identity).unwrap_or(Identity {
+            account_id: UNPAIRED.into(),
+            atem_device_id: UNPAIRED.into(),
+            host_trust_gen: 0,
+        });
+        let host = Self::build(journal, &identity, epoch, &clock)?;
+        Ok(Self {
+            host,
+            dir: dir.to_path_buf(),
+            clock,
+            considered: None,
+            link: None,
+            last_advance: 0,
+            recovered: false,
+            seen: HashMap::new(),
+            seen_order: VecDeque::new(),
+            per: BTreeMap::new(),
+            restore: HashSet::new(),
+            streams: HashMap::new(),
+            chats: HashMap::new(),
+            submitters: HashMap::new(),
+            prompts: HashMap::new(),
+            interrupts: HashMap::new(),
+            pending: HashMap::new(),
+            terminal_out: VecDeque::new(),
+        })
+    }
+
+    fn build(
+        journal: FileJournal,
+        identity: &Identity,
+        runtime_epoch: u64,
+        clock: &Clock,
+    ) -> anyhow::Result<SessionHost<FileJournal>> {
+        let ctx = HostContext {
+            account_id: identity.account_id.clone(),
+            atem_device_id: identity.atem_device_id.clone(),
+            host_trust_gen: identity.host_trust_gen,
+            runtime_gen: uuid::Uuid::new_v4().to_string(),
+            runtime_epoch,
+        };
+        let config = HostConfig {
+            wall_offset_ms: wall_ms().saturating_sub(clock.now()),
+            ..HostConfig::default()
+        };
+        SessionHost::new(ctx, config, journal, random_ids()).map_err(|e| anyhow::anyhow!(e.0))
+    }
+
+    /// The attachment holding `session_id`'s lease.
+    pub fn lease_holder(&self, session_id: &str) -> Option<&str> {
+        self.host.lease_holder(session_id)
+    }
+
+    /// An adopted worker's input epoch against the journal (before the
+    /// session is registered): one beyond the reserved block was never
+    /// granted by a broker of this journal, so the session is
+    /// `recovery_required`; below the floor it is raised to it.
+    pub fn check_adoption(&mut self, session: &mut BrokerSession) {
+        let sid = session.id.to_string();
+        if session.is_live() {
+            let floor = self.host.lease_floor(&sid);
+            let hello = session.input_epoch();
+            if hello > floor.saturating_add(LEASE_EPOCH_BLOCK) {
+                session.refuse_adoption("its input epoch is ahead of the journal");
+            } else if floor > hello {
+                let _ = session.raise_input_epoch_to(floor);
+            }
+        }
+        self.restore.insert(sid);
+    }
+
+    /// Local frontend input: revokes any remote lease (a new input epoch,
+    /// sent to the worker first), then writes `bytes` (none for a reclaim).
+    pub fn local_input(
+        &mut self,
+        sid: &SessionId,
+        bytes: Vec<u8>,
+        client: &AstationClient,
+        sessions: &mut BTreeMap<SessionId, BrokerSession>,
+    ) -> anyhow::Result<()> {
+        let mut cx = Cx { client, sessions };
+        if !self.per.get(sid.as_str()).is_some_and(|p| p.registered) {
+            // Not a host session (yet): write as is.
+            if bytes.is_empty() {
+                let session = cx
+                    .sessions
+                    .get_mut(sid)
+                    .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
+                return session.raise_input_epoch().map(|_| ());
+            }
+            let session = cx
+                .sessions
+                .get_mut(sid)
+                .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
+            return session.write(&bytes);
+        }
+        let queued = cx.sessions.get(sid).is_some_and(|s| s.writes_in_flight());
+        if bytes.is_empty()
+            && queued
+            && let Some(per) = self.per.get_mut(sid.as_str())
+        {
+            // A reclaim: control changes explicitly, so whatever is still
+            // queued at the worker (local or remote) is dropped. Only then:
+            // the worker's epoch stays within the journal's reserved block.
+            per.dirty = true;
+        }
+        let effects = self.host.local_input(sid.as_str(), bytes);
+        let mut result = Ok(());
+        for effect in effects {
+            if let Effect::PtyWrite {
+                session_id,
+                bytes,
+                origin: Origin::Local,
+            } = &effect
+            {
+                self.sync_epoch(session_id, &mut cx);
+                if bytes.is_empty() {
+                    continue;
+                }
+                if let Some(session) =
+                    SessionId::parse(session_id).and_then(|id| cx.sessions.get_mut(&id))
+                {
+                    result = session.write(bytes);
+                }
+                continue;
+            }
+            self.exec(vec![effect], &mut cx);
+        }
+        self.sync_all(&mut cx);
+        result
+    }
+
+    /// One pass: the link, the sessions, the messages the App received, what
+    /// the workers reported, timers, writes, frames and chat.
+    pub fn tick(
+        &mut self,
+        app: &mut App,
+        sessions: &mut BTreeMap<SessionId, BrokerSession>,
+        adopting: bool,
+    ) {
+        let client = &app.astation_client;
+        let mut cx = Cx { client, sessions };
+        self.sync_link(app_link(app), &mut cx);
+        self.sync_sessions(&mut cx);
+        if !adopting && !self.recovered {
+            self.recovered = true;
+            let effects = self.host.recover();
+            self.exec(effects, &mut cx);
+        }
+        if !adopting && let Some(hosted) = app.hosted.as_mut() {
+            let inbox: Vec<(u64, String)> = hosted.inbox.drain(..).collect();
+            for (link_gen, text) in inbox {
+                self.receive(link_gen, &text, &mut cx);
+            }
+        }
+        self.worker_reports(&mut cx);
+        let now = self.clock.now();
+        if now >= self.last_advance + ADVANCE_EVERY {
+            self.last_advance = now;
+            let effects = self.host.advance(now);
+            self.exec(effects, &mut cx);
+        }
+        self.sync_all(&mut cx);
+        self.drain_remote(&mut cx);
+        self.frames(&mut cx);
+        self.heartbeats(&mut cx);
+        if let Some(hosted) = app.hosted.as_mut() {
+            hosted.sessions = cx
+                .sessions
+                .values()
+                .filter_map(|s| {
+                    Some(HostedSession {
+                        id: s.id.clone(),
+                        provider: Provider::from_alias(&s.provider)?,
+                        cwd: s.cwd.clone(),
+                        live: s.is_live(),
+                        remote_controlled: self.host.lease_holder(s.id.as_str()).is_some(),
+                        last_used: s.last_used,
+                    })
+                })
+                .collect();
+        }
+    }
+
+    // ── The link ──
+
+    fn sync_link(&mut self, want: Option<u64>, cx: &mut Cx) {
+        if want == self.considered {
+            return;
+        }
+        if let Some(link) = self.link.take() {
+            self.drop_attachment(&link.attachment, cx);
+        }
+        self.considered = want;
+        if want.is_none() {
+            return;
+        }
+        let Some(identity) = link_identity(cx.client) else {
+            eprintln!(
+                "atem runtime: the Astation link is not a verified pairing; no session attachment"
+            );
+            return;
+        };
+        if !self.adopt_identity(&identity, cx) {
+            return;
+        }
+        let attachment = uuid::Uuid::new_v4().to_string();
+        let attach = Attach {
+            client: cx
+                .client
+                .connected_astation_id()
+                .unwrap_or_default()
+                .to_string(),
+            attachment_gen: attachment.clone(),
+            permissions: vec![Permission::View, Permission::Control, Permission::Approve],
+            client_kind: ClientKind::Native,
+            authorization_ms: LINK_AUTHORIZATION_MS,
+        };
+        match self.host.connect(attach) {
+            Ok(effects) => {
+                self.link = Some(Link {
+                    link_gen: want.unwrap_or_default(),
+                    attachment,
+                });
+                self.exec(effects, cx);
+            }
+            Err(error) => eprintln!("atem runtime: session attachment refused: {error}"),
+        }
+    }
+
+    /// The host runs under `identity`: a later trust generation moves it on;
+    /// another account or device restarts the host (new runtime generation
+    /// and epoch) over the same journal. False when the link's trust
+    /// generation is older than the host's.
+    fn adopt_identity(&mut self, identity: &Identity, cx: &mut Cx) -> bool {
+        let ctx = self.host.context().clone();
+        if identity.host_trust_gen < ctx.host_trust_gen {
+            eprintln!("atem runtime: the Astation link's pairing is older than this host's");
+            return false;
+        }
+        if identity.account_id == ctx.account_id && identity.atem_device_id == ctx.atem_device_id {
+            if identity.host_trust_gen > ctx.host_trust_gen {
+                match self.host.change_trust_gen(identity.host_trust_gen) {
+                    Ok(effects) => self.exec(effects, cx),
+                    Err(error) => {
+                        eprintln!("atem runtime: {error}");
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        let epoch = match next_runtime_epoch(&self.dir) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                eprintln!("atem runtime: {error:#}");
+                return false;
+            }
+        };
+        let runtime_gen = uuid::Uuid::new_v4().to_string();
+        match self.host.rebind(
+            &identity.account_id,
+            &identity.atem_device_id,
+            identity.host_trust_gen,
+            &runtime_gen,
+            epoch,
+        ) {
+            Ok(effects) => {
+                // Every attachment, stream and conversation belonged to the old host.
+                self.streams.clear();
+                self.chats.clear();
+                self.submitters.clear();
+                for per in self.per.values_mut() {
+                    per.remote.clear();
+                    per.host_epoch = u64::MAX;
+                }
+                self.exec(effects, cx);
+                self.sync_all(cx);
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "atem runtime: the session host could not take the new identity: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    fn drop_attachment(&mut self, attachment: &str, cx: &mut Cx) {
+        let effects = self.host.disconnect(attachment);
+        self.exec(effects, cx);
+        self.streams.retain(|(att, _), _| att != attachment);
+        for chats in self.chats.values_mut() {
+            chats
+                .conversations
+                .retain(|_, c| c.attachment != attachment);
+        }
+        self.terminal_out.clear();
+        for per in self.per.values_mut() {
+            per.remote.retain(|w| w.attachment != attachment);
+        }
+    }
+
+    fn current(&self, attachment: &str) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|l| l.attachment == attachment)
+    }
+
+    // ── Messages ──
+
+    fn receive(&mut self, link_gen: u64, text: &str, cx: &mut Cx) {
+        let decoded = wire::decode(text.as_bytes());
+        let Some(attachment) = self
+            .link
+            .as_ref()
+            .filter(|l| l.link_gen == link_gen)
+            .map(|l| l.attachment.clone())
+        else {
+            // No attachment for this link (not a verified pairing, or gone).
+            if self.considered == Some(link_gen) {
+                let re = match &decoded {
+                    Ok(Envelope::Session(m)) => Some(m.id.clone()),
+                    Ok(Envelope::Family(_)) => None,
+                    Err(e) => e.id.clone(),
+                };
+                let _ = cx.client.try_send_wire(unauthorized(re), false);
+            }
+            return;
+        };
+        let now = self.clock.now();
+        if let Ok(Envelope::Session(m)) = &decoded
+            && self.duplicate(&m.id, now)
+        {
+            return;
+        }
+        let effects = self.host.receive_decoded(&attachment, decoded, now);
+        self.exec(effects, cx);
+    }
+
+    /// The same session message (`id`) was handled within the window.
+    fn duplicate(&mut self, id: &str, now: u64) -> bool {
+        while let Some((at, old)) = self.seen_order.front() {
+            if now.saturating_sub(*at) < DEDUP_MS {
+                break;
+            }
+            if self.seen.get(old) == Some(at) {
+                self.seen.remove(old);
+            }
+            self.seen_order.pop_front();
+        }
+        if self.seen.contains_key(id) {
+            return true;
+        }
+        self.seen.insert(id.to_string(), now);
+        self.seen_order.push_back((now, id.to_string()));
+        false
+    }
+
+    fn send(&mut self, attachment: &str, message: &Envelope, cx: &mut Cx) {
+        if !self.current(attachment) {
+            return;
+        }
+        let text = String::from_utf8(wire::encode(message)).expect("wire JSON is UTF-8");
+        let terminal = matches!(message, Envelope::Family(f) if f.family == "terminal");
+        if terminal {
+            self.terminal_out.push_back(text);
+            self.flush_terminal(cx);
+        } else {
+            let _ = cx.client.try_send_wire(text, false);
+        }
+    }
+
+    fn flush_terminal(&mut self, cx: &mut Cx) {
+        while let Some(text) = self.terminal_out.front() {
+            if cx.client.try_send_wire(text.clone(), true).is_err() {
+                break;
+            }
+            self.terminal_out.pop_front();
+        }
+    }
+
+    fn send_chat(&self, env: ChatEnvelope, cx: &mut Cx) {
+        let text = serde_json::to_string(&AstationMessage::AgentChat(env))
+            .expect("chat envelopes serialize");
+        let _ = cx.client.try_send_wire(text, false);
+    }
+
+    // ── Effects ──
+
+    fn exec(&mut self, effects: Vec<Effect>, cx: &mut Cx) {
+        for effect in effects {
+            match effect {
+                Effect::Send {
+                    attachment,
+                    message,
+                } => self.send(&attachment, &message, cx),
+                // A fenced attachment of this link's client: already gone.
+                Effect::Close { .. } => {}
+                Effect::PtyWrite {
+                    session_id,
+                    bytes,
+                    origin,
+                } => match origin {
+                    Origin::Local => {
+                        self.sync_epoch(&session_id, cx);
+                        if let Some(session) = session_of(cx, &session_id) {
+                            let _ = session.write(&bytes);
+                        }
+                    }
+                    Origin::Remote {
+                        input_epoch,
+                        attachment,
+                        stream_id,
+                        sequence,
+                    } => {
+                        if let Some(per) = self.per.get_mut(&session_id) {
+                            per.remote.push_back(RemoteWrite {
+                                bytes,
+                                host_epoch: input_epoch,
+                                attachment,
+                                stream_id,
+                                sequence,
+                            });
+                        }
+                    }
+                },
+                Effect::Resize {
+                    session_id,
+                    rows,
+                    cols,
+                } => {
+                    if let Some(session) = session_of(cx, &session_id) {
+                        let _ = session.resize(rows, cols);
+                    }
+                }
+                Effect::Stop { session_id } => {
+                    if let Some(session) = session_of(cx, &session_id) {
+                        let _ = session.stop();
+                    }
+                }
+                Effect::StreamOpened {
+                    attachment,
+                    session_id,
+                    stream_id,
+                } => {
+                    let generation = self
+                        .host
+                        .descriptor_of(&session_id)
+                        .map(|d| d.process_gen)
+                        .unwrap_or_default();
+                    self.streams.insert(
+                        (attachment, session_id.clone()),
+                        FrameStream::new(&session_id, &generation, &stream_id),
+                    );
+                }
+                Effect::StreamClosed {
+                    attachment,
+                    session_id,
+                    stream_id,
+                } => {
+                    let key = (attachment, session_id);
+                    if self
+                        .streams
+                        .get(&key)
+                        .is_some_and(|s| s.stream_id == stream_id)
+                    {
+                        self.streams.remove(&key);
+                    }
+                }
+                Effect::Forward {
+                    attachment,
+                    session_id,
+                    message,
+                } => self.forward(&attachment, &session_id, &message, cx),
+                Effect::Dispatch {
+                    request_id,
+                    target,
+                    kind,
+                    payload,
+                } => {
+                    let report = self.dispatch(&request_id, &target.session_id, kind, &payload, cx);
+                    if let Some(report) = report {
+                        let effects = self.host.dispatch_report(&request_id, report);
+                        self.exec(effects, cx);
+                    }
+                }
+                Effect::Reconcile { request_id, .. } => {
+                    // A broker restart can't tell what an executing request did.
+                    let effects = self
+                        .host
+                        .dispatch_report(&request_id, DispatchReport::Unknown);
+                    self.exec(effects, cx);
+                }
+                Effect::Chat {
+                    attachment,
+                    conversation_id,
+                    session_id,
+                    reply,
+                } => self.chat_reply(&attachment, &conversation_id, &session_id, reply, cx),
+            }
+        }
+    }
+
+    /// Performs a request; `Some` when its outcome is known at once.
+    fn dispatch(
+        &mut self,
+        request_id: &str,
+        sid: &str,
+        kind: ReceiptKind,
+        payload: &Value,
+        cx: &mut Cx,
+    ) -> Option<DispatchReport> {
+        let Some(session) = session_of(cx, sid).filter(|s| s.is_live()) else {
+            return Some(DispatchReport::FailedNoEffect);
+        };
+        match kind {
+            ReceiptKind::Prompt => {
+                let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+                if !session.chat_v1 {
+                    // No chat to observe the turn's end: nothing is typed.
+                    return Some(DispatchReport::FailedNoEffect);
+                }
+                let generation = session.chat.generation().to_string();
+                let input_count = session.input_count;
+                let text =
+                    match session
+                        .chat
+                        .submit(request_id, &generation, text, input_count, false)
+                    {
+                        Ok(text) => text,
+                        Err(_) => return Some(DispatchReport::FailedNoEffect),
+                    };
+                match session.paste(&text) {
+                    Ok(seq) => {
+                        session.chat.mark_pasted(request_id, Instant::now());
+                        self.pending
+                            .insert((sid.to_string(), seq), Pending::Prompt(request_id.into()));
+                        self.prompts.insert(request_id.into(), sid.to_string());
+                        None
+                    }
+                    Err(error) => {
+                        session.chat.paste_failed(request_id, &error.to_string());
+                        Some(DispatchReport::FailedNoEffect)
+                    }
+                }
+            }
+            ReceiptKind::Interrupt => {
+                let state = session.chat.status().state;
+                if session.chat_v1 && !matches!(state, ChatState::Working | ChatState::Waiting) {
+                    return Some(DispatchReport::Completed {
+                        detail: Some(NO_TURN.into()),
+                        turn_id: None,
+                    });
+                }
+                match session.write_tagged(INTERRUPT_KEY, WriteTag::Host) {
+                    Ok(seq) => {
+                        self.pending.insert(
+                            (sid.to_string(), seq),
+                            Pending::Interrupt(request_id.into()),
+                        );
+                        self.interrupts
+                            .entry(sid.to_string())
+                            .or_default()
+                            .push(request_id.into());
+                        None
+                    }
+                    Err(_) => Some(DispatchReport::FailedNoEffect),
+                }
+            }
+            // The exit completes it (`process_exited`).
+            ReceiptKind::Stop => match session.stop() {
+                Ok(()) => None,
+                Err(_) => Some(DispatchReport::FailedNoEffect),
+            },
+            ReceiptKind::Approval => Some(DispatchReport::FailedNoEffect),
+        }
+    }
+
+    // ── Sessions ──
+
+    fn sync_sessions(&mut self, cx: &mut Cx) {
+        let gone: Vec<String> = self
+            .per
+            .keys()
+            .filter(|sid| SessionId::parse(sid).is_none_or(|id| !cx.sessions.contains_key(&id)))
+            .cloned()
+            .collect();
+        for sid in gone {
+            let registered = self.per.remove(&sid).is_some_and(|p| p.registered);
+            if registered {
+                let effects = self.host.remove_session(&sid);
+                self.exec(effects, cx);
+            }
+            self.end_conversations(&sid, RESTARTED, cx);
+            self.streams.retain(|(_, s), _| s != &sid);
+            self.interrupts.remove(&sid);
+        }
+        let ids: Vec<SessionId> = cx.sessions.keys().cloned().collect();
+        for id in ids {
+            let sid = id.to_string();
+            if !self.per.contains_key(&sid) {
+                self.register(&id, cx);
+            }
+            self.sync_state(&id, cx);
+        }
+    }
+
+    fn register(&mut self, id: &SessionId, cx: &mut Cx) {
+        let sid = id.to_string();
+        let session = &cx.sessions[id];
+        let (rows, cols) = session.size();
+        let spec = SessionSpec {
+            session_id: sid.clone(),
+            process_gen: session.process_gen.clone(),
+            provider: session.provider.clone(),
+            cwd_label: session
+                .cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            chat: session.provider == Provider::Claude.as_str(),
+            rows,
+            cols,
+        };
+        let result = if self.restore.remove(&sid) {
+            self.host.restore_session(spec)
+        } else {
+            self.host
+                .add_session(spec.clone())
+                .or_else(|_| self.host.restore_session(spec))
+        };
+        let registered = match result {
+            Ok(effects) => {
+                self.exec(effects, cx);
+                true
+            }
+            Err(error) => {
+                eprintln!("atem runtime: {sid} is not served to Astation: {error}");
+                false
+            }
+        };
+        self.per.insert(
+            sid.clone(),
+            PerSession {
+                registered,
+                host_epoch: self.host.input_epoch(&sid).unwrap_or(0),
+                dirty: false,
+                held: false,
+                state: BrokerState::Running,
+                activity: None,
+                remote: VecDeque::new(),
+            },
+        );
+    }
+
+    /// The session's lifecycle and activity, as the host's registry shows it.
+    fn sync_state(&mut self, id: &SessionId, cx: &mut Cx) {
+        let sid = id.as_str();
+        let session = &cx.sessions[id];
+        let (state, status, activity) =
+            (session.state, session.exit_status.clone(), session.activity);
+        let Some(per) = self.per.get_mut(sid).filter(|p| p.registered) else {
+            return;
+        };
+        if per.state != state {
+            per.state = state;
+            per.remote.clear();
+            let effects = match state {
+                BrokerState::Running => Vec::new(),
+                BrokerState::Exited => self.host.process_exited(sid, status),
+                BrokerState::Interrupted => {
+                    self.host
+                        .process_lost(sid, SessionState::Interrupted, status)
+                }
+                BrokerState::RecoveryRequired => {
+                    self.host
+                        .process_lost(sid, SessionState::RecoveryRequired, status)
+                }
+            };
+            self.interrupts.remove(sid);
+            self.exec(effects, cx);
+            return;
+        }
+        if state == BrokerState::Running && per.activity != Some(activity) {
+            per.activity = Some(activity);
+            if let Ok(effects) = self
+                .host
+                .set_activity(sid, host_activity(activity), wall_ms())
+            {
+                self.exec(effects, cx);
+            }
+        }
+    }
+
+    // ── Input epochs and remote writes ──
+
+    fn sync_all(&mut self, cx: &mut Cx) {
+        let sids: Vec<String> = self.per.keys().cloned().collect();
+        for sid in sids {
+            self.sync_epoch(&sid, cx);
+        }
+    }
+
+    /// The host's input epoch for `sid` moved: if remote bytes may be queued
+    /// at the worker (sent under its current epoch, or a lease was held),
+    /// the worker's epoch is raised before anything else is written.
+    fn sync_epoch(&mut self, sid: &str, cx: &mut Cx) {
+        let Some(host_epoch) = self.host.input_epoch(sid) else {
+            return;
+        };
+        let lease_epoch = self.host.lease_epoch(sid).unwrap_or(0);
+        let holder = self.host.lease_holder(sid).is_some();
+        let Some(per) = self.per.get_mut(sid) else {
+            return;
+        };
+        if per.host_epoch != host_epoch {
+            per.host_epoch = host_epoch;
+            if per.dirty || per.held {
+                per.dirty = false;
+                if let Some(session) = session_of(cx, sid) {
+                    let _ = session.raise_input_epoch_to(lease_epoch);
+                }
+            }
+        }
+        per.held = holder;
+    }
+
+    fn drain_remote(&mut self, cx: &mut Cx) {
+        let now = self.clock.now();
+        let sids: Vec<String> = self
+            .per
+            .iter()
+            .filter(|(_, p)| !p.remote.is_empty())
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in sids {
+            loop {
+                let Some(session) = session_of(cx, &sid) else {
+                    break;
+                };
+                if !session.can_write() {
+                    break;
+                }
+                let process_gen = session.process_gen.clone();
+                let Some(write) = self.per.get_mut(&sid).and_then(|p| p.remote.pop_front()) else {
+                    break;
+                };
+                // The PTY write boundary: the lease that admitted it still holds.
+                let error = if self.host.admit_write(&sid, write.host_epoch, now) {
+                    self.sync_epoch(&sid, cx);
+                    let session = session_of(cx, &sid).expect("checked above");
+                    match session.write_tagged(&write.bytes, WriteTag::Host) {
+                        Ok(seq) => {
+                            if let Some(per) = self.per.get_mut(&sid) {
+                                per.dirty = true;
+                            }
+                            self.pending.insert(
+                                (sid.clone(), seq),
+                                Pending::Input {
+                                    attachment: write.attachment,
+                                    stream_id: write.stream_id,
+                                    sequence: write.sequence,
+                                    process_gen,
+                                },
+                            );
+                            continue;
+                        }
+                        Err(error) => error.to_string(),
+                    }
+                } else {
+                    "control changed; not written".to_string()
+                };
+                self.written(
+                    &write.attachment,
+                    &sid,
+                    &process_gen,
+                    &write.stream_id,
+                    write.sequence,
+                    Some(error),
+                    cx,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn written(
+        &mut self,
+        attachment: &str,
+        sid: &str,
+        generation: &str,
+        stream_id: &str,
+        sequence: u64,
+        error: Option<String>,
+        cx: &mut Cx,
+    ) {
+        if !self.current(attachment) {
+            return;
+        }
+        let message = TerminalMessage::Written {
+            terminal_id: sid.into(),
+            generation: generation.into(),
+            stream_id: stream_id.into(),
+            sequence,
+            error,
+        };
+        self.queue_terminal(message, cx);
+    }
+
+    fn queue_terminal(&mut self, message: TerminalMessage, cx: &mut Cx) {
+        let text = serde_json::to_string(&AstationMessage::Terminal(message.into()))
+            .expect("terminal messages serialize");
+        self.terminal_out.push_back(text);
+        self.flush_terminal(cx);
+    }
+
+    /// What the workers answered and the chat sessions produced.
+    fn worker_reports(&mut self, cx: &mut Cx) {
+        let ids: Vec<SessionId> = cx.sessions.keys().cloned().collect();
+        for id in ids {
+            let sid = id.to_string();
+            let session = cx.sessions.get_mut(&id).expect("listed");
+            let results = session.take_results();
+            let outs = session.take_chat();
+            let reset = session.take_chat_reset();
+            for result in results {
+                self.write_result(&sid, result, cx);
+            }
+            self.chat_outs(&sid, outs, cx);
+            if let Some(reason) = reset {
+                self.end_conversations(&sid, reason, cx);
+            }
+        }
+    }
+
+    fn write_result(&mut self, sid: &str, result: WriteOutcome, cx: &mut Cx) {
+        let Some(pending) = self.pending.remove(&(sid.to_string(), result.seq)) else {
+            return;
+        };
+        let failure = if result.dropped {
+            Some(DispatchReport::FailedNoEffect)
+        } else if !result.ok {
+            Some(DispatchReport::FailedAfterPossibleEffect)
+        } else {
+            None
+        };
+        match pending {
+            Pending::Input {
+                attachment,
+                stream_id,
+                sequence,
+                process_gen,
+            } => {
+                let error = if result.dropped {
+                    Some("control changed; not written".to_string())
+                } else if !result.ok {
+                    Some(result.error.unwrap_or_else(|| "the write failed".into()))
+                } else {
+                    None
+                };
+                self.written(
+                    &attachment,
+                    sid,
+                    &process_gen,
+                    &stream_id,
+                    sequence,
+                    error,
+                    cx,
+                );
+            }
+            Pending::Prompt(request_id) => {
+                if let Some(report) = failure {
+                    self.prompts.remove(&request_id);
+                    if let Some(session) = session_of(cx, sid) {
+                        let reason = result.error.unwrap_or_else(|| "not written".into());
+                        session.chat.paste_failed(&request_id, &reason);
+                    }
+                    let effects = self.host.dispatch_report(&request_id, report);
+                    self.exec(effects, cx);
+                }
+            }
+            Pending::Interrupt(request_id) => {
+                if let Some(report) = failure {
+                    if let Some(waiting) = self.interrupts.get_mut(sid) {
+                        waiting.retain(|r| r != &request_id);
+                    }
+                    let effects = self.host.dispatch_report(&request_id, report);
+                    self.exec(effects, cx);
+                }
+            }
+        }
+    }
+
+    // ── Frames ──
+
+    fn frames(&mut self, cx: &mut Cx) {
+        self.flush_terminal(cx);
+        if !self.terminal_out.is_empty() {
+            if self.terminal_out.len() > TERMINAL_BACKLOG {
+                self.congested(cx);
+            }
+            return;
+        }
+        let keys: Vec<(String, String)> = self.streams.keys().cloned().collect();
+        let mut failed = Vec::new();
+        for key in keys {
+            if !self.current(&key.0) {
+                continue;
+            }
+            let Some(session) = session_of(cx, &key.1) else {
+                continue;
+            };
+            if !session.synced() {
+                continue;
+            }
+            let exit = (session.state != BrokerState::Running).then(|| {
+                session
+                    .exit_status
+                    .clone()
+                    .unwrap_or_else(|| "exited".into())
+            });
+            let stream = self.streams.get_mut(&key).expect("listed");
+            match stream.frames(session.screen(), exit.as_deref()) {
+                Ok(messages) => {
+                    for message in messages {
+                        let text =
+                            serde_json::to_string(&AstationMessage::Terminal(message.into()))
+                                .expect("terminal messages serialize");
+                        self.terminal_out.push_back(text);
+                    }
+                }
+                Err(error) => failed.push((key, error)),
+            }
+        }
+        for (key, error) in failed {
+            if let Some(stream) = self.streams.remove(&key) {
+                self.terminal_error(&key.1, Some(&stream.stream_id), "busy", &error, cx);
+            }
+        }
+        self.flush_terminal(cx);
+        if self.terminal_out.len() > TERMINAL_BACKLOG {
+            self.congested(cx);
+        }
+    }
+
+    /// The terminal transport fell behind: every stream ends (viewers
+    /// subscribe again).
+    fn congested(&mut self, cx: &mut Cx) {
+        self.terminal_out.clear();
+        let streams: Vec<((String, String), FrameStream)> = self.streams.drain().collect();
+        for ((_, sid), stream) in streams {
+            self.terminal_error(
+                &sid,
+                Some(&stream.stream_id),
+                "busy",
+                "Terminal transport congested; subscribe again",
+                cx,
+            );
+        }
+    }
+
+    fn terminal_error(
+        &self,
+        sid: &str,
+        stream_id: Option<&str>,
+        code: &str,
+        message: &str,
+        cx: &mut Cx,
+    ) {
+        let mut data = json!({
+            "v": 1, "op": "error", "terminal_id": sid, "code": code, "message": message,
+        });
+        if let Some(stream_id) = stream_id {
+            data["stream_id"] = Value::String(stream_id.into());
+        }
+        let text = json!({"type": "terminal", "data": data}).to_string();
+        let _ = cx.client.try_send_wire(text, false);
+    }
+
+    // ── chat-v1 ──
+
+    /// An authorized terminal-v1 `ack` or chat-v1 `open`/`close`.
+    fn forward(&mut self, attachment: &str, sid: &str, message: &FamilyMessage, cx: &mut Cx) {
+        let data = message.data.clone().unwrap_or(Value::Null);
+        match message.family.as_str() {
+            "terminal" => {
+                let offset = data.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let key = (attachment.to_string(), sid.to_string());
+                let Some(stream) = self.streams.get_mut(&key) else {
+                    return;
+                };
+                if stream.ack(offset).is_err() {
+                    let stream_id = stream.stream_id.clone();
+                    self.streams.remove(&key);
+                    self.terminal_error(
+                        sid,
+                        Some(&stream_id),
+                        "stale_target",
+                        "Invalid terminal acknowledgement; subscribe again",
+                        cx,
+                    );
+                }
+            }
+            "agentChat" => {
+                let Ok(env) = serde_json::from_value::<ChatEnvelope>(data) else {
+                    return;
+                };
+                let conversation = env.conversation_id.clone();
+                match chat_wire::parse_inbound(&env) {
+                    Ok(Inbound::Open { before }) => self.open_conversation(
+                        attachment,
+                        sid,
+                        &conversation,
+                        before.as_deref(),
+                        cx,
+                    ),
+                    Ok(Inbound::Close) => {
+                        if let Some(chats) = self.chats.get_mut(sid) {
+                            chats.conversations.remove(&conversation);
+                        }
+                    }
+                    Ok(Inbound::Submit { .. }) => {}
+                    Err(text) => {
+                        let env = chat_error(
+                            &conversation,
+                            sid,
+                            None,
+                            None,
+                            "unsupported_version",
+                            &text,
+                        );
+                        self.send_chat(env, cx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_conversation(
+        &mut self,
+        attachment: &str,
+        sid: &str,
+        conversation: &str,
+        before: Option<&str>,
+        cx: &mut Cx,
+    ) {
+        let Some(session) = session_of(cx, sid) else {
+            return;
+        };
+        // An exited agent's history and status stay readable.
+        if !session.chat_v1 && session.state == BrokerState::Running {
+            let text = match &session.chat_reason {
+                Some(reason) => format!("{NOT_AVAILABLE}: {reason}"),
+                None => NOT_AVAILABLE.to_string(),
+            };
+            let env = chat_error(conversation, sid, None, None, "busy", &text);
+            self.send_chat(env, cx);
+            return;
+        }
+        let generation = session.chat.generation().to_string();
+        let mut envelopes = vec![chat_wire::opened(
+            conversation,
+            sid,
+            &generation,
+            session.chat.status(),
+        )];
+        let history = session
+            .chat
+            .history(before, HISTORY_MESSAGES, HISTORY_BYTES);
+        let mut sequence = 1;
+        for message in &history {
+            envelopes.push(chat_wire::history_message(
+                conversation,
+                sid,
+                &generation,
+                sequence,
+                message,
+            ));
+            sequence += 1;
+        }
+        let chats = self.chats.entry(sid.to_string()).or_default();
+        let mut closes = Vec::new();
+        if !chats.conversations.contains_key(conversation)
+            && chats.conversations.len() >= MAX_CONVERSATIONS
+            && let Some(oldest) = chats
+                .conversations
+                .iter()
+                .min_by_key(|(_, c)| c.opened)
+                .map(|(id, _)| id.clone())
+        {
+            chats.conversations.remove(&oldest);
+            closes.push(chat_wire::close(&oldest, sid));
+        }
+        chats.opens += 1;
+        let opened = chats.opens;
+        chats.conversations.insert(
+            conversation.to_string(),
+            Conversation {
+                attachment: attachment.to_string(),
+                next: sequence,
+                last_heartbeat: Instant::now(),
+                opened,
+            },
+        );
+        for env in closes.into_iter().chain(envelopes) {
+            self.send_chat(env, cx);
+        }
+    }
+
+    /// The head of the next event in a conversation (`None` when it isn't open).
+    fn next_head(&mut self, sid: &str, conversation: &str, cx: &mut Cx) -> Option<(String, u64)> {
+        let generation = session_of(cx, sid)?.chat.generation().to_string();
+        let c = self
+            .chats
+            .get_mut(sid)?
+            .conversations
+            .get_mut(conversation)?;
+        let sequence = c.next;
+        c.next += 1;
+        Some((generation, sequence))
+    }
+
+    /// A receipt's state for a chat submit, in chat-v1 terms (§7).
+    fn chat_reply(
+        &mut self,
+        attachment: &str,
+        conversation: &str,
+        sid: &str,
+        reply: ChatReply,
+        cx: &mut Cx,
+    ) {
+        if !self.current(attachment) {
+            return;
+        }
+        let head = self.next_head(sid, conversation, cx);
+        let env = match reply {
+            ChatReply::Accepted { request_id } => {
+                self.submitters
+                    .insert(request_id.clone(), (sid.into(), conversation.into()));
+                let mut body = Map::new();
+                body.insert("requestId".into(), Value::String(request_id));
+                chat_envelope(conversation, sid, "accepted", head, body)
+            }
+            ChatReply::Complete {
+                request_id,
+                turn_id,
+            } => {
+                self.submitters.remove(&request_id);
+                let mut body = Map::new();
+                body.insert("requestId".into(), Value::String(request_id));
+                if let Some(turn_id) = turn_id {
+                    body.insert("turnId".into(), Value::String(turn_id));
+                }
+                body.insert("outcome".into(), Value::String("done".into()));
+                chat_envelope(conversation, sid, "complete", head, body)
+            }
+            ChatReply::Error {
+                request_id,
+                code,
+                text,
+            } => {
+                if let Some(r) = &request_id {
+                    self.submitters.remove(r);
+                }
+                chat_error(conversation, sid, head, request_id.as_deref(), &code, &text)
+            }
+        };
+        self.send_chat(env, cx);
+    }
+
+    /// The chat session's output: to every open conversation, except what
+    /// belongs to a request (its submitter hears about it through its
+    /// receipt); a turn's end completes the prompt and any interrupt.
+    fn chat_outs(&mut self, sid: &str, outs: Vec<Out>, cx: &mut Cx) {
+        for out in outs {
+            let mut except = None;
+            match &out {
+                Out::Accepted { .. } => continue,
+                Out::Error {
+                    request_id: Some(request_id),
+                    ..
+                } => {
+                    if self.prompts.remove(request_id).is_some() {
+                        let effects = self
+                            .host
+                            .dispatch_report(request_id, DispatchReport::Unknown);
+                        self.exec(effects, cx);
+                    }
+                    continue;
+                }
+                Out::Complete {
+                    turn_id,
+                    request_id,
+                    ..
+                } => {
+                    if let Some(request_id) = request_id {
+                        except = self.submitters.get(request_id).map(|(_, c)| c.clone());
+                        if self.prompts.remove(request_id).is_some() {
+                            let report = DispatchReport::Completed {
+                                detail: None,
+                                turn_id: Some(turn_id.clone()),
+                            };
+                            let effects = self.host.dispatch_report(request_id, report);
+                            self.exec(effects, cx);
+                        }
+                    }
+                    self.interrupts_done(sid, cx);
+                }
+                Out::Status(status) if status.state == ChatState::Ready => {
+                    self.interrupts_done(sid, cx);
+                }
+                _ => {}
+            }
+            self.broadcast(sid, &out, except.as_deref(), cx);
+        }
+    }
+
+    fn interrupts_done(&mut self, sid: &str, cx: &mut Cx) {
+        for request_id in self.interrupts.remove(sid).unwrap_or_default() {
+            let report = DispatchReport::Completed {
+                detail: None,
+                turn_id: None,
+            };
+            let effects = self.host.dispatch_report(&request_id, report);
+            self.exec(effects, cx);
+        }
+    }
+
+    fn broadcast(&mut self, sid: &str, out: &Out, except: Option<&str>, cx: &mut Cx) {
+        let ids: Vec<String> = self
+            .chats
+            .get(sid)
+            .map(|c| {
+                c.conversations
+                    .iter()
+                    .filter(|(id, c)| Some(id.as_str()) != except && self.current(&c.attachment))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ids {
+            if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
+                let env = chat_wire::event(&id, sid, &generation, sequence, out);
+                self.send_chat(env, cx);
+            }
+        }
+    }
+
+    /// Tells every open conversation of `sid` why it ends (`error`, `close`).
+    fn end_conversations(&mut self, sid: &str, text: &str, cx: &mut Cx) {
+        let ids: Vec<String> = self
+            .chats
+            .get(sid)
+            .map(|c| c.conversations.keys().cloned().collect())
+            .unwrap_or_default();
+        let error = Out::Error {
+            text: text.to_string(),
+            request_id: None,
+        };
+        for id in ids {
+            let current = self
+                .chats
+                .get(sid)
+                .and_then(|c| c.conversations.get(&id))
+                .is_some_and(|c| self.current(&c.attachment));
+            if current {
+                if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
+                    self.send_chat(
+                        chat_wire::event(&id, sid, &generation, sequence, &error),
+                        cx,
+                    );
+                }
+                self.send_chat(chat_wire::close(&id, sid), cx);
+            }
+        }
+        self.chats.remove(sid);
+    }
+
+    /// Re-sends the status to each conversation that has not had it for 15 s.
+    fn heartbeats(&mut self, cx: &mut Cx) {
+        let due: Vec<(String, String)> = self
+            .chats
+            .iter()
+            .flat_map(|(sid, chats)| {
+                chats
+                    .conversations
+                    .iter()
+                    .filter(|(_, c)| c.last_heartbeat.elapsed() >= HEARTBEAT)
+                    .map(|(id, _)| (sid.clone(), id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (sid, id) in due {
+            let Some(status) = session_of(cx, &sid).map(|s| s.chat.heartbeat()) else {
+                continue;
+            };
+            if let Some(c) = self
+                .chats
+                .get_mut(&sid)
+                .and_then(|c| c.conversations.get_mut(&id))
+            {
+                c.last_heartbeat = Instant::now();
+            }
+            if let Some((generation, sequence)) = self.next_head(&sid, &id, cx) {
+                self.send_chat(
+                    chat_wire::event(&id, &sid, &generation, sequence, &status),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Test access to the host.
+    #[cfg(test)]
+    pub fn host(&self) -> &SessionHost<FileJournal> {
+        &self.host
+    }
+}
+
+/// The link the App holds now: its generation while authenticated.
+fn app_link(app: &App) -> Option<u64> {
+    (app.astation_connected && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
+        .then_some(app.astation_link_gen)
+}
+
+fn session_of<'a>(cx: &'a mut Cx, sid: &str) -> Option<&'a mut BrokerSession> {
+    let id = SessionId::parse(sid)?;
+    cx.sessions.get_mut(&id)
+}
+
+fn chat_envelope(
+    conversation: &str,
+    sid: &str,
+    op: &str,
+    head: Option<(String, u64)>,
+    mut body: Map<String, Value>,
+) -> ChatEnvelope {
+    if let Some((generation, sequence)) = head {
+        body.insert("generation".into(), Value::String(generation));
+        body.insert("sequence".into(), Value::from(sequence));
+    }
+    ChatEnvelope {
+        v: 1,
+        op: op.into(),
+        conversation_id: conversation.into(),
+        agent_id: sid.into(),
+        body,
+    }
+}
+
+/// chat-v1 `error{requestId?, code, text}`.
+fn chat_error(
+    conversation: &str,
+    sid: &str,
+    head: Option<(String, u64)>,
+    request_id: Option<&str>,
+    code: &str,
+    text: &str,
+) -> ChatEnvelope {
+    let mut body = Map::new();
+    if let Some(request_id) = request_id {
+        body.insert("requestId".into(), Value::String(request_id.into()));
+    }
+    body.insert("code".into(), Value::String(code.into()));
+    body.insert("text".into(), Value::String(text.into()));
+    chat_envelope(conversation, sid, "error", head, body)
+}
+
+/// A session `error{code:"unauthorized"}` for a link without an attachment.
+fn unauthorized(re: Option<String>) -> String {
+    use crate::session_protocol::wire::{ErrorCode, Op, SessionMessage};
+    let message = Envelope::Session(SessionMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        re,
+        op: Op::Error {
+            code: ErrorCode::Unauthorized,
+            detail: None,
+        },
+    });
+    String::from_utf8(wire::encode(&message)).expect("wire JSON is UTF-8")
+}
+
+/// Without a session host (its journal could not be opened), session-family
+/// messages are refused as the TUI refuses them.
+pub fn refuse_all(app: &mut App) {
+    let Some(hosted) = app.hosted.as_mut() else {
+        return;
+    };
+    let inbox: Vec<(u64, String)> = hosted.inbox.drain(..).collect();
+    for (_, text) in inbox {
+        let re = match wire::decode(text.as_bytes()) {
+            Ok(Envelope::Session(m)) => Some(m.id),
+            Ok(Envelope::Family(_)) => None,
+            Err(e) => e.id,
+        };
+        let _ = app.astation_client.try_send_wire(refusal(re), false);
+    }
+}
+
+#[cfg(test)]
+#[path = "host_bridge_tests.rs"]
+mod tests;

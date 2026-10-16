@@ -258,7 +258,7 @@ impl Session {
     /// A session without a process yet: a `rows` x `cols` screen, no PTY.
     pub fn new(provider: Provider, rows: u16, cols: u16) -> Self {
         let id = SessionId::new();
-        let share = SharedTerminal::new(id.as_str(), provider.as_str());
+        let share = SharedTerminal::new();
         Self {
             id,
             provider,
@@ -350,6 +350,7 @@ impl Sessions {
     }
 
     /// Creation order.
+    #[cfg(test)]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Session> {
         let mut sessions: Vec<&mut Session> = self.map.values_mut().collect();
         let position = |id: &SessionId| self.order.iter().position(|other| other == id);
@@ -511,14 +512,6 @@ mod tests {
         assert!(text.contains("--x"), "{text}");
         request.env = None;
         assert!(format!("{request:?}").contains("env: <inherited>"));
-    }
-
-    #[test]
-    fn a_session_shares_its_terminal_under_its_own_id() {
-        let s = session(Provider::Codex);
-        assert_eq!(s.share.id, s.id.as_str());
-        let screen = vt100::Parser::new(24, 80, 0);
-        assert_eq!(s.share.info(screen.screen()).provider, "codex");
     }
 
     #[test]

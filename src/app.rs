@@ -1,6 +1,5 @@
 pub(crate) mod chat;
-#[cfg(test)]
-mod chat_tests;
+pub mod hosted;
 mod reauth;
 #[cfg(test)]
 mod session_tests;
@@ -16,7 +15,7 @@ use crossterm::{
 };
 use serde_json::Value;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fs,
     io,
     path::PathBuf,
@@ -67,7 +66,6 @@ pub enum MenuAction {
 
 pub struct App {
     pub last_session_refresh: Option<Instant>,
-    pub terminal_outbox: VecDeque<crate::terminal_share::Message>,
     pub mode: AppMode,
     pub selected_index: usize,
     pub main_menu_items: Vec<String>,
@@ -79,6 +77,13 @@ pub struct App {
     pub status_message: Option<String>,
     pub astation_client: AstationClient,
     pub astation_connected: bool,
+    /// Counts the times the Astation link became authenticated (a connect or
+    /// a re-authentication): the session host gives each one its own attachment.
+    pub astation_link_gen: u64,
+    /// Inside `atem runtime`: the broker's sessions and the session-family
+    /// messages for its session host (see `app/hosted.rs`). `None` in the TUI,
+    /// which refuses remote session, terminal and chat messages.
+    pub hosted: Option<hosted::Hosted>,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,
     /// Launch configuration for Codex sessions.
@@ -127,10 +132,6 @@ pub struct App {
     pub logs_dir: PathBuf,
     /// The session the active main mark task was sent to.
     pub main_task_session: Option<SessionId>,
-    /// chat-v1 envelopes queued while removing sessions (sent by `poll_chat`).
-    pub(crate) chat_outbox: Vec<crate::chat::wire::ChatEnvelope>,
-    /// Sessions started, exited or were removed: `poll_chat` sends the agent list.
-    pub(crate) agent_list_dirty: bool,
 }
 
 impl App {
@@ -138,7 +139,6 @@ impl App {
         let config = crate::config::AtemConfig::load().unwrap_or_default();
         let mut app = Self {
             last_session_refresh: None,
-            terminal_outbox: VecDeque::new(),
             mode: AppMode::MainMenu,
             selected_index: 0,
             main_menu_items: Vec::new(),
@@ -150,6 +150,8 @@ impl App {
             status_message: None,
             astation_client: AstationClient::new(),
             astation_connected: false,
+            astation_link_gen: 0,
+            hosted: None,
             connected_astation_id: None,
             codex_client: CodexClient::new(),
             claude_client: ClaudeClient::new(),
@@ -178,8 +180,6 @@ impl App {
             chat_swept: false,
             logs_dir: Self::default_logs_dir(),
             main_task_session: None,
-            chat_outbox: Vec::new(),
-            agent_list_dirty: false,
         };
         app.rebuild_menu();
         app
@@ -452,7 +452,7 @@ impl App {
     }
 
     /// Start a new session (Claude gets its chat adapter). Registers it (id =
-    /// session id) and sends the agent list when connected. A failed launch
+    /// session id) in the local registry. A failed launch
     /// returns its error and leaves nothing behind.
     pub async fn launch_session(&mut self, req: LaunchRequest) -> Result<SessionId> {
         if let Some(env) = &req.env {
@@ -516,7 +516,6 @@ impl App {
             pty_pid: None,
             capabilities: vec![],
         });
-        self.send_agent_list_if_connected().await;
         self.rebuild_menu();
         Ok(id)
     }
@@ -531,7 +530,7 @@ impl App {
     }
 
     /// Remove sessions that exited `EXITED_KEEP` (10 min) before `now`, with
-    /// their registry entries; Astation hears of it at the next `poll_chat`.
+    /// their registry entries.
     pub fn reap_exited_sessions(&mut self, now: Instant) {
         let due: Vec<SessionId> = self
             .sessions
@@ -543,11 +542,8 @@ impl App {
             return;
         }
         for id in due {
-            let Some(mut session) = self.sessions.remove(&id) else { continue; };
+            if self.sessions.remove(&id).is_none() { continue; }
             self.agent_registry.remove(id.as_str());
-            if let Some(chat) = session.chat.take() {
-                self.end_chat(chat);
-            }
             if self.focused.as_ref() == Some(&id) {
                 self.focused = None;
                 if matches!(self.mode, AppMode::Terminal) {
@@ -556,27 +552,13 @@ impl App {
                 }
             }
         }
-        self.agent_list_dirty = true;
         self.rebuild_menu();
-    }
-
-    /// Tests: launch `provider` in Atem's directory and environment.
-    #[cfg(test)]
-    pub(crate) async fn launch_here(&mut self, provider: Provider) -> Result<SessionId> {
-        let (rows, cols) = self.launch_size();
-        self.launch_session(LaunchRequest::here(provider, Vec::new(), rows, cols)).await
     }
 
     /// Tests: the newest session of `provider`, live or exited.
     #[cfg(test)]
     pub(crate) fn last_session(&self, provider: Provider) -> Option<&Session> {
         self.sessions.iter().filter(|s| s.provider == provider).last()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_session_mut(&mut self, provider: Provider) -> Option<&mut Session> {
-        let id = self.last_session(provider)?.id.clone();
-        self.sessions.get_mut(&id)
     }
 
     /// The session shown by the terminal view, while it is open.
@@ -726,14 +708,12 @@ impl App {
         if let Some(input) = &session.input {
             input.set_remote(false);
         }
-        self.agent_list_dirty = true;
         self.rebuild_menu();
     }
 
     /// The host part of the terminal UI's loop, run by the TUI and by `atem
     /// runtime` every tick: the Astation connection and its messages, every
-    /// session's output, exited-session reaping, chat-v1, terminal-v1 frames
-    /// and mark tasks.
+    /// session's output, exited-session reaping, chat state and mark tasks.
     pub async fn tick_host(&mut self) {
         // Check if background Astation connection has completed
         self.poll_astation_connect();
@@ -745,8 +725,7 @@ impl App {
         self.process_astation_messages().await;
         self.process_sessions_output();
         self.reap_exited_sessions(Instant::now());
-        self.poll_chat().await;
-        self.pump_terminals();
+        self.poll_chat();
 
         // Dispatcher: drain triage verdicts and try to send next task to main
         self.dispatcher.poll_triage_results();
@@ -823,7 +802,6 @@ impl App {
         session.events = None;
         session.exited_at = Some(Instant::now());
         session.waiting_exit = false;
-        self.agent_list_dirty = true;
         self.rebuild_menu();
 
         if was_focused {
@@ -1002,6 +980,7 @@ impl App {
                     self.astation_reconnect_at = None; // Clear any pending retry
                     self.astation_client = client;
                     self.astation_connected = true;
+                    self.astation_link_gen += 1;
                     self.pairing_code = code;
                     self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
@@ -1151,15 +1130,8 @@ impl App {
                     }
                 }
             }
-            AstationMessage::AgentListRequest => {
-                let agents = self.agent_registry.all();
-                let _ = self.astation_client.send_agent_list(agents).await;
-            }
-            AstationMessage::Terminal(envelope) => {
-                self.handle_terminal_message(envelope);
-            }
-            AstationMessage::AgentChat(envelope) => {
-                self.handle_agent_chat(envelope).await;
+            AstationMessage::SessionWire(text) => {
+                self.session_wire(text);
             }
             AstationMessage::VisualizeRequest { session_id, .. } => {
                 // Diagram generation was removed; answer so Astation stops waiting.
@@ -1213,8 +1185,6 @@ impl App {
     /// Marks any paired credential entries for that Astation with `disconnected_at`
     /// so the grace-period logic in `CredentialStore::resolve` can take effect.
     pub fn on_astation_disconnect(&mut self) {
-        self.disconnect_terminals();
-        self.close_chat_conversations();
         if let Some(aid) = self.connected_astation_id.take() {
             let mut store = crate::credentials::CredentialStore::load();
             if let Some(entry) = store.find_paired_mut(&aid) {
@@ -1227,7 +1197,7 @@ impl App {
     // MARK: - Mark Task Processing
 
     /// `<cwd>/.chisel/tasks/<task_id>.json` (a task id is a file name, never a path).
-    fn mark_task_path(cwd: &std::path::Path, task_id: &str) -> Option<PathBuf> {
+    pub(crate) fn mark_task_path(cwd: &std::path::Path, task_id: &str) -> Option<PathBuf> {
         let name = std::path::Path::new(task_id);
         let mut parts = name.components();
         let plain = matches!(
@@ -1239,6 +1209,9 @@ impl App {
 
     /// The live Claude session whose directory has the task (most recently used first).
     pub fn mark_task_session(&self, task_id: &str) -> Option<SessionId> {
+        if let Some(hosted) = &self.hosted {
+            return hosted.mark_task_session(task_id);
+        }
         let mut sessions: Vec<&Session> = self
             .sessions
             .iter()
@@ -1253,10 +1226,11 @@ impl App {
 
     /// Load the task JSON from `session`'s directory and build a WorkItem for it.
     pub fn load_and_build_work_item(&self, task_id: &str, received_at_ms: u64, session: &SessionId) -> Result<WorkItem> {
-        let cwd = self
-            .sessions
-            .get(session)
-            .map(|s| s.cwd.clone())
+        let cwd = match &self.hosted {
+            Some(hosted) => hosted.session(session).map(|s| s.cwd.clone()),
+            None => self.sessions.get(session).map(|s| s.cwd.clone()),
+        };
+        let cwd = cwd
             .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
         let task_path = Self::mark_task_path(&cwd, task_id)
             .ok_or_else(|| anyhow::anyhow!("Invalid task id"))?;
@@ -1283,12 +1257,16 @@ impl App {
         }
         let Some(next) = self.dispatcher.peek_main() else { return; };
         let target = self.work_items.get(next).map(|item| item.session.clone());
-        let controlled = target
-            .as_ref()
-            .and_then(|id| self.sessions.get(id))
-            .filter(|s| s.is_live())
-            .and_then(|s| s.input.as_ref())
-            .is_some_and(|input| input.remote_controlled());
+        let controlled = match (&self.hosted, &target) {
+            // Inside the runtime: a remote lease holder exists.
+            (Some(hosted), Some(id)) => hosted.session(id).is_some_and(|s| s.live && s.remote_controlled),
+            _ => target
+                .as_ref()
+                .and_then(|id| self.sessions.get(id))
+                .filter(|s| s.is_live())
+                .and_then(|s| s.input.as_ref())
+                .is_some_and(|input| input.remote_controlled()),
+        };
         if controlled {
             return;
         }
@@ -1308,7 +1286,11 @@ impl App {
         };
 
         let id = item.session.clone();
-        if !self.sessions.get(&id).is_some_and(|s| s.is_live() && s.input.is_some()) {
+        let live = match &self.hosted {
+            Some(hosted) => hosted.session(&id).is_some_and(|s| s.live),
+            None => self.sessions.get(&id).is_some_and(|s| s.is_live() && s.input.is_some()),
+        };
+        if !live {
             let _ = self
                 .astation_client
                 .send_mark_result(&task_id, false, NO_PROJECT_SESSION)
@@ -1320,6 +1302,14 @@ impl App {
             return;
         }
 
+        if let Some(hosted) = self.hosted.as_mut() {
+            // The broker writes it through the session's worker (local-origin
+            // input: no remote lease exists, and none is revoked).
+            hosted.writes.push((task_id.clone(), id.clone(), format!("{}\n\r", item.prompt)));
+            self.main_task_session = Some(id);
+            self.status_message = Some(format!("\u{1f4cc} Task {} → Claude", task_id));
+            return;
+        }
         self.focused = Some(id.clone());
         self.mode = AppMode::Terminal;
         self.input_text.clear();
@@ -1425,10 +1415,6 @@ impl App {
     }
 
     pub async fn process_astation_messages(&mut self) {
-        // Revoke before draining requests that were queued on a closed transport.
-        if self.astation_connected && self.astation_client.is_ws_closed() {
-            self.disconnect_terminals();
-        }
         // Drain all pending messages (non-blocking try_recv loop)
         let mut message_count = 0;
         while message_count < 32 {

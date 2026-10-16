@@ -322,11 +322,6 @@ pub fn history_message(
     )
 }
 
-/// For errors raised before a session exists: no generation or sequence.
-pub fn error(conv: &str, agent: &str, text: &str, request_id: Option<&str>) -> ChatEnvelope {
-    envelope(conv, agent, "error", None, ErrorBody { text, request_id })
-}
-
 /// Atem ends a conversation: after an `error` saying why, or without one when a
 /// ninth conversation replaces the oldest.
 pub fn close(conv: &str, agent: &str) -> ChatEnvelope {
@@ -582,20 +577,12 @@ mod tests {
     }
 
     #[test]
-    fn history_and_pre_session_error() {
+    fn history_message_is_marked() {
         let v = body(&history_message("c1", "claude", "g", 4, &msg()));
         assert_eq!(v["op"], "message");
         assert_eq!(v["history"], true);
         assert_eq!(v["sequence"], 4);
         assert_eq!(v["messageId"], "m1");
-        assert_eq!(
-            body(&error("c1", "claude", "no chat", Some("r1"))),
-            json!({"v":1,"op":"error","conversationId":"c1","agentId":"claude","text":"no chat","requestId":"r1"})
-        );
-        assert_eq!(
-            body(&error("c1", "claude", "no chat", None)),
-            json!({"v":1,"op":"error","conversationId":"c1","agentId":"claude","text":"no chat"})
-        );
     }
 
     #[test]
