@@ -127,6 +127,8 @@ user sends:
 
 Output: the user watches atem's terminal directly. No down lane.
 
+> **Status:** `agentInput`, `agentPrompt`, `voiceRequest`/`voiceCommand`/`voiceResponse` and `userCommand`/`commandResponse` described below are removed from Atem. Removed in atem-session r6; see designs/protocol/atem-session-v1.md.
+
 ### Current implementation and remaining scope (v1)
 
 | Capability | Status |
@@ -136,6 +138,8 @@ Output: the user watches atem's terminal directly. No down lane.
 | Text instruction → agent stdin | **implemented** in Atem (`agentInput{kind:text}`), focused PTY only |
 | Control keys → agent PTY | **implemented** in Atem (`agentInput{kind:key}`), focused PTY only |
 | `agent_id` (multiple agents per atem) | Field exists, but `handle_agent_input` ignores it; explicit multi-agent routing remains future work |
+
+> **Status:** Removed in atem-session r6; see designs/protocol/atem-session-v1.md (`agentInput`, `agentPrompt`, voice and `userCommand` messages).
 
 ### Message protocol
 
@@ -187,6 +191,8 @@ Existing generic/voice feedback uses `commandResponse`, `voiceResponse`, and
 `handle_agent_input` currently sets local status after enqueueing input; it
 does not provide a correlated remote accepted/written acknowledgement. The
 acknowledgement contract below is proposed.
+
+> **Status:** `handle_agent_input`/`agent_key_to_bytes` are removed. Removed in atem-session r6; see designs/protocol/atem-session-v1.md.
 
 ### Injection semantics (atem side)
 

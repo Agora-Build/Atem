@@ -135,7 +135,7 @@ atem pair / cred / list  ─┘  (same user)    └─ one authenticated Astatio
   connection (local or relay, re-authentication, credential sync, encryption
   messages), the agent registry and agent list, every session's PTY, canonical
   screen and terminal-v1 sharing, the chat-v1 adapters and sessions, mark
-  tasks, voice requests and `AgentInput`/`AgentPrompt` routing. It uses the key
+  tasks, voice requests and `AgentInput`/`AgentPrompt` routing (removed in atem-session r6; see designs/protocol/atem-session-v1.md: voice requests, `AgentInput`/`AgentPrompt`). It uses the key
   agent for keys exactly as `App` does now. Its own paired-token refresh uses
   the current in-process path (no IPC to itself).
 - Without a pairing the runtime runs local-only (sessions and frontends, no
@@ -270,6 +270,7 @@ HTTP-only commands (`atem sync`, `memory`, `skill`, `vault`) are unchanged.
 
 - Agent list: one entry per session (`id` = `session_id`, `name` = provider,
   `kind`, status, `capabilities`); several Claude/Codex entries can exist.
+- Status: the terminal-v1 `sessions`/aliases/`terminal_ids` and the `AgentInput`/`AgentPrompt`/voice routing below are removed in atem-session r6; see designs/protocol/atem-session-v1.md.
 - terminal-v1: `sessions` lists every session with `terminal_id` = session id
   and `provider`. For older Astation builds, `claude` and `codex` stay valid
   aliases for the most recently used live session of that provider. A new

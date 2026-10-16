@@ -53,6 +53,8 @@ installed version of an external agent.
 | Terminal output in `src/app.rs` | Feeds a local vt100 parser and records output | No shared screen snapshots/diffs, revision recovery, or remote resize policy |
 | Existing voice path | Sends transcribed requests to Claude | Selecting the intended Codex/Claude terminal session requires addressed routing |
 
+> **Status:** the `AgentPrompt`, `AgentInput` and voice rows above are removed in atem-session r6; see designs/protocol/atem-session-v1.md.
+
 The baseline's ACP commands (`atem agent list/connect/prompt/probe/visualize`),
 the ACP client and agent detector, and ACP event forwarding to Astation have
 since been removed from Atem.
@@ -553,6 +555,8 @@ an SSO login is not a substitute.
   each CLI invocation and the TUI's `App` state.
 - Extend the agent registry/event abstraction with durable session and turn
   identity, approvals, recovery, and provider capability reporting.
+> **Status:** `AgentPrompt`, `AgentInput` and the voice transcription path are removed in atem-session r6; see designs/protocol/atem-session-v1.md.
+
 - Map existing `AgentPrompt`/`AgentEvent` messages into the runtime, negotiating
   new fields and event types with Astation. Honor the supplied session ID.
 - Keep legacy `AgentInput` for the focused PTY path until explicit addressing

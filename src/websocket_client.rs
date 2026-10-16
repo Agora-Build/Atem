@@ -3,7 +3,6 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::fs;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -656,7 +655,7 @@ impl AstationClient {
     fn remember_astation_relay_code(&self, astation_id: &str) {
         #[cfg(test)]
         if let Some(path) = self.relay_code_path_override.as_deref() {
-            let _ = fs::write(path, astation_id);
+            let _ = std::fs::write(path, astation_id);
             return;
         }
 
@@ -1643,12 +1642,13 @@ fn read_local_bootstrap_token() -> Option<String> {
     read_local_bootstrap_token_from(&path)
 }
 
-#[cfg(unix)]
+/// Used on macOS (the only Astation platform) and by tests.
+#[cfg(all(unix, any(target_os = "macos", test)))]
 fn read_local_bootstrap_token_from(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let mut file = fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -1750,6 +1750,7 @@ fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// A delayed success for a connection whose pairing was replaced (atem
     /// unpair, then atem pair) while the proof was out is not adopted: no

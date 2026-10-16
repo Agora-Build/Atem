@@ -51,11 +51,13 @@ impl TaskQueue {
     }
 
     /// Whether there are pending tasks waiting.
+    #[cfg(test)]
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 
     /// Number of pending tasks.
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
