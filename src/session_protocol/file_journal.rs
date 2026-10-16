@@ -504,14 +504,25 @@ impl FileJournal {
     pub fn open(state_dir: &Path) -> Result<Self, JournalError> {
         private_dir(state_dir)?;
         let lock_path = state_dir.join("journal.lock");
-        let lock = crate::daemon::lock_exclusive_with_pid(&lock_path)
-            .map_err(|e| io_err("cannot lock", &lock_path, e))?
-            .ok_or_else(|| {
-                JournalError(format!(
+        // A process forked by another thread can share the lock's open file
+        // description until its exec closes it (O_CLOEXEC); a broker that has
+        // just exited may still be releasing it. Wait briefly before
+        // concluding that another journal holds the directory.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let lock = loop {
+            if let Some(lock) = crate::daemon::lock_exclusive_with_pid(&lock_path)
+                .map_err(|e| io_err("cannot lock", &lock_path, e))?
+            {
+                break lock;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(JournalError(format!(
                     "{} is used by another process",
                     state_dir.display()
-                ))
-            })?;
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         let logs = state_dir.join("receipts");
         private_dir(&logs)?;
         let mut journal = Self {
