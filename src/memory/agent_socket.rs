@@ -258,7 +258,7 @@ struct CryptedReply {
 /// What to do about a running agent of another protocol version.
 fn version_mismatch(version: u64) -> anyhow::Error {
     anyhow!(
-        "the running key agent speaks protocol v{version}, this atem speaks v{PROTOCOL_VERSION}; check `atem cred status` first (a storage key not yet held by Astation needs `atem cred unlock` from the atem that started the agent), then stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry"
+        "the running key agent speaks protocol v{version}, this atem speaks v{PROTOCOL_VERSION}; check `atem status` first (a storage key not yet held by Astation needs `atem cred unlock` from the atem that started the agent), then stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry"
     )
 }
 
@@ -872,7 +872,7 @@ pub async fn run_key_agent() -> Result<()> {
     };
     let watch = Watch::new(&socket, &paths.agent_socket, ORPHAN_CHECK)?;
     // A key-file error never stops the agent: it starts locked and says why
-    // on `atem cred status` (see KeyAgent::new).
+    // on `atem status` (see KeyAgent::new).
     let agent = KeyAgent::new(paths)?;
     eprintln!(
         "atem key agent (protocol v{PROTOCOL_VERSION}, pid {}) listening on {}",
@@ -1473,7 +1473,7 @@ mod tests {
         let hint = format!("{:#}", older_agent.err().unwrap());
         // Check first that Astation holds the storage key, then stop it.
         let (status, pkill) = (
-            hint.find("atem cred status").expect(&hint),
+            hint.find("atem status").expect(&hint),
             hint.find("pkill").expect(&hint),
         );
         assert!(status < pkill, "{hint}");
@@ -1987,29 +1987,23 @@ mod tests {
     }
 
     #[test]
-    fn cred_status_against_an_old_agent_says_to_stop_it() {
-        use crate::memory::trust::TrustStore;
-        use crate::memory::unlock::{AgentState, agent_state, status_report};
+    fn status_against_an_old_agent_says_to_stop_it() {
         let dir = short_dir();
         let client = KeyAgentClient::at(start_v1_agent(dir.path()));
         assert!(client.is_running());
-        let state = agent_state(Some(&client));
-        let report = status_report(
-            &TrustStore::default(),
-            "astation-1",
-            &state,
-            Some("0a1b2c3d"),
-            None,
-        );
-        // The report is printed, not an error: the mismatch and what to do.
+        let profile = tempfile::tempdir().unwrap();
+        std::fs::write(profile.path().join("device_keys.sealed"), b"{}").unwrap();
+        let src = crate::status::Sources::in_dir(profile.path());
+        let credentials = crate::status::gather_with(&src, Some(&client))
+            .credentials
+            .value;
+        // Shown, not an error: the mismatch and what to do.
         assert!(
-            report.contains("Key agent: not answering (the running key agent speaks protocol v1, this atem speaks v2"),
-            "{report}"
+            credentials.starts_with("unknown (key agent not answering: the running key agent speaks protocol v1, this atem speaks v2"),
+            "{credentials}"
         );
-        assert!(report.contains("pkill"), "{report}");
-        assert!(report.contains("retry"), "{report}");
-        assert!(report.contains("Storage key: 0a1b2c3d"), "{report}");
-        assert!(matches!(agent_state(None), AgentState::NotRunning));
+        assert!(credentials.contains("pkill"), "{credentials}");
+        assert!(credentials.contains("retry"), "{credentials}");
     }
 
     #[test]

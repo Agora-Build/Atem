@@ -1602,19 +1602,24 @@ impl App {
                 astation_id,
                 save_credentials,
             } => {
-                let mut store = crate::credentials::CredentialStore::load();
-                let now = crate::credentials::CredentialEntry::now_secs();
-                store.upsert(crate::credentials::CredentialEntry::new_paired(
-                    access_token,
-                    refresh_token,
-                    expires_at,
-                    login_id.clone(),
-                    astation_id.clone(),
-                    save_credentials,
-                    now,
-                ));
-                if let Err(e) = store.save() {
-                    self.status_message = Some(format!("Failed to save paired credentials: {}", e));
+                // Only for the pairing this connection authenticated under:
+                // never re-creates a pairing removed (or replaced) meanwhile.
+                let saved = self.astation_client.apply_bound(&astation_id, || {
+                    let mut store = crate::credentials::CredentialStore::load();
+                    let now = crate::credentials::CredentialEntry::now_secs();
+                    store.upsert(crate::credentials::CredentialEntry::new_paired(
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                        login_id.clone(),
+                        astation_id.clone(),
+                        save_credentials,
+                        now,
+                    ));
+                    store.save()
+                });
+                if let Err(e) = saved {
+                    self.status_message = Some(format!("Paired credentials not saved: {e:#}"));
                 } else {
                     self.connected_astation_id = Some(astation_id.clone());
                     let preview = login_id.as_deref().unwrap_or("—");

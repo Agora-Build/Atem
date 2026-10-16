@@ -65,7 +65,7 @@ pub struct TrustStore {
     escrow_unanswered: bool,
     /// The home Astation answered an unlock with "denied and revoked": it
     /// dropped this device's storage key, so these keys can never unlock
-    /// again. `atem pair` then sets them aside and verifies with new ones.
+    /// again. `atem unpair` then sets them aside; `atem pair` verifies new ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revoked: Option<RevokedBy>,
     #[serde(default)]
@@ -477,14 +477,14 @@ impl TrustStore {
     pub fn verification_line(&self, astation_id: &str) -> String {
         if let Some(revoked) = &self.revoked {
             return format!(
-                "Verified: revoked by Astation {} ({}); run 'atem pair' to verify this device again",
+                "Verified: revoked by Astation {} ({}); run 'atem unpair', then 'atem pair', to set this device up again",
                 revoked.astation_id,
                 crate::config::format_unix_timestamp_hhmm_pub(revoked.at)
             );
         }
         match self.verified(astation_id) {
             Some(trust) => format!("Verified: yes  (safety code {})", trust.safety_code),
-            None => "Verified: no  (run 'atem pair' to verify this device)".to_string(),
+            None => "Verified: no  (run 'atem pair verify' to verify this device)".to_string(),
         }
     }
 }
@@ -867,7 +867,7 @@ mod tests {
         );
         assert_eq!(
             loaded.verification_line("other"),
-            "Verified: no  (run 'atem pair' to verify this device)"
+            "Verified: no  (run 'atem pair verify' to verify this device)"
         );
         assert_eq!(
             loaded.verification_status(ASTATION),
