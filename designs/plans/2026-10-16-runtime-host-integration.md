@@ -38,6 +38,12 @@ Remove the r6 "removed ops" from `src/app.rs`, `src/app/terminal.rs`, `src/app/c
 
 In `src/runtime/`: the broker owns the Astation connection(s) (local :8080 and relay through the existing client) and drives `SessionHost`: session-v1 hello/welcome (identity from the authenticated socket + `pairing_binding` trust gen), registry from workers, leases, receipts via FileJournal, terminal-v1 frames/input bound to sessions (write effects → worker `write` with epoch; `admit_write` semantics), chat-v1 submit → receipt → paste through the worker, `set_activity` from chat status, `replace_process`/exit from workers, periodic `advance` (100 ms), dedup of identical requests arriving on direct and relay (by message id within a window, and by request_id for submits). Remote connection loss → leases stop renewing; registry per attachment. Tests: in-process broker with fake workers + fake Astation peer.
 
+Worker notes (from Task 3's review):
+- The broker's input epoch for an adopted session starts at max(journal lease-epoch floor, the worker's `hello.input_epoch`). If `hello.input_epoch` exceeds the journal floor by more than the reserved block, adoption is refused and the session is reported `recovery_required`.
+- A revoke without a new grant always sends `set_input_epoch` to the worker, so bytes queued under the revoked epoch are dropped at the write boundary.
+- Never tag a `write`/`paste` with an epoch the broker hasn't granted.
+- An adopted worker whose agent already exited (`hello.exited`, or `exited` later) gets the release `stop` once the broker has recorded the exit, so the worker removes its record and ends.
+
 ### Task 5: Local frontends through the broker
 
 `atem agent launch|attach|list|stop` as broker clients (the earlier step-1 Task 5 design): local input and resize travel to the broker, which revokes remote leases and forwards to the worker; detach keeps the session. Bare `atem` menu launches/attaches through the broker. Binary tests (launch, detach, attach restore, stop, two sessions, broker restart with a surviving worker).

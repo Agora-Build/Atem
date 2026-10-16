@@ -11,7 +11,7 @@
 //! Nothing is ever restarted or replayed.
 
 use super::protocol::LaunchEnv;
-use super::worker::{read_record, socket_dir, workers_dir, write_spec};
+use super::worker::{ANOTHER_BROKER, read_record, socket_dir, workers_dir, write_spec};
 use super::worker_protocol::{
     BrokerMsg, MAX_LINE, WorkerMsg, WorkerRecord, WorkerSpec, decode_worker, encode_broker,
 };
@@ -446,6 +446,17 @@ fn same_process(pid: Option<u32>, start_time: Option<u64>) -> bool {
     }
 }
 
+/// Retries of an adoption refused because another broker is connected.
+const ADOPT_RETRIES: usize = 3;
+const ADOPT_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+async fn connect_record(
+    socket: &Path,
+    expect: &Expect,
+) -> Result<Result<WorkerHandle>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(HELLO_WAIT, WorkerHandle::connect(socket, expect, None)).await
+}
+
 /// The worker record at `path` (session `session_id`), checked and adopted.
 pub async fn adopt_record(path: &Path, session_id: &str) -> Adoption {
     let record = match read_record(path) {
@@ -500,12 +511,18 @@ pub async fn adopt_record(path: &Path, session_id: &str) -> Adoption {
         pid: record.worker_pid,
         start_time: Some(record.start_time),
     };
-    match tokio::time::timeout(
-        HELLO_WAIT,
-        WorkerHandle::connect(&record.socket, &expect, None),
-    )
-    .await
-    {
+    let mut connected = connect_record(&record.socket, &expect).await;
+    // An old broker that is just closing still holds the worker for a moment.
+    for _ in 0..ADOPT_RETRIES {
+        match &connected {
+            Ok(Err(error)) if error.to_string().contains(ANOTHER_BROKER) => {
+                tokio::time::sleep(ADOPT_RETRY_DELAY).await;
+                connected = connect_record(&record.socket, &expect).await;
+            }
+            _ => break,
+        }
+    }
+    match connected {
         Ok(Ok(handle)) => Adoption::Adopted(handle),
         Ok(Err(error)) => Adoption::RecoveryRequired {
             session_id: session_id.into(),

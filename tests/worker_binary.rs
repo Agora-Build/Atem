@@ -183,6 +183,26 @@ impl Broker {
         }
     }
 
+    /// Connects and reads `hello`, connecting again while the worker still
+    /// refuses because the broker before is just closing.
+    fn adopt(socket: &Path) -> (Self, Value) {
+        for _ in 0..20 {
+            let mut broker = Self::connect(socket);
+            let first = broker.recv();
+            if first["op"] == "hello" {
+                return (broker, first);
+            }
+            assert!(
+                first["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("another broker")),
+                "{first}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the worker kept refusing");
+    }
+
     fn send(&mut self, message: Value) {
         let mut message = message;
         message["v"] = json!(1);
@@ -301,7 +321,6 @@ fn a_worker_owns_its_agent_survives_the_broker_and_is_adopted_by_a_new_one() {
 
     // The broker goes away: the worker and its agent keep running.
     drop(broker);
-    std::thread::sleep(Duration::from_millis(300));
     assert!(alive(worker_pid) && alive(agent_pid));
 
     // A real broker adopts it at start; killing that broker leaves both running.
@@ -314,12 +333,10 @@ fn a_worker_owns_its_agent_survives_the_broker_and_is_adopted_by_a_new_one() {
     );
     runtime.kill().unwrap();
     runtime.wait().unwrap();
-    std::thread::sleep(Duration::from_millis(300));
     assert!(alive(worker_pid) && alive(agent_pid));
 
     // Another broker connects: same session and process, the screen restored.
-    let mut broker = Broker::connect(&socket);
-    let hello = broker.recv();
+    let (mut broker, hello) = Broker::adopt(&socket);
     assert_eq!(hello["op"], "hello", "{hello}");
     assert_eq!(hello["session_id"], sid);
     assert_eq!(hello["process_gen"], process_gen);
@@ -342,7 +359,6 @@ fn a_worker_owns_its_agent_survives_the_broker_and_is_adopted_by_a_new_one() {
     assert_eq!(refused["op"], "error");
     drop(second);
     drop(broker);
-    std::thread::sleep(Duration::from_millis(300));
 
     // A forged record (the live worker's pid with another start time) is
     // refused and kept; the genuine one is adopted again.
@@ -375,12 +391,11 @@ fn a_worker_owns_its_agent_survives_the_broker_and_is_adopted_by_a_new_one() {
     let mut runtime = cleanup.children.pop().unwrap();
     runtime.kill().unwrap();
     runtime.wait().unwrap();
-    std::thread::sleep(Duration::from_millis(300));
 
     // The agent exits: the broker hears `exited`, then releases the worker,
     // which exits and removes its record.
-    let mut broker = Broker::connect(&socket);
-    assert_eq!(broker.recv()["op"], "hello");
+    let (mut broker, hello) = Broker::adopt(&socket);
+    assert_eq!(hello["op"], "hello");
     broker.write(3, b"\x04", 5);
     let exited = broker.until(|m, _| m["op"] == "exited").pop().unwrap();
     assert!(exited["status"].is_string(), "{exited}");

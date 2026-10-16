@@ -231,7 +231,6 @@ async fn a_new_broker_adopts_the_worker_after_the_old_one_is_gone() {
     assert!(refused.unwrap_err().to_string().contains("another broker"));
     drop(handle);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         process_start_time(agent).is_some(),
         "the agent keeps running"
@@ -282,7 +281,6 @@ async fn a_record_with_another_start_time_or_session_is_never_adopted() {
     let (running, mut handle) = start().await;
     until(&mut handle, has_output("ready")).await;
     drop(handle);
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let path = record_path(&running.state(), &running.spec.session_id);
     let genuine = running.record();
 
@@ -310,7 +308,6 @@ async fn a_record_with_another_start_time_or_session_is_never_adopted() {
     };
     assert!(reason.contains("serves"), "{reason}");
     drop(adopted);
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // A record naming another session than its file.
     let mut forged = genuine.clone();
@@ -497,4 +494,88 @@ fn records_and_specs_are_private_files() {
     assert!(!text.contains("env"), "{text}");
     assert_eq!(worker::read_spec(&state, &spec.session_id).unwrap(), spec);
     assert!(worker::read_spec(&state, &SessionId::new().to_string()).is_err());
+}
+
+#[tokio::test]
+async fn a_paste_with_control_characters_is_refused_by_the_worker() {
+    let (running, mut handle) = start().await;
+    until(&mut handle, has_output("ready")).await;
+    handle.paste(1, "x\x1b[201~\rinjected", 0).unwrap();
+    let seen = until(&mut handle, |m| {
+        matches!(m, WorkerMsg::WriteResult { seq: 1, .. })
+    })
+    .await;
+    assert!(matches!(
+        seen.last(),
+        Some(WorkerMsg::WriteResult {
+            ok: false,
+            dropped: false,
+            error: Some(_),
+            ..
+        })
+    ));
+    handle.write(2, b"after\r", 0).unwrap();
+    let seen = until(&mut handle, has_output("got:after")).await;
+    assert!(!output_text(&seen).contains("injected"));
+    stop(running, handle).await;
+}
+
+#[tokio::test]
+async fn adoption_waits_out_an_old_broker_that_is_just_closing() {
+    let (running, mut handle) = start().await;
+    until(&mut handle, has_output("ready")).await;
+    // The old broker closes a moment after the new one starts adopting.
+    let closing = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(handle);
+    });
+    let mut adopted = adopt(&running.state()).await;
+    closing.await.unwrap();
+    let Adoption::Adopted(handle) = adopted.remove(0) else {
+        panic!("not adopted: {adopted:?}")
+    };
+    stop(running, handle).await;
+}
+
+#[tokio::test]
+async fn a_silent_connection_does_not_use_up_the_first_connect_window() {
+    let dir = tempfile::Builder::new()
+        .prefix("atem-w")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let sid = SessionId::new();
+    let spec = WorkerSpec {
+        session_id: sid.to_string(),
+        process_gen: uuid::Uuid::new_v4().to_string(),
+        provider: "codex".into(),
+        args: vec!["-c".into(), AGENT.into()],
+        cwd: dir.path().to_path_buf(),
+        rows: 24,
+        cols: 80,
+        socket: dir.path().join("sock").join(format!("{sid}.sock")),
+    };
+    let listener = worker::listen(&spec.socket).unwrap();
+    let options = WorkerOptions {
+        state: dir.path().join("state"),
+        pid: std::process::id(),
+        start_time: process_start_time(std::process::id()).unwrap(),
+        chat_root: dir.path().join("chat"),
+        uid: unsafe { libc::getuid() },
+        first_connect: Duration::from_secs(6),
+        linger: Duration::from_secs(2),
+    };
+    let served = tokio::spawn(worker::serve(spec.clone(), listener, options));
+    // Connects and says nothing, and stays.
+    let _silent = tokio::net::UnixStream::connect(&spec.socket).await.unwrap();
+    let running = Running { dir, spec, served };
+    let env = LaunchEnv(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("CODEX_CLI_BIN".into(), "/bin/sh".into()),
+    ]);
+    let mut handle =
+        WorkerHandle::connect(&running.spec.socket, &running.expect(), Some(Some(env)))
+            .await
+            .unwrap();
+    until(&mut handle, has_output("ready")).await;
+    stop(running, handle).await;
 }

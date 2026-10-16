@@ -193,12 +193,17 @@ pub enum WorkerMsg {
     /// What the chat adapter read since the last `chat`, in the order the
     /// App handles it (events, log, turn ends follow the log), with the
     /// terminal input count at that moment and the adapter's capability.
+    /// At most `worker_chat::BATCH_BYTES` of items; a text over the chat cap
+    /// ends with `… (truncated)`. `gap`: items dropped right before these
+    /// (no broker took them in time), so the history is incomplete.
     Chat {
         events: Vec<AgentEvent>,
         log: Vec<LogItem>,
         input_count: u64,
         chat_v1: bool,
         reason: Option<String>,
+        #[serde(default)]
+        gap: u64,
     },
     Activity {
         state: Activity,
@@ -401,6 +406,7 @@ mod tests {
                 input_count: 2,
                 chat_v1: true,
                 reason: None,
+                gap: 3,
             },
             WorkerMsg::Activity {
                 state: Activity::Working,

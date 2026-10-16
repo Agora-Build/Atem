@@ -209,7 +209,15 @@ impl PtyInput {
 
     /// A bracketed paste plus Enter as one fenced write (not counted as
     /// terminal input, like `send_paste`).
+    /// Control characters other than newline and tab are refused, so no
+    /// writer can end the bracketed paste early or submit early.
     pub fn paste_fenced(&self, text: &str, epoch: u64, sequence: u64) -> Result<()> {
+        if text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            bail!("A paste may hold no control characters other than newline and tab");
+        }
         let mut bytes = Vec::with_capacity(text.len() + 13);
         bytes.extend_from_slice(b"\x1b[200~");
         bytes.extend_from_slice(text.as_bytes());
@@ -639,6 +647,26 @@ mod tests {
         assert_eq!(input.input_count(), 2);
         assert!(input.write_fenced(Vec::new(), 4, 4).is_err());
         assert!(input.write_fenced(vec![0; MAX_FENCED + 1], 4, 4).is_err());
+    }
+
+    #[test]
+    fn a_fenced_paste_refuses_control_characters_but_newline_and_tab() {
+        let (input, mut queued) = PtyInput::test_channel();
+        for bad in [
+            "end\x1b[201~rm -rf ~\r",
+            "a\rb",
+            "\x03",
+            "\u{9b}201~",
+            "\x7f",
+        ] {
+            assert!(input.paste_fenced(bad, 0, 1).is_err(), "{bad:?}");
+        }
+        assert!(queued.try_recv().is_err(), "nothing was queued");
+        input.paste_fenced("line one\n\tline two", 0, 2).unwrap();
+        assert_eq!(
+            queued.try_recv().unwrap(),
+            "\x1b[200~line one\n\tline two\x1b[201~\r"
+        );
     }
 
     #[test]

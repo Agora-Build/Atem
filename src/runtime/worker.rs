@@ -11,6 +11,11 @@
 //! older than its current epoch — checked again at the PTY's write boundary,
 //! so bytes queued before a `set_input_epoch` are dropped too.
 //!
+//! The agent normally dies with its worker: the worker holds the PTY master,
+//! and its close hangs the agent up (SIGHUP). An agent that survives its
+//! worker anyway can't be driven by anyone; adoption reports that session
+//! `recovery_required` (the record names the agent's pid and start time).
+//!
 //! Files (the broker's state dir): `<state>/workers/<sid>.spec.json` (the
 //! broker's request, removed once read), `<sid>.json` (the worker record),
 //! `<sid>.lock` (one worker per session) and `<sid>.log` (its output).
@@ -26,7 +31,6 @@ use crate::pty_session::{FencedOutcome, PtyEvent, PtyHandle, PtyInput, SpawnSpec
 use crate::session::{Provider, SessionId};
 use crate::terminal_share::SharedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -41,8 +45,11 @@ use tokio::sync::mpsc;
 /// Unsent output to the broker before the worker stops sending it and sends
 /// a fresh `screen` once the broker caught up.
 pub const OUTPUT_BACKLOG: usize = 1024 * 1024;
-/// Chat items kept while no broker is connected (the oldest go first).
-const CHAT_BACKLOG: usize = 4096;
+/// How long a new connection has to send `start` before the first broker
+/// is awaited on the next one.
+const HANDSHAKE: Duration = Duration::from_secs(2);
+/// The refusal a second broker gets while one is connected.
+pub const ANOTHER_BROKER: &str = "another broker is connected to this worker";
 /// How often the chat adapter is read.
 const CHAT_POLL: Duration = Duration::from_millis(200);
 
@@ -363,9 +370,8 @@ struct Worker {
     adapter: Option<crate::chat::claude::ClaudeAdapter>,
     chat: ChatSession,
     capabilities: Capabilities,
-    /// Chat batches not yet sent (no broker connected).
-    chat_backlog: VecDeque<(Vec<AgentEvent>, Vec<LogItem>)>,
-    chat_items: usize,
+    /// Chat read and not yet sent (no broker connected).
+    chat_backlog: super::worker_chat::ChatBacklog,
     activity: (Activity, Option<String>),
     exited: Option<String>,
     exit_deadline: Option<Instant>,
@@ -387,7 +393,9 @@ async fn first_broker(
             continue;
         }
         let mut conn = Conn::open(stream);
-        match tokio::time::timeout_at(deadline, conn.rx.recv()).await {
+        // A silent peer gets `HANDSHAKE`, not the whole window.
+        let handshake = deadline.min(tokio::time::Instant::now() + HANDSHAKE);
+        match tokio::time::timeout_at(handshake, conn.rx.recv()).await {
             Ok(Some(Ok(BrokerMsg::Start { env }))) => {
                 return Ok((conn, env.map(|env| env.to_os())));
             }
@@ -396,7 +404,12 @@ async fn first_broker(
             }),
             Ok(Some(Err(text))) => conn.send(&WorkerMsg::Error { text }),
             Ok(None) => {}
-            Err(_) => bail!("no broker started the agent"),
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                bail!("no broker started the agent")
+            }
+            Err(_) => conn.send(&WorkerMsg::Error {
+                text: "no start within the handshake time".into(),
+            }),
         }
         conn.flush().await;
     }
@@ -469,8 +482,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         adapter,
         chat: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
         capabilities: Capabilities::default(),
-        chat_backlog: VecDeque::new(),
-        chat_items: 0,
+        chat_backlog: Default::default(),
         activity: (Activity::Unknown, None),
         exited: None,
         exit_deadline: None,
@@ -579,7 +591,7 @@ impl Worker {
                             return true;
                         }
                         if self.conn.as_ref().is_some_and(|c| !c.tx.is_closed()) {
-                            tokio::spawn(refuse(stream, "another broker is connected to this worker"));
+                            tokio::spawn(refuse(stream, ANOTHER_BROKER));
                         } else {
                             self.connected(Conn::open(stream));
                         }
@@ -831,16 +843,7 @@ impl Worker {
         self.chat.tick(Instant::now());
         let changed = capabilities != self.capabilities;
         self.capabilities = capabilities;
-        if !events.is_empty() || !log.is_empty() {
-            self.chat_items += events.len() + log.len();
-            self.chat_backlog.push_back((events, log));
-            while self.chat_items > CHAT_BACKLOG
-                && let Some((events, log)) = self.chat_backlog.pop_front()
-            {
-                self.chat_items -= events.len() + log.len();
-                eprintln!("atem worker: no broker connected; older chat items were dropped");
-            }
-        }
+        self.chat_backlog.push(events, log, input_count);
         self.flush_chat(changed);
         let (state, detail) = if self.capabilities.chat_v1 {
             let status = self.chat.status();
@@ -861,26 +864,25 @@ impl Worker {
     /// capability) to a connected broker.
     fn flush_chat(&mut self, always: bool) {
         let Some(conn) = &self.conn else { return };
-        let input_count = self.input.input_count();
-        let mut sent = false;
-        while let Some((events, log)) = self.chat_backlog.pop_front() {
-            self.chat_items -= events.len() + log.len();
-            conn.send(&WorkerMsg::Chat {
-                events,
-                log,
-                input_count,
-                chat_v1: self.capabilities.chat_v1,
-                reason: self.capabilities.reason.clone(),
-            });
-            sent = true;
-        }
-        if always && !sent {
+        let chunks = self.chat_backlog.take();
+        if always && chunks.is_empty() {
             conn.send(&WorkerMsg::Chat {
                 events: Vec::new(),
                 log: Vec::new(),
-                input_count,
+                input_count: self.input.input_count(),
                 chat_v1: self.capabilities.chat_v1,
                 reason: self.capabilities.reason.clone(),
+                gap: 0,
+            });
+        }
+        for chunk in chunks {
+            conn.send(&WorkerMsg::Chat {
+                events: chunk.events,
+                log: chunk.log,
+                input_count: chunk.input_count,
+                chat_v1: self.capabilities.chat_v1,
+                reason: self.capabilities.reason.clone(),
+                gap: chunk.gap,
             });
         }
     }

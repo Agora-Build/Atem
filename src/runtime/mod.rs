@@ -13,6 +13,8 @@ pub mod server;
 #[allow(dead_code)]
 pub mod worker;
 #[allow(dead_code)]
+pub mod worker_chat;
+#[allow(dead_code)]
 pub mod worker_protocol;
 
 #[cfg(test)]
