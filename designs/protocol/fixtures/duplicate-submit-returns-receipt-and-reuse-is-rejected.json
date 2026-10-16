@@ -17,7 +17,6 @@
      "control"
     ],
     "holds_lease_epoch": 1,
-    "upgraded": true,
     "client_kind": "native"
    }
   ],
