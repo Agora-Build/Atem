@@ -1,4 +1,4 @@
-//! Several sessions in one App: session ids, launch cwd/env, addressed routing,
+//! Several sessions in one App: session ids, launch cwd/env, terminal addressing,
 //! reaping and per-session logs.
 use super::{App, AppMode};
 use crate::agent_client::AgentKind;
@@ -10,8 +10,6 @@ use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-const NO_CLAUDE: &str = "no Claude session; run `atem agent launch claude`";
 
 /// An App whose agents are `cat`, with chat, logs and chat directories under a
 /// temp dir. Claude gets no chat (its directory can't be created), so it stays `cat`.
@@ -87,7 +85,7 @@ async fn wait_for_screen(app: &mut App, id: &SessionId, text: &str) {
 }
 
 #[tokio::test]
-async fn sessions_have_their_own_ids_in_the_agent_and_terminal_lists() {
+async fn sessions_have_their_own_ids_in_the_agent_list() {
     let (mut app, root) = app();
     let (a, b) = (dir(&root, "a"), dir(&root, "b"));
     let first = app
@@ -124,46 +122,18 @@ async fn sessions_have_their_own_ids_in_the_agent_and_terminal_lists() {
     );
     let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, ["claude-code", "claude-code", "codex"]);
-
-    app.astation_connected = true;
-    app.handle_terminal_message(Message::List.into());
-    let Some(Message::Sessions {
-        sessions,
-        terminal_ids,
-    }) = app.terminal_outbox.pop_front()
-    else {
-        panic!("expected the session list")
-    };
-    assert_eq!(terminal_ids.as_deref(), Some("session"));
-    let listed: Vec<(&str, &str)> = sessions
-        .iter()
-        .map(|s| (s.terminal_id.as_str(), s.provider.as_str()))
-        .collect();
-    assert_eq!(
-        listed,
-        [
-            (first.as_str(), "claude"),
-            (second.as_str(), "claude"),
-            (codex.as_str(), "codex")
-        ]
-    );
 }
 
 #[tokio::test]
-async fn terminal_requests_take_a_session_id_or_the_provider_alias() {
+async fn terminal_requests_take_only_a_session_id() {
     let (mut app, root) = app();
     let a = dir(&root, "a");
     let first = app
         .launch_session(request(Provider::Claude, &a))
         .await
         .unwrap();
-    let second = app
-        .launch_session(request(Provider::Claude, &a))
-        .await
-        .unwrap();
     app.astation_connected = true;
-    let generation =
-        |app: &App, id: &SessionId| app.sessions.get(id).unwrap().share.generation.clone();
+    let generation = app.sessions.get(&first).unwrap().share.generation.clone();
     let subscribe = |app: &mut App, terminal_id: &str, generation: String| {
         app.handle_terminal_message(
             Message::Subscribe {
@@ -175,159 +145,112 @@ async fn terminal_requests_take_a_session_id_or_the_provider_alias() {
         app.terminal_outbox.pop_front().unwrap()
     };
 
-    // By id.
-    let g = generation(&app, &first);
-    let Message::Attached { session, .. } = subscribe(&mut app, first.as_str(), g) else {
+    let Message::Attached { session, .. } = subscribe(&mut app, first.as_str(), generation.clone())
+    else {
         panic!("expected attachment")
     };
     assert_eq!(session.terminal_id, first.as_str());
 
-    // The alias names the most recently used live session; the reply carries its id.
-    app.sessions.get_mut(&first).unwrap().last_used = Instant::now() + Duration::from_secs(5);
-    app.sessions.get_mut(&second).unwrap().last_used = Instant::now() + Duration::from_secs(9);
-    let g = generation(&app, &second);
-    let Message::Attached { session, stream_id } = subscribe(&mut app, "claude", g.clone()) else {
-        panic!("expected attachment")
-    };
-    assert_eq!(session.terminal_id, second.as_str());
-    // Later requests through the alias reach the same session.
-    app.handle_terminal_message(
-        Message::Control {
-            terminal_id: "claude".into(),
-            generation: g,
-            stream_id,
-            take: true,
-        }
-        .into(),
-    );
-    let Some(Message::Controller {
-        terminal_id,
-        lease_id: Some(_),
-        ..
-    }) = app.terminal_outbox.pop_front()
-    else {
-        panic!("expected a lease")
-    };
-    assert_eq!(terminal_id, second.as_str());
-    assert!(
-        app.sessions
-            .get(&second)
-            .unwrap()
-            .input
-            .as_ref()
-            .unwrap()
-            .remote_controlled()
-    );
-    assert!(
-        !app.sessions
-            .get(&first)
-            .unwrap()
-            .input
-            .as_ref()
-            .unwrap()
-            .remote_controlled()
-    );
-
-    for unknown in ["ses-aaaaaaaaaaaa", "codex", "gemini"] {
-        let reply = subscribe(&mut app, unknown, "g".into());
+    // Provider names are not terminal ids.
+    for unknown in ["ses-aaaaaaaaaaaa", "claude", "codex", "gemini"] {
         let Message::Error {
             terminal_id,
             message,
-        } = reply
+        } = subscribe(&mut app, unknown, generation.clone())
         else {
             panic!("expected an error for {unknown}")
         };
         assert_eq!(terminal_id.as_deref(), Some(unknown));
         assert_eq!(message, "Unknown terminal");
     }
+    assert!(app.terminal_outbox.is_empty());
 }
 
 #[tokio::test]
-async fn agent_prompts_reach_the_addressed_session() {
+async fn remote_terminal_mutations_are_refused_without_effect() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
     let (mut app, root) = app();
     let a = dir(&root, "a");
-    let (first, mut first_rx) = test_session(&mut app, Provider::Claude, &a, 1);
-    let (second, mut second_rx) = test_session(&mut app, Provider::Claude, &a, 0);
-    let (codex, mut codex_rx) = test_session(&mut app, Provider::Codex, &a, 2);
-    app.handle_agent_prompt(second.as_str(), "to second").await;
-    app.handle_agent_prompt(codex.as_str(), "to codex").await;
-    app.handle_agent_prompt(first.as_str(), "to first").await;
-    assert_eq!(written(&mut first_rx), "to first\n\r");
-    assert_eq!(written(&mut second_rx), "to second\n\r");
-    assert_eq!(written(&mut codex_rx), "to codex\n\r");
-
-    app.handle_agent_prompt("ses-aaaaaaaaaaaa", "lost").await;
-    assert!(status(&app).contains("Unknown agent"), "{}", status(&app));
-    // Without an id: the most recently used Claude session.
-    app.handle_agent_prompt("", "latest").await;
-    assert_eq!(written(&mut first_rx), "latest\n\r");
-    assert_eq!(written(&mut second_rx) + &written(&mut codex_rx), "");
+    let id = app
+        .launch_session(request(Provider::Codex, &a))
+        .await
+        .unwrap();
+    app.astation_connected = true;
+    let generation = app.sessions.get(&id).unwrap().share.generation.clone();
+    app.handle_terminal_message(
+        Message::Subscribe {
+            terminal_id: id.to_string(),
+            generation: generation.clone(),
+        }
+        .into(),
+    );
+    let Some(Message::Attached { stream_id, .. }) = app.terminal_outbox.pop_front() else {
+        panic!("expected attachment")
+    };
+    let requests = [
+        Message::Input {
+            terminal_id: id.to_string(),
+            generation: generation.clone(),
+            stream_id: stream_id.clone(),
+            sequence: 0,
+            bytes: STANDARD.encode(b"REMOTE\n"),
+        },
+        Message::Resize {
+            terminal_id: id.to_string(),
+            generation: generation.clone(),
+            stream_id: stream_id.clone(),
+            rows: 30,
+            cols: 90,
+        },
+        Message::Stop {
+            terminal_id: id.to_string(),
+            generation: generation.clone(),
+            stream_id: stream_id.clone(),
+        },
+    ];
+    for request in requests {
+        app.handle_terminal_message(request.into());
+        let Some(Message::Error {
+            terminal_id,
+            message,
+        }) = app.terminal_outbox.pop_front()
+        else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(terminal_id.as_deref(), Some(id.as_str()));
+        assert_eq!(message, super::terminal::REMOTE_MUTATION_REFUSED);
+    }
+    // No effect: the viewer stays view-only, nothing was typed, the size is the
+    // local one and the process still answers local input.
+    let session = app.sessions.get(&id).unwrap();
+    assert!(session.share.has_viewer());
+    assert!(!session.input.as_ref().unwrap().remote_controlled());
+    assert_eq!(session.terminal.screen().size(), (24, 80));
+    app.send_data(&id, "local\n");
+    wait_for_screen(&mut app, &id, "local").await;
+    let screen = app.sessions.get(&id).unwrap().terminal.screen().contents();
+    assert!(!screen.contains("REMOTE"), "{screen:?}");
+    assert!(app.sessions.get(&id).unwrap().is_live());
 }
 
-#[tokio::test]
-async fn agent_input_without_an_id_goes_to_the_latest_claude_session_unless_it_has_a_draft() {
-    let root = tempfile::tempdir().unwrap();
-    let mut app = App::new();
-    app.chat_root = root.path().join("run");
-    let a = dir(&root, "a");
-    let (codex, mut codex_rx) = test_session(&mut app, Provider::Codex, &a, 9);
-    app.handle_agent_input(None, "text".into(), Some("hi".into()), None);
-    assert!(status(&app).contains(NO_CLAUDE), "{}", status(&app));
-    assert_eq!(written(&mut codex_rx), "");
-
-    let (older, mut older_rx) = test_session(&mut app, Provider::Claude, &a, 1);
-    let (latest, mut latest_rx) = test_session(&mut app, Provider::Claude, &a, 5);
-    app.handle_agent_input(None, "text".into(), Some("hi".into()), None);
-    assert_eq!(written(&mut latest_rx), "hi\n\r");
-    assert_eq!(written(&mut older_rx), "");
-
-    // An explicit id.
-    app.handle_agent_input(
-        Some(codex.to_string()),
-        "key".into(),
-        None,
-        Some("esc".into()),
-    );
-    assert_eq!(written(&mut codex_rx), "\x1b");
-    app.handle_agent_input(
-        Some(older.to_string()),
-        "key".into(),
-        None,
-        Some("y".into()),
-    );
-    assert_eq!(written(&mut older_rx), "y");
-    app.handle_agent_input(
-        Some("ses-aaaaaaaaaaaa".into()),
-        "key".into(),
-        None,
-        Some("y".into()),
-    );
-    assert!(status(&app).contains("Unknown agent"), "{}", status(&app));
-
-    // With chat: input typed since the last prompt is a draft that legacy input must not submit.
-    let (chat, _) = app.prepare_claude_chat(latest.as_str(), &[]);
-    app.sessions.get_mut(&latest).unwrap().chat = Some(chat.expect("chat prepared"));
-    app.sessions.get_mut(&latest).unwrap().last_used = Instant::now() + Duration::from_secs(60);
-    app.handle_agent_input(None, "text".into(), Some("over a draft".into()), None);
-    assert!(status(&app).contains("unsent input"), "{}", status(&app));
-    assert_eq!(written(&mut latest_rx) + &written(&mut older_rx), "");
-    // Keys are not text: they reach the session even over a draft (a prompt
-    // waiting for y/n or Esc must stay answerable), one after another.
-    app.handle_agent_input(None, "key".into(), None, Some("y".into()));
-    assert_eq!(written(&mut latest_rx), "y");
-    app.handle_agent_input(None, "key".into(), None, Some("esc".into()));
-    assert_eq!(written(&mut latest_rx), "\x1b");
-    app.handle_agent_input(None, "text".into(), Some("still a draft".into()), None);
-    assert!(status(&app).contains("unsent input"), "{}", status(&app));
-    assert_eq!(written(&mut latest_rx) + &written(&mut older_rx), "");
-    // Addressed input is the caller's choice.
-    app.handle_agent_input(
-        Some(latest.to_string()),
-        "key".into(),
-        None,
-        Some("enter".into()),
-    );
-    assert_eq!(written(&mut latest_rx), "\r");
+#[test]
+fn removed_remote_ops_do_not_parse() {
+    for json in [
+        r#"{"type":"agentInput","data":{"kind":"text","text":"hi"}}"#,
+        r#"{"type":"agentPrompt","data":{"agent_id":"ses-aaaaaaaaaaaa","session_id":"s","text":"hi"}}"#,
+        r#"{"type":"userCommand","data":{"command":"ls","context":{}}}"#,
+        r#"{"type":"voiceCommand","data":{"text":"hi","is_final":true}}"#,
+        r#"{"type":"voice_toggle","data":{"active":false}}"#,
+        r#"{"type":"voiceRequest","data":{"session_id":"s","accumulated_text":"hi","relay_url":"https://r"}}"#,
+        r#"{"type":"codexTaskResponse","data":{"output":"o","success":true,"timestamp":"0"}}"#,
+        r#"{"type":"terminal","data":{"v":1,"op":"list"}}"#,
+        r#"{"type":"terminal","data":{"v":1,"op":"control","terminal_id":"ses-aaaaaaaaaaaa","generation":"g","stream_id":"s","take":true}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<AstationMessage>(json).is_err(),
+            "{json} still parses"
+        );
+    }
 }
 
 #[test]
@@ -346,17 +269,6 @@ fn local_paste_counts_as_use_only_when_written() {
     app.terminal_paste("pasted");
     assert!(app.sessions.get(&id).unwrap().last_used > before);
     assert!(written(&mut rx).contains("pasted"));
-}
-
-#[tokio::test]
-async fn voice_and_prompts_never_start_a_session() {
-    let (mut app, _root) = app();
-    app.handle_voice_command("hello", true).await;
-    assert!(status(&app).contains(NO_CLAUDE), "{}", status(&app));
-    app.handle_agent_prompt("", "hello").await;
-    assert!(status(&app).contains(NO_CLAUDE), "{}", status(&app));
-    assert_eq!(app.sessions.iter().count(), 0);
-    assert!(app.agent_registry.all().is_empty());
 }
 
 #[tokio::test]

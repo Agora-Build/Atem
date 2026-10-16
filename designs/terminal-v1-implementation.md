@@ -293,7 +293,7 @@ approval was submitted in these checks.
 
 ### Live provider conversation tests
 
-Opt-in tests in `src/app/terminal/live_tests.rs` launch the installed original
+Opt-in tests (removed with terminal-v1 `control`, atem-session r6) launched the installed original
 CLI using the same session-start methods as `atem agent launch`. A loopback
 WebSocket peer subscribes to the hidden terminal, takes control, sends a paste
 and Enter as separate inputs, renders and acknowledges ANSI frames, and stops

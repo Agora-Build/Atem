@@ -1,6 +1,6 @@
 //! terminal-v1: canonical visible-screen ANSI updates over the authenticated link.
 //! Viewers receive rendered state, never the CLI's terminal queries or hidden buffers.
-use crate::pty_session::{MAX_INPUT, PtyHandle, PtyInput};
+use crate::pty_session::PtyInput;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -25,14 +25,6 @@ impl From<Message> for Envelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Message {
-    List,
-    Sessions {
-        sessions: Vec<SessionInfo>,
-        /// `"session"`: `terminal_id` is a session id (`claude`/`codex` stay
-        /// aliases for the most recently used live session of that provider).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        terminal_ids: Option<String>,
-    },
     Subscribe {
         terminal_id: String,
         generation: String,
@@ -48,17 +40,10 @@ pub enum Message {
         stream_id: String,
         offset: u64,
     },
-    Control {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-        take: bool,
-    },
     Input {
         terminal_id: String,
         generation: String,
         stream_id: String,
-        lease_id: String,
         sequence: u64,
         bytes: String,
     },
@@ -66,7 +51,6 @@ pub enum Message {
         terminal_id: String,
         generation: String,
         stream_id: String,
-        lease_id: String,
         rows: u16,
         cols: u16,
     },
@@ -74,7 +58,6 @@ pub enum Message {
         terminal_id: String,
         generation: String,
         stream_id: String,
-        lease_id: String,
     },
     Attached {
         session: SessionInfo,
@@ -90,12 +73,6 @@ pub enum Message {
         complete: bool,
         rows: u16,
         cols: u16,
-    },
-    Controller {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-        lease_id: Option<String>,
     },
     Written {
         terminal_id: String,
@@ -116,31 +93,16 @@ pub enum Message {
 }
 
 impl Message {
-    /// The terminal a request names (`None` for `list` and replies).
+    /// The terminal a request names (`None` for replies).
     pub fn request_terminal_id(&self) -> Option<&str> {
         match self {
             Message::Subscribe { terminal_id, .. }
             | Message::Unsubscribe { terminal_id, .. }
             | Message::Ack { terminal_id, .. }
-            | Message::Control { terminal_id, .. }
             | Message::Input { terminal_id, .. }
             | Message::Resize { terminal_id, .. }
             | Message::Stop { terminal_id, .. } => Some(terminal_id),
             _ => None,
-        }
-    }
-
-    /// Point a request at `id` (an alias resolved to its session id).
-    pub fn set_request_terminal_id(&mut self, id: &str) {
-        match self {
-            Message::Subscribe { terminal_id, .. }
-            | Message::Unsubscribe { terminal_id, .. }
-            | Message::Ack { terminal_id, .. }
-            | Message::Control { terminal_id, .. }
-            | Message::Input { terminal_id, .. }
-            | Message::Resize { terminal_id, .. }
-            | Message::Stop { terminal_id, .. } => *terminal_id = id.to_string(),
-            _ => {}
         }
     }
 }
@@ -166,9 +128,6 @@ struct Viewer {
     sent: u64,
     acked: u64,
     boundaries: VecDeque<u64>,
-    lease: Option<(String, u64)>,
-    next_input: u64,
-    writes: VecDeque<(u64, u64)>,
 }
 
 /// The whole screen as ANSI: reset, contents, input modes. A terminal of the
@@ -185,7 +144,6 @@ pub struct SharedTerminal {
     pub generation: String,
     provider: String,
     viewer: Option<Viewer>,
-    next_write: u64,
     utf8: Vec<u8>,
     queries: vte::Parser,
     pub exit_status: Option<String>,
@@ -200,7 +158,6 @@ impl SharedTerminal {
             generation: uuid::Uuid::new_v4().to_string(),
             provider: provider.into(),
             viewer: None,
-            next_write: 0,
             utf8: Vec::new(),
             queries: vte::Parser::new(),
             exit_status: None,
@@ -222,6 +179,7 @@ impl SharedTerminal {
         }
     }
 
+    #[cfg(test)]
     pub fn has_viewer(&self) -> bool {
         self.viewer.is_some()
     }
@@ -229,9 +187,6 @@ impl SharedTerminal {
     pub fn exited(&mut self, status: String, input: &PtyInput) {
         self.exit_status = Some(status);
         input.set_remote(false);
-        if let Some(viewer) = &mut self.viewer {
-            viewer.lease = None;
-        }
     }
 
     pub fn disconnect(&mut self, input: &PtyInput) {
@@ -239,25 +194,14 @@ impl SharedTerminal {
         self.viewer = None;
     }
 
-    pub fn reclaim(&mut self, input: &PtyInput) -> Option<Message> {
-        input.set_remote(false);
-        self.viewer.as_mut().map(|v| {
-            v.lease = None;
-            Message::Controller {
-                terminal_id: self.id.clone(),
-                generation: self.generation.clone(),
-                stream_id: v.id.clone(),
-                lease_id: None,
-            }
-        })
-    }
-
+    /// A viewer's request: `subscribe`, `unsubscribe` or `ack`. Viewing never
+    /// changes the session; remote input, resize and stop are not handled
+    /// here (the App refuses them until atem-session v1 grants a lease).
     pub fn handle(
         &mut self,
         message: Message,
-        parser: &mut vt100::Parser,
+        screen: &vt100::Screen,
         input: &PtyInput,
-        handle: &PtyHandle,
     ) -> Result<Vec<Message>, String> {
         let (terminal_id, generation) = match &message {
             Message::Subscribe {
@@ -273,28 +217,8 @@ impl SharedTerminal {
                 terminal_id,
                 generation,
                 ..
-            }
-            | Message::Control {
-                terminal_id,
-                generation,
-                ..
-            }
-            | Message::Input {
-                terminal_id,
-                generation,
-                ..
-            }
-            | Message::Resize {
-                terminal_id,
-                generation,
-                ..
-            }
-            | Message::Stop {
-                terminal_id,
-                generation,
-                ..
             } => (terminal_id, generation),
-            _ => return Err("Expected a terminal request".into()),
+            _ => return Err("Expected a terminal view request".into()),
         };
         if terminal_id != &self.id || generation != &self.generation {
             return Err("Terminal process is no longer available; refresh the session list".into());
@@ -304,7 +228,7 @@ impl SharedTerminal {
             self.exit_sent = false;
             let id = uuid::Uuid::new_v4().to_string();
             let response = Message::Attached {
-                session: self.info(parser.screen()),
+                session: self.info(screen),
                 stream_id: id.clone(),
             };
             self.viewer = Some(Viewer {
@@ -312,36 +236,23 @@ impl SharedTerminal {
                 baseline: None,
                 pending: VecDeque::new(),
                 reset: true,
-                size: parser.screen().size(),
+                size: screen.size(),
                 sent: 0,
                 acked: 0,
                 boundaries: VecDeque::new(),
-                lease: None,
-                next_input: 0,
-                writes: VecDeque::new(),
             });
             return Ok(vec![response]);
         }
         let viewer = self
             .viewer
             .as_mut()
-            .ok_or("Subscribe before controlling a terminal")?;
+            .ok_or("Subscribe to the terminal first")?;
         let stream_id = match &message {
-            Message::Unsubscribe { stream_id, .. }
-            | Message::Ack { stream_id, .. }
-            | Message::Control { stream_id, .. }
-            | Message::Input { stream_id, .. }
-            | Message::Resize { stream_id, .. }
-            | Message::Stop { stream_id, .. } => stream_id,
+            Message::Unsubscribe { stream_id, .. } | Message::Ack { stream_id, .. } => stream_id,
             _ => unreachable!(),
         };
         if stream_id != &viewer.id {
             return Err("Stale terminal stream".into());
-        }
-        if self.exit_status.is_some()
-            && !matches!(message, Message::Ack { .. } | Message::Unsubscribe { .. })
-        {
-            return Err("Terminal process has exited".into());
         }
         match message {
             Message::Unsubscribe { .. } => {
@@ -361,88 +272,8 @@ impl SharedTerminal {
                 viewer.acked = offset;
                 Ok(vec![])
             }
-            Message::Control { take, .. } => {
-                if !take {
-                    return Ok(self.reclaim(input).into_iter().collect());
-                }
-                if viewer.lease.is_none() {
-                    viewer.lease = Some((uuid::Uuid::new_v4().to_string(), input.set_remote(true)));
-                }
-                Ok(vec![Message::Controller {
-                    terminal_id: self.id.clone(),
-                    generation: self.generation.clone(),
-                    stream_id: viewer.id.clone(),
-                    lease_id: viewer.lease.as_ref().map(|l| l.0.clone()),
-                }])
-            }
-            Message::Input {
-                lease_id,
-                sequence,
-                bytes,
-                ..
-            } => {
-                let epoch = Self::lease(viewer, &lease_id)?;
-                if sequence != viewer.next_input {
-                    return Err("Out-of-order or duplicate input; input was not replayed".into());
-                }
-                // Consume the sequence even on a queue rejection. Clients never retry typing.
-                viewer.next_input += 1;
-                if bytes.len() > MAX_INPUT.div_ceil(3) * 4 {
-                    return Err("Input too large".into());
-                }
-                let data = STANDARD.decode(bytes).map_err(|_| "Invalid input base64")?;
-                if viewer.writes.len() >= 64 {
-                    return Err("Too many pending writes".into());
-                }
-                self.next_write += 1;
-                input
-                    .send_remote(data, epoch, self.next_write)
-                    .map_err(|e| e.to_string())?;
-                viewer.writes.push_back((self.next_write, sequence));
-                Ok(vec![])
-            }
-            Message::Resize {
-                lease_id,
-                rows,
-                cols,
-                ..
-            } => {
-                Self::lease(viewer, &lease_id)?;
-                handle.resize(rows, cols).map_err(|e| e.to_string())?;
-                parser.set_size(rows, cols);
-                Ok(vec![])
-            }
-            Message::Stop { lease_id, .. } => {
-                Self::lease(viewer, &lease_id)?;
-                input.set_remote(false);
-                viewer.lease = None;
-                handle.stop().map_err(|e| e.to_string())?;
-                Ok(vec![])
-            }
             _ => unreachable!(),
         }
-    }
-
-    fn lease(viewer: &Viewer, id: &str) -> Result<u64, String> {
-        viewer
-            .lease
-            .as_ref()
-            .filter(|lease| lease.0 == id)
-            .map(|lease| lease.1)
-            .ok_or_else(|| "Take control before sending input, resizing or stopping".into())
-    }
-
-    pub fn written(&mut self, sequence: u64, error: Option<String>) -> Option<Message> {
-        let viewer = self.viewer.as_mut()?;
-        let index = viewer.writes.iter().position(|w| w.0 == sequence)?;
-        let (_, sequence) = viewer.writes.remove(index)?;
-        Some(Message::Written {
-            terminal_id: self.id.clone(),
-            generation: self.generation.clone(),
-            stream_id: viewer.id.clone(),
-            sequence,
-            error,
-        })
     }
 
     /// Only one bounded state transaction is outstanding. A slow viewer skips
@@ -655,32 +486,9 @@ mod tests {
             terminal_id: share.id.clone(),
             generation: share.generation.clone(),
         };
-        let result = share
-            .handle(message, parser, &pty.sender, &pty.resize_handle)
-            .unwrap();
+        let result = share.handle(message, parser.screen(), &pty.sender).unwrap();
         match &result[0] {
             Message::Attached { stream_id, .. } => stream_id.clone(),
-            _ => panic!(),
-        }
-    }
-
-    fn control(
-        share: &mut SharedTerminal,
-        parser: &mut vt100::Parser,
-        pty: &crate::pty_session::PtySession,
-        stream: &str,
-    ) -> String {
-        let message = Message::Control {
-            terminal_id: share.id.clone(),
-            generation: share.generation.clone(),
-            stream_id: stream.into(),
-            take: true,
-        };
-        let result = share
-            .handle(message, parser, &pty.sender, &pty.resize_handle)
-            .unwrap();
-        match &result[0] {
-            Message::Controller { lease_id, .. } => lease_id.clone().unwrap(),
             _ => panic!(),
         }
     }
@@ -723,9 +531,8 @@ mod tests {
                                 stream_id,
                                 offset: offset + bytes.len() as u64,
                             },
-                            host,
+                            host.screen(),
                             &pty.sender,
-                            &pty.resize_handle,
                         )
                         .unwrap();
                 }
@@ -776,7 +583,7 @@ mod tests {
         let (mut share, mut host, pty) = fixture();
         let mut remote = vt100::Parser::new(24, 80, 0);
         host.process(b"main screen\x1b[s\x1b[?1049h\x1b[?2004h\x1b[?1h\x1b[31malt");
-        let stream = subscribe(&mut share, &mut host, &pty);
+        subscribe(&mut share, &mut host, &pty);
         paint(&mut share, &mut host, &mut remote, &pty);
         same_screen(host.screen(), remote.screen());
         for bytes in [
@@ -789,101 +596,51 @@ mod tests {
             paint(&mut share, &mut host, &mut remote, &pty);
             same_screen(host.screen(), remote.screen());
         }
-        let lease = control(&mut share, &mut host, &pty, &stream);
-        share
-            .handle(
-                Message::Resize {
-                    terminal_id: share.id.clone(),
-                    generation: share.generation.clone(),
-                    stream_id: stream,
-                    lease_id: lease,
-                    rows: 30,
-                    cols: 100,
-                },
-                &mut host,
-                &pty.sender,
-                &pty.resize_handle,
-            )
-            .unwrap();
+        host.set_size(30, 100);
         paint(&mut share, &mut host, &mut remote, &pty);
         same_screen(host.screen(), remote.screen());
     }
 
     #[test]
-    fn attach_is_view_only_and_reconnect_rejects_old_lease_and_stream() {
+    fn attach_is_view_only_and_mutations_are_not_handled_here() {
         let (mut share, mut host, pty) = fixture();
         let stream = subscribe(&mut share, &mut host, &pty);
         assert!(!pty.sender.remote_controlled());
-        let input = |stream: String, lease: String| Message::Input {
-            terminal_id: share.id.clone(),
-            generation: share.generation.clone(),
-            stream_id: stream,
-            lease_id: lease,
-            sequence: 0,
-            bytes: STANDARD.encode(b"hello\r"),
-        };
-        let bad = input(stream.clone(), "no-lease".into());
-        assert!(
-            share
-                .handle(bad, &mut host, &pty.sender, &pty.resize_handle)
-                .is_err()
-        );
-        let lease = control(&mut share, &mut host, &pty, &stream);
-        assert!(pty.sender.send("local".into()).is_err());
-        let old = Message::Input {
-            terminal_id: share.id.clone(),
-            generation: share.generation.clone(),
-            stream_id: stream,
-            lease_id: lease,
-            sequence: 0,
-            bytes: STANDARD.encode(b"hello\r"),
-        };
+        for request in [
+            Message::Input {
+                terminal_id: share.id.clone(),
+                generation: share.generation.clone(),
+                stream_id: stream.clone(),
+                sequence: 0,
+                bytes: STANDARD.encode(b"hello\r"),
+            },
+            Message::Resize {
+                terminal_id: share.id.clone(),
+                generation: share.generation.clone(),
+                stream_id: stream.clone(),
+                rows: 30,
+                cols: 100,
+            },
+            Message::Stop {
+                terminal_id: share.id.clone(),
+                generation: share.generation.clone(),
+                stream_id: stream.clone(),
+            },
+        ] {
+            assert!(share.handle(request, host.screen(), &pty.sender).is_err());
+        }
+        assert!(!pty.sender.remote_controlled());
+        assert_eq!(host.screen().size(), (24, 80));
+        // A new subscription replaces the old stream.
         share.disconnect(&pty.sender);
         subscribe(&mut share, &mut host, &pty);
-        assert!(!pty.sender.remote_controlled());
-        assert!(
-            share
-                .handle(old, &mut host, &pty.sender, &pty.resize_handle)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn no_input_replay_and_reclaim_revokes_permission() {
-        let (mut share, mut host, pty) = fixture();
-        let stream = subscribe(&mut share, &mut host, &pty);
-        let lease = control(&mut share, &mut host, &pty, &stream);
-        let input = Message::Input {
-            terminal_id: share.id.clone(),
-            generation: share.generation.clone(),
-            stream_id: stream.clone(),
-            lease_id: lease.clone(),
-            sequence: 0,
-            bytes: STANDARD.encode(b"typed once\r"),
-        };
-        share
-            .handle(input.clone(), &mut host, &pty.sender, &pty.resize_handle)
-            .unwrap();
-        assert!(
-            share
-                .handle(input, &mut host, &pty.sender, &pty.resize_handle)
-                .is_err()
-        );
-        share.reclaim(&pty.sender);
-        let input = Message::Input {
+        let stale = Message::Unsubscribe {
             terminal_id: share.id.clone(),
             generation: share.generation.clone(),
             stream_id: stream,
-            lease_id: lease,
-            sequence: 1,
-            bytes: STANDARD.encode(b"stale\r"),
         };
-        assert!(
-            share
-                .handle(input, &mut host, &pty.sender, &pty.resize_handle)
-                .is_err()
-        );
-        assert!(!pty.sender.remote_controlled());
+        assert!(share.handle(stale, host.screen(), &pty.sender).is_err());
+        assert!(share.has_viewer());
     }
 
     #[test]
@@ -896,9 +653,8 @@ mod tests {
                         terminal_id: share.id.clone(),
                         generation: "old-process".into()
                     },
-                    &mut host,
-                    &pty.sender,
-                    &pty.resize_handle
+                    host.screen(),
+                    &pty.sender
                 )
                 .is_err()
         );
@@ -913,9 +669,8 @@ mod tests {
                         stream_id: stream,
                         offset: 9999999
                     },
-                    &mut host,
-                    &pty.sender,
-                    &pty.resize_handle
+                    host.screen(),
+                    &pty.sender
                 )
                 .is_err()
         );
@@ -966,9 +721,8 @@ mod tests {
                             stream_id,
                             offset: offset + bytes.len() as u64,
                         },
-                        &mut host,
+                        host.screen(),
                         &pty.sender,
-                        &pty.resize_handle,
                     )
                     .unwrap();
             }
@@ -995,9 +749,8 @@ mod tests {
                     stream_id: viewer.id.clone(),
                     offset: viewer.sent,
                 },
-                &mut host,
+                host.screen(),
                 &pty.sender,
-                &pty.resize_handle,
             )
             .unwrap();
         assert!(matches!(
@@ -1013,34 +766,19 @@ mod tests {
 
     #[test]
     fn wire_envelope_is_versioned_and_relay_compatible() {
-        let outer = crate::websocket_client::AstationMessage::Terminal(Message::List.into());
+        let outer = crate::websocket_client::AstationMessage::Terminal(
+            Message::Subscribe {
+                terminal_id: "ses-abcdefgh2345".into(),
+                generation: "g".into(),
+            }
+            .into(),
+        );
         let json = serde_json::to_value(outer).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"type":"terminal","data":{"v":1,"op":"list"}})
+            serde_json::json!({"type":"terminal","data":{
+                "v":1,"op":"subscribe","terminal_id":"ses-abcdefgh2345","generation":"g"}})
         );
         serde_json::from_value::<crate::websocket_client::AstationMessage>(json).unwrap();
-    }
-
-    #[test]
-    fn sessions_say_terminal_ids_are_session_ids_and_parse_without_it() {
-        let (share, parser, _pty) = fixture();
-        let message = Message::Sessions {
-            sessions: vec![share.info(parser.screen())],
-            terminal_ids: Some("session".into()),
-        };
-        let json = serde_json::to_value(Envelope::from(message)).unwrap();
-        assert_eq!(json["op"], "sessions");
-        assert_eq!(json["terminal_ids"], "session");
-        assert_eq!(json["sessions"][0]["terminal_id"], "ses-abcdefgh2345");
-        assert_eq!(json["sessions"][0]["provider"], "codex");
-        // An older peer's list (no terminal_ids) still parses.
-        let old = serde_json::json!({"v": 1, "op": "sessions", "sessions": []});
-        let Message::Sessions { terminal_ids, .. } =
-            serde_json::from_value::<Envelope>(old).unwrap().message
-        else {
-            panic!("expected sessions")
-        };
-        assert_eq!(terminal_ids, None);
     }
 }

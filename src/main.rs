@@ -19,7 +19,6 @@ mod convo_test_server;
 mod convo_wizard;
 mod credentials;
 mod repl;
-mod rtm_client;
 mod time_sync;
 mod token;
 mod tui;

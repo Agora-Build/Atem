@@ -4,7 +4,6 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -102,33 +101,6 @@ pub enum AstationMessage {
         timestamp: String,
     },
 
-    #[serde(rename = "userCommand")]
-    UserCommand {
-        command: String,
-        context: std::collections::HashMap<String, String>,
-    },
-
-    #[serde(rename = "commandResponse")]
-    CommandResponse {
-        output: String,
-        success: bool,
-        timestamp: String,
-    },
-
-    #[serde(rename = "codexTaskRequest")]
-    CodexTaskRequest {
-        prompt: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context: Option<std::collections::HashMap<String, String>>,
-    },
-
-    #[serde(rename = "codexTaskResponse")]
-    CodexTaskResponse {
-        output: String,
-        success: bool,
-        timestamp: String,
-    },
-
     #[serde(rename = "statusUpdate")]
     StatusUpdate {
         status: String,
@@ -166,22 +138,11 @@ pub enum AstationMessage {
     #[serde(rename = "pong")]
     Pong { timestamp: String },
 
-    #[serde(rename = "voice_toggle")]
-    VoiceToggle { active: bool },
-
     #[serde(rename = "video_toggle")]
     VideoToggle { active: bool },
 
     #[serde(rename = "atem_instance_list")]
     AtemInstanceList { instances: Vec<AtemInstance> },
-
-    #[serde(rename = "voiceCommand")]
-    VoiceCommand {
-        text: String,
-        /// true = final chunk (trigger word detected by sender), false = partial
-        #[serde(default)]
-        is_final: bool,
-    },
 
     #[serde(rename = "markTaskAssignment")]
     MarkTaskAssignment {
@@ -217,14 +178,6 @@ pub enum AstationMessage {
         agents: Vec<crate::agent_client::AgentInfo>,
     },
 
-    /// Astation → Atem: send a text prompt to a specific agent.
-    #[serde(rename = "agentPrompt")]
-    AgentPrompt {
-        agent_id: String,
-        session_id: String,
-        text: String,
-    },
-
     /// Atem → Astation: a streaming event from an agent.
     ///
     /// `event_type` is one of: `"text_delta"`, `"tool_call"`,
@@ -245,36 +198,6 @@ pub enum AstationMessage {
     AgentStatusUpdate {
         agent_id: String,
         status: crate::agent_client::AgentStatus,
-    },
-
-    /// Astation → Atem: voice coding request with accumulated transcription.
-    #[serde(rename = "voiceRequest")]
-    VoiceRequest {
-        session_id: String,
-        accumulated_text: String,
-        relay_url: String,
-    },
-
-    /// Astation → Atem (remote agent control v1): text or a control key to write
-    /// to the focused agent's PTY. `agent_id` is optional (v1 = focused/only
-    /// agent). Wire shape: `{type:"agentInput", data:{agentId?, kind, text?, key?}}`.
-    #[serde(rename = "agentInput")]
-    AgentInput {
-        #[serde(rename = "agentId", default, skip_serializing_if = "Option::is_none")]
-        agent_id: Option<String>,
-        kind: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        key: Option<String>,
-    },
-
-    /// Atem → Astation: voice coding response confirmation.
-    #[serde(rename = "voiceResponse")]
-    VoiceResponse {
-        session_id: String,
-        success: bool,
-        message: String,
     },
 
     /// Astation → Atem: request to generate a visual diagram. Diagram
@@ -1492,20 +1415,6 @@ impl AstationClient {
         self.send_message(msg).await
     }
 
-    pub async fn send_voice_response(
-        &self,
-        session_id: &str,
-        success: bool,
-        message: &str,
-    ) -> Result<()> {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: session_id.to_string(),
-            success,
-            message: message.to_string(),
-        };
-        self.send_message(msg).await
-    }
-
     pub async fn send_visualize_result(
         &self,
         session_id: &str,
@@ -1520,24 +1429,6 @@ impl AstationClient {
             file_path,
         };
         self.send_message(msg).await
-    }
-
-    pub async fn send_command_response(
-        &self,
-        output: &str,
-        success: bool,
-    ) -> Result<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        let message = AstationMessage::CommandResponse {
-            output: output.to_string(),
-            success,
-            timestamp,
-        };
-        self.send_message(message).await
     }
 
     /// Reply to an `agentListRequest` with all currently registered agents.
@@ -1944,7 +1835,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            socket.send(Message::Text(r#"{"type":"terminal","data":{"v":1,"op":"list"}}"#.into())).await.unwrap();
+            socket.send(Message::Text(r#"{"type":"terminal","data":{"v":1,"op":"subscribe","terminal_id":"ses-aaaaaaaaaaaa","generation":"g"}}"#.into())).await.unwrap();
             socket.close(None).await.unwrap();
         });
         let mut client = AstationClient::new();
@@ -2859,26 +2750,6 @@ mod tests {
     }
 
     #[test]
-    fn command_response_roundtrip() {
-        let msg = AstationMessage::CommandResponse {
-            output: "hello world".into(),
-            success: true,
-            timestamp: "1000".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::CommandResponse {
-            output, success, ..
-        } = parsed
-        {
-            assert_eq!(output, "hello world");
-            assert!(success);
-        } else {
-            panic!("expected CommandResponse");
-        }
-    }
-
-    #[test]
     fn heartbeat_roundtrip() {
         let msg = AstationMessage::Heartbeat {
             timestamp: "555".into(),
@@ -2922,23 +2793,6 @@ mod tests {
             assert_eq!(status.projects, 5);
         } else {
             panic!("expected SystemStatusResponse");
-        }
-    }
-
-    #[test]
-    fn codex_task_request_without_context() {
-        let msg = AstationMessage::CodexTaskRequest {
-            prompt: "write a test".into(),
-            context: None,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(!json.contains("context"));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::CodexTaskRequest { prompt, context } = parsed {
-            assert_eq!(prompt, "write a test");
-            assert!(context.is_none());
-        } else {
-            panic!("expected CodexTaskRequest");
         }
     }
 
@@ -3004,44 +2858,6 @@ mod tests {
         let json = r#"{"type":"unknownMessageType","data":{}}"#;
         let result = serde_json::from_str::<AstationMessage>(json);
         assert!(result.is_err());
-    }
-
-    // --- VoiceToggle tests ---
-
-    #[test]
-    fn voice_toggle_roundtrip() {
-        let msg = AstationMessage::VoiceToggle { active: true };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voice_toggle""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceToggle { active } = parsed {
-            assert!(active);
-        } else {
-            panic!("expected VoiceToggle");
-        }
-    }
-
-    #[test]
-    fn voice_toggle_false_roundtrip() {
-        let msg = AstationMessage::VoiceToggle { active: false };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceToggle { active } = parsed {
-            assert!(!active);
-        } else {
-            panic!("expected VoiceToggle");
-        }
-    }
-
-    #[test]
-    fn deserialize_voice_toggle_from_json() {
-        let json = r#"{"type":"voice_toggle","data":{"active":true}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceToggle { active } = msg {
-            assert!(active);
-        } else {
-            panic!("expected VoiceToggle");
-        }
     }
 
     // --- VideoToggle tests ---
@@ -3157,66 +2973,6 @@ mod tests {
         assert!(json.contains("false"));
     }
 
-    // --- VoiceCommand tests ---
-
-    #[test]
-    fn voice_command_roundtrip() {
-        let msg = AstationMessage::VoiceCommand {
-            text: "fix the login page".into(),
-            is_final: false,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voiceCommand""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = parsed {
-            assert_eq!(text, "fix the login page");
-            assert!(!is_final);
-        } else {
-            panic!("expected VoiceCommand");
-        }
-    }
-
-    #[test]
-    fn voice_command_final_roundtrip() {
-        let msg = AstationMessage::VoiceCommand {
-            text: "execute".into(),
-            is_final: true,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = parsed {
-            assert_eq!(text, "execute");
-            assert!(is_final);
-        } else {
-            panic!("expected VoiceCommand");
-        }
-    }
-
-    #[test]
-    fn deserialize_voice_command_from_json() {
-        let json = r#"{"type":"voiceCommand","data":{"text":"add a button","is_final":false}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = msg {
-            assert_eq!(text, "add a button");
-            assert!(!is_final);
-        } else {
-            panic!("expected VoiceCommand");
-        }
-    }
-
-    #[test]
-    fn deserialize_voice_command_without_is_final() {
-        // is_final should default to false when missing
-        let json = r#"{"type":"voiceCommand","data":{"text":"hello world"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = msg {
-            assert_eq!(text, "hello world");
-            assert!(!is_final);
-        } else {
-            panic!("expected VoiceCommand");
-        }
-    }
-
     // --- MarkTaskAssignment / MarkTaskResult tests ---
 
     #[test]
@@ -3281,117 +3037,6 @@ mod tests {
         }
     }
 
-    // --- UserCommand tests ---
-
-    #[test]
-    fn test_user_command_roundtrip() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "cli_input".to_string());
-        context.insert("source".to_string(), "voice".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "fix the bug".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "fix the bug");
-            assert_eq!(context.get("action").unwrap(), "cli_input");
-            assert_eq!(context.get("source").unwrap(), "voice");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_cli_input_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "cli_input".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "refactor the module".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "refactor the module");
-            assert_eq!(context.get("action").unwrap(), "cli_input");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_shell_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "shell".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "ls -la".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "ls -la");
-            assert_eq!(context.get("action").unwrap(), "shell");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_claude_input_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "claude_input".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "explain this code".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "explain this code");
-            assert_eq!(context.get("action").unwrap(), "claude_input");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_codex_input_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "codex_input".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "write a test".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "write a test");
-            assert_eq!(context.get("action").unwrap(), "codex_input");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_empty_context() {
-        let context = std::collections::HashMap::new();
-        let msg = AstationMessage::UserCommand {
-            command: "hello".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "hello");
-            assert!(context.is_empty());
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
     // ── Agent hub message tests ───────────────────────────────────────────
 
     fn make_agent_info(id: &str) -> crate::agent_client::AgentInfo {
@@ -3444,29 +3089,6 @@ mod tests {
             assert!(agents.is_empty());
         } else {
             panic!("expected AgentListResponse");
-        }
-    }
-
-    #[test]
-    fn agent_prompt_roundtrip() {
-        let msg = AstationMessage::AgentPrompt {
-            agent_id: "agent-1".into(),
-            session_id: "sess-1".into(),
-            text: "write a unit test".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentPrompt {
-            agent_id,
-            session_id,
-            text,
-        } = parsed
-        {
-            assert_eq!(agent_id, "agent-1");
-            assert_eq!(session_id, "sess-1");
-            assert_eq!(text, "write a unit test");
-        } else {
-            panic!("expected AgentPrompt");
         }
     }
 
@@ -3623,167 +3245,6 @@ mod tests {
         match msg {
             AstationMessage::CredentialSync { login_id, .. } => assert!(login_id.is_none()),
             _ => panic!("expected CredentialSync"),
-        }
-    }
-
-    // ── VoiceRequest / VoiceResponse tests ─────────────────────────────
-
-    #[test]
-    fn voice_request_deserialize() {
-        let json = r#"{"type":"voiceRequest","data":{"session_id":"sess-abc","accumulated_text":"fix the login bug","relay_url":"https://station.agora.build"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceRequest {
-            session_id,
-            accumulated_text,
-            relay_url,
-        } = msg
-        {
-            assert_eq!(session_id, "sess-abc");
-            assert_eq!(accumulated_text, "fix the login bug");
-            assert_eq!(relay_url, "https://station.agora.build");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_request_roundtrip() {
-        let msg = AstationMessage::VoiceRequest {
-            session_id: "sess-1".into(),
-            accumulated_text: "add a button".into(),
-            relay_url: "https://relay.example.com".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voiceRequest""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceRequest {
-            session_id,
-            accumulated_text,
-            relay_url,
-        } = parsed
-        {
-            assert_eq!(session_id, "sess-1");
-            assert_eq!(accumulated_text, "add a button");
-            assert_eq!(relay_url, "https://relay.example.com");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_response_serialize() {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: "sess-1".into(),
-            success: true,
-            message: "Response delivered".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voiceResponse""#));
-        assert!(json.contains(r#""session_id":"sess-1""#));
-        assert!(json.contains(r#""success":true"#));
-        assert!(json.contains("Response delivered"));
-    }
-
-    #[test]
-    fn voice_response_roundtrip() {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: "sess-2".into(),
-            success: false,
-            message: "Claude timeout".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceResponse {
-            session_id,
-            success,
-            message,
-        } = parsed
-        {
-            assert_eq!(session_id, "sess-2");
-            assert!(!success);
-            assert_eq!(message, "Claude timeout");
-        } else {
-            panic!("expected VoiceResponse");
-        }
-    }
-
-    #[test]
-    fn voice_request_empty_text() {
-        let msg = AstationMessage::VoiceRequest {
-            session_id: "sess-empty".into(),
-            accumulated_text: "".into(),
-            relay_url: "https://relay.example.com".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceRequest { accumulated_text, .. } = parsed {
-            assert_eq!(accumulated_text, "");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_request_special_characters() {
-        let msg = AstationMessage::VoiceRequest {
-            session_id: "sess-special".into(),
-            accumulated_text: "create a fn that returns \"hello\" with 100% accuracy & <b>tags</b>".into(),
-            relay_url: "https://relay.example.com/path?key=val&other=1".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceRequest { accumulated_text, relay_url, .. } = parsed {
-            assert!(accumulated_text.contains("\"hello\""));
-            assert!(accumulated_text.contains("100%"));
-            assert!(accumulated_text.contains("<b>tags</b>"));
-            assert!(relay_url.contains("key=val&other=1"));
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_response_success_true() {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: "sess-ok".into(),
-            success: true,
-            message: "Response delivered to relay".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceResponse { success, message, .. } = parsed {
-            assert!(success);
-            assert_eq!(message, "Response delivered to relay");
-        } else {
-            panic!("expected VoiceResponse");
-        }
-    }
-
-    #[test]
-    fn voice_request_wire_format_field_names() {
-        // Verify the exact wire format field names match what Astation Swift sends
-        let json = r#"{"type":"voiceRequest","data":{"session_id":"s1","accumulated_text":"hello","relay_url":"https://r.test"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceRequest { session_id, accumulated_text, relay_url } = msg {
-            assert_eq!(session_id, "s1");
-            assert_eq!(accumulated_text, "hello");
-            assert_eq!(relay_url, "https://r.test");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_response_wire_format_field_names() {
-        // Verify the exact wire format field names match what Atem Rust sends
-        let json = r#"{"type":"voiceResponse","data":{"session_id":"s1","success":true,"message":"ok"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceResponse { session_id, success, message } = msg {
-            assert_eq!(session_id, "s1");
-            assert!(success);
-            assert_eq!(message, "ok");
-        } else {
-            panic!("expected VoiceResponse");
         }
     }
 
@@ -3956,57 +3417,6 @@ mod tests {
         assert!(json.contains(r#""type":"pairSavePreference""#));
         let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
         matches!(parsed, AstationMessage::PairSavePreference { save_credentials: true });
-    }
-
-    // --- AgentInput (remote agent control) ---
-
-    #[test]
-    fn agent_input_text_deserializes_from_astation_wire() {
-        // Exact shape sent by Astation's sendAgentText (key omitted).
-        let json = r#"{"type":"agentInput","data":{"agentId":"a1","kind":"text","text":"refactor auth"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            AstationMessage::AgentInput { agent_id, kind, text, key } => {
-                assert_eq!(agent_id.as_deref(), Some("a1"));
-                assert_eq!(kind, "text");
-                assert_eq!(text.as_deref(), Some("refactor auth"));
-                assert_eq!(key, None);
-            }
-            _ => panic!("expected AgentInput"),
-        }
-    }
-
-    #[test]
-    fn agent_input_key_deserializes_without_agent_id() {
-        // sendAgentKey with agentId omitted (v1 focused-agent default).
-        let json = r#"{"type":"agentInput","data":{"kind":"key","key":"ctrl-c"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            AstationMessage::AgentInput { agent_id, kind, text, key } => {
-                assert_eq!(agent_id, None);
-                assert_eq!(kind, "key");
-                assert_eq!(text, None);
-                assert_eq!(key.as_deref(), Some("ctrl-c"));
-            }
-            _ => panic!("expected AgentInput"),
-        }
-    }
-
-    #[test]
-    fn agent_input_roundtrips() {
-        let msg = AstationMessage::AgentInput {
-            agent_id: None,
-            kind: "text".into(),
-            text: Some("hi".into()),
-            key: None,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"agentInput""#));
-        // nil fields are omitted on the wire
-        assert!(!json.contains("agentId"));
-        assert!(!json.contains("\"key\""));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        matches!(parsed, AstationMessage::AgentInput { .. });
     }
 
     #[test]

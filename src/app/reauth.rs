@@ -94,14 +94,11 @@ impl App {
     }
 
     /// The socket is open but no longer authenticated: offline, remote
-    /// terminals revoked, chat conversations closed, Astation-routed work
-    /// dropped. The local agent PTY and anything typed into it are left alone.
+    /// terminals revoked, chat conversations closed. The local agent PTY and anything typed into it are left alone.
     pub(super) fn suspend_astation(&mut self) {
         self.astation_connected = false;
         self.disconnect_terminals();
         self.close_chat_conversations();
-        self.pending_astation_command = None;
-        self.pending_voice_request = None;
         self.rebuild_menu();
     }
 
@@ -255,7 +252,8 @@ mod tests {
         )
     }
 
-    /// Adds a live `cat` PTY as Codex with a remote viewer that holds control.
+    /// Adds a live `cat` PTY as Codex with a remote viewer and a remote
+    /// controller (the input authority a lease would hold).
     fn share_codex_with_remote_controller(app: &mut App) {
         let mut session = Session::new(
             Provider::Codex,
@@ -266,30 +264,21 @@ mod tests {
         app.sessions.insert(session).unwrap();
         app.mode = AppMode::MainMenu;
         let generation = codex(app).share.generation.clone();
+        let terminal_id = codex(app).id.to_string();
         app.handle_terminal_message(
             Message::Subscribe {
-                terminal_id: "codex".into(),
-                generation: generation.clone(),
-            }
-            .into(),
-        );
-        let stream_id = app
-            .terminal_outbox
-            .iter()
-            .find_map(|message| match message {
-                Message::Attached { stream_id, .. } => Some(stream_id.clone()),
-                _ => None,
-            })
-            .expect("viewer attached");
-        app.handle_terminal_message(
-            Message::Control {
-                terminal_id: "codex".into(),
+                terminal_id,
                 generation,
-                stream_id,
-                take: true,
             }
             .into(),
         );
+        assert!(
+            app.terminal_outbox
+                .iter()
+                .any(|message| matches!(message, Message::Attached { .. })),
+            "viewer attached"
+        );
+        codex(app).input.as_ref().unwrap().set_remote(true);
         assert!(codex(app).share.has_viewer());
         assert!(codex(app).input.as_ref().unwrap().remote_controlled());
     }
@@ -736,30 +725,30 @@ mod tests {
     #[tokio::test]
     async fn requests_are_ignored_while_reauthentication_is_pending() {
         let (mut app, mut peer) = connected_app().await;
-        let (input, mut written) = crate::pty_session::PtyInput::test_channel();
         let mut claude = Session::new(Provider::Claude, 24, 80);
-        claude.input = Some(input);
-        app.sessions.insert(claude).unwrap();
+        claude.attach(crate::pty_session::spawn("cat", &[]).unwrap());
+        let claude = app.sessions.insert(claude).unwrap();
+        let subscribe = Message::Subscribe {
+            terminal_id: claude.id.to_string(),
+            generation: claude.share.generation.clone(),
+        };
         peer.send
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();
         next_auth(&mut app, &mut peer).await;
 
         peer.send
-            .send(AstationMessage::AgentInput {
-                agent_id: None,
-                kind: "text".into(),
-                text: Some("rm -rf build".into()),
-                key: None,
-            })
-            .unwrap();
-        peer.send
-            .send(AstationMessage::Terminal(Message::List.into()))
+            .send(AstationMessage::Terminal(subscribe.into()))
             .unwrap();
         peer.send.send(AstationMessage::AgentListRequest).unwrap();
         let frames = pump(&mut app, &mut peer).await;
-        assert!(written.try_recv().is_err(), "agent input reached the PTY");
         assert!(app.terminal_outbox.is_empty());
+        assert!(
+            !app.last_session(Provider::Claude)
+                .unwrap()
+                .share
+                .has_viewer()
+        );
         assert!(
             !frames
                 .iter()

@@ -16,10 +16,12 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 const HISTORY_MESSAGES: usize = 50;
 const HISTORY_BYTES: usize = 256 * 1024;
 const NOT_AVAILABLE: &str = "chat is not available for this agent";
-/// Sent instead of the OS error, which stays local.
-const PASTE_FAILED: &str = "could not write to the terminal";
 const RESTARTED: &str = "the agent was restarted; reopen the chat";
 const SWITCHED: &str = "the conversation was switched; reopen the chat";
+/// The reply to every chat-v1 `submit`: prompts need an atem-session v1
+/// binding and lease, which this host does not serve yet. Nothing is typed.
+pub const SUBMIT_REFUSED: &str =
+    "chat submit needs atem-session v1, which this host does not serve yet";
 /// Open conversations per agent; opening one more closes the oldest.
 const MAX_CONVERSATIONS: usize = 8;
 pub const CHAT_V1: &str = "chat-v1";
@@ -75,11 +77,6 @@ fn not_available(reason: Option<&str>) -> String {
 }
 
 impl AgentChat {
-    /// The agent's terminal has a draft (see `ChatSession::has_unsent_input`).
-    pub fn has_unsent_input(&self, input_count: u64) -> bool {
-        self.session.has_unsent_input(input_count)
-    }
-
     /// Number `outs` for one conversation (its own sequence).
     fn for_conversation(&mut self, conversation: &str, outs: &[Out]) -> Vec<ChatEnvelope> {
         let Some(c) = self.conversations.get_mut(conversation) else {
@@ -355,7 +352,8 @@ impl App {
         }
     }
 
-    /// `agentChat` from Astation: open, submit or close a conversation.
+    /// `agentChat` from Astation: open or close a conversation (a submit is
+    /// refused with `SUBMIT_REFUSED` and has no effect).
     pub async fn handle_agent_chat(&mut self, env: ChatEnvelope) {
         // Only on an authenticated link (cleared while re-authenticating).
         if !self.astation_connected || self.astation_client.is_ws_closed() {
@@ -370,10 +368,10 @@ impl App {
                 return self.send_chat(vec![reply]).await;
             }
         };
-        let request_id = match &inbound {
-            Inbound::Submit { request_id, .. } => Some(request_id.as_str()),
-            _ => None,
-        };
+        if let Inbound::Submit { request_id, .. } = &inbound {
+            let reply = wire::error(&conversation, &agent, SUBMIT_REFUSED, Some(request_id));
+            return self.send_chat(vec![reply]).await;
+        }
         let session_id = self
             .sessions
             .iter()
@@ -400,14 +398,11 @@ impl App {
         };
         if let Err(reason) = available {
             let text = not_available(reason.as_deref());
-            let reply = wire::error(&conversation, &agent, &text, request_id);
+            let reply = wire::error(&conversation, &agent, &text, None);
             return self.send_chat(vec![reply]).await;
         }
         let Some(Session {
-            chat: Some(chat),
-            input,
-            last_used,
-            ..
+            chat: Some(chat), ..
         }) = session_id.and_then(|id| self.sessions.get_mut(&id))
         else {
             unreachable!("checked above");
@@ -444,54 +439,7 @@ impl App {
                 chat.conversations.remove(&conversation);
                 Vec::new()
             }
-            Inbound::Submit {
-                generation,
-                request_id,
-                text,
-            } => {
-                if !chat.conversations.contains_key(&conversation) {
-                    vec![wire::error(
-                        &conversation,
-                        &agent,
-                        "open the conversation first",
-                        Some(&request_id),
-                    )]
-                } else {
-                    let sender = input.as_ref();
-                    let input_count = sender.map_or(0, |s| s.input_count());
-                    let remote = sender.is_some_and(|s| s.remote_controlled());
-                    let outs = match chat.session.submit(
-                        &request_id,
-                        &generation,
-                        &text,
-                        input_count,
-                        remote,
-                    ) {
-                        Ok(text) => {
-                            let written = match sender {
-                                Some(sender) => sender.send_paste(&text),
-                                None => Err(anyhow::anyhow!("no terminal")),
-                            };
-                            match written {
-                                Ok(()) => {
-                                    // Remote input: the session is the alias target now.
-                                    *last_used = Instant::now();
-                                    chat.session.mark_pasted(&request_id, Instant::now());
-                                    Vec::new()
-                                }
-                                Err(error) => {
-                                    crate::diagnostics::warn(format!(
-                                        "Chat prompt was not written to Claude: {error}"
-                                    ));
-                                    chat.session.paste_failed(&request_id, PASTE_FAILED)
-                                }
-                            }
-                        }
-                        Err(outs) => outs,
-                    };
-                    chat.for_conversation(&conversation, &outs)
-                }
-            }
+            Inbound::Submit { .. } => unreachable!("refused above"),
         };
         self.send_chat(envelopes).await;
     }

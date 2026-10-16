@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 /// Main Atem configuration loaded from ~/.config/atem/config.toml + env vars
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AtemConfig {
-    pub rtm_channel: Option<String>,
-    pub rtm_account: Option<String>,
     pub astation_ws: Option<String>,
     pub astation_relay_url: Option<String>,
     /// Most recently authenticated Astation identity. Learned automatically and
@@ -65,12 +63,6 @@ impl AtemConfig {
             AtemConfig::default()
         };
 
-        if let Ok(val) = std::env::var("ATEM_RTM_CHANNEL") {
-            config.rtm_channel = Some(val);
-        }
-        if let Ok(val) = std::env::var("ATEM_RTM_ACCOUNT") {
-            config.rtm_account = Some(val);
-        }
         if let Ok(val) = std::env::var("ASTATION_WS") {
             config.astation_ws = Some(val);
         }
@@ -213,12 +205,6 @@ impl AtemConfig {
         let table = existing.as_table_mut().expect("config is a TOML table");
 
         // Write non-sensitive settings
-        if let Some(ch) = &self.rtm_channel {
-            table.insert("rtm_channel".into(), toml::Value::String(ch.clone()));
-        }
-        if let Some(acc) = &self.rtm_account {
-            table.insert("rtm_account".into(), toml::Value::String(acc.clone()));
-        }
         if let Some(ws) = &self.astation_ws {
             table.insert("astation_ws".into(), toml::Value::String(ws.clone()));
         }
@@ -284,14 +270,6 @@ impl AtemConfig {
 
         let mut lines = Vec::new();
         lines.push(format!("Config file: {}", Self::config_path().display()));
-        lines.push(format!(
-            "rtm_channel: {}",
-            self.rtm_channel.as_deref().unwrap_or("(not set)")
-        ));
-        lines.push(format!(
-            "rtm_account: {}",
-            self.rtm_account.as_deref().unwrap_or("(not set)")
-        ));
         lines.push(format!(
             "astation_ws: {}",
             self.astation_ws.as_deref().unwrap_or("(not set)")
@@ -381,16 +359,6 @@ impl AtemConfig {
         }
 
         lines.join("\n")
-    }
-
-    /// Get RTM channel with fallback default
-    pub fn rtm_channel(&self) -> &str {
-        self.rtm_channel.as_deref().unwrap_or("atem_channel")
-    }
-
-    /// Get RTM account with fallback default
-    pub fn rtm_account(&self) -> &str {
-        self.rtm_account.as_deref().unwrap_or("atem01")
     }
 
     /// Get Astation URL with fallback default
@@ -724,8 +692,6 @@ mod tests {
     #[test]
     fn default_config_has_none_fields() {
         let config = AtemConfig::default();
-        assert!(config.rtm_channel.is_none());
-        assert!(config.rtm_account.is_none());
         assert!(config.astation_ws.is_none());
         assert!(config.astation_relay_url.is_none());
         assert!(config.bff_url.is_none());
@@ -735,8 +701,6 @@ mod tests {
     #[test]
     fn config_defaults() {
         let config = AtemConfig::default();
-        assert_eq!(config.rtm_channel(), "atem_channel");
-        assert_eq!(config.rtm_account(), "atem01");
         assert_eq!(config.astation_ws(), "ws://127.0.0.1:8080/ws");
         assert_eq!(config.astation_relay_url(), "https://station.agora.build");
     }
@@ -777,11 +741,11 @@ mod tests {
     #[test]
     fn display_masked_shows_sso_section() {
         let config = AtemConfig {
-            rtm_channel: Some("test_channel".to_string()),
+            astation_ws: Some("ws://test-host:8080/ws".to_string()),
             ..Default::default()
         };
         let display = config.display_masked();
-        assert!(display.contains("test_channel")); // non-secret shown
+        assert!(display.contains("ws://test-host:8080/ws")); // non-secret shown
         assert!(display.contains("SSO:"));
         // Shows either "logged in" or "not logged in" depending on real session state
         assert!(display.contains("logged in") || display.contains("not logged in"));

@@ -247,7 +247,6 @@ async fn run_tui_loop(
             }
             if let Event::Key(key) = event {
                 if key.kind != KeyEventKind::Release {
-                    app.register_local_activity(true).await;
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
                     if matches!(app.mode, AppMode::Terminal) {

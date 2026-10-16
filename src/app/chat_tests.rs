@@ -206,26 +206,17 @@ impl Harness {
         (self.seen[at].clone(), history)
     }
 
-    /// Submit and run until `complete` for it; returns the conversation's events from the submit on.
-    async fn submit_until_complete(
+    /// Type `text` as a prompt in Atem's own terminal (a bracketed paste, the
+    /// local input path) and run until its turn completes; returns the
+    /// conversation's events from the prompt on.
+    async fn prompt_locally_until_complete(
         &mut self,
         conversation: &str,
-        generation: &str,
-        request_id: &str,
         text: &str,
     ) -> Vec<Value> {
         let from = self.seen.len();
-        self.send_chat(
-            "submit",
-            conversation,
-            json!({"generation": generation, "requestId": request_id, "text": text}),
-        );
-        let rid = request_id.to_string();
-        let at = self
-            .pump_until(from, move |v| {
-                is_chat(v, "complete") && v["data"]["requestId"] == rid.as_str()
-            })
-            .await;
+        send_claude(&mut self.app, &format!("\x1b[200~{text}\x1b[201~\r"));
+        let at = self.pump_until(from, |v| is_chat(v, "complete")).await;
         // The turn's end also sets status ready, right after `complete`.
         let conv = conversation.to_string();
         self.pump_until(at + 1, move |v| {
@@ -343,7 +334,7 @@ async fn agent_list_advertises_chat_v1_after_session_start() {
 }
 
 #[tokio::test]
-async fn chat_open_submit_reply_complete() {
+async fn chat_open_local_prompt_reply_complete() {
     let mut h = start().await;
     h.wait_for_chat().await;
     let (opened, history) = h.open("c1", 0).await;
@@ -352,9 +343,7 @@ async fn chat_open_submit_reply_complete() {
     assert!(history.is_empty());
     let generation = opened["data"]["generation"].as_str().unwrap().to_string();
 
-    let events = h
-        .submit_until_complete("c1", &generation, "r1", "hello there")
-        .await;
+    let events = h.prompt_locally_until_complete("c1", "hello there").await;
     for e in &events {
         assert_eq!(e["data"]["generation"], generation.as_str(), "{e}");
     }
@@ -365,22 +354,23 @@ async fn chat_open_submit_reply_complete() {
         "{events:#?}"
     );
 
-    let accepted = position(&events, |v| {
-        is_chat(v, "accepted") && v["data"]["requestId"] == "r1"
-    });
+    assert!(
+        !events.iter().any(|v| is_chat(v, "accepted")),
+        "{events:#?}"
+    );
     let user = position(&events, |v| {
         is_chat(v, "message") && v["data"]["role"] == "user"
     });
     let u = &events[user]["data"];
-    assert_eq!(u["origin"], "remote");
-    assert_eq!(u["requestId"], "r1");
+    assert_eq!(u["origin"], "local");
+    assert!(u.get("requestId").is_none(), "{u}");
     assert_eq!(u["parts"][0]["markdown"], "hello there");
     let tool = position(&events, |v| {
         is_chat(v, "message") && v["data"]["role"] == "assistant"
     });
     let a = &events[tool]["data"];
     assert_eq!(a["messageId"], "msg-1");
-    assert_eq!(a["requestId"], "r1");
+    assert!(a.get("requestId").is_none(), "{a}");
     assert_eq!(a["parts"][0]["kind"], "tool");
     assert_eq!(a["parts"][0]["name"], "Bash");
     assert_eq!(a["parts"][0]["summary"], "echo hi");
@@ -391,10 +381,9 @@ async fn chat_open_submit_reply_complete() {
     let complete = position(&events, |v| is_chat(v, "complete"));
     let c = &events[complete]["data"];
     assert_eq!(c["outcome"], "done");
-    assert_eq!(c["requestId"], "r1");
+    assert!(c.get("requestId").is_none(), "{c}");
     assert_eq!(c["turnId"], "p-1");
     assert!(user < tool && tool < delta && delta < complete);
-    assert!(accepted < complete);
     let last_status = events.iter().rev().find(|v| is_chat(v, "status")).unwrap();
     assert_eq!(last_status["data"]["state"], "ready");
     assert!(
@@ -407,13 +396,11 @@ async fn chat_open_submit_reply_complete() {
 }
 
 #[tokio::test]
-async fn submit_refused_after_local_typing() {
+async fn submit_is_refused_without_effect() {
     let mut h = start().await;
     h.wait_for_chat().await;
     let (opened, _) = h.open("c1", 0).await;
     let generation = opened["data"]["generation"].as_str().unwrap().to_string();
-    // A key typed in Atem's own terminal view (the local input path).
-    send_claude(&mut h.app, "x");
     let from = h.seen.len();
     h.send_chat(
         "submit",
@@ -423,15 +410,15 @@ async fn submit_refused_after_local_typing() {
     let at = h.pump_until(from, |v| is_chat(v, "error")).await;
     let e = &h.seen[at]["data"];
     assert_eq!(e["requestId"], "r1");
-    assert!(
-        e["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("the terminal has unsent input"),
-        "{e}"
-    );
-    assert_eq!(e["sequence"], 1);
+    assert_eq!(e["text"], super::chat::SUBMIT_REFUSED);
     h.pump_for(Duration::from_millis(300)).await;
+    assert!(
+        !h.seen[from..]
+            .iter()
+            .any(|v| is_chat(v, "accepted") || is_chat(v, "message")),
+        "{:#?}",
+        &h.seen[from..]
+    );
     assert!(
         !h.transcript_lines()
             .iter()
@@ -442,49 +429,12 @@ async fn submit_refused_after_local_typing() {
 }
 
 #[tokio::test]
-async fn duplicate_request_is_not_executed_twice() {
-    let mut h = start().await;
-    h.wait_for_chat().await;
-    let (opened, _) = h.open("c1", 0).await;
-    let generation = opened["data"]["generation"].as_str().unwrap().to_string();
-    h.submit_until_complete("c1", &generation, "r1", "only once")
-        .await;
-    let from = h.seen.len();
-    h.send_chat(
-        "submit",
-        "c1",
-        json!({"generation": generation, "requestId": "r1", "text": "only once"}),
-    );
-    let at = h
-        .pump_until(from, |v| {
-            is_chat(v, "complete") && v["data"]["requestId"] == "r1"
-        })
-        .await;
-    assert!(h.seen[from..at].iter().any(|v| is_chat(v, "accepted")));
-    h.pump_for(Duration::from_millis(500)).await;
-    let prompts = h
-        .transcript_lines()
-        .iter()
-        .filter(|l| l.contains("\"content\":\"only once\""))
-        .count();
-    assert_eq!(prompts, 1, "the prompt was typed once");
-    assert!(
-        !h.seen[from..]
-            .iter()
-            .any(|v| is_chat(v, "message") && v["data"]["role"] == "user"),
-        "no new user message"
-    );
-    h.stop().await;
-}
-
-#[tokio::test]
 async fn reconnect_restores_status_and_history() {
     let mut h = start().await;
     h.wait_for_chat().await;
     let (opened, _) = h.open("c1", 0).await;
     let generation = opened["data"]["generation"].as_str().unwrap().to_string();
-    h.submit_until_complete("c1", &generation, "r1", "remember me")
-        .await;
+    h.prompt_locally_until_complete("c1", "remember me").await;
     h.send_chat("close", "c1", json!({}));
 
     let (opened, history) = h.open("c1", 2).await;
@@ -494,8 +444,7 @@ async fn reconnect_restores_status_and_history() {
     assert_eq!(sequences(&history), vec![1, 2]);
     let user = &history[0]["data"];
     assert_eq!(user["role"], "user");
-    assert_eq!(user["origin"], "remote");
-    assert_eq!(user["requestId"], "r1");
+    assert_eq!(user["origin"], "local");
     assert_eq!(user["parts"][0]["markdown"], "remember me");
     let reply = &history[1]["data"];
     assert_eq!(reply["role"], "assistant");
@@ -786,26 +735,6 @@ async fn relaunch_is_a_new_session_and_reaping_the_old_one_tells_its_conversatio
     let (opened, _) = h.open("c1", 0).await;
     assert_ne!(opened["data"]["generation"], old_generation.as_str());
     assert_eq!(h.chat_dirs().len(), 1, "the old chat directory is gone");
-    h.stop().await;
-}
-
-#[tokio::test]
-async fn a_chat_prompt_makes_its_session_the_alias_target() {
-    let mut h = start().await;
-    h.wait_for_chat().await;
-    let (opened, _) = h.open("c1", 0).await;
-    let generation = opened["data"]["generation"].as_str().unwrap().to_string();
-    let chat_session = claude_session(&h.app).id.clone();
-    // A later Claude session (no process) is the most recently used one.
-    let (input, _reader) = crate::pty_session::PtyInput::test_channel();
-    let mut other = Session::new(Provider::Claude, 24, 80);
-    other.input = Some(input);
-    let other = h.app.sessions.insert(other).unwrap().id.clone();
-    assert_eq!(h.app.sessions.resolve("claude"), Some(other.clone()));
-    h.submit_until_complete("c1", &generation, "r1", "hello there")
-        .await;
-    assert_eq!(h.app.sessions.resolve("claude"), Some(chat_session));
-    h.app.sessions.remove(&other);
     h.stop().await;
 }
 

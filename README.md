@@ -1,6 +1,6 @@
 # Atem
 
-A terminal that connects builders, Agora platform, and AI agents. Manage Agora projects and tokens, route tasks between [Astation](https://github.com/Agora-Build/Astation) and AI coding agents, drive voice-powered coding workflows, and more -- all from a single CLI/TUI.
+A terminal that connects builders, Agora platform, and AI agents. Manage Agora projects and tokens, route tasks between [Astation](https://github.com/Agora-Build/Astation) and AI coding agents, and more -- all from a single CLI/TUI.
 
 ## Install
 
@@ -53,7 +53,7 @@ atem unpair [--yes]                     # Remove all Astation pairings and saved
 `atem login` unlocks a limited set: project list, tokens for the active
 project, and the dev servers (`serv rtc`, `serv convo`, `serv webhooks`).
 Pairing with Astation unlocks the full set: vault, sync, memory, skills,
-`atem cred`, and Astation-driven remote agent control, voice coding and mark
+`atem cred`, and Astation-driven terminal viewing, chat and mark
 tasks. `serv files`, `config`, and tokens from
 `AGORA_APP_ID`/`AGORA_APP_CERTIFICATE` need neither.
 
@@ -148,9 +148,11 @@ atem agent launch claude -- --help      # Use -- to read the agent's own help
 `claude` or `codex` CLI, unchanged, in a full-screen Atem terminal. It uses
 your working directory and your own login for that CLI. Nothing here replaces
 the CLI with an API conversation. It works without Astation. If you are
-paired, Astation can view the same session and take control of it (one
-viewer per session; while Astation holds control, local typing is refused until you press
-the prefix, then `g`). Quitting Atem ends the session.
+paired, Astation can view the same session (one viewer per session).
+Remote typing, resizing and stopping are refused for now: they will come back
+through Atem's session protocol (atem-session v1), not the older `agentInput`,
+`agentPrompt`, voice or `userCommand` messages, which were removed. Quitting
+Atem ends the session.
 
 Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
 
@@ -168,13 +170,14 @@ The bottom row reads, for example,
 `Atem | Claude | Local | Astation ✓ | Notice | Ctrl+] then ?:help`:
 
 - `Claude` or `Codex` is the agent on screen.
-- `Local` means your keyboard drives the agent; `Remote` means Astation holds
-  control and local typing is refused until you press the prefix, then `g`.
+- `Local` means your keyboard drives the agent; `Remote` means a remote
+  controller holds input and local typing is refused until you press the
+  prefix, then `g` (no remote controller exists yet).
 - `Astation ✓` means an authenticated Astation link; `Astation ✗` means none
   (not paired, Astation unreachable, or re-authenticating). When Astation
   challenges an open connection again (for example after it alone reconnected
   to the relay), Atem briefly shows `Astation ✗`, drops remote viewers and
-  control, and answers with the saved session; it shows `✓` again once Astation
+  answers with the saved session; it shows `✓` again once Astation
   accepts. If Astation refuses or doesn't answer within 15 seconds, Atem
   records a notice and reconnects with the saved session (a refused session
   needs `atem pair`). Remote viewers subscribe again afterwards, view only.
@@ -192,9 +195,9 @@ See [`designs/terminal-v1-implementation.md`](designs/terminal-v1-implementation
 launched with `atem agent launch claude`: your prompts appear as messages and
 Claude's replies come from its own session log, with a status of ready,
 working, waiting or unknown. Atem adds its hooks with `--settings` for that run
-only; your `~/.claude` settings are not changed. Prompts from chat are refused
-while you have unsent input in the terminal, and approvals stay in the
-terminal. Codex has no chat yet (its status is unknown). See
+only; your `~/.claude` settings are not changed. Sending prompts from chat is
+refused for now (it will return through atem-session v1), and approvals stay
+in the terminal. Codex has no chat yet (its status is unknown). See
 [`designs/agent-chat-host.md`](designs/agent-chat-host.md).
 
 ### Vault (shared cross-agent context)
@@ -413,7 +416,7 @@ are documented in [`designs/session-auth.md`](designs/session-auth.md).
 | **Claude Chat** | Claude Code integration via PTY |
 | **Codex Chat** | Codex terminal integration via PTY |
 
-Astation integration and voice-driven coding are in progress — see [ROADMAP.md](ROADMAP.md).
+Astation integration is in progress — see [ROADMAP.md](ROADMAP.md).
 
 ## Configuration
 
@@ -512,7 +515,6 @@ Use `./scripts/release.sh` rather than `git tag` directly — the script keeps
 
 | Flag | Description |
 |------|-------------|
-| `real_rtm` | Link against Agora RTM SDK (default: stub) |
 | `openssl-vendored` | Build OpenSSL from source (for cross-compilation) |
 
 ## Roadmap

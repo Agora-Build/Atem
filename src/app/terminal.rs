@@ -16,22 +16,13 @@ pub(super) fn append_log(log: &mut String, offset: &mut usize, text: &str) {
     }
 }
 
-pub(super) fn log_since(log: &str, offset: usize, position: usize) -> &str {
-    let mut start = position.saturating_sub(offset).min(log.len());
-    while !log.is_char_boundary(start) {
-        start += 1;
-    }
-    &log[start..]
-}
+/// The reply to a remote terminal-v1 `input`, `resize` or `stop`: remote
+/// mutations need an atem-session v1 binding and lease, which this host does
+/// not serve yet. They have no effect.
+pub const REMOTE_MUTATION_REFUSED: &str =
+    "Remote terminal input, resize and stop need atem-session v1, which this host does not serve yet";
 
 impl App {
-    pub fn handle_terminal_legacy_rejection(&mut self) {
-        self.status_message = Some("Use terminal-v1 control for an attached terminal".into());
-        self.queue_terminal(Message::Error {
-            terminal_id: None,
-            message: "Use terminal-v1 input and its control lease for an attached terminal".into(),
-        });
-    }
 
     pub fn disconnect_terminals(&mut self) {
         for session in self.sessions.iter_mut() {
@@ -66,56 +57,35 @@ impl App {
             });
             return;
         }
-        if matches!(envelope.message, Message::List) {
-            // Every session with a process (exited ones carry their exit status),
-            // in creation order.
-            let sessions = self
-                .sessions
-                .iter()
-                .filter(|s| s.input.is_some() && s.handle.is_some())
-                .map(|s| s.share.info(s.terminal.screen()))
-                .collect();
-            self.queue_terminal(Message::Sessions {
-                sessions,
-                terminal_ids: Some("session".into()),
-            });
-            return;
-        }
-        let mut message = envelope.message;
+        let message = envelope.message;
         let Some(requested) = message.request_terminal_id().map(str::to_string) else {
             return;
         };
-        // A session id, or the claude/codex alias for the most recently used
-        // live session of that provider (resolved for each request).
-        let target = match Provider::from_alias(&requested) {
-            Some(provider) => self.sessions.latest(provider),
-            None => SessionId::parse(&requested).filter(|id| self.sessions.get(id).is_some()),
-        };
-        let Some(target) = target else {
+        // Terminal ids are session ids only.
+        let Some(target) = SessionId::parse(&requested).filter(|id| self.sessions.get(id).is_some())
+        else {
             self.queue_terminal(Message::Error {
                 terminal_id: Some(requested),
                 message: "Unknown terminal".into(),
             });
             return;
         };
-        message.set_request_terminal_id(target.as_str());
         let id = target.to_string();
-        let is_input = matches!(message, Message::Input { .. });
+        if matches!(message, Message::Input { .. } | Message::Resize { .. } | Message::Stop { .. }) {
+            self.queue_terminal(Message::Error {
+                terminal_id: Some(id),
+                message: REMOTE_MUTATION_REFUSED.into(),
+            });
+            return;
+        }
         let result = match self.sessions.get_mut(&target) {
             Some(Session {
                 share,
                 terminal,
                 input: Some(input),
-                handle: Some(handle),
-                last_used,
+                handle: Some(_),
                 ..
-            }) => {
-                let result = share.handle(message, terminal, input, handle);
-                if is_input && result.is_ok() {
-                    *last_used = std::time::Instant::now();
-                }
-                result
-            }
+            }) => share.handle(message, terminal.screen(), input),
             _ => Err("Terminal unavailable; launch the CLI in Atem first".into()),
         };
         match result {
@@ -149,7 +119,6 @@ impl App {
         else {
             return;
         };
-        let mut replies = Vec::new();
         let mut exit = false;
         for _ in 0..64 {
             match receiver.try_recv() {
@@ -160,11 +129,8 @@ impl App {
                 Ok(PtyEvent::Error(error)) => {
                     self.status_message = Some(format!("{label}: {error}"))
                 }
-                Ok(PtyEvent::Written { sequence, result }) => {
-                    if let Some(reply) = share.written(sequence, result.err()) {
-                        replies.push(reply);
-                    }
-                }
+                // Only remote writes report back, and there are none.
+                Ok(PtyEvent::Written { .. }) => {}
                 Ok(PtyEvent::Exit(status)) => {
                     share.exited(status, input);
                     exit = true;
@@ -177,9 +143,6 @@ impl App {
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             }
-        }
-        for reply in replies {
-            self.queue_terminal(reply);
         }
         self.update_output_from_terminal(id);
         if exit {
@@ -253,21 +216,17 @@ impl App {
         }
     }
 
-    /// Take control of session `id` back from a remote terminal-v1 viewer;
-    /// the local view regains size ownership.
+    /// Take control of session `id` back from a remote controller; the local
+    /// view regains size ownership.
     pub fn reclaim_session(&mut self, id: &SessionId) {
         let Some(session) = self.sessions.get_mut(id) else {
             return;
         };
-        let message = match &session.input {
-            Some(input) => session.share.reclaim(input),
-            None => None,
-        };
+        if let Some(input) = &session.input {
+            input.set_remote(false);
+        }
         // Force the local viewport to regain size ownership on the next draw.
         session.view.0 = 0;
-        if let Some(message) = message {
-            self.queue_terminal(message);
-        }
         self.status_message = Some("Local control restored; unfinished input preserved".into());
     }
 
@@ -335,9 +294,6 @@ impl App {
 }
 
 #[cfg(test)]
-mod live_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -400,11 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_peer_cannot_subscribe_and_legacy_input_cannot_bypass_lease() {
+    fn disconnected_peer_cannot_subscribe() {
         let mut app = app_with_cat();
         let generation = codex(&app).share.generation.clone();
         let request = Message::Subscribe {
-            terminal_id: "codex".into(),
+            terminal_id: codex_id(&app).to_string(),
             generation,
         };
         app.handle_terminal_message(request.clone().into());
@@ -412,8 +368,6 @@ mod tests {
         app.astation_connected = true;
         app.handle_terminal_message(request.into());
         assert!(codex(&app).share.has_viewer());
-        app.handle_agent_input(None, "key".into(), None, Some("enter".into()));
-        assert!(app.status_message.as_ref().unwrap().contains("terminal-v1"));
         app.disconnect_terminals();
         assert!(!codex(&app).share.has_viewer());
     }
@@ -429,72 +383,6 @@ mod tests {
         app.reclaim_terminal();
         app.adjust_terminal_size(&id, 40, 120);
         assert_eq!(codex(&app).terminal.screen().size(), (40, 120));
-    }
-
-    #[test]
-    fn remote_release_restores_the_cached_local_size_for_both_providers() {
-        for provider in ["codex", "claude"] {
-            let mut app = app_with_cat_as(Provider::from_alias(provider).unwrap());
-            app.astation_connected = true;
-            let id = app.focused.clone().unwrap();
-            let resize = |app: &mut App, rows, cols| app.adjust_terminal_size(&id, rows, cols);
-            resize(&mut app, 40, 120);
-            let generation = app.sessions.get(&id).unwrap().share.generation.clone();
-            app.handle_terminal_message(
-                Message::Subscribe {
-                    terminal_id: provider.into(),
-                    generation: generation.clone(),
-                }
-                .into(),
-            );
-            let Message::Attached { stream_id, .. } = app.terminal_outbox.pop_front().unwrap()
-            else {
-                panic!("expected attachment")
-            };
-            app.handle_terminal_message(
-                Message::Control {
-                    terminal_id: provider.into(),
-                    generation: generation.clone(),
-                    stream_id: stream_id.clone(),
-                    take: true,
-                }
-                .into(),
-            );
-            let Message::Controller {
-                lease_id: Some(lease_id),
-                ..
-            } = app.terminal_outbox.pop_front().unwrap()
-            else {
-                panic!("expected lease")
-            };
-            app.handle_terminal_message(
-                Message::Resize {
-                    terminal_id: provider.into(),
-                    generation: generation.clone(),
-                    stream_id: stream_id.clone(),
-                    lease_id,
-                    rows: 30,
-                    cols: 90,
-                }
-                .into(),
-            );
-            resize(&mut app, 40, 120);
-            let screen = app.sessions.get(&id).unwrap().terminal.screen();
-            assert_eq!(screen.size(), (30, 90));
-            app.handle_terminal_message(
-                Message::Control {
-                    terminal_id: provider.into(),
-                    generation,
-                    stream_id,
-                    take: false,
-                }
-                .into(),
-            );
-            // No explicit local reclaim and no change to the cached viewport dimensions.
-            resize(&mut app, 40, 120);
-            let screen = app.sessions.get(&id).unwrap().terminal.screen();
-            assert_eq!(screen.size(), (40, 120));
-        }
     }
 
     #[test]
@@ -547,20 +435,24 @@ mod tests {
         append_log(&mut log, &mut offset, &"\u{4e2d}".repeat(400000));
         assert!(log.len() <= 1024 * 1024);
         assert_eq!(log.len() + offset, 1200000);
-        let position = offset + log.len();
         append_log(&mut log, &mut offset, "tail");
-        assert_eq!(log_since(&log, offset, position), "tail");
-        assert!(std::str::from_utf8(log_since(&log, offset, offset + 1).as_bytes()).is_ok());
+        assert!(log.ends_with("tail"));
+        assert_eq!(log.len() + offset, 1200004);
     }
 
     #[tokio::test]
-    async fn websocket_peer_views_and_controls_the_same_hidden_pty() {
+    async fn websocket_peer_views_the_same_hidden_pty_by_session_id() {
         use crate::websocket_client::AstationMessage;
         use base64::{Engine, engine::general_purpose::STANDARD};
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let mut app = app_with_cat();
+        let id = codex_id(&app);
+        let generation = codex(&app).share.generation.clone();
+        app.leave_terminal_view();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let terminal_id = id.to_string();
         let peer = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
@@ -569,10 +461,14 @@ mod tests {
                     serde_json::to_string(&AstationMessage::Terminal(message.into())).unwrap(),
                 )
             };
-            socket.send(encode(Message::List)).await.unwrap();
+            socket
+                .send(encode(Message::Subscribe {
+                    terminal_id,
+                    generation,
+                }))
+                .await
+                .unwrap();
             let mut remote = vt100::Parser::new(24, 80, 0);
-            let mut written = false;
-            let mut displayed = false;
             while let Some(frame) = socket.next().await {
                 let WsMessage::Text(json) = frame.unwrap() else {
                     continue;
@@ -582,50 +478,7 @@ mod tests {
                     continue;
                 };
                 match envelope.message {
-                    Message::Sessions { sessions, .. } => {
-                        assert_eq!(sessions.len(), 1);
-                        socket
-                            .send(encode(Message::Subscribe {
-                                terminal_id: sessions[0].terminal_id.clone(),
-                                generation: sessions[0].generation.clone(),
-                            }))
-                            .await
-                            .unwrap();
-                    }
-                    Message::Attached { session, stream_id } => {
-                        socket
-                            .send(encode(Message::Control {
-                                terminal_id: session.terminal_id,
-                                generation: session.generation,
-                                stream_id,
-                                take: true,
-                            }))
-                            .await
-                            .unwrap();
-                    }
-                    Message::Controller {
-                        terminal_id,
-                        generation,
-                        stream_id,
-                        lease_id: Some(lease_id),
-                    } => {
-                        socket
-                            .send(encode(Message::Input {
-                                terminal_id,
-                                generation,
-                                stream_id,
-                                lease_id,
-                                sequence: 0,
-                                bytes: STANDARD.encode(b"REMOTE\n"),
-                            }))
-                            .await
-                            .unwrap();
-                    }
-                    Message::Written {
-                        sequence: 0,
-                        error: None,
-                        ..
-                    } => written = true,
+                    Message::Attached { .. } => {}
                     Message::Frame {
                         terminal_id,
                         generation,
@@ -651,32 +504,33 @@ mod tests {
                             }))
                             .await
                             .unwrap();
-                        displayed |= remote.screen().contents().contains("REMOTE");
+                        if remote.screen().contents().contains("LOCAL") {
+                            socket.close(None).await.unwrap();
+                            return;
+                        }
                     }
                     message => panic!("unexpected response: {message:?}"),
                 }
-                if written && displayed {
-                    socket.close(None).await.unwrap();
-                    return;
-                }
             }
-            panic!("peer disconnected before remote input was displayed");
+            panic!("peer disconnected before local input was displayed");
         });
-        let mut app = app_with_cat();
-        let id = codex_id(&app);
-        app.leave_terminal_view();
         app.astation_client
             .connect_raw(&format!("ws://{address}"))
             .await
             .unwrap();
         // Authentication is covered by websocket_client tests; inject its result here.
         app.astation_connected = true;
+        let mut typed = false;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 while let Some(message) = app.astation_client.recv_message() {
                     if let AstationMessage::Terminal(envelope) = message {
                         app.handle_terminal_message(envelope);
                     }
+                }
+                if !typed && codex(&app).share.has_viewer() {
+                    app.send_data(&id, "LOCAL\n");
+                    typed = true;
                 }
                 app.process_terminal_output(&id);
                 app.pump_terminals();
@@ -693,6 +547,5 @@ mod tests {
         assert!(matches!(app.mode, AppMode::MainMenu));
         assert!(codex(&app).events.is_some());
         assert!(!codex(&app).input.as_ref().unwrap().remote_controlled());
-        assert!(codex(&app).terminal.screen().contents().contains("REMOTE"));
     }
 }

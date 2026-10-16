@@ -30,19 +30,14 @@ use crate::claude_client::ClaudeClient;
 use crate::codex_client::CodexClient;
 use crate::pty_session::SpawnSpec;
 use crate::session::{EXITED_KEEP, LaunchRequest, Provider, Session, SessionId, Sessions};
-use crate::command::StreamBuffer;
 use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
-use crate::rtm_client::{RtmClient, RtmEvent};
 use crate::websocket_client::{AstationClient, AstationMessage};
 use crate::agent_client::{AgentInfo, AgentOrigin, AgentProtocol, AgentStatus};
 use crate::agent_registry::AgentRegistry;
 
 /// The answer to every `visualizeRequest` from Astation.
 pub const VISUALIZE_REMOVED: &str = "Diagram generation was removed from atem";
-/// A request without an agent id and no live Claude session to take it.
-pub const NO_CLAUDE_SESSION: &str = "no Claude session; run `atem agent launch claude`";
-pub const NO_CODEX_SESSION: &str = "no Codex session; run `atem agent launch codex`";
 /// A mark task whose file no live Claude session's directory has.
 pub const NO_PROJECT_SESSION: &str =
     "no Claude session for this project; run `atem agent launch claude` there";
@@ -96,12 +91,6 @@ pub struct App {
     pub focused: Option<SessionId>,
     pub force_terminal_redraw: bool,
     pub terminal_ui: crate::tui::terminal_view::State,
-    pub rtm_client: Option<RtmClient>,
-    pub rtm_client_id: String,
-    pub last_activity_ping: Option<Instant>,
-    pub activity_ping_interval: Duration,
-    pub pending_transcriptions: VecDeque<String>,
-    pub rtm_token_expires_at: Option<Instant>,
     pub show_certificates: bool,
     pub cached_projects: Vec<BffProject>,
     pub voice_volume: f32,
@@ -112,7 +101,6 @@ pub struct App {
     pub config: AtemConfig,
     pub dispatcher: TaskDispatcher,
     pub work_items: HashMap<String, WorkItem>,
-    pub voice_commands: StreamBuffer,
     pub pairing_code: Option<String>,
     /// Registry of the PTY agents Atem launched (Claude Code, Codex).
     pub agent_registry: AgentRegistry,
@@ -131,10 +119,6 @@ pub struct App {
     /// Deadline of a re-authentication proof sent over the open socket that
     /// Astation has not accepted yet (see `app/reauth.rs`).
     pub astation_reauth: Option<Instant>,
-    /// Pending command from Astation waiting for output relay.
-    pub pending_astation_command: Option<PendingAstationCommand>,
-    /// Pending voice coding request waiting for Claude to finish.
-    pub pending_voice_request: Option<PendingVoiceRequest>,
     /// Where per-session chat directories are created (`chat-<uuid>`).
     pub chat_root: PathBuf,
     /// Stale chat directories under `chat_root` were swept (once per App).
@@ -149,47 +133,9 @@ pub struct App {
     pub(crate) agent_list_dirty: bool,
 }
 
-/// Tracks a command sent from Astation that needs output relayed back.
-#[derive(Debug, Clone)]
-pub struct PendingAstationCommand {
-    pub target: SessionId,
-    pub output_start_pos: usize, // Position in output_log where command output starts
-    pub sent_at: Instant,
-}
-
-/// Map an `agentInput` control-key name (from Astation) to the raw byte
-/// sequence written to the agent PTY. Returns None for an unknown key.
-pub fn agent_key_to_bytes(key: &str) -> Option<&'static str> {
-    match key {
-        "enter" => Some("\r"),
-        "esc" => Some("\x1b"),
-        "ctrl-c" => Some("\x03"),
-        "up" => Some("\x1b[A"),
-        "down" => Some("\x1b[B"),
-        "left" => Some("\x1b[D"),
-        "right" => Some("\x1b[C"),
-        "y" => Some("y"),
-        "n" => Some("n"),
-        _ => None,
-    }
-}
-
-/// Tracks a voice coding request waiting for Claude to finish.
-#[derive(Debug, Clone)]
-pub struct PendingVoiceRequest {
-    /// The Claude session the request was typed into.
-    pub target: SessionId,
-    pub session_id: String,
-    pub relay_url: String,
-    pub sent_at: Instant,
-    pub output_snapshot_len: usize,
-    pub last_output_at: Instant,
-}
-
 impl App {
     pub fn new() -> Self {
         let config = crate::config::AtemConfig::load().unwrap_or_default();
-        let rtm_client_id = config.rtm_account().to_string();
         let mut app = Self {
             last_session_refresh: None,
             terminal_outbox: VecDeque::new(),
@@ -211,12 +157,6 @@ impl App {
             focused: None,
             force_terminal_redraw: false,
             terminal_ui: crate::tui::terminal_view::State::new(config.terminal_prefix.as_deref()),
-            rtm_client: None,
-            rtm_client_id,
-            last_activity_ping: None,
-            activity_ping_interval: Duration::from_secs(2),
-            pending_transcriptions: VecDeque::new(),
-            rtm_token_expires_at: None,
             show_certificates: false,
             cached_projects: Vec::new(),
             voice_volume: 0.0,
@@ -227,7 +167,6 @@ impl App {
             config,
             dispatcher: TaskDispatcher::new(),
             work_items: HashMap::new(),
-            voice_commands: StreamBuffer::new(&["execute", "run it", "do it", "go ahead", "send it"]),
             pairing_code: None,
             agent_registry: AgentRegistry::new(),
             active_agent_id: None,
@@ -235,8 +174,6 @@ impl App {
             astation_connect_rx: None,
             astation_reconnect_at: None,
             astation_reauth: None,
-            pending_astation_command: None,
-            pending_voice_request: None,
             chat_root: crate::chat::claude::hooks::session_dir_root(),
             chat_swept: false,
             logs_dir: Self::default_logs_dir(),
@@ -642,45 +579,6 @@ impl App {
         self.sessions.get_mut(&id)
     }
 
-    /// The live session an Astation request names: a session id.
-    fn addressed_session(&self, agent_id: &str) -> Result<SessionId, String> {
-        SessionId::parse(agent_id)
-            .and_then(|id| self.sessions.resolve(id.as_str()))
-            .ok_or_else(|| format!("\u{274c} Unknown agent: {agent_id}"))
-    }
-
-    /// Where a request without an agent id goes: the most recently used live
-    /// session of `provider`. With `check_draft` (text, prompts, voice) it is
-    /// refused while that terminal holds a draft (chat-v1's rule); keys pass.
-    /// Atem never starts a session for it.
-    fn default_session(&self, provider: Provider, check_draft: bool) -> Result<SessionId, String> {
-        let Some(id) = self.sessions.latest(provider) else {
-            return Err(match provider {
-                Provider::Claude => NO_CLAUDE_SESSION.to_string(),
-                Provider::Codex => NO_CODEX_SESSION.to_string(),
-            });
-        };
-        let session = self.sessions.get(&id).expect("latest is a session");
-        if check_draft
-            && let (Some(chat), Some(input)) = (&session.chat, &session.input)
-            && chat.has_unsent_input(input.input_count())
-        {
-            return Err(format!(
-                "{} has unsent input; finish or clear it in its terminal",
-                provider.label()
-            ));
-        }
-        Ok(id)
-    }
-
-    /// `agent_id` when given (and not empty), else `default_session`.
-    fn route(&self, agent_id: Option<&str>, provider: Provider, check_draft: bool) -> Result<SessionId, String> {
-        match agent_id.filter(|id| !id.is_empty()) {
-            Some(agent_id) => self.addressed_session(agent_id),
-            None => self.default_session(provider, check_draft),
-        }
-    }
-
     /// The session shown by the terminal view, while it is open.
     pub fn focused_session(&self) -> Option<&Session> {
         if !matches!(self.mode, AppMode::Terminal) {
@@ -725,44 +623,6 @@ impl App {
                     provider.product(),
                     err
                 ));
-            }
-        }
-    }
-
-    /// Type `prompt` into session `id` and submit it.
-    pub fn send_prompt(&mut self, id: &SessionId, prompt: &str) -> Result<()> {
-        let trimmed = prompt.trim();
-        if trimmed.is_empty() { return Ok(()); }
-        let session = self
-            .sessions
-            .get_mut(id)
-            .filter(|s| s.is_live())
-            .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
-        if session.waiting_exit {
-            anyhow::bail!("{} is shutting down", session.provider.label());
-        }
-        let input = session
-            .input
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("{} terminal unavailable", session.provider.label()))?;
-        input.send(format!("{trimmed}\n\r"))?;
-        session.last_used = Instant::now();
-        session.user_actions.push(trimmed.to_string());
-        if trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit") {
-            session.waiting_exit = true;
-        }
-        Ok(())
-    }
-
-    /// `agentPrompt` from Astation: type `text` into the session `agent_id`
-    /// names (without one, the latest Claude session; see `route`).
-    pub async fn handle_agent_prompt(&mut self, agent_id: &str, text: &str) {
-        match self.route(Some(agent_id), Provider::Claude, true) {
-            Err(message) => self.status_message = Some(message),
-            Ok(id) => {
-                if let Err(err) = self.send_prompt(&id, text) {
-                    self.status_message = Some(format!("Failed to send the prompt: {err}"));
-                }
             }
         }
     }
@@ -872,8 +732,8 @@ impl App {
 
     /// The host part of the terminal UI's loop, run by the TUI and by `atem
     /// runtime` every tick: the Astation connection and its messages, every
-    /// session's output, exited-session reaping, chat-v1, terminal-v1 frames,
-    /// mark tasks and RTM.
+    /// session's output, exited-session reaping, chat-v1, terminal-v1 frames
+    /// and mark tasks.
     pub async fn tick_host(&mut self) {
         // Check if background Astation connection has completed
         self.poll_astation_connect();
@@ -905,133 +765,6 @@ impl App {
         if self.dispatcher.take_main_needs_finalize() {
             self.finalize_mark_task(true).await;
         }
-        if let Err(err) = self.process_rtm_messages().await {
-            self.status_message = Some(format!("RTM processing error: {}", err));
-        }
-    }
-
-    pub async fn ensure_rtm_client(&mut self) -> Result<()> {
-        // RTM DISABLED: Use WebSocket for all communication
-        // TODO: Re-enable RTM for voice coding features in the future
-        Ok(())
-    }
-
-    pub async fn send_activity_ping(&mut self, _focused: bool) -> Result<()> {
-        // RTM DISABLED: Activity pings not needed without voice coding
-        // TODO: Send activity via WebSocket when implementing voice coding
-        Ok(())
-    }
-
-    pub async fn maybe_send_activity_ping(&mut self, focused: bool) {
-        let should_send = match self.last_activity_ping {
-            Some(last) => last.elapsed() >= self.activity_ping_interval,
-            None => true,
-        };
-
-        if should_send {
-            match self.send_activity_ping(focused).await {
-                Ok(()) => {
-                    self.last_activity_ping = Some(Instant::now());
-                }
-                Err(_err) => {
-                    // Silently ignore activity ping errors (RTM not configured/no current project)
-                    // This is expected in normal TUI usage without voice coding features
-                }
-            }
-        }
-    }
-
-    pub async fn process_rtm_messages(&mut self) -> Result<()> {
-        // RTM DISABLED: No RTM events to process
-        // Still flush transcriptions if needed
-        self.flush_pending_transcriptions().await?;
-        Ok(())
-    }
-
-    pub fn handle_rtm_event(&mut self, event: RtmEvent) {
-        if event.payload.trim().is_empty() {
-            return;
-        }
-
-        match serde_json::from_str::<Value>(&event.payload) {
-            Ok(value) => {
-                if let Some(kind) = value.get("type").and_then(|v| v.as_str()) {
-                    match kind {
-                        "transcription" => {
-                            let target = value
-                                .get("target")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            if target == self.rtm_client_id {
-                                if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
-                                    self.pending_transcriptions.push_back(text.to_string());
-                                }
-                            }
-                        }
-                        "active_update" => {
-                            if let Some(active) =
-                                value.get("active_atem_id").and_then(|v| v.as_str())
-                            {
-                                if active == self.rtm_client_id {
-                                    self.status_message =
-                                        Some("Astation marked this Atem as active.".to_string());
-                                } else {
-                                    self.status_message =
-                                        Some(format!("Astation active Atem: {}", active));
-                                }
-                            }
-                        }
-                        "dictation_state" => {
-                            if let Some(state) = value.get("enabled").and_then(|v| v.as_bool()) {
-                                self.status_message = Some(if state {
-                                    "Astation dictation enabled.".to_string()
-                                } else {
-                                    "Astation dictation paused.".to_string()
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(err) => {
-                self.status_message = Some(format!(
-                    "Failed to parse RTM message '{}' ({})",
-                    event.payload, err
-                ));
-            }
-        }
-    }
-
-    pub async fn flush_pending_transcriptions(&mut self) -> Result<()> {
-        while let Some(text) = self.pending_transcriptions.pop_front() {
-            let focused = self.focused_session().map(|s| (s.id.clone(), s.provider));
-            if let Some((id, Provider::Codex)) = &focused {
-                if let Err(err) = self.send_prompt(id, &text) {
-                    self.status_message =
-                        Some(format!("Failed to send transcription to Codex: {}", err));
-                    return Err(err);
-                }
-            } else if let Some((id, Provider::Claude)) = focused.as_ref().filter(|_| !self.astation_connected) {
-                if let Err(err) = self.send_prompt(id, &text) {
-                    self.status_message =
-                        Some(format!("Failed to send transcription to Claude: {}", err));
-                    return Err(err);
-                }
-            } else {
-                self.status_message = Some(format!(
-                    "Transcription received (switch to Codex/Claude): {}",
-                    text
-                ));
-                self.pending_transcriptions.push_front(text);
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn register_local_activity(&mut self, focused: bool) {
-        self.maybe_send_activity_ping(focused).await;
     }
 
     pub fn finalize_session(&mut self, id: &SessionId) {
@@ -1308,13 +1041,6 @@ impl App {
         if self.intercept_astation_reauth(&message).await {
             return;
         }
-        let shared = self.sessions.iter().any(|s| s.share.has_viewer());
-        if (shared || self.astation_client.is_ws_closed()) && matches!(&message, AstationMessage::AgentInput { .. } | AstationMessage::AgentPrompt { .. }
-            | AstationMessage::VoiceRequest { .. } | AstationMessage::VoiceCommand { .. }
-            | AstationMessage::VoiceToggle { .. } | AstationMessage::UserCommand { .. }) {
-            self.handle_terminal_legacy_rejection();
-            return;
-        }
         match self.astation_client.handle_encryption_message(&message).await {
             Ok(Some(status)) => {
                 self.status_message = Some(status);
@@ -1390,57 +1116,14 @@ impl App {
                 // `auth_required` and auth replies were handled by
                 // `intercept_astation_reauth`; other status updates need nothing.
             }
-            AstationMessage::CodexTaskResponse {
-                output,
-                success,
-                timestamp: _,
-            } => {
-                let text = if success {
-                    format!("\u{1f9e0} [Astation] {}\n", output)
-                } else {
-                    format!("\u{274c} [Astation] {}\n", output)
-                };
-                self.status_message = Some(text.trim().to_string());
-                let codex = self.sessions.latest(Provider::Codex);
-                if let Some(session) = codex.as_ref().and_then(|id| self.sessions.get_mut(id)) {
-                    crate::app::terminal::append_log(&mut session.raw_log, &mut session.raw_log_start, &text);
-                }
-                if let Some(codex) = codex.filter(|id| self.is_focused(id)) {
-                    self.refresh_view(&codex);
-                } else if success {
-                    self.output_text = format!("\u{1f9e0} Codex response (via Astation):\n\n{}", output);
-                } else {
-                    self.output_text = format!("\u{274c} Codex task failed (via Astation): {}", output);
-                }
-            }
             AstationMessage::VolumeUpdate { level } => {
                 self.update_voice_volume(level);
-            }
-            AstationMessage::VoiceToggle { active } => {
-                self.voice_active = active;
-                // PTT flush: when mic is released, send any buffered voice text to Claude
-                if !active && self.voice_commands.has_content() {
-                    let command = self.voice_commands.take();
-                    self.status_message = Some(format!("\u{1f3a4} PTT: {}", command));
-                    match self.default_session(Provider::Claude, true) {
-                        Err(message) => self.status_message = Some(message),
-                        Ok(id) => {
-                            if let Err(err) = self.send_prompt(&id, &command) {
-                                self.status_message =
-                                    Some(format!("Failed to send PTT voice to Claude: {}", err));
-                            }
-                        }
-                    }
-                }
             }
             AstationMessage::VideoToggle { active } => {
                 self.video_active = active;
             }
             AstationMessage::AtemInstanceList { instances } => {
                 self.peer_atems = instances;
-            }
-            AstationMessage::VoiceCommand { text, is_final } => {
-                self.handle_voice_command(&text, is_final).await;
             }
             AstationMessage::MarkTaskAssignment { task_id, received_at_ms } => {
                 self.status_message = Some(format!("\u{1f4cc} Task received: {}", task_id));
@@ -1468,71 +1151,15 @@ impl App {
                     }
                 }
             }
-            AstationMessage::UserCommand { command, context } => {
-                let action = context.get("action").map(|s| s.as_str()).unwrap_or("cli_input");
-
-                if action == "shell" {
-                    // Shell output is not relayed back yet.
-                    self.pending_astation_command = None;
-                    self.execute_command(&command).await.ok();
-                } else {
-                    // "codex_input" goes to the latest Codex session; anything
-                    // else ("cli_input", "claude_input") to the latest Claude one.
-                    let provider = if action == "codex_input" { Provider::Codex } else { Provider::Claude };
-                    match self.default_session(provider, true) {
-                        Err(message) => {
-                            self.status_message = Some(message);
-                            return;
-                        }
-                        Ok(target) => {
-                            // Output relay starts at the end of the raw log, which accumulates.
-                            let output_start_pos = self.log_end(&target);
-                            self.pending_astation_command = Some(PendingAstationCommand {
-                                target: target.clone(),
-                                output_start_pos,
-                                sent_at: Instant::now(),
-                            });
-                            self.send_prompt(&target, &command).ok();
-                        }
-                    }
-                }
-
-                self.status_message = Some(format!(
-                    "Received command: {}",
-                    &command[..command.len().min(50)]
-                ));
-            }
             AstationMessage::AgentListRequest => {
                 let agents = self.agent_registry.all();
                 let _ = self.astation_client.send_agent_list(agents).await;
-            }
-            AstationMessage::AgentPrompt {
-                agent_id,
-                session_id: _,
-                text,
-            } => {
-                self.handle_agent_prompt(&agent_id, &text).await;
-            }
-            AstationMessage::VoiceRequest {
-                session_id,
-                accumulated_text,
-                relay_url,
-            } => {
-                self.handle_voice_request(session_id, accumulated_text, relay_url).await;
             }
             AstationMessage::Terminal(envelope) => {
                 self.handle_terminal_message(envelope);
             }
             AstationMessage::AgentChat(envelope) => {
                 self.handle_agent_chat(envelope).await;
-            }
-            AstationMessage::AgentInput {
-                agent_id,
-                kind,
-                text,
-                key,
-            } => {
-                self.handle_agent_input(agent_id, kind, text, key);
             }
             AstationMessage::VisualizeRequest { session_id, .. } => {
                 // Diagram generation was removed; answer so Astation stops waiting.
@@ -1797,243 +1424,6 @@ impl App {
         }
     }
 
-    // MARK: - Voice Command Processing
-
-    /// Handle an incoming voice command chunk from Astation.
-    /// Buffers text until a trigger word is detected (or is_final is set),
-    /// then sends the accumulated text to Claude Code via PTY.
-    pub async fn handle_voice_command(&mut self, text: &str, is_final: bool) {
-        self.voice_commands.push(text);
-
-        let should_send = is_final || self.voice_commands.detect_trigger();
-
-        if should_send && self.voice_commands.has_content() {
-            let command = self.voice_commands.take();
-
-            self.status_message = Some(format!("\u{1f3a4} Voice: {}", command));
-
-            // Send to Claude Code (never starts a session).
-            match self.default_session(Provider::Claude, true) {
-                Err(message) => self.status_message = Some(message),
-                Ok(id) => {
-                    if let Err(err) = self.send_prompt(&id, &command) {
-                        self.status_message =
-                            Some(format!("Failed to send voice command to Claude: {}", err));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Remote agent control (Astation → Atem): write text or a control key to
-    /// the session `agent_id` names, else to the latest Claude session (unless
-    /// its terminal holds a draft; see `route`). `kind:"text"` types the line
-    /// and submits it with Enter; `kind:"key"` writes the raw control bytes (see
-    /// [`agent_key_to_bytes`]). Unknown kinds/keys are dropped with a status note.
-    pub fn handle_agent_input(
-        &mut self,
-        agent_id: Option<String>,
-        kind: String,
-        text: Option<String>,
-        key: Option<String>,
-    ) {
-        if self.sessions.iter().any(|s| s.share.has_viewer()) {
-            self.status_message = Some("Use terminal-v1 control for an attached terminal".into());
-            return;
-        }
-        // `kind` selects the input; the non-matching field is ignored (Astation
-        // only ever populates one).
-        let data: Option<String> = match kind.as_str() {
-            // Type the line and submit it. Trims + skips empty like
-            // send_prompt, and matches its submit sequence (text, then
-            // "\n", then "\r") which the Claude/Codex TUIs need to accept a line.
-            "text" => text
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .map(|t| format!("{t}\n\r")),
-            "key" => key
-                .as_deref()
-                .and_then(agent_key_to_bytes)
-                .map(|s| s.to_string()),
-            _ => None,
-        };
-
-        let Some(data) = data else {
-            self.status_message = Some(format!(
-                "Ignored agentInput (kind={}, key={:?})",
-                kind, key
-            ));
-            return;
-        };
-
-        // Only text could submit a draft; control keys always pass.
-        match self.route(agent_id.as_deref(), Provider::Claude, kind == "text") {
-            Err(message) => self.status_message = Some(message),
-            Ok(target) => {
-                self.status_message = Some(format!("\u{2328} agentInput: {}", kind));
-                self.send_data(&target, &data);
-            }
-        }
-    }
-
-    pub async fn handle_voice_request(
-        &mut self,
-        session_id: String,
-        accumulated_text: String,
-        relay_url: String,
-    ) {
-        self.status_message = Some(format!("\u{1f3a4} Voice request: {}", &accumulated_text[..accumulated_text.len().min(50)]));
-
-        // Send the transcribed text to Claude Code (never starts a session).
-        let target = self.default_session(Provider::Claude, true);
-        let sent = match &target {
-            Ok(id) => self.send_prompt(id, &accumulated_text),
-            Err(message) => Err(anyhow::anyhow!("{message}")),
-        };
-        if let Err(err) = sent {
-            self.status_message =
-                Some(format!("Failed to send voice request to Claude: {}", err));
-            // POST failure to relay so it unblocks
-            let client = reqwest::Client::new();
-            let _ = client
-                .post(format!("{}/api/voice-sessions/response", relay_url))
-                .json(&serde_json::json!({
-                    "session_id": session_id,
-                    "response": format!("Error: {}", err),
-                }))
-                .send()
-                .await;
-            let _ = self
-                .astation_client
-                .send_voice_response(&session_id, false, &format!("Failed to send to Claude: {}", err))
-                .await;
-            return;
-        }
-
-        // Track pending request — watch for Claude output completion
-        let Ok(target) = target else { return; };
-        let now = Instant::now();
-        let output_snapshot_len = self.log_end(&target);
-        self.pending_voice_request = Some(PendingVoiceRequest {
-            target,
-            session_id,
-            relay_url,
-            sent_at: now,
-            output_snapshot_len,
-            last_output_at: now,
-        });
-    }
-
-    /// The absolute end of session `id`'s raw log.
-    fn log_end(&self, id: &SessionId) -> usize {
-        self.sessions
-            .get(id)
-            .map_or(0, |s| s.raw_log_start + s.raw_log.len())
-    }
-
-    /// Check if a pending voice request's Claude output is complete (2s inactivity).
-    /// When done, POST the response to the relay and notify Astation.
-    pub async fn check_voice_request_completion(&mut self) {
-        let pending = match self.pending_voice_request.clone() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let current_len = self.log_end(&pending.target);
-
-        // Output is still growing — update snapshot
-        if current_len > pending.output_snapshot_len {
-            if let Some(ref mut p) = self.pending_voice_request {
-                p.output_snapshot_len = current_len;
-                p.last_output_at = Instant::now();
-            }
-            return;
-        }
-
-        // No new output yet — wait at least 2 seconds of inactivity
-        if pending.last_output_at.elapsed() < Duration::from_secs(2) {
-            return;
-        }
-
-        // Also require at least 2s since the prompt was sent (avoid racing)
-        if pending.sent_at.elapsed() < Duration::from_secs(2) {
-            return;
-        }
-
-        // Claude is done — extract the response text.
-        // At this point current_len <= pending.output_snapshot_len (output stopped growing).
-        let output = self
-            .sessions
-            .get(&pending.target)
-            .map_or("", |s| crate::app::terminal::log_since(&s.raw_log, s.raw_log_start, pending.output_snapshot_len));
-        let response_text = if !output.is_empty() {
-            output.to_string()
-        } else {
-            "No output received from Claude.".to_string()
-        };
-
-        // POST response to relay server
-        let client = reqwest::Client::new();
-        let post_result = client
-            .post(format!("{}/api/voice-sessions/response", pending.relay_url))
-            .json(&serde_json::json!({
-                "session_id": pending.session_id,
-                "response": response_text,
-            }))
-            .send()
-            .await;
-
-        let success = post_result.is_ok();
-        let msg = if success {
-            "Response delivered to relay".to_string()
-        } else {
-            format!("Failed to POST to relay: {}", post_result.unwrap_err())
-        };
-
-        // Notify Astation
-        let _ = self
-            .astation_client
-            .send_voice_response(&pending.session_id, success, &msg)
-            .await;
-
-        self.status_message = Some(format!("\u{1f3a4} Voice response: {}", msg));
-        self.pending_voice_request = None;
-    }
-
-    /// Check if pending Astation command has output ready and relay it back.
-    /// Sends output after 2 seconds of inactivity.
-    pub async fn check_relay_output(&mut self) {
-        if let Some(ref pending) = self.pending_astation_command.clone() {
-            let elapsed = pending.sent_at.elapsed();
-
-            // Wait at least 2 seconds for output to accumulate
-            if elapsed < Duration::from_secs(2) {
-                return;
-            }
-
-            // Extract output since command was sent (use raw_log which accumulates all output)
-            let output = self
-                .sessions
-                .get(&pending.target)
-                .map_or("", |s| crate::app::terminal::log_since(&s.raw_log, s.raw_log_start, pending.output_start_pos));
-            let (output, success) = if !output.is_empty() {
-                (output.to_string(), true)
-            } else {
-                ("No output received".to_string(), false)
-            };
-
-            // Send response back to Astation
-            if let Err(e) = self.astation_client.send_command_response(&output, success).await {
-                self.status_message = Some(format!("Failed to relay output to Astation: {}", e));
-            } else {
-                self.status_message = Some("Output relayed to Astation".to_string());
-            }
-
-            // Clear pending command
-            self.pending_astation_command = None;
-        }
-    }
-
     pub async fn process_astation_messages(&mut self) {
         // Revoke before draining requests that were queued on a closed transport.
         if self.astation_connected && self.astation_client.is_ws_closed() {
@@ -2068,12 +1458,6 @@ impl App {
                 let _ = session.save();
             }
         }
-
-        // Check if we should relay output back to Astation
-        self.check_relay_output().await;
-
-        // Check if pending voice request has completed
-        self.check_voice_request_completion().await;
     }
 
     /// Check if it is time to retry the Astation connection.
@@ -2102,124 +1486,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_key_maps_control_keys_to_pty_bytes() {
-        assert_eq!(agent_key_to_bytes("enter"), Some("\r"));
-        assert_eq!(agent_key_to_bytes("esc"), Some("\x1b"));
-        assert_eq!(agent_key_to_bytes("ctrl-c"), Some("\x03"));
-        assert_eq!(agent_key_to_bytes("up"), Some("\x1b[A"));
-        assert_eq!(agent_key_to_bytes("down"), Some("\x1b[B"));
-        assert_eq!(agent_key_to_bytes("y"), Some("y"));
-        assert_eq!(agent_key_to_bytes("n"), Some("n"));
-    }
-
-    #[test]
-    fn agent_key_unknown_returns_none() {
-        assert_eq!(agent_key_to_bytes("f13"), None);
-        assert_eq!(agent_key_to_bytes(""), None);
-        assert_eq!(agent_key_to_bytes("Enter"), None); // case-sensitive by design
-    }
-
-    /// A session of `provider` writing to `input`, shown by the terminal view. Live
-    /// without a process on purpose: these tests only check what reaches its input.
-    fn focus_test_session(app: &mut App, provider: Provider, input: crate::pty_session::PtyInput) {
-        let mut session = Session::new(provider, 24, 80);
-        session.input = Some(input);
-        let id = app.sessions.insert(session).unwrap().id.clone();
-        app.focused = Some(id);
-        app.mode = AppMode::Terminal;
-    }
-
-    #[test]
-    fn handle_agent_input_text_types_line_and_submits_to_claude() {
-        let mut app = App::new();
-        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        focus_test_session(&mut app, Provider::Claude, tx);
-        app.handle_agent_input(None, "text".into(), Some("hello".into()), None);
-        let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(got, "hello\n\r");
-    }
-
-    #[test]
-    fn handle_agent_input_key_writes_raw_control_bytes() {
-        let mut app = App::new();
-        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        focus_test_session(&mut app, Provider::Claude, tx);
-        app.handle_agent_input(None, "key".into(), None, Some("ctrl-c".into()));
-        let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(got, "\x03");
-    }
-
-    #[test]
-    fn handle_agent_input_empty_text_sends_nothing() {
-        let mut app = App::new();
-        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        focus_test_session(&mut app, Provider::Claude, tx);
-        app.handle_agent_input(None, "text".into(), Some("   ".into()), None);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn handle_agent_input_unknown_key_sends_nothing() {
-        let mut app = App::new();
-        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        focus_test_session(&mut app, Provider::Claude, tx);
-        app.handle_agent_input(None, "key".into(), None, Some("f13".into()));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn handle_agent_input_routes_to_codex_by_id() {
-        let mut app = App::new();
-        let (tx, mut rx) = crate::pty_session::PtyInput::test_channel();
-        focus_test_session(&mut app, Provider::Codex, tx);
-        let codex = app.focused.clone().unwrap();
-        app.handle_agent_input(Some(codex.to_string()), "key".into(), None, Some("esc".into()));
-        let got: String = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(got, "\x1b");
-    }
-
-    #[test]
     fn test_pairing_code_default_is_none() {
         let app = App::new();
         assert!(app.pairing_code.is_none());
-    }
-
-    #[test]
-    fn test_pending_voice_request_default_is_none() {
-        let app = App::new();
-        assert!(app.pending_voice_request.is_none());
-    }
-
-    #[test]
-    fn test_pending_voice_request_tracks_fields() {
-        let now = Instant::now();
-        let req = PendingVoiceRequest {
-            target: SessionId::new(),
-            session_id: "sess-123".to_string(),
-            relay_url: "https://relay.example.com".to_string(),
-            sent_at: now,
-            output_snapshot_len: 42,
-            last_output_at: now,
-        };
-        assert_eq!(req.session_id, "sess-123");
-        assert_eq!(req.relay_url, "https://relay.example.com");
-        assert_eq!(req.output_snapshot_len, 42);
-    }
-
-    #[test]
-    fn test_pending_voice_request_clone() {
-        let now = Instant::now();
-        let req = PendingVoiceRequest {
-            target: SessionId::new(),
-            session_id: "sess-clone".to_string(),
-            relay_url: "https://relay.test".to_string(),
-            sent_at: now,
-            output_snapshot_len: 100,
-            last_output_at: now,
-        };
-        let cloned = req.clone();
-        assert_eq!(cloned.session_id, "sess-clone");
-        assert_eq!(cloned.output_snapshot_len, 100);
     }
 
     /// Diagram generation was removed: every `visualizeRequest` is answered

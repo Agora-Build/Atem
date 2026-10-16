@@ -154,7 +154,6 @@ dependencies = [
  "anyhow",
  "atem-core",
  "base64 0.21.7",
- "cc",
  "chacha20poly1305",
  "clap",
  "crossterm 0.27.0",

@@ -356,19 +356,6 @@ impl Sessions {
         self.order.clone()
     }
 
-    /// "claude"/"codex" alias or a session id → the live session it names
-    /// (alias = the most recently used live session of that provider).
-    pub fn resolve(&self, id_or_alias: &str) -> Option<SessionId> {
-        if let Some(provider) = Provider::from_alias(id_or_alias) {
-            return self.latest(provider);
-        }
-        let id = SessionId::parse(id_or_alias)?;
-        self.map
-            .get(&id)
-            .filter(|s| s.is_live())
-            .map(|s| s.id.clone())
-    }
-
     /// The most recently used live session of `provider` (the newest on a tie).
     pub fn latest(&self, provider: Provider) -> Option<SessionId> {
         self.iter()
@@ -553,9 +540,8 @@ mod tests {
     }
 
     #[test]
-    fn aliases_resolve_to_the_most_recently_used_live_session() {
+    fn latest_is_the_most_recently_used_live_session() {
         let mut sessions = Sessions::default();
-        assert_eq!(sessions.resolve("claude"), None);
         assert_eq!(sessions.latest(Provider::Claude), None);
         let start = Instant::now();
         let mut ids = Vec::new();
@@ -570,20 +556,13 @@ mod tests {
             .id
             .clone();
         assert_eq!(sessions.latest(Provider::Claude), Some(ids[1].clone()));
-        assert_eq!(sessions.resolve("claude"), Some(ids[1].clone()));
-        assert_eq!(sessions.resolve("codex"), Some(codex.clone()));
-        // Use moves the alias.
+        assert_eq!(sessions.latest(Provider::Codex), Some(codex));
+        // Use moves the latest.
         sessions.get_mut(&ids[0]).unwrap().last_used = start + Duration::from_secs(9);
-        assert_eq!(sessions.resolve("claude"), Some(ids[0].clone()));
-        // Exited sessions are not aliased or resolved.
+        assert_eq!(sessions.latest(Provider::Claude), Some(ids[0].clone()));
+        // Exited sessions are never the latest.
         sessions.get_mut(&ids[0]).unwrap().exited_at = Some(Instant::now());
-        assert_eq!(sessions.resolve("claude"), Some(ids[1].clone()));
-        assert_eq!(sessions.resolve(ids[0].as_str()), None);
-        // A session id names its own session.
-        assert_eq!(sessions.resolve(ids[2].as_str()), Some(ids[2].clone()));
-        assert_eq!(sessions.resolve(codex.as_str()), Some(codex));
-        assert_eq!(sessions.resolve("ses-aaaaaaaaaaaa"), None);
-        assert_eq!(sessions.resolve("gemini"), None);
+        assert_eq!(sessions.latest(Provider::Claude), Some(ids[1].clone()));
         sessions.get_mut(&ids[1]).unwrap().exited_at = Some(Instant::now());
         sessions.get_mut(&ids[2]).unwrap().exited_at = Some(Instant::now());
         assert_eq!(sessions.latest(Provider::Claude), None);

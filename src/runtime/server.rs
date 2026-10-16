@@ -656,12 +656,9 @@ impl Server {
         None
     }
 
-    /// A session id or the `claude`/`codex` alias (live or exited sessions).
-    fn find(&self, id_or_alias: &str) -> Option<SessionId> {
-        if let Some(sid) = self.app.sessions.resolve(id_or_alias) {
-            return Some(sid);
-        }
-        SessionId::parse(id_or_alias).filter(|sid| self.app.sessions.get(sid).is_some())
+    /// The session a session id names (live or exited).
+    fn find(&self, id: &str) -> Option<SessionId> {
+        SessionId::parse(id).filter(|sid| self.app.sessions.get(sid).is_some())
     }
 
     /// The session `session_id` names when `client` is attached to it.
