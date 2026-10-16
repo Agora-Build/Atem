@@ -140,41 +140,73 @@ impl OpUi for ClientUi {
     }
 }
 
-/// What operations need besides the link: the profile and the key agent
-/// (tests use temp ones) and how pairing connections are made.
+/// Where an operation's profile comes from (read when it starts).
+type ProfileSource = Arc<dyn Fn() -> Result<Sources> + Send + Sync>;
+/// Where an operation's key agent comes from.
+type AgentSource = Arc<dyn Fn() -> Result<Arc<dyn KeyAgentApi>> + Send + Sync>;
+
+/// What operations need besides the link: the profile, the key agent and
+/// how long to wait for the link. Named explicitly: this user's
+/// (`for_user`, `atem runtime`), a given one (`for_profile`, tests), or
+/// none (`unavailable`: every operation fails).
 #[derive(Clone)]
 pub struct OpEnv {
-    /// `None`: this user's profile, read when the operation starts.
-    pub profile: Option<Sources>,
-    /// `None`: the user's key agent (started on demand).
-    pub key_agent: Option<Arc<dyn KeyAgentApi>>,
-    /// A fresh client for a first pairing.
-    pub new_client: fn(&Sources) -> AstationClient,
-}
-
-impl Default for OpEnv {
-    fn default() -> Self {
-        Self {
-            profile: None,
-            key_agent: None,
-            new_client: |src| AstationClient::new().with_profile(src.clone()),
-        }
-    }
+    profile: ProfileSource,
+    agent: AgentSource,
+    /// How long an operation waits for the link to come up.
+    pub link_wait: Duration,
 }
 
 impl OpEnv {
-    fn sources(&self) -> Result<Sources> {
-        match &self.profile {
-            Some(profile) => Ok(profile.clone()),
-            None => Sources::current(),
+    /// This user's profile (read when each operation starts) and key agent.
+    pub fn for_user() -> Self {
+        Self {
+            profile: Arc::new(Sources::current),
+            agent: Arc::new(|| Ok(Arc::from(default_agent()))),
+            link_wait: LINK_WAIT,
         }
     }
 
-    fn agent(&self) -> Arc<dyn KeyAgentApi> {
-        match &self.key_agent {
-            Some(agent) => agent.clone(),
-            None => Arc::from(default_agent()),
+    /// The profile `src` and the key agent `agent`.
+    #[cfg(test)]
+    pub fn for_profile(src: Sources, agent: Arc<dyn KeyAgentApi>) -> Self {
+        Self {
+            profile: Arc::new(move || Ok(src.clone())),
+            agent: Arc::new(move || Ok(agent.clone())),
+            link_wait: LINK_WAIT,
         }
+    }
+
+    /// Waits `wait` for the link instead.
+    #[cfg(test)]
+    pub fn with_link_wait(mut self, wait: Duration) -> Self {
+        self.link_wait = wait;
+        self
+    }
+
+    /// No profile: every operation fails (a runtime that runs none).
+    #[cfg(test)]
+    pub fn unavailable() -> Self {
+        Self {
+            profile: Arc::new(|| Err(anyhow!("this runtime runs no Astation operations"))),
+            agent: Arc::new(|| Err(anyhow!("this runtime runs no Astation operations"))),
+            link_wait: LINK_WAIT,
+        }
+    }
+
+    fn sources(&self) -> Result<Sources> {
+        (self.profile)()
+    }
+
+    fn agent(&self) -> Result<Arc<dyn KeyAgentApi>> {
+        (self.agent)()
+    }
+
+    /// A fresh client of the profile `src` for a first pairing.
+    fn new_client(&self, src: &Sources) -> Result<AstationClient> {
+        Ok(AstationClient::new()
+            .with_profile(src.clone())
+            .with_agent(self.agent()?))
     }
 }
 
@@ -300,6 +332,7 @@ async fn guard<U: OpUi, T>(ui: &U, work: impl Future<Output = Result<T>>) -> Res
 /// A handle on the broker's authenticated link (waits up to `LINK_WAIT`).
 async fn link(
     calls: &mpsc::UnboundedSender<OpCall>,
+    wait: Duration,
     encryption: bool,
     credentials: bool,
 ) -> Result<AstationClient> {
@@ -311,7 +344,7 @@ async fn link(
             reply,
         })
         .map_err(|_| anyhow!("the atem runtime is stopping"))?;
-    tokio::time::timeout(LINK_WAIT, answer)
+    tokio::time::timeout(wait, answer)
         .await
         .map_err(|_| anyhow!(NO_LINK))?
         .map_err(|_| anyhow!(NO_LINK))?
@@ -321,22 +354,24 @@ async fn link(
 /// `link`, which must be authenticated with `astation_id` (`what` names it).
 async fn link_to(
     calls: &mpsc::UnboundedSender<OpCall>,
+    env: &OpEnv,
     astation_id: &str,
     what: &str,
     encryption: bool,
 ) -> Result<AstationClient> {
-    link_routing(calls, astation_id, what, encryption, false).await
+    link_routing(calls, env, astation_id, what, encryption, false).await
 }
 
 /// `link_to`, with `credentialSync` routed to the operation when `credentials`.
 async fn link_routing(
     calls: &mpsc::UnboundedSender<OpCall>,
+    env: &OpEnv,
     astation_id: &str,
     what: &str,
     encryption: bool,
     credentials: bool,
 ) -> Result<AstationClient> {
-    let view = link(calls, encryption, credentials).await?;
+    let view = link(calls, env.link_wait, encryption, credentials).await?;
     match view.connected_astation_id() {
         Some(id) if id == astation_id => Ok(view),
         other => bail!(
@@ -400,7 +435,7 @@ async fn pair_verify<U: OpUi>(
     };
     let mut view = guard(
         ui,
-        link_to(calls, &astation_id, "the paired Astation", true),
+        link_to(calls, env, &astation_id, "the paired Astation", true),
     )
     .await?;
     ui.print(
@@ -408,7 +443,7 @@ async fn pair_verify<U: OpUi>(
         &format!("Verifying this device with Astation {astation_id}..."),
     );
     let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.keys, env.agent(), ui).await,
+        verify_device(&mut view, &astation_id, &src.keys, env.agent()?, ui).await,
         |line| ui.print(PrintLevel::Warn, line),
     );
     settle_encryption(&mut view, ui).await;
@@ -680,7 +715,7 @@ async fn pair<U: OpUi>(
     };
     let config = src.config.clone();
     ui.print(PrintLevel::Info, "Connecting to Astation...");
-    let mut client = (env.new_client)(&src).with_pairing_notice(ui.printer());
+    let mut client = env.new_client(&src)?.with_pairing_notice(ui.printer());
     // Local first, then a relay pairing code. Returns the code (or "local").
     let result = guard(ui, client.connect_with_pairing(&config)).await?;
     if result == "local" {
@@ -731,7 +766,7 @@ async fn pair<U: OpUi>(
         // encryption messages it held are applied on the authenticated one.
         let held = client.take_held_encryption();
         drop(client);
-        let mut identity = (env.new_client)(&src).with_pairing_notice(ui.printer());
+        let mut identity = env.new_client(&src)?.with_pairing_notice(ui.printer());
         guard(
             ui,
             identity.connect_relay_identity(config.astation_relay_url(), &astation_id),
@@ -796,7 +831,7 @@ async fn pair<U: OpUi>(
         .map_err(|_| anyhow!("the atem runtime is stopping"))?;
     let mut view = guard(
         ui,
-        link_to(calls, &astation_id, "the paired Astation", true),
+        link_to(calls, env, &astation_id, "the paired Astation", true),
     )
     .await?;
     for message in held {
@@ -805,7 +840,7 @@ async fn pair<U: OpUi>(
     // A failed verification is shown, then makes the result a failure; the
     // pairing stays saved.
     let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.keys, env.agent(), ui).await,
+        verify_device(&mut view, &astation_id, &src.keys, env.agent()?, ui).await,
         |line| ui.print(PrintLevel::Warn, line),
     );
     settle_encryption(&mut view, ui).await;
@@ -872,7 +907,7 @@ async fn cred_unlock<U: OpUi>(
     let src = env.sources()?;
     let paths = &src.keys;
     let home = unlock_home(&src)?;
-    let agent = env.agent();
+    let agent = env.agent()?;
     let nothing_to_do = {
         let (agent, paths, home) = (agent.clone(), paths.clone(), home.clone());
         blocking(move || already_unlocked(agent.as_ref(), &paths, &home)).await?
@@ -884,7 +919,7 @@ async fn cred_unlock<U: OpUi>(
                 PrintLevel::Info,
                 "Finishing the encryption migration with Astation…",
             );
-            let view = link_to(calls, &home, "this device's home Astation", true).await?;
+            let view = link_to(calls, env, &home, "this device's home Astation", true).await?;
             match view.finish_pending_migration(&home).await {
                 Ok(Some(status)) => ui.print(PrintLevel::Info, &shown(&status)),
                 Ok(None) => {}
@@ -896,7 +931,7 @@ async fn cred_unlock<U: OpUi>(
         }
         return Ok(());
     }
-    let mut view = link_to(calls, &home, "this device's home Astation", true).await?;
+    let mut view = link_to(calls, env, &home, "this device's home Astation", true).await?;
     // Every key-agent request from here on (finishing the unlock, rotation,
     // escrow) runs only while the pairing the link authenticated under is
     // current: a grant or ack arriving after `atem unpair` is dropped.
@@ -924,7 +959,7 @@ async fn cred_unlock<U: OpUi>(
     // The report sent on connect was skipped (the keys were still locked);
     // send it now. Best effort, like on connect.
     let _ = view
-        .report_credential_projects_with(None, env.agent())
+        .report_credential_projects_with(None, env.agent()?)
         .await;
     Ok(())
 }
@@ -941,12 +976,12 @@ async fn cred_projects<U: OpUi>(
         .home()
         .ok_or_else(|| anyhow!("Verify this device with Astation first"))?
         .to_string();
-    let agent = env.agent();
+    let agent = env.agent()?;
     let status = agent.clone();
     if !blocking(move || status.status().map(|status| status.unlocked)).await? {
         bail!(LOCKED);
     }
-    let view = link_to(calls, &home, "this device's home Astation", false).await?;
+    let view = link_to(calls, env, &home, "this device's home Astation", false).await?;
     view.report_credential_projects_with(cwd, agent)
         .await
         .context("Project reporting requires an updated, unlocked Atem key agent")?;
@@ -982,9 +1017,8 @@ async fn token<U: OpUi>(
     if paired_fresh(&src.credentials, &astation_id) {
         return Ok(());
     }
-    let mut view = link_routing(calls, &astation_id, "the paired Astation", false, true)
-        .await
-        .map_err(|_| anyhow!("timed out waiting for Astation"))?;
+    let mut view =
+        link_routing(calls, env, &astation_id, "the paired Astation", false, true).await?;
     if paired_fresh(&src.credentials, &astation_id) {
         return Ok(());
     }

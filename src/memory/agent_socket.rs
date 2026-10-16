@@ -53,6 +53,9 @@ fn own_uid() -> u32 {
 /// `$XDG_RUNTIME_DIR/atem/agent.sock` when that directory is safe, else
 /// `~/.config/atem/agent.sock`.
 pub fn agent_socket_path() -> PathBuf {
+    #[cfg(test)]
+    return socket_path_in(&crate::test_profile::dir(), None);
+    #[cfg(not(test))]
     socket_path_in(
         &crate::config::AtemConfig::config_dir(),
         std::env::var_os("XDG_RUNTIME_DIR"),
@@ -76,6 +79,7 @@ fn socket_path_from(runtime_dir: Option<OsString>, config_dir: &Path) -> PathBuf
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub fn agent_log_path() -> PathBuf {
     crate::config::AtemConfig::config_dir().join("key-agent.log")
 }
@@ -815,10 +819,10 @@ impl KeyAgentClient {
     #[cfg(test)]
     pub(crate) fn at(socket: PathBuf) -> Self {
         Self {
+            log: socket.with_file_name("key-agent.log"),
             socket,
             record: None,
             launcher: None,
-            log: agent_log_path(),
             lock: None,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
@@ -829,6 +833,7 @@ impl KeyAgentClient {
     }
 
     /// A client for this user's agent that starts it when none answers.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn autostart() -> Self {
         let mut client = Self::finding(
             &crate::config::AtemConfig::config_dir(),
@@ -842,6 +847,7 @@ impl KeyAgentClient {
     }
 
     /// A client for this user's running agent that never starts one.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn existing() -> Self {
         Self::finding(
             &crate::config::AtemConfig::config_dir(),
@@ -876,10 +882,10 @@ impl KeyAgentClient {
     #[cfg(test)]
     pub(crate) fn with_launcher(socket: PathBuf, launcher: Launcher) -> Self {
         Self {
+            log: socket.with_file_name("key-agent.log"),
             socket,
             record: None,
             launcher: Some(launcher),
-            log: agent_log_path(),
             lock: None,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
@@ -1325,13 +1331,11 @@ mod tests {
     fn another_user_is_refused() {
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid().wrapping_add(1));
+        let log = socket.with_file_name("key-agent.log");
         let error = format!("{:#}", KeyAgentClient::at(socket).status().err().unwrap());
         assert!(error.contains("closed the connection"), "{error}");
         // The client checked the listener's uid already: the hint is the log.
-        assert!(
-            error.contains(&format!("see {}", agent_log_path().display())),
-            "{error}"
-        );
+        assert!(error.contains(&format!("see {}", log.display())), "{error}");
         assert!(!error.contains("another user"), "{error}");
     }
 

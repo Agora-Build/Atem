@@ -22,6 +22,9 @@ fn short_dir() -> tempfile::TempDir {
 
 /// `body` on a current-thread runtime with a `LocalSet` (the App stays on one task).
 fn local<F: std::future::Future>(body: F) -> F::Output {
+    // Never the user's profile (src/test_profile.rs).
+    let profile = tempfile::tempdir().unwrap();
+    let _profile = crate::test_profile::use_dir(profile.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -97,7 +100,7 @@ impl Runtime {
             launcher: launcher(dir.path()),
             profile: None,
             clock: Default::default(),
-            ops: Default::default(),
+            ops: crate::runtime::ops::OpEnv::unavailable(),
         };
         let server = tokio::task::spawn_local(serve(app, listener, options, async {
             let _ = stopped.await;
@@ -676,7 +679,7 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
                     launcher: launcher(&root),
                     profile: None,
                     clock: Default::default(),
-                    ops: Default::default(),
+                    ops: crate::runtime::ops::OpEnv::unavailable(),
                 },
                 async {
                     let _ = stopped.await;

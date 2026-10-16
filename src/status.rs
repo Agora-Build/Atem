@@ -114,6 +114,14 @@ impl Sources {
         })
     }
 
+    /// The profile's directory (where `pairing.json` and `config.toml` are).
+    pub fn config_dir(&self) -> PathBuf {
+        self.pairing
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
     /// A profile directory: its `config.toml` (no env overrides), and every
     /// file in it. Never queries a key agent.
     #[cfg(test)]

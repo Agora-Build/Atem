@@ -920,6 +920,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             store.remove_sso();
             store.save()?;
             println!("Logged out.");
+            reload_runtime().await;
             Ok(())
         }
         Commands::Status => {
@@ -1321,8 +1322,9 @@ async fn run_pair_verify_with<F: std::future::Future<Output = Result<()>>>(
     }
 }
 
-/// `atem unpair` tells a running runtime to drop the link and attachments
-/// of the removed pairing; it never starts one.
+/// `atem unpair` and `atem logout` tell a running runtime to re-read the
+/// profile (dropping the link and attachments of a removed pairing); they
+/// never start one.
 async fn reload_runtime() {
     let locator = crate::runtime::client::Locator::default_paths();
     if let Ok(Some(mut client)) =

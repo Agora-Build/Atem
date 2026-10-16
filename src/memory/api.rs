@@ -171,7 +171,6 @@ pub struct KnowledgeClient {
     /// The paired Astation id — the relay account this client syncs with.
     astation_id: String,
     http: reqwest::Client,
-    #[cfg(test)]
     encryption_with: Option<(crate::memory::verification::KeyPaths, std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>)>,
 }
 
@@ -217,12 +216,11 @@ impl KnowledgeClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
-            #[cfg(test)]
             encryption_with: None,
         }
     }
 
-    #[cfg(test)]
+    
     pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::KeyPaths, agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
@@ -253,7 +251,6 @@ impl KnowledgeClient {
     }
 
     fn encryption(&self) -> Result<EncryptionContext, ApiError> {
-        #[cfg(test)]
         if let Some((paths, agent)) = &self.encryption_with {
             return EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone())
                 .map_err(ApiError::from);

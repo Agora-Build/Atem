@@ -31,7 +31,7 @@ pub mod migration;
 pub mod agent_socket;
 
 #[cfg(test)]
-mod e2e_tests;
+pub(crate) mod e2e_tests;
 #[cfg(test)]
 mod kat_tests;
 #[cfg(test)]

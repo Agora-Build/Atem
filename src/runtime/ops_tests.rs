@@ -41,6 +41,9 @@ fn short_dir() -> tempfile::TempDir {
 
 /// `body` on a current-thread runtime with a `LocalSet` (the App stays on one task).
 fn local<F: std::future::Future>(body: F) -> F::Output {
+    // Never the user's profile (src/test_profile.rs).
+    let profile = tempfile::tempdir().unwrap();
+    let _profile = crate::test_profile::use_dir(profile.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -356,6 +359,8 @@ struct Runtime {
     socket: PathBuf,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// The profile and key agent stand in for the user's on this thread.
+    _scopes: (crate::test_profile::Scope, crate::test_profile::Scope),
 }
 
 impl Runtime {
@@ -369,12 +374,17 @@ impl Runtime {
         let root = dir.path();
         let profile = root.join("profile");
         std::fs::create_dir_all(&profile).unwrap();
+        let scopes = (
+            crate::test_profile::use_dir(&profile),
+            crate::test_profile::use_agent(agent.clone()),
+        );
         let mut app = App::new();
         // Never the user's sessions.json, never a real Astation.
         app.last_session_refresh = Some(Instant::now());
         app.astation_reconnect = false;
         app.astation_client =
-            AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"));
+            AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"))
+                .with_agent(agent.clone());
         if let Some(url) = peer_url {
             app.astation_client.connect_raw(url).await.unwrap();
             app.astation_client.pin_astation_for_test(ASTATION);
@@ -393,13 +403,9 @@ impl Runtime {
             }),
             profile: Some(crate::status::Sources::in_dir(&profile)),
             clock: Default::default(),
-            ops: OpEnv {
-                profile: Some(crate::status::Sources::in_dir(&profile)),
-                key_agent: Some(agent),
-                new_client: |src| {
-                    AstationClient::new_with_test_state(ATEM_ID, src.sessions.clone())
-                },
-            },
+            // A link that's gone is reported well within the test's wait.
+            ops: OpEnv::for_profile(crate::status::Sources::in_dir(&profile), agent)
+                .with_link_wait(Duration::from_secs(3)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::task::spawn_local(serve(app, unix, options, async {
@@ -411,6 +417,7 @@ impl Runtime {
             socket,
             stop: Some(stop),
             server,
+            _scopes: scopes,
         }
     }
 
@@ -805,7 +812,9 @@ fn a_reply_without_an_operation_is_dropped() {
             reason: "no".into(),
             revoked: true,
         });
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Handled in order: once the hello after them is answered, they were.
+        let mut peer = peer;
+        peer.hello().await;
         assert!(!rt.keys().trust.exists(), "nothing was applied");
         rt.shutdown().await;
     });
@@ -883,7 +892,9 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
         // Local first: the fake is the local Astation; the relay is unreachable.
         std::fs::write(
             profile.join("config.toml"),
-            format!("astation_ws = \"{url}\"\nastation_relay_url = \"http://127.0.0.1:1\"\n"),
+            format!(
+                "astation_ws = \"{url}\"\nastation_relay_url = \"http://127.0.0.1:1\"\natem_id = \"{ATEM_ID}\"\n"
+            ),
         )
         .unwrap();
         let keys = KeyPaths::in_dir(&profile);
@@ -1152,6 +1163,8 @@ fn the_cli_side_renders_answers_and_ends_with_done() {
 
 #[test]
 fn routing_is_by_operation_and_link() {
+    let profile = tempfile::tempdir().unwrap();
+    let _profile = crate::test_profile::use_dir(profile.path());
     let mut app = App::new();
     app.astation_link_gen = 4;
     let verify_abort = || AstationMessage::VerifyAbort { reason: "r".into() };
@@ -1188,4 +1201,138 @@ fn routing_is_by_operation_and_link() {
     app.astation_link_gen = 5;
     assert!(app.route_to_op(verify_abort()).is_none());
     assert!(rx.try_recv().is_err());
+}
+
+/// A device whose account is migrating to encryption (K held, unlocked and
+/// escrowed), its relay data in a stub relay, paired with `ASTATION`.
+async fn migrating_device(
+    profile: &Path,
+) -> (
+    crate::memory::fake_astation::UnlockedDevice,
+    Arc<std::sync::Mutex<crate::memory::e2e_tests::RelayState>>,
+) {
+    use crate::memory::crypto::EncryptionMode;
+    use crate::memory::e2e_tests::{RelayState, stub_relay};
+    paired(profile);
+    let relay = Arc::new(std::sync::Mutex::new(RelayState::seeded()));
+    let base = stub_relay(relay.clone()).await;
+    std::fs::write(
+        profile.join("config.toml"),
+        format!(
+            "astation_relay_code = \"{ASTATION}\"\nastation_relay_url = \"{base}\"\ninstance_id = \"atem-1\"\n"
+        ),
+    )
+    .unwrap();
+    let mut device = crate::memory::fake_astation::UnlockedDevice::new(profile);
+    device.set_key(EncryptionMode::Enabling, "0123abcd", [7; 32]);
+    (device, relay)
+}
+
+#[test]
+fn cred_unlock_finishes_a_pending_migration_on_the_runtimes_link() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let profile = dir.path().join("profile");
+        let (device, relay) = migrating_device(&profile).await;
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir, Some(&url), device.agent.clone()).await;
+        let mut op = Op::start(rt.client().await, OpKind::CredUnlock, OpOptions::default()).await;
+        let complete = peer.next("encryptionMigrationComplete").await;
+        assert_eq!(complete["data"]["mode"], "on");
+        assert_eq!(complete["data"]["kid"], "0123abcd");
+        op.done().await.unwrap();
+        for line in [
+            "Already unlocked",
+            "Finishing the encryption migration",
+            "Encryption migration complete",
+        ] {
+            assert!(
+                op.printed.iter().any(|l| l.contains(line)),
+                "{line}: {:?}",
+                op.printed
+            );
+        }
+        crate::memory::e2e_tests::assert_all_encrypted_with(&relay.lock().unwrap(), "0123abcd");
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn the_link_leaves_a_migration_to_the_operation_running_one() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        let (device, _relay) = migrating_device(&profile).await;
+        let (url, _peer) = Peer::listen().await;
+        let mut link = AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"))
+            .with_agent(device.agent.clone());
+        link.connect_raw(&url).await.unwrap();
+        link.pin_astation_for_test(ASTATION);
+        // An operation (or another finish) is running one.
+        let running = crate::websocket_client::MIGRATION.lock().await;
+        let status = link.finish_pending_migration(ASTATION).await.unwrap();
+        assert_eq!(
+            status.as_deref(),
+            Some("An encryption migration is already running")
+        );
+        // An operation's handle waits for it instead.
+        let (view, _routed) = link.op_view();
+        let waiting = view.finish_pending_migration(ASTATION);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "the operation waits"
+        );
+        drop(running);
+        let status = tokio::time::timeout(WAIT, waiting).await.unwrap().unwrap();
+        assert_eq!(
+            status.as_deref(),
+            Some("Encryption migration complete; requesting on")
+        );
+    });
+}
+
+#[test]
+fn credentials_astation_sends_go_to_the_links_profile() {
+    local(async {
+        let elsewhere = crate::config::AtemConfig::config_dir();
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (url, _peer) = Peer::listen().await;
+        let mut app = App::new();
+        app.last_session_refresh = Some(Instant::now());
+        app.astation_reconnect = false;
+        app.astation_client =
+            AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"));
+        app.astation_client.connect_raw(&url).await.unwrap();
+        app.astation_client.pin_astation_for_test(ASTATION);
+        app.astation_connected = true;
+        app.handle_astation_message(AstationMessage::CredentialSync {
+            access_token: "synced".into(),
+            refresh_token: "r".into(),
+            expires_at: crate::credentials::CredentialEntry::now_secs() + 3600,
+            login_id: None,
+            astation_id: ASTATION.into(),
+            save_credentials: false,
+        })
+        .await;
+        let creds = profile.join("credentials.enc");
+        assert!(crate::runtime::ops::paired_fresh(&creds, ASTATION));
+        app.on_astation_disconnect();
+        let mut store = crate::credentials::CredentialStore::load_from(&creds);
+        assert!(
+            store
+                .find_paired_mut(ASTATION)
+                .unwrap()
+                .disconnected_at
+                .is_some()
+        );
+        assert!(
+            !elsewhere.join("credentials.enc").exists(),
+            "only the link's profile"
+        );
+    });
 }

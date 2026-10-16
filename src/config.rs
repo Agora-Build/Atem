@@ -126,7 +126,12 @@ impl AtemConfig {
     /// Merge a single top-level key into `config.toml`, preserving other keys.
     /// Best-effort: silently no-ops on IO/parse failure.
     fn write_config_value(key: &str, value: toml::Value) {
-        let path = Self::config_path();
+        Self::write_config_value_at(&Self::config_path(), key, value);
+    }
+
+    /// `write_config_value` for the `config.toml` at `path`.
+    fn write_config_value_at(path: &std::path::Path, key: &str, value: toml::Value) {
+        let path = path.to_path_buf();
         let mut existing = fs::read_to_string(&path)
             .ok()
             .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
@@ -193,6 +198,15 @@ impl AtemConfig {
         Self::write_config_string("astation_relay_code", astation_id);
     }
 
+    /// `store_astation_relay_code` into the profile in `config_dir`.
+    pub fn store_astation_relay_code_in(config_dir: &std::path::Path, astation_id: &str) {
+        Self::write_config_value_at(
+            &config_dir.join("config.toml"),
+            "astation_relay_code",
+            toml::Value::String(astation_id.to_string()),
+        );
+    }
+
     /// Persist the config to disk.
     ///
     /// Non-sensitive settings → `~/.config/atem/config.toml` (plaintext)
@@ -256,6 +270,10 @@ impl AtemConfig {
 
     /// Get the config directory path: ~/.config/atem/ (same on all platforms)
     pub fn config_dir() -> PathBuf {
+        // Tests never reach the real profile (src/test_profile.rs).
+        #[cfg(test)]
+        return crate::test_profile::dir();
+        #[cfg(not(test))]
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".config")
@@ -690,14 +708,19 @@ impl crate::auth::AuthSession {
 
     /// Load saved session from disk. Returns None if not found.
     pub fn load_saved() -> Option<Self> {
-        let path = Self::session_path();
+        Self::load_saved_from(&Self::session_path())
+    }
+
+    /// `load_saved` from `path`.
+    pub fn load_saved_from(path: &std::path::Path) -> Option<Self> {
+        let path = path.to_path_buf();
         let content = crate::auth::read_private_file(&path).ok()??;
         serde_json::from_slice(&content).ok()
     }
 
-    /// Save session to disk.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::session_path();
+    /// Save session to `path`.
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        let path = path.to_path_buf();
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir)?;
         crate::auth::set_private_directory_permissions(dir)?;
@@ -778,6 +801,7 @@ mod tests {
 
     #[test]
     fn display_masked_shows_sso_section() {
+        let _profile = crate::test_profile::temp();
         let config = AtemConfig {
             rtm_channel: Some("test_channel".to_string()),
             ..Default::default()
@@ -833,6 +857,7 @@ mod tests {
 
     #[test]
     fn test_display_masked_includes_astation_relay_url() {
+        let _profile = crate::test_profile::temp();
         let config = AtemConfig::default();
         let display = config.display_masked();
         assert!(display.contains("astation_relay_url"));
@@ -882,6 +907,7 @@ mod tests {
 
     #[test]
     fn project_cache_round_trip_via_temp_path() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("project_cache.enc");
         let mut cache = ProjectCache::default();
@@ -897,6 +923,7 @@ mod tests {
 
     #[test]
     fn set_current_and_get_current_round_trip() {
+        let _profile = crate::test_profile::temp();
         let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         let backup_path = ProjectCache::path();
         let backup = backup_path.with_extension("enc.bak");
@@ -920,6 +947,7 @@ mod tests {
 
     #[test]
     fn save_preserves_current_if_still_present() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.enc");
 
@@ -935,6 +963,7 @@ mod tests {
 
     #[test]
     fn save_clears_current_if_project_removed() {
+        let _profile = crate::test_profile::temp();
         // When the user runs `atem project list` and the previously-current project
         // no longer exists in the new list, current_app_id should be cleared.
         let dir = tempfile::tempdir().unwrap();
@@ -953,6 +982,7 @@ mod tests {
 
     #[test]
     fn get_by_index_returns_projects_in_order() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.enc");
         let mut cache = ProjectCache::default();
@@ -966,6 +996,7 @@ mod tests {
 
     #[test]
     fn load_returns_default_on_missing_file() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does_not_exist.enc");
         let cache = ProjectCache::load_from(&path);
@@ -975,6 +1006,7 @@ mod tests {
 
     #[test]
     fn cleanup_legacy_files_removes_both() {
+        let _profile = crate::test_profile::temp();
         let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         let dir = AtemConfig::config_dir();
         fs::create_dir_all(&dir).unwrap();
@@ -995,6 +1027,7 @@ mod tests {
 
     #[test]
     fn load_returns_default_on_corrupt_file() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("garbage.enc");
         fs::write(&path, b"this is not encrypted").unwrap();

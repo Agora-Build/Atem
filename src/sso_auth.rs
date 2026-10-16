@@ -64,7 +64,11 @@ pub async fn valid_token_from(
     connected_astation_id: Option<&str>,
     sso_url: &str,
 ) -> Result<String> {
-    valid_token_with(path, connected_astation_id, sso_url, fetch_from_astation).await
+    let store = path.to_path_buf();
+    valid_token_with(path, connected_astation_id, sso_url, move |aid, save| {
+        fetch_from_astation(store, aid, save)
+    })
+    .await
 }
 
 /// Saves tokens Astation sent: called by the "ask Astation" step while its
@@ -162,10 +166,14 @@ pub struct PairedTokens {
 /// connection), and the runtime itself reads what its link received
 /// (Astation sends `credentialSync` on connect and whenever it refreshes;
 /// the runtime saves them under the pairing).
-async fn fetch_from_astation(astation_id: String, _save: SavePaired) -> Result<PairedTokens> {
-    let path = crate::credentials::CredentialStore::path();
+async fn fetch_from_astation(
+    path: std::path::PathBuf,
+    astation_id: String,
+    _save: SavePaired,
+) -> Result<PairedTokens> {
     if !crate::runtime::in_runtime() {
-        crate::runtime::op_client::run(
+        // Quiet: the menu's TUI may own the screen.
+        crate::runtime::op_client::run_quiet(
             crate::runtime::protocol::OpKind::Token,
             crate::runtime::protocol::OpOptions {
                 astation_id: Some(astation_id.clone()),

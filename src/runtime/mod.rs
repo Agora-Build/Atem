@@ -114,7 +114,7 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
         launcher: broker::Launcher::Process(paths),
         profile: crate::status::Sources::current().ok(),
         clock: host_bridge::Clock::default(),
-        ops: ops::OpEnv::default(),
+        ops: ops::OpEnv::for_user(),
     };
     let served = server::serve(app, listener, options, shutdown_signal()).await;
     // A clean exit takes its pid out of the lock and removes its socket.

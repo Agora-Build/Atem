@@ -328,6 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_look_at_a_runtime_that_never_answers_ends_within_its_wait() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::Builder::new()
             .prefix("atem-look")
             .tempdir_in("/tmp")

@@ -519,11 +519,7 @@ impl App {
                     self.status_message = Some("Connected to Astation".to_string());
 
                     // Refresh session on successful connection
-                    if let Some(session) = crate::auth::AuthSession::load_saved() {
-                        let mut session = session;
-                        session.refresh();
-                        let _ = session.save();
-                    }
+                    self.refresh_saved_session();
                 }
                 Ok(Err(error)) => {
                     self.astation_connect_error = error
@@ -684,8 +680,11 @@ impl App {
             } => {
                 // Only for the pairing this connection authenticated under:
                 // never re-creates a pairing removed (or replaced) meanwhile.
+                // In the link's own profile (never another one).
+                let profile = self.astation_client.profile();
                 let saved = self.astation_client.apply_bound(&astation_id, || {
-                    let mut store = crate::credentials::CredentialStore::load();
+                    let path = profile?.credentials;
+                    let mut store = crate::credentials::CredentialStore::load_from(&path);
                     let now = crate::credentials::CredentialEntry::now_secs();
                     store.upsert(crate::credentials::CredentialEntry::new_paired(
                         access_token,
@@ -696,7 +695,7 @@ impl App {
                         save_credentials,
                         now,
                     ));
-                    store.save()
+                    store.save_to(&path)
                 });
                 if let Err(e) = saved {
                     self.status_message = Some(format!("Paired credentials not saved: {e:#}"));
@@ -719,12 +718,25 @@ impl App {
     /// Marks any paired credential entries for that Astation with `disconnected_at`
     /// so the grace-period logic in `CredentialStore::resolve` can take effect.
     pub fn on_astation_disconnect(&mut self) {
-        if let Some(aid) = self.connected_astation_id.take() {
-            let mut store = crate::credentials::CredentialStore::load();
+        // The link's own profile (never another one).
+        if let Some(aid) = self.connected_astation_id.take()
+            && let Ok(profile) = self.astation_client.profile()
+        {
+            let mut store = crate::credentials::CredentialStore::load_from(&profile.credentials);
             if let Some(entry) = store.find_paired_mut(&aid) {
                 entry.disconnected_at = Some(crate::credentials::CredentialEntry::now_secs());
-                let _ = store.save();
+                let _ = store.save_to(&profile.credentials);
             }
+        }
+    }
+
+    /// Keeps the link profile's saved session (`session.json`) fresh.
+    fn refresh_saved_session(&self) {
+        if let Ok(path) = self.astation_client.saved_session_file()
+            && let Some(mut session) = crate::auth::AuthSession::load_saved_from(&path)
+        {
+            session.refresh();
+            let _ = session.save_to(&path);
         }
     }
 
@@ -930,11 +942,7 @@ impl App {
         // Refresh session activity if we received any messages
         if message_count > 0 && self.last_session_refresh.is_none_or(|last| last.elapsed() >= Duration::from_secs(60)) {
             self.last_session_refresh = Some(Instant::now());
-            if let Some(session) = crate::auth::AuthSession::load_saved() {
-                let mut session = session;
-                session.refresh();
-                let _ = session.save();
-            }
+            self.refresh_saved_session();
         }
     }
 
@@ -968,6 +976,7 @@ mod tests {
 
     #[test]
     fn test_pairing_code_default_is_none() {
+        let _profile = crate::test_profile::temp();
         let app = App::new();
         assert!(app.pairing_code.is_none());
     }
@@ -977,6 +986,7 @@ mod tests {
     /// an agent.
     #[tokio::test]
     async fn visualize_request_is_answered_as_unsupported() {
+        let _profile = crate::test_profile::temp();
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -1024,6 +1034,7 @@ mod tests {
 
     #[test]
     fn the_menu_launches_and_lists_agents_through_the_runtime() {
+        let _profile = crate::test_profile::temp();
         let app = App::new();
         // The menu never opens its own Astation connection.
         assert!(!app.astation_connected && app.astation_connect_rx.is_none());
@@ -1045,6 +1056,7 @@ mod tests {
 
     #[test]
     fn the_agent_entry_counts_the_runtime_sessions() {
+        let _profile = crate::test_profile::temp();
         let mut app = App::new();
         let session = |id: &str, state: &str| SessionSummary {
             id: id.into(),

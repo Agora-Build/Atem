@@ -1654,7 +1654,10 @@ impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T> {
 /// This user's agent, started on first use (lazily: nothing connects until
 /// a request is made).
 pub fn default_agent() -> Box<dyn KeyAgentApi> {
-    #[cfg(unix)]
+    // Tests never reach the user's key agent (src/test_profile.rs).
+    #[cfg(test)]
+    return Box::new(crate::test_profile::Injected(crate::test_profile::agent()));
+    #[cfg(all(unix, not(test)))]
     {
         Box::new(crate::memory::agent_socket::KeyAgentClient::autostart())
     }
@@ -1669,6 +1672,15 @@ pub fn default_agent() -> Box<dyn KeyAgentApi> {
 pub async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    // Tests: the injected profile and agent go along (src/test_profile.rs).
+    #[cfg(test)]
+    let work = {
+        let carried = crate::test_profile::carry();
+        move || {
+            let _scope = carried.enter();
+            work()
+        }
+    };
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| anyhow!("the key agent call didn't finish: {error}"))?
@@ -1676,14 +1688,21 @@ pub async fn blocking<T: Send + 'static>(
 
 /// The running agent, without starting one.
 pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
-    #[cfg(unix)]
+    #[cfg(test)]
     {
-        let client = crate::memory::agent_socket::KeyAgentClient::existing();
-        if client.is_running() {
-            return Some(Box::new(client));
-        }
+        Some(Box::new(crate::test_profile::Injected(crate::test_profile::agent())))
     }
-    None
+    #[cfg(not(test))]
+    {
+        #[cfg(unix)]
+        {
+            let client = crate::memory::agent_socket::KeyAgentClient::existing();
+            if client.is_running() {
+                return Some(Box::new(client));
+            }
+        }
+        None
+    }
 }
 
 #[cfg(not(unix))]

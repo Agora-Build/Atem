@@ -17,6 +17,9 @@ pub const HOOK_EVENTS: [&str; 6] = [
 
 /// `$XDG_RUNTIME_DIR/atem` when set and non-empty, else `~/.config/atem/run`.
 pub fn session_dir_root() -> PathBuf {
+    #[cfg(test)]
+    return crate::test_profile::dir().join("run");
+    #[cfg(not(test))]
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v).join("atem"),
         _ => crate::config::AtemConfig::config_dir().join("run"),

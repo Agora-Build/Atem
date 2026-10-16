@@ -31,6 +31,8 @@ mod chat;
 mod daemon;
 mod runtime;
 mod session_protocol;
+#[cfg(test)]
+mod test_profile;
 // Agora RTM client: kept but unused for now (voice coding was removed in atem-session r6).
 #[allow(dead_code)]
 mod rtm_client;

@@ -157,6 +157,8 @@ mod tests {
     struct Peer {
         send: mpsc::UnboundedSender<AstationMessage>,
         recv: mpsc::UnboundedReceiver<Option<AstationMessage>>,
+        /// The temp profile stands in for the user's (src/test_profile.rs).
+        _profile: crate::test_profile::Scope,
         _state: tempfile::TempDir,
     }
 
@@ -229,6 +231,7 @@ mod tests {
             }
         });
 
+        let profile = crate::test_profile::use_dir(state.path());
         let mut app = App::new();
         // Keep process_astation_messages away from the user's sessions.json.
         app.last_session_refresh = Some(Instant::now());
@@ -245,6 +248,7 @@ mod tests {
             Peer {
                 send,
                 recv,
+                _profile: profile,
                 _state: state,
             },
         )

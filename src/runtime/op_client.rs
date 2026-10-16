@@ -61,6 +61,36 @@ pub async fn run(kind: OpKind, options: OpOptions) -> Result<()> {
     run_with(client, kind, options, &mut Terminal).await
 }
 
+/// Collects what an operation prints (nothing goes to the screen, which a
+/// TUI may own); questions are left unanswered.
+#[derive(Default)]
+pub(crate) struct Quiet {
+    pub lines: Vec<String>,
+}
+
+impl CliUi for Quiet {
+    fn print(&mut self, _: PrintLevel, text: &str) {
+        self.lines.push(text.to_string());
+    }
+
+    async fn ask(&mut self, _: AskKind, _: &str) -> AnswerValue {
+        AnswerValue::NoTerminal("this operation runs without a terminal".into())
+    }
+}
+
+/// Runs `kind` without printing; what it printed, or its error with them.
+pub async fn run_quiet(kind: OpKind, options: OpOptions) -> Result<Vec<String>> {
+    let client = RuntimeClient::connect_or_start()
+        .await
+        .map_err(|error| anyhow!("{NO_RUNTIME}: {error:#}"))?;
+    let mut quiet = Quiet::default();
+    match run_with(client, kind, options, &mut quiet).await {
+        Ok(()) => Ok(quiet.lines),
+        Err(error) if quiet.lines.is_empty() => Err(error),
+        Err(error) => Err(anyhow!("{error:#} ({})", quiet.lines.join("; "))),
+    }
+}
+
 /// Runs `kind` through `client`, shown on `ui`; the operation's result.
 pub(crate) async fn run_with(
     mut client: RuntimeClient,

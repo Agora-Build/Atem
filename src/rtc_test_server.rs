@@ -52,6 +52,9 @@ pub struct ServerEntry {
 
 /// Directory where server JSON files are stored.
 pub fn servers_dir() -> PathBuf {
+    #[cfg(test)]
+    return crate::test_profile::dir().join("servers");
+    #[cfg(not(test))]
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("atem")
@@ -1453,6 +1456,7 @@ mod tests {
 
     #[test]
     fn resolve_id_or_index_rejects_invalid_index() {
+        let _profile = crate::test_profile::temp();
         // 0 (out of 1-based range) and very large numbers should fail
         // when no servers are running. Without writing real registry
         // files we can at least confirm the error path triggers.
@@ -1462,6 +1466,7 @@ mod tests {
 
     #[test]
     fn html_page_contains_app_id_and_channel() {
+        let _profile = crate::test_profile::temp();
         let html = build_html_page(
             "abc123def456ghij", "my-test-channel", "0", false, "0",
         );
@@ -1474,6 +1479,7 @@ mod tests {
 
     #[test]
     fn html_page_has_rtm_section_when_enabled() {
+        let _profile = crate::test_profile::temp();
         let html = build_html_page(
             "abc123def456ghij", "chan", "42", true, "alice",
         );
@@ -1489,6 +1495,7 @@ mod tests {
 
     #[test]
     fn html_page_has_no_rtm_section_when_disabled() {
+        let _profile = crate::test_profile::temp();
         let html = build_html_page(
             "abc123def456ghij", "chan", "42", false, "0",
         );
@@ -1504,6 +1511,7 @@ mod tests {
 
     #[test]
     fn servers_dir_under_config() {
+        let _profile = crate::test_profile::temp();
         let dir = servers_dir();
         let dir_str = dir.to_string_lossy();
         assert!(dir_str.contains("atem"));

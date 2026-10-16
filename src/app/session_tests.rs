@@ -84,6 +84,7 @@ fn hosted(provider: Provider, cwd: &Path, offset: u64) -> HostedSession {
 
 #[tokio::test]
 async fn mark_tasks_go_to_the_claude_session_of_their_project() {
+    let _profile = crate::test_profile::temp();
     let root = tempfile::tempdir().unwrap();
     let (a, b) = (root.path().join("a"), root.path().join("b"));
     std::fs::create_dir_all(b.join(".chisel/tasks")).unwrap();
@@ -141,6 +142,7 @@ async fn mark_tasks_go_to_the_claude_session_of_their_project() {
 
 #[test]
 fn the_menu_tui_hosts_no_sessions_for_mark_tasks() {
+    let _profile = crate::test_profile::temp();
     let app = App::new();
     assert!(app.hosted.is_none());
     assert_eq!(app.mark_task_session("t1"), None);

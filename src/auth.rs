@@ -61,6 +61,19 @@ pub fn pairing_session() -> std::result::Result<PairedSession, PairingProblem> {
     pairing_from(config.astation_relay_url(), astation_id.as_deref(), session_id)
 }
 
+/// `pairing_session` for the profile `src`.
+pub fn pairing_session_in(
+    src: &crate::status::Sources,
+) -> std::result::Result<PairedSession, PairingProblem> {
+    let astation_id = src.config.astation_relay_code.clone();
+    let session_id = astation_id.as_deref().and_then(|id| {
+        SessionManager::load_from(&src.sessions)
+            .ok()
+            .and_then(|m| m.get(id).map(|s| s.session_id.clone()))
+    });
+    pairing_from(src.config.astation_relay_url(), astation_id.as_deref(), session_id)
+}
+
 /// The tier-2 gate message: `feature` refused because this machine isn't
 /// paired with an Astation.
 pub fn pairing_gate_message(feature: &str) -> String {
@@ -246,9 +259,14 @@ impl SessionManager {
 
     /// Get the path to the sessions file.
     pub(crate) fn sessions_path() -> Result<std::path::PathBuf> {
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| anyhow!("Could not determine config directory"))?;
-        Ok(config_dir.join("atem").join("sessions.json"))
+        #[cfg(test)]
+        return Ok(crate::test_profile::dir().join("sessions.json"));
+        #[cfg(not(test))]
+        {
+            let config_dir = dirs::config_dir()
+                .ok_or_else(|| anyhow!("Could not determine config directory"))?;
+            Ok(config_dir.join("atem").join("sessions.json"))
+        }
     }
 }
 

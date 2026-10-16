@@ -35,6 +35,9 @@ fn short_dir() -> tempfile::TempDir {
 
 /// `body` on a current-thread runtime with a `LocalSet` (the App stays on one task).
 fn local<F: std::future::Future>(body: F) -> F::Output {
+    // Never the user's profile (src/test_profile.rs).
+    let profile = tempfile::tempdir().unwrap();
+    let _profile = crate::test_profile::use_dir(profile.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -319,7 +322,7 @@ impl Runtime {
             }),
             profile: profile_at_start.then(|| crate::status::Sources::in_dir(&profile_dir)),
             clock: clock.clone(),
-            ops: Default::default(),
+            ops: crate::runtime::ops::OpEnv::unavailable(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::task::spawn_local(serve(app, unix, options, async {
@@ -1167,6 +1170,7 @@ fn congestion_keeps_written_acks_and_drops_only_frames() {
 
 #[tokio::test]
 async fn repeated_reclaims_never_push_the_worker_epoch_past_the_block() {
+    let _profile = crate::test_profile::temp();
     let dir = short_dir();
     let mut bridge =
         super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
