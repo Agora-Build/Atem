@@ -46,7 +46,6 @@ pub struct ClientSetup {
     pub name: String,
     pub attachment_gen: String,
     pub permissions: Vec<Permission>,
-    pub upgraded: bool,
     pub client_kind: ClientKind,
     #[serde(default)]
     pub holds_lease_epoch: Option<u64>,
@@ -376,7 +375,7 @@ impl Runner {
         // The action key, and the companion keys it allows.
         const ACTIONS: &[(&str, &[&str])] = &[
             ("send", &["json"]),
-            ("expect", &["match", "capture"]),
+            ("expect", &["type", "match", "capture"]),
             ("expect_all", &[]),
             ("expect_none", &["for_ms"]),
             ("advance_ms", &[]),
@@ -438,7 +437,8 @@ impl Runner {
                 let client = self.client(arg)?.to_string();
                 let empty = Value::Object(Map::new());
                 let matches = step.get("match").unwrap_or(&empty);
-                let data = self.expect(&client, matches)?;
+                let ty = step.get("type").map(|t| as_str(t, "type")).transpose()?;
+                let data = self.expect(&client, ty, matches)?;
                 if let Some(capture) = step.get("capture") {
                     let capture = capture.as_object().ok_or("capture must be an object")?;
                     for (name, path) in capture {
@@ -452,7 +452,7 @@ impl Runner {
             }
             ("expect_all", Side::Host) => {
                 for client in self.client_names.clone() {
-                    self.expect(&client, arg)
+                    self.expect(&client, None, arg)
                         .map_err(|e| format!("{client}: {e}"))?;
                 }
                 Ok(())
@@ -602,16 +602,22 @@ impl Runner {
         Ok(())
     }
 
-    /// Pops `client`'s next message and checks every `path: value` against
-    /// its `data`; returns the `data`.
-    fn expect(&mut self, client: &str, matches: &Value) -> Result<Value, String> {
+    /// Takes `client`'s next message of the selected `type` (when given) and
+    /// `op` (`match.op`, when given) — messages of other types/ops stay queued
+    /// for later expectations — and checks every `path: value` against its
+    /// `data`; returns the `data`. A selected message that doesn't match fails.
+    fn expect(&mut self, client: &str, ty: Option<&str>, matches: &Value) -> Result<Value, String> {
         let matches = matches.as_object().ok_or("match must be an object")?;
-        let msg = self
-            .queues
-            .get_mut(client)
-            .unwrap()
-            .pop_front()
-            .ok_or(format!("{client} received nothing"))?;
+        let op = matches.get("op");
+        let queue = self.queues.get_mut(client).unwrap();
+        let selected = queue.iter().position(|m| {
+            ty.is_none_or(|t| m["type"] == t) && op.is_none_or(|o| &m["data"]["op"] == o)
+        });
+        let msg = selected.and_then(|i| queue.remove(i)).ok_or(format!(
+            "{client} received no {} message{}; queued: {queue:?}",
+            ty.unwrap_or("matching"),
+            op.map_or(String::new(), |o| format!(" with op {o}"))
+        ))?;
         let data = msg.get("data").cloned().unwrap_or(Value::Null);
         for (path, expected) in matches {
             same(expected, lookup(&data, path), path).map_err(|e| format!("{e} in {msg}"))?;
@@ -896,6 +902,9 @@ mod tests {
         let mut f = fixture("runtime-epoch-and-sequence-ordering");
         f["setup"]["clients"][0]["colour"] = json!("red");
         assert!(run_scenario(&f, None).is_err());
+        let mut f = fixture("runtime-epoch-and-sequence-ordering");
+        f["setup"]["clients"][0]["upgraded"] = json!(true);
+        assert!(run_scenario(&f, None).is_err(), "upgraded is gone (r6)");
     }
 
     #[test]
@@ -907,8 +916,9 @@ mod tests {
         assert!(substitute(&mut json!("${missing}"), &vars).is_err());
     }
 
-    /// A scripted host: answers every session request with `error{busy}` and
-    /// counts events, to exercise the host-side plumbing.
+    /// A scripted host: answers every session request with `error{busy}`,
+    /// every other message with a terminal-v1 `exited`, and counts events, to
+    /// exercise the host-side plumbing.
     struct EchoHost {
         out: Vec<(String, Envelope)>,
         events: u64,
@@ -927,6 +937,17 @@ mod tests {
                             code: wire::ErrorCode::Busy,
                             detail: None,
                         },
+                    }),
+                ));
+            } else if let Ok(Envelope::Family(_)) = msg {
+                let exited = json!({"v": 1, "op": "exited", "terminal_id": "ses-aaaaaaaaaaaa",
+                    "generation": "22222222-2222-4222-8222-222222222222", "status": "0"});
+                self.out.push((
+                    client.to_string(),
+                    Envelope::Family(wire::FamilyMessage {
+                        family: "terminal".into(),
+                        data: Some(exited),
+                        binding: None,
                     }),
                 ));
             }
@@ -986,6 +1007,68 @@ mod tests {
             let mut g = f.clone();
             g["steps"].as_array_mut().unwrap().push(bad.clone());
             assert!(run_scenario(&g, Some(&factory)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn expect_selects_the_next_message_of_its_type_and_op() {
+        let list = json!({"type": "session", "data": {"v": 1, "op": "list",
+            "id": "11111111-1111-4111-8111-000000000001"}});
+        let beat = json!({"type": "heartbeat", "data": {"ts": 1}});
+        let factory = |_: &Setup| -> Box<dyn HostUnderTest> {
+            Box::new(EchoHost {
+                out: vec![],
+                events: 0,
+                now: 0,
+            })
+        };
+        let run = |steps: Value| {
+            let mut f = fixture("lease-expires-without-renewal");
+            f["steps"] = steps;
+            run_scenario(&f, Some(&factory))
+        };
+        // Queued: terminal exited, then session error. Each expect picks its own.
+        let base = json!([{"send": "c1", "json": beat}, {"send": "c1", "json": list}]);
+        let with = |extra: Value| {
+            let mut steps = base.clone();
+            steps
+                .as_array_mut()
+                .unwrap()
+                .extend(extra.as_array().unwrap().iter().cloned());
+            steps
+        };
+        assert_eq!(
+            run(with(json!([
+                {"expect": "c1", "match": {"op": "error", "code": "busy"}},
+                {"expect": "c1", "type": "terminal", "match": {"status": "0"}},
+                {"expect_none": "c1", "for_ms": 1}
+            ]))),
+            Ok(Outcome::Passed)
+        );
+        assert_eq!(
+            run(with(json!([
+                {"expect": "c1", "type": "session", "match": {"code": "busy"}},
+                {"expect": "c1", "match": {"op": "exited"}}
+            ]))),
+            Ok(Outcome::Passed)
+        );
+        // Without a selector the very next message is taken.
+        assert_eq!(
+            run(with(json!([{"expect": "c1", "match": {"op": "exited"}},
+                {"expect": "c1", "match": {"code": "busy"}}]))),
+            Ok(Outcome::Passed)
+        );
+        for bad in [
+            // The selected message must match fully.
+            json!([{"expect": "c1", "match": {"op": "error", "code": "forbidden"}}]),
+            json!([{"expect": "c1", "type": "terminal", "match": {"op": "error"}}]),
+            // Without a selector the next message is the terminal one.
+            json!([{"expect": "c1", "match": {"code": "busy"}}]),
+            // expect_none sees every type.
+            json!([{"expect": "c1", "match": {"op": "error"}}, {"expect_none": "c1", "for_ms": 1}]),
+            json!([{"expect": "c1", "type": 7}]),
+        ] {
+            assert!(run(with(bad.clone())).is_err(), "{bad}");
         }
     }
 }

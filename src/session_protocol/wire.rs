@@ -13,6 +13,13 @@
 //! Every decode failure is `unsupported_version` (§7: out-of-range
 //! representation); `DecodeError::id` carries the request id when it could be
 //! read, so the host can still answer with `re`.
+//!
+//! Contract r6 §0 has no legacy paths: the removed families (`agentInput`,
+//! `agentPrompt`, `voiceCommand`, `voiceToggle`, `userCommand`), terminal-v1
+//! `control`/`controller` and any terminal-v1 or chat-v1 request without its
+//! `binding` or with a `lease_id` fail with `DecodeError::removed` set, so the
+//! host answers `unsupported_version` and does nothing. terminal-v1 requests
+//! decode into `TerminalRequest` (terminal ids are session ids).
 
 use super::canonical::{self, MAX_SAFE_INTEGER, Numbers};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -376,6 +383,113 @@ pub struct DecodeError {
     pub id: Option<String>,
     /// Internal reason, for logs only; never sent to a peer.
     pub reason: String,
+    /// Set when the message is a form the contract removed (r6 §0).
+    pub removed: Option<RemovedOp>,
+}
+
+/// A message type (and op) removed by contract r6 §0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedOp {
+    pub family: String,
+    pub op: Option<String>,
+}
+
+/// Families removed outright (r6 §0): every remote mutation is session-v1.
+pub const REMOVED_FAMILIES: &[&str] = &[
+    "agentInput",
+    "agentPrompt",
+    "voiceCommand",
+    "voiceToggle",
+    "userCommand",
+];
+
+/// terminal-v1 requests from a client (§2). Each carries `data.binding`
+/// (read for subscribe/unsubscribe/ack, mutation for input/resize/stop);
+/// there is no `lease_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum TerminalRequest {
+    Subscribe {
+        terminal_id: String,
+        generation: String,
+    },
+    Unsubscribe {
+        terminal_id: String,
+        generation: String,
+        stream_id: String,
+    },
+    Ack {
+        terminal_id: String,
+        generation: String,
+        stream_id: String,
+        offset: u64,
+    },
+    Input {
+        terminal_id: String,
+        generation: String,
+        stream_id: String,
+        sequence: u64,
+        bytes: String,
+    },
+    Resize {
+        terminal_id: String,
+        generation: String,
+        stream_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    Stop {
+        terminal_id: String,
+        generation: String,
+        stream_id: String,
+    },
+}
+
+impl TerminalRequest {
+    fn ids(&self) -> (&str, &str) {
+        match self {
+            TerminalRequest::Subscribe {
+                terminal_id,
+                generation,
+            }
+            | TerminalRequest::Unsubscribe {
+                terminal_id,
+                generation,
+                ..
+            }
+            | TerminalRequest::Ack {
+                terminal_id,
+                generation,
+                ..
+            }
+            | TerminalRequest::Input {
+                terminal_id,
+                generation,
+                ..
+            }
+            | TerminalRequest::Resize {
+                terminal_id,
+                generation,
+                ..
+            }
+            | TerminalRequest::Stop {
+                terminal_id,
+                generation,
+                ..
+            } => (terminal_id, generation),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let (terminal_id, generation) = self.ids();
+        check(is_session_id(terminal_id), "terminal_id")?;
+        uuid(generation, "generation")?;
+        if let TerminalRequest::Input { bytes, .. } = self {
+            use base64::{Engine, engine::general_purpose::STANDARD};
+            check(STANDARD.decode(bytes).is_ok(), "bytes")?;
+        }
+        Ok(())
+    }
 }
 
 impl Target {
@@ -578,7 +692,8 @@ impl FamilyMessage {
 
     /// Applies `Binding::check_family_ids` with this family's own id fields
     /// (terminal-v1 `terminal_id`/`generation`, chat-v1 `agentId`/`generation`).
-    /// Unbound messages and other families have nothing to compare.
+    /// Messages without a binding (host messages, other families) have
+    /// nothing to compare.
     pub fn check_binding_ids(&self) -> Result<(), ErrorCode> {
         let Some(b) = &self.binding else {
             return Ok(());
@@ -598,6 +713,17 @@ fn fail(id: Option<String>, reason: impl Into<String>) -> DecodeError {
         code: ErrorCode::UnsupportedVersion,
         id,
         reason: reason.into(),
+        removed: None,
+    }
+}
+
+fn removed(family: &str, op: Option<&str>) -> DecodeError {
+    DecodeError {
+        removed: Some(RemovedOp {
+            family: family.to_string(),
+            op: op.map(str::to_string),
+        }),
+        ..fail(None, "removed by contract r6")
     }
 }
 
@@ -647,6 +773,9 @@ fn decode_session(data: Map<String, Value>) -> Result<SessionMessage, DecodeErro
 }
 
 fn decode_family(family: String, mut data: Option<Value>) -> Result<FamilyMessage, DecodeError> {
+    if REMOVED_FAMILIES.contains(&family.as_str()) {
+        return Err(removed(&family, None));
+    }
     let binding = match data.as_mut() {
         Some(Value::Object(m)) => m
             .remove("binding")
@@ -655,17 +784,13 @@ fn decode_family(family: String, mut data: Option<Value>) -> Result<FamilyMessag
             .map_err(|e| fail(None, format!("binding: {e}")))?,
         _ => None,
     };
-    let use_ = match family.as_str() {
-        "terminal" => check_terminal(data.as_ref(), binding.is_some())?,
-        "agentChat" => check_chat(data.as_ref(), binding.is_some())?,
-        _ => None,
-    };
-    if let Some(b) = &binding {
-        match use_ {
-            Some(u) => b.validate(u),
-            None => b.validate_shape(),
+    match family.as_str() {
+        "terminal" => check_terminal(data.as_ref(), binding.as_ref())?,
+        "agentChat" => check_chat(data.as_ref(), binding.as_ref())?,
+        _ if binding.is_some() => {
+            return Err(fail(None, format!("{family} cannot carry a binding")));
         }
-        .map_err(|e| fail(None, format!("binding: {e}")))?;
+        _ => {}
     }
     Ok(FamilyMessage {
         family,
@@ -687,57 +812,76 @@ fn family_head(data: Option<&Value>) -> Result<(&Map<String, Value>, &str), Deco
     }
 }
 
-/// terminal-v1: the message must decode with today's `terminal_share` types.
-/// With a binding (§2) the `lease_id` field is not used, so an absent one is
-/// filled with a placeholder for this shape check only. Returns how the
-/// binding is used by the op.
-fn check_terminal(data: Option<&Value>, bound: bool) -> Result<Option<BindingUse>, DecodeError> {
-    let (m, op) = family_head(data)?;
-    let mut typed = m.clone();
-    let use_ = match op {
-        "subscribe" | "unsubscribe" | "ack" => Some(BindingUse::Read),
-        // control{take:true} maps to acquire (no epoch), take:false to release.
-        "control" => match m.get("take") {
-            Some(Value::Bool(true)) => Some(BindingUse::Read),
-            _ => Some(BindingUse::Mutation),
-        },
-        "input" | "resize" | "stop" => {
-            if bound {
-                typed
-                    .entry("lease_id")
-                    .or_insert_with(|| Value::String(String::new()));
-            }
-            Some(BindingUse::Mutation)
-        }
-        _ => None,
-    };
-    if bound && use_.is_none() {
-        return Err(fail(None, format!("terminal {op} cannot carry a binding")));
-    }
-    serde_json::from_value::<crate::terminal_share::Envelope>(Value::Object(typed))
-        .map_err(|e| fail(None, format!("terminal: {e}")))?;
-    Ok(use_)
+/// The binding a terminal-v1/chat-v1 request must carry: absent is the
+/// removed unbound form; present, it must fit how the op uses it.
+fn require_binding(
+    family: &str,
+    op: &str,
+    binding: Option<&Binding>,
+    use_: BindingUse,
+) -> Result<(), DecodeError> {
+    let b = binding.ok_or_else(|| removed(family, Some(op)))?;
+    b.validate(use_)
+        .map_err(|e| fail(None, format!("binding: {e}")))
 }
 
-/// chat-v1: the message must decode with today's `chat::wire` types (inbound
-/// ops through `parse_inbound`).
-fn check_chat(data: Option<&Value>, bound: bool) -> Result<Option<BindingUse>, DecodeError> {
+/// terminal-v1. Requests decode into `TerminalRequest` with their binding;
+/// host messages must decode with `terminal_share` types and carry none.
+fn check_terminal(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), DecodeError> {
+    let (m, op) = family_head(data)?;
+    let use_ = match op {
+        "control" | "controller" => return Err(removed("terminal", Some(op))),
+        "subscribe" | "unsubscribe" | "ack" => BindingUse::Read,
+        "input" | "resize" | "stop" => BindingUse::Mutation,
+        _ => {
+            if binding.is_some() {
+                return Err(fail(None, format!("terminal {op} cannot carry a binding")));
+            }
+            serde_json::from_value::<crate::terminal_share::Envelope>(Value::Object(m.clone()))
+                .map_err(|e| fail(None, format!("terminal: {e}")))?;
+            return Ok(());
+        }
+    };
+    if m.contains_key("lease_id") {
+        return Err(removed("terminal", Some(op)));
+    }
+    require_binding("terminal", op, binding, use_)?;
+    let req: TerminalRequest = serde_json::from_value(Value::Object(m.clone()))
+        .map_err(|e| fail(None, format!("terminal: {e}")))?;
+    req.validate()
+        .map_err(|e| fail(None, format!("terminal: {e}")))
+}
+
+/// chat-v1: requests (`open`, `close`, `submit`) carry their binding and must
+/// pass `chat::wire::parse_inbound`; `agentId` is a session id and a submit's
+/// `requestId` is the §6 `request_id` (UUID v4). Host messages carry none.
+fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), DecodeError> {
     let (m, op) = family_head(data)?;
     let env: crate::chat::wire::ChatEnvelope = serde_json::from_value(Value::Object(m.clone()))
         .map_err(|e| fail(None, format!("agentChat: {e}")))?;
     let use_ = match op {
-        "open" | "close" => Some(BindingUse::Read),
-        "submit" => Some(BindingUse::Mutation),
-        _ => None,
+        "open" | "close" => BindingUse::Read,
+        "submit" => BindingUse::Mutation,
+        _ if binding.is_some() => {
+            return Err(fail(None, format!("agentChat {op} cannot carry a binding")));
+        }
+        _ => return Ok(()),
     };
-    if use_.is_some() {
-        crate::chat::wire::parse_inbound(&env)
-            .map_err(|e| fail(None, format!("agentChat: {e}")))?;
+    require_binding("agentChat", op, binding, use_)?;
+    let bad = |e: String| fail(None, format!("agentChat: {e}"));
+    crate::chat::wire::parse_inbound(&env).map_err(bad)?;
+    check(is_session_id(&env.agent_id), "agentId").map_err(bad)?;
+    if op == "submit" {
+        let field = |name| {
+            env.body
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        };
+        uuid(field("requestId"), "requestId").map_err(bad)?;
+        uuid(field("generation"), "generation").map_err(bad)?;
     }
-    if bound && use_.is_none() {
-        return Err(fail(None, format!("agentChat {op} cannot carry a binding")));
-    }
-    Ok(use_)
+    Ok(())
 }
 
 /// The wire JSON of `env`.

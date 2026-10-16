@@ -198,6 +198,14 @@ fn round_trip(msg: &Value) -> Envelope {
     env
 }
 
+/// Does the step after a `send` expect `unsupported_version` (a message the
+/// fixture means to be refused)?
+fn refused_by_next(steps: &[Value], i: usize) -> bool {
+    steps
+        .get(i + 1)
+        .is_some_and(|n| n.get("expect").is_some() && n["match"]["code"] == "unsupported_version")
+}
+
 #[test]
 fn every_fixture_wire_message_decodes_and_round_trips() {
     let mut files: Vec<_> = std::fs::read_dir(fixtures_dir())
@@ -208,32 +216,43 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
         .collect();
     files.sort();
     assert!(files.len() >= 7, "fixture files missing");
-    let (mut total, mut session, mut bound) = (0, 0, 0);
+    let (mut total, mut session, mut bound, mut refused) = (0, 0, 0, 0);
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let file = read_fixture(&name);
-        let mut msgs = Vec::new();
-        collect_messages(&file["steps"], &mut msgs);
-        assert!(!msgs.is_empty(), "{name} has no wire messages");
-        for mut msg in msgs {
-            substitute(&mut msg);
-            match round_trip(&msg) {
-                Envelope::Session(_) => session += 1,
-                Envelope::Family(f) => {
-                    assert_ne!(msg["type"], "session");
-                    if let Some(b) = &f.binding {
-                        bound += 1;
-                        b.validate(BindingUse::Read)
-                            .or_else(|_| b.validate(BindingUse::Mutation))
-                            .unwrap();
+        let steps = file["steps"].as_array().unwrap();
+        for (i, step) in steps.iter().enumerate() {
+            let mut msgs = Vec::new();
+            collect_messages(step, &mut msgs);
+            for mut msg in msgs {
+                substitute(&mut msg);
+                total += 1;
+                if refused_by_next(steps, i) {
+                    let e = wire::decode(&serde_json::to_vec(&msg).unwrap())
+                        .expect_err(&format!("{name}: refused message decoded: {msg}"));
+                    assert_eq!(e.code, ErrorCode::UnsupportedVersion);
+                    refused += 1;
+                    continue;
+                }
+                match round_trip(&msg) {
+                    Envelope::Session(_) => session += 1,
+                    Envelope::Family(f) => {
+                        assert_ne!(msg["type"], "session");
+                        if f.binding.is_some() {
+                            bound += 1;
+                        }
                     }
                 }
             }
-            total += 1;
         }
     }
-    eprintln!("fixture wire messages: {total} ({session} session, {bound} legacy with binding)");
-    assert!(total >= 55 && session >= 30, "{total} / {session}");
+    eprintln!(
+        "fixture wire messages: {total} ({session} session, {bound} bound terminal/chat, {refused} refused)"
+    );
+    assert!(
+        total >= 40 && session >= 25 && refused >= 12,
+        "{total} / {session} / {refused}"
+    );
 }
 
 // ── every op round-trips ──────────────────────────────────────────────────
@@ -364,9 +383,7 @@ fn all_ops() -> Vec<Value> {
             "binding":binding(None)}}),
         json!({"type":"agentChat","data":{"v":1,"op":"submit","conversationId":"c1","agentId":"ses-aaaaaaaaaaaa",
             "generation":PG,"requestId":RE,"text":"run the tests","binding":binding(Some(7))}}),
-        // legacy, unbound
-        json!({"type":"terminal","data":{"v":1,"op":"input","terminal_id":"claude","generation":"g","stream_id":"s",
-            "lease_id":"l","sequence":3,"bytes":"aGk="}}),
+        // another family, untouched
         json!({"type":"heartbeat","data":{"ts":1}}),
     ]
 }
@@ -418,8 +435,8 @@ fn family_binding_ids_must_agree() {
     let wrong_gen = json!({"type":"agentChat","data":{"v":1,"op":"submit","conversationId":"c1",
         "agentId":"ses-aaaaaaaaaaaa","generation":AG,"requestId":RE,"text":"x","binding":binding(Some(7))}});
     assert_eq!(check(wrong_gen), Err(ErrorCode::StaleTarget));
-    let unbound = json!({"type":"agentInput","data":{"agent_id":null,"kind":"text","text":"x"}});
-    assert_eq!(check(unbound), Ok(()));
+    let other = json!({"type":"heartbeat","data":{"ts":1}});
+    assert_eq!(check(other), Ok(()));
 }
 
 // ── negative cases per §1 row ─────────────────────────────────────────────
@@ -802,17 +819,69 @@ fn lease_epoch_presence_follows_mutation_rules() {
         Some(json!("claude")),
     ));
     rejects(&with(ops[26].clone(), "binding", Some(json!("x"))));
-    // A bound legacy op still needs its own fields.
+    // A bound op still needs its own fields, in their v1 shapes.
     rejects(&with(ops[26].clone(), "terminal_id", None));
     rejects(&with(ops[30].clone(), "generation", None));
-    // A foreign family's binding is shape-checked too.
-    let foreign = json!({"type":"agentInput","data":{"kind":"text","text":"x","binding":{"target":target()}}});
-    rejects(&foreign);
-    // Unbound legacy messages keep their existing shapes.
-    rejects(&with(ops[31].clone(), "sequence", Some(json!(-1))));
+    rejects(&with(ops[26].clone(), "sequence", Some(json!(-1))));
+    rejects(&with(ops[26].clone(), "bytes", Some(json!("not base64!"))));
+    rejects(&with(ops[30].clone(), "requestId", Some(json!("r1"))));
+    rejects(&with(ops[29].clone(), "agentId", Some(json!("claude"))));
+    // Provider-name terminal ids are gone (an invalid representation, not a
+    // removed op).
+    let claude = with(ops[25].clone(), "terminal_id", Some(json!("claude")));
+    assert_eq!(rejects(&claude).removed, None);
+    // Other families never carry a binding.
+    rejects(&json!({"type":"heartbeat","data":{"ts":1,"binding":binding(None)}}));
     rejects(&json!({"type":"terminal","data":{"v":1,"op":"warp"}}));
-    rejects(
-        &json!({"type":"agentChat","data":{"v":1,"op":"submit","conversationId":"c","agentId":"a"}}),
+    rejects(&json!({"type":"terminal","data":{"v":1,"op":"frame","binding":binding(None)}}));
+}
+
+/// r6 §0: removed forms fail with `removed` set (answered `unsupported_version`).
+#[test]
+fn removed_ops_decode_as_removed() {
+    let ops = all_ops();
+    let removed = |msg: &Value| {
+        let e = rejects(msg);
+        assert_eq!(e.code, ErrorCode::UnsupportedVersion);
+        let r = e
+            .removed
+            .unwrap_or_else(|| panic!("not marked removed: {msg}"));
+        (r.family, r.op)
+    };
+    for family in wire::REMOVED_FAMILIES {
+        let msg = json!({"type": family, "data": {"agent_id": null, "kind": "text", "text": "x"}});
+        assert_eq!(removed(&msg), (family.to_string(), None));
+        assert_eq!(
+            removed(&json!({"type": family})),
+            (family.to_string(), None)
+        );
+    }
+    let t = |op: &str| ("terminal".to_string(), Some(op.to_string()));
+    let control = json!({"type":"terminal","data":{"v":1,"op":"control","terminal_id":"ses-aaaaaaaaaaaa",
+        "generation":PG,"stream_id":"s1","take":true}});
+    assert_eq!(removed(&control), t("control"));
+    let controller = json!({"type":"terminal","data":{"v":1,"op":"controller","terminal_id":"ses-aaaaaaaaaaaa",
+        "generation":PG,"stream_id":"s1","lease_id":null}});
+    assert_eq!(removed(&controller), t("controller"));
+    // terminal-v1 requests without their binding, or with a lease_id.
+    for (i, op) in [
+        (25, "subscribe"),
+        (26, "input"),
+        (27, "resize"),
+        (28, "stop"),
+    ] {
+        assert_eq!(removed(&with(ops[i].clone(), "binding", None)), t(op));
+    }
+    assert_eq!(
+        removed(&with(ops[26].clone(), "lease_id", Some(json!("l")))),
+        t("input")
+    );
+    // chat-v1 requests without their binding.
+    let c = |op: &str| ("agentChat".to_string(), Some(op.to_string()));
+    assert_eq!(removed(&with(ops[29].clone(), "binding", None)), c("open"));
+    assert_eq!(
+        removed(&with(ops[30].clone(), "binding", None)),
+        c("submit")
     );
 }
 
