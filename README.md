@@ -208,9 +208,28 @@ Claude's replies come from its own session log, with a status of ready,
 working, waiting or unknown. Atem adds its hooks with `--settings` for that run
 only; your `~/.claude` settings are not changed. A prompt sent from chat needs
 control of the session, is typed into Claude once, and is reported as
-accepted, then complete (or failed) when Claude's turn ends. Approvals stay in
-the terminal. Codex has no chat yet (its status is unknown). See
+accepted, then complete (or failed) when Claude's turn ends. Codex has no
+chat yet (its status is unknown). See
 [`designs/agent-chat-host.md`](designs/agent-chat-host.md).
+
+**Approve prompts from Astation and your phone.** When Claude Code or Codex
+asks for permission to run a tool, Astation shows the request as a card (in
+a Claude chat view too) and Atem asks the relay to notify your devices
+with control. A card shows the tool and a short summary — the command's first
+line or the file path, never file contents — and offers **Allow once**,
+**Always allow** (one of the rules the agent itself suggests, with where it
+is saved; Claude only) or **Deny** (with an optional note for the agent).
+Answering takes control of the session for that device. The terminal can
+always answer instead: Claude keeps its own dialog on screen (the first
+answer wins), and for Codex any key you type in the terminal hands the
+prompt back to Codex's own dialog. If nobody answers, nothing is allowed:
+after the hook's wait (Claude 10 min, Codex 5 min) the agent asks in the
+terminal as usual. Claude gets the hook with `--settings` for each launch.
+The first `atem agent launch codex` asks once whether to add Atem's hook to
+`~/.codex/hooks.json` (a backup is kept as `hooks.json.atem-bak`); to turn it
+off later, set `approvals_hook = false` under `[codex]` in
+`~/.config/atem/config.toml` — the next `atem agent launch codex` removes the
+hook. See [§6a of the session protocol](designs/protocol/atem-session-v1.md).
 
 ### Vault (shared cross-agent context)
 

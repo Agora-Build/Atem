@@ -1,4 +1,4 @@
-# Atem host handoff: atem-session r6 on `feat/runtime`
+# Atem host handoff: atem-session r6 on `feat/runtime`, r7 approvals on `feat/approvals`
 
 For the Astation team, 2026-10-16. The Atem side of
 [atem-session-v1.md](atem-session-v1.md) (r6, compatibility mode) now runs in
@@ -153,7 +153,8 @@ Receipts (session-v1 `submit`), per kind:
 - `interrupt`: writes Esc; completes when a turn ends, or at once when none
   runs.
 - `stop`: stops the agent; completes at its exit.
-- `approval`: `rejected` (approvals stay in the terminal).
+- `approval`: handed to the agent's waiting permission hook; completes when
+  the agent applied it (see [Approvals](#approvals-r7-6a-on-featapprovals)).
 - A dispatch refused before anything was queued is `rejected` ("could not
   write to the terminal"); a writer failure after queueing is
   `outcome_unknown` ("write interrupted"). Work executing when the broker
@@ -203,6 +204,8 @@ and `written` acks are not queued for `expect` (the acks count toward
 | receipt-query-is-scoped-to-the-exact-target | core harness only (3 attachments) |
 | takeover-moves-control-and-the-old-holder-becomes-a-viewer | core harness only (3 attachments) |
 | closed-session-refuses-work-before-the-lease-check | core harness only: the runtime has no trigger that closes a running session yet |
+| approval-allow-once-is-handed-to-the-agent-and-completes, approval-allow-always-must-name-an-offered-rule, approval-deny-carries-the-message-to-the-agent, approval-duplicate-submit-returns-the-receipt, approval-answered-in-the-terminal-first-refuses-the-late-remote-answer, approval-pending-is-sent-again-after-list, approval-stays-pending-when-the-lease-ends, approval-opens-without-a-lease-holder, approval-late-answer-after-push-resolved-is-stale-target | pass (`feat/approvals`; the fake Claude runs the real hook, see Approvals) |
+| approval-needs-control-and-the-lease, approval-survives-takeover, approval-answer-with-acquire-takes-control-from-the-holder | core harness only (2 attachments) |
 
 The multi-attachment fixtures (receipt-query, removed-ops, takeover) run
 only in the core harness (`SessionHost` in `src/session_protocol/fixtures.rs`)
@@ -217,6 +220,135 @@ Not honoured against real processes: `timers: false` (the broker's loop runs
 `advance` whenever the clock moved 100 ms), `close_session`,
 `disconnect`/`resume` (no resume in compatibility mode), `fail_next_fsync`,
 `change_trust_gen`, and more than one client per scenario.
+
+## Approvals (r7 §6a, on `feat/approvals`)
+
+Branch `feat/approvals` (from `feat/runtime`; not merged). The agent's own
+permission prompt — Claude Code's and Codex's `PermissionRequest` hook — can be
+answered from Astation, bound to that exact prompt; the terminal can always
+answer instead, and Atem never allows anything by itself (any failure,
+timeout or missing answer is "no decision": the agent asks in its own
+dialog). The contract is [§6a](atem-session-v1.md); this lists everything
+Astation sees that changed since r6.2.
+
+### Wire changes since r6.2
+
+- **`approval_request`** (H→C): `approval_id` (UUID), `session_id`,
+  `process_gen`, `tool`, `summary`, `created_at`, `always_rules: [{rule_id,
+  label, scope}]`. Sent when the hook asks, **whoever holds the lease (or
+  nobody)**, to every attachment subscribed by `list` that has `control`, and
+  again after every `sessions` snapshot for each pending one. Key it by
+  `approval_id`; a repeat replaces. `summary` is redacted (the command's
+  first line or the file path; credentials masked), never full inputs.
+- **`approval_closed`** (H→C): `approval_id`, `reason`: `answered_remote`,
+  `answered_terminal`, `interrupted`, `timed_out`, `released`,
+  `process_ended`. **`lease_lost` is gone**, renamed in effect to
+  `released`: Atem gave the prompt back to the agent (input reached a Codex
+  session, or the runtime restarted). Lease changes — expiry, release,
+  takeover, local input, trust change — never close an approval.
+- **`submit` `kind:"approval"`**, payload exactly `{approval_id, decision:
+  allow_once|allow_always|deny, rule_id?, message?, acquire?}`: `rule_id`
+  iff `allow_always` (one of the request's `always_rules`), `message` only
+  with `deny` (≤ 512 bytes, given to the agent; without one the agent reads
+  "Denied from Astation"). Without `acquire` the binding carries the current
+  `lease_epoch` (else `stale_lease`). **With `acquire: true`** the binding
+  has no `lease_epoch`: Atem needs `control` and a running session, and once
+  the answer is durably `accepted` it gives this attachment the lease (a
+  takeover if another holds it), sends `lease_changed` (`granted`/`takeover`,
+  to every viewer including you) and `session_changed`, then the receipts —
+  the lease is taken only together with an answer that was admitted. A
+  closed, answered or unknown approval, another process, or a rule it didn't
+  offer is `stale_target` (nothing recorded, no lease taken): show "already
+  answered". Receipt: `accepted` → `executing` (the card closes
+  `answered_remote`) → `completed` when the agent applied it; `rejected` if
+  it closed first or couldn't be handed over; `outcome_unknown` when the
+  terminal answered too, the agent exited, or it never confirmed within
+  630 s.
+- **View-only rule.** `approval_request`, `approval_closed` and chat cards go
+  only to attachments with `control` (today the runtime's one link always
+  has `view` and `control`). `welcome.permissions` has no `approve`.
+- **Relay messages (H→relay)**, over Atem's authenticated link, only when it
+  is the verified pairing's; not session messages (no `id`, no reply):
+
+  ```json
+  {"type":"relay","data":{"v":1,"op":"push_approval","approval_id":"…","atem_device_id":"…",
+    "session_id":"ses-…","tool":"Bash","summary":"npm test","expires_at":1760500600000}}
+  {"type":"relay","data":{"v":1,"op":"push_resolved","approval_id":"…","reason":"answered_terminal"}}
+  ```
+
+  `expires_at` is wall ms when the agent's hook gives up (Claude 600 s,
+  Codex 300 s after `created_at`). `push_resolved.reason` is an
+  `approval_closed` reason. Best effort: while the link is down Atem keeps
+  the latest state per approval (≤ 64; unsent ones are dropped first, a
+  pushed one never) and on reconnect sends `push_approval` only for
+  approvals still pending and not expired, `push_resolved` only for ones it
+  pushed.
+- **chat-v1 card.** In a Claude conversation (only for attachments with
+  `control`, live and in history) each approval is an assistant `message`
+  `approval-<approval_id>` with one part `{id:"approval", kind:"approval",
+  approval_id, tool, summary, always_rules, state}`; `state` is `pending`,
+  `allowed` / `always_allowed` / `denied` (answered from Astation, set at the
+  hand-off), `answered_terminal`, `expired`, or `closed` (interrupted,
+  released, process ended, or a remote answer not taken / outcome unknown,
+  including the 630 s deadline). A state change re-sends the whole message
+  with the same `messageId`: replace it. Answer from chat with `submit`
+  carrying `approval` (the payload above) instead of `text`; `accepted` /
+  `complete` / `error{code}` follow the receipt as for prompts.
+- **Codex offers no "always allow".** Codex's hook docs reserve
+  `updatedPermissions` ("fail closed today"), so Codex requests have
+  `always_rules: []`; offer Allow once and Deny and say why.
+
+### Expected relay behaviour (Astation's side)
+
+- On `push_approval`: notify every device on the account with `control`,
+  online or not — APNs on iOS (`mutable-content`, so the app can decrypt on
+  device once end-to-end encryption lands) and FCM on Android — with the tool
+  and summary only ("Claude on Genie wants to run `npm test`"). Use
+  `approval_id` as the collapse id (APNs `apns-collapse-id`, FCM tag), and
+  don't deliver after `expires_at`.
+- On `push_resolved`: replace or remove that notification everywhere (same
+  collapse id / tag).
+- A tap wakes the app, which reconnects, authenticates, `list`s (the pending
+  approval follows the snapshot) and answers with `acquire: true`. A late tap
+  gets `stale_target`: "already answered". Until the device list (account
+  trust step 1) exists, only the paired Astation has an attachment, so only
+  it can answer.
+
+### Behaviour on the Atem side
+
+- Claude: the hook runs per launch from `--settings` (600 s) while Claude
+  shows its own dialog; the first answer wins. A terminal answer is seen
+  from the tool running (PostToolUse) or the transcript's refusal and closes
+  the card `answered_terminal`.
+- Codex: one Atem entry in `~/.codex/hooks.json`, added after the first
+  `atem agent launch codex` asks once (`[codex] approvals_hook` in Atem's
+  config.toml; `false` removes it). Codex hides its prompt while the hook
+  waits, so any input to the session — local keys or the lease holder's —
+  first releases the waiting hooks (`approval_closed{released}`), and Atem
+  holds that input until they exited (≤ 500 ms) so it reaches Codex's own
+  prompt. Codex's hook only counts when the session's agent itself started
+  it.
+- Approvals live in the broker's memory: after a runtime restart every
+  waiting hook gets "no decision" and an `accepted` answer is `rejected`.
+
+### How to test
+
+- `tests/fixtures/approvals/fake-agent.py` stands in for Claude (with
+  `--settings`) or Codex (`FAKE_CODEX_HOOK` = the command Atem puts in
+  hooks.json). It runs the real hook script for each `$FAKE_DIR/ask-<n>.json`
+  (`{tool_name, tool_input, permission_suggestions?}`) and acts on the answer
+  as the agent does; `terminal-yes-<n>` / `terminal-no-<n>` answer in its own
+  dialog, `kill-<n>` interrupts, `stop-<n>` freezes the hook. It logs to
+  `$FAKE_DIR/events` (`answer <n> allow|deny|none <message>`, `input <bytes>`).
+- `cargo test --bin atem host_bridge::tests` runs the in-process broker
+  tests (card + push + acquire, deny with message, terminal answer, Codex
+  release before input, view-only link, the 630 s deadline);
+  `cargo test --test runtime_fixtures_binary` runs the approval fixtures
+  against the real runtime binary (table above).
+- The rejection text Claude writes for a terminal "No" (also with a typed
+  instruction) and for a hook deny (the message as it is) were checked
+  against a live Claude Code 2.1.301 on 2026-10-16
+  (`tests/fixtures/chat/claude/session-rejected-tool.jsonl`).
 
 ## Differences from session-multiplexing.md
 
