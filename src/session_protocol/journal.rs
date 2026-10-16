@@ -41,6 +41,16 @@ pub enum Record {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalError(pub String);
 
+/// Durable receipt storage.
+///
+/// A file journal can't know what an fsync error left on disk (the record may
+/// or may not have been written). After one, a real implementation must stop
+/// admitting new records until it has truncated back to its last durable
+/// record; the host treats every `Err` as "not written".
+///
+/// A request's payload is only needed while it is `accepted` (a dispatch
+/// after a crash); once a `Transition` moves it on, the journal may drop the
+/// payload (compaction). The digest is kept forever, for duplicates.
 pub trait Journal {
     /// Appends `record` and makes it durable (fsync) before returning `Ok`.
     /// On `Err` the record must be treated as not written.
@@ -89,6 +99,20 @@ impl Journal for MemJournal {
             Some(n) => self.fail_in = Some(n - 1),
             None => {}
         }
+        if let Record::Transition { request_id, .. } = &record {
+            // Compaction: the payload isn't needed past `accepted`.
+            for r in &mut self.records {
+                if let Record::Accepted {
+                    request_id: id,
+                    payload,
+                    ..
+                } = r
+                    && id == request_id
+                {
+                    *payload = Value::Null;
+                }
+            }
+        }
         self.records.push(record);
         self.fsyncs += 1;
         Ok(())
@@ -106,7 +130,8 @@ pub struct Stored {
     pub target: Target,
     pub kind: ReceiptKind,
     pub payload_digest: String,
-    pub payload: Value,
+    /// Present only while `accepted` (needed to dispatch after a crash).
+    pub payload: Option<Value>,
     pub state: ReceiptState,
     pub detail: Option<String>,
     pub updated_at: u64,
@@ -163,7 +188,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     target,
                     kind,
                     payload_digest,
-                    payload,
+                    payload: Some(payload),
                     state: ReceiptState::Accepted,
                     detail: None,
                     updated_at,
@@ -188,6 +213,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     )));
                 }
                 s.state = state;
+                s.payload = None;
                 s.detail = detail;
                 s.updated_at = updated_at;
             }

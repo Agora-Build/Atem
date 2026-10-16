@@ -15,6 +15,13 @@ implementation; the fixture plays the host with `deliver_to_client`).
 - `sessions[]`: `{session_id, process_gen, chat?}`.
 - `clients[]`: `{name, attachment_gen, permissions, client_kind, holds_lease_epoch?}` — the client's authenticated identity, permissions and connection mode, set by the harness (never derived from message fields).
 
+Host scenarios start with every client already welcomed: the harness connects
+each client, sends `hello` itself and consumes (and checks) the `welcome`
+before step 0; `reconnect` does the same on the new attachment. With
+`holds_lease_epoch: n` the harness then sends a real `acquire` for the
+scenario's only session and requires a `lease` at epoch `n`. None of these
+setup messages is visible to the steps.
+
 `steps[]`, in order, on a deterministic monotonic clock starting at 0 ms:
 
 | step | meaning |
@@ -33,7 +40,7 @@ implementation; the fixture plays the host with `deliver_to_client`).
 | `{"fail_next_pty_enqueue": true}` | the next dispatch fails before any byte reaches the PTY |
 | `{"fail_next_pty_write_after_partial": true}` | the next dispatch's writer fails after possibly writing some bytes |
 | `{"reconnect": client, "attachment_gen": uuid}` | a new attachment for the same client (no resume) |
-| `{"assert": {…}}` | host counters: `dispatch_attempts`, `pty_bytes_written` (a number or `"unknown"`), `pty_writes` (split as `pty_writes_local`/`pty_writes_remote`), `resizes`, `stops`, `dispatches`, `lease_holder`, `receipts_visible: {client: n}` |
+| `{"assert": {…}}` | host counters: `dispatch_attempts` (every dispatch the host started, including ones refused before any effect), `dispatches` (dispatches that reached the PTY/agent: attempts minus those that failed with no effect), `pty_bytes_written` (a number or `"unknown"`), `pty_writes` (terminal input written, split as `pty_writes_local`/`pty_writes_remote`; dispatches are counted separately), `resizes`, `stops`, `lease_holder`, `receipts_visible: {client: n}` |
 | `{"assert_client": {…}}` | client state: `controls`, `deadline_ms`, `registry` (ids), `registry_state`, `runtime_epoch`, `seq`, `sent_list`, `input_enabled` |
 
 Negative scenarios assert the error and the absence of side effects

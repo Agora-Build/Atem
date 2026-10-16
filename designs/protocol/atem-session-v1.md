@@ -137,7 +137,10 @@ Every request that targets a session carries one **binding** object:
   anything still arriving on it) before accepting mutations on the new one.
   Resume never re-acquires a lease and never revives an expired one.
 - Compatibility mode: no `challenge`/`resume_proof`; every `hello` gets a new
-  `controller_session` and `attachment_gen` and holds no lease.
+  `controller_session` and `attachment_gen` and holds no lease. A `hello`
+  with `resume`, and any `resume_proof`, is refused `unauthorized`. A second
+  `hello` on an attachment that was already welcomed is refused
+  `unauthorized` (a new welcome needs a new attachment).
 - A broker restart (new `runtime_gen`) invalidates all attachments and leases;
   workers and receipts stay addressable by `session_id`/`process_gen`.
 
@@ -191,7 +194,8 @@ Descriptor:
   as a resurrection of the removed one. (Tombstones are kept 10 minutes host-side
   only to answer late requests with `unknown_session`.)
 - The registry and every response are filtered by the attachment's view
-  permission. `cwd_label` is the last path component only; clients show
+  permission: `list` without `view` is `forbidden`; an op with a `binding`
+  from an attachment without `view` is `unknown_session`. `cwd_label` is the last path component only; clients show
   `session_id` when labels repeat. Presence is never liveness evidence.
 
 ## 5. Control lease
@@ -211,6 +215,13 @@ Normative rules:
   renew every 5 s and never after their own monotonic estimate of expiry.
   `ms_left` is for estimation only.
 - **Fencing**: a lease is held by one (`controller_session`, `attachment_gen`).
+- **Epochs**: `lease_epoch` strictly increases per session and may skip values
+  (the host reserves epochs durably in blocks, so after a restart the next
+  grant can be well above the last one seen); clients compare, never count.
+- **Recipients**: `lease_changed` goes to every welcomed attachment with `view`
+  except the one whose own request caused the change (it gets the direct
+  reply: `lease` or `lease_released`). Expiry, local input, revocation and
+  process end have no requester, so the holder gets `lease_changed` too.
 - **Reply correlation and the client deadline** (normative for clients):
   1. A `lease` reply is applied only if its `re` equals one outstanding
      `acquire`/`renew` request id, and each outstanding request consumes at most
@@ -282,8 +293,17 @@ Kinds and payloads (v1):
   Same `request_id` with every bound value equal → the recorded receipt (needs
   current view permission for the target; no lease, no re-execution). Same
   `request_id` with any value different → `request_id_reused`.
-- **Admission** of a new request needs the current lease (`stale_lease`
-  otherwise), `control` permission, and a session that accepts submissions.
+- **Admission** of a new request needs `control` permission, a session that
+  accepts submissions (`session_closed` otherwise, checked before the lease)
+  and the current lease (`stale_lease` otherwise). If the durable write of
+  `accepted` fails, the reply is `error{code:"busy"}`, nothing is recorded and
+  the client may retry with the same `request_id`.
+- A duplicate `submit` names the current target: one naming an earlier
+  `process_gen` of the session is `stale_target`, while `receipt_query` for
+  that earlier target still returns its receipts.
+- **Scheduling**: `prompt`s are serialized per session (one paste at a time;
+  later ones stay `accepted` until the previous one leaves `executing`);
+  `interrupt` and `stop` are dispatched immediately.
 - **States and transitions** (all others are invalid and never happen):
 
 | from | to | when |

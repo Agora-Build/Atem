@@ -644,7 +644,13 @@ fn prompt_runs_to_completion_and_duplicates_return_the_receipt() {
     assert_eq!(msgs[0]["state"], "accepted");
     assert_eq!(msgs[1]["state"], "executing");
     assert_eq!(msgs[0]["target"], target_with(S1, 1));
-    rt.dispatch_report(&rid(1), DispatchReport::Completed { detail: None });
+    rt.dispatch_report(
+        &rid(1),
+        DispatchReport::Completed {
+            detail: None,
+            turn_id: None,
+        },
+    );
     assert_eq!(receipts_of(&mut rt, "c1"), vec![st("completed", "")]);
     // A duplicate needs no lease, only view of the target.
     rt.set_now(LEASE_MS);
@@ -707,7 +713,13 @@ fn trust_change_before_dispatch_rejects_and_revokes() {
     let m = acquire(&rt, "c1", S1, false);
     rt.send("c1", &m);
     assert_error(&only(&mut rt, "c1"), "stale_target");
-    rt.dispatch_report(&rid(1), DispatchReport::Completed { detail: None });
+    rt.dispatch_report(
+        &rid(1),
+        DispatchReport::Completed {
+            detail: None,
+            turn_id: None,
+        },
+    );
     assert_eq!(receipts_of(&mut rt, "c1"), vec![st("completed", "")]);
     assert_eq!(rt.pty.dispatch_attempts, 1);
     assert!(rt.host.change_trust_gen(2).is_err(), "never goes back");
@@ -822,7 +834,10 @@ fn crash_after_executing_is_outcome_unknown_and_queued_work_runs_once() {
     let e = hold(&mut rt, "c1", S1);
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
     rt.send("c1", &m);
-    rt.reconcile_answer = DispatchReport::Completed { detail: None };
+    rt.reconcile_answer = DispatchReport::Completed {
+        detail: None,
+        turn_id: None,
+    };
     rt.restart(GEN2, 8);
     assert_eq!(
         rt.host.receipt(&rid(1)).unwrap().state,
@@ -904,7 +919,7 @@ fn process_end_and_observation_windows() {
     );
     let m = submit(&rt, "c1", S1, e + 1, 2, "prompt");
     rt.send("c1", &m);
-    assert_error(&only(&mut rt, "c1"), "stale_lease");
+    assert_error(&only(&mut rt, "c1"), "session_closed");
 
     // interrupt: nothing observed within 10 s; stop: completes on exit.
     let mut rt = setup();
@@ -953,7 +968,7 @@ fn closed_session_refuses_submissions_and_rejects_queued_work() {
         rt.send("c1", &m);
     }
     got(&mut rt, "c1");
-    rt.close_session(S1);
+    rt.close_session(S1, false);
     let msgs = got(&mut rt, "c1");
     let r = msgs.iter().find(|m| m["op"] == "receipt").unwrap();
     assert_eq!(r["request_id"], rid(2));
@@ -1056,29 +1071,365 @@ fn receipt_and_in_flight_limits() {
 }
 
 #[test]
-fn chat_submit_is_a_bound_prompt_submit() {
+fn chat_submit_results_use_chat_ops() {
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
-    let chat = |rt: &FakeRuntime, agent: &str, n: u64| {
-        json!({"type": "agentChat", "data": {"v": 1, "op": "submit", "conversationId": "c",
+    let chat = |rt: &FakeRuntime, agent: &str, n: u64, epoch: u64| {
+        json!({"type": "agentChat", "data": {"v": 1, "op": "submit", "conversationId": "conv-1",
             "agentId": agent, "generation": P1, "requestId": rid(n), "text": "run the tests",
-            "binding": binding(rt, "c1", S1, Some(e))}})
+            "binding": binding(rt, "c1", S1, Some(epoch))}})
     };
-    let m = chat(&rt, S1, 1);
+    let m = chat(&rt, S1, 1, e);
     rt.send("c1", &m);
+    let msgs = rt.take("c1");
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    assert_eq!(msgs[0]["type"], "agentChat");
+    let a = &msgs[0]["data"];
     assert_eq!(
-        receipts_of(&mut rt, "c1"),
-        vec![st("accepted", ""), st("executing", "")]
+        (
+            a["op"].clone(),
+            a["requestId"].clone(),
+            a["conversationId"].clone()
+        ),
+        (json!("accepted"), json!(rid(1)), json!("conv-1"))
     );
-    // The same request through session-v1 is a duplicate (same digest).
+    rt.dispatch_report(
+        &rid(1),
+        DispatchReport::Completed {
+            detail: None,
+            turn_id: Some("turn-7".into()),
+        },
+    );
+    let msgs = rt.take("c1");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "no session receipt for a chat submit: {msgs:#?}"
+    );
+    let c = &msgs[0]["data"];
+    assert_eq!(c["op"], "complete");
+    assert_eq!(c["requestId"], rid(1));
+    assert_eq!(c["turnId"], "turn-7");
+    assert_eq!(c["outcome"], "done");
+    // A session-v1 duplicate of it gets a session receipt (its own channel).
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
     rt.send("c1", &m);
-    assert_eq!(only(&mut rt, "c1")["state"], "executing");
+    assert_eq!(only(&mut rt, "c1")["state"], "completed");
     assert_eq!(rt.pty.dispatch_attempts, 1);
+    // A chat duplicate maps the recorded final state.
+    let m = chat(&rt, S1, 1, e);
+    rt.send("c1", &m);
+    assert_eq!(only(&mut rt, "c1")["op"], "complete");
+
+    // Admission refusals and failures are chat errors with requestId and code.
+    let m = chat(&rt, S1, 2, e + 5);
+    rt.send("c1", &m);
+    let err = only(&mut rt, "c1");
+    assert_eq!(
+        (err["op"].clone(), err["code"].clone()),
+        (json!("error"), json!("stale_lease"))
+    );
+    assert_eq!(err["requestId"], rid(2));
+    assert!(err["text"].is_string());
+    rt.pty.fail_next_partial = true;
+    let m = chat(&rt, S1, 3, e);
+    rt.send("c1", &m);
+    let msgs = got(&mut rt, "c1");
+    assert_eq!(ops(&msgs), vec!["accepted", "error"]);
+    assert_eq!(msgs[1]["code"], "outcome_unknown");
+    assert_eq!(msgs[1]["text"], DETAIL_WRITE_INTERRUPTED);
+    rt.pty.fail_next_enqueue = true;
+    let m = chat(&rt, S1, 4, e);
+    rt.send("c1", &m);
+    let msgs = got(&mut rt, "c1");
+    assert_eq!(msgs[1]["code"], "rejected");
+    assert_eq!(msgs[1]["text"], DETAIL_NO_TERMINAL_WRITE);
     // agentId must equal the binding's session.
-    let m = chat(&rt, S2, 2);
+    let m = chat(&rt, S2, 5, e);
+    rt.send("c1", &m);
+    let err = only(&mut rt, "c1");
+    assert_eq!(
+        (err["op"].clone(), err["code"].clone()),
+        (json!("error"), json!("stale_target"))
+    );
+}
+
+#[test]
+fn refused_terminal_requests_get_terminal_errors_and_removed_ops_session_errors() {
+    let mut rt = setup();
+    let stream = subscribe(&mut rt, "c1");
+    let m = input(&rt, "c1", &stream, 1);
+    rt.send("c1", &m);
+    let msgs = rt.take("c1");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["type"], "terminal");
+    let d = &msgs[0]["data"];
+    assert_eq!(d["op"], "error");
+    assert_eq!(d["code"], "stale_lease");
+    assert_eq!(d["terminal_id"], S1);
+    assert_eq!(d["stream_id"], json!(stream));
+    assert!(d["message"].is_string());
+    // A removed op stays a session error without re.
+    let control = json!({"type": "terminal", "data": {"v": 1, "op": "control", "terminal_id": S1,
+        "generation": P1, "stream_id": stream, "take": true}});
+    rt.send("c1", &control);
+    let msgs = rt.take("c1");
+    assert_eq!(msgs[0]["type"], "session");
+    assert_eq!(msgs[0]["data"]["code"], "unsupported_version");
+    assert!(msgs[0]["data"].get("re").is_none());
+}
+
+#[test]
+fn closed_and_exited_sessions_answer_session_closed() {
+    for end in ["close", "exit"] {
+        let mut rt = setup();
+        let stream = subscribe(&mut rt, "c1");
+        let e = hold(&mut rt, "c1", S1);
+        if end == "close" {
+            rt.close_session(S1, false);
+        } else {
+            rt.process_exited(S1);
+        }
+        got(&mut rt, "c1");
+        let m = submit(&rt, "c1", S1, e, 1, "prompt");
+        rt.send("c1", &m);
+        assert_error(&only(&mut rt, "c1"), "session_closed");
+        let m = input(&rt, "c1", &stream, e);
+        rt.send("c1", &m);
+        assert_error(&only(&mut rt, "c1"), "session_closed");
+        assert_eq!(rt.pty.writes_remote + rt.pty.dispatch_attempts, 0, "{end}");
+    }
+}
+
+#[test]
+fn ending_a_session_finishes_executing_work() {
+    type End = fn(&mut FakeRuntime);
+    let ends: &[(&str, End, Option<&str>)] = &[
+        (
+            "remove",
+            |rt| rt.remove_session(S1),
+            Some(DETAIL_AGENT_EXITED),
+        ),
+        (
+            "close, process gone",
+            |rt| rt.close_session(S1, true),
+            Some(DETAIL_AGENT_EXITED),
+        ),
+        (
+            "close, process alive",
+            |rt| rt.close_session(S1, false),
+            None,
+        ),
+    ];
+    for (name, end, expect) in ends {
+        let mut rt = setup();
+        let e = hold(&mut rt, "c1", S1);
+        let m = submit(&rt, "c1", S1, e, 1, "prompt");
+        rt.send("c1", &m);
+        end(&mut rt);
+        let r = rt.host.receipt(&rid(1)).unwrap();
+        match expect {
+            Some(d) => {
+                assert_eq!(r.state, ReceiptState::OutcomeUnknown, "{name}");
+                assert_eq!(r.detail.as_deref(), Some(*d), "{name}");
+            }
+            None => assert_eq!(r.state, ReceiptState::Executing, "{name}"),
+        }
+    }
+}
+
+#[test]
+fn expiry_does_not_need_a_timer_tick() {
+    let mut rt = setup();
+    rt.ticks = false;
+    let stream = subscribe(&mut rt, "c1");
+    assert_eq!(hold(&mut rt, "c1", S1), 1);
+    rt.hold_writes = true;
+    rt.set_now(LEASE_MS - 1);
+    let m = input(&rt, "c1", &stream, 1);
+    rt.send("c1", &m);
+    rt.set_now(LEASE_MS);
+    // The queued chunk reaches the writer at the deadline: dropped.
+    rt.flush_writes();
+    assert_eq!((rt.pty.writes_remote, rt.pty.dropped_remote), (0, 1));
+    for m in [renew(&rt, "c1", S1, 1), input(&rt, "c1", &stream, 1)] {
+        rt.send("c1", &m);
+        let msgs = got(&mut rt, "c1");
+        assert_error(
+            msgs.iter().find(|m| m["op"] == "error").unwrap(),
+            "stale_lease",
+        );
+    }
+    assert_eq!(rt.pty.writes_remote, 0);
+}
+
+#[test]
+fn failure_details_are_kind_specific() {
+    let cases = [
+        (
+            "stop",
+            DispatchReport::FailedNoEffect,
+            ReceiptState::Rejected,
+            DETAIL_STOP_FAILED,
+        ),
+        (
+            "stop",
+            DispatchReport::FailedAfterPossibleEffect,
+            ReceiptState::OutcomeUnknown,
+            DETAIL_STILL_RUNNING,
+        ),
+        (
+            "interrupt",
+            DispatchReport::FailedAfterPossibleEffect,
+            ReceiptState::OutcomeUnknown,
+            DETAIL_NO_INTERRUPT,
+        ),
+        (
+            "prompt",
+            DispatchReport::FailedAfterPossibleEffect,
+            ReceiptState::OutcomeUnknown,
+            DETAIL_WRITE_INTERRUPTED,
+        ),
+        (
+            "prompt",
+            DispatchReport::FailedNoEffect,
+            ReceiptState::Rejected,
+            DETAIL_NO_TERMINAL_WRITE,
+        ),
+    ];
+    for (kind, report, state, detail) in cases {
+        let mut rt = setup();
+        let e = hold(&mut rt, "c1", S2);
+        let m = submit(&rt, "c1", S2, e, 1, kind);
+        rt.send("c1", &m);
+        rt.dispatch_report(&rid(1), report.clone());
+        let r = rt.host.receipt(&rid(1)).unwrap();
+        assert_eq!(
+            (r.state, r.detail.as_deref()),
+            (state, Some(detail)),
+            "{kind} {report:?}"
+        );
+    }
+}
+
+#[test]
+fn a_fenced_or_disconnected_holder_loses_its_queued_bytes() {
+    for how in ["disconnect", "reconnect"] {
+        let mut rt = setup();
+        let stream = subscribe(&mut rt, "c1");
+        hold(&mut rt, "c1", S1);
+        rt.hold_writes = true;
+        let m = input(&rt, "c1", &stream, 1);
+        rt.send("c1", &m);
+        if how == "disconnect" {
+            rt.disconnect("c1");
+        } else {
+            rt.event_reconnect("c1", C1B);
+        }
+        rt.flush_writes();
+        assert_eq!(
+            (rt.pty.writes_remote, rt.pty.dropped_remote),
+            (0, 1),
+            "{how}"
+        );
+        // The lease itself still expires normally.
+        assert_eq!(rt.host.lease_holder(S1), Some(C1), "{how}");
+        rt.set_now(LEASE_MS);
+        assert_eq!(rt.host.lease_holder(S1), None, "{how}");
+    }
+}
+
+#[test]
+fn dispatches_count_only_what_reached_the_agent() {
+    use super::fixtures::HostUnderTest;
+    let mut rt = setup();
+    let e = hold(&mut rt, "c1", S1);
+    rt.pty.fail_next_enqueue = true;
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    let m = submit(&rt, "c1", S1, e, 2, "prompt");
+    rt.send("c1", &m);
+    assert_eq!(rt.counter("dispatch_attempts").unwrap(), 2);
+    assert_eq!(rt.counter("dispatches").unwrap(), 1);
+}
+
+#[test]
+fn activity_and_process_replacement() {
+    let mut rt = setup();
+    rt.send("v", &session("list", json!({})));
+    got(&mut rt, "v");
+    rt.set_activity(S1, wire::Activity::Working, 1_760_500_000_123);
+    let c = only(&mut rt, "v");
+    assert_eq!(c["descriptor"]["activity"], "working");
+    assert_eq!(c["descriptor"]["activity_since"], 1_760_500_000_123u64);
+
+    let e = hold(&mut rt, "c1", S1);
+    for n in [1, 2] {
+        let m = submit(&rt, "c1", S1, e, n, "prompt");
+        rt.send("c1", &m);
+    }
+    got(&mut rt, "c1");
+    got(&mut rt, "v");
+    let new_gen = "22222222-2222-4222-8222-000000000002";
+    rt.replace_process(S1, new_gen);
+    let a = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(
+        (a.state, a.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_AGENT_EXITED))
+    );
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Rejected
+    );
+    let msgs = got(&mut rt, "v");
+    let ended = msgs.iter().find(|m| m["op"] == "lease_changed").unwrap();
+    assert_eq!(ended["reason"], "process_ended");
+    assert_eq!(ended["process_gen"], P1);
+    let change = msgs.iter().rfind(|m| m["op"] == "session_changed").unwrap();
+    assert_eq!(change["descriptor"]["process_gen"], new_gen);
+    assert_eq!(change["descriptor"]["state"], "running");
+    assert_eq!(rt.host.lease_holder(S1), None);
+    got(&mut rt, "c1");
+    // Old-generation bindings are stale; receipts of it stay queryable.
+    let m = acquire(&rt, "c1", S1, false);
     rt.send("c1", &m);
     assert_error(&only(&mut rt, "c1"), "stale_target");
+    let q = query(&rt, "c1", target_with(S1, 1), vec![rid(1)]);
+    rt.send("c1", &q);
+    assert_eq!(only(&mut rt, "c1")["receipts"][0]["request_id"], rid(1));
+    assert!(rt.host.replace_process(S1, new_gen).is_err(), "must be new");
+}
+
+#[test]
+fn prompt_payloads_are_dropped_once_past_accepted() {
+    let mut rt = setup();
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    let accepted = rt
+        .host
+        .journal()
+        .records()
+        .iter()
+        .find_map(|r| match r {
+            Record::Accepted {
+                payload,
+                payload_digest,
+                ..
+            } => Some((payload.clone(), payload_digest.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(accepted.0, Value::Null, "payload dropped once executing");
+    assert!(wire::is_digest(&accepted.1));
+    let replayed = super::journal::replay(rt.host.journal().records().to_vec()).unwrap();
+    let s = &replayed.receipts[&rid(1)];
+    assert_eq!(s.payload, None);
+    assert_eq!(s.payload_digest, accepted.1);
+    // The digest still identifies duplicates.
+    got(&mut rt, "c1");
+    rt.send("c1", &m);
+    assert_eq!(only(&mut rt, "c1")["state"], "executing");
 }
 
 impl FakeRuntime {
@@ -1111,13 +1462,32 @@ impl FakeRuntime {
         self.apply(fx);
     }
 
-    fn close_session(&mut self, s: &str) {
-        let fx = self.host.close_session(s);
+    fn close_session(&mut self, s: &str, process_gone: bool) {
+        let fx = self.host.close_session(s, process_gone);
         self.apply(fx);
     }
 
     fn remove_session(&mut self, s: &str) {
         let fx = self.host.remove_session(s);
+        self.apply(fx);
+    }
+
+    fn disconnect(&mut self, client: &str) {
+        use super::fixtures::{HostEvent, HostUnderTest};
+        let now = self.now();
+        let event = HostEvent::Disconnect {
+            client: client.into(),
+        };
+        self.event(&event, now).unwrap();
+    }
+
+    fn set_activity(&mut self, s: &str, activity: wire::Activity, since: u64) {
+        let fx = self.host.set_activity(s, activity, since);
+        self.apply(fx);
+    }
+
+    fn replace_process(&mut self, s: &str, process_gen: &str) {
+        let fx = self.host.replace_process(s, process_gen).unwrap();
         self.apply(fx);
     }
 

@@ -11,15 +11,15 @@
 
 use super::fixtures::{HostEvent, HostUnderTest, Setup};
 use super::host::{
-    Attach, DispatchReport, Effect, HostConfig, HostContext, Origin, SessionHost, SessionSpec,
-    random_ids,
+    Attach, ChatReply, DispatchReport, Effect, HostConfig, HostContext, Origin, SessionHost,
+    SessionSpec, random_ids,
 };
 use super::journal::MemJournal;
 use super::wire::{
     self, Binding, ClientKind, DecodeError, Envelope, Op, Permission, ReceiptKind, SessionMessage,
     Target,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// The authenticated link's authorization in the fixtures (24 h).
@@ -30,7 +30,10 @@ pub const AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
 pub struct Pty {
     pub fail_next_enqueue: bool,
     pub fail_next_partial: bool,
+    /// Every `Dispatch` the host asked for.
     pub dispatch_attempts: u64,
+    /// Dispatches that reached the PTY/agent (not refused before any effect).
+    pub dispatches: u64,
     /// `None` once a writer failed after a possible partial write.
     pub bytes_written: Option<u64>,
     pub writes_local: u64,
@@ -47,6 +50,7 @@ impl Default for Pty {
             fail_next_enqueue: false,
             fail_next_partial: false,
             dispatch_attempts: 0,
+            dispatches: 0,
             bytes_written: Some(0),
             writes_local: 0,
             writes_remote: 0,
@@ -76,6 +80,9 @@ pub struct FakeRuntime {
     /// Hold remote PTY writes in a queue instead of writing them at once
     /// (`flush_writes` writes them through the write boundary).
     pub hold_writes: bool,
+    /// Whether the clock runs the host's timers (`advance`); off, the host
+    /// sees time only through `receive` and `admit_write`.
+    pub ticks: bool,
     queued_writes: Vec<Effect>,
     /// How a `Reconcile` is answered.
     pub reconcile_answer: DispatchReport,
@@ -95,6 +102,44 @@ fn message(op: Op) -> Envelope {
         id: uuid::Uuid::new_v4().to_string(),
         re: None,
         op,
+    })
+}
+
+/// Renders a chat reply as the chat runtime would (without its stream head).
+fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Envelope {
+    let mut data = json!({"v": 1, "conversationId": conversation_id, "agentId": session_id});
+    let body = match reply {
+        ChatReply::Accepted { request_id } => json!({"op": "accepted", "requestId": request_id}),
+        ChatReply::Complete {
+            request_id,
+            turn_id,
+        } => {
+            let mut b = json!({"op": "complete", "requestId": request_id, "outcome": "done"});
+            if let Some(t) = turn_id {
+                b["turnId"] = Value::String(t);
+            }
+            b
+        }
+        ChatReply::Error {
+            request_id,
+            code,
+            text,
+        } => {
+            let mut b = json!({"op": "error", "code": code, "text": text});
+            if let Some(r) = request_id {
+                b["requestId"] = Value::String(r);
+            }
+            b
+        }
+    };
+    data.as_object_mut()
+        .unwrap()
+        .extend(body.as_object().unwrap().clone());
+    Envelope::Family(wire::FamilyMessage {
+        family: "agentChat".into(),
+        data: Some(data),
+        binding: None,
+        request: None,
     })
 }
 
@@ -118,6 +163,7 @@ impl FakeRuntime {
             host,
             pty: Pty::default(),
             hold_writes: false,
+            ticks: true,
             queued_writes: Vec::new(),
             reconcile_answer: DispatchReport::Unknown,
             clients: BTreeMap::new(),
@@ -220,9 +266,11 @@ impl FakeRuntime {
             .insert(attachment_gen.to_string(), client.to_string());
         self.live
             .insert(attachment_gen.to_string(), client.to_string());
-        let fx = self
-            .host
-            .receive_decoded(attachment_gen, Ok(message(Op::Hello { resume: None })));
+        let fx = self.host.receive_decoded(
+            attachment_gen,
+            Ok(message(Op::Hello { resume: None })),
+            self.now,
+        );
         self.apply(fx);
         let i = self
             .out
@@ -284,6 +332,7 @@ impl FakeRuntime {
                 binding,
                 takeover: false,
             })),
+            self.now,
         );
         self.apply(fx);
         let i = self
@@ -348,6 +397,9 @@ impl FakeRuntime {
                         // Written; completion comes from the provider later.
                         None
                     };
+                    if report != Some(DispatchReport::FailedNoEffect) {
+                        self.pty.dispatches += 1;
+                    }
                     if let Some(report) = report {
                         work.extend(self.host.dispatch_report(&request_id, report));
                     }
@@ -355,6 +407,17 @@ impl FakeRuntime {
                 Effect::Reconcile { request_id, .. } => {
                     let answer = self.reconcile_answer.clone();
                     work.extend(self.host.dispatch_report(&request_id, answer));
+                }
+                Effect::Chat {
+                    attachment,
+                    conversation_id,
+                    session_id,
+                    reply,
+                } => {
+                    if let Some(name) = self.live.get(&attachment) {
+                        let msg = render_chat(&conversation_id, &session_id, reply);
+                        self.out.push((name.clone(), msg));
+                    }
                 }
                 Effect::StreamOpened { .. }
                 | Effect::StreamClosed { .. }
@@ -380,7 +443,7 @@ impl FakeRuntime {
                 self.pty.wrote(bytes.len());
             }
             Origin::Remote { input_epoch, .. } => {
-                if self.host.admit_write(&session_id, input_epoch) {
+                if self.host.admit_write(&session_id, input_epoch, self.now) {
                     self.pty.writes_remote += 1;
                     self.pty.wrote(bytes.len());
                 } else {
@@ -398,8 +461,10 @@ impl FakeRuntime {
 
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
-        let fx = self.host.advance(now);
-        self.apply(fx);
+        if self.ticks {
+            let fx = self.host.advance(now);
+            self.apply(fx);
+        }
     }
 
     /// `client` sends `json` on its current attachment.
@@ -411,7 +476,7 @@ impl FakeRuntime {
     /// Sends `json` on a specific (possibly fenced) attachment.
     pub fn send_on(&mut self, attachment: &str, json: &Value) {
         let msg = wire::decode(&serde_json::to_vec(json).unwrap());
-        let fx = self.host.receive_decoded(attachment, msg);
+        let fx = self.host.receive_decoded(attachment, msg, self.now);
         self.apply(fx);
     }
 
@@ -439,7 +504,7 @@ impl HostUnderTest for FakeRuntime {
     fn receive(&mut self, client: &str, msg: Result<Envelope, DecodeError>, now_ms: u64) {
         self.set_now(now_ms);
         let att = self.attachment(client);
-        let fx = self.host.receive_decoded(&att, msg);
+        let fx = self.host.receive_decoded(&att, msg, now_ms);
         self.apply(fx);
     }
 
@@ -477,8 +542,11 @@ impl HostUnderTest for FakeRuntime {
                 let resume = Some(wire::Resume {
                     controller_session: uuid::Uuid::new_v4().to_string(),
                 });
-                self.host
-                    .receive_decoded(attachment_gen, Ok(message(Op::Hello { resume })))
+                self.host.receive_decoded(
+                    attachment_gen,
+                    Ok(message(Op::Hello { resume })),
+                    self.now,
+                )
             }
             HostEvent::Reconnect {
                 client,
@@ -521,7 +589,8 @@ impl HostUnderTest for FakeRuntime {
     fn counter(&self, key: &str) -> Result<Value, String> {
         let p = &self.pty;
         Ok(match key {
-            "dispatch_attempts" | "dispatches" => p.dispatch_attempts.into(),
+            "dispatch_attempts" => p.dispatch_attempts.into(),
+            "dispatches" => p.dispatches.into(),
             "pty_bytes_written" => p.bytes_written.map_or("unknown".into(), Value::from),
             "pty_writes" => (p.writes_local + p.writes_remote).into(),
             "pty_writes_local" => p.writes_local.into(),

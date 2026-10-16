@@ -4,7 +4,9 @@
 //! submissions with durable receipts (§6) and errors without disclosure (§7).
 //!
 //! `SessionHost` is pure: it never touches sockets, PTYs, processes or files.
-//! Time is the injected monotonic clock (`advance`); every input returns the
+//! Time is the injected monotonic clock (`advance`, and the `now` passed with
+//! every message and write check, so expiry never waits for a timer tick);
+//! every input returns the
 //! `Effect`s the runtime must perform, in order. Durability goes through the
 //! `Journal`: a receipt state is reported only after its record is durable.
 //!
@@ -14,9 +16,14 @@
 //! carrying `binding` and the current lease, after `welcome`.
 //!
 //! The PTY write boundary is the runtime's: right before writing a queued
-//! remote chunk it calls `admit_write(session, input_epoch)`; transfer,
-//! expiry, release, revoke and local input bump the epoch first, so bytes
-//! queued under an older lease are dropped, never written.
+//! remote chunk it calls `admit_write(session, input_epoch, now)`; transfer,
+//! expiry, release, revoke, local input and the holder's attachment going
+//! away bump the epoch first, so bytes queued under an older lease are
+//! dropped, never written.
+//!
+//! Refused terminal-v1 requests are answered with terminal-v1 `error`, and a
+//! chat-v1 `submit` hears about its request through chat-v1 ops
+//! (`Effect::Chat`); removed forms get a session `error` without `re`.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 use super::journal::{self, Journal, JournalError, Record, Stored};
@@ -114,7 +121,7 @@ pub struct SessionSpec {
 pub enum Origin {
     /// Typed on the host's own terminal; never fenced.
     Local,
-    /// From the lease holder; written only if `admit_write(input_epoch)`
+    /// From the lease holder; written only if `admit_write` still admits `input_epoch`
     /// still holds at the write boundary.
     Remote {
         input_epoch: u64,
@@ -180,13 +187,47 @@ pub enum Effect {
         target: Target,
         kind: ReceiptKind,
     },
+    /// A chat-v1 reply to the conversation that submitted (or was refused).
+    /// The runtime's chat stream renders it with its own `generation` and
+    /// `sequence` head.
+    Chat {
+        attachment: String,
+        conversation_id: String,
+        session_id: String,
+        reply: ChatReply,
+    },
+}
+
+/// chat-v1 results of a chat `submit`, mapped from its receipt (§6: chat-v1
+/// `accepted`/`complete` follow the receipt's `accepted`/`completed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatReply {
+    Accepted {
+        request_id: String,
+    },
+    /// The turn ended (`outcome: "done"`); `turn_id` is the provider's turn.
+    Complete {
+        request_id: String,
+        turn_id: Option<String>,
+    },
+    /// `code` is a §7 error code for refusals, or `rejected` /
+    /// `outcome_unknown` for a final receipt; `text` its bounded detail.
+    Error {
+        request_id: Option<String>,
+        code: String,
+        text: String,
+    },
 }
 
 /// What the runtime observed for a dispatched (or reconciled) request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchReport {
-    /// The kind's completion (§6 table) was observed.
-    Completed { detail: Option<String> },
+    /// The kind's completion (§6 table) was observed; for a prompt,
+    /// `turn_id` is the provider's turn that ended.
+    Completed {
+        detail: Option<String>,
+        turn_id: Option<String>,
+    },
     /// Failed with proof that nothing reached the agent (e.g. the PTY
     /// reservation failed, the signal could not be delivered).
     FailedNoEffect,
@@ -252,6 +293,10 @@ struct Entry {
     observe_deadline: Option<u64>,
     /// A final state is waiting for a durable write (retried on `advance`).
     finishing: bool,
+    /// Submitted through chat-v1 in this conversation: replies use chat ops.
+    chat: Option<String>,
+    /// The provider turn a completed prompt ended (chat `complete`).
+    turn_id: Option<String>,
 }
 
 pub type IdSource = Box<dyn FnMut() -> String + Send>;
@@ -429,7 +474,14 @@ impl<J: Journal> SessionHost<J> {
         self.take()
     }
 
+    /// Fences or forgets an attachment. A lease it holds is not released (it
+    /// expires), but its queued remote bytes are dropped at the write boundary.
     fn drop_attachment(&mut self, id: &str) {
+        for s in self.sessions.values_mut() {
+            if s.lease.as_ref().is_some_and(|l| l.attachment == id) {
+                s.input_epoch += 1;
+            }
+        }
         if let Some(a) = self.attachments.remove(id) {
             for (session_id, stream_id) in a.streams {
                 self.out.push(Effect::StreamClosed {
@@ -450,6 +502,11 @@ impl<J: Journal> SessionHost<J> {
     /// observation windows close, pending durable writes are retried and
     /// tombstones/receipts past retention are dropped.
     pub fn advance(&mut self, now: u64) -> Vec<Effect> {
+        self.tick(now);
+        self.take()
+    }
+
+    fn tick(&mut self, now: u64) {
         self.now = self.now.max(now);
         let now = self.now;
         let expired: Vec<String> = self
@@ -489,7 +546,6 @@ impl<J: Journal> SessionHost<J> {
         for sid in past {
             self.evict_receipts(&sid);
         }
-        self.take()
     }
 
     fn evict_receipts(&mut self, sid: &str) {
@@ -527,11 +583,14 @@ impl<J: Journal> SessionHost<J> {
         self.take()
     }
 
-    /// Called by the PTY writer right before writing a queued remote chunk.
-    pub fn admit_write(&self, session_id: &str, input_epoch: u64) -> bool {
-        self.sessions
-            .get(session_id)
-            .is_some_and(|s| s.input_epoch == input_epoch && s.lease.is_some())
+    /// Called by the PTY writer right before writing a queued remote chunk,
+    /// with the monotonic time of the write: the chunk's input epoch must
+    /// still be current and its lease unexpired (`now >= deadline` is
+    /// expired, whether or not `advance` ran).
+    pub fn admit_write(&self, session_id: &str, input_epoch: u64, now: u64) -> bool {
+        self.sessions.get(session_id).is_some_and(|s| {
+            s.input_epoch == input_epoch && s.lease.as_ref().is_some_and(|l| now < l.deadline)
+        })
     }
 
     /// The outcome of a `Dispatch` or `Reconcile`.
@@ -544,7 +603,10 @@ impl<J: Journal> SessionHost<J> {
         }
         let kind = e.stored.kind;
         let (state, detail) = match report {
-            DispatchReport::Completed { detail } => {
+            DispatchReport::Completed { detail, turn_id } => {
+                if let Some(e) = self.receipts.get_mut(request_id) {
+                    e.turn_id = turn_id;
+                }
                 let detail = detail.map(|d| bounded_detail(&d));
                 (ReceiptState::Completed, detail)
             }
@@ -561,7 +623,14 @@ impl<J: Journal> SessionHost<J> {
             ),
             DispatchReport::FailedAfterPossibleEffect => (
                 ReceiptState::OutcomeUnknown,
-                Some(DETAIL_WRITE_INTERRUPTED.to_string()),
+                Some(
+                    match kind {
+                        ReceiptKind::Prompt | ReceiptKind::Approval => DETAIL_WRITE_INTERRUPTED,
+                        ReceiptKind::Interrupt => DETAIL_NO_INTERRUPT,
+                        ReceiptKind::Stop => DETAIL_STILL_RUNNING,
+                    }
+                    .to_string(),
+                ),
             ),
             DispatchReport::Unknown => (
                 ReceiptState::OutcomeUnknown,
@@ -588,6 +657,15 @@ impl<J: Journal> SessionHost<J> {
         s.exit_status = exit_status;
         s.activity_since = wall;
         self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
+        self.process_gone(session_id);
+        self.registry_changed(session_id);
+        self.take()
+    }
+
+    /// The session's agent process is gone: a `stop` completes, other
+    /// executing work is `outcome_unknown` ("agent exited"), accepted work is
+    /// rejected.
+    fn process_gone(&mut self, session_id: &str) {
         let process_gen = self.sessions[session_id].spec.process_gen.clone();
         let work: Vec<(String, ReceiptState, ReceiptKind)> = self
             .receipts
@@ -614,13 +692,12 @@ impl<J: Journal> SessionHost<J> {
                 _ => {}
             }
         }
-        self.registry_changed(session_id);
-        self.take()
     }
 
     /// The session no longer accepts submissions; its receipts are kept for
-    /// `RECEIPT_RETENTION_MS`.
-    pub fn close_session(&mut self, session_id: &str) -> Vec<Effect> {
+    /// `RECEIPT_RETENTION_MS`. With `process_gone` its executing work is
+    /// finished as after `process_exited`; otherwise it may still complete.
+    pub fn close_session(&mut self, session_id: &str, process_gone: bool) -> Vec<Effect> {
         let Some(s) = self.sessions.get_mut(session_id) else {
             return Vec::new();
         };
@@ -628,8 +705,72 @@ impl<J: Journal> SessionHost<J> {
         self.ended.entry(session_id.to_string()).or_insert(self.now);
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
+        if process_gone {
+            self.process_gone(session_id);
+        }
         self.registry_changed(session_id);
         self.take()
+    }
+
+    /// The provider's activity changed (from agent-native events; `Unknown`
+    /// when it can't be detected). `since` is wall-clock ms.
+    pub fn set_activity(
+        &mut self,
+        session_id: &str,
+        activity: Activity,
+        since: u64,
+    ) -> Vec<Effect> {
+        let Some(s) = self.sessions.get_mut(session_id) else {
+            return Vec::new();
+        };
+        s.activity = activity;
+        s.activity_since = since.min(MAX_SAFE_INTEGER);
+        self.registry_changed(session_id);
+        self.take()
+    }
+
+    /// The agent process was replaced (restart/resume): a new `process_gen`.
+    /// Leases end, the old process's executing work is `outcome_unknown`
+    /// ("agent exited") and its accepted work rejected; terminal streams of
+    /// the old process close.
+    pub fn replace_process(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+    ) -> Result<Vec<Effect>, String> {
+        let s = self.sessions.get(session_id).ok_or("unknown session")?;
+        if !wire::is_uuid_v4(process_gen) || s.spec.process_gen == process_gen {
+            return Err("process_gen must be a new UUID v4".into());
+        }
+        let used = self.receipts.values().any(|e| {
+            e.stored.target.session_id == session_id && e.stored.target.process_gen == process_gen
+        });
+        if used {
+            return Err("process_gen already used".into());
+        }
+        self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
+        self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
+        self.process_gone(session_id);
+        let wall = self.wall();
+        let s = self.sessions.get_mut(session_id).unwrap();
+        s.spec.process_gen = process_gen.to_string();
+        s.state = SessionState::Running;
+        s.exit_status = None;
+        s.activity = Activity::Unknown;
+        s.activity_since = wall;
+        s.input_epoch += 1;
+        s.queued.clear();
+        for (att, a) in self.attachments.iter_mut() {
+            if let Some(stream_id) = a.streams.remove(session_id) {
+                self.out.push(Effect::StreamClosed {
+                    attachment: att.clone(),
+                    session_id: session_id.to_string(),
+                    stream_id,
+                });
+            }
+        }
+        self.registry_changed(session_id);
+        Ok(self.take())
     }
 
     /// Removes the session: subscribers get its last descriptor with
@@ -640,6 +781,7 @@ impl<J: Journal> SessionHost<J> {
         }
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
+        self.process_gone(session_id);
         self.sessions.get_mut(session_id).unwrap().state = SessionState::Removed;
         self.registry_changed(session_id);
         self.sessions.remove(session_id);
@@ -720,6 +862,8 @@ impl<J: Journal> SessionHost<J> {
                     submitted_by: None,
                     observe_deadline: None,
                     finishing: false,
+                    chat: None,
+                    turn_id: None,
                 };
                 (rid, entry)
             })
@@ -815,17 +959,22 @@ impl<J: Journal> SessionHost<J> {
 
     // ── Messages ──
 
-    /// One message from `attachment`, strictly decoded here.
-    pub fn receive(&mut self, attachment: &str, bytes: &[u8]) -> Vec<Effect> {
-        self.receive_decoded(attachment, wire::decode(bytes))
+    /// One message from `attachment`, arriving at monotonic `now`, strictly
+    /// decoded here.
+    pub fn receive(&mut self, attachment: &str, bytes: &[u8], now: u64) -> Vec<Effect> {
+        self.receive_decoded(attachment, wire::decode(bytes), now)
     }
 
-    /// One message from `attachment`, already decoded with `wire::decode`.
+    /// One message from `attachment`, arriving at monotonic `now`, already
+    /// decoded with `wire::decode`. Timers due by `now` fire first, so expiry
+    /// (`now >= deadline`) never depends on `advance` having run.
     pub fn receive_decoded(
         &mut self,
         attachment: &str,
         msg: Result<Envelope, DecodeError>,
+        now: u64,
     ) -> Vec<Effect> {
+        self.tick(now);
         let re = match &msg {
             Ok(Envelope::Session(m)) => Some(m.id.clone()),
             Err(e) => e.id.clone(),
@@ -901,7 +1050,7 @@ impl<J: Journal> SessionHost<J> {
                     request_id,
                     kind,
                     payload,
-                } => self.submit(att, re.clone(), &binding, &request_id, kind, payload),
+                } => self.submit_session(att, re.clone(), &binding, &request_id, kind, payload),
                 Op::ReceiptQuery {
                     binding,
                     request_ids,
@@ -973,17 +1122,21 @@ impl<J: Journal> SessionHost<J> {
         if !self.attachments[att].can(Permission::Control) {
             return Err(ErrorCode::Forbidden);
         }
-        let holds = s
-            .lease
-            .as_ref()
-            .is_some_and(|l| l.attachment == att && Some(s.lease_epoch) == lease_epoch);
-        if !holds {
-            return Err(ErrorCode::StaleLease);
-        }
+        // A session that no longer accepts work says so, whatever the lease.
         if s.state != SessionState::Running {
             return Err(ErrorCode::SessionClosed);
         }
+        if !self.lease_live(att, s, lease_epoch) {
+            return Err(ErrorCode::StaleLease);
+        }
         Ok(())
+    }
+
+    /// `att` holds `s`'s lease at exactly `lease_epoch` and it hasn't expired.
+    fn lease_live(&self, att: &str, s: &Session, lease_epoch: Option<u64>) -> bool {
+        s.lease.as_ref().is_some_and(|l| {
+            l.attachment == att && Some(s.lease_epoch) == lease_epoch && self.now < l.deadline
+        })
     }
 
     // ── Registry (§4) ──
@@ -1203,11 +1356,7 @@ impl<J: Journal> SessionHost<J> {
 
     fn holds(&self, att: &str, b: &Binding) -> Checked<()> {
         let s = self.check_binding(att, b)?;
-        let holds = s
-            .lease
-            .as_ref()
-            .is_some_and(|l| l.attachment == att && Some(s.lease_epoch) == b.lease_epoch);
-        if holds {
+        if self.lease_live(att, s, b.lease_epoch) {
             Ok(())
         } else {
             Err(ErrorCode::StaleLease)
@@ -1239,10 +1388,29 @@ impl<J: Journal> SessionHost<J> {
 
     // ── Submissions and receipts (§6) ──
 
-    fn submit(
+    fn submit_session(
         &mut self,
         att: &str,
         re: Option<String>,
+        b: &Binding,
+        request_id: &str,
+        kind: ReceiptKind,
+        payload: Value,
+    ) -> Checked {
+        if kind == ReceiptKind::Approval && !self.receipts.contains_key(request_id) {
+            self.check_binding(att, b)?;
+            self.error(att, re, ErrorCode::Forbidden, Some(DETAIL_APPROVAL));
+            return Ok(());
+        }
+        self.submit(att, Reply::Session(re), b, request_id, kind, payload)
+    }
+
+    /// §6 admission. `reply` is how the submitter hears about it: session
+    /// `receipt`s, or chat-v1 ops for a chat `submit`.
+    fn submit(
+        &mut self,
+        att: &str,
+        reply: Reply,
         b: &Binding,
         request_id: &str,
         kind: ReceiptKind,
@@ -1256,13 +1424,8 @@ impl<J: Journal> SessionHost<J> {
             if st.target != b.target || st.kind != kind || st.payload_digest != digest {
                 return Err(ErrorCode::RequestIdReused);
             }
-            // Same request: the recorded receipt, no lease, no re-execution.
-            let receipt = to_receipt(st);
-            self.send(att, re, Op::Receipt(receipt));
-            return Ok(());
-        }
-        if kind == ReceiptKind::Approval {
-            self.error(att, re, ErrorCode::Forbidden, Some(DETAIL_APPROVAL));
+            // Same request: the recorded state, no lease, no re-execution.
+            self.report_state(att, reply, request_id);
             return Ok(());
         }
         let sid = &b.target.session_id;
@@ -1303,13 +1466,16 @@ impl<J: Journal> SessionHost<J> {
             target: b.target.clone(),
             kind,
             payload_digest: digest,
-            payload,
+            payload: Some(payload),
             state: ReceiptState::Accepted,
             detail: None,
             updated_at,
             order,
         };
-        let receipt = to_receipt(&stored);
+        let chat = match &reply {
+            Reply::Chat { conversation_id } => Some(conversation_id.clone()),
+            Reply::Session(_) => None,
+        };
         self.receipts.insert(
             request_id.to_string(),
             Entry {
@@ -1317,11 +1483,33 @@ impl<J: Journal> SessionHost<J> {
                 submitted_by: Some(att.to_string()),
                 observe_deadline: None,
                 finishing: false,
+                chat,
+                turn_id: None,
             },
         );
-        self.send(att, re, Op::Receipt(receipt));
+        self.report_state(att, reply, request_id);
         self.schedule(request_id);
         Ok(())
+    }
+
+    /// Tells `att` the request's current state on its channel.
+    fn report_state(&mut self, att: &str, reply: Reply, rid: &str) {
+        let e = &self.receipts[rid];
+        match reply {
+            Reply::Session(re) => {
+                let receipt = to_receipt(&e.stored);
+                self.send(att, re, Op::Receipt(receipt));
+            }
+            Reply::Chat { conversation_id } => {
+                let reply = chat_reply(e);
+                self.out.push(Effect::Chat {
+                    attachment: att.to_string(),
+                    conversation_id,
+                    session_id: e.stored.target.session_id.clone(),
+                    reply,
+                });
+            }
+        }
     }
 
     /// Prompts paste one at a time per session (queued while another prompt
@@ -1387,6 +1575,12 @@ impl<J: Journal> SessionHost<J> {
             self.finish(rid, ReceiptState::Rejected, Some(detail));
             return;
         }
+        // The payload is dropped once the request leaves `accepted`.
+        let payload = self.receipts[rid]
+            .stored
+            .payload
+            .clone()
+            .unwrap_or(Value::Null);
         if !self.transition(rid, ReceiptState::Executing, None) {
             self.finish(rid, ReceiptState::Rejected, Some(DETAIL_NOT_RECORDED));
             return;
@@ -1401,7 +1595,7 @@ impl<J: Journal> SessionHost<J> {
             request_id: rid.to_string(),
             target: s.target.clone(),
             kind: s.kind,
-            payload: s.payload.clone(),
+            payload,
         };
         self.out.push(effect);
     }
@@ -1432,11 +1626,17 @@ impl<J: Journal> SessionHost<J> {
         e.stored.detail = detail;
         e.stored.updated_at = updated_at;
         e.finishing = false;
-        let receipt = to_receipt(&e.stored);
+        e.stored.payload = None;
         let kind = e.stored.kind;
         let sid = e.stored.target.session_id.clone();
-        if let Some(att) = e.submitted_by.clone() {
-            self.send(&att, None, Op::Receipt(receipt));
+        let reply = match e.chat.clone() {
+            // chat-v1 has no `executing`: the turn just runs.
+            Some(_) if to == ReceiptState::Executing => None,
+            Some(conversation_id) => Some(Reply::Chat { conversation_id }),
+            None => Some(Reply::Session(None)),
+        };
+        if let (Some(att), Some(reply)) = (e.submitted_by.clone(), reply) {
+            self.report_state(&att, reply, rid);
         }
         if from == ReceiptState::Executing && kind == ReceiptKind::Prompt {
             self.pump_queue(&sid);
@@ -1515,7 +1715,57 @@ impl<J: Journal> SessionHost<J> {
             _ => Ok(()),
         };
         if let Err(code) = result {
-            self.error(att, None, code, None);
+            self.family_error(att, &f, code);
+        }
+    }
+
+    /// A refused terminal-v1 or chat-v1 request is answered in its own family
+    /// (removed forms never get here: they fail decoding and get a session
+    /// `error`). Nothing about other targets is disclosed.
+    fn family_error(&mut self, att: &str, f: &FamilyMessage, code: ErrorCode) {
+        let field = |name: &str| {
+            f.data
+                .as_ref()
+                .and_then(|d| d.get(name))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        match f.family.as_str() {
+            "terminal" => {
+                let mut data = json!({
+                    "v": 1,
+                    "op": "error",
+                    "terminal_id": field("terminal_id"),
+                    "code": code_name(code),
+                    "message": code_text(code),
+                });
+                if let Some(stream_id) = field("stream_id") {
+                    data["stream_id"] = Value::String(stream_id);
+                }
+                self.out.push(Effect::Send {
+                    attachment: att.to_string(),
+                    message: Envelope::Family(FamilyMessage {
+                        family: "terminal".into(),
+                        data: Some(data),
+                        binding: None,
+                        request: None,
+                    }),
+                });
+            }
+            "agentChat" => {
+                let submit = field("op").as_deref() == Some("submit");
+                self.out.push(Effect::Chat {
+                    attachment: att.to_string(),
+                    conversation_id: field("conversationId").unwrap_or_default(),
+                    session_id: field("agentId").unwrap_or_default(),
+                    reply: ChatReply::Error {
+                        request_id: field("requestId").filter(|_| submit),
+                        code: code_name(code),
+                        text: code_text(code).to_string(),
+                    },
+                });
+            }
+            _ => self.error(att, None, code, None),
         }
     }
 
@@ -1676,7 +1926,13 @@ impl<J: Journal> SessionHost<J> {
                 }
                 let payload = json!({ "text": text });
                 let request_id = request_id.to_string();
-                self.submit(att, None, b, &request_id, ReceiptKind::Prompt, payload)
+                let reply = Reply::Chat {
+                    conversation_id: data["conversationId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                self.submit(att, reply, b, &request_id, ReceiptKind::Prompt, payload)
             }
             Some("open" | "close") => {
                 self.out.push(Effect::Forward {
@@ -1688,6 +1944,63 @@ impl<J: Journal> SessionHost<J> {
             }
             _ => Err(ErrorCode::UnsupportedVersion),
         }
+    }
+}
+
+/// How a submitter hears about its request.
+#[derive(Debug, Clone)]
+enum Reply {
+    /// session-v1 `receipt` (with `re` for the direct reply).
+    Session(Option<String>),
+    /// chat-v1 `accepted` / `complete` / `error`.
+    Chat { conversation_id: String },
+}
+
+/// A chat submit's current state in chat-v1 terms.
+fn chat_reply(e: &Entry) -> ChatReply {
+    let s = &e.stored;
+    let request_id = s.request_id.clone();
+    let error = |code: &str| ChatReply::Error {
+        request_id: Some(request_id.clone()),
+        code: code.to_string(),
+        text: s.detail.clone().unwrap_or_default(),
+    };
+    match s.state {
+        ReceiptState::Accepted | ReceiptState::Executing => ChatReply::Accepted {
+            request_id: request_id.clone(),
+        },
+        ReceiptState::Completed => ChatReply::Complete {
+            request_id: request_id.clone(),
+            turn_id: e.turn_id.clone(),
+        },
+        ReceiptState::Rejected => error("rejected"),
+        ReceiptState::OutcomeUnknown => error("outcome_unknown"),
+    }
+}
+
+/// The wire name of a §7 code.
+pub fn code_name(code: ErrorCode) -> String {
+    match serde_json::to_value(code) {
+        Ok(Value::String(s)) => s,
+        _ => unreachable!("error codes serialize as strings"),
+    }
+}
+
+/// Fixed human text per code: never paths, OS errors or other targets' ids.
+pub fn code_text(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::UnsupportedVersion => "unsupported request",
+        ErrorCode::Unauthorized => "not authorized",
+        ErrorCode::Forbidden => "not permitted",
+        ErrorCode::StaleTarget => "the session changed; list again",
+        ErrorCode::UnknownSession => "unknown session",
+        ErrorCode::LeaseHeld => "another controller holds control",
+        ErrorCode::StaleLease => "control lease is not current",
+        ErrorCode::RequestIdReused => "request id already used",
+        ErrorCode::ReceiptLimit => "too many requests for this session",
+        ErrorCode::SessionClosed => "the session no longer accepts requests",
+        ErrorCode::Busy => "busy; try again",
+        ErrorCode::Paused => "authorization expired; control paused",
     }
 }
 
