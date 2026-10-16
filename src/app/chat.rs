@@ -4,7 +4,7 @@
 use super::App;
 use crate::agent_client::AgentStatus;
 use crate::chat::adapter::{AgentAdapter, AgentEvent, LogItem};
-use crate::chat::claude::{ClaudeAdapter, hooks};
+use crate::chat::claude::hooks;
 use crate::chat::session::{ChatSession, Out, State};
 use crate::chat::wire::{self, ChatEnvelope, Inbound};
 use crate::session::{Session, SessionId};
@@ -188,16 +188,8 @@ impl App {
             self.chat_swept = true;
             hooks::sweep_stale(&self.chat_root);
         }
-        let dir = match hooks::create_session_dir(&self.chat_root) {
-            Ok(dir) => dir,
-            Err(error) => {
-                crate::diagnostics::warn(format!("Chat is off for Claude: {error}"));
-                return (None, Vec::new());
-            }
-        };
-        let mut adapter = ClaudeAdapter::new();
-        match adapter.prepare_launch(args, &dir) {
-            Ok(plan) => {
+        match crate::chat::claude::prepare_chat(&self.chat_root, args) {
+            Ok((adapter, extra_args)) => {
                 let chat = AgentChat {
                     agent_id: agent_id.to_string(),
                     adapter: Some(Box::new(adapter)),
@@ -207,10 +199,9 @@ impl App {
                     chat_v1: false,
                     reason_noticed: false,
                 };
-                (Some(chat), plan.extra_args)
+                (Some(chat), extra_args)
             }
             Err(error) => {
-                let _ = std::fs::remove_dir_all(&dir);
                 crate::diagnostics::warn(format!("Chat is off for Claude: {error}"));
                 (None, Vec::new())
             }

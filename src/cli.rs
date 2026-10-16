@@ -102,6 +102,16 @@ pub enum Commands {
     /// Runs the agent runtime (started automatically by `atem agent`)
     #[command(hide = true)]
     Runtime,
+    /// Runs one agent session for the runtime (started by it; outlives it)
+    #[command(hide = true)]
+    Worker {
+        /// The runtime's state directory
+        #[arg(long)]
+        state: std::path::PathBuf,
+        /// The session id (`ses-…`)
+        #[arg(long)]
+        session: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1064,6 +1074,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Runtime => {
             crate::runtime::run_runtime(crate::config::AtemConfig::config_dir()).await
         }
+        Commands::Worker { state, session } => crate::runtime::worker::run_worker(state, session).await,
     }
 }
 
@@ -2303,6 +2314,22 @@ mod tests {
         assert!(matches!(cli.command, Some(Commands::Runtime)));
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("runtime"), "{help}");
+    }
+
+    #[test]
+    fn worker_is_a_hidden_subcommand_with_state_and_session() {
+        use clap::CommandFactory;
+        let cli = Cli::try_parse_from(["atem", "worker", "--state", "/tmp/s", "--session", "ses-abcdefgh2345"]).unwrap();
+        match cli.command {
+            Some(Commands::Worker { state, session }) => {
+                assert_eq!(state, std::path::PathBuf::from("/tmp/s"));
+                assert_eq!(session, "ses-abcdefgh2345");
+            }
+            _ => panic!("not a worker command"),
+        }
+        assert!(Cli::try_parse_from(["atem", "worker"]).is_err());
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("worker"), "{help}");
     }
 
     #[test]

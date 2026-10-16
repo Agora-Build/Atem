@@ -298,7 +298,18 @@ pub fn spawn_detached(
     log: &Path,
     envs: &[(OsString, OsString)],
 ) -> io::Result<u32> {
-    spawn(exe, subcommand, cwd, log, envs, false)
+    spawn(exe, &[subcommand.as_ref()], cwd, log, envs, false)
+}
+
+/// `spawn_detached` with several arguments (`worker --state … --session …`).
+pub fn spawn_detached_args(
+    exe: &Path,
+    args: &[&std::ffi::OsStr],
+    cwd: &Path,
+    log: &Path,
+    envs: &[(OsString, OsString)],
+) -> io::Result<u32> {
+    spawn(exe, args, cwd, log, envs, false)
 }
 
 /// `spawn_detached` with exactly `envs` as the environment (nothing inherited).
@@ -309,12 +320,12 @@ pub fn spawn_detached_clean(
     log: &Path,
     envs: &[(OsString, OsString)],
 ) -> io::Result<u32> {
-    spawn(exe, subcommand, cwd, log, envs, true)
+    spawn(exe, &[subcommand.as_ref()], cwd, log, envs, true)
 }
 
 fn spawn(
     exe: &Path,
-    subcommand: &str,
+    args: &[&std::ffi::OsStr],
     cwd: &Path,
     log: &Path,
     envs: &[(OsString, OsString)],
@@ -339,7 +350,7 @@ fn spawn(
         command.env_clear();
     }
     command
-        .arg(subcommand)
+        .args(args)
         .envs(envs.iter().map(|(key, value)| (key, value)))
         .stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone()?)

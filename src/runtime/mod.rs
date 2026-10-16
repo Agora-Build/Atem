@@ -4,8 +4,16 @@
 // The frontends (`atem agent launch|attach|list|stop`, next task) use it.
 #[allow(dead_code)]
 pub mod client;
+// The broker drives workers from the next task on; until then it only
+// adopts them at start.
+#[allow(dead_code)]
+pub mod adopt;
 pub mod protocol;
 pub mod server;
+#[allow(dead_code)]
+pub mod worker;
+#[allow(dead_code)]
+pub mod worker_protocol;
 
 #[cfg(test)]
 mod server_tests;
@@ -25,6 +33,40 @@ pub fn files(config_dir: &Path, runtime_dir: Option<OsString>) -> DaemonFiles {
     files.lock = config_dir.join("runtime.lock");
     files.record = config_dir.join("runtime.socket");
     files
+}
+
+/// The broker's state directory (`<config>/runtime`): worker records and
+/// specs under `workers/`.
+pub fn state_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("runtime")
+}
+
+/// Adopts the workers an earlier broker left (see `adopt.rs`), logging what
+/// became of each, and keeps the adopted connections until they close. The
+/// broker routes sessions through them from the next task on.
+async fn adopt_workers(state: PathBuf) {
+    for adoption in adopt::adopt(&state).await {
+        let sid = adoption.session_id().to_string();
+        match adoption {
+            adopt::Adoption::Adopted(mut handle) => {
+                eprintln!(
+                    "atem runtime: adopted worker {sid} (process_gen {}, pid {})",
+                    handle.info.process_gen, handle.info.pid
+                );
+                tokio::spawn(async move {
+                    while let Some(message) = handle.recv().await {
+                        if let worker_protocol::WorkerMsg::Exited { status } = message {
+                            eprintln!("atem runtime: {sid} exited ({status})");
+                        }
+                    }
+                });
+            }
+            adopt::Adoption::RecoveryRequired { reason, .. } => {
+                eprintln!("atem runtime: {sid}: recovery_required ({reason})");
+            }
+            other => eprintln!("atem runtime: {sid}: {}", other.status()),
+        }
+    }
 }
 
 /// `ATEM_RUNTIME_IDLE_SECS` (for tests), else 10 minutes.
@@ -75,6 +117,7 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
         std::process::id(),
         files.socket.display()
     );
+    tokio::spawn(adopt_workers(state_dir(&config_dir)));
     let mut app = crate::app::App::new();
     app.spawn_astation_connect();
     let options = server::Options {

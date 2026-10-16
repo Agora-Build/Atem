@@ -22,7 +22,27 @@ pub enum PtyEvent {
         sequence: u64,
         result: Result<(), String>,
     },
+    /// What became of a fenced write (`PtyInput::write_fenced`/`paste_fenced`).
+    Fenced {
+        sequence: u64,
+        outcome: FencedOutcome,
+    },
 }
+
+/// A fenced write at the write boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FencedOutcome {
+    /// All of its bytes were written.
+    Written(usize),
+    /// Its input epoch was older than the current one when its turn came:
+    /// nothing was written.
+    Dropped,
+    Failed(String),
+}
+
+/// Most bytes in one fenced write (a paste is written as one request, so a
+/// raised epoch drops all of it or none).
+pub const MAX_FENCED: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct Authority {
@@ -35,6 +55,9 @@ struct WriteRequest {
     data: Vec<u8>,
     epoch: Option<u64>,
     sequence: Option<u64>,
+    /// A fenced write: its input epoch, compared at the write boundary with
+    /// the current one (`PtyInput::raise_input_epoch`).
+    fence: Option<u64>,
 }
 
 fn write_request(
@@ -54,12 +77,31 @@ fn write_request(
         .map_err(|e| e.to_string())
 }
 
+/// A fenced write at the write boundary: dropped when `fence` is older than
+/// the current input epoch.
+fn write_fenced_request(
+    writer: &mut impl Write,
+    current: &AtomicU64,
+    fence: u64,
+    data: &[u8],
+) -> FencedOutcome {
+    if fence < current.load(Ordering::SeqCst) {
+        return FencedOutcome::Dropped;
+    }
+    match writer.write_all(data).and_then(|()| writer.flush()) {
+        Ok(()) => FencedOutcome::Written(data.len()),
+        Err(error) => FencedOutcome::Failed(error.to_string()),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PtyInput {
     tx: mpsc::Sender<WriteRequest>,
     authority: Arc<Mutex<Authority>>,
     /// Successful send()/send_remote() calls, shared by clones.
     inputs: Arc<AtomicU64>,
+    /// The current input epoch for fenced writes; only ever rises.
+    input_epoch: Arc<AtomicU64>,
 }
 
 impl PtyInput {
@@ -124,6 +166,7 @@ impl PtyInput {
                 data: chunk.to_vec(),
                 epoch: Some(authority.epoch),
                 sequence: None,
+                fence: None,
             });
         }
         Ok(())
@@ -143,6 +186,51 @@ impl PtyInput {
         self.enqueue(data, None, None)
     }
 
+    /// Raises the input epoch fenced writes are checked against (never
+    /// lowers it); returns the current one. A fenced write already queued
+    /// with an older epoch is dropped when its turn comes.
+    pub fn raise_input_epoch(&self, epoch: u64) -> u64 {
+        self.input_epoch
+            .fetch_max(epoch, Ordering::SeqCst)
+            .max(epoch)
+    }
+
+    pub fn input_epoch(&self) -> u64 {
+        self.input_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Terminal input (counted) written only if `epoch` is still current at
+    /// the write boundary; the outcome comes back as `PtyEvent::Fenced`.
+    pub fn write_fenced(&self, data: Vec<u8>, epoch: u64, sequence: u64) -> Result<()> {
+        self.enqueue_fenced(data, epoch, sequence)?;
+        self.inputs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// A bracketed paste plus Enter as one fenced write (not counted as
+    /// terminal input, like `send_paste`).
+    pub fn paste_fenced(&self, text: &str, epoch: u64, sequence: u64) -> Result<()> {
+        let mut bytes = Vec::with_capacity(text.len() + 13);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~\r");
+        self.enqueue_fenced(bytes, epoch, sequence)
+    }
+
+    fn enqueue_fenced(&self, data: Vec<u8>, epoch: u64, sequence: u64) -> Result<()> {
+        if data.is_empty() || data.len() > MAX_FENCED {
+            bail!("Input must contain 1..={MAX_FENCED} bytes");
+        }
+        self.tx
+            .try_send(WriteRequest {
+                data,
+                epoch: None,
+                sequence: Some(sequence),
+                fence: Some(epoch),
+            })
+            .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
+    }
+
     fn enqueue(&self, data: Vec<u8>, epoch: Option<u64>, sequence: Option<u64>) -> Result<()> {
         if data.is_empty() || data.len() > MAX_INPUT {
             bail!("Input must contain 1..={MAX_INPUT} bytes");
@@ -152,6 +240,7 @@ impl PtyInput {
                 data,
                 epoch,
                 sequence,
+                fence: None,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
     }
@@ -164,6 +253,7 @@ impl PtyInput {
                 tx,
                 authority: Arc::default(),
                 inputs: Arc::default(),
+                input_epoch: Arc::default(),
             },
             TestInputReader(requests),
         )
@@ -234,6 +324,11 @@ impl PtyHandle {
     pub fn stop(&self) -> Result<()> {
         stop_child(self.0.child.clone());
         Ok(())
+    }
+
+    /// The agent process's pid (while it can still be asked).
+    pub fn process_id(&self) -> Option<u32> {
+        self.0.child.lock().ok()?.process_id()
     }
 }
 
@@ -347,8 +442,21 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
     let authority = Arc::new(Mutex::new(Authority::default()));
     let writer_authority = authority.clone();
     let writer_output = output.clone();
+    let input_epoch = Arc::new(AtomicU64::new(0));
+    let writer_epoch = input_epoch.clone();
     std::thread::spawn(move || {
         while let Some(request) = input.blocking_recv() {
+            if let (Some(fence), Some(sequence)) = (request.fence, request.sequence) {
+                let outcome =
+                    write_fenced_request(&mut writer, &writer_epoch, fence, &request.data);
+                if writer_output
+                    .blocking_send(PtyEvent::Fenced { sequence, outcome })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             // Recheck at the actual write boundary, not merely when enqueueing.
             let result = write_request(&mut writer, &writer_authority, &request);
             if let Some(sequence) = request.sequence {
@@ -399,6 +507,7 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
             tx,
             authority,
             inputs: Arc::default(),
+            input_epoch,
         },
         receiver,
         resize_handle: handle,
@@ -493,6 +602,43 @@ mod tests {
         let request = queued.0.try_recv().unwrap();
         write_request(&mut destination, &input.authority, &request).unwrap();
         assert_eq!(destination, b"new local input");
+    }
+
+    #[test]
+    fn a_fenced_write_older_than_the_current_epoch_is_dropped_at_the_writer() {
+        let (input, mut queued) = PtyInput::test_channel();
+        assert_eq!(input.raise_input_epoch(3), 3);
+        input.write_fenced(b"old".to_vec(), 3, 1).unwrap();
+        input.paste_fenced("hi", 3, 2).unwrap();
+        // Raised after they were queued: both are dropped when written.
+        assert_eq!(input.raise_input_epoch(4), 4);
+        // Never lowered.
+        assert_eq!(input.raise_input_epoch(2), 4);
+        assert_eq!(input.input_epoch(), 4);
+        input.write_fenced(b"new".to_vec(), 4, 3).unwrap();
+        let mut destination = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Ok(request) = queued.0.try_recv() {
+            outcomes.push(write_fenced_request(
+                &mut destination,
+                &input.input_epoch,
+                request.fence.unwrap(),
+                &request.data,
+            ));
+        }
+        assert_eq!(
+            outcomes,
+            [
+                FencedOutcome::Dropped,
+                FencedOutcome::Dropped,
+                FencedOutcome::Written(3)
+            ]
+        );
+        assert_eq!(destination, b"new");
+        // Writes count as terminal input; pastes don't.
+        assert_eq!(input.input_count(), 2);
+        assert!(input.write_fenced(Vec::new(), 4, 4).is_err());
+        assert!(input.write_fenced(vec![0; MAX_FENCED + 1], 4, 4).is_err());
     }
 
     #[test]

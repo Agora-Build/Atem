@@ -52,6 +52,22 @@ impl ClaudeAdapter {
     }
 }
 
+/// A new chat directory under `root` and the arguments Claude needs for it
+/// (put before the launch arguments `args`). On failure nothing is left
+/// behind. Shared by the App and `atem worker`, so both launch Claude alike.
+pub fn prepare_chat(root: &Path, args: &[String]) -> anyhow::Result<(ClaudeAdapter, Vec<String>)> {
+    let dir = hooks::create_session_dir(root)?;
+    let mut adapter = ClaudeAdapter::new();
+    match adapter.prepare_launch(args, &dir) {
+        Ok(plan) => Ok((adapter, plan.extra_args)),
+        Err(error) => {
+            drop(adapter);
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(error)
+        }
+    }
+}
+
 fn resumes_or_pins(args: &[String]) -> bool {
     args.iter().any(|a| {
         matches!(

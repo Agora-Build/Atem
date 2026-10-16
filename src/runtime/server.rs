@@ -198,6 +198,15 @@ pub(crate) async fn read_line(
     reader: &mut (impl AsyncBufRead + Unpin),
     line: &mut Vec<u8>,
 ) -> std::io::Result<bool> {
+    read_line_max(reader, line, super::protocol::MAX_LINE).await
+}
+
+/// `read_line` with a bound of `max` bytes.
+pub(crate) async fn read_line_max(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<bool> {
     line.clear();
     loop {
         let available = reader.fill_buf().await?;
@@ -216,7 +225,7 @@ pub(crate) async fn read_line(
                 reader.consume(count);
             }
         }
-        if line.len() > super::protocol::MAX_LINE {
+        if line.len() > max {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "message too long",

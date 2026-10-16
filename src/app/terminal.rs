@@ -130,7 +130,7 @@ impl App {
                     self.status_message = Some(format!("{label}: {error}"))
                 }
                 // Only remote writes report back, and there are none.
-                Ok(PtyEvent::Written { .. }) => {}
+                Ok(PtyEvent::Written { .. } | PtyEvent::Fenced { .. }) => {}
                 Ok(PtyEvent::Exit(status)) => {
                     share.exited(status, input);
                     exit = true;
