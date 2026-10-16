@@ -148,33 +148,53 @@ a phone. Both agents can take an external allow/deny without simulating keys:
 | No answer | normal terminal dialog appears | normal prompt appears |
 | Setup | per launch via `--settings` (as chat does) | `~/.codex/hooks.json`, trusted once in Codex (`/hooks`) |
 
-Flow:
+Verified on Claude Code 2.1.301 (interactive, hook from `--settings`;
+fixtures: `designs/fixtures/permission-hook/`):
 
-1. The hook writes the request (tool, summary) as one event file in the
-   session's private directory, like the other chat hooks, then waits for a
-   decision file.
-2. The worker reports it; the runtime announces
-   `approval_request{approval_id, session_id, process_gen, tool, summary,
-   created_at}` to attached viewers; chat shows an **approval card** (tool,
-   command or file, reason) with Allow / Deny, and a mobile app can raise it as
-   a lock-screen notification.
-3. **No remote controller** → the runtime answers "no decision" at once and the
-   normal dialog appears in the terminal.
-4. **Remote controller** → it answers with a §6 submission `kind:"approval"`,
-   payload `{approval_id, decision: allow|deny}`, under its current lease epoch;
-   the runtime checks that this prompt is still pending for that exact
-   session/process, writes the decision file, records the receipt (which device,
-   which lease, which prompt), and the hook returns the decision.
-5. **Local keyboard input while waiting** → local input wins: the remote lease is
-   revoked, the hook gets "no decision", the dialog appears.
-6. **No answer within the hook's window** → no decision, dialog appears. Never
-   auto-allow.
+- The hook fires with `session_id`, `transcript_path`, `cwd`, `prompt_id`,
+  `permission_mode`, `tool_name`, `tool_input`, `permission_suggestions`.
+- **The terminal dialog is shown at once while the hook runs.** The local user
+  can answer it immediately; the hook is not killed and its late output is
+  ignored. The hook decides only if it answers before the user does.
+- `allow` → no dialog, the command runs ("Allowed by PermissionRequest hook");
+  `deny` + message → not run, the model sees the message and doesn't retry;
+  no output → normal dialog.
+- A `timeout` field is honoured (SIGTERM at the limit; the dialog stays).
+- Esc on the dialog interrupts the turn and SIGTERMs the waiting hook.
+- The Notification `permission_prompt` hook fires ~6 s later, only if the dialog
+  is still unanswered.
+
+So the terminal dialog and the remote approval race, and **whichever answers
+first wins** — Claude arbitrates; the local user never loses the ability to
+answer. Flow:
+
+1. The hook writes the request (tool, summary, `prompt_id`) as one event file in
+   the session's private directory, like the other chat hooks.
+2. **No remote lease holder** → the runtime answers "no decision" at once; the
+   hook exits; the local dialog (already visible) is the only way to answer.
+3. **A remote lease holder** → the runtime announces `approval_request{approval_id,
+   session_id, process_gen, tool, summary, created_at}`; chat shows an approval
+   card with Allow / Deny (a phone can raise a lock-screen notification); the hook
+   keeps waiting (hook `timeout` 600 s).
+4. The controller answers with a §6 submission `kind:"approval"`, payload
+   `{approval_id, decision: allow|deny}`, under its current lease epoch; the
+   runtime checks the prompt is still pending for that exact session/process and
+   writes the decision file; the hook returns it.
+5. **Answered in the terminal first**, interrupted (Esc), timed out, or the lease
+   lost → the request is closed (the runtime sees the tool run or fail via the
+   PostToolUse/transcript events, or the hook's exit); a later remote answer gets
+   `error{code:"stale_target"}` and is never applied. The card disappears.
+6. Receipts record the outcome as observed: `completed` when the tool ran/was
+   refused as decided by the remote answer, `outcome_unknown` if the terminal
+   answer and the remote answer crossed and Atem can't tell which won.
+
+Codex: the same `PermissionRequest` hook exists; behaviour to be verified the
+same way once the hook is trusted in Codex (codex-cli 0.162.1 is installed here).
 
 Changes to earlier rules: chat's "no approvals from chat" becomes "approvals by
 the lease holder, bound to the exact prompt"; "hooks never decide" gains one
 exception — the `PermissionRequest` hook may return a decision it received from
-the runtime. To verify on the installed Claude Code before building: the hook's
-default timeout and that `--settings` hooks fire for this event.
+the runtime; the local terminal dialog always stays available.
 
 ## 6b. Comparison with Codex Remote (ChatGPT mobile)
 
