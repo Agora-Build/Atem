@@ -40,7 +40,7 @@ running after the CLI has been updated; see the upgrade steps below.
    the pairing command open until it reports device verification.
 4. If Astation asks you to save a recovery kit, save the complete kit and
    confirm. Finish any key-escrow/unlock approval requested by the pairing
-   command, then run `atem cred status`.
+   command, then run `atem status`.
 
 The status must say the device is verified. **Connected** or **Paired with
 Astation** alone confirms neither device verification nor key-agent unlock.
@@ -51,7 +51,7 @@ the relay or remove the Mac approval required to unlock sealed device keys.
 ## Unlock and upgrade the key agent
 
 ```sh
-atem cred status
+atem status
 atem cred unlock
 ```
 
@@ -67,7 +67,7 @@ development build next to the npm one. With the atem you want to use, run:
 ```sh
 atem cred lock
 atem cred unlock
-atem cred status
+atem status
 ```
 
 Lock wipes keys from memory and stops the agent. Unlock starts the current
@@ -138,7 +138,7 @@ by account-data encryption. See the [encryption design](../designs/e2e-encryptio
 
 ## Current availability
 
-`atem cred status`, `unlock`, `lock` and `projects` are implemented. The
+`atem status` and `atem cred unlock`, `lock` and `projects` are implemented. The
 planned `atem cred get/list` service for retrieving values from Astation's
 Credentials editor is not implemented. Use that editor on the Mac to add,
 update, copy or delete its values with Touch ID. Memory and skills must contain
