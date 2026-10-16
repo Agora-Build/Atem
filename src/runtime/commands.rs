@@ -102,6 +102,11 @@ fn terminal_size() -> (u16, u16) {
 pub async fn launch(agent: &str, args: Vec<String>) -> Result<()> {
     check_provider(agent)?;
     require_terminal("launch")?;
+    if agent == "codex" {
+        // Asks once whether Astation may answer Codex's approvals, and keeps
+        // Atem's hook in ~/.codex/hooks.json (never blocks the launch).
+        crate::chat::codex::setup_on_launch();
+    }
     let mut client = RuntimeClient::connect_or_start().await?;
     let session = launch_session(&mut client, agent, args, terminal_size()).await?;
     crate::tui::frontend::run_frontend(client, &session.id).await?;

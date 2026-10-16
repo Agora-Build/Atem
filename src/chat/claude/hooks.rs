@@ -39,13 +39,15 @@ fn private_dir(path: &Path) -> anyhow::Result<()> {
 /// A chat directory without a `pid` file is stale after this long.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// `root/chat-<uuid>` (0700) with an `events/` subdirectory (0700) and a `pid`
-/// file (0600) naming this process and host, for `sweep_stale`.
+/// `root/chat-<uuid>` (0700) with `events/` and `approvals/` subdirectories
+/// (0700) and a `pid` file (0600) naming this process and host, for
+/// `sweep_stale`.
 pub fn create_session_dir(root: &Path) -> anyhow::Result<PathBuf> {
     private_dir(root)?;
     let dir = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
     private_dir(&dir)?;
     private_dir(&dir.join("events"))?;
+    private_dir(&crate::chat::approvals::approvals_dir(&dir))?;
     let owner = format!("{}\n{}\n", std::process::id(), crate::auth::get_hostname());
     write_private(&dir.join("pid"), owner.as_bytes())?;
     Ok(dir)
@@ -146,8 +148,13 @@ pub fn hook_command(dir: &Path) -> String {
     )
 }
 
-/// Write `dir/settings.json` (0600) registering the hook for every event.
+/// Write `dir/settings.json` (0600) registering the hook for every event,
+/// and the approval hook (`chat::approvals`, installed in `dir`): the
+/// `PermissionRequest` hook (600 s) and, on `PostToolUse`, its note that a
+/// tool ran (a prompt answered in the terminal).
 pub fn write_settings(dir: &Path) -> anyhow::Result<PathBuf> {
+    use crate::chat::approvals;
+    approvals::install_script(&dir.join(approvals::SCRIPT_NAME))?;
     let cmd = hook_command(dir);
     let mut hooks = serde_json::Map::new();
     for ev in HOOK_EVENTS {
@@ -155,12 +162,27 @@ pub fn write_settings(dir: &Path) -> anyhow::Result<PathBuf> {
         if ev == "PreToolUse" || ev == "PostToolUse" {
             entry.insert("matcher".into(), "".into());
         }
-        entry.insert(
-            "hooks".into(),
-            serde_json::json!([{ "type": "command", "command": cmd }]),
-        );
+        let mut commands = vec![serde_json::json!({ "type": "command", "command": cmd })];
+        if ev == "PostToolUse" {
+            commands.push(serde_json::json!({
+                "type": "command",
+                "command": approvals::claude_post_command(dir),
+            }));
+        }
+        entry.insert("hooks".into(), Value::Array(commands));
         hooks.insert(ev.into(), Value::Array(vec![Value::Object(entry)]));
     }
+    hooks.insert(
+        "PermissionRequest".into(),
+        serde_json::json!([{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": approvals::claude_command(dir),
+                "timeout": approvals::CLAUDE_TIMEOUT,
+            }]
+        }]),
+    );
     let body = serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))?;
     let path = dir.join("settings.json");
     write_private(&path, body.as_bytes())?;
@@ -301,7 +323,24 @@ mod tests {
                 assert!(entry.get("matcher").is_none(), "{ev}");
             }
         }
-        assert_eq!(v["hooks"].as_object().unwrap().len(), 6);
+        assert_eq!(v["hooks"].as_object().unwrap().len(), 7);
+        let post = &v["hooks"]["PostToolUse"][0]["hooks"][1];
+        assert_eq!(
+            post["command"],
+            crate::chat::approvals::claude_post_command(&dir).as_str()
+        );
+        let perm = &v["hooks"]["PermissionRequest"][0];
+        assert_eq!(perm["matcher"], "");
+        assert_eq!(perm["hooks"][0]["timeout"], 600);
+        assert_eq!(
+            perm["hooks"][0]["command"],
+            crate::chat::approvals::claude_command(&dir).as_str()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("approval-hook.sh")).unwrap(),
+            crate::chat::approvals::SCRIPT
+        );
+        assert_eq!(mode(&dir.join("approvals")), 0o700);
     }
 
     fn dead_pid() -> u32 {

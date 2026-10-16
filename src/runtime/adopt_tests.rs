@@ -36,6 +36,15 @@ impl Running {
 /// A worker for a `/bin/sh -c AGENT` session served in this process, and the
 /// broker connection that started it.
 async fn start() -> (Running, WorkerHandle) {
+    start_with(AGENT, |_| Vec::new()).await
+}
+
+/// `start` with another agent script and more launch environment (given
+/// the test's directory).
+async fn start_with(
+    agent: &str,
+    extra_env: impl FnOnce(&Path) -> Vec<(String, String)>,
+) -> (Running, WorkerHandle) {
     let dir = tempfile::Builder::new()
         .prefix("atem-w")
         .tempdir_in("/tmp")
@@ -46,13 +55,14 @@ async fn start() -> (Running, WorkerHandle) {
         session_id: sid.to_string(),
         process_gen: uuid::Uuid::new_v4().to_string(),
         provider: "codex".into(),
-        args: vec!["-c".into(), AGENT.into()],
+        args: vec!["-c".into(), agent.into()],
         cwd: dir.path().to_path_buf(),
         rows: 24,
         cols: 80,
         socket: dir.path().join("sock").join(format!("{sid}.sock")),
     };
     let listener = worker::listen(&spec.socket).unwrap();
+    let extra = extra_env(dir.path());
     let options = WorkerOptions {
         state: state.clone(),
         pid: std::process::id(),
@@ -62,13 +72,16 @@ async fn start() -> (Running, WorkerHandle) {
         uid: unsafe { libc::getuid() },
         first_connect: Duration::from_secs(10),
         linger: Duration::from_secs(2),
+        approval_script: dir.path().join("approval-hook.sh"),
     };
     let served = tokio::spawn(worker::serve(spec.clone(), listener, options));
     let running = Running { dir, spec, served };
-    let env = LaunchEnv(vec![
+    let mut vars: Vec<(String, String)> = vec![
         ("PATH".into(), "/usr/bin:/bin".into()),
         ("CODEX_CLI_BIN".into(), "/bin/sh".into()),
-    ]);
+    ];
+    vars.extend(extra);
+    let env = LaunchEnv(vars);
     let handle = WorkerHandle::connect(&running.spec.socket, &running.expect(), Some(Some(env)))
         .await
         .unwrap();
@@ -567,6 +580,7 @@ async fn a_silent_connection_does_not_use_up_the_first_connect_window() {
         uid: unsafe { libc::getuid() },
         first_connect: Duration::from_secs(6),
         linger: Duration::from_secs(2),
+        approval_script: dir.path().join("approval-hook.sh"),
     };
     let served = tokio::spawn(worker::serve(spec.clone(), listener, options));
     // Connects and says nothing, and stays.
@@ -611,4 +625,128 @@ async fn synchronous_refusals_report_that_nothing_was_written() {
         ),
         "{result:?}"
     );
+}
+
+/// A Codex-like agent that, for each line typed, runs the stable hook
+/// command from hooks.json with a permission request on stdin (as Codex
+/// does), then prints `hook-done`.
+const APPROVING_AGENT: &str = "echo ready; while read l; do printf '%s' \"$REQ\" | /bin/sh -c \"$HOOK\"; echo; echo hook-done; done";
+
+const SECRET_REQ: &str = r#"{"hook_event_name":"PermissionRequest","turn_id":"t","tool_name":"Bash","tool_input":{"command":"psql postgres://admin:hunter2pass@db.example/prod -c 'drop table x'"}}"#;
+
+async fn start_approving() -> (Running, WorkerHandle) {
+    let (running, mut handle) = start_with(APPROVING_AGENT, |dir| {
+        let hook = crate::chat::codex::hook_command(&dir.join("approval-hook.sh"));
+        vec![("REQ".into(), SECRET_REQ.into()), ("HOOK".into(), hook)]
+    })
+    .await;
+    until(&mut handle, has_output("ready")).await;
+    (running, handle)
+}
+
+async fn approval_request(handle: &mut WorkerHandle, seq: u64) -> String {
+    handle.write(seq, b"go\r", 0).unwrap();
+    let seen = until(handle, |m| matches!(m, WorkerMsg::ApprovalRequest { .. })).await;
+    match seen.last().unwrap() {
+        WorkerMsg::ApprovalRequest {
+            request_id,
+            tool,
+            summary,
+            always_rules,
+        } => {
+            assert_eq!(tool, "Bash");
+            assert_eq!(
+                summary,
+                "psql postgres://admin:[redacted]@db.example/prod -c 'drop table x'"
+            );
+            assert!(always_rules.is_empty(), "Codex offers no rule");
+            request_id.clone()
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn a_codex_hook_waits_for_the_brokers_decision() {
+    let (running, mut handle) = start_approving().await;
+    let id = approval_request(&mut handle, 1).await;
+    handle
+        .approval_decision(
+            &id,
+            crate::session_protocol::wire::ApprovalDecision::Deny,
+            None,
+            Some("not on prod".into()),
+        )
+        .unwrap();
+    let mut applied = false;
+    let mut printed = false;
+    let mut all = String::new();
+    until(&mut handle, |m| {
+        all.push_str(&output_text(std::slice::from_ref(m)));
+        printed |= all.contains(r#""behavior":"deny","message":"not on prod""#);
+        if let WorkerMsg::ApprovalApplied { request_id, ok } = m {
+            assert_eq!((request_id.as_str(), *ok), (id.as_str(), true));
+            applied = true;
+        }
+        applied && printed && all.contains("hook-done")
+    })
+    .await;
+    // A late answer to the same request is refused.
+    handle
+        .approval_decision(
+            &id,
+            crate::session_protocol::wire::ApprovalDecision::AllowOnce,
+            None,
+            None,
+        )
+        .unwrap();
+    until(&mut handle, |m| {
+        matches!(m, WorkerMsg::ApprovalApplied { ok: false, .. })
+    })
+    .await;
+    stop(running, handle).await;
+}
+
+#[tokio::test]
+async fn release_approvals_and_adoption_give_no_decision() {
+    let (running, mut handle) = start_approving().await;
+    let id = approval_request(&mut handle, 1).await;
+    handle.release_approvals().unwrap();
+    let seen = until(&mut handle, has_output("hook-done")).await;
+    assert!(!output_text(&seen).contains("behavior"));
+    // The next one: a broker that knows only other approvals (adoption).
+    let id2 = approval_request(&mut handle, 2).await;
+    assert_ne!(id, id2);
+    handle.known_approvals(vec!["other".into()]).unwrap();
+    let seen = until(&mut handle, has_output("hook-done")).await;
+    assert!(!output_text(&seen).contains("behavior"));
+    assert!(
+        !seen.iter().any(|m| matches!(
+            m,
+            WorkerMsg::ApprovalApplied { .. } | WorkerMsg::ApprovalClosed { .. }
+        )),
+        "a release reports nothing: {seen:?}"
+    );
+    stop(running, handle).await;
+}
+
+#[tokio::test]
+async fn a_broker_that_goes_away_releases_the_waiting_hook() {
+    let (running, mut handle) = start_approving().await;
+    approval_request(&mut handle, 1).await;
+    drop(handle);
+    // The hook got "no decision" and the agent went on; a new broker sees it.
+    let mut adopted = adopt(&running.state()).await;
+    let Adoption::Adopted(mut handle, _) = adopted.remove(0) else {
+        panic!("not adopted")
+    };
+    handle.request_screen().unwrap();
+    until(&mut handle, |m| match m {
+        WorkerMsg::Screen { restore, .. } => {
+            String::from_utf8_lossy(&unb64(restore).unwrap()).contains("hook-done")
+        }
+        _ => false,
+    })
+    .await;
+    stop(running, handle).await;
 }

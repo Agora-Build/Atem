@@ -15,6 +15,7 @@ pub mod server;
 pub mod session_log;
 pub mod test_hooks;
 pub mod worker;
+pub mod worker_approvals;
 pub mod worker_chat;
 pub mod worker_protocol;
 

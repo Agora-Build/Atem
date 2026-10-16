@@ -21,11 +21,13 @@
 //! `<sid>.lock` (one worker per session) and `<sid>.log` (its output).
 
 use super::adopt::process_start_time;
+use super::worker_approvals::{Approvals, Event as ApprovalEvent};
 use super::worker_protocol::{
     Activity, BrokerMsg, MAX_LINE, MAX_OUTPUT, WorkerMsg, WorkerRecord, WorkerSpec, b64,
     decode_broker, encode_worker, write_bytes,
 };
 use crate::chat::adapter::{AgentAdapter, AgentEvent, Capabilities, LogItem};
+use crate::chat::approvals::Agent;
 use crate::chat::session::{ChatSession, State};
 use crate::pty_session::{FencedOutcome, PtyEvent, PtyHandle, PtyInput, SpawnSpec};
 use crate::session::{Provider, SessionId};
@@ -217,19 +219,30 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// What `agent_command` starts.
+struct Launch {
+    binary: String,
+    args: Vec<String>,
+    adapter: Option<crate::chat::claude::ClaudeAdapter>,
+    /// The session directory the approval hook writes to, and for which agent.
+    approvals: Option<(PathBuf, Agent)>,
+    /// A session directory the worker made (Codex) and removes at the end.
+    owned_dir: Option<PathBuf>,
+}
+
 /// The binary, arguments and chat adapter for `spec`, exactly as the App
 /// launches a session: `CLAUDE_CLI_*`/`CODEX_CLI_*` from the launch
 /// environment (else the worker's own), the spec's arguments after them,
-/// and for Claude its chat hooks first.
+/// and for Claude its chat hooks first (approvals included). A Codex
+/// session gets its own session directory for the approval hook in
+/// `~/.codex/hooks.json` (`chat::codex`), whose stable script `script` is
+/// refreshed here.
 fn agent_command(
     spec: &WorkerSpec,
     env: Option<&[(OsString, OsString)]>,
     chat_root: &Path,
-) -> Result<(
-    String,
-    Vec<String>,
-    Option<crate::chat::claude::ClaudeAdapter>,
-)> {
+    script: &Path,
+) -> Result<Launch> {
     let provider = Provider::from_alias(&spec.provider)
         .ok_or_else(|| anyhow!("unknown provider {:?}", spec.provider))?;
     Ok(match provider {
@@ -246,23 +259,60 @@ fn agent_command(
                         (None, Vec::new())
                     }
                 };
-            (
-                client.binary().to_string(),
-                [chat_args, launch_args].concat(),
+            let approvals = adapter
+                .as_ref()
+                .and_then(|a| a.dir())
+                .map(|d| (d.to_path_buf(), Agent::Claude));
+            Launch {
+                binary: client.binary().to_string(),
+                args: [chat_args, launch_args].concat(),
                 adapter,
-            )
+                approvals,
+                owned_dir: None,
+            }
         }
         Provider::Codex => {
             let client = env
                 .map(crate::codex_client::CodexClient::from_env)
                 .unwrap_or_else(crate::codex_client::CodexClient::new);
-            (
-                client.binary().to_string(),
-                [client.launch_args(), &spec.args[..]].concat(),
-                None,
-            )
+            if let Err(error) = crate::chat::approvals::install_script(script) {
+                eprintln!("atem worker: could not write {}: {error}", script.display());
+            }
+            let dir = match crate::chat::claude::hooks::create_session_dir(chat_root) {
+                Ok(dir) => Some(dir),
+                Err(error) => {
+                    eprintln!("atem worker: approvals are off for Codex: {error}");
+                    None
+                }
+            };
+            Launch {
+                binary: client.binary().to_string(),
+                args: [client.launch_args(), &spec.args[..]].concat(),
+                adapter: None,
+                approvals: dir.clone().map(|d| (d, Agent::Codex)),
+                owned_dir: dir,
+            }
         }
     })
+}
+
+/// The agent's environment: never an outer session's `ATEM_APPROVAL_DIR`;
+/// a Codex session's own (`dir`), which its stable hook command reads.
+/// Claude's hook command names its directory itself.
+fn approval_env(
+    env: Option<Vec<(OsString, OsString)>>,
+    dir: Option<&Path>,
+) -> Option<Vec<(OsString, OsString)>> {
+    let name = OsString::from(crate::chat::approvals::ENV);
+    if env.is_none() && dir.is_none() && std::env::var_os(&name).is_none() {
+        return None;
+    }
+    let mut vars = env.unwrap_or_else(|| std::env::vars_os().collect());
+    vars.retain(|(k, _)| *k != name);
+    if let Some(dir) = dir {
+        vars.push((name, dir.as_os_str().to_owned()));
+    }
+    Some(vars)
 }
 
 /// How a worker runs; `run_worker` fills it for the real process, tests run
@@ -282,6 +332,8 @@ pub struct WorkerOptions {
     pub first_connect: Duration,
     /// After the agent exited with no broker to tell, how long to wait for one.
     pub linger: Duration,
+    /// The stable approval hook script Codex's hooks.json names.
+    pub approval_script: PathBuf,
 }
 
 /// One broker connection.
@@ -389,6 +441,10 @@ struct Worker {
     offset: u64,
     dropped: u64,
     adapter: Option<crate::chat::claude::ClaudeAdapter>,
+    /// The agent's waiting permission prompts (`worker_approvals`).
+    approvals: Option<Approvals>,
+    /// The Codex session directory, removed when the agent exited.
+    owned_dir: Option<PathBuf>,
     chat: ChatSession,
     capabilities: Capabilities,
     /// Chat read and not yet sent (no broker connected).
@@ -445,20 +501,37 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     }
     let (conn, env) = first_broker(&listener, &options).await?;
     let (rows, cols) = (spec.rows.clamp(2, 200), spec.cols.clamp(2, 400));
-    let launched = agent_command(&spec, env.as_deref(), &options.chat_root).and_then(
-        |(binary, args, adapter)| {
-            let pty = crate::pty_session::spawn_spec(SpawnSpec {
-                binary,
-                args,
-                cwd: spec.cwd.clone(),
-                env,
-                rows,
-                cols,
-            })?;
-            Ok((pty, adapter))
-        },
-    );
-    let (pty, adapter) = match launched {
+    let launched = agent_command(
+        &spec,
+        env.as_deref(),
+        &options.chat_root,
+        &options.approval_script,
+    )
+    .and_then(|launch| {
+        let codex_dir = launch
+            .approvals
+            .as_ref()
+            .filter(|(_, agent)| *agent == Agent::Codex)
+            .map(|(dir, _)| dir.as_path());
+        let spawned = crate::pty_session::spawn_spec(SpawnSpec {
+            binary: launch.binary.clone(),
+            args: launch.args.clone(),
+            cwd: spec.cwd.clone(),
+            env: approval_env(env, codex_dir),
+            rows,
+            cols,
+        });
+        match spawned {
+            Ok(pty) => Ok((pty, launch)),
+            Err(error) => {
+                if let Some(dir) = &launch.owned_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                Err(error)
+            }
+        }
+    });
+    let (pty, launch) = match launched {
         Ok(launched) => launched,
         Err(error) => {
             conn.send(&WorkerMsg::Error {
@@ -469,6 +542,12 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         }
     };
     let agent_pid = pty.resize_handle.process_id();
+    let Launch {
+        adapter,
+        approvals,
+        owned_dir,
+        ..
+    } = launch;
     let record = WorkerRecord {
         session_id: spec.session_id.clone(),
         process_gen: spec.process_gen.clone(),
@@ -484,6 +563,9 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     };
     if let Err(error) = write_record(&options.state, &record) {
         let _ = pty.resize_handle.stop();
+        if let Some(dir) = &owned_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         conn.send(&WorkerMsg::Error {
             text: format!("could not write the worker record: {error}"),
         });
@@ -502,6 +584,8 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         offset: 0,
         dropped: 0,
         adapter,
+        approvals: approvals.map(|(dir, agent)| Approvals::new(&dir, agent)),
+        owned_dir,
         chat: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
         capabilities: Capabilities::default(),
         chat_backlog: Default::default(),
@@ -604,6 +688,8 @@ impl Worker {
                         Some(Err(text)) => self.send(&WorkerMsg::Error { text }),
                         None => {
                             // The broker went away; the agent keeps running.
+                            // Its approvals went with it: the agent asks.
+                            self.release_approvals();
                             let heard = self.conn.take().is_some_and(|c| c.exit_sent);
                             if heard {
                                 return true;
@@ -630,6 +716,7 @@ impl Worker {
                 }
                 _ = poll.tick() => {
                     self.poll_chat();
+                    self.poll_approvals();
                     if self.exit_deadline.is_some_and(|at| Instant::now() >= at) && self.conn.is_none() {
                         eprintln!("atem worker: no broker heard the agent's exit; leaving the record");
                         return false;
@@ -657,6 +744,7 @@ impl Worker {
                 Ok(Err(text)) => self.send(&WorkerMsg::Error { text }),
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
+                    self.release_approvals();
                     return self.conn.take().is_some_and(|c| c.exit_sent);
                 }
             }
@@ -735,6 +823,13 @@ impl Worker {
     fn agent_exited(&mut self, status: String) {
         self.events = None;
         self.poll_chat();
+        if let Some(mut approvals) = self.approvals.take() {
+            let events = approvals.process_ended();
+            self.send_approval_events(events);
+        }
+        if let Some(dir) = self.owned_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         self.chat.on_process_exit(now_ms());
         self.adapter = None;
         self.set_activity(Activity::Unknown, None);
@@ -827,8 +922,77 @@ impl Worker {
                     conn.send(&screen);
                 }
             }
+            BrokerMsg::ApprovalDecision {
+                request_id,
+                decision,
+                rule_id,
+                message,
+            } => {
+                let refused = match self.approvals.as_mut() {
+                    Some(a) => a.decide(
+                        &request_id,
+                        decision,
+                        rule_id.as_deref(),
+                        message.as_deref(),
+                    ),
+                    None => Some(ApprovalEvent::Applied {
+                        request_id,
+                        ok: false,
+                    }),
+                };
+                self.send_approval_events(refused.into_iter().collect());
+            }
+            BrokerMsg::ReleaseApproval { request_id } => {
+                if let Some(a) = self.approvals.as_mut() {
+                    a.release(&request_id);
+                }
+            }
+            BrokerMsg::ReleaseApprovals => self.release_approvals(),
+            BrokerMsg::KnownApprovals { request_ids } => {
+                if let Some(a) = self.approvals.as_mut() {
+                    a.keep_only(&request_ids);
+                }
+            }
         }
         false
+    }
+
+    /// Every waiting hook gets "no decision".
+    fn release_approvals(&mut self) {
+        if let Some(a) = self.approvals.as_mut() {
+            a.release_all();
+        }
+    }
+
+    /// Reads the approvals directory (a request with no broker connected is
+    /// released at once) and reports what happened.
+    fn poll_approvals(&mut self) {
+        let connected = self.conn.as_ref().is_some_and(|c| !c.tx.is_closed());
+        let Some(a) = self.approvals.as_mut() else {
+            return;
+        };
+        let events = a.poll(connected);
+        self.send_approval_events(events);
+    }
+
+    fn send_approval_events(&mut self, events: Vec<ApprovalEvent>) {
+        for event in events {
+            let message = match event {
+                ApprovalEvent::Request { request_id, info } => WorkerMsg::ApprovalRequest {
+                    request_id,
+                    tool: info.tool,
+                    summary: info.summary,
+                    always_rules: info.always_rules,
+                },
+                ApprovalEvent::Closed { request_id, reason } => {
+                    WorkerMsg::ApprovalClosed { request_id, reason }
+                }
+                ApprovalEvent::Applied { request_id, ok } => {
+                    WorkerMsg::ApprovalApplied { request_id, ok }
+                }
+            };
+            self.send(&message);
+        }
     }
 
     /// A write or paste may go on: the agent runs and `input_epoch` is not
@@ -872,6 +1036,18 @@ impl Worker {
         let events = adapter.poll_events();
         let log = adapter.poll_log();
         let capabilities = adapter.capabilities();
+        // Claude went on (a new prompt, the turn ended): a prompt still
+        // waiting was answered (or interrupted) in the terminal.
+        let moved_on = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::PromptSubmitted { .. } | AgentEvent::TurnEnded
+            )
+        }) || log.iter().any(|i| matches!(i, LogItem::TurnEnded { .. }));
+        if moved_on && let Some(a) = self.approvals.as_mut() {
+            let closed = a.turn_moved_on();
+            self.send_approval_events(closed);
+        }
         let (ends, others): (Vec<_>, Vec<_>) = events
             .iter()
             .cloned()
@@ -1020,6 +1196,7 @@ pub async fn run_worker(state: PathBuf, session_id: String) -> Result<()> {
         uid: unsafe { libc::getuid() },
         first_connect: Duration::from_secs(30),
         linger: crate::session::EXITED_KEEP,
+        approval_script: crate::chat::codex::script_path(),
     };
     let served = serve(spec, listener, options).await;
     if std::fs::symlink_metadata(&socket).is_ok_and(|m| {

@@ -672,6 +672,14 @@ impl BrokerSession {
                 eprintln!("atem runtime: worker of {}: {text}", self.id);
             }
             WorkerMsg::Notice { text } => pumped.notices.push(text),
+            // Until the session host takes approvals (Task 3), every request
+            // gets "no decision" at once: the agent asks in the terminal.
+            WorkerMsg::ApprovalRequest { request_id, .. } => {
+                if let Some(worker) = &self.worker {
+                    let _ = worker.release_approval(&request_id);
+                }
+            }
+            WorkerMsg::ApprovalClosed { .. } | WorkerMsg::ApprovalApplied { .. } => {}
             WorkerMsg::Hello { .. } => {}
             WorkerMsg::ChatSnapshot {
                 snapshot,
@@ -792,6 +800,7 @@ impl InProcess {
             uid: unsafe { libc::getuid() },
             first_connect: std::time::Duration::from_secs(10),
             linger: std::time::Duration::from_secs(30),
+            approval_script: self.chat_root.join("approval-hook.sh"),
         };
         let socket = spec.socket.clone();
         tokio::spawn(worker::serve(spec, listener, options));

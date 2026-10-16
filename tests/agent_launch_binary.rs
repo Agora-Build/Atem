@@ -409,3 +409,72 @@ fn launch_runs_the_agent_in_the_launching_directory_and_never_logs_its_environme
     assert!(sandbox.config().join("runtime.log").exists());
     assert!(checked > 0);
 }
+
+#[test]
+fn codex_launch_asks_once_and_merges_the_approval_hook() {
+    let sandbox = Sandbox::new();
+    std::fs::remove_file(sandbox.config().join("config.toml")).unwrap();
+    let codex_home = sandbox.home.join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let mine = r#"{"hooks": {"PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/mine.sh"}]}]}}"#;
+    std::fs::write(codex_home.join("hooks.json"), mine).unwrap();
+    let agent = sandbox.script(
+        "approval agent",
+        "echo \"DIR=${ATEM_APPROVAL_DIR:-none}\"\necho AGENT_READY\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent.to_str().unwrap())],
+    );
+    frontend.shows("Allow approvals from Astation for Codex?");
+    frontend.send(b"y\r");
+    frontend.shows("AGENT_READY");
+    let written = frontend.written();
+    assert!(written.contains("Added Atem's approval hook"), "{written}");
+    assert!(written.contains("/hooks"), "{written}");
+    // The session's own directory, under the sandbox's runtime dir.
+    let dir_line = frontend
+        .text()
+        .lines()
+        .find(|l| l.contains("DIR="))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(
+        dir_line.contains(&format!("DIR={}/atem/chat-", sandbox.run.display())),
+        "{dir_line}"
+    );
+    // Merged: theirs first, ours appended; the original backed up.
+    let hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_home.join("hooks.json")).unwrap())
+            .unwrap();
+    let groups = hooks["hooks"]["PermissionRequest"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["hooks"][0]["command"], "/mine.sh");
+    let ours = groups[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(ours.starts_with(": atem-approval-hook;"), "{ours}");
+    assert_eq!(groups[1]["hooks"][0]["timeout"], 120);
+    assert_eq!(
+        std::fs::read_to_string(codex_home.join("hooks.json.atem-bak")).unwrap(),
+        mine
+    );
+    let script = sandbox.config().join("hooks").join("approval-hook.sh");
+    assert!(ours.contains(script.to_str().unwrap()), "{ours}");
+    assert!(script.exists());
+    let config = std::fs::read_to_string(sandbox.config().join("config.toml")).unwrap();
+    assert!(config.contains("approvals_hook = true"), "{config}");
+    let sid = frontend.detach();
+    sandbox.track();
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "stop failed: {err}");
+    // Outside Atem the hook does nothing: no output, at once.
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(ours)
+        .env_remove("ATEM_APPROVAL_DIR")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+}

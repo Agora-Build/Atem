@@ -210,6 +210,42 @@ impl WorkerHandle {
         self.send(&BrokerMsg::RequestScreen)
     }
 
+    /// The lease holder's answer to a waiting approval → `approval_applied`.
+    #[allow(dead_code)] // the session host's approvals (Task 3)
+    pub fn approval_decision(
+        &self,
+        request_id: &str,
+        decision: crate::session_protocol::wire::ApprovalDecision,
+        rule_id: Option<String>,
+        message: Option<String>,
+    ) -> Result<()> {
+        self.send(&BrokerMsg::ApprovalDecision {
+            request_id: request_id.into(),
+            decision,
+            rule_id,
+            message,
+        })
+    }
+
+    /// "No decision" for one waiting approval.
+    pub fn release_approval(&self, request_id: &str) -> Result<()> {
+        self.send(&BrokerMsg::ReleaseApproval {
+            request_id: request_id.into(),
+        })
+    }
+
+    /// "No decision" for every waiting approval (before local input).
+    #[allow(dead_code)] // the broker's local input (Task 3)
+    pub fn release_approvals(&self) -> Result<()> {
+        self.send(&BrokerMsg::ReleaseApprovals)
+    }
+
+    /// After adoption: the approvals this broker knows (the rest released).
+    #[allow(dead_code)] // the session host's approvals (Task 3)
+    pub fn known_approvals(&self, request_ids: Vec<String>) -> Result<()> {
+        self.send(&BrokerMsg::KnownApprovals { request_ids })
+    }
+
     /// The worker's next message; `None` once its connection closed.
     #[cfg(test)]
     pub async fn recv(&mut self) -> Option<WorkerMsg> {

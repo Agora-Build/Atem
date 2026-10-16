@@ -46,7 +46,7 @@ impl ClaudeAdapter {
         }
     }
 
-    #[cfg(test)]
+    /// The chat directory (also the approvals' session directory).
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
     }

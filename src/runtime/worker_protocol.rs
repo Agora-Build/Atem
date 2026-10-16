@@ -10,6 +10,9 @@
 
 use crate::chat::adapter::{AgentEvent, LogItem};
 use crate::runtime::protocol::LaunchEnv;
+use crate::session_protocol::wire::{
+    AlwaysRule, ApprovalCloseReason, ApprovalDecision, MAX_APPROVAL_MESSAGE_BYTES,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -107,6 +110,30 @@ pub enum BrokerMsg {
     Stop,
     /// → `screen`
     RequestScreen,
+    /// The lease holder's answer to the waiting approval `request_id`,
+    /// written for its hook → `approval_applied` (`ok: false` at once when
+    /// it can't be handed over).
+    ApprovalDecision {
+        request_id: String,
+        decision: ApprovalDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// "No decision" for one waiting hook (the host closed its approval):
+    /// the agent asks as usual. Nothing is reported back.
+    ReleaseApproval {
+        request_id: String,
+    },
+    /// "No decision" for every waiting hook (before local input is written:
+    /// Codex hides its prompt while a hook waits).
+    ReleaseApprovals,
+    /// After adoption: the approvals this broker knows; every other waiting
+    /// hook gets "no decision".
+    KnownApprovals {
+        request_ids: Vec<String>,
+    },
 }
 
 impl std::fmt::Debug for BrokerMsg {
@@ -140,6 +167,21 @@ impl std::fmt::Debug for BrokerMsg {
             BrokerMsg::Resize { rows, cols } => write!(f, "Resize({rows}x{cols})"),
             BrokerMsg::Stop => f.write_str("Stop"),
             BrokerMsg::RequestScreen => f.write_str("RequestScreen"),
+            BrokerMsg::ApprovalDecision {
+                request_id,
+                decision,
+                rule_id,
+                message,
+            } => write!(
+                f,
+                "ApprovalDecision({request_id}, {decision:?}, rule {rule_id:?}, {} message bytes)",
+                message.as_ref().map_or(0, String::len)
+            ),
+            BrokerMsg::ReleaseApproval { request_id } => write!(f, "ReleaseApproval({request_id})"),
+            BrokerMsg::ReleaseApprovals => f.write_str("ReleaseApprovals"),
+            BrokerMsg::KnownApprovals { request_ids } => {
+                write!(f, "KnownApprovals({} ids)", request_ids.len())
+            }
         }
     }
 }
@@ -259,6 +301,28 @@ pub enum WorkerMsg {
     Notice {
         text: String,
     },
+    /// The agent's permission prompt waits for a decision (its hook runs):
+    /// what the card shows, redacted (`worker_approvals`). Sent only while a
+    /// broker is connected; `always_rules` are the agent's own suggestions
+    /// (Claude; none for Codex).
+    ApprovalRequest {
+        request_id: String,
+        tool: String,
+        summary: String,
+        always_rules: Vec<AlwaysRule>,
+    },
+    /// The prompt ended without the broker's decision being taken:
+    /// `answered_terminal`, `interrupted`, `timed_out` or `process_ended`.
+    ApprovalClosed {
+        request_id: String,
+        reason: ApprovalCloseReason,
+    },
+    /// The hook took the broker's decision (`ok`), or it couldn't be
+    /// handed over (`ok: false`).
+    ApprovalApplied {
+        request_id: String,
+        ok: bool,
+    },
 }
 
 impl WorkerMsg {
@@ -324,6 +388,16 @@ pub fn decode_broker(line: &str) -> Result<BrokerMsg, String> {
         BrokerMsg::Start { env: Some(env) } => {
             crate::session::check_env(&env.to_os())?;
         }
+        BrokerMsg::ApprovalDecision {
+            message: Some(m), ..
+        } if m.len() > MAX_APPROVAL_MESSAGE_BYTES => {
+            return Err(format!(
+                "an approval message holds at most {MAX_APPROVAL_MESSAGE_BYTES} bytes"
+            ));
+        }
+        BrokerMsg::KnownApprovals { request_ids } if request_ids.len() > 1024 => {
+            return Err("too many approvals".into());
+        }
         _ => {}
     }
     Ok(message)
@@ -385,6 +459,25 @@ mod tests {
             },
             BrokerMsg::Stop,
             BrokerMsg::RequestScreen,
+            BrokerMsg::ApprovalDecision {
+                request_id: "a1".into(),
+                decision: ApprovalDecision::AllowAlways,
+                rule_id: Some("r0-ab".into()),
+                message: None,
+            },
+            BrokerMsg::ApprovalDecision {
+                request_id: "a1".into(),
+                decision: ApprovalDecision::Deny,
+                rule_id: None,
+                message: Some("no".into()),
+            },
+            BrokerMsg::ReleaseApproval {
+                request_id: "a1".into(),
+            },
+            BrokerMsg::ReleaseApprovals,
+            BrokerMsg::KnownApprovals {
+                request_ids: vec!["a1".into()],
+            },
         ];
         for message in messages {
             let line = encode_broker(&message);
@@ -464,6 +557,24 @@ mod tests {
                 error: None,
             },
             WorkerMsg::Error { text: "e".into() },
+            WorkerMsg::ApprovalRequest {
+                request_id: "a1".into(),
+                tool: "Bash".into(),
+                summary: "ls".into(),
+                always_rules: vec![AlwaysRule {
+                    rule_id: "r0-ab".into(),
+                    label: "Allow Bash(ls:*)".into(),
+                    scope: "this session only".into(),
+                }],
+            },
+            WorkerMsg::ApprovalClosed {
+                request_id: "a1".into(),
+                reason: ApprovalCloseReason::AnsweredTerminal,
+            },
+            WorkerMsg::ApprovalApplied {
+                request_id: "a1".into(),
+                ok: true,
+            },
         ];
         for message in messages {
             let line = encode_worker(&message);
@@ -509,6 +620,14 @@ mod tests {
         let long = format!(r#"{{"v":1,"op":"stop","x":"{}"}}"#, "a".repeat(MAX_LINE));
         assert!(decode_broker(&long).is_err());
         assert!(decode_worker(r#"{"v":2,"op":"exited","status":"0"}"#).is_err());
+        let deny = |n| BrokerMsg::ApprovalDecision {
+            request_id: "a".into(),
+            decision: ApprovalDecision::Deny,
+            rule_id: None,
+            message: Some("m".repeat(n)),
+        };
+        assert!(decode_broker(&encode_broker(&deny(MAX_APPROVAL_MESSAGE_BYTES))).is_ok());
+        assert!(decode_broker(&encode_broker(&deny(MAX_APPROVAL_MESSAGE_BYTES + 1))).is_err());
     }
 
     #[test]
@@ -522,8 +641,14 @@ mod tests {
             input_epoch: 0,
             not_after: None,
         };
+        let deny = BrokerMsg::ApprovalDecision {
+            request_id: "a1".into(),
+            decision: ApprovalDecision::Deny,
+            rule_id: None,
+            message: Some("hunter2".into()),
+        };
         let text = format!(
-            "{start:?} {paste:?} {:?}",
+            "{start:?} {paste:?} {:?} {deny:?}",
             BrokerMsg::write(1, b"hunter2", 0)
         );
         for secret in ["sk-secret", "API_KEY", "hunter2", "aHVudGVyMg"] {
