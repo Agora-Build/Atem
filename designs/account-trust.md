@@ -210,8 +210,8 @@ What that means for Atem with Codex:
    also answers "no decision" to a waiting hook first, so Codex shows its prompt
    and the user answers it in the terminal (the keystroke that released it is
    delivered after the prompt appears).
-2. **A short wait** (hook `timeout` 120 s for Codex) so an unattended terminal
-   isn't blocked for long; on timeout Codex shows its own prompt.
+2. **Hook timeout 300 s for Codex** (long enough to answer from a locked phone);
+   any local key releases it earlier; on timeout Codex shows its own prompt.
 3. On Esc the runtime closes the request itself (the hook may keep running; its
    late output is ignored).
 4. **Set up by `atem agent launch codex`, once, without breaking anything**
@@ -244,6 +244,35 @@ Changes to earlier rules: chat's "no approvals from chat" becomes "approvals by
 the lease holder, bound to the exact prompt"; "hooks never decide" gains one
 exception — the `PermissionRequest` hook may return a decision it received from
 the runtime; the local terminal dialog always stays available.
+
+### Push-based approvals (user decision, 2026-10-16)
+
+The core experience: leave the computer, lock the phone, still get and answer
+approval requests. Notification delivery and lease ownership are independent:
+
+1. Every approval opens a card for all devices with `control` — no lease needed
+   to receive it.
+2. Atem asks the relay (over its authenticated link) to push it:
+   `push_approval{approval_id, atem_device_id, session_id, tool, summary,
+   expires_at}`; the relay delivers via **APNs (iOS) / FCM (Android)** to every
+   device on the account with `control`, online or not. Astation owns the push
+   credentials, device token registration and the notification UI.
+3. The notification shows "Claude on Genie wants to run `npm test`" (tool +
+   short redacted summary only); marked `mutable-content` so iOS can decrypt it on
+   device once end-to-end encryption lands.
+4. Tapping wakes the app, which reconnects, authenticates as a member device and
+   receives the pending approval; Allow once / Always allow (Claude) / Deny.
+5. The answer carries `acquire: true`: Atem takes the lease for that device
+   (takeover allowed) and applies the decision **atomically** — the lease is only
+   taken when the user acts.
+6. Answered elsewhere, expired or closed → `push_resolved{approval_id}` replaces
+   the notification everywhere (collapse-id / FCM tag = approval_id); a late tap
+   says "already answered".
+7. Hook waits: Claude 600 s (dialog stays visible; first answer wins), Codex
+   300 s (prompt hidden while waiting; any local key releases it).
+
+Phones can answer once they are members (step 1); until then only the paired
+Astation can.
 
 ## 6b. Comparison with Codex Remote (ChatGPT mobile)
 
