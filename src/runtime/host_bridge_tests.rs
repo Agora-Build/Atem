@@ -1164,8 +1164,13 @@ fn congestion_keeps_written_acks_and_drops_only_frames() {
         Queued::Other("written-2".into()),
     ]);
     super::drop_frames(&mut queue);
-    let kept: Vec<String> = queue.into_iter().map(Queued::into_text).collect();
-    assert_eq!(kept, ["written-1", "written-2"]);
+    assert_eq!(
+        Vec::from(queue),
+        [
+            Queued::Other("written-1".into()),
+            Queued::Other("written-2".into())
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1276,6 +1281,45 @@ fn the_link_is_fenced_and_dropped_at_its_authorization_deadline() {
         })
         .await
         .expect("the link stayed open past its authorization");
+        rt.shutdown().await;
+    });
+}
+
+/// `atem unpair` took effect without telling the runtime (no `reload`
+/// delivered): the broker notices the changed pairing on its own and drops
+/// the link with its attachment.
+#[test]
+fn a_changed_pairing_drops_the_link_without_a_reload() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        rt.peer.hello().await;
+        std::fs::write(
+            rt.dir.path().join("profile").join("pairing.json"),
+            json!({"version": 1, "host_trust_gen": TRUST_GEN + 1}).to_string(),
+        )
+        .unwrap();
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("the link of a removed pairing stayed open");
+        rt.shutdown().await;
+    });
+}
+
+/// A suspended machine: the monotonic clock stood still, wall time passed
+/// the 24 h. The authorization holds in wall time too.
+#[test]
+fn the_link_is_dropped_when_wall_time_passes_its_authorization() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        rt.peer.hello().await;
+        rt.clock.skip_wall(super::LINK_AUTHORIZATION_MS + 1);
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("the link stayed open past its wall-clock authorization");
         rt.shutdown().await;
     });
 }
@@ -1506,4 +1550,23 @@ fn mark_task_notices_reach_only_the_frontend_of_their_session() {
         );
         rt.shutdown().await;
     });
+}
+
+/// Duplicate detection remembers at most `MAX_SEEN` messages; the oldest
+/// go first.
+#[test]
+fn the_duplicate_window_is_bounded() {
+    let profile = tempfile::tempdir().unwrap();
+    let _profile = crate::test_profile::use_dir(profile.path());
+    let dir = short_dir();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    for i in 0..=super::MAX_SEEN {
+        assert!(!bridge.duplicate(&format!("m{i}"), 0));
+    }
+    assert_eq!(bridge.seen.len(), super::MAX_SEEN);
+    assert_eq!(bridge.seen_order.len(), super::MAX_SEEN);
+    // The newest is still remembered; the oldest was evicted.
+    assert!(bridge.duplicate(&format!("m{}", super::MAX_SEEN), 0));
+    assert!(!bridge.duplicate("m0", 0));
 }

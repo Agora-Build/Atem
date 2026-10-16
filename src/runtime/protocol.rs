@@ -274,6 +274,10 @@ pub enum RuntimeMsg {
         /// on every change).
         #[serde(default)]
         astation: bool,
+        /// Why remote sessions are off in this runtime (its session host
+        /// could not start), if they are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_error: Option<String>,
     },
     Launched {
         session: SessionSummary,
@@ -603,6 +607,7 @@ mod tests {
                 build: "b".into(),
                 pid: 7,
                 astation: true,
+                host_error: Some("remote sessions disabled: x".into()),
             },
             RuntimeMsg::Launched { session: summary() },
             RuntimeMsg::Attached {

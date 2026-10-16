@@ -66,8 +66,7 @@ Removed, no compatibility (atem-session r6):
   `voiceRequest`, `userCommand`, `codexTaskRequest` and `agentListRequest`
   no longer parse. Each is answered with a session
   `error{code:"unsupported_version", detail:"removed in atem-session r6"}`
-  (no `re`: they have no session id) and has no effect, in the runtime and in
-  the plain TUI (r6 §0).
+  (no `re`: they have no session id) and has no effect (r6 §0).
 - terminal-v1 `list`/`sessions`, `control`/`controller`, `lease_id`, the
   `terminal_ids` marker and provider-name ids (`claude`, `codex`) are gone;
   chat-v1 `submit` without `binding` is refused. These family messages are
@@ -75,11 +74,13 @@ Removed, no compatibility (atem-session r6):
 
 Attachments and identity:
 
-- The plain TUI (bare `atem` without a runtime) serves no sessions: any
-  `session`, `terminal` or `agentChat` message is answered with
-  `error{code:"unsupported_version", detail:"sessions are served by atem
-  runtime"}`. Bare `atem` no longer opens an
-  Astation connection at all; the runtime does.
+- Bare `atem` (the menu TUI) opens no Astation connection at all; only
+  `atem runtime` does, and it serves the sessions. If the runtime's session
+  host can't start (e.g. a damaged `runtime/journal/runtime_epoch`, which is
+  never reset silently), session-family messages are answered
+  `error{code:"unsupported_version"}` and `atem agent list` shows "remote
+  sessions disabled: <path> is damaged; move it aside to reset the runtime
+  epoch".
 - Only the paired Astation the link authenticated with, verified in this
   profile's `cred_state.json`, gets an attachment (`view`, `control`,
   `approve`; `client_kind: native`). Any other link (unpaired, unverified,
@@ -95,14 +96,20 @@ Attachments and identity:
   the broker restarts (the epoch is a durable counter) and when the host
   rebinds to a new identity (a pairing verified after the broker started).
 - Authorization: an attachment is authorized for 24 h (no freshness proof in
-  compatibility mode). At the end the broker fences it and drops the link;
-  the reconnect authenticates again and gets a new attachment.
+  compatibility mode), counted on the monotonic clock and in wall time,
+  whichever ends first (the monotonic clock stands still while the machine
+  is suspended). At the end the broker fences it and drops the link; the
+  reconnect authenticates again and gets a new attachment.
 - Duplicates: a session message with the same `id` and identical content on
   the same attachment within 60 s is handled once (e.g. arriving over both
   transports); other content under that id, or a retry on a new attachment,
   is handled.
 - `atem unpair` / `atem logout` make a running runtime reload: a link whose
-  pairing is gone is dropped with its attachments.
+  pairing is gone is dropped with its attachments. The broker also re-checks
+  the link's pairing every 5 s, so an unpair takes effect even if the
+  reload never reached it.
+- Duplicate detection remembers at most 4096 messages (oldest forgotten
+  first).
 
 terminal-v1:
 

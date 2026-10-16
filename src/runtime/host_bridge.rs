@@ -81,14 +81,20 @@ const INTERRUPT_KEY: &[u8] = b"\x1b";
 /// authorized under it).
 const UNPAIRED: &str = "unpaired";
 const RUNTIME_EPOCH_FILE: &str = "runtime_epoch";
+/// How often the link's pairing capture is checked against `pairing.json`.
+const CAPTURE_CHECK: Duration = Duration::from_secs(5);
+/// Session messages remembered for duplicate detection, at most.
+const MAX_SEEN: usize = 4096;
 /// Turn outcomes kept for duplicate submits (cleared beyond it).
 const MAX_OUTCOMES: usize = 4096;
 
-/// The broker's monotonic clock in milliseconds (tests move it forward).
+/// The broker's monotonic clock in milliseconds, and wall time (tests move
+/// either forward).
 #[derive(Clone, Debug)]
 pub struct Clock {
     origin: Instant,
     skew: Arc<AtomicU64>,
+    wall_skew: Arc<AtomicU64>,
 }
 
 impl Default for Clock {
@@ -96,6 +102,7 @@ impl Default for Clock {
         Self {
             origin: Instant::now(),
             skew: Arc::new(AtomicU64::new(0)),
+            wall_skew: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -108,10 +115,23 @@ impl Clock {
         base + self.skew.load(Ordering::SeqCst)
     }
 
+    /// Wall-clock milliseconds since the Unix epoch. Unlike `now`, it moves
+    /// while the machine is suspended.
+    pub fn wall(&self) -> u64 {
+        wall_ms() + self.wall_skew.load(Ordering::SeqCst)
+    }
+
     /// Moves the clock `ms` forward (tests).
     #[cfg(test)]
     pub fn skip(&self, ms: u64) {
         self.skew.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    /// Moves wall time `ms` forward, the monotonic clock standing still (a
+    /// suspend; tests).
+    #[cfg(test)]
+    pub fn skip_wall(&self, ms: u64) {
+        self.wall_skew.fetch_add(ms, Ordering::SeqCst);
     }
 }
 
@@ -181,10 +201,12 @@ fn next_runtime_epoch(dir: &Path) -> anyhow::Result<u64> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = dir.join(RUNTIME_EPOCH_FILE);
     let previous = match std::fs::read_to_string(&path) {
-        Ok(text) => text
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("{} is damaged", path.display()))?,
+        Ok(text) => text.trim().parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "{} is damaged; move it aside to reset the runtime epoch",
+                path.display()
+            )
+        })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(e.into()),
     };
@@ -269,8 +291,11 @@ struct Chats {
 struct Link {
     link_gen: u64,
     attachment: String,
-    /// The attachment's authorization ends here (monotonic ms).
+    /// The attachment's authorization ends at whichever comes first: this
+    /// monotonic ms, or this wall-clock ms (the monotonic clock stands still
+    /// while the machine is suspended).
     deadline: u64,
+    wall_deadline: u64,
 }
 
 pub struct HostBridge {
@@ -281,6 +306,8 @@ pub struct HostBridge {
     considered: Option<u64>,
     link: Option<Link>,
     last_advance: u64,
+    /// When the link's pairing capture was last checked.
+    capture_checked: Instant,
     recovered: bool,
     seen: HashMap<String, u64>,
     seen_order: VecDeque<(u64, String)>,
@@ -333,6 +360,7 @@ impl HostBridge {
             considered: None,
             link: None,
             last_advance: 0,
+            capture_checked: Instant::now(),
             recovered: false,
             seen: HashMap::new(),
             seen_order: VecDeque::new(),
@@ -463,11 +491,25 @@ impl HostBridge {
         if self
             .link
             .as_ref()
-            .is_some_and(|l| self.clock.now() >= l.deadline)
+            .is_some_and(|l| self.clock.now() >= l.deadline || self.clock.wall() >= l.wall_deadline)
         {
             // Its authorization ended: the attachment is fenced and the link
             // dropped, so the normal reconnect authenticates it again.
             app.drop_astation_link("Astation link authorization expired; reconnecting".into());
+        }
+        if self.capture_checked.elapsed() >= CAPTURE_CHECK {
+            self.capture_checked = Instant::now();
+            // `atem unpair` (or a new pairing) changed the pairing this link
+            // authenticated under, even if no `reload` reached the runtime:
+            // drop the link with its attachment.
+            let stale = app.astation_connected
+                && app
+                    .astation_client
+                    .capture()
+                    .is_some_and(|capture| capture.check().is_err());
+            if stale {
+                app.drop_astation_link("The Astation pairing changed; the link was dropped".into());
+            }
         }
         let client = &app.astation_client;
         let mut cx = Cx { client, sessions };
@@ -553,6 +595,7 @@ impl HostBridge {
                     link_gen: want.unwrap_or_default(),
                     attachment,
                     deadline: self.clock.now().saturating_add(LINK_AUTHORIZATION_MS),
+                    wall_deadline: self.clock.wall().saturating_add(LINK_AUTHORIZATION_MS),
                 });
                 self.exec(effects, cx);
             }
@@ -694,6 +737,14 @@ impl HostBridge {
         }
         self.seen.insert(id.to_string(), now);
         self.seen_order.push_back((now, id.to_string()));
+        // Bounded: beyond `MAX_SEEN` the oldest are forgotten early.
+        while self.seen_order.len() > MAX_SEEN {
+            if let Some((at, old)) = self.seen_order.pop_front()
+                && self.seen.get(&old) == Some(&at)
+            {
+                self.seen.remove(&old);
+            }
+        }
         false
     }
 
@@ -1700,14 +1751,6 @@ pub(super) fn classify(result: &WriteOutcome) -> Option<DispatchReport> {
 pub(super) enum Queued {
     Frame(String),
     Other(String),
-}
-
-impl Queued {
-    pub(super) fn into_text(self) -> String {
-        match self {
-            Queued::Frame(t) | Queued::Other(t) => t,
-        }
-    }
 }
 
 pub(super) fn drop_frames(queue: &mut VecDeque<Queued>) {

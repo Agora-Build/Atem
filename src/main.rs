@@ -38,7 +38,6 @@ mod test_profile;
 mod rtm_client;
 mod websocket_client;
 // Agent status on the Astation wire
-mod agent_client;
 // Shared HTTPS scaffolding
 mod web_server;
 // RTC test server

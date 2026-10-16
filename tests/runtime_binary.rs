@@ -362,6 +362,13 @@ fn sessions_run_in_workers_that_a_restarted_runtime_adopts() {
             "the record of {sid} stayed"
         );
         assert!(within(10, || start_time(worker).is_none()), "worker {worker} kept running");
+        // Its lock and log go with the record.
+        for leftover in [format!("{sid}.lock"), format!("{sid}.log")] {
+            assert!(
+                within(10, || !workers.join(&leftover).exists()),
+                "{leftover} stayed"
+            );
+        }
     }
     let sessions = frontend.list();
     assert!(sessions.iter().all(|s| s["state"] == "exited"), "{sessions:?}");

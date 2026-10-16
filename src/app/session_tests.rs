@@ -237,52 +237,24 @@ const REMOVED_OPS: &[&str] = &[
     r#"{"type":"agentListRequest","data":{}}"#,
 ];
 
-/// r6 §0: every removed op is answered `unsupported_version` with no effect,
-/// in the runtime and in the menu TUI.
+/// r6 §0: every removed op is answered `unsupported_version` with no effect.
 #[tokio::test]
 async fn removed_ops_are_answered_unsupported_with_no_effect() {
     let _profile = crate::test_profile::temp();
-    for in_runtime in [true, false] {
-        let mut app = App::new();
-        if in_runtime {
-            app.hosted = Some(Hosted::default());
-        }
-        let (tx, mut rx) = raw_astation(&mut app).await;
-        for op in REMOVED_OPS {
-            tx.send(op.to_string()).unwrap();
-        }
-        handle_received(&mut app, REMOVED_OPS.len()).await;
-        for reply in replies(&mut rx, REMOVED_OPS.len()).await {
-            assert_eq!(reply["type"], "session", "{reply}");
-            assert_eq!(reply["data"]["op"], "error", "{reply}");
-            assert_eq!(reply["data"]["code"], "unsupported_version", "{reply}");
-            assert!(reply["data"].get("re").is_none(), "{reply}");
-        }
-        if let Some(hosted) = &app.hosted {
-            assert!(hosted.inbox.is_empty() && hosted.writes.is_empty());
-        }
-        assert!(app.work_items.is_empty());
-    }
-}
-
-/// The menu TUI serves no sessions and says where they are served.
-#[tokio::test]
-async fn the_menu_tui_refers_session_messages_to_the_runtime() {
-    let _profile = crate::test_profile::temp();
     let mut app = App::new();
+    app.hosted = Some(Hosted::default());
     let (tx, mut rx) = raw_astation(&mut app).await;
-    tx.send(
-        r#"{"type":"session","data":{"v":1,"op":"list","id":"11111111-1111-4111-8111-000000000001"}}"#
-            .into(),
-    )
-    .unwrap();
-    handle_received(&mut app, 1).await;
-    let reply = replies(&mut rx, 1).await.remove(0);
-    assert_eq!(reply["data"]["op"], "error", "{reply}");
-    assert_eq!(reply["data"]["code"], "unsupported_version");
-    assert_eq!(reply["data"]["re"], "11111111-1111-4111-8111-000000000001");
-    assert_eq!(
-        reply["data"]["detail"],
-        "sessions are served by atem runtime"
-    );
+    for op in REMOVED_OPS {
+        tx.send(op.to_string()).unwrap();
+    }
+    handle_received(&mut app, REMOVED_OPS.len()).await;
+    for reply in replies(&mut rx, REMOVED_OPS.len()).await {
+        assert_eq!(reply["type"], "session", "{reply}");
+        assert_eq!(reply["data"]["op"], "error", "{reply}");
+        assert_eq!(reply["data"]["code"], "unsupported_version", "{reply}");
+        assert!(reply["data"].get("re").is_none(), "{reply}");
+    }
+    let hosted = app.hosted.as_ref().unwrap();
+    assert!(hosted.inbox.is_empty() && hosted.writes.is_empty());
+    assert!(app.work_items.is_empty());
 }

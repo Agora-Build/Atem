@@ -720,6 +720,10 @@ fn the_runtime_environment_is_sanitized() {
         ("ANTHROPIC_API_KEY", "secret"),
         ("CLAUDE_CLI_BIN", "/x"),
         ("SSH_AUTH_SOCK", "/tmp/a"),
+        // Test hooks are set by tests on the process they start, never
+        // passed on to a runtime a client starts.
+        ("ATEM_TEST_CLOCK_FILE", "/tmp/clock"),
+        ("ATEM_TEST_PTY_FAULTS", "/tmp/faults"),
     ]
     .map(|(k, v)| (OsString::from(k), OsString::from(v)));
     let kept: Vec<String> = super::client::runtime_env_from(vars.into_iter())
@@ -941,6 +945,10 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
             exited: None,
         };
         super::worker::write_record(&runtime.state(), &record).unwrap();
+        let lock = super::worker::lock_path(&runtime.state(), &sid);
+        let log = super::worker::log_path(&runtime.state(), &sid);
+        std::fs::write(&lock, "").unwrap();
+        std::fs::write(&log, "worker output").unwrap();
         // This broker already scanned at start: another one adopts it.
         let dir = runtime.dir.clone();
         runtime.shutdown().await;
@@ -984,6 +992,8 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
         })
         .await;
         assert!(!record_file(&runtime, &sid).exists());
+        // Its lock and log go with it.
+        assert!(!lock.exists() && !log.exists());
         assert!(list(&mut client).await.is_empty());
         runtime.shutdown().await;
     });
@@ -1528,6 +1538,40 @@ fn a_session_without_output_writes_no_log() {
         .await;
         assert_eq!(notice, "Codex session ended (no output captured).");
         assert!(!runtime.dir.path().join("logs").join(&sid).exists());
+        runtime.shutdown().await;
+    });
+}
+
+/// A damaged runtime epoch is never reset silently: the host stays off and
+/// every frontend (and `atem agent list`) is told why.
+#[test]
+fn a_damaged_runtime_epoch_disables_remote_sessions_and_says_so() {
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let journal = dir.path().join("state").join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("state"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let epoch = journal.join("runtime_epoch");
+        std::fs::write(&epoch, "not a number").unwrap();
+        let runtime = Runtime::start_in(dir, "rt.sock", Duration::from_secs(600), own_uid());
+        let client = runtime.client().await;
+        let expected = format!(
+            "remote sessions disabled: {} is damaged; move it aside to reset the runtime epoch",
+            epoch.display()
+        );
+        assert_eq!(
+            client.welcome.host_error.as_deref(),
+            Some(expected.as_str())
+        );
+        let listed = super::commands::format_list(&client.welcome, &[]);
+        assert!(listed.contains(&expected), "{listed}");
+        // Never reset behind the user's back.
+        assert_eq!(std::fs::read_to_string(&epoch).unwrap(), "not a number");
         runtime.shutdown().await;
     });
 }

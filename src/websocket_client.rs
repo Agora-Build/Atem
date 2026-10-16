@@ -253,13 +253,6 @@ pub enum AstationMessage {
         data: Option<serde_json::Value>,
     },
 
-    /// Atem → Astation: an agent's status changed.
-    #[serde(rename = "agentStatusUpdate")]
-    AgentStatusUpdate {
-        agent_id: String,
-        status: crate::agent_client::AgentStatus,
-    },
-
     /// Astation → Atem: request to generate a visual diagram. Diagram
     /// generation was removed from atem; every request is answered at once
     /// with an unsuccessful `VisualizeResult`.
@@ -3216,23 +3209,6 @@ mod tests {
         assert!(inner["data"].is_null());
         let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, AstationMessage::AgentEventMsg { .. }));
-    }
-
-    #[test]
-    fn agent_status_update_roundtrip() {
-        use crate::agent_client::AgentStatus;
-        let msg = AstationMessage::AgentStatusUpdate {
-            agent_id: "agent-1".into(),
-            status: AgentStatus::Thinking,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentStatusUpdate { agent_id, status } = parsed {
-            assert_eq!(agent_id, "agent-1");
-            assert_eq!(status, AgentStatus::Thinking);
-        } else {
-            panic!("expected AgentStatusUpdate");
-        }
     }
 
     #[test]

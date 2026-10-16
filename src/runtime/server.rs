@@ -149,6 +149,8 @@ struct Server {
     /// The session host (`None` when its journal could not be opened:
     /// remote session messages are refused then).
     bridge: Option<HostBridge>,
+    /// Why there is no session host (sent in every `welcome`).
+    host_error: Option<String>,
     /// The Astation link state the clients last heard.
     astation: bool,
     /// The running Astation operation (pairing, unlock), one at a time.
@@ -217,13 +219,17 @@ pub async fn serve(
         adoptions_tx,
     ));
     let journal = options.launcher.state().join("journal");
-    let bridge = match HostBridge::open(&journal, options.profile.as_ref(), options.clock.clone()) {
-        Ok(bridge) => Some(bridge),
-        Err(error) => {
-            eprintln!("atem runtime: no session host ({error:#}); remote sessions are refused");
-            None
-        }
-    };
+    let (bridge, host_error) =
+        match HostBridge::open(&journal, options.profile.as_ref(), options.clock.clone()) {
+            Ok(bridge) => (Some(bridge), None),
+            Err(error) => {
+                // Never repaired behind the user's back: remote sessions stay
+                // off until the cause is fixed and the runtime restarts.
+                let text = format!("remote sessions disabled: {error:#}");
+                eprintln!("atem runtime: {text}");
+                (None, Some(text))
+            }
+        };
     app.hosted = Some(crate::app::hosted::Hosted::default());
     let (op_calls, mut op_called) = mpsc::unbounded_channel::<OpCall>();
     let mut server = Server {
@@ -241,6 +247,7 @@ pub async fn serve(
         restart: false,
         wake: wake.clone(),
         bridge,
+        host_error,
         astation: false,
         op: None,
         op_calls,
@@ -748,6 +755,7 @@ impl Server {
                             build: crate::memory::key_agent::build_id().to_string(),
                             pid: std::process::id(),
                             astation: self.astation,
+                            host_error: self.host_error.clone(),
                         });
                     }
                 }

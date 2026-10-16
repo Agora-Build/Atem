@@ -14,8 +14,9 @@
 //! the mirror wait for the next `screen` the same way.
 //!
 //! Input: the broker is the only writer authority. Each session has an input
-//! epoch: at start the worker's `hello.input_epoch` (max with the journal's
-//! lease-epoch floor once there is a journal), raised with `set_input_epoch`
+//! epoch: at start the worker's `hello.input_epoch`, raised to the journal's
+//! lease-epoch floor by `HostBridge::check_adoption` (which refuses one
+//! beyond the reserved block), raised with `set_input_epoch`
 //! whenever control changes (a local `reclaim`), and every `write` carries
 //! the current one, so bytes queued under an older epoch are dropped at the
 //! worker's write boundary. The broker never tags a write with an epoch it
@@ -292,7 +293,8 @@ impl BrokerSession {
     }
 
     fn connect(&mut self, handle: WorkerHandle, synced: bool) {
-        // No journal yet: the worker's epoch is the floor.
+        // The worker's epoch; `HostBridge::check_adoption` raises it to the
+        // journal's lease-epoch floor before the session is registered.
         self.input_epoch = handle.info.input_epoch;
         self.offset = handle.info.offset;
         self.tap.restart_at(self.offset);
@@ -812,10 +814,11 @@ pub async fn adopt_all(state: PathBuf, tx: mpsc::UnboundedSender<Adoption>) {
     }
 }
 
-/// Removes the worker record of `session_id` (its exit was recorded, or the
-/// user stopped a session that has no worker). The lock and log stay.
+/// Removes the worker record of `session_id` (the user stopped a session
+/// that has no worker), with its lock and log.
 pub fn remove_record(state: &Path, session_id: &str) {
     let _ = std::fs::remove_file(super::worker::record_path(state, session_id));
+    super::worker::remove_leftovers(state, session_id);
 }
 
 #[cfg(test)]

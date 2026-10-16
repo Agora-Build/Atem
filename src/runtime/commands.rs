@@ -126,6 +126,9 @@ pub fn format_list(client: &super::client::Welcome, sessions: &[SessionSummary])
         "Runtime pid {} \u{b7} protocol {} \u{b7} build {} \u{b7} Astation {link}\n",
         client.pid, client.protocol, client.build
     );
+    if let Some(error) = &client.host_error {
+        text.push_str(&format!("{error}\n"));
+    }
     if sessions.is_empty() {
         text.push_str("No sessions. Start one: atem agent launch claude|codex\n");
         return text;
@@ -212,6 +215,7 @@ mod tests {
             build: "0.7.0+1".into(),
             pid: 42,
             astation: false,
+            host_error: None,
         };
         let text = format_list(&welcome, &[]);
         assert!(text.starts_with("Runtime pid 42 \u{b7} protocol 1 \u{b7} build 0.7.0+1"));

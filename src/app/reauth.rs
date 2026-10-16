@@ -687,39 +687,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_tui_refuses_session_messages_and_the_runtime_queues_them() {
+    async fn session_messages_go_to_the_runtime_host_with_their_link() {
         let (mut app, mut peer) = connected_app().await;
-        let list = r#"{"type":"session","data":{"v":1,"op":"list","id":"11111111-1111-4111-8111-111111111111"}}"#;
         let subscribe = Message::Subscribe {
             terminal_id: "ses-aaaaaaaaaaaa".to_string(),
             generation: "g".to_string(),
         };
-        app.handle_astation_message(AstationMessage::SessionWire(list.into()))
-            .await;
+        // Bare `atem` never links; were it to get one, nothing is answered.
         app.handle_astation_message(AstationMessage::SessionWire(
             serde_json::to_string(&AstationMessage::Terminal(subscribe.clone().into())).unwrap(),
         ))
         .await;
-        let frames = pump(&mut app, &mut peer).await;
-        let errors: Vec<serde_json::Value> = frames
-            .iter()
-            .flatten()
-            .filter_map(|frame| match frame {
-                AstationMessage::SessionWire(text) => serde_json::from_str(text).ok(),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(errors.len(), 2, "{frames:?}");
-        for error in &errors {
-            assert_eq!(error["type"], "session");
-            assert_eq!(error["data"]["op"], "error");
-            assert_eq!(error["data"]["code"], "unsupported_version");
-        }
-        assert_eq!(
-            errors[0]["data"]["re"],
-            "11111111-1111-4111-8111-111111111111"
-        );
-        assert!(errors[1]["data"].get("re").is_none());
+        assert!(session_errors(&pump(&mut app, &mut peer).await).is_empty());
 
         // Inside the runtime they go to the session host, with their link.
         app.hosted = Some(crate::app::hosted::Hosted::default());

@@ -22,6 +22,8 @@ pub struct Welcome {
     pub pid: u32,
     /// The runtime's Astation link was up when it greeted.
     pub astation: bool,
+    /// Why remote sessions are off in this runtime, if they are.
+    pub host_error: Option<String>,
 }
 
 /// Where a runtime listens and logs.
@@ -59,7 +61,9 @@ pub struct RuntimeClient {
 
 /// The environment `atem runtime` is started with: what it needs to find its
 /// files and settings, never the user's whole environment (sessions get
-/// their launching frontend's environment instead).
+/// their launching frontend's environment instead) and never the
+/// `ATEM_TEST_*` hooks (`test_hooks.rs`), which only tests set, on the
+/// process they start.
 pub fn runtime_env_from(
     vars: impl Iterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
@@ -68,7 +72,7 @@ pub fn runtime_env_from(
         matches!(
             key.as_ref(),
             "PATH" | "HOME" | "XDG_RUNTIME_DIR" | "RUST_LOG"
-        ) || key.starts_with("ATEM_")
+        ) || (key.starts_with("ATEM_") && !key.starts_with("ATEM_TEST_"))
             || key.starts_with("ASTATION_")
     })
     .collect()
@@ -201,6 +205,7 @@ impl RuntimeClient {
                 build: String::new(),
                 pid: 0,
                 astation: false,
+                host_error: None,
             },
         };
         let hello = ClientMsg::Hello {
@@ -220,12 +225,14 @@ impl RuntimeClient {
                 build,
                 pid,
                 astation,
+                host_error,
             })) => {
                 client.welcome = Welcome {
                     protocol,
                     build,
                     pid,
                     astation,
+                    host_error,
                 };
                 Ok(client)
             }

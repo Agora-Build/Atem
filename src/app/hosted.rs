@@ -5,9 +5,8 @@
 //! the App received (`inbox`) and writes the mark-task prompts it queued
 //! (`writes`).
 //!
-//! The TUI without a runtime has no session host: it refuses every remote
-//! `session`, `terminal` and `agentChat` message (`error` with
-//! `unsupported_version`, as before `welcome`) and changes nothing.
+//! The TUI without a runtime (bare `atem`) opens no Astation connection at
+//! all, so it never sees a session-family message.
 use super::App;
 use crate::session::{Provider, SessionId};
 use crate::session_protocol::wire::{self, Envelope, ErrorCode, Op, SessionMessage};
@@ -70,26 +69,21 @@ impl App {
             return;
         }
         let link = self.astation_link_gen;
-        let full = match self.hosted.as_mut() {
-            Some(hosted) if hosted.inbox.len() < INBOX_LIMIT => {
-                hosted.inbox.push_back((link, text));
-                return;
-            }
-            Some(_) => true,
-            None => false,
+        // Only `atem runtime` has a link (bare `atem` opens none).
+        let Some(hosted) = self.hosted.as_mut() else {
+            return;
         };
+        if hosted.inbox.len() < INBOX_LIMIT {
+            hosted.inbox.push_back((link, text));
+            return;
+        }
         let re = match wire::decode(text.as_bytes()) {
             Ok(Envelope::Session(m)) => Some(m.id),
             Ok(Envelope::Family(_)) => None,
             Err(e) => e.id,
         };
-        // The host's inbox is full: `busy` (the client may retry); without
-        // a runtime, no session is served at all.
-        if full {
-            self.session_refusal(re, ErrorCode::Busy, None);
-        } else {
-            self.session_refusal(re, ErrorCode::UnsupportedVersion, Some(NOT_SERVED_HERE));
-        }
+        // The host's inbox is full: `busy` (the client may retry).
+        self.session_refusal(re, ErrorCode::Busy, None);
     }
 
     /// A session `error` with `code` (answering `re`) on an authenticated link.
@@ -130,13 +124,12 @@ impl App {
     }
 }
 
-/// The TUI's answer to a session-family message: it serves no sessions.
+/// The answer to a session-family message when no session host serves it
+/// (the runtime's journal could not be opened).
 pub fn refusal(re: Option<String>) -> String {
     error_text(re, ErrorCode::UnsupportedVersion)
 }
 
-/// The detail of the TUI's refusal of a session-family message.
-pub const NOT_SERVED_HERE: &str = "sessions are served by atem runtime";
 /// The detail of the refusal of an op removed in atem-session r6.
 pub const REMOVED_OP: &str = "removed in atem-session r6";
 

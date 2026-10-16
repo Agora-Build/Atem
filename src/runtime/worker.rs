@@ -77,6 +77,12 @@ pub fn log_path(state: &Path, session_id: &str) -> PathBuf {
     workers_dir(state).join(format!("{session_id}.log"))
 }
 
+/// Removes a released worker's lock and log (its record is gone).
+pub fn remove_leftovers(state: &Path, session_id: &str) {
+    let _ = std::fs::remove_file(lock_path(state, session_id));
+    let _ = std::fs::remove_file(log_path(state, session_id));
+}
+
 /// Where worker sockets live: `$XDG_RUNTIME_DIR/atem/workers` when the
 /// runtime dir is an absolute, safe directory, else `<state>/workers`.
 /// Session logs: `logs/` next to the state dir (`<config>/logs`).
@@ -1024,5 +1030,10 @@ pub async fn run_worker(state: PathBuf, session_id: String) -> Result<()> {
     }
     let _ = lock.clear_pid();
     eprintln!("atem worker (pid {pid}) for {session_id} exiting");
+    // Released (a broker heard the exit) or never started: nothing to adopt,
+    // so the lock and log go too. A record that stays keeps them.
+    if !record_path(&state, &session_id).exists() {
+        remove_leftovers(&state, &session_id);
+    }
     served
 }
