@@ -331,6 +331,7 @@ impl Parser<'_> {
         if n > MAX_SAFE_INTEGER {
             return Err(StrictError::UnsafeInteger);
         }
+        // `-0` becomes 0: counters and other integers have no negative zero.
         Ok(if negative {
             Value::from(-(n as i64))
         } else {

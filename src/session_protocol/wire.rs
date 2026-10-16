@@ -603,9 +603,7 @@ fn fail(id: Option<String>, reason: impl Into<String>) -> DecodeError {
 
 /// Strictly decodes one wire message (see the module docs).
 pub fn decode(bytes: &[u8]) -> Result<Envelope, DecodeError> {
-    if bytes.len() > MAX_MESSAGE_BYTES {
-        return Err(fail(None, "message too large"));
-    }
+    // `parse_strict` checks the size bound before allocating anything.
     let root = canonical::parse_strict(bytes, MAX_MESSAGE_BYTES, Numbers::AllowFractions)
         .map_err(|e| fail(None, format!("{e:?}")))?;
     let Value::Object(mut root) = root else {
