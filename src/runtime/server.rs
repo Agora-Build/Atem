@@ -578,6 +578,9 @@ impl Server {
                 );
             }
             let Some(attachment) = self.attached.get_mut(&sid) else {
+                for text in pumped.notices {
+                    eprintln!("atem runtime: {sid}: {text}");
+                }
                 continue;
             };
             let (client, size) = (attachment.client, attachment.size);
@@ -589,6 +592,9 @@ impl Server {
             }
             for text in pumped.failed {
                 self.error(client, text, "input");
+            }
+            for text in pumped.notices {
+                self.send(client, &RuntimeMsg::Notice { text });
             }
             if pumped.dropped_bytes > 0 {
                 let text = format!(

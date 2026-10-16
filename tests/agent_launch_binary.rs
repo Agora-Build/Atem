@@ -256,6 +256,14 @@ fn prefix_x_stops_the_session_and_shows_its_end() {
     frontend.send(b"\r");
     assert!(frontend.exits());
     within("the worker to end", || sandbox.records().is_empty());
+    // The worker left its log and summary under this sandbox's config dir.
+    let written = frontend.written();
+    let at = written.find("Session ses-").expect("the exit line") + "Session ".len();
+    let sid = &written[at..at + 16];
+    let dir = sandbox.config().join("logs").join(sid);
+    let log = std::fs::read_to_string(dir.join("session.ansi")).unwrap();
+    assert!(log.contains("READY"), "{log:?}");
+    assert!(dir.join("summary.md").is_file());
 }
 
 #[test]

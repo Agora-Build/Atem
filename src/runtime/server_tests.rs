@@ -1430,3 +1430,99 @@ fn stop_answers_stopped_for_that_session() {
         runtime.shutdown().await;
     });
 }
+
+#[test]
+fn a_session_with_output_leaves_its_log_and_summary_when_it_ends() {
+    local(async {
+        let runtime = Runtime::new();
+        let agent = script(
+            runtime.dir.path(),
+            "talker",
+            "printf 'HELLO-LOG line one\\r\\nline two\\r\\n'\nsleep 0.3",
+        );
+        let mut client = runtime.client().await;
+        client
+            .send(&runtime.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let sid = launched(&mut client).await.id;
+        client
+            .send(&ClientMsg::Attach {
+                session_id: sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        attached(&mut client).await;
+        // The worker writes them at the exit; the frontend is told where.
+        let notice = expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text } if text.contains("log saved to") => Some(text),
+            _ => None,
+        })
+        .await;
+        let logs = runtime.dir.path().join("logs");
+        let dir = logs.join(&sid);
+        let (log, summary) = (dir.join("session.ansi"), dir.join("summary.md"));
+        assert!(notice.contains(&log.display().to_string()), "{notice}");
+        assert!(
+            notice.contains(&format!("Summary saved to {}", summary.display())),
+            "{notice}"
+        );
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("HELLO-LOG line one"), "{text:?}");
+        assert!(text.contains("Codex CLI session ended."), "{text:?}");
+        let written = std::fs::read_to_string(&summary).unwrap();
+        assert!(
+            written.starts_with("# Codex Session Summary\n\n"),
+            "{written}"
+        );
+        assert!(written.contains("Commands executed: 0\n"), "{written}");
+        assert!(
+            written.contains("Total output lines captured: 2\n"),
+            "{written}"
+        );
+        assert!(
+            written.contains(&format!("Full log saved at: {}\n", log.display())),
+            "{written}"
+        );
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&logs), 0o700);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&log), 0o600);
+        assert_eq!(mode(&summary), 0o600);
+        // The launch environment is never in them.
+        assert!(!text.contains("FAKE_NAME") && !written.contains("/usr/bin:/bin"));
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn a_session_without_output_writes_no_log() {
+    local(async {
+        let runtime = Runtime::new();
+        let agent = script(runtime.dir.path(), "silent", "sleep 0.3");
+        let mut client = runtime.client().await;
+        client
+            .send(&runtime.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let sid = launched(&mut client).await.id;
+        client
+            .send(&ClientMsg::Attach {
+                session_id: sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        let notice = expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text } if text.contains("session ended") => Some(text),
+            _ => None,
+        })
+        .await;
+        assert_eq!(notice, "Codex session ended (no output captured).");
+        assert!(!runtime.dir.path().join("logs").join(&sid).exists());
+        runtime.shutdown().await;
+    });
+}

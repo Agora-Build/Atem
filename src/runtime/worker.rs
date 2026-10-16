@@ -79,6 +79,14 @@ pub fn log_path(state: &Path, session_id: &str) -> PathBuf {
 
 /// Where worker sockets live: `$XDG_RUNTIME_DIR/atem/workers` when the
 /// runtime dir is an absolute, safe directory, else `<state>/workers`.
+/// Session logs: `logs/` next to the state dir (`<config>/logs`).
+pub fn logs_dir(state: &Path) -> PathBuf {
+    state
+        .parent()
+        .map(|config| config.join("logs"))
+        .unwrap_or_default()
+}
+
 pub fn socket_dir(state: &Path, runtime_dir: Option<OsString>) -> PathBuf {
     let uid = unsafe { libc::getuid() };
     runtime_dir
@@ -260,6 +268,8 @@ pub struct WorkerOptions {
     pub start_time: u64,
     /// Root of Claude chat directories.
     pub chat_root: PathBuf,
+    /// Where session logs go (`<logs>/<session_id>/`).
+    pub logs: PathBuf,
     /// Peers must run as this user.
     pub uid: u32,
     /// How long to wait for the broker that started the worker.
@@ -368,6 +378,8 @@ struct Worker {
     events: Option<mpsc::Receiver<PtyEvent>>,
     parser: vt100::Parser,
     share: SharedTerminal,
+    /// The agent's output for the session log.
+    log: super::session_log::SessionLog,
     offset: u64,
     dropped: u64,
     adapter: Option<crate::chat::claude::ClaudeAdapter>,
@@ -474,6 +486,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     }
     let mut worker = Worker {
         share: SharedTerminal::new(),
+        log: Default::default(),
         spec,
         record,
         input: pty.sender,
@@ -669,7 +682,8 @@ impl Worker {
         match event {
             Some(PtyEvent::Output(bytes)) => {
                 let start = self.offset;
-                self.share.process(&mut self.parser, &self.input, &bytes);
+                let text = self.share.process(&mut self.parser, &self.input, &bytes);
+                self.log.append(&text);
                 self.offset += bytes.len() as u64;
                 if let Some(conn) = &mut self.conn {
                     if conn.resync || conn.backlog() > OUTPUT_BACKLOG {
@@ -718,6 +732,15 @@ impl Worker {
         self.chat.on_process_exit(now_ms());
         self.adapter = None;
         self.set_activity(Activity::Unknown, None);
+        if let Some(provider) = crate::session::Provider::from_alias(&self.spec.provider) {
+            let notice = self.log.finish(
+                &self.options.logs,
+                &self.spec.session_id,
+                provider,
+                self.parser.screen(),
+            );
+            self.send(&WorkerMsg::Notice { text: notice });
+        }
         self.exited = Some(status.clone());
         self.exit_deadline = Some(Instant::now() + self.options.linger);
         self.record.exited = Some(status.clone());
@@ -982,6 +1005,7 @@ pub async fn run_worker(state: PathBuf, session_id: String) -> Result<()> {
         pid,
         start_time,
         chat_root,
+        logs: logs_dir(&state),
         uid: unsafe { libc::getuid() },
         first_connect: Duration::from_secs(30),
         linger: crate::session::EXITED_KEEP,

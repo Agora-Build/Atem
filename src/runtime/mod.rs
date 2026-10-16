@@ -10,6 +10,7 @@ pub mod commands;
 pub mod host_bridge;
 pub mod protocol;
 pub mod server;
+pub mod session_log;
 pub mod worker;
 pub mod worker_chat;
 pub mod worker_protocol;

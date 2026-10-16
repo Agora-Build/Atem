@@ -172,6 +172,8 @@ pub struct Pumped {
     pub dropped_bytes: usize,
     /// The agent exited, or the worker went away, in this pass.
     pub ended: bool,
+    /// Notices for the session's frontend.
+    pub notices: Vec<String>,
 }
 
 impl BrokerSession {
@@ -658,6 +660,7 @@ impl BrokerSession {
             WorkerMsg::Error { text } => {
                 eprintln!("atem runtime: worker of {}: {text}", self.id);
             }
+            WorkerMsg::Notice { text } => pumped.notices.push(text),
             WorkerMsg::Hello { .. } => {}
             WorkerMsg::ChatSnapshot {
                 snapshot,
@@ -774,6 +777,7 @@ impl InProcess {
             pid,
             start_time: adopt::process_start_time(pid).expect("own start time"),
             chat_root: self.chat_root.clone(),
+            logs: worker::logs_dir(&self.state),
             uid: unsafe { libc::getuid() },
             first_connect: std::time::Duration::from_secs(10),
             linger: std::time::Duration::from_secs(30),

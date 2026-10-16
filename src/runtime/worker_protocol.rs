@@ -240,6 +240,10 @@ pub enum WorkerMsg {
     Error {
         text: String,
     },
+    /// For the session's frontend (e.g. where the session log was saved).
+    Notice {
+        text: String,
+    },
 }
 
 impl WorkerMsg {
