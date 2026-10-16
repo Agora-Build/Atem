@@ -304,7 +304,10 @@ Kinds and payloads (v1):
   (`session_closed`, even when the lease is also stale), then the current
   lease (`stale_lease`). If the durable write of
   `accepted` fails, the reply is `error{code:"busy"}`, nothing is recorded and
-  the client may retry with the same `request_id`.
+  the client may retry with the same `request_id`. After a double I/O failure
+  (the write fails and so does undoing it) a request answered `busy` may still
+  be dispatched once, under its original target and trust generation; a retry
+  with the same `request_id` returns its receipt.
 - A duplicate `submit` names the current target: one naming an earlier
   `process_gen` of the session is `stale_target`, while `receipt_query` for
   that earlier target still returns its receipts.

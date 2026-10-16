@@ -117,6 +117,10 @@ fn log(dir: &Path, sid: &str) -> PathBuf {
     dir.join("receipts").join(format!("{sid}.log"))
 }
 
+fn text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
 fn mode(path: &Path) -> u32 {
     fs::symlink_metadata(path).unwrap().mode() & 0o777
 }
@@ -208,19 +212,18 @@ fn a_torn_last_record_is_truncated_and_earlier_ones_kept() {
 #[test]
 fn a_corrupted_middle_record_truncates_the_log_there() {
     let dir = tempfile::tempdir().unwrap();
-    let mut j = open(&sd(&dir));
+    drop(open(&sd(&dir)));
     let records = [
         accepted("a", S1, "one"),
         accepted("c", S1, "two"),
         to("a", ReceiptState::Executing, 2),
         to("c", ReceiptState::Rejected, 3),
     ];
-    for r in &records {
-        j.append(r.clone()).unwrap();
-    }
-    drop(j);
     let path = log(&sd(&dir), S1);
-    let mut bytes = fs::read(&path).unwrap();
+    let mut bytes = Vec::new();
+    for (seq, r) in records.iter().enumerate() {
+        bytes.extend(encode(seq as u64 + 1, r.clone()).unwrap());
+    }
     let first_end = bytes.iter().position(|&b| b == b'\n').unwrap() + 1;
     // Flip one byte inside the second record's JSON (checksum mismatch).
     let at = first_end + 30;
@@ -296,35 +299,6 @@ fn caller_errors_do_not_fail_the_journal() {
 }
 
 #[test]
-fn compaction_drops_payloads_and_evicted_receipts_and_keeps_finals_and_floors() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut j = open(&sd(&dir));
-    let records = history();
-    for r in &records {
-        j.append(r.clone()).unwrap();
-    }
-    let before = fs::read(log(&sd(&dir), S1)).unwrap();
-    assert!(String::from_utf8_lossy(&before).contains(SECRET));
-    j.compact_all().unwrap();
-    let s1 = String::from_utf8(fs::read(log(&sd(&dir), S1)).unwrap()).unwrap();
-    let s2 = String::from_utf8(fs::read(log(&sd(&dir), S2)).unwrap()).unwrap();
-    assert!(s1.len() < before.len());
-    // `a` left accepted: payload gone, digest and final state kept.
-    assert!(!s1.contains(SECRET));
-    assert!(s1.contains("\"completed\""));
-    // `c` is still accepted: its payload stays for a dispatch after a crash.
-    assert!(s1.contains("still accepted"));
-    // One floor record, the highest.
-    assert_eq!(s1.matches("lease_epochs").count(), 1);
-    assert!(s1.contains("\"reserved\":128"));
-    // `b` was evicted: gone with its records.
-    assert!(!s2.contains("\"b\""));
-    assert!(!s2.contains("evicted"));
-    assert!(s2.contains("\"outcome_unknown\""));
-    assert_eq!(state(j.load().unwrap()), mem_state(&records));
-}
-
-#[test]
 fn a_log_with_nothing_live_is_removed_by_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let mut j = open(&sd(&dir));
@@ -360,38 +334,10 @@ fn a_large_log_is_compacted_on_append() {
     }
     j.append(floor(S1, 64)).unwrap();
     all.push(floor(S1, 64));
-    let len = fs::metadata(log(&sd(&dir), S1)).unwrap().len();
+    let len = fs::metadata(log(&sd(&dir), S1)).map_or(0, |m| m.len());
     assert!(len <= 4096 + 1024, "log stays bounded: {len}");
     drop(j);
     assert_eq!(state(open(&sd(&dir)).load().unwrap()), mem_state(&all));
-}
-
-#[test]
-fn a_crash_during_compaction_leaves_a_valid_log() {
-    for fault in [Fault::CrashBeforeRename, Fault::CrashAfterRename] {
-        let dir = tempfile::tempdir().unwrap();
-        let records = history();
-        let mut j = open(&sd(&dir));
-        for r in &records {
-            j.append(r.clone()).unwrap();
-        }
-        j.inject(fault);
-        assert!(j.compact_all().is_err());
-        assert!(j.failed().is_some(), "{fault:?}");
-        assert!(j.append(floor(S1, 192)).is_err());
-        drop(j);
-        let tmp = &sd(&dir).join("receipts").join(format!("{S1}{TMP_SUFFIX}"));
-        assert_eq!(
-            tmp.exists(),
-            fault == Fault::CrashBeforeRename,
-            "{fault:?}: the temp is there until the next open"
-        );
-        let j = open(&sd(&dir));
-        assert!(!tmp.exists(), "leftover temp removed on open");
-        let s1 = String::from_utf8(fs::read(log(&sd(&dir), S1)).unwrap()).unwrap();
-        assert_eq!(s1.contains(SECRET), fault == Fault::CrashBeforeRename);
-        assert_eq!(state(j.load().unwrap()), mem_state(&records), "{fault:?}");
-    }
 }
 
 #[test]
@@ -450,4 +396,184 @@ fn one_journal_per_state_dir() {
     assert!(FileJournal::open(&sd(&dir)).is_err());
     drop(j);
     open(&sd(&dir));
+}
+
+#[test]
+fn compaction_drops_payloads_and_evicted_receipts_and_keeps_finals_and_floors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    let records = history();
+    for r in &records {
+        j.append(r.clone()).unwrap();
+    }
+    j.compact_all().unwrap();
+    let s1 = text(&log(&sd(&dir), S1));
+    let s2 = text(&log(&sd(&dir), S2));
+    // `a` left accepted: payload gone, digest and final state kept.
+    assert!(!s1.contains(SECRET));
+    assert!(s1.contains("\"completed\""));
+    // `c` is still accepted: its payload stays for a dispatch after a crash.
+    assert!(s1.contains("still accepted"));
+    // Floors live in their own file, the highest per session.
+    assert!(!s1.contains("lease_epochs") && !s2.contains("lease_epochs"));
+    let floors = text(&sd(&dir).join("floors"));
+    assert!(floors.contains(&format!("\"{S1}\":128")), "{floors}");
+    assert!(floors.contains(&format!("\"{S2}\":64")), "{floors}");
+    // `b` was evicted: gone with its records.
+    assert!(!s2.contains("\"b\""));
+    assert!(!s2.contains("evicted"));
+    assert!(s2.contains("\"outcome_unknown\""));
+    assert_eq!(state(j.load().unwrap()), mem_state(&records));
+}
+
+#[test]
+fn a_finished_prompt_leaves_no_text_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    j.append(accepted("a", S1, SECRET)).unwrap();
+    j.append(accepted("c", S1, "still accepted")).unwrap();
+    assert!(text(&log(&sd(&dir), S1)).contains(SECRET));
+    // The transition out of `accepted` takes the text off the disk at once.
+    j.append(to("a", ReceiptState::Executing, 2)).unwrap();
+    let s1 = text(&log(&sd(&dir), S1));
+    assert!(!s1.contains(SECRET), "{s1}");
+    assert!(s1.contains("still accepted"));
+    // Rejected straight from `accepted`, and evicted: same.
+    j.append(accepted("d", S2, SECRET)).unwrap();
+    j.append(to("d", ReceiptState::Rejected, 3)).unwrap();
+    assert!(!text(&log(&sd(&dir), S2)).contains(SECRET));
+    drop(j);
+
+    // A log left with a finished prompt's text (a crash before the rewrite)
+    // is rewritten when the journal opens.
+    let path = log(&sd(&dir), S2);
+    let mut bytes = encode(50, accepted("e", S2, SECRET)).unwrap();
+    bytes.extend(encode(51, to("e", ReceiptState::Rejected, 4)).unwrap());
+    fs::write(&path, &bytes).unwrap();
+    let j = open(&sd(&dir));
+    assert!(!text(&path).contains(SECRET));
+    assert_eq!(
+        j.load()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, Record::Accepted { request_id, .. } if request_id == "e"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_session_with_every_receipt_evicted_leaves_no_log_and_no_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    j.append(floor(S2, 64)).unwrap();
+    j.append(accepted("a", S2, "t")).unwrap();
+    j.append(accepted("b", S1, "t")).unwrap();
+    assert_eq!(j.open_handles(), 2);
+    j.append(to("a", ReceiptState::Rejected, 2)).unwrap();
+    j.append(evicted("a")).unwrap();
+    assert!(!log(&sd(&dir), S2).exists());
+    assert_eq!(j.open_handles(), 1);
+    drop(j);
+    let j = open(&sd(&dir));
+    assert!(!log(&sd(&dir), S2).exists());
+    assert_eq!(state(j.load().unwrap()).1, vec![(S2.to_string(), 64)]);
+}
+
+#[test]
+fn compaction_backs_off_as_the_live_state_grows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir)).with_compact_threshold(1024);
+    // Live receipts without payload text: every compaction keeps them all.
+    for n in 0..400 {
+        j.append(Record::Accepted {
+            request_id: format!("i{n}"),
+            target: target(S1),
+            kind: ReceiptKind::Interrupt,
+            payload_digest: "0".repeat(64),
+            payload: json!({}),
+            updated_at: n,
+        })
+        .unwrap();
+    }
+    assert!(j.compactions() <= 12, "{} compactions", j.compactions());
+}
+
+#[test]
+fn an_invalid_transition_truncates_instead_of_failing_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(&sd(&dir)));
+    let path = log(&sd(&dir), S1);
+    let mut bytes = encode(5, accepted("a", S1, "t")).unwrap();
+    let good = bytes.len() as u64;
+    bytes.extend(encode(6, to("a", ReceiptState::Completed, 2)).unwrap());
+    bytes.extend(encode(7, to("a", ReceiptState::Executing, 3)).unwrap());
+    fs::write(&path, &bytes).unwrap();
+    let j = open(&sd(&dir));
+    assert_eq!(fs::metadata(&path).unwrap().len(), good);
+    assert_eq!(
+        state(j.load().unwrap()),
+        mem_state(&[accepted("a", S1, "t")])
+    );
+}
+
+#[test]
+fn a_failed_undo_is_retried_on_refused_appends_and_on_drop() {
+    for retry_on_drop in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = open(&sd(&dir));
+        j.append(accepted("a", S1, "t")).unwrap();
+        let path = log(&sd(&dir), S1);
+        let len = fs::metadata(&path).unwrap().len();
+        j.inject(Fault::FsyncAndUndo);
+        assert!(j.append(accepted("b", S1, "t")).is_err());
+        assert!(fs::metadata(&path).unwrap().len() > len, "undo failed");
+        if retry_on_drop {
+            drop(j);
+        } else {
+            assert!(j.append(accepted("c", S1, "t")).is_err());
+            assert_eq!(fs::metadata(&path).unwrap().len(), len);
+            drop(j);
+        }
+        assert_eq!(fs::metadata(&path).unwrap().len(), len);
+        let j = open(&sd(&dir));
+        assert_eq!(
+            state(j.load().unwrap()),
+            mem_state(&[accepted("a", S1, "t")])
+        );
+    }
+}
+
+#[test]
+fn a_crash_during_compaction_leaves_a_valid_log() {
+    for fault in [Fault::CrashBeforeRename, Fault::CrashAfterRename] {
+        let dir = tempfile::tempdir().unwrap();
+        let records = [
+            accepted("a", S1, SECRET),
+            accepted("c", S1, "still accepted"),
+            to("a", ReceiptState::Executing, 2),
+        ];
+        let mut j = open(&sd(&dir));
+        j.append(records[0].clone()).unwrap();
+        j.append(records[1].clone()).unwrap();
+        j.inject(fault);
+        // The record is durable; the rewrite after it "crashed".
+        j.append(records[2].clone()).unwrap();
+        assert!(j.failed().is_some(), "{fault:?}");
+        assert!(j.append(floor(S1, 192)).is_err());
+        drop(j);
+        let tmp = sd(&dir).join("receipts").join(format!("{S1}{TMP_SUFFIX}"));
+        assert_eq!(tmp.exists(), fault == Fault::CrashBeforeRename, "{fault:?}");
+        assert_eq!(
+            text(&log(&sd(&dir), S1)).contains(SECRET),
+            fault == Fault::CrashBeforeRename
+        );
+        let j = open(&sd(&dir));
+        assert!(!tmp.exists(), "leftover temp removed on open");
+        assert!(
+            !text(&log(&sd(&dir), S1)).contains(SECRET),
+            "rewritten on open"
+        );
+        assert_eq!(state(j.load().unwrap()), mem_state(&records), "{fault:?}");
+    }
 }

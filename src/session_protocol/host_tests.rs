@@ -1000,7 +1000,7 @@ fn evicted_receipts_stay_gone_after_a_reload() {
     rt.host.journal_mut().compact_all().unwrap();
     drop(rt);
     let log = dir.path().join("state/receipts").join(format!("{S1}.log"));
-    let text = std::fs::read_to_string(&log).unwrap();
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(!text.contains("run the tests"), "no payload left");
     assert!(!text.contains(&rid(1)), "no evicted receipt left");
     let journal = FileJournal::open(&dir.path().join("state")).unwrap();

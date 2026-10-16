@@ -5,38 +5,47 @@
 //!
 //! ```text
 //! <state>/journal.lock          flock held for the journal's life (one writer)
+//! <state>/floors                0600, lease-epoch floors of every session
 //! <state>/receipts/             0700
-//! <state>/receipts/<sid>.log    0600, append-only, one per session
+//! <state>/receipts/<sid>.log    0600, append-only, one per session with live receipts
 //! ```
 //!
-//! A session's log holds every record of that session: its `Accepted`
-//! records (the target names the session), their `Transition`/`Evicted`
-//! records (routed by request id) and its `LeaseEpochs` reservations (the
-//! lease-epoch floor lives in the session's own log, so it is compacted and
-//! truncated with the receipts it protects).
+//! A session's log holds its `Accepted` records (the target names the
+//! session) and their `Transition`/`Evicted` records (routed by request id).
+//! Lease-epoch floors (`LeaseEpochs`) live in the shared `floors` file, one
+//! framed record replaced atomically (temp, fsync, rename, directory fsync)
+//! whenever a floor rises; a damaged floors file is refused, never guessed.
+//! Floors are kept for every session ever seen (one small entry each, also in
+//! `SessionHost`'s in-memory map): a session id is never reused.
 //!
 //! Each record is one line, `<len> <crc32> <json>\n`: `len` is the JSON's
 //! byte length in decimal, `crc32` the IEEE CRC-32 of those bytes in 8 lower
 //! hex digits, `json` `{"seq":N,"t":...}` where `seq` is a journal-wide
 //! sequence number (it restores the append order across sessions on `load`).
 //! A torn or corrupted record fails the length, checksum, JSON or coherence
-//! check; opening the journal truncates the log to the last valid record
-//! before it (and warns, without content), and nothing past a bad record is
-//! ever trusted.
+//! check (including the §6 transition table); opening the journal truncates
+//! the log to the last valid record before it (and warns, without content),
+//! and nothing past a bad record is ever trusted.
 //!
 //! Durability: `append` writes the line and `fdatasync`s it before returning
 //! `Ok` (a new log also fsyncs the directory). After any write or sync error
-//! the journal tries to cut the log back to its previous length and then
-//! fails: every later `append` returns `Err` until the process restarts and
-//! reopens it (`SessionHost` answers a failed `accepted` write with `busy`).
+//! the journal cuts the log back to its previous length and fails: every
+//! later `append` returns `Err` until the process restarts and reopens it
+//! (`SessionHost` answers a failed `accepted` write with `busy`). If the cut
+//! itself fails it is retried on every refused append and on drop; after a
+//! double failure a request answered `busy` may still be on disk (§6).
 //!
-//! Compaction: when a log grows past the threshold (1 MiB by default) or on
-//! `compact_all`, it is rewritten with only its live state — the current
-//! receipts with their latest state (a payload only while `accepted`; the
-//! digest always), no evicted receipts, one `LeaseEpochs` with the floor — to
-//! `<sid>.log.tmp`, which is fsynced, renamed over the log, and the directory
-//! fsynced. A crash at any point leaves the old or the new log, both valid
-//! and replaying to the same state; leftover temp files are removed on open.
+//! Compaction rewrites a log with only its live state — the current receipts
+//! with their latest state (a payload only while `accepted`; the digest
+//! always), no evicted receipts — to `<sid>.log.tmp`, which is fsynced,
+//! renamed over the log, and the directory fsynced; a log with nothing live
+//! is removed (and its handle dropped). It runs when a request carrying a
+//! payload leaves `accepted` (so finished prompt text doesn't stay on disk),
+//! when a session's last receipt is evicted, when a log grows past
+//! max(threshold (1 MiB by default), 2 × its size after the last compaction),
+//! at open for logs with such leftovers, and on `compact_all`. A crash at any
+//! point leaves the old or the new log, both valid and replaying to the same
+//! state; leftover temp files are removed on open.
 //!
 //! Prompt payloads are user content: the files are private and nothing here
 //! logs a payload.
@@ -45,7 +54,7 @@ use super::journal::{self, Journal, JournalError, Record};
 use super::wire::{self, ReceiptKind, ReceiptState, Target};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -57,6 +66,12 @@ pub const COMPACT_BYTES: u64 = 1 << 20;
 const MAX_RECORD_BYTES: usize = 8 << 20;
 const LOG_SUFFIX: &str = ".log";
 const TMP_SUFFIX: &str = ".log.tmp";
+const FLOORS: &str = "floors";
+
+#[derive(Serialize, Deserialize)]
+struct FloorsFile {
+    floors: BTreeMap<String, u64>,
+}
 
 // ── CRC-32 (IEEE 802.3, reflected) ──
 
@@ -217,17 +232,30 @@ impl Disk {
     }
 }
 
+/// `<len> <crc32> <json>\n`.
+fn frame(json: &[u8]) -> Vec<u8> {
+    let mut line = format!("{} {:08x} ", json.len(), crc32(json)).into_bytes();
+    line.extend_from_slice(json);
+    line.push(b'\n');
+    line
+}
+
 fn encode(seq: u64, record: Record) -> Result<Vec<u8>, JournalError> {
     let json = serde_json::to_vec(&Disk::new(seq, record))
         .map_err(|e| JournalError(format!("cannot encode a journal record: {e}")))?;
-    let mut line = format!("{} {:08x} ", json.len(), crc32(&json)).into_bytes();
-    line.extend_from_slice(&json);
-    line.push(b'\n');
-    Ok(line)
+    Ok(frame(&json))
 }
 
 /// One record line at the start of `bytes`: the record and the line's length.
 fn decode_line(bytes: &[u8]) -> Option<(u64, Record, usize)> {
+    let (json, used) = unframe(bytes)?;
+    let disk: Disk = serde_json::from_slice(json).ok()?;
+    let (seq, record) = disk.into_parts();
+    Some((seq, record, used))
+}
+
+/// The checked JSON of the frame at the start of `bytes`, and its length.
+fn unframe(bytes: &[u8]) -> Option<(&[u8], usize)> {
     let space = bytes.iter().take(21).position(|&b| b == b' ')?;
     let digits = &bytes[..space];
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
@@ -247,9 +275,7 @@ fn decode_line(bytes: &[u8]) -> Option<(u64, Record, usize)> {
     if rest.get(9 + len) != Some(&b'\n') || crc32(json) != crc {
         return None;
     }
-    let disk: Disk = serde_json::from_slice(json).ok()?;
-    let (seq, record) = disk.into_parts();
-    Some((seq, record, space + 1 + 9 + len + 1))
+    Some((json, space + 1 + 9 + len + 1))
 }
 
 /// A session log read up to its first invalid record.
@@ -261,13 +287,14 @@ struct Parsed {
 }
 
 /// Reads records while they are well formed and coherent: the session they
-/// name is this log's, `seq` never goes back, and a transition or eviction
-/// names a request admitted earlier in this log.
+/// name is this log's, `seq` never goes back, a transition follows the §6
+/// table from the request's current state, an eviction names a live request,
+/// and no lease floor appears (those live in the floors file).
 fn parse_log(bytes: &[u8], sid: &str) -> Parsed {
     let mut records = Vec::new();
     let mut at = 0usize;
     let mut last_seq = 0u64;
-    let mut live: HashSet<String> = HashSet::new();
+    let mut live: HashMap<String, ReceiptState> = HashMap::new();
     while at < bytes.len() {
         let Some((seq, record, used)) = decode_line(&bytes[at..]) else {
             break;
@@ -278,10 +305,23 @@ fn parse_log(bytes: &[u8], sid: &str) -> Parsed {
         let coherent = match &record {
             Record::Accepted {
                 request_id, target, ..
-            } => target.session_id == sid && live.insert(request_id.clone()),
-            Record::Transition { request_id, .. } => live.contains(request_id),
-            Record::Evicted { request_id } => live.remove(request_id),
-            Record::LeaseEpochs { session_id, .. } => session_id == sid,
+            } => {
+                target.session_id == sid
+                    && live
+                        .insert(request_id.clone(), ReceiptState::Accepted)
+                        .is_none()
+            }
+            Record::Transition {
+                request_id, state, ..
+            } => match live.get_mut(request_id) {
+                Some(current) if journal::valid_transition(*current, *state) => {
+                    *current = *state;
+                    true
+                }
+                _ => false,
+            },
+            Record::Evicted { request_id } => live.remove(request_id).is_some(),
+            Record::LeaseEpochs { .. } => false,
         };
         if !coherent {
             break;
@@ -396,6 +436,8 @@ pub enum Fault {
     Write,
     /// The line is written but its fsync fails.
     Fsync,
+    /// The fsync fails and so does the first attempt to undo the write.
+    FsyncAndUndo,
     /// Compaction "crashes" after the temp file is synced, before the rename.
     CrashBeforeRename,
     /// Compaction "crashes" after the rename, before the directory fsync.
@@ -408,12 +450,26 @@ struct SessionLog {
 }
 
 pub struct FileJournal {
+    state: PathBuf,
     logs: PathBuf,
+    /// Append handles, only for sessions with live receipts.
     open: HashMap<String, SessionLog>,
     /// request_id → session_id, for every admitted and not evicted request.
     owner: HashMap<String, String>,
+    /// session_id → live (admitted, not evicted) receipts.
+    live: HashMap<String, usize>,
+    /// Requests whose payload is on disk and that are still `accepted`.
+    with_payload: HashSet<String>,
+    /// session_id → size of its log right after the last compaction.
+    compacted_len: HashMap<String, u64>,
+    /// The lease-epoch floors, as in the `floors` file.
+    floors: BTreeMap<String, u64>,
+    /// Logs whose failed append could not be undone yet: handle and the
+    /// length before that append. Retried on every refused append and on drop.
+    undo: HashMap<String, SessionLog>,
     next_seq: u64,
     compact_bytes: u64,
+    compactions: u64,
     /// Set by a write/sync error: no more appends in this process.
     failed: Option<String>,
     _lock: crate::daemon::HeldLock,
@@ -430,10 +486,21 @@ impl std::fmt::Debug for FileJournal {
     }
 }
 
+/// A payload worth taking off the disk once its request leaves `accepted`.
+fn has_content(payload: &Value) -> bool {
+    match payload {
+        Value::Null => false,
+        Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
 impl FileJournal {
-    /// Opens (or creates) the journal under `state_dir`, truncating every
-    /// session log to its last valid record and removing compaction leftovers.
-    /// Fails if another journal holds the directory.
+    /// Opens (or creates) the journal under `state_dir`: truncates every
+    /// session log to its last valid record, removes compaction leftovers,
+    /// and rewrites logs that still hold a finished request's payload or
+    /// nothing live. Fails if another journal holds the directory or the
+    /// floors file is damaged.
     pub fn open(state_dir: &Path) -> Result<Self, JournalError> {
         private_dir(state_dir)?;
         let lock_path = state_dir.join("journal.lock");
@@ -448,21 +515,30 @@ impl FileJournal {
         let logs = state_dir.join("receipts");
         private_dir(&logs)?;
         let mut journal = Self {
+            state: state_dir.to_path_buf(),
             logs,
             open: HashMap::new(),
             owner: HashMap::new(),
+            live: HashMap::new(),
+            with_payload: HashSet::new(),
+            compacted_len: HashMap::new(),
+            floors: BTreeMap::new(),
+            undo: HashMap::new(),
             next_seq: 1,
             compact_bytes: COMPACT_BYTES,
+            compactions: 0,
             failed: None,
             _lock: lock,
             #[cfg(test)]
             fault: None,
         };
+        journal.load_floors()?;
         journal.recover_files()?;
         Ok(journal)
     }
 
-    /// Compacts a log once it is larger than `bytes`.
+    /// Compacts a log once it is larger than `bytes` (and than twice its
+    /// size after the last compaction).
     pub fn with_compact_threshold(mut self, bytes: u64) -> Self {
         self.compact_bytes = bytes;
         self
@@ -471,6 +547,16 @@ impl FileJournal {
     /// Why appends are refused, after a write or sync error.
     pub fn failed(&self) -> Option<&str> {
         self.failed.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn open_handles(&self) -> usize {
+        self.open.len()
+    }
+
+    #[cfg(test)]
+    pub fn compactions(&self) -> u64 {
+        self.compactions
     }
 
     #[cfg(test)]
@@ -492,6 +578,10 @@ impl FileJournal {
         self.logs.join(format!("{sid}{LOG_SUFFIX}"))
     }
 
+    fn floors_path(&self) -> PathBuf {
+        self.state.join(FLOORS)
+    }
+
     /// Session ids with a log, sorted.
     fn session_ids(&self) -> Result<Vec<String>, JournalError> {
         let mut ids = Vec::new();
@@ -510,18 +600,64 @@ impl FileJournal {
         Ok(ids)
     }
 
-    fn read_log(&self, sid: &str) -> Result<Parsed, JournalError> {
-        let path = self.log_path(sid);
-        let mut file = open_private(&path, OpenOptions::new().read(true))
-            .map_err(|e| io_err("cannot open", &path, e))?;
+    fn read_private(path: &Path) -> Result<Vec<u8>, JournalError> {
+        let mut file = open_private(path, OpenOptions::new().read(true))
+            .map_err(|e| io_err("cannot open", path, e))?;
         let mut bytes = Vec::new();
-        io::Read::read_to_end(&mut file, &mut bytes)
-            .map_err(|e| io_err("cannot read", &path, e))?;
-        Ok(parse_log(&bytes, sid))
+        io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_err("cannot read", path, e))?;
+        Ok(bytes)
+    }
+
+    fn read_log(&self, sid: &str) -> Result<Parsed, JournalError> {
+        Ok(parse_log(&Self::read_private(&self.log_path(sid))?, sid))
+    }
+
+    /// Reads the floors file (a single framed record, replaced atomically).
+    /// A damaged one is refused: forgetting a floor could reissue an epoch.
+    fn load_floors(&mut self) -> Result<(), JournalError> {
+        let path = self.floors_path();
+        let tmp = self.state.join(format!("{FLOORS}.tmp"));
+        remove_entry(&tmp).map_err(|e| io_err("cannot remove", &tmp, e))?;
+        if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            return Ok(());
+        }
+        let bytes = Self::read_private(&path)?;
+        let floors = unframe(&bytes)
+            .filter(|(_, used)| *used == bytes.len())
+            .and_then(|(json, _)| serde_json::from_slice::<FloorsFile>(json).ok())
+            .filter(|f| f.floors.keys().all(|sid| wire::is_session_id(sid)))
+            .ok_or_else(|| JournalError(format!("{} is damaged", path.display())))?;
+        self.floors = floors.floors;
+        Ok(())
+    }
+
+    /// Replaces the floors file with `floors` (temp, fsync, rename, dir fsync).
+    fn write_floors(&mut self, floors: &BTreeMap<String, u64>) -> Result<(), JournalError> {
+        let json = serde_json::to_vec(&FloorsFile {
+            floors: floors.clone(),
+        })
+        .map_err(|e| JournalError(format!("cannot encode the floors: {e}")))?;
+        let path = self.floors_path();
+        let tmp = self.state.join(format!("{FLOORS}.tmp"));
+        let state = self.state.clone();
+        let written = (|| {
+            remove_entry(&tmp)?;
+            let mut f = create_private(&tmp, false)?;
+            f.write_all(&frame(&json))?;
+            f.sync_all()?;
+            drop(f);
+            fs::rename(&tmp, &path)?;
+            sync_dir(&state)
+        })();
+        written.map_err(|e| {
+            let _ = remove_entry(&tmp);
+            self.fail(format!("cannot write {}: {e}", path.display()))
+        })
     }
 
     /// Open-time recovery: drop compaction temps, truncate torn tails, learn
-    /// the request owners and the next sequence number.
+    /// the request owners and the next sequence number, and rewrite logs that
+    /// hold a finished request's payload or nothing live.
     fn recover_files(&mut self) -> Result<(), JournalError> {
         let entries = fs::read_dir(&self.logs).map_err(|e| io_err("cannot read", &self.logs, e))?;
         for entry in entries {
@@ -535,6 +671,7 @@ impl FileJournal {
                 remove_entry(&path).map_err(|e| io_err("cannot remove", &path, e))?;
             }
         }
+        let mut rewrite = Vec::new();
         for sid in self.session_ids()? {
             let parsed = self.read_log(&sid)?;
             if parsed.valid_len < parsed.total_len {
@@ -551,18 +688,42 @@ impl FileJournal {
                     .and_then(|()| file.sync_all())
                     .map_err(|e| io_err("cannot truncate", &path, e))?;
             }
+            let mut stale_payload = false;
             for (seq, record) in parsed.records {
                 self.next_seq = self.next_seq.max(seq + 1);
                 match record {
-                    Record::Accepted { request_id, .. } => {
-                        self.owner.insert(request_id, sid.clone());
+                    Record::Accepted {
+                        request_id,
+                        payload,
+                        ..
+                    } => {
+                        if has_content(&payload) {
+                            self.with_payload.insert(request_id.clone());
+                        }
+                        *self.live.entry(sid.clone()).or_default() += 1;
+                        self.owner.insert(request_id.clone(), sid.clone());
+                    }
+                    Record::Transition { request_id, .. } => {
+                        stale_payload |= self.with_payload.remove(&request_id);
                     }
                     Record::Evicted { request_id } => {
+                        stale_payload |= self.with_payload.remove(&request_id);
                         self.owner.remove(&request_id);
+                        *self.live.entry(sid.clone()).or_default() -= 1;
                     }
-                    _ => {}
+                    Record::LeaseEpochs { .. } => {}
                 }
             }
+            if self.live.get(&sid).is_none_or(|n| *n == 0) {
+                self.live.remove(&sid);
+                stale_payload = true;
+            }
+            if stale_payload {
+                rewrite.push(sid);
+            }
+        }
+        for sid in rewrite {
+            self.compact(&sid)?;
         }
         Ok(())
     }
@@ -571,6 +732,17 @@ impl FileJournal {
         let message = format!("session journal failed: {why}; restart to reload it");
         self.failed = Some(message.clone());
         JournalError(message)
+    }
+
+    /// Cuts logs back to their length before a failed append, where the
+    /// first attempt failed.
+    fn retry_undo(&mut self) {
+        self.undo.retain(|_, log| {
+            log.file
+                .set_len(log.len)
+                .and_then(|()| log.file.sync_all())
+                .is_err()
+        });
     }
 
     /// The append handle of `sid`'s log, creating the log (and making its
@@ -629,13 +801,13 @@ impl FileJournal {
     /// Writes `line` at the end of `sid`'s log and syncs it.
     fn write_line(&mut self, sid: &str, line: &[u8]) -> Result<(), JournalError> {
         #[cfg(test)]
-        let torn = self.take_fault(Fault::Write);
+        let (torn, sync_fails, undo_fails) = {
+            let torn = self.take_fault(Fault::Write);
+            let both = self.take_fault(Fault::FsyncAndUndo);
+            (torn, both || self.take_fault(Fault::Fsync), both)
+        };
         #[cfg(not(test))]
-        let torn = false;
-        #[cfg(test)]
-        let sync_fails = self.take_fault(Fault::Fsync);
-        #[cfg(not(test))]
-        let sync_fails = false;
+        let (torn, sync_fails, undo_fails) = (false, false, false);
         let log = self.log_for(sid)?;
         let before = log.len;
         let written = if torn {
@@ -658,10 +830,19 @@ impl FileJournal {
                 Ok(())
             }
             Err(e) => {
-                // Best effort: cut the log back so a restart doesn't find a
-                // record the host was told is not written.
-                let _ = log.file.set_len(before).and_then(|()| log.file.sync_all());
-                self.open.remove(sid);
+                // Cut the log back so a restart doesn't find a record the
+                // host was told is not written; retried until it works.
+                let mut log = self.open.remove(sid).unwrap();
+                log.len = before;
+                let undone = !undo_fails
+                    && log
+                        .file
+                        .set_len(before)
+                        .and_then(|()| log.file.sync_all())
+                        .is_ok();
+                if !undone {
+                    self.undo.insert(sid.to_string(), log);
+                }
                 Err(self.fail(format!("cannot write the {sid} log: {e}")))
             }
         }
@@ -678,11 +859,12 @@ impl FileJournal {
         Ok(())
     }
 
-    /// Rewrites `sid`'s log with only its live state (see the module docs).
+    /// Rewrites `sid`'s log with only its live state (see the module docs);
+    /// a log with nothing live is removed.
     fn compact(&mut self, sid: &str) -> Result<(), JournalError> {
+        self.compactions += 1;
         let parsed = self.read_log(sid)?;
         let seq_of: Vec<u64> = parsed.records.iter().map(|(s, _)| *s).collect();
-        let last_seq = seq_of.last().copied().unwrap_or(0);
         let replayed = journal::replay(parsed.records.into_iter().map(|(_, r)| r).collect())?;
         let mut stored: Vec<_> = replayed.receipts.into_values().collect();
         stored.sort_by_key(|s| s.order);
@@ -726,19 +908,10 @@ impl FileJournal {
                 }
             }
         }
-        if let Some(&reserved) = replayed.lease_epochs.get(sid) {
-            // `seq` only orders records across logs; a floor's place is free.
-            out.extend(encode(
-                last_seq,
-                Record::LeaseEpochs {
-                    session_id: sid.to_string(),
-                    reserved,
-                },
-            )?);
-        }
         if out.is_empty() {
-            // Nothing live and no floor: the log goes (old or none is valid).
+            // Nothing live: the log goes (the old one or none is valid).
             self.open.remove(sid);
+            self.compacted_len.remove(sid);
             let path = self.log_path(sid);
             remove_entry(&path).map_err(|e| io_err("cannot remove", &path, e))?;
             if let Err(e) = sync_dir(&self.logs) {
@@ -746,7 +919,9 @@ impl FileJournal {
             }
             return Ok(());
         }
-        self.replace_log(sid, &out)
+        self.replace_log(sid, &out)?;
+        self.compacted_len.insert(sid.to_string(), out.len() as u64);
+        Ok(())
     }
 
     /// Atomically replaces `sid`'s log with `bytes`.
@@ -785,30 +960,80 @@ impl FileJournal {
         }
         Ok(())
     }
+
+    fn append_floor(&mut self, sid: String, reserved: u64) -> Result<(), JournalError> {
+        if !wire::is_session_id(&sid) {
+            return Err(JournalError("invalid session id".into()));
+        }
+        if self.floors.get(&sid).is_some_and(|f| *f >= reserved) {
+            return Ok(()); // already durable: floors never go down
+        }
+        let mut floors = self.floors.clone();
+        floors.insert(sid, reserved);
+        self.write_floors(&floors)?;
+        self.floors = floors;
+        Ok(())
+    }
+}
+
+impl Drop for FileJournal {
+    fn drop(&mut self) {
+        self.retry_undo();
+    }
 }
 
 impl Journal for FileJournal {
     fn append(&mut self, record: Record) -> Result<(), JournalError> {
         if let Some(f) = &self.failed {
-            return Err(JournalError(f.clone()));
+            let f = f.clone();
+            self.retry_undo();
+            return Err(JournalError(f));
+        }
+        if let Record::LeaseEpochs {
+            session_id,
+            reserved,
+        } = record
+        {
+            return self.append_floor(session_id, reserved);
         }
         let sid = self.session_of(&record)?;
-        let (owner_add, owner_remove) = match &record {
-            Record::Accepted { request_id, .. } => (Some(request_id.clone()), None),
-            Record::Evicted { request_id } => (None, Some(request_id.clone())),
-            _ => (None, None),
+        let request_id = match &record {
+            Record::Accepted { request_id, .. }
+            | Record::Transition { request_id, .. }
+            | Record::Evicted { request_id } => request_id.clone(),
+            Record::LeaseEpochs { .. } => unreachable!("handled above"),
         };
-        let line = encode(self.next_seq, record)?;
-        self.write_line(&sid, &line)?;
+        let with_content =
+            matches!(&record, Record::Accepted { payload, .. } if has_content(payload));
+        let is_accepted = matches!(record, Record::Accepted { .. });
+        let is_evicted = matches!(record, Record::Evicted { .. });
+        self.write_line(&sid, &encode(self.next_seq, record)?)?;
+        let mut rewrite = false;
+        if is_accepted {
+            if with_content {
+                self.with_payload.insert(request_id.clone());
+            }
+            self.owner.insert(request_id.clone(), sid.clone());
+            *self.live.entry(sid.clone()).or_default() += 1;
+        } else {
+            // Its payload is no longer needed: take it off the disk.
+            rewrite = self.with_payload.remove(&request_id);
+        }
+        if is_evicted {
+            self.owner.remove(&request_id);
+            let live = self.live.entry(sid.clone()).or_default();
+            *live = live.saturating_sub(1);
+            if *live == 0 {
+                self.live.remove(&sid);
+                rewrite = true; // the log and its handle go
+            }
+        }
         self.next_seq += 1;
-        if let Some(rid) = owner_add {
-            self.owner.insert(rid, sid.clone());
-        }
-        if let Some(rid) = owner_remove {
-            self.owner.remove(&rid);
-        }
         let len = self.open.get(&sid).map_or(0, |l| l.len);
-        if len > self.compact_bytes
+        let limit = self
+            .compact_bytes
+            .max(2 * self.compacted_len.get(&sid).copied().unwrap_or(0));
+        if (rewrite || len > limit)
             && let Err(e) = self.compact(&sid)
         {
             // The record itself is durable; a failed compaction only leaves
@@ -819,7 +1044,17 @@ impl Journal for FileJournal {
     }
 
     fn load(&self) -> Result<Vec<Record>, JournalError> {
-        let mut all: Vec<(u64, Record)> = Vec::new();
+        let mut all: Vec<(u64, Record)> = self
+            .floors
+            .iter()
+            .map(|(sid, reserved)| {
+                let record = Record::LeaseEpochs {
+                    session_id: sid.clone(),
+                    reserved: *reserved,
+                };
+                (0, record)
+            })
+            .collect();
         for sid in self.session_ids()? {
             all.extend(self.read_log(&sid)?.records);
         }
