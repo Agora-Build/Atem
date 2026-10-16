@@ -582,6 +582,13 @@ mod tests {
         held.clear_pid().unwrap();
         assert_eq!(read_lock_pid(&path), None);
         drop(held);
+        // Another test thread may fork between our open and its exec; the child
+        // briefly shares our open file description (and its flock) until exec
+        // closes it (O_CLOEXEC). Wait for that window to pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while lock_is_held(&path) != Some(false) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(lock_is_held(&path), Some(false));
         assert!(lock_exclusive_with_pid(&path).unwrap().is_some());
         let link = dir.path().join("link.lock");
