@@ -1,0 +1,154 @@
+{
+ "name": "local-input-revokes-the-lease-and-drops-queued-bytes",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222"
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native",
+    "holds_lease_epoch": 1
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "subscribe",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "attached",
+    "session.terminal_id": "ses-aaaaaaaaaaaa"
+   },
+   "capture": {
+    "s": "stream_id"
+   }
+  },
+  {
+   "hold_pty_writes": true
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "input",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "${s}",
+     "sequence": 0,
+     "bytes": "aGkN",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "local_input": "ses-aaaaaaaaaaaa",
+   "bytes": "eA=="
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "local_input",
+    "lease_epoch": 2,
+    "controller": null
+   }
+  },
+  {
+   "flush_pty_writes": true
+  },
+  {
+   "assert": {
+    "pty_writes_local": 1,
+    "pty_writes_remote": 0,
+    "pty_writes_dropped": 1,
+    "lease_holder": null
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "input",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "${s}",
+     "sequence": 1,
+     "bytes": "aGkN",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "error",
+    "code": "stale_lease"
+   }
+  }
+ ],
+ "note": "Local input wins: the remote lease is revoked (new epoch) before the local bytes are written, and remote bytes queued under the old epoch are dropped at the write boundary."
+}

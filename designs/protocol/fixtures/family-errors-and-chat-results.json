@@ -1,0 +1,414 @@
+{
+ "name": "family-errors-and-chat-results",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native",
+    "holds_lease_epoch": 1
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "subscribe",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "attached",
+    "session.terminal_id": "ses-aaaaaaaaaaaa"
+   },
+   "capture": {
+    "s": "stream_id"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "input",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "${s}",
+     "sequence": 0,
+     "bytes": "aGkN",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 2
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "error",
+    "code": "stale_lease",
+    "terminal_id": "ses-aaaaaaaaaaaa",
+    "stream_id": "${s}"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "input",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "not-the-stream",
+     "sequence": 0,
+     "bytes": "aGkN",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "error",
+    "code": "stale_target",
+    "terminal_id": "ses-aaaaaaaaaaaa",
+    "stream_id": "not-the-stream"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-000000000001",
+     "text": "run the tests",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 2
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "error",
+    "code": "stale_lease",
+    "requestId": "44444444-4444-4444-8444-000000000001",
+    "conversationId": "conv-1"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-000000000002",
+     "text": "run the tests",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "accepted",
+    "requestId": "44444444-4444-4444-8444-000000000002",
+    "conversationId": "conv-1",
+    "agentId": "ses-aaaaaaaaaaaa"
+   }
+  },
+  {
+   "turn_complete": "ses-aaaaaaaaaaaa",
+   "turn_id": "turn-1"
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "complete",
+    "requestId": "44444444-4444-4444-8444-000000000002",
+    "turnId": "turn-1",
+    "outcome": "done"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-000000000002",
+     "text": "run the tests",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "complete",
+    "requestId": "44444444-4444-4444-8444-000000000002",
+    "outcome": "done"
+   }
+  },
+  {
+   "fail_next_pty_enqueue": true
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-000000000003",
+     "text": "run the tests",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "accepted",
+    "requestId": "44444444-4444-4444-8444-000000000003"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "error",
+    "requestId": "44444444-4444-4444-8444-000000000003",
+    "code": "rejected",
+    "text": "could not write to the terminal"
+   }
+  },
+  {
+   "fail_next_pty_write_after_partial": true
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-000000000004",
+     "text": "run the tests",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "accepted",
+    "requestId": "44444444-4444-4444-8444-000000000004"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "error",
+    "requestId": "44444444-4444-4444-8444-000000000004",
+    "code": "outcome_unknown",
+    "text": "write interrupted"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "requestId": "44444444-4444-4444-8444-000000000005",
+     "text": "hi"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "subscribe",
+     "terminal_id": "claude",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 3,
+    "dispatches": 2,
+    "pty_writes": 0
+   }
+  }
+ ],
+ "note": "Refused terminal-v1 requests get terminal-v1 error{terminal_id, stream_id, code, message}; a chat-v1 submit hears only chat-v1 ops mapped from its receipt (accepted/executing -> accepted, completed -> complete{outcome:done, turnId}, rejected/outcome_unknown -> error{code, text}), never a session receipt; removed and undecodable family requests get a session error."
+}

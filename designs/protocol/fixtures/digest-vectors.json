@@ -1,0 +1,140 @@
+{
+ "algorithm": "sha256(RFC 8785 JCS(payload)) lowercase hex. Supported domain: objects, arrays, strings (valid Unicode scalar values only), true/false/null, integers within ±(2^53−1). Keys sorted by UTF-16 code units. Parsers must reject the must_reject inputs before canonicalising (duplicate keys at any depth, lone surrogates, non-integers, exponents, unsafe integers, invalid UTF-8).",
+ "vectors": [
+  {
+   "name": "prompt-ascii",
+   "payload": {
+    "text": "run the tests"
+   },
+   "canonical": "{\"text\":\"run the tests\"}",
+   "sha256": "51b365c654de71c69dac5afdc09dbbf06929ef6137ee7878f32937071d2923a8"
+  },
+  {
+   "name": "prompt-unicode",
+   "payload": {
+    "text": "héllo 世界"
+   },
+   "canonical": "{\"text\":\"héllo 世界\"}",
+   "sha256": "98945f882da718228730803d0d175141da947f0f1169099d47b558dd44746e8e"
+  },
+  {
+   "name": "empty",
+   "payload": {},
+   "canonical": "{}",
+   "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  {
+   "name": "nested-sorted",
+   "payload": {
+    "text": "a",
+    "b": [
+     1,
+     true,
+     null,
+     "x"
+    ]
+   },
+   "canonical": "{\"b\":[1,true,null,\"x\"],\"text\":\"a\"}",
+   "sha256": "11132adf10a49624454ea644e1582f0669cf71867b61bd12f20b80ee3cb28e02"
+  },
+  {
+   "name": "escapes",
+   "payload": {
+    "text": "line1\nline2\t\"q\"\\"
+   },
+   "canonical": "{\"text\":\"line1\\nline2\\t\\\"q\\\"\\\\\"}",
+   "sha256": "40e4b600f8bca9c4c6636065e2274854929101b360f5bc2a4d221ad42e9b450a"
+  },
+  {
+   "name": "utf16-key-order-supplementary",
+   "payload": {
+    "😀": 1,
+    "ﬁ": 2,
+    "a": 3,
+    "é": 4
+   },
+   "canonical": "{\"a\":3,\"é\":4,\"😀\":1,\"ﬁ\":2}",
+   "sha256": "db257859f37825cbdbc7e3fa930596e1fa4eac1ce98d86df74169ec143eaf4aa"
+  },
+  {
+   "name": "supplementary-value",
+   "payload": {
+    "text": "emoji 😀 and CJK 世"
+   },
+   "canonical": "{\"text\":\"emoji 😀 and CJK 世\"}",
+   "sha256": "b9c8f42c512a0164707cae3a06ec873f703bc9e963cf6c6871d96c01eab49d6e"
+  },
+  {
+   "name": "control-escapes",
+   "payload": {
+    "text": "\u0000\u0001\u001f\b\f\n\r\t/"
+   },
+   "canonical": "{\"text\":\"\\u0000\\u0001\\u001f\\b\\f\\n\\r\\t/\"}",
+   "sha256": "235e007d5d4c4a4288ab4b44483417567dcc3391c301176fbcc39413735f07c9"
+  },
+  {
+   "name": "safe-integer-max",
+   "payload": {
+    "n": 9007199254740991,
+    "m": -9007199254740991
+   },
+   "canonical": "{\"m\":-9007199254740991,\"n\":9007199254740991}",
+   "sha256": "3f54c80abdfbc38f08ed5654622eea6e7d7e58cbac36cf5a0670c8aeb054703d"
+  },
+  {
+   "name": "nested-key-order",
+   "payload": {
+    "z": {
+     "b": 1,
+     "a": 2
+    },
+    "a": [
+     {
+      "y": true,
+      "x": false
+     }
+    ]
+   },
+   "canonical": "{\"a\":[{\"x\":false,\"y\":true}],\"z\":{\"a\":2,\"b\":1}}",
+   "sha256": "7f886746bde2f1329e79e1fa3909a0f0d44b044c2e301ee84d6ae25eede4d698"
+  }
+ ],
+ "must_reject": [
+  {
+   "name": "float-rejected",
+   "payload_json": "{\"n\":1.5}"
+  },
+  {
+   "name": "duplicate-key-rejected",
+   "payload_json": "{\"text\":\"a\",\"text\":\"b\"}"
+  },
+  {
+   "name": "unsafe-integer-rejected",
+   "payload_json": "{\"n\":9007199254740992}"
+  },
+  {
+   "name": "lone-high-surrogate",
+   "payload_json": "{\"text\":\"\\ud800\"}"
+  },
+  {
+   "name": "lone-low-surrogate",
+   "payload_json": "{\"text\":\"\\udc00x\"}"
+  },
+  {
+   "name": "negative-unsafe-integer",
+   "payload_json": "{\"n\":-9007199254740992}"
+  },
+  {
+   "name": "exponent-number",
+   "payload_json": "{\"n\":1e3}"
+  },
+  {
+   "name": "nested-duplicate-key",
+   "payload_json": "{\"a\":{\"k\":1,\"k\":1}}"
+  },
+  {
+   "name": "invalid-utf8-bytes",
+   "payload_hex": "7b2274657874223a22ff227d"
+  }
+ ]
+}
