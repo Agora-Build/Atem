@@ -43,7 +43,8 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
   The old ops are removed from the host and answered with
   `error{code:"unsupported_version"}` and no effect: `agentInput`,
   `agentPrompt`, `voiceCommand`/`voiceToggle` prompts, `userCommand`,
-  terminal-v1 `control` and its `lease_id` field, chat-v1 `submit` without
+  terminal-v1 `control` and its `lease_id` field, terminal-v1 `list`/`sessions`
+  (session-v1 `list` is the only registry), chat-v1 `submit` without
   `binding`, and any session op before `welcome`. Terminal ids are session ids
   only (no `claude`/`codex` aliases).
   - Local terminal input on the host revokes any remote lease first (§5).

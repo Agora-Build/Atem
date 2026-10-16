@@ -20,9 +20,9 @@ implementation; the fixture plays the host with `deliver_to_client`).
 | step | meaning |
 |---|---|
 | `{"send": client, "json": msg}` | client sends `msg` to the host (send time = current clock) |
-| `{"expect": client, "match": {path: value}, "capture"?: {name: path}}` | next message to that client matches (dotted paths into `data`); `capture` stores values for later steps, referenced in any string as `${name}` |
-| `{"expect_all": {…}}` | every client's next message matches |
-| `{"expect_none": client, "for_ms": n}` | nothing reaches that client while the clock advances n |
+| `{"expect": client, "type"?: t, "match": {path: value}, "capture"?: {name: path}}` | takes that client's next message of envelope type `t` (when given) and op `match.op` (when given); messages of other types/ops stay queued for later `expect`s. The taken message must match every path (dotted paths into `data`, array indexes as numbers), else the step fails. With neither `type` nor `op` it takes the very next message. `capture` stores values for later steps, referenced in any string as `${name}` |
+| `{"expect_all": {…}}` | `expect` with that `match` for every client |
+| `{"expect_none": client, "for_ms": n}` | nothing of any type is queued for that client after the clock advances n |
 | `{"advance_ms": n}` | advance the clock; timers may fire |
 | `{"hold": {"to": client, "op": op}}` / `{"deliver": "held"}` | delay the next matching host→client message, deliver it later (reordering) |
 | `{"deliver_to_client": client, "json": msg}` | client-side fixtures: the host's message arrives now |

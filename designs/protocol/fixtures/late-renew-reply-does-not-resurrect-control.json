@@ -81,7 +81,92 @@
    }
   },
   {
-   "advance_ms": 5000
+   "advance_ms": 2000
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "renew",
+     "id": "11111111-1111-4111-8111-000000000014",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "lease",
+     "id": "11111111-1111-4111-8111-000000000090",
+     "re": "11111111-1111-4111-8111-000000000010",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "ms_left": 15000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "controls": true,
+    "deadline_ms": 15000
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "lease",
+     "id": "11111111-1111-4111-8111-000000000094",
+     "re": "11111111-1111-4111-8111-000000000014",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "ms_left": 15000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "controls": true,
+    "deadline_ms": 17000
+   }
+  },
+  {
+   "advance_ms": 3000
   },
   {
    "send": "c1",
@@ -278,5 +363,5 @@
    }
   }
  ],
- "note": "Client-side fixture (t = fake monotonic clock, ms). The t=17000 reply to the t=5000 renew arrives after the acknowledged deadline (15000), with no timer tick, and is dropped. A replayed reply to an already consumed re is dropped. A repeat acquire sent at 31000 whose reply (ms_left 500) is applied at 31500 gives deadline = min(32000, 31000+500, auth) = 31500 = now, so control and input are off immediately (expiry is now >= deadline)."
+ "note": "Client-side fixture (t = fake monotonic clock, ms). While renew B (sent at 2000) is pending, a duplicate of the already consumed acquire reply is dropped and the deadline stays 15000; B's reply then gives 2000+15000 = 17000. The reply to the renew sent at 5000 arrives at t=17000 with no timer tick: the acknowledged deadline (17000) is reached (now >= deadline), so it is dropped. A replayed reply to an already consumed re is dropped. A repeat acquire sent at 31000 whose reply (ms_left 500) is applied at 31500 gives deadline = min(32000, 31000+500, auth) = 31500 = now, so control and input are off immediately (expiry is now >= deadline)."
 }
