@@ -1,4 +1,4 @@
-//! atem-session v1 (designs/protocol/atem-session-v1.md, r5, compatibility mode):
+//! atem-session v1 (designs/protocol/atem-session-v1.md, r6, compatibility mode):
 //! wire types, strict decoding and the canonical payload digest (`wire`,
 //! `canonical`), and the client lease/registry state machines (`client`),
 //! checked against the shared fixtures (`fixtures`).

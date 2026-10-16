@@ -28,7 +28,7 @@ struct Pending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRefused {
     /// `renew`/`release` without control (never renew after the local estimate
-    /// of expiry).
+    /// of expiry; nothing to release).
     NotControlling,
     /// The id is already outstanding.
     DuplicateId,
@@ -50,8 +50,11 @@ pub enum ReplyOutcome {
     /// Rule 2: the previously acknowledged deadline had passed; this client is
     /// now a viewer and only a new `acquire` regains control.
     DeadlinePassed,
-    /// The reply doesn't fit the request (other target/attachment, wrong op).
+    /// The reply doesn't fit the request (other target/attachment, wrong op,
+    /// or a renew answered for another epoch — which also ends control).
     Mismatch,
+    /// The granted epoch is older than one already seen in `lease_changed`.
+    StaleEpoch,
     /// Not a lease reply (`lease`, `lease_released` or `error`).
     NotALeaseReply,
 }
@@ -65,6 +68,9 @@ pub struct LeaseClient {
     /// Acknowledged local deadline (monotonic ms); `Some` while controlling.
     deadline: Option<u64>,
     lease_epoch: Option<u64>,
+    /// Highest `lease_epoch` seen for this target (grants and
+    /// `lease_changed`), kept while a viewer; older grants are dropped.
+    highest_epoch_seen: Option<u64>,
     authorization_deadline: Option<u64>,
 }
 
@@ -119,6 +125,7 @@ impl LeaseClient {
             outstanding: HashMap::new(),
             deadline: None,
             lease_epoch: None,
+            highest_epoch_seen: None,
             authorization_deadline: None,
         }
     }
@@ -149,7 +156,7 @@ impl LeaseClient {
         }
         match kind {
             LeaseRequest::Acquire => {}
-            LeaseRequest::Renew if self.deadline.is_none() => {
+            LeaseRequest::Renew | LeaseRequest::Release if self.deadline.is_none() => {
                 return Err(RequestRefused::NotControlling);
             }
             LeaseRequest::Renew => {}
@@ -214,6 +221,9 @@ impl LeaseClient {
         if binding.target != self.target || binding.attachment_gen != self.attachment_gen {
             return ReplyOutcome::Mismatch;
         }
+        if self.highest_epoch_seen.is_some_and(|h| epoch < h) {
+            return ReplyOutcome::StaleEpoch;
+        }
         // Rule 3: send time + ms_left, capped by authorization.
         let mut candidate = pending.sent_at.saturating_add(ms_left);
         if let Some(a) = self.authorization_deadline {
@@ -223,6 +233,8 @@ impl LeaseClient {
             (LeaseRequest::Release, _) => return ReplyOutcome::Mismatch,
             (LeaseRequest::Renew, None) => return ReplyOutcome::Mismatch,
             (LeaseRequest::Renew, Some(_)) if self.lease_epoch != Some(epoch) => {
+                // Fail closed: the host's lease isn't the one this client holds.
+                self.become_viewer();
                 return ReplyOutcome::Mismatch;
             }
             (LeaseRequest::Renew, Some(_)) => candidate,
@@ -237,6 +249,7 @@ impl LeaseClient {
         }
         self.deadline = Some(new);
         self.lease_epoch = Some(epoch);
+        self.highest_epoch_seen = Some(self.highest_epoch_seen.map_or(epoch, |h| h.max(epoch)));
         ReplyOutcome::Applied
     }
 
@@ -246,6 +259,10 @@ impl LeaseClient {
         if session_id != self.target.session_id || process_gen != self.target.process_gen {
             return;
         }
+        self.highest_epoch_seen = Some(
+            self.highest_epoch_seen
+                .map_or(lease_epoch, |h| h.max(lease_epoch)),
+        );
         if self.lease_epoch.is_some_and(|e| lease_epoch > e) {
             self.become_viewer();
         }
@@ -273,9 +290,10 @@ impl LeaseClient {
         self.controls(now_ms)
     }
 
-    /// The acknowledged local deadline (monotonic ms), `None` as a viewer.
-    pub fn deadline_ms(&self) -> Option<u64> {
-        self.deadline
+    /// The acknowledged local deadline (monotonic ms); `None` as a viewer or
+    /// once `now >= deadline`.
+    pub fn deadline_ms(&self, now_ms: u64) -> Option<u64> {
+        self.deadline.filter(|d| now_ms < *d)
     }
 
     pub fn lease_epoch(&self) -> Option<u64> {
@@ -554,7 +572,7 @@ mod tests {
             c.on_reply(&lease(&id(1), 1, 15_000), 1_400),
             ReplyOutcome::Applied
         );
-        assert_eq!(c.deadline_ms(), Some(16_000));
+        assert_eq!(c.deadline_ms(0), Some(16_000));
         assert_eq!(c.lease_epoch(), Some(1));
         assert!(c.controls(15_999) && c.input_enabled(15_999));
         assert!(
@@ -584,12 +602,12 @@ mod tests {
         let mut no_re = lease(&id(2), 1, 15_000);
         no_re.re = None;
         assert_eq!(c.on_reply(&no_re, 6_000), ReplyOutcome::UnknownRe);
-        assert_eq!(c.deadline_ms(), Some(15_000));
+        assert_eq!(c.deadline_ms(0), Some(15_000));
         assert_eq!(
             c.on_reply(&lease(&id(2), 1, 15_000), 6_000),
             ReplyOutcome::Applied
         );
-        assert_eq!(c.deadline_ms(), Some(20_000));
+        assert_eq!(c.deadline_ms(0), Some(20_000));
         assert_eq!(
             c.on_reply(&lease(&id(2), 1, 15_000), 6_000),
             ReplyOutcome::UnknownRe
@@ -607,7 +625,7 @@ mod tests {
             ReplyOutcome::DeadlinePassed
         );
         assert!(!c.controls(15_000));
-        assert_eq!(c.deadline_ms(), None);
+        assert_eq!(c.deadline_ms(0), None);
         assert_eq!(c.lease_epoch(), None);
         // Renew is refused without control.
         assert_eq!(
@@ -633,7 +651,7 @@ mod tests {
             c.on_reply(&lease(&id(3), 3, 15_000), 16_200),
             ReplyOutcome::Applied
         );
-        assert_eq!(c.deadline_ms(), Some(31_000));
+        assert_eq!(c.deadline_ms(0), Some(31_000));
         assert_eq!(c.lease_epoch(), Some(3));
     }
 
@@ -644,7 +662,7 @@ mod tests {
         c.on_reply(&lease(&id(1), 1, 15_000), 0);
         c.sent(&id(2), LeaseRequest::Renew, 14_000).unwrap();
         c.tick(15_000);
-        assert_eq!(c.deadline_ms(), None);
+        assert_eq!(c.deadline_ms(0), None);
         assert_eq!(
             c.on_reply(&lease(&id(2), 1, 15_000), 15_000),
             ReplyOutcome::UnknownRe
@@ -659,14 +677,14 @@ mod tests {
         c.sent(&id(2), LeaseRequest::Acquire, 1_000).unwrap();
         c.on_reply(&lease(&id(2), 1, 15_000), 1_000);
         assert_eq!(
-            c.deadline_ms(),
+            c.deadline_ms(0),
             Some(15_000),
             "min(previous, send + ms_left)"
         );
         c.sent(&id(3), LeaseRequest::Acquire, 2_000).unwrap();
         c.on_reply(&lease(&id(3), 1, 4_000), 2_500);
         assert_eq!(
-            c.deadline_ms(),
+            c.deadline_ms(0),
             Some(6_000),
             "a shorter remaining lifetime wins"
         );
@@ -677,7 +695,7 @@ mod tests {
             ReplyOutcome::AppliedExpired
         );
         assert!(!c.controls(5_500) && !c.input_enabled(5_500));
-        assert_eq!(c.deadline_ms(), None);
+        assert_eq!(c.deadline_ms(0), None);
     }
 
     #[test]
@@ -687,7 +705,7 @@ mod tests {
         c.on_reply(&lease(&id(1), 1, 15_000), 0);
         c.sent(&id(2), LeaseRequest::Renew, 5_000).unwrap();
         c.on_reply(&lease(&id(2), 1, 14_000), 9_000);
-        assert_eq!(c.deadline_ms(), Some(19_000));
+        assert_eq!(c.deadline_ms(0), Some(19_000));
     }
 
     #[test]
@@ -696,10 +714,10 @@ mod tests {
         c.set_authorization_deadline(Some(10_000));
         c.sent(&id(1), LeaseRequest::Acquire, 0).unwrap();
         c.on_reply(&lease(&id(1), 1, 15_000), 0);
-        assert_eq!(c.deadline_ms(), Some(10_000));
+        assert_eq!(c.deadline_ms(0), Some(10_000));
         c.set_authorization_deadline(Some(8_000));
         assert_eq!(
-            c.deadline_ms(),
+            c.deadline_ms(0),
             Some(8_000),
             "a shorter authorization caps at once"
         );
@@ -708,7 +726,7 @@ mod tests {
             c.on_reply(&lease(&id(2), 1, 15_000), 7_000),
             ReplyOutcome::Applied
         );
-        assert_eq!(c.deadline_ms(), Some(8_000));
+        assert_eq!(c.deadline_ms(0), Some(8_000));
     }
 
     #[test]
@@ -786,6 +804,70 @@ mod tests {
         assert_eq!(
             c.sent(&id(999), LeaseRequest::Acquire, 0),
             Err(RequestRefused::TooManyInFlight)
+        );
+    }
+
+    #[test]
+    fn deadline_reads_none_once_reached() {
+        let mut c = client();
+        c.sent(&id(1), LeaseRequest::Acquire, 0).unwrap();
+        c.on_reply(&lease(&id(1), 1, 15_000), 0);
+        assert_eq!(c.deadline_ms(14_999), Some(15_000));
+        assert_eq!(c.deadline_ms(15_000), None, "now >= deadline");
+    }
+
+    #[test]
+    fn renew_reply_with_another_epoch_fails_closed() {
+        let mut c = client();
+        c.sent(&id(1), LeaseRequest::Acquire, 0).unwrap();
+        c.on_reply(&lease(&id(1), 4, 15_000), 0);
+        c.sent(&id(2), LeaseRequest::Renew, 5_000).unwrap();
+        assert_eq!(
+            c.on_reply(&lease(&id(2), 5, 15_000), 5_100),
+            ReplyOutcome::Mismatch
+        );
+        assert!(
+            !c.controls(5_100),
+            "a renew answered for another epoch ends control"
+        );
+        assert_eq!(c.lease_epoch(), None);
+    }
+
+    #[test]
+    fn release_needs_control() {
+        let mut c = client();
+        assert_eq!(
+            c.sent(&id(1), LeaseRequest::Release, 0),
+            Err(RequestRefused::NotControlling)
+        );
+    }
+
+    #[test]
+    fn lease_replies_older_than_a_seen_lease_change_are_dropped() {
+        let mut c = client();
+        // A viewer with an acquire outstanding sees the lease move to epoch 6.
+        c.sent(&id(1), LeaseRequest::Acquire, 0).unwrap();
+        c.on_lease_changed(&target().session_id, PG, 6);
+        assert_eq!(
+            c.on_reply(&lease(&id(1), 5, 15_000), 100),
+            ReplyOutcome::StaleEpoch
+        );
+        assert!(!c.controls(100));
+        // A grant at (or after) the highest seen epoch applies.
+        c.sent(&id(2), LeaseRequest::Acquire, 200).unwrap();
+        assert_eq!(
+            c.on_reply(&lease(&id(2), 6, 15_000), 300),
+            ReplyOutcome::Applied
+        );
+        assert!(c.controls(300));
+        // Other targets' changes don't count.
+        c.on_lease_changed(&target().session_id, PG2, 50);
+        c.on_lease_changed("ses-bbbbbbbbbbbb", PG, 50);
+        assert!(c.controls(300));
+        c.sent(&id(3), LeaseRequest::Acquire, 400).unwrap();
+        assert_eq!(
+            c.on_reply(&lease(&id(3), 6, 15_000), 500),
+            ReplyOutcome::Applied
         );
     }
 

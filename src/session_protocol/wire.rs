@@ -16,7 +16,7 @@
 //!
 //! Contract r6 §0 has no legacy paths: the removed families (`agentInput`,
 //! `agentPrompt`, `voiceCommand`, `voiceToggle`, `userCommand`), terminal-v1
-//! `control`/`controller` and any terminal-v1 or chat-v1 request without its
+//! `control`/`controller`/`list`/`sessions` and any terminal-v1 or chat-v1 request without its
 //! `binding` or with a `lease_id` fail with `DecodeError::removed` set, so the
 //! host answers `unsupported_version` and does nothing. terminal-v1 requests
 //! decode into `TerminalRequest` (terminal ids are session ids).
@@ -368,6 +368,8 @@ pub struct FamilyMessage {
     /// `None` for messages without `data` (e.g. `{"type":"projectListRequest"}`).
     pub data: Option<Value>,
     pub binding: Option<Binding>,
+    /// A terminal-v1 request, typed (`None` for every other message).
+    pub request: Option<TerminalRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -784,18 +786,22 @@ fn decode_family(family: String, mut data: Option<Value>) -> Result<FamilyMessag
             .map_err(|e| fail(None, format!("binding: {e}")))?,
         _ => None,
     };
-    match family.as_str() {
+    let request = match family.as_str() {
         "terminal" => check_terminal(data.as_ref(), binding.as_ref())?,
-        "agentChat" => check_chat(data.as_ref(), binding.as_ref())?,
+        "agentChat" => {
+            check_chat(data.as_ref(), binding.as_ref())?;
+            None
+        }
         _ if binding.is_some() => {
             return Err(fail(None, format!("{family} cannot carry a binding")));
         }
-        _ => {}
-    }
+        _ => None,
+    };
     Ok(FamilyMessage {
         family,
         data,
         binding,
+        request,
     })
 }
 
@@ -827,10 +833,17 @@ fn require_binding(
 
 /// terminal-v1. Requests decode into `TerminalRequest` with their binding;
 /// host messages must decode with `terminal_share` types and carry none.
-fn check_terminal(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), DecodeError> {
+/// terminal-v1 `list`/`sessions` are removed: session-v1 `list` is the only
+/// registry (r6 §0).
+fn check_terminal(
+    data: Option<&Value>,
+    binding: Option<&Binding>,
+) -> Result<Option<TerminalRequest>, DecodeError> {
     let (m, op) = family_head(data)?;
     let use_ = match op {
-        "control" | "controller" => return Err(removed("terminal", Some(op))),
+        "control" | "controller" | "list" | "sessions" => {
+            return Err(removed("terminal", Some(op)));
+        }
         "subscribe" | "unsubscribe" | "ack" => BindingUse::Read,
         "input" | "resize" | "stop" => BindingUse::Mutation,
         _ => {
@@ -839,7 +852,7 @@ fn check_terminal(data: Option<&Value>, binding: Option<&Binding>) -> Result<(),
             }
             serde_json::from_value::<crate::terminal_share::Envelope>(Value::Object(m.clone()))
                 .map_err(|e| fail(None, format!("terminal: {e}")))?;
-            return Ok(());
+            return Ok(None);
         }
     };
     if m.contains_key("lease_id") {
@@ -849,7 +862,8 @@ fn check_terminal(data: Option<&Value>, binding: Option<&Binding>) -> Result<(),
     let req: TerminalRequest = serde_json::from_value(Value::Object(m.clone()))
         .map_err(|e| fail(None, format!("terminal: {e}")))?;
     req.validate()
-        .map_err(|e| fail(None, format!("terminal: {e}")))
+        .map_err(|e| fail(None, format!("terminal: {e}")))?;
+    Ok(Some(req))
 }
 
 /// chat-v1: requests (`open`, `close`, `submit`) carry their binding and must

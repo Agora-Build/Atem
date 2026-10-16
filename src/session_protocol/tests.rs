@@ -419,6 +419,40 @@ fn decoded_values_are_typed() {
 }
 
 #[test]
+fn terminal_requests_decode_typed() {
+    let ops = all_ops();
+    let request = |msg: &Value| {
+        let Envelope::Family(f) = wire::decode(&serde_json::to_vec(msg).unwrap()).unwrap() else {
+            panic!()
+        };
+        f.request
+    };
+    assert_eq!(
+        request(&ops[26]),
+        Some(wire::TerminalRequest::Input {
+            terminal_id: "ses-aaaaaaaaaaaa".into(),
+            generation: PG.into(),
+            stream_id: "s1".into(),
+            sequence: 0,
+            bytes: "aGkN".into(),
+        })
+    );
+    assert!(matches!(
+        request(&ops[27]),
+        Some(wire::TerminalRequest::Resize {
+            rows: 40,
+            cols: 120,
+            ..
+        })
+    ));
+    // Chat and host messages have no terminal request.
+    assert_eq!(request(&ops[30]), None);
+    let exited = json!({"type":"terminal","data":{"v":1,"op":"exited","terminal_id":"ses-aaaaaaaaaaaa",
+        "generation":PG,"status":"0"}});
+    assert_eq!(request(&exited), None);
+}
+
+#[test]
 fn family_binding_ids_must_agree() {
     let check = |msg: Value| {
         let Envelope::Family(f) = wire::decode(&serde_json::to_vec(&msg).unwrap()).unwrap() else {
@@ -863,6 +897,11 @@ fn removed_ops_decode_as_removed() {
     let controller = json!({"type":"terminal","data":{"v":1,"op":"controller","terminal_id":"ses-aaaaaaaaaaaa",
         "generation":PG,"stream_id":"s1","lease_id":null}});
     assert_eq!(removed(&controller), t("controller"));
+    // session-v1 `list` is the only registry.
+    let list = json!({"type":"terminal","data":{"v":1,"op":"list"}});
+    assert_eq!(removed(&list), t("list"));
+    let sessions = json!({"type":"terminal","data":{"v":1,"op":"sessions","sessions":[]}});
+    assert_eq!(removed(&sessions), t("sessions"));
     // terminal-v1 requests without their binding, or with a lease_id.
     for (i, op) in [
         (25, "subscribe"),

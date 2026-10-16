@@ -200,7 +200,20 @@ pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, 
             None => return Ok(Outcome::Skipped),
             Some(factory) => Runner::new(&scenario, Some(factory(&scenario.setup))),
         },
-        Side::Client => Runner::new(&scenario, None),
+        Side::Client => {
+            if scenario
+                .setup
+                .clients
+                .iter()
+                .any(|c| c.holds_lease_epoch.is_some())
+            {
+                return Err(format!(
+                    "{}: holds_lease_epoch is a host-side setup",
+                    scenario.name
+                ));
+            }
+            Runner::new(&scenario, None)
+        }
     };
     for (i, step) in scenario.steps.iter().enumerate() {
         runner
@@ -255,8 +268,10 @@ pub fn substitute(v: &mut Value, vars: &HashMap<String, Value>) -> Result<(), St
 struct ClientMachines {
     registry: RegistryClient,
     leases: BTreeMap<String, LeaseClient>,
-    lists_sent: u64,
+    /// `list` requests the registry machine asked for (not fixture sends).
+    lists_requested: u64,
     authorization_deadline: Option<u64>,
+    attachment_gen: String,
 }
 
 struct Runner {
@@ -314,16 +329,18 @@ impl Runner {
     fn new(s: &Scenario, host: Option<Box<dyn HostUnderTest>>) -> Self {
         let client_names: Vec<String> = s.setup.clients.iter().map(|c| c.name.clone()).collect();
         let clients = if s.side == Side::Client {
-            client_names
+            s.setup
+                .clients
                 .iter()
-                .map(|n| {
+                .map(|c| {
                     let m = ClientMachines {
                         registry: RegistryClient::default(),
                         leases: BTreeMap::new(),
-                        lists_sent: 0,
+                        lists_requested: 0,
                         authorization_deadline: None,
+                        attachment_gen: c.attachment_gen.clone(),
                     };
-                    (n.clone(), m)
+                    (c.name.clone(), m)
                 })
                 .collect()
         } else {
@@ -627,19 +644,16 @@ impl Runner {
 
     fn assert_host(&mut self, arg: &Value) -> Result<(), String> {
         let o = arg.as_object().ok_or("assert must be an object")?;
-        // `after` labels the assertion in a failure message.
-        let label = o.get("after").and_then(Value::as_str).unwrap_or("");
         let host = self.host()?;
-        for (key, expected) in o.iter().filter(|(k, _)| *k != "after") {
-            let got = host.counter(key).map_err(|e| format!("{e} ({label})"))?;
+        for (key, expected) in o {
+            let got = host.counter(key)?;
             match expected {
                 Value::Object(per) => {
                     for (sub, exp) in per {
-                        same(exp, got.get(sub), &format!("{key}.{sub}"))
-                            .map_err(|e| format!("{e} ({label})"))?;
+                        same(exp, got.get(sub), &format!("{key}.{sub}"))?;
                     }
                 }
-                _ => same(expected, Some(&got), key).map_err(|e| format!("{e} ({label})"))?,
+                _ => same(expected, Some(&got), key)?,
             }
         }
         Ok(())
@@ -657,7 +671,6 @@ impl Runner {
         let m = self.clients.get_mut(client).unwrap();
         let (kind, binding) = match &msg.op {
             Op::List {} => {
-                m.lists_sent += 1;
                 m.registry.note_list_sent();
                 return Ok(());
             }
@@ -666,6 +679,9 @@ impl Runner {
             Op::Release { binding } => (LeaseRequest::Release, binding),
             other => return Err(format!("client machines don't send {other:?}")),
         };
+        if binding.attachment_gen != m.attachment_gen {
+            return Err(format!("{client} sent with another attachment_gen"));
+        }
         let auth = m.authorization_deadline;
         let lease = m
             .leases
@@ -712,7 +728,7 @@ impl Runner {
             Op::Sessions { .. } | Op::SessionChanged { .. } => {
                 m.registry.on_message(&msg.op);
                 if m.registry.take_list_request() {
-                    m.lists_sent += 1;
+                    m.lists_requested += 1;
                     m.registry.note_list_sent();
                 }
             }
@@ -752,7 +768,7 @@ impl Runner {
                 "controls" => Value::Bool(lease.is_some_and(|l| l.controls(now))),
                 "input_enabled" => Value::Bool(lease.is_some_and(|l| l.input_enabled(now))),
                 "deadline_ms" => lease
-                    .and_then(LeaseClient::deadline_ms)
+                    .and_then(|l| l.deadline_ms(now))
                     .map_or(Value::Null, Value::from),
                 "registry" => {
                     let mut want: Vec<String> = serde_json::from_value(expected.clone())
@@ -779,7 +795,7 @@ impl Runner {
                 }
                 "runtime_epoch" => m.registry.runtime_epoch().map_or(Value::Null, Value::from),
                 "seq" => m.registry.seq().map_or(Value::Null, Value::from),
-                "sent_list" => Value::Bool(m.lists_sent > 0),
+                "sent_list" => Value::Bool(m.lists_requested > 0),
                 other => return Err(format!("unknown assert_client key {other:?}")),
             };
             same(expected, Some(&got), key)?;
@@ -905,6 +921,26 @@ mod tests {
         let mut f = fixture("runtime-epoch-and-sequence-ordering");
         f["setup"]["clients"][0]["upgraded"] = json!(true);
         assert!(run_scenario(&f, None).is_err(), "upgraded is gone (r6)");
+        // A client scenario can't start holding a lease.
+        let mut f = fixture("runtime-epoch-and-sequence-ordering");
+        f["setup"]["clients"][0]["holds_lease_epoch"] = json!(1);
+        assert!(run_scenario(&f, None).is_err());
+        // Requests must come from the client's own attachment.
+        let mut f = fixture("late-renew-reply-does-not-resurrect-control");
+        f["steps"][0]["json"]["data"]["binding"]["attachment_gen"] =
+            json!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        assert!(run_scenario(&f, None).is_err());
+    }
+
+    #[test]
+    fn sent_list_counts_only_lists_the_client_machine_requested() {
+        let list = json!({"type": "session", "data": {"v": 1, "op": "list",
+            "id": "11111111-1111-4111-8111-000000000001"}});
+        let steps = json!([{"send": "c1", "json": list}, {"assert_client": {"sent_list": false}}]);
+        assert_eq!(
+            run_scenario(&client_scenario(steps), None),
+            Ok(Outcome::Passed)
+        );
     }
 
     #[test]
@@ -948,6 +984,7 @@ mod tests {
                         family: "terminal".into(),
                         data: Some(exited),
                         binding: None,
+                        request: None,
                     }),
                 ));
             }
@@ -986,7 +1023,7 @@ mod tests {
             {"expect": "c1", "match": {"op": "error", "code": "${code}", "re": "11111111-1111-4111-8111-000000000001"}},
             {"local_input": "ses-aaaaaaaaaaaa", "bytes": "eA=="},
             {"restart_runtime": {"runtime_gen": "99999999-9999-4999-8999-999999999999", "runtime_epoch": 8}},
-            {"assert": {"events": 2, "now": 10, "receipts_visible": {"c2": 3}, "after": "label"}}
+            {"assert": {"events": 2, "now": 10, "receipts_visible": {"c2": 3}}}
         ]);
         let factory = |_: &Setup| -> Box<dyn HostUnderTest> {
             Box::new(EchoHost {
@@ -1001,6 +1038,7 @@ mod tests {
         for bad in [
             json!({"assert": {"events": 3}}),
             json!({"assert": {"nope": 1}}),
+            json!({"assert": {"after": "labels belong in note"}}),
             json!({"expect": "c1", "match": {"op": "lease"}}),
             json!({"expect_all": {"op": "error"}}),
         ] {
