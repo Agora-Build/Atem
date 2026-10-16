@@ -1,7 +1,10 @@
 # Atem runtime: one owner for every agent session and the Astation connection
 
-Status: proposed 2026-10-15 (decisions A–C agreed with the user); being
-built. **Superseded where it differs by the approved
+Status: **implemented on `feat/runtime`** (2026-10-16; plans
+`designs/plans/2026-10-16-runtime-host-integration.md` and its
+predecessors), not yet released. See "Implementation status" below for what
+was built and where it deviates from this text. Proposed 2026-10-15
+(decisions A–C agreed with the user). **Superseded where it differs by the approved
 [session-multiplexing.md](session-multiplexing.md)** (Astation + user,
 2026-10-15); see "Alignment with session-multiplexing.md" below, which is
 binding for Atem. It is phase 2 of [local-agent-runtime.md](local-agent-runtime.md)
@@ -60,6 +63,57 @@ below disagrees, this section wins.
    implements the parts that communicate. Atem builds the local parts (CLI
    workflow, runtime, workers, journal, host lease logic) against that
    contract as it lands.
+
+## Implementation status (feat/runtime, 2026-10-16)
+
+Built as the Alignment section says, not as the older text below where they
+differ:
+
+- **Broker and workers.** `atem runtime` is the broker; every session runs in
+  its own `atem worker` (agent PTY, canonical screen, Claude chat adapter,
+  session log) that survives the broker. A new broker adopts a surviving
+  worker only after its `hello` matches the record's session id and process
+  generation and the OS start time of its pid; otherwise the session is
+  `interrupted` or `recovery_required`. The "agents end with the runtime" and
+  "sessions do not survive a runtime restart" statements below no longer
+  hold.
+- **One writer authority.** The broker grants input epochs; the worker drops
+  a write whose epoch is older than its current one at the PTY write
+  boundary. Local input revokes any remote lease first.
+- **Session host.** The broker runs atem-session r6.2 (compatibility mode,
+  `designs/protocol/atem-session-v1.md`) over a `FileJournal` in
+  `<config>/runtime/journal/`; the runtime's one Astation link is one
+  attachment, new on every connect or re-authentication. Only a paired,
+  verified Astation gets one. Terminal-v1 and chat-v1 are bound to session-v1
+  (bindings and leases); `agentInput`, `agentPrompt`, voice, `userCommand`,
+  terminal-v1 `control`/`list`, provider-name terminal ids and the agent list
+  are removed with no compatibility (the "Astation-visible changes" section
+  below is replaced by `designs/protocol/atem-host-handoff.md`).
+- **Operations.** `atem pair`, `atem pair verify`, `atem cred unlock|projects`
+  and the paired-token refresh run in the broker on its link, as described
+  below; `atem unpair` and `atem logout` send `reload`.
+- **Session logs** are written by the worker when an agent that printed
+  something ends (`<config>/logs/<session_id>/session.ansi`, `summary.md`).
+
+Deviations from the text below:
+
+- Lifetime: the runtime exits after 10 minutes with no live sessions, no
+  launch in progress and no non-passive client; there is no separate
+  30-second rule for a runtime started only for an operation (the operation's
+  CLI stays connected while it runs).
+- `atem pair` on an already paired profile only prints the status (Alignment
+  item 2); re-pairing over a live connection ("`atem pair` cases" 1–3) does not
+  exist: `atem unpair`, then `atem pair`.
+- `atem cred status` is not an alias: `atem status` is the only status
+  command.
+- Remote viewers and controllers are not limited to "one viewer per session"
+  by the runtime; the limit is the one link (one attachment).
+- Shared fixtures (`tests/runtime_fixtures_binary.rs`): eight host fixtures
+  pass against the real runtime; `lease-expiry-at-the-deadline-needs-no-timer`
+  fails as a known deviation (a chunk admitted before the deadline but still
+  waiting at the worker's PTY writer is cut only when the host's 100 ms
+  `advance` raises the worker's epoch); four can't run against one link. See
+  `designs/protocol/atem-host-handoff.md`.
 
 ## Problem
 
@@ -133,7 +187,7 @@ atem pair / cred / list  ─┘  (same user)    └─ one authenticated Astatio
   or use the atem that started them".
 - The runtime owns what `App` owns today for Astation and agents: the Astation
   connection (local or relay, re-authentication, credential sync, encryption
-  messages), the agent registry and agent list, every session's PTY, canonical
+  messages), the session registry (session-v1), every session's PTY (in its worker), canonical
   screen and terminal-v1 sharing, the chat-v1 adapters and sessions, mark
   tasks, voice requests and `AgentInput`/`AgentPrompt` routing (removed in atem-session r6; see designs/protocol/atem-session-v1.md: voice requests, `AgentInput`/`AgentPrompt`). It uses the key
   agent for keys exactly as `App` does now. Its own paired-token refresh uses
@@ -142,9 +196,9 @@ atem pair / cred / list  ─┘  (same user)    └─ one authenticated Astatio
   Astation), as `atem agent launch` works without Astation today.
 - Each session's tasks and each client's handler run isolated: a panic ends
   that session or client (recorded in `runtime.log` with the cause), not the
-  runtime. If the runtime itself exits or crashes, its agent processes end with
-  it (they are its PTY children); frontends say so. Sessions do not survive a
-  runtime restart or reboot.
+  runtime. If the runtime itself exits or crashes, its workers and their
+  agents keep running and the next runtime adopts them (see "Implementation
+  status"); a reboot ends them.
 
 ### Sessions
 
@@ -273,24 +327,12 @@ HTTP-only commands (`atem sync`, `memory`, `skill`, `vault`) are unchanged.
 
 ### Astation-visible changes
 
-- Agent list: one entry per session (`id` = `session_id`, `name` = provider,
-  `kind`, status, `capabilities`); several Claude/Codex entries can exist.
-- Status: the terminal-v1 `sessions`/aliases/`terminal_ids` and the `AgentInput`/`AgentPrompt`/voice routing below are removed in atem-session r6; see designs/protocol/atem-session-v1.md.
-- terminal-v1: `sessions` lists every session with `terminal_id` = session id
-  and `provider`. For older Astation builds, `claude` and `codex` stay valid
-  aliases for the most recently used live session of that provider. A new
-  `sessions` field `terminal_ids: "session"` tells a newer Astation to address
-  sessions by id. To confirm with Astation.
-- chat-v1: unchanged (`agentId` = session id).
-- `AgentInput`, `AgentPrompt` and voice route by `agent_id` when given. Without
-  one (older Astation) they go to the most recently used live Claude session,
-  subject to chat-v1's draft check; with none they fail with a message. Atem no
-  longer starts a Claude session on its own for them.
-- Mark tasks go to a live Claude session whose working directory contains
-  `.chisel/tasks/<task_id>.json`; with none, the task fails with "no Claude
-  session for this project; run `atem agent launch claude` there".
-- The relay is unchanged. Astation is asked separately to close a replaced
-  socket with a reason (code 4001).
+Replaced by atem-session r6.2: the complete list of wire-visible changes, and
+how to run the host, are in
+[protocol/atem-host-handoff.md](protocol/atem-host-handoff.md). Mark tasks go
+to a live Claude session whose working directory contains
+`.chisel/tasks/<task_id>.json`; with none, the task fails with "no Claude
+session for this project; run `atem agent launch claude` there".
 
 ## Failure handling
 
@@ -299,7 +341,7 @@ HTTP-only commands (`atem sync`, `memory`, `skill`, `vault`) are unchanged.
 | Frontend closed or crashed | Session keeps running; `atem agent attach` reopens it |
 | Agent process exits | Session shows exited (final screen kept 10 min); Astation gets `exited`, chat gets `unknown` |
 | Session or client handler panics | That session or client ends; cause in `runtime.log`; others continue |
-| Runtime crashes | Its agents end; frontends report it; the next command starts a new runtime |
+| Runtime crashes | Workers and agents keep running; frontends report it; the next command starts a new runtime, which adopts them (receipts executing at the crash become `outcome_unknown`) |
 | Astation disconnects / re-authenticates | Sessions unaffected; the runtime reconnects as `App` does today |
 | Connection replaced by another process (an older Atem binary) | Close code 4001, or two closes without a reason within 5 s of authenticating: notice naming the cause and no reconnect for 60 s, then backoff up to 10 min |
 | Connection lost during an Astation operation | Operation fails, no replay; sessions reconnect |
@@ -328,11 +370,15 @@ every atem on a machine together.
 Atem side:
 
 - Unit: session ids, registry, protocol encode/decode and limits, version
-  check, backpressure, routing by `agent_id` and the legacy fallback, mark-task
-  routing by working directory, operation serialization and reply routing.
-- In-process with two fake agents and a fake Astation: both in the agent
-  list; terminal-v1 subscribe by id and by the `claude` alias; chat on the
-  Claude one; stop one while the other runs.
+  check, backpressure, mark-task routing by working directory, operation
+  serialization and reply routing.
+- In-process with fake agents and a fake Astation (`runtime/*_tests.rs`):
+  session-v1 registry, leases and receipts; terminal-v1 subscribe by session
+  id; chat on the Claude one; stop one while the other runs; broker restart
+  with adopted workers.
+- The shared atem-session host fixtures against the real binaries
+  (`tests/runtime_fixtures_binary.rs`; results in
+  `protocol/atem-host-handoff.md`).
 - Pairing and unlock (fake Astation, a session attached throughout):
   verification completes on the runtime's connection and the session's
   terminal and chat are still attached and unchanged afterwards; Touch ID
@@ -358,8 +404,11 @@ and controllable in Astation throughout, verification approved with Touch ID.
 
 ## Delivery
 
-Three PRs merged in order and released together (step 1 alone would leave a
-long-lived runtime racing a direct `atem pair`):
+Planned as three PRs released together (step 1 alone would leave a
+long-lived runtime racing a direct `atem pair`). Built instead on one branch,
+`feat/runtime`, by the plans in `designs/plans/2026-10-16-*`; the
+aliases, `agent_id` routing and agent list in step 1 were dropped (atem-session
+r6, no compatibility):
 
 1. **Runtime and sessions.** `atem runtime`, local protocol, `launch` /
    `attach` / `list` / `stop`, several sessions, agent list and terminal-v1 by
@@ -377,6 +426,6 @@ long-lived runtime racing a direct `atem pair`):
 
 ## Out of scope
 
-Sessions surviving a runtime restart or reboot; a system service; a GPUI
+Sessions surviving a reboot; a system service; a GPUI
 desktop frontend; attaching to agent processes Atem did not start; several
 runtimes per profile; session names.

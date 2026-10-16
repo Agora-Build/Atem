@@ -6,16 +6,16 @@
 //! on the host through `fake_runtime`).
 //!
 //! Pure logic apart from `file_journal` (the journal on disk): nothing here
-//! touches sockets or PTYs; the runtime performs the host's effects (a later
-//! plan wires it in).
+//! touches sockets or PTYs; `atem runtime` performs the host's effects
+//! (src/runtime/host_bridge.rs), and tests/runtime_fixtures_binary.rs runs
+//! the host fixtures against it.
 //!
 //! Unknown fields are ignored (§1), but they still go through the strict
 //! parser: an unsafe integer (beyond ±(2^53−1)) or a float that overflows f64
 //! inside an unknown field rejects the whole message, as do duplicate keys or
 //! lone surrogates anywhere in it.
 
-// Not wired into the runtime yet (a later plan does that); until then only the
-// tests use most of this module.
+// Parts are used only by tests (the client machines, journal helpers).
 #[allow(dead_code)]
 pub mod canonical;
 #[allow(dead_code)]

@@ -71,7 +71,7 @@ the credentials keep working when Astation disconnects; without it they stop
 Once paired, `atem pair` only prints the status (`Already paired. Verify this
 device: atem pair verify · Replace the pairing: atem unpair, then atem pair`):
 it never pairs again or changes keys, trust or sessions. `atem pair verify`
-verifies the existing pairing over its saved session, does nothing when the
+verifies the existing pairing on the runtime's Astation link, does nothing when the
 device is already verified, and refuses after a revocation (run `atem unpair`,
 which sets the revoked keys aside, then `atem pair`). `atem status` reads only
 local files and an already running key agent; it never connects, so
@@ -142,17 +142,33 @@ atem agent launch codex                 # Open the original Codex CLI in an Atem
 atem agent launch claude --continue     # Arguments after the agent type go to that CLI: continue the last Claude session
 atem agent launch codex resume --last   # Continue the last Codex session
 atem agent launch claude -- --help      # Use -- to read the agent's own help
+atem agent list                         # The sessions the background runtime holds
+atem agent attach ses-…                 # Reopen a session (screen restored)
+atem agent stop ses-…                   # Stop a session
 ```
 
 `atem agent launch [claude|claude-code|codex] [ARGS]...` runs the installed
 `claude` or `codex` CLI, unchanged, in a full-screen Atem terminal. It uses
 your working directory and your own login for that CLI. Nothing here replaces
-the CLI with an API conversation. It works without Astation. If you are
-paired, Astation can view the same session (one viewer per session).
-Remote typing, resizing and stopping are refused for now: they will come back
-through Atem's session protocol (atem-session v1), not the older `agentInput`,
-`agentPrompt`, voice or `userCommand` messages, which were removed. Quitting
-Atem ends the session.
+the CLI with an API conversation. It works without Astation.
+
+Sessions belong to a background `atem runtime` (started on demand, one per
+profile; it exits after 10 minutes with no sessions and no frontends), and each agent runs in its own `atem
+worker` process. Closing the terminal window or hiding it (prefix, then `h`)
+leaves the session running; `atem agent attach` reopens it. Several Claude
+and Codex sessions can run at once, and they keep running if the runtime
+itself restarts. The runtime also holds this machine's one Astation
+connection: `atem pair`, `atem pair verify`, `atem cred unlock` and `atem cred
+projects` run on it (they start the runtime if needed) and never open their
+own, so pairing never disconnects a running session. When an agent that
+printed something ends, its last output and a short summary are saved under
+`~/.config/atem/logs/<session id>/`.
+
+If you are paired and verified, Astation can view each session, take control
+of it (one controller at a time, on a lease Astation keeps renewing; typing
+locally takes control back at once), and send prompts to Claude from its chat view.
+Every remote request names the exact session; old `agentInput`,
+`agentPrompt`, voice and `userCommand` messages were removed.
 
 Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
 
@@ -170,17 +186,12 @@ The bottom row reads, for example,
 `Atem | Claude | Local | Astation ✓ | Notice | Ctrl+] then ?:help`:
 
 - `Claude` or `Codex` is the agent on screen.
-- `Local` means your keyboard drives the agent; `Remote` means a remote
-  controller holds input and local typing is refused until you press the
-  prefix, then `g` (no remote controller exists yet).
-- `Astation ✓` means an authenticated Astation link; `Astation ✗` means none
-  (not paired, Astation unreachable, or re-authenticating). When Astation
-  challenges an open connection again (for example after it alone reconnected
-  to the relay), Atem briefly shows `Astation ✗`, drops remote viewers and
-  answers with the saved session; it shows `✓` again once Astation
-  accepts. If Astation refuses or doesn't answer within 15 seconds, Atem
-  records a notice and reconnects with the saved session (a refused session
-  needs `atem pair`). Remote viewers subscribe again afterwards, view only.
+- `Local` means your keyboard drives the agent; `Remote` means Astation holds
+  control. Typing takes it back (prefix, then `g`, does it without typing).
+- `Astation ✓` means the runtime's Astation link is authenticated; `Astation
+  ✗` means none (not paired, Astation unreachable, or re-authenticating).
+  Every reconnect or re-authentication is a new remote attachment: Astation
+  views again and asks for control again.
 - `Notice` appears once Atem has recorded a warning or status message. Press
   the prefix, then `?`, to read the recent notices (newest first).
 
@@ -189,15 +200,16 @@ Press the prefix twice to send it to the agent. To change it, set
 `ATEM_TERMINAL_PREFIX` (which wins over the file). Ctrl+], Ctrl+\ or
 Ctrl+<letter> other than i or m are accepted. The `CLAUDE_CLI_BIN`/`CLAUDE_CLI_ARGS`
 and `CODEX_CLI_BIN`/`CODEX_CLI_ARGS` variables still override the command.
-See [`designs/terminal-v1-implementation.md`](designs/terminal-v1-implementation.md).
+See [`designs/agent-runtime.md`](designs/agent-runtime.md).
 
 **Chat from Astation.** Astation can open a chat view of a Claude session
 launched with `atem agent launch claude`: your prompts appear as messages and
 Claude's replies come from its own session log, with a status of ready,
 working, waiting or unknown. Atem adds its hooks with `--settings` for that run
-only; your `~/.claude` settings are not changed. Sending prompts from chat is
-refused for now (it will return through atem-session v1), and approvals stay
-in the terminal. Codex has no chat yet (its status is unknown). See
+only; your `~/.claude` settings are not changed. A prompt sent from chat needs
+control of the session, is typed into Claude once, and is reported as
+accepted, then complete (or failed) when Claude's turn ends. Approvals stay in
+the terminal. Codex has no chat yet (its status is unknown). See
 [`designs/agent-chat-host.md`](designs/agent-chat-host.md).
 
 ### Vault (shared cross-agent context)
@@ -413,8 +425,7 @@ are documented in [`designs/session-auth.md`](designs/session-auth.md).
 |------|-------------|
 | **Token Gen** | Generate Agora RTC/RTM tokens locally |
 | **Projects** | Browse and select Agora projects |
-| **Claude Chat** | Claude Code integration via PTY |
-| **Codex Chat** | Codex terminal integration via PTY |
+| **Agent Sessions** | The runtime's Claude/Codex sessions: launch or attach |
 
 Astation integration is in progress — see [ROADMAP.md](ROADMAP.md).
 
