@@ -135,6 +135,70 @@ Astation).
 3. **Browser QR grants:** a native device signs `{browser key, target, scope,
    expiry ≤ 1 h}`; the browser proves its key on connect; same checks.
 
+## 6a. Approvals in chat and on mobile (step 1b)
+
+The lease holder may answer the agent's permission prompts from the chat view or
+a phone. Both agents can take an external allow/deny without simulating keys:
+
+| | Claude Code ([hooks](https://code.claude.com/docs/en/hooks)) | Codex ([hooks](https://developers.openai.com/codex/hooks)) |
+|---|---|---|
+| Hook | `PermissionRequest` — runs only when a permission dialog would appear | `PermissionRequest` — runs only when an approval would be asked |
+| Input | `session_id`, `tool_name`, `tool_input`, `permission_suggestions` | `turn_id`, `tool_name`, `tool_input` |
+| Answer | `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}` or `deny` + `message` | same shape |
+| No answer | normal terminal dialog appears | normal prompt appears |
+| Setup | per launch via `--settings` (as chat does) | `~/.codex/hooks.json`, trusted once in Codex (`/hooks`) |
+
+Flow:
+
+1. The hook writes the request (tool, summary) as one event file in the
+   session's private directory, like the other chat hooks, then waits for a
+   decision file.
+2. The worker reports it; the runtime announces
+   `approval_request{approval_id, session_id, process_gen, tool, summary,
+   created_at}` to attached viewers; chat shows an **approval card** (tool,
+   command or file, reason) with Allow / Deny, and a mobile app can raise it as
+   a lock-screen notification.
+3. **No remote controller** → the runtime answers "no decision" at once and the
+   normal dialog appears in the terminal.
+4. **Remote controller** → it answers with a §6 submission `kind:"approval"`,
+   payload `{approval_id, decision: allow|deny}`, under its current lease epoch;
+   the runtime checks that this prompt is still pending for that exact
+   session/process, writes the decision file, records the receipt (which device,
+   which lease, which prompt), and the hook returns the decision.
+5. **Local keyboard input while waiting** → local input wins: the remote lease is
+   revoked, the hook gets "no decision", the dialog appears.
+6. **No answer within the hook's window** → no decision, dialog appears. Never
+   auto-allow.
+
+Changes to earlier rules: chat's "no approvals from chat" becomes "approvals by
+the lease holder, bound to the exact prompt"; "hooks never decide" gains one
+exception — the `PermissionRequest` hook may return a decision it received from
+the runtime. To verify on the installed Claude Code before building: the hook's
+default timeout and that `--settings` hooks fire for this event.
+
+## 6b. Comparison with Codex Remote (ChatGPT mobile)
+
+OpenAI's Remote lets a phone continue Codex chats, answer questions and approve
+commands on a Mac/Windows host through OpenAI's relay
+([announcement](https://openai.com/index/work-with-codex-from-anywhere/),
+[architecture overview](https://codex.danielvaughan.com/2026/05/15/codex-mobile-chatgpt-app-relay-architecture-remote-agent-control/),
+[pairing RPCs](https://codex.danielvaughan.com/2026/06/06/codex-cli-remote-control-mobile-pairing-app-server-v2-remodex/),
+[app-server](https://developers.openai.com/codex/app-server/)).
+
+| | Codex Remote | Atem + Astation |
+|---|---|---|
+| Agent session | `codex app-server`; an already running terminal session isn't shared live | the original terminal session stays live; chat comes from the agent's hooks and transcript |
+| Phone view | structured thread items (messages, tool steps, diffs, approvals) | chat-v1 messages + terminal view |
+| Approvals | `item/…/requestApproval` → accept / acceptForSession / decline / cancel | `PermissionRequest` hook → `approval_request` → lease-bound `approval` |
+| Trust | QR pairing per phone per host + account MFA; list/revoke controllers per host | pair Atem once; add each device to the account once; Settings → Devices |
+| Control | multi-device / local-terminal arbitration not documented | many viewers, one lease holder, local input wins |
+| Relay | OpenAI relay; E2EE documented only by a third-party bridge | our relay; E2EE in step 2 (ephemeral X25519 + signed transcript) |
+
+Borrowed: approval cards with push; recording the approval's source (our
+receipts); a revocable controller list (Settings → Devices); the handshake shape
+for step 2. Not borrowed: per-host pairing of every phone, and replacing the
+terminal session with an app-server conversation.
+
 ## 7. Decisions (user, 2026-10-16)
 
 1. **Who can add devices:** only devices marked "can manage devices" (role
