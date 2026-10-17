@@ -64,6 +64,7 @@
 //! trust (`confirm_approval_rules`; the worker drops the rest, and allows by
 //! none until then), and a rebind or trust change drops them all.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
+use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
 use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome, HeldRule, RuleGrant};
 use crate::app::App;
@@ -389,6 +390,11 @@ pub struct HostBridge {
     revokes: HashMap<String, (String, String)>,
     /// Push requests for the relay (`push_queue`).
     pushes: super::push_queue::PushQueue,
+    /// runtime.log lines for refused requests, rate-limited per link.
+    refusal_log: RefusalLog,
+    /// The request being handled (its link and what a refusal line says
+    /// about it): error replies while it is set are logged.
+    refusing: Option<(u64, Request, Option<String>)>,
 }
 
 /// Where effects go: the link's client and the broker's sessions.
@@ -437,6 +443,8 @@ impl HostBridge {
             approvals: HashMap::new(),
             revokes: HashMap::new(),
             pushes: Default::default(),
+            refusal_log: RefusalLog::default(),
+            refusing: None,
         })
     }
 
@@ -593,6 +601,7 @@ impl HostBridge {
             }
         }
         self.worker_reports(&mut cx);
+        self.app_refusals(&mut app.hosted);
         let now = self.clock.now();
         if now >= self.last_advance + ADVANCE_EVERY {
             self.last_advance = now;
@@ -804,6 +813,10 @@ impl HostBridge {
                 let _ = cx.client.try_send_wire(unauthorized(re), false);
                 if hello.is_some() {
                     log_handshake("refused unauthorized (no attachment on this link)");
+                } else {
+                    let request = Request::of(&decoded, text);
+                    let line = refusal_log::line(&request, "unauthorized", Some("no attachment"));
+                    self.log_refusal(link_gen, line);
                 }
             }
             return;
@@ -820,11 +833,46 @@ impl HostBridge {
                 return;
             }
         }
+        // `hello` outcomes have their own line (`log_hello`).
+        if hello.is_none() {
+            let reason = decoded.as_ref().err().map(refusal_log::decode_reason);
+            self.refusing = Some((link_gen, Request::of(&decoded, text), reason));
+        }
         let effects = self.host.receive_decoded(&attachment, decoded, now);
         if let Some(id) = &hello {
             log_hello(id, &effects);
         }
         self.exec(effects, cx);
+        self.refusing = None;
+    }
+
+    /// Writes `line` unless the link's refusal lines are suppressed.
+    fn log_refusal(&mut self, link_gen: u64, line: String) {
+        let now = self.clock.now();
+        refusal_log::write(self.refusal_log.record(link_gen, now, line));
+    }
+
+    /// An error reply (`code`) to the request being handled: logged once
+    /// per reply, never with its content.
+    fn refused(&mut self, code: &str) {
+        let Some((link_gen, request, reason)) = self.refusing.clone() else {
+            return;
+        };
+        let line = refusal_log::line(&request, code, reason.as_deref());
+        self.log_refusal(link_gen, line);
+    }
+
+    /// Refusals the App answered itself (oversize, a full inbox).
+    fn app_refusals(&mut self, hosted: &mut Option<crate::app::hosted::Hosted>) {
+        let refused = hosted
+            .as_mut()
+            .map(|h| std::mem::take(&mut h.refused))
+            .unwrap_or_default();
+        for (link_gen, line) in refused {
+            self.log_refusal(link_gen, line);
+        }
+        let now = self.clock.now();
+        refusal_log::write(self.refusal_log.flush(now));
     }
 
     /// The same session message (attachment, `id`, content) was handled
@@ -859,6 +907,11 @@ impl HostBridge {
         if !self.current(attachment) {
             return;
         }
+        if self.refusing.is_some()
+            && let Some(code) = error_code(message)
+        {
+            self.refused(&code);
+        }
         let text = String::from_utf8(wire::encode(message)).expect("wire JSON is UTF-8");
         let terminal = matches!(message, Envelope::Family(f) if f.family == "terminal");
         if terminal {
@@ -879,7 +932,12 @@ impl HostBridge {
         }
     }
 
-    fn send_chat(&self, env: ChatEnvelope, cx: &mut Cx) {
+    fn send_chat(&mut self, env: ChatEnvelope, cx: &mut Cx) {
+        if env.op == "error"
+            && let Some(code) = env.body.get("code").and_then(Value::as_str)
+        {
+            self.refused(code);
+        }
         let text = serde_json::to_string(&AstationMessage::AgentChat(env))
             .expect("chat envelopes serialize");
         let _ = cx.client.try_send_wire(text, false);
@@ -2022,6 +2080,7 @@ impl HostBridge {
         message: &str,
         cx: &mut Cx,
     ) {
+        self.refused(code);
         let mut data = json!({
             "v": 1, "op": "error", "terminal_id": sid, "code": code, "message": message,
         });
@@ -2657,6 +2716,26 @@ pub(super) fn rule_revoked_line(sid: &str, rule_id: &str, ok: bool) -> String {
         format!("atem runtime: {sid}: session rule {rule_id} revoked")
     } else {
         format!("atem runtime: {sid}: session rule {rule_id} not revoked (no longer active)")
+    }
+}
+
+/// The code of an error reply: a session `error`, a terminal-v1 `error`, or
+/// a `rejected` receipt.
+fn error_code(message: &Envelope) -> Option<String> {
+    use crate::session_protocol::wire::{Op, ReceiptState};
+    match message {
+        Envelope::Session(m) => match &m.op {
+            Op::Error { code, .. } => serde_json::to_value(code)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string)),
+            Op::Receipt(r) if r.state == ReceiptState::Rejected => Some("rejected".into()),
+            _ => None,
+        },
+        Envelope::Family(f) if f.family == "terminal" => {
+            let data = f.data.as_ref()?;
+            (data["op"] == "error").then(|| data["code"].as_str().unwrap_or("?").to_string())
+        }
+        Envelope::Family(_) => None,
     }
 }
 

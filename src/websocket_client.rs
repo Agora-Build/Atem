@@ -141,7 +141,7 @@ pub enum AstationMessage {
     /// (not kept): answered with an `error` (`re` = its session `id`, when
     /// it had a readable one).
     #[serde(skip)]
-    SessionOversize { id: Option<String> },
+    SessionOversize { id: Option<String>, family: String },
 
     /// An op removed in atem-session r6 (`REMOVED_OPS`): answered with an
     /// `error` `unsupported_version` and no effect.
@@ -903,7 +903,7 @@ impl AstationClient {
                     Ok(Message::Text(text)) => {
                         let astation_msg = match session_family(&text) {
                             Some(family) if text.len() > if family == "terminal" { 32 * 1024 } else { crate::session_protocol::wire::MAX_MESSAGE_BYTES } => {
-                                Some(AstationMessage::SessionOversize { id: session_message_id(&text) })
+                                Some(AstationMessage::SessionOversize { id: session_message_id(&text), family: family.to_string() })
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
                             None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),

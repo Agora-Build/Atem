@@ -8,6 +8,7 @@
 //! The TUI without a runtime (bare `atem`) opens no Astation connection at
 //! all, so it never sees a session-family message.
 use super::App;
+use crate::runtime::refusal_log;
 use crate::session::{Provider, SessionId};
 use crate::session_protocol::wire::{self, Envelope, ErrorCode, Op, SessionMessage};
 use std::collections::VecDeque;
@@ -38,6 +39,9 @@ pub struct Hosted {
     pub sessions: Vec<HostedSession>,
     /// Mark-task prompts to write: (task id, session, text).
     pub writes: Vec<(String, SessionId, String)>,
+    /// Refusals answered here (oversize, a full inbox): (link generation,
+    /// runtime.log line), written by the broker under its rate limit.
+    pub refused: Vec<(u64, String)>,
 }
 
 impl Hosted {
@@ -77,13 +81,35 @@ impl App {
             hosted.inbox.push_back((link, text));
             return;
         }
-        let re = match wire::decode(text.as_bytes()) {
+        let decoded = wire::decode(text.as_bytes());
+        let request = refusal_log::Request::of(&decoded, &text);
+        let line = refusal_log::line(&request, "busy", Some("inbox full"));
+        if hosted.refused.len() < INBOX_LIMIT {
+            hosted.refused.push((link, line));
+        }
+        let re = match decoded {
             Ok(Envelope::Session(m)) => Some(m.id),
             Ok(Envelope::Family(_)) => None,
             Err(e) => e.id,
         };
         // The host's inbox is full: `busy` (the client may retry).
         self.session_refusal(re, ErrorCode::Busy, None);
+    }
+
+    /// A session-family message over the size bound: dropped unread and
+    /// refused (`unsupported_version`), with a runtime.log line.
+    pub(super) fn session_oversize(&mut self, id: Option<String>, family: &str) {
+        if self.astation_connected && !self.astation_client.is_ws_closed() {
+            let link = self.astation_link_gen;
+            if let Some(hosted) = self.hosted.as_mut()
+                && hosted.refused.len() < INBOX_LIMIT
+            {
+                let request = refusal_log::Request::family_only(family);
+                let line = refusal_log::line(&request, "unsupported_version", Some("oversize"));
+                hosted.refused.push((link, line));
+            }
+        }
+        self.session_refusal(id, ErrorCode::UnsupportedVersion, None);
     }
 
     /// A session `error` with `code` (answering `re`) on an authenticated link.
