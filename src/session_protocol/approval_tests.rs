@@ -1363,3 +1363,35 @@ fn a_rule_revoked_from_chat_completes_in_chat() {
         ReceiptKind::ApprovalRuleRevoke
     );
 }
+
+#[test]
+fn a_trust_change_or_restart_clears_the_session_rules() {
+    let mut rt = setup();
+    list_and_hold(&mut rt, "c1");
+    let fx = rt
+        .host
+        .set_approval_rules(S1, P1, vec![session_rule("s-1")])
+        .unwrap();
+    rt.apply(fx);
+    got(&mut rt, "c1");
+    // A new trust generation: the copy goes and viewers see it empty (the
+    // runtime has its workers drop theirs).
+    let fx = rt.host.change_trust_gen(2).unwrap();
+    rt.apply(fx);
+    let c1 = got(&mut rt, "c1");
+    let empty = c1.iter().find(|m| m["op"] == "approval_rules").unwrap();
+    assert_eq!(empty["rules"], json!([]));
+    assert!(rt.host.approval_rules(S1).is_empty());
+    // A restart (or rebind) loses the copy too; the workers report again.
+    let fx = rt
+        .host
+        .set_approval_rules(S1, P1, vec![session_rule("s-2")])
+        .unwrap();
+    rt.apply(fx);
+    let fx = rt
+        .host
+        .restart("66666666-6666-4666-8666-666666666666", 8)
+        .unwrap();
+    rt.apply(fx);
+    assert!(rt.host.approval_rules(S1).is_empty());
+}

@@ -1066,6 +1066,7 @@ mod tests {
             always_rules: vec![],
             state,
             rule_id: None,
+            note: None,
         };
         let Out::Message(first) = s.approval_card(card(ApprovalCardState::Pending), 5) else {
             panic!()

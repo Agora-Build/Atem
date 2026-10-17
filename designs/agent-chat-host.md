@@ -50,19 +50,24 @@ no `chat-v1` capability.
   `expires_at`, and a tap gets `stale_target` ("already answered").
 - **Atem session rules for Codex** (since 2026-10-17, contract §6a r7.2).
   Codex's hook can't take a persistent rule, so a Codex card offers one
-  Atem rule instead: "Always allow `<command>` in <cwd> for this session"
-  (`scope: "session"`). Answering `allow_always` with it allows this request
+  Atem rule instead, for a shell command only: "Always allow `<command>` in
+  <cwd> for this session" (`scope: "session"`; no rule for file changes or
+  for a command whose input carries anything besides `command` and
+  `description`; `cwd` is the hook's session cwd). Answering `allow_always` with it allows this request
   and makes the worker keep the rule for the rest of this agent process (at
   most 32; a respawn starts with none; a broker restart keeps them). A later
   request of the session's own pinned Codex with byte-equal tool, full
-  command (file changes: kinds and paths) and cwd is allowed by the worker
+  command and cwd is allowed by the worker
   without a card: an `auto_allowed` card naming `rule_id` appears in the
   conversation, runtime.log gets one line without the command, nothing is
   pushed and no lease is taken. A nested `codex`, another cwd or any other
   command still asks. The active rules are listed in `opened.approvalRules`
   and re-sent with `rules` when they change; a `submit` with
   `approval_rule_revoke: {rule_id}` instead of `text` revokes one (lease
-  required). Claude's rules are unchanged.
+  required; an allow it wrote that Codex hasn't taken yet is withdrawn). A
+  rule the session can't keep when Codex takes the answer (32 already) is
+  not kept: the card ends `allowed` with a `note`. A new account, device or
+  trust generation drops every rule. Claude's rules are unchanged.
 - **Never merge with a local draft.** A chat prompt is refused when anyone
   typed into the terminal since Claude's last turn ended.
 - **Never resend.** A prompt whose delivery is unknown is reported, not retried.
@@ -303,7 +308,8 @@ message {
              always_rules: [{rule_id, label, scope}],
              state: pending|allowed|always_allowed|denied|answered_terminal|expired|closed
                     |auto_allowed,
-             rule_id? } ],   // auto_allowed: the Atem session rule that allowed it
+             rule_id?,       // auto_allowed: the Atem session rule that allowed it
+             note? } ],      // e.g. an allow_always whose rule wasn't kept
   history?: true      // backfill on open / page
 }
 delta { messageId, part: { id, kind, … } }   // append one part; a part id

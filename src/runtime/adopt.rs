@@ -316,6 +316,16 @@ impl WorkerHandle {
         })
     }
 
+    /// Drops every session rule of the session.
+    pub fn revoke_all_approval_rules(&self) -> Result<()> {
+        self.send(&BrokerMsg::RevokeAllApprovalRules)
+    }
+
+    /// Asks for the session's current rules (`approval_rules`).
+    pub fn request_approval_rules(&self) -> Result<()> {
+        self.send(&BrokerMsg::RequestApprovalRules)
+    }
+
     /// The worker's next message; `None` once its connection closed.
     #[cfg(test)]
     pub async fn recv(&mut self) -> Option<WorkerMsg> {

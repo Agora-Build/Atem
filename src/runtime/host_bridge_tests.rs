@@ -2934,3 +2934,170 @@ fn the_auto_allowed_log_line_names_the_rule_never_the_command() {
         "atem runtime: ses-aaaaaaaaaaaa: Bash allowed by session rule s-0123456789abcdef"
     );
 }
+
+/// The worker's next session-rules report (`approval_rules`), skipping
+/// other approval events.
+async fn next_rules(
+    sessions: &mut std::collections::BTreeMap<
+        crate::session::SessionId,
+        crate::runtime::broker::BrokerSession,
+    >,
+) -> Vec<crate::session_protocol::wire::AlwaysRule> {
+    use crate::runtime::worker_approvals::Event;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            for session in sessions.values_mut() {
+                session.pump();
+                for event in session.take_approvals() {
+                    if let Event::Rules(rules) = event {
+                        return rules;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no approval_rules")
+}
+
+/// Has the worker of the only session keep a session rule for `command`
+/// (a Codex card answered `allow_always`, the `n`th tool call).
+async fn keep_a_rule(
+    sessions: &mut std::collections::BTreeMap<
+        crate::session::SessionId,
+        crate::runtime::broker::BrokerSession,
+    >,
+    fake: &Path,
+    n: u32,
+    command: &str,
+) -> String {
+    use crate::runtime::worker_approvals::Event;
+    ask(
+        fake,
+        n,
+        json!({"tool_name": "Bash", "cwd": "/p", "tool_input": {"command": command}}),
+    );
+    let session = sessions.values_mut().next().unwrap();
+    let (worker_id, rule_id) = tokio::time::timeout(WAIT, async {
+        loop {
+            session.pump();
+            for event in session.take_approvals() {
+                if let Event::Request { request_id, info } = event {
+                    return (request_id, info.always_rules[0].rule_id.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no approval request");
+    session
+        .approval_decision(
+            &worker_id,
+            crate::session_protocol::wire::ApprovalDecision::AllowAlways,
+            Some(rule_id.clone()),
+            None,
+        )
+        .unwrap();
+    agent_event(fake, &format!("answer {n} allow ")).await;
+    let rules = next_rules(sessions).await;
+    assert!(rules.iter().any(|r| r.rule_id == rule_id), "{rules:?}");
+    rule_id
+}
+
+/// Session rules across host rebinds: under the same identity and trust
+/// the workers send theirs again; a new account/device or a new trust
+/// generation makes every worker drop them all.
+#[tokio::test]
+async fn host_rebinds_reload_or_drop_the_workers_session_rules() {
+    use crate::runtime::adopt::SpawnRequest;
+    let dir = short_dir();
+    let fake = dir.path().join("fake");
+    let launcher = Launcher::InProcess(InProcess {
+        state: dir.path().join("state"),
+        socket_dir: dir.path().join("ws"),
+        chat_root: dir.path().join("chat"),
+    });
+    let request = SpawnRequest {
+        session_id: crate::session::SessionId::new(),
+        process_gen: uuid::Uuid::new_v4().to_string(),
+        provider: crate::session::Provider::Codex,
+        args: vec![],
+        cwd: dir.path().to_path_buf(),
+        rows: 24,
+        cols: 80,
+    };
+    let hook = crate::chat::codex::hook_command(&dir.path().join("chat/approval-hook.sh"));
+    let env = LaunchEnv(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        (
+            "CODEX_CLI_BIN".into(),
+            approval_agent().display().to_string(),
+        ),
+        ("FAKE_DIR".into(), fake.display().to_string()),
+        ("FAKE_CODEX_HOOK".into(), hook),
+    ]);
+    let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
+    let session = crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
+    agent_event(&fake, "started").await;
+    let mut sessions = std::collections::BTreeMap::new();
+    sessions.insert(session.id.clone(), session);
+    let rule_id = keep_a_rule(&mut sessions, &fake, 1, "npm test").await;
+
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    let client = AstationClient::new();
+    // The same identity and trust (the host lost only its copy): the
+    // workers send theirs again.
+    let same = bridge.host.context().clone();
+    {
+        let mut cx = super::Cx {
+            client: &client,
+            sessions: &mut sessions,
+        };
+        bridge.rules_after_rebind(&same, &mut cx);
+    }
+    let again = next_rules(&mut sessions).await;
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].rule_id, rule_id);
+
+    // Another account and device: every rule dropped.
+    let other = super::Identity {
+        account_id: "account-b".into(),
+        atem_device_id: "device-b".into(),
+        host_trust_gen: 1,
+    };
+    {
+        let mut cx = super::Cx {
+            client: &client,
+            sessions: &mut sessions,
+        };
+        assert!(bridge.adopt_identity(&other, &mut cx));
+    }
+    assert!(next_rules(&mut sessions).await.is_empty());
+    assert!(
+        bridge
+            .host
+            .approval_rules(request.session_id.as_str())
+            .is_empty()
+    );
+
+    // A new trust generation under that identity: dropped as well.
+    keep_a_rule(&mut sessions, &fake, 2, "make").await;
+    let newer = super::Identity {
+        host_trust_gen: 2,
+        ..other
+    };
+    {
+        let mut cx = super::Cx {
+            client: &client,
+            sessions: &mut sessions,
+        };
+        assert!(bridge.adopt_identity(&newer, &mut cx));
+    }
+    assert!(next_rules(&mut sessions).await.is_empty());
+    for session in sessions.values() {
+        let _ = session.stop();
+    }
+}

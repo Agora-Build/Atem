@@ -224,8 +224,9 @@ a Claude chat view too) and Atem asks the relay to notify your devices
 with control. A card shows the tool and a short summary — the command's first
 line or the file path, never file contents — and offers **Allow once**,
 **Always allow** (Claude: one of the rules Claude itself suggests, with where
-it is saved; Codex: **Always allow this command** — exactly this command in
-this folder, for the rest of this Codex process, kept by Atem; later runs of
+it is saved; Codex, for shell commands only: **Always allow this command** —
+exactly this command in this folder, for the rest of this Codex process, kept
+by Atem; later runs of
 the very same command are allowed without asking and show as "auto allowed",
 and the rule can be revoked from Astation) or **Deny** (with an optional
 note for the agent).

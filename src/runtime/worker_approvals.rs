@@ -46,16 +46,19 @@
 //! over only while the hook has more than 5 s left. Never an allow without
 //! the broker's decision.
 //!
-//! Atem session rules (Codex, r7.2): a Codex card offers "Always allow this
-//! command" (`approvals::SessionRule`). Once the hook took an `allow_always`
-//! naming it, the worker keeps the rule for this agent process (at most
-//! `MAX_SESSION_RULES`; gone when the process ends, kept across broker
-//! restarts since the worker owns it). A later request of this session's
-//! pinned Codex (`codex_owns`; a nested or foreign `codex` never) whose
-//! tool, full command (or file changes) and cwd are byte-equal to a rule's
-//! is answered allow by the worker itself while a broker is connected — no
-//! approval is opened — and reported `AutoAllowed` (redacted). The broker
-//! can revoke a rule (`revoke`); every change is reported as `Rules`.
+//! Atem session rules (Codex, r7.2): a Codex card for a shell command offers
+//! "Always allow this command" (`approvals::SessionRule`). Once the hook
+//! took an `allow_always` naming it, the worker keeps the rule for this
+//! agent process (at most `MAX_SESSION_RULES`, else `RuleNotKept`; gone when
+//! the process ends, kept across broker restarts since the worker owns it).
+//! A later request of this session's pinned Codex (`codex_owns`; a nested or
+//! foreign `codex` never) whose tool, full command and cwd are byte-equal to
+//! a rule's is answered allow by the worker itself while a broker is
+//! connected — no approval is opened — and reported `AutoAllowed`
+//! (redacted). The broker can revoke a rule (`revoke`) or all of them
+//! (`revoke_all`: the host's identity or trust changed); an allow written
+//! for a revoked rule that the hook hasn't taken is withdrawn. Every change
+//! is reported as `Rules`.
 
 use crate::chat::adapter::ToolResultKind;
 use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request, SessionRule};
@@ -110,6 +113,10 @@ pub enum Event {
     /// The broker's `revoke_approval_rule`: whether the rule was active
     /// (never produced by `Approvals`; the worker reports it).
     RuleRevoked { rule_id: String, ok: bool },
+    /// The hook took an `allow_always` choosing a session rule, but the
+    /// session already holds `MAX_SESSION_RULES`: allowed once, not kept
+    /// (reported before its `Applied`).
+    RuleNotKept { request_id: String },
 }
 
 /// What the agent did, as the worker learns it besides the hook files.
@@ -170,6 +177,9 @@ struct Waiting {
     /// The session rule an `allow_always` decision chose, kept once the
     /// hook took it.
     pending_rule: Option<SessionRule>,
+    /// The session rule whose allow the worker wrote for it (auto-allowed);
+    /// revoking the rule withdraws that allow while the hook hasn't taken it.
+    auto_rule: Option<String>,
     state: State,
 }
 
@@ -266,27 +276,59 @@ impl Approvals {
     }
 
     /// Revokes the session rule `rule_id`; false when it isn't active.
+    /// An allow it wrote that the hook hasn't taken yet is withdrawn ("no
+    /// decision": Codex's own dialog asks).
     pub fn revoke(&mut self, rule_id: &str) -> bool {
         let before = self.rules.len();
         self.rules.retain(|r| r.rule.rule_id != rule_id);
+        self.withdraw_auto(|r| r == rule_id);
         self.rules.len() != before
     }
 
-    /// Keeps `rule` (the hook took the `allow_always` that chose it), unless
-    /// the session holds as many as it may or one that matches the same.
-    fn keep_rule(&mut self, rule: SessionRule) {
+    /// Drops every session rule (the host's identity or trust generation
+    /// changed), withdrawing allows not yet taken, as `revoke`.
+    pub fn revoke_all(&mut self) {
+        self.rules.clear();
+        self.withdraw_auto(|_| true);
+    }
+
+    /// Withdraws the not-yet-taken allows written for the rules `which`
+    /// names: those hooks get "no decision" instead.
+    fn withdraw_auto(&mut self, which: impl Fn(&str) -> bool) {
+        let ids: Vec<String> = self
+            .waiting
+            .iter()
+            .filter(|(_, w)| w.auto_rule.as_deref().is_some_and(&which))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(w) = self.waiting.get_mut(&id) {
+                w.auto_rule = None;
+            }
+            if self.withdraw(&id) {
+                self.write_decision(&id, "");
+                self.released = true;
+            }
+        }
+    }
+
+    /// Keeps `rule` (the hook took the `allow_always` that chose it); false
+    /// when the session already holds as many as it may (one that matches
+    /// the same counts as kept).
+    fn keep_rule(&mut self, rule: SessionRule) -> bool {
         if self.rules.iter().any(|r| r.matcher == rule.matcher) {
-            return;
+            return true;
         }
         if self.rules.len() >= MAX_SESSION_RULES {
             eprintln!(
                 "atem worker: session rule {} not kept: the session holds {MAX_SESSION_RULES}",
                 rule.rule.rule_id
             );
-            return;
+            return false;
         }
         self.rules.push(rule);
         self.queued.push(Event::Rules(self.rules()));
+        true
     }
 
     /// The active rule this request matches exactly, if any.
@@ -535,14 +577,20 @@ impl Approvals {
     fn claimed(&mut self, id: &str, allow: bool, deny: Option<String>) {
         let claim_ms = self.take_claim(id).unwrap_or_else(now_ms);
         if self.agent == Agent::Codex {
+            // A rule the full session couldn't keep is said before the
+            // answer completes (its card is still known then).
+            if let Some(rule) = self.waiting.get_mut(id).and_then(|w| w.pending_rule.take())
+                && !self.keep_rule(rule)
+            {
+                self.queued.push(Event::RuleNotKept {
+                    request_id: id.into(),
+                });
+            }
             self.queued.push(Event::Applied {
                 request_id: id.into(),
                 outcome: ApplyOutcome::Ok,
             });
             self.set(id, State::Released);
-            if let Some(rule) = self.waiting.get_mut(id).and_then(|w| w.pending_rule.take()) {
-                self.keep_rule(rule);
-            }
         } else {
             self.set(
                 id,
@@ -690,6 +738,7 @@ impl Approvals {
                 reported: false,
                 ours,
                 pending_rule: None,
+                auto_rule: None,
                 state: State::Open,
             },
         );
@@ -697,6 +746,11 @@ impl Approvals {
             && self.write_decision(id, &approvals::allow_output())
         {
             // Done for the broker: the files go once the hook is gone.
+            if let (Some(w), Event::AutoAllowed { rule_id, .. }) =
+                (self.waiting.get_mut(id), &event)
+            {
+                w.auto_rule = Some(rule_id.clone());
+            }
             self.set(id, State::Released);
             return Some(event);
         }

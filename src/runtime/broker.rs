@@ -476,6 +476,22 @@ impl BrokerSession {
         }
     }
 
+    /// Drops every session rule (the host's identity or trust changed).
+    pub fn revoke_all_approval_rules(&self) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.revoke_all_approval_rules(),
+            None => Ok(()),
+        }
+    }
+
+    /// Asks the worker for its current session rules.
+    pub fn request_approval_rules(&self) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.request_approval_rules(),
+            None => Ok(()),
+        }
+    }
+
     /// After adoption: the approvals this broker knows; the worker answers
     /// every other waiting hook "no decision".
     pub fn known_approvals(&self, request_ids: Vec<String>) -> anyhow::Result<()> {
@@ -818,6 +834,9 @@ impl BrokerSession {
             WorkerMsg::ApprovalRuleRevoked { rule_id, ok } => self
                 .approval_events
                 .push(ApprovalEvent::RuleRevoked { rule_id, ok }),
+            WorkerMsg::ApprovalRuleNotKept { request_id } => self
+                .approval_events
+                .push(ApprovalEvent::RuleNotKept { request_id }),
             WorkerMsg::Hello { .. } => {}
             WorkerMsg::ChatSnapshot {
                 snapshot,

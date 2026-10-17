@@ -440,7 +440,7 @@ fn a_codex_session_rule_matches_exactly_what_was_asked() {
     let r = ask("Bash", json!({"command": "npm test"}), Some("/p"));
     assert_eq!(
         r.matcher,
-        Some(RuleMatch::Command {
+        Some(RuleMatch {
             tool: "Bash".into(),
             command: "npm test".into(),
             cwd: "/p".into(),
@@ -462,11 +462,34 @@ fn a_codex_session_rule_matches_exactly_what_was_asked() {
     ] {
         assert_ne!(r.matcher, other.matcher, "{:?}", other.matcher);
     }
-    // No cwd, or a tool it can't tell exactly: no rule offered.
+    // A description is fine (it doesn't change what runs).
+    let described = ask(
+        "Bash",
+        json!({"command": "npm test", "description": "run the tests"}),
+        Some("/p"),
+    );
+    assert_eq!(r.matcher, described.matcher);
+    // No cwd, a tool it can't tell exactly, or any other input key (it
+    // could change what runs, e.g. a workdir or env): no rule offered.
     for none in [
         ask("Bash", json!({"command": "npm test"}), None),
         ask("Bash", json!({"command": ["npm", "test"]}), Some("/p")),
         ask("WebFetch", json!({"url": "https://x"}), Some("/p")),
+        ask(
+            "Bash",
+            json!({"command": "npm test", "workdir": "/etc"}),
+            Some("/p"),
+        ),
+        ask(
+            "exec_command",
+            json!({"command": "npm test", "env": {"A": "1"}}),
+            Some("/p"),
+        ),
+        ask(
+            "Bash",
+            json!({"command": "npm test", "description": "d", "timeout": 5}),
+            Some("/p"),
+        ),
     ] {
         assert!(none.matcher.is_none() && none.session_rule.is_none());
         assert!(none.info.always_rules.is_empty());
@@ -482,24 +505,23 @@ fn a_codex_session_rule_matches_exactly_what_was_asked() {
         multi.info.always_rules[0].label,
         "Always allow `echo one` (+2 more lines) in /p for this session"
     );
-    // File changes: exact paths and kinds.
-    let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** Add File: b.txt\n+hi\n*** End Patch";
-    let p = ask("apply_patch", json!({"command": patch}), Some("/p"));
-    assert_eq!(
-        p.matcher,
-        Some(RuleMatch::Files {
-            tool: "apply_patch".into(),
-            changes: vec![
-                ("update".into(), "src/a.rs".into()),
-                ("add".into(), "b.txt".into())
-            ],
-            cwd: "/p".into(),
-        })
-    );
-    assert_eq!(
-        p.info.always_rules[0].label,
-        "Always allow update src/a.rs, add b.txt in /p for this session"
-    );
+}
+
+#[test]
+fn a_file_change_never_offers_or_matches_a_session_rule() {
+    // An apply_patch card offers Allow once and Deny only: a patch's rule
+    // would have to understand the patch, so none is offered — including
+    // an indented header that a line-based matcher would skip.
+    for patch in [
+        "*** Begin Patch\n*** Update File: a\n@@\n-x\n+y\n*** End Patch",
+        "*** Begin Patch\n*** Update File: a\n@@\n-x\n+y\n  *** Delete File: b\n*** End Patch",
+    ] {
+        let v = json!({"tool_name": "apply_patch", "cwd": "/p", "tool_input": {"command": patch}});
+        let r = request(Agent::Codex, &v).unwrap();
+        assert!(r.matcher.is_none() && r.session_rule.is_none(), "{patch}");
+        assert!(r.info.always_rules.is_empty());
+        assert!(decision_output(&r, ApprovalDecision::AllowAlways, Some("s-x"), None).is_none());
+    }
 }
 
 #[test]
@@ -511,9 +533,7 @@ fn a_session_rule_label_is_redacted_and_claude_gets_none() {
     let label = &r.info.always_rules[0].label;
     assert!(!label.contains(secret), "{label}");
     // The matcher keeps the exact command (it never leaves the worker).
-    assert!(
-        matches!(&r.matcher, Some(RuleMatch::Command { command, .. }) if command.contains(secret))
-    );
+    assert!(matches!(&r.matcher, Some(m) if m.command.contains(secret)));
     // An allow_always naming another id is not deliverable.
     assert!(decision_output(&r, ApprovalDecision::AllowAlways, Some("s-other"), None).is_none());
     // Claude keeps its own suggestions only.

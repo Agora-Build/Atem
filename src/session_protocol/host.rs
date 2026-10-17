@@ -1053,6 +1053,12 @@ impl<J: Journal> SessionHost<J> {
             return Err("host_trust_gen must increase".into());
         }
         self.ctx.host_trust_gen = host_trust_gen;
+        // Session rules were granted under the old trust: the runtime has
+        // the workers drop them; viewers see the lists empty.
+        let ruled: Vec<String> = self.rules.keys().cloned().collect();
+        for sid in ruled {
+            self.clear_rules(&sid);
+        }
         let ids: Vec<String> = self.sessions.keys().cloned().collect();
         for sid in &ids {
             self.end_lease(sid, LeaseChangeReason::Revoked, None);

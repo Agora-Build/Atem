@@ -1043,3 +1043,112 @@ fn a_session_holds_at_most_32_rules() {
     a.keep_rule(rule(99));
     assert_eq!(a.rules().len(), 32);
 }
+
+#[test]
+fn a_codex_nested_through_one_shell_with_another_session_never_matches() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    always_allow(&s, &mut a, &codex_ask("npm test", "/p"));
+    // A non-shell process (`timeout`, standing in for a nested `codex`)
+    // started by the agent through one shell runs the hook, for another
+    // Codex session with the very same command and cwd.
+    let script = approvals::shell_quote(&s.path().join(approvals::SCRIPT_NAME).to_string_lossy());
+    let other = codex_ask("npm test", "/p").replace(r#""session_id":"s1""#, r#""session_id":"s9""#);
+    assert!(other.contains(r#""session_id":"s9""#));
+    let nested = s.run(
+        &format!("timeout 30 /bin/sh {script} codex 30; true"),
+        &other,
+    );
+    known(&mut a, 1, true);
+    assert_eq!(printed(nested), "", "never allowed by the rule");
+    assert!(drained(&mut a).is_empty(), "nor reported as this session's");
+}
+
+#[test]
+fn revoking_withdraws_an_allow_the_hook_has_not_taken() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    let rule_id = always_allow(&s, &mut a, &ask);
+    // A hook that hasn't read its decision yet (it never will).
+    let mut sleeper = s.fake_request("slow", &ask);
+    let got = events(&mut a, true);
+    assert!(matches!(&got[..], [Event::AutoAllowed { .. }]), "{got:?}");
+    let dec = s.approvals().join("dec-slow.json");
+    assert_eq!(
+        std::fs::read_to_string(&dec).unwrap(),
+        approvals::allow_output()
+    );
+    assert!(a.revoke(&rule_id));
+    assert_eq!(
+        std::fs::read_to_string(&dec).unwrap(),
+        "",
+        "no decision: Codex's own dialog asks"
+    );
+    assert!(a.take_released());
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    drained(&mut a);
+    // revoke_all does the same for every rule.
+    let rule_id = always_allow(&s, &mut a, &codex_ask("make", "/p"));
+    let mut sleeper2 = s.fake_request("slow2", &codex_ask("make", "/p"));
+    assert!(
+        matches!(&events(&mut a, true)[..], [Event::AutoAllowed { rule_id: r, .. }] if *r == rule_id)
+    );
+    a.revoke_all();
+    assert!(a.rules().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(s.approvals().join("dec-slow2.json")).unwrap(),
+        ""
+    );
+    let _ = sleeper2.kill();
+    let _ = sleeper2.wait();
+}
+
+#[test]
+fn a_rule_the_full_session_cannot_keep_is_reported_before_the_answer_completes() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let rule = |n: usize| {
+        let v: Value = serde_json::from_str(&codex_ask(&format!("echo {n}"), "/p")).unwrap();
+        approvals::request(Agent::Codex, &v)
+            .unwrap()
+            .session_rule
+            .unwrap()
+    };
+    for n in 0..MAX_SESSION_RULES - 1 {
+        assert!(a.keep_rule(rule(n)));
+    }
+    a.poll(true, Vec::new());
+    // Offered while there was room…
+    let hook = s.hook("codex", 30, &codex_ask("npm test", "/p"));
+    let got = events(&mut a, true);
+    let Event::Request { request_id, info } = &got[0] else {
+        panic!("{got:?}")
+    };
+    let offered = info.always_rules[0].rule_id.clone();
+    // …but full by the time the hook takes the answer.
+    assert!(a.keep_rule(rule(99)));
+    a.poll(true, Vec::new());
+    assert_eq!(
+        a.decide(
+            request_id,
+            ApprovalDecision::AllowAlways,
+            Some(&offered),
+            None
+        ),
+        None
+    );
+    assert_eq!(printed(hook), ALLOW, "allowed once all the same");
+    let done = drained(&mut a);
+    assert_eq!(
+        done,
+        vec![
+            Event::RuleNotKept {
+                request_id: request_id.clone()
+            },
+            applied(request_id, ApplyOutcome::Ok)
+        ]
+    );
+    assert!(!a.rules().iter().any(|r| r.rule_id == offered));
+}

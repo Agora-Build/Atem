@@ -1085,6 +1085,24 @@ impl Worker {
                 if let Some((true, rules)) = revoked {
                     self.send(&WorkerMsg::ApprovalRules { rules });
                 }
+                // A withdrawn allow goes to Codex's dialog: its waiting status.
+                self.send_approval_events(Vec::new());
+            }
+            BrokerMsg::RevokeAllApprovalRules => {
+                if let Some(a) = self.approvals.as_mut() {
+                    a.revoke_all();
+                }
+                self.send(&WorkerMsg::ApprovalRules { rules: Vec::new() });
+                // Withdrawn allows go to Codex's dialog: its waiting status.
+                self.send_approval_events(Vec::new());
+            }
+            BrokerMsg::RequestApprovalRules => {
+                let rules = self
+                    .approvals
+                    .as_ref()
+                    .map(Approvals::rules)
+                    .unwrap_or_default();
+                self.send(&WorkerMsg::ApprovalRules { rules });
             }
         }
         false
@@ -1160,7 +1178,8 @@ impl Worker {
                 }
                 ApprovalEvent::AutoAllowed { .. }
                 | ApprovalEvent::Rules(_)
-                | ApprovalEvent::RuleRevoked { .. } => {}
+                | ApprovalEvent::RuleRevoked { .. }
+                | ApprovalEvent::RuleNotKept { .. } => {}
             }
         }
         let released = self.approvals.as_mut().is_some_and(|a| a.take_released());
@@ -1199,6 +1218,9 @@ impl Worker {
                 ApprovalEvent::Rules(rules) => WorkerMsg::ApprovalRules { rules },
                 ApprovalEvent::RuleRevoked { rule_id, ok } => {
                     WorkerMsg::ApprovalRuleRevoked { rule_id, ok }
+                }
+                ApprovalEvent::RuleNotKept { request_id } => {
+                    WorkerMsg::ApprovalRuleNotKept { request_id }
                 }
             };
             self.send(&message);

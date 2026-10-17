@@ -182,6 +182,8 @@ enum PartBody<'a> {
         state: super::adapter::ApprovalCardState,
         #[serde(skip_serializing_if = "Option::is_none")]
         rule_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<&'a str>,
     },
 }
 
@@ -260,6 +262,7 @@ fn part_body(p: &Part) -> PartBody<'_> {
             always_rules: &c.always_rules,
             state: c.state,
             rule_id: c.rule_id.as_deref(),
+            note: c.note.as_deref(),
         },
     }
 }
@@ -512,6 +515,7 @@ mod tests {
             }],
             state: ApprovalCardState::AlwaysAllowed,
             rule_id: None,
+            note: None,
         })];
         let e = body(&event("c1", "claude", "g", 3, &Out::Message(m)));
         assert_eq!(
@@ -562,6 +566,7 @@ mod tests {
             always_rules: Vec::new(),
             state: ApprovalCardState::AutoAllowed,
             rule_id: Some("s-1".into()),
+            note: None,
         })];
         let e = body(&event("c1", "codex", "g", 3, &Out::Message(m)));
         assert_eq!(

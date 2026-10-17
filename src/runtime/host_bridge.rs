@@ -107,6 +107,10 @@ const NO_TURN_STATE: &str = "no turn state; use the terminal";
 /// own dialog (the worker consumed it).
 const INTERRUPT_HANDED: &str =
     "the approval was handed to the terminal; interrupt again to stop the turn";
+/// The note on an `allow_always` card whose session rule the full session
+/// couldn't keep.
+const RULE_NOT_KEPT: &str =
+    "allowed once; the rule wasn't kept: this session already holds 32 rules";
 /// A revoke whose rule the worker no longer held.
 const RULE_GONE: &str = "the rule is no longer active";
 /// Esc interrupts Claude Code's and Codex's current turn.
@@ -681,6 +685,7 @@ impl HostBridge {
                         return false;
                     }
                 }
+                self.rules_after_rebind(&ctx, cx);
             }
             return true;
         }
@@ -710,6 +715,7 @@ impl HostBridge {
                 }
                 self.exec(effects, cx);
                 self.sync_all(cx);
+                self.rules_after_rebind(&ctx, cx);
                 true
             }
             Err(error) => {
@@ -718,6 +724,26 @@ impl HostBridge {
                 );
                 false
             }
+        }
+    }
+
+    /// After the host was rebound or its trust moved on from `previous`:
+    /// session rules were granted under the old account, device or trust
+    /// generation, so with any of them changed every worker drops all its
+    /// rules (the host already cleared its copy); under the same identity
+    /// and trust the host lost only its copy, so the workers send theirs
+    /// again.
+    fn rules_after_rebind(&mut self, previous: &HostContext, cx: &mut Cx) {
+        let now = self.host.context();
+        let changed = now.account_id != previous.account_id
+            || now.atem_device_id != previous.atem_device_id
+            || now.host_trust_gen != previous.host_trust_gen;
+        for session in cx.sessions.values() {
+            let _ = if changed {
+                session.revoke_all_approval_rules()
+            } else {
+                session.request_approval_rules()
+            };
         }
     }
 
@@ -1186,6 +1212,10 @@ impl HostBridge {
         let registered = match result {
             Ok(effects) => {
                 self.exec(effects, cx);
+                // Its session rules, which it may have sent before this.
+                if let Some(session) = cx.sessions.get(id) {
+                    let _ = session.request_approval_rules();
+                }
                 true
             }
             Err(error) => {
@@ -1523,6 +1553,18 @@ impl HostBridge {
                     self.exec(effects, cx);
                     self.approvals.remove(&id);
                 }
+                ApprovalEvent::RuleNotKept { request_id } => {
+                    let Some(id) = self.approval_of(sid, &request_id) else {
+                        continue;
+                    };
+                    eprintln!(
+                        "atem runtime: {sid}: a session rule was not kept (the session holds 32)"
+                    );
+                    if let Some(card) = self.approvals.get_mut(&id).and_then(|a| a.card.as_mut()) {
+                        card.note = Some(RULE_NOT_KEPT.into());
+                    }
+                    self.card_state(&id, ApprovalCardState::Allowed, cx);
+                }
                 ApprovalEvent::AutoAllowed {
                     request_id: _,
                     rule_id,
@@ -1584,6 +1626,7 @@ impl HostBridge {
             always_rules: Vec::new(),
             state: ApprovalCardState::AutoAllowed,
             rule_id: Some(rule_id),
+            note: None,
         };
         let Some(session) = session_of(cx, sid) else {
             return;
@@ -1599,6 +1642,9 @@ impl HostBridge {
         let Some(process_gen) = session_of(cx, sid).map(|s| s.process_gen.clone()) else {
             return;
         };
+        // Rules a worker reports before its session is registered with the
+        // host (e.g. right after adoption) are dropped here: `register`
+        // asks the worker for them again once it is.
         if !self.per.get(sid).is_some_and(|p| p.registered) {
             return;
         }
@@ -1770,6 +1816,7 @@ impl HostBridge {
                 always_rules: request.always_rules.clone(),
                 state: ApprovalCardState::Pending,
                 rule_id: None,
+                note: None,
             };
             self.card(
                 &request.approval_id,

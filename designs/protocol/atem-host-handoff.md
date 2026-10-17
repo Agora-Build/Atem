@@ -396,8 +396,10 @@ Astation sees that changed since r6.2.
   Codex's hook can't take a persistent rule (`updatedPermissions` fails
   closed), so a Codex request's `always_rules` holds one Atem rule:
   `{rule_id: "s-…", label: "Always allow `npm test` in /home/me/proj for
-  this session", scope: "session"}` (none when the request has no exact
-  form, or the session already holds 32). Show it like Claude's rules: the
+  this session", scope: "session"}` for a shell command only (none for
+  file changes, for a command whose input carries anything besides
+  `command`/`description`, or when the session already holds 32). File-change
+  cards offer Allow once and Deny. Show it like Claude's rules: the
   label on the button, the scope as "this Codex session only". Answering
   `allow_always` with that `rule_id` allows this request; Atem keeps the
   rule for the rest of that agent process.
@@ -426,8 +428,13 @@ Astation sees that changed since r6.2.
   `approval_rule_revoke: {"rule_id": "s-…"}` instead of `text`. The receipt
   completes once the worker dropped the rule (chat: `complete`), then the
   new list arrives. An unknown or already revoked rule is `stale_target`
-  (refresh the list). A rule never outlives the agent process: a respawn
-  starts with none.
+  (refresh the list). A revoke also withdraws an allow written for that
+  rule that Codex hasn't taken yet (Codex's own dialog asks). A rule never
+  outlives the agent process: a respawn starts with none, and a new
+  account, device or trust generation drops every rule (`rules: []`).
+- **Rule not kept.** If the session filled up (32) between the card and the
+  answer, the request is allowed once and the card ends `allowed` with a
+  `note` ("allowed once; the rule wasn't kept: …"): show the note.
 - New shared fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule`
   (core harness; the real-runtime runner lists it as not run, since its
   agent is Claude, and the real-agent Codex test covers it end to end).

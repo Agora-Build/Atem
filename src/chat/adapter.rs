@@ -39,6 +39,9 @@ pub struct ApprovalCard {
     pub state: ApprovalCardState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
+    /// A short note on how it ended (e.g. the session rule wasn't kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

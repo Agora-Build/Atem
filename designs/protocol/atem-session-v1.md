@@ -557,16 +557,20 @@ takes the lease with the answer (`acquire`).
 - **Atem session rules (r7.2).** For an agent whose hook can't keep a rule
   (Codex: `updatedPermissions` fails closed) `always_rules` holds one rule
   the host offers itself: `{rule_id, label: "Always allow `<command's first
-  line, redacted>` in <cwd> for this session", scope: "session"}`, for a
-  request with an exact form (a shell command with a string `command`, or a
-  patch's file changes) and a `cwd`. Answering `allow_always` with it
+  line, redacted>` in <cwd> for this session", scope: "session"}`, only
+  for a shell command request: a string `command` with no other
+  `tool_input` key than `description` (any other key, such as a working
+  directory or environment, could change what runs: no rule), and the
+  hook's `cwd` — the agent session's working directory as the hook reports
+  it, not a per-command directory. File-change requests (patches) never
+  get one: their cards offer Allow once and Deny. Answering `allow_always` with it
   allows this request (the agent gets a plain allow) and, once the agent
   took the answer, the runtime keeps the rule for that agent process: at
   most 32 per session (a full session offers none); gone when the process
   ends (a respawn has none); kept across a broker restart (the worker owns
   it). The match uses the full, unredacted request: tool, the exact full
-  command (byte-equal; file changes: the exact kinds and paths) and the
-  exact cwd — no prefix, glob or normalisation — and only the session's own
+  command (byte-equal) and the exact cwd — no prefix, glob or
+  normalisation — and only the session's own
   agent (never a nested or foreign process of the same agent). A matching
   request is allowed by the runtime without opening an approval: no
   `approval_request`, no push, no lease; it appears in chat-v1 as a card in
@@ -583,7 +587,15 @@ takes the lease with the answer (`acquire`).
   `stale_lease`), then the rule must be active for exactly the binding's
   process, else `stale_target` (nothing recorded or dispatched). It is
   dispatched to the runtime and completes once the runtime dropped the
-  rule; the new list follows.
+  rule; the new list follows. An allow the runtime wrote for that rule and
+  the agent hasn't taken yet is withdrawn ("no decision": the agent's own
+  prompt asks). A rule the session can't keep at the moment the agent takes
+  the answer (it already holds 32) is not kept: the request is allowed once
+  and its chat-v1 card ends `allowed` with a `note` saying so. Rules are
+  bound to the host's identity: when the account, the device or the host
+  trust generation changes, every runtime worker drops all its rules
+  (viewers get `rules: []`); a host that lost only its copy under the same
+  identity and trust (a restart) gets the workers' rules again.
 
   ```json
   {"type":"session","data":{"v":1,"op":"approval_rules","id":"…","session_id":"ses-aaaaaaaaaaaa",

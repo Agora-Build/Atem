@@ -149,6 +149,12 @@ pub enum BrokerMsg {
     RevokeApprovalRule {
         rule_id: String,
     },
+    /// Drops every Atem session rule (the host's identity or trust
+    /// generation changed) → `approval_rules` (empty).
+    RevokeAllApprovalRules,
+    /// → `approval_rules` with the current list (even when empty): a broker
+    /// that registered the session, or rebound its host, asks again.
+    RequestApprovalRules,
 }
 
 impl std::fmt::Debug for BrokerMsg {
@@ -197,6 +203,8 @@ impl std::fmt::Debug for BrokerMsg {
                 write!(f, "KnownApprovals({} ids)", request_ids.len())
             }
             BrokerMsg::RevokeApprovalRule { rule_id } => write!(f, "RevokeApprovalRule({rule_id})"),
+            BrokerMsg::RevokeAllApprovalRules => f.write_str("RevokeAllApprovalRules"),
+            BrokerMsg::RequestApprovalRules => f.write_str("RequestApprovalRules"),
         }
     }
 }
@@ -377,6 +385,12 @@ pub enum WorkerMsg {
     ApprovalRuleRevoked {
         rule_id: String,
         ok: bool,
+    },
+    /// The hook took an `allow_always` choosing the request's session rule,
+    /// but the session holds 32: allowed once, the rule not kept. Sent
+    /// before that request's `approval_applied`.
+    ApprovalRuleNotKept {
+        request_id: String,
     },
 }
 
