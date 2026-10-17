@@ -341,8 +341,14 @@ Claude's replies come from its own session log, with a status of ready,
 working, waiting or unknown. Atem adds its hooks with `--settings` for that run
 only; your `~/.claude` settings are not changed. A prompt sent from chat needs
 control of the session, is typed into Claude once, and is reported as
-accepted, then complete (or failed) when Claude's turn ends. Codex has no
-chat yet (its status is unknown). See
+accepted, then complete (or failed) when Claude's turn ends.
+Codex works the same way once you allow Atem's Codex hooks (asked
+once on the first `atem agent launch codex`, see below): Atem reads Codex's
+own session log, so Codex shows ready, working, waiting or unknown. Codex
+reports nothing before its first prompt, so type the first prompt in the
+terminal; after that chat prompts work. Replies arrive whole (no streaming),
+and Codex's chat has no reasoning text, "always allow" or error details.
+Interrupt from chat stops a running turn only. See
 [`designs/agent-chat-host.md`](https://github.com/Agora-Build/Atem/blob/main/designs/agent-chat-host.md).
 
 **Approve prompts from Astation and your phone.** When Claude Code or Codex
@@ -361,11 +367,11 @@ terminal as usual. Claude gets the hook with `--settings` for each launch;
 to turn it off, set `approvals_hook = false` under `[claude]` in
 `~/.config/atem/config.toml` (Claude sessions launched afterwards keep their
 prompts in the terminal).
-The first `atem agent launch codex` asks once whether to add Atem's hook to
-`~/.codex/hooks.json` (a backup is kept as `hooks.json.atem-bak`); to turn it
-off later, set `approvals_hook = false` under `[codex]` in
-`~/.config/atem/config.toml` — the next `atem agent launch codex` removes the
-hook. See [§6a of the session protocol](https://github.com/Agora-Build/Atem/blob/main/designs/protocol/atem-session-v1.md).
+The first `atem agent launch codex` asks once whether to add Atem's hooks
+(one per Codex event, for approvals and chat) to `~/.codex/hooks.json`, after
+your own (a backup is kept as `hooks.json.atem-bak`); to turn them off later,
+set `hooks = false` under `[codex]` in `~/.config/atem/config.toml` — the next
+`atem agent launch codex` removes them. See [§6a of the session protocol](https://github.com/Agora-Build/Atem/blob/main/designs/protocol/atem-session-v1.md).
 
 ## TUI Modes
 

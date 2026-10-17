@@ -201,6 +201,57 @@ Pairing, verification and unlock:
   ends it (`verifyAbort` for verification); a lost link ends it, never
   replayed.
 
+## Codex chat (for Astation)
+
+Codex now has a chat-v1 adapter (branch `feat/codex-chat`; design:
+`designs/agent-chat-host.md`, "Codex"). What changes for the relay and the
+web page:
+
+- **Availability.** `["terminal-v1","chat-v1"]` only when the user allowed
+  Atem's Codex hooks (`[codex] hooks = true`, asked once at the first
+  `atem agent launch codex`; Codex also needs them trusted in its `/hooks`).
+  Otherwise `["terminal-v1"]` and no turn state. Show chat per descriptor,
+  not per provider.
+- **`opened.unavailable`.** An array of strings naming what the agent's chat
+  cannot provide: `streaming`, `reasoning`, `always_allow`, `error_details`.
+  Codex sends all four, Claude `[]`. Hide or disable the matching UI (no
+  typing indicator for partial text, no "always allow" button, no reasoning
+  fold, no error detail). Unknown names must be ignored.
+- **No streaming.** A Codex reply arrives whole, as the rollout records it
+  (commentary and final answers are separate messages; a command run is a
+  `Bash` tool part). Do not animate it as a stream.
+- **Activity is real.** Codex's `activity` (descriptor, `atem agent list`,
+  chat `status`) is `unknown` before its first prompt, then `working`,
+  `waiting` (a permission prompt is open) and `ready`. It no longer stays
+  `unknown`. The activity dot should follow process state: `exited` or an
+  unavailable session is not "ready", and `unknown` is grey, never green.
+- **First-prompt refusal.** Codex reports nothing until it gets a prompt, so
+  chat opens in status `unknown` with the detail "type a first prompt in the
+  terminal: Codex reports nothing before it (and Atem's Codex hooks must be
+  trusted in its /hooks)". A chat `submit` (or a session-v1 `prompt`
+  receipt) before then is refused: chat-v1 `error{text}` and the receipt's
+  `rejected` `detail` carry that same text. Show it and let the user type in
+  the terminal; chat prompts work once the status is `ready` (after that first turn ends).
+  Other refusals (busy, a local draft) now carry their reason the same way.
+  With hooks off, a prompt is `rejected` with "chat is not available for
+  this agent; use the terminal".
+- **Interrupt.** Esc is written only while the status is `working` or
+  `waiting`, and the receipt completes at that turn's end (chat `complete`
+  with outcome `interrupted`). In `ready` or `unknown` it completes at once
+  with nothing written. With no chat (hooks off) it is `rejected` ("no turn
+  state; use the terminal"). `outcome_unknown` after 10 s means no interrupt
+  was observed.
+- **Prompt origin.** Only a prompt after the paste can be the remote one; a
+  local prompt typed just before shows as `origin: local`. Compaction turns
+  produce no `complete`.
+- **Approvals** are unchanged: cards in the chat, allow once / deny only.
+- **Worker `hello.chat` is required** (an older worker is
+  `recovery_required` after a runtime upgrade; no compatibility).
+
+Known limits: filesystems and logs with whole-second times allow same-second
+races when pairing a prompt or a turn end; tool-result evidence keeps 1 s
+slack; a hook read after its npm-wrapper parent exited is dropped (harmless).
+
 ## Shared fixtures against the real runtime
 
 `tests/runtime_fixtures_binary.rs` runs every host scenario in `fixtures/`

@@ -208,8 +208,14 @@ Claude's replies come from its own session log, with a status of ready,
 working, waiting or unknown. Atem adds its hooks with `--settings` for that run
 only; your `~/.claude` settings are not changed. A prompt sent from chat needs
 control of the session, is typed into Claude once, and is reported as
-accepted, then complete (or failed) when Claude's turn ends. Codex has no
-chat yet (its status is unknown). See
+accepted, then complete (or failed) when Claude's turn ends.
+Codex works the same way once you allow Atem's Codex hooks (asked
+once on the first `atem agent launch codex`, see below): Atem reads Codex's
+own session log, so Codex shows ready, working, waiting or unknown. Codex
+reports nothing before its first prompt, so type the first prompt in the
+terminal; after that chat prompts work. Replies arrive whole (no streaming),
+and Codex's chat has no reasoning text, "always allow" or error details.
+Interrupt from chat stops a running turn only. See
 [`designs/agent-chat-host.md`](designs/agent-chat-host.md).
 
 **Approve prompts from Astation and your phone.** When Claude Code or Codex
