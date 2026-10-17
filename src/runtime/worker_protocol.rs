@@ -28,6 +28,12 @@ pub const MAX_OUTPUT: usize = 16 * 1024;
 pub const MAX_WRITE: usize = crate::pty_session::MAX_FENCED;
 /// Most bytes of text in one `paste`.
 pub const MAX_PASTE: usize = 256 * 1024;
+/// Why a consumed write (`consumed`) wasn't written: the remote `written`
+/// ack's error.
+pub const APPROVAL_HANDED: &str = "the approval was handed to the terminal; not written";
+/// The local frontend's notice for consumed input.
+pub const APPROVAL_HANDED_NOTICE: &str =
+    "Codex's approval was handed to the terminal; answer its dialog";
 
 /// What the broker asks a new worker to run. Written to
 /// `<state>/workers/<session_id>.spec.json` (0600) — without the environment,
@@ -89,6 +95,11 @@ pub enum BrokerMsg {
         input_epoch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         not_after: Option<u64>,
+        /// Codex: every waiting hook gets "no decision" first (Codex hides
+        /// its prompt while one waits); when that released one, this input
+        /// is consumed, never written (`write_result` with `consumed`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        release_approvals: bool,
     },
     /// A bracketed paste plus Enter, under the same rules → `write_result`.
     Paste {
@@ -97,6 +108,8 @@ pub enum BrokerMsg {
         input_epoch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         not_after: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        release_approvals: bool,
     },
     /// Raises the current input epoch (a lower one is ignored).
     SetInputEpoch {
@@ -118,6 +131,10 @@ pub enum BrokerMsg {
         decision: ApprovalDecision,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule_id: Option<String>,
+        /// With `rule_id`: the identity and trust the rule is granted
+        /// under, kept with it. A rule without one is never kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        granted_under: Option<RuleGrant>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -126,14 +143,48 @@ pub enum BrokerMsg {
     ReleaseApproval {
         request_id: String,
     },
-    /// "No decision" for every waiting hook (before local input is written:
-    /// Codex hides its prompt while a hook waits).
-    ReleaseApprovals,
     /// After adoption: the approvals this broker knows; every other waiting
     /// hook gets "no decision".
     KnownApprovals {
         request_ids: Vec<String>,
     },
+    /// Revokes the Atem session rule `rule_id` (r7.2) →
+    /// `approval_rule_revoked`, then `approval_rules` when it was active.
+    RevokeApprovalRule {
+        rule_id: String,
+    },
+    /// Drops every Atem session rule (the host's identity or trust
+    /// generation changed) → `approval_rules` (empty).
+    RevokeAllApprovalRules,
+    /// → `approval_rules` with the current list (even when empty): a broker
+    /// that registered the session asks for them.
+    RequestApprovalRules,
+    /// The broker accepted the unconfirmed rules `rule_ids` (granted under
+    /// its current identity and trust): they allow again. Every other
+    /// unconfirmed rule is dropped; confirmed ones are untouched →
+    /// `approval_rules`.
+    ConfirmApprovalRules {
+        rule_ids: Vec<String>,
+    },
+}
+
+/// The identity and trust generation an Atem session rule was granted
+/// under (r7.2): a later broker accepts the rule only under the same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleGrant {
+    pub account_id: String,
+    pub atem_device_id: String,
+    pub host_trust_gen: u64,
+}
+
+/// One Atem session rule a worker holds. `confirmed`: granted or accepted
+/// by the broker connected now; a rule is unconfirmed after every new
+/// broker connection and allows nothing until the broker confirms it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldRule {
+    pub rule: AlwaysRule,
+    pub granted_under: RuleGrant,
+    pub confirmed: bool,
 }
 
 impl std::fmt::Debug for BrokerMsg {
@@ -172,15 +223,21 @@ impl std::fmt::Debug for BrokerMsg {
                 decision,
                 rule_id,
                 message,
+                ..
             } => write!(
                 f,
                 "ApprovalDecision({request_id}, {decision:?}, rule {rule_id:?}, {} message bytes)",
                 message.as_ref().map_or(0, String::len)
             ),
             BrokerMsg::ReleaseApproval { request_id } => write!(f, "ReleaseApproval({request_id})"),
-            BrokerMsg::ReleaseApprovals => f.write_str("ReleaseApprovals"),
             BrokerMsg::KnownApprovals { request_ids } => {
                 write!(f, "KnownApprovals({} ids)", request_ids.len())
+            }
+            BrokerMsg::RevokeApprovalRule { rule_id } => write!(f, "RevokeApprovalRule({rule_id})"),
+            BrokerMsg::RevokeAllApprovalRules => f.write_str("RevokeAllApprovalRules"),
+            BrokerMsg::RequestApprovalRules => f.write_str("RequestApprovalRules"),
+            BrokerMsg::ConfirmApprovalRules { rule_ids } => {
+                write!(f, "ConfirmApprovalRules({rule_ids:?})")
             }
         }
     }
@@ -189,16 +246,24 @@ impl std::fmt::Debug for BrokerMsg {
 impl BrokerMsg {
     #[cfg(test)]
     pub fn write(seq: u64, bytes: &[u8], input_epoch: u64) -> Self {
-        Self::write_until(seq, bytes, input_epoch, None)
+        Self::write_until(seq, bytes, input_epoch, None, false)
     }
 
-    /// A write that must not reach the PTY at or after `not_after`.
-    pub fn write_until(seq: u64, bytes: &[u8], input_epoch: u64, not_after: Option<u64>) -> Self {
+    /// A write that must not reach the PTY at or after `not_after`, after
+    /// releasing the waiting approvals when `release_approvals` (Codex).
+    pub fn write_until(
+        seq: u64,
+        bytes: &[u8],
+        input_epoch: u64,
+        not_after: Option<u64>,
+        release_approvals: bool,
+    ) -> Self {
         BrokerMsg::Write {
             seq,
             bytes: STANDARD.encode(bytes),
             input_epoch,
             not_after,
+            release_approvals,
         }
     }
 }
@@ -233,6 +298,9 @@ pub enum WorkerMsg {
         dropped: u64,
         /// The exit status when the agent already exited.
         exited: Option<String>,
+        /// The session has a chat adapter (Claude's; Codex's with Atem's
+        /// Codex hooks on): it offers chat-v1.
+        chat: bool,
     },
     /// Raw PTY output (base64) starting at stream position `offset`.
     Output {
@@ -260,6 +328,10 @@ pub enum WorkerMsg {
         input_count: u64,
         chat_v1: bool,
         reason: Option<String>,
+        /// What the adapter's chat can't provide (`Capabilities::unavailable`:
+        /// `streaming`, `reasoning`, `always_allow`, `error_details`).
+        #[serde(default)]
+        unavailable: Vec<String>,
         #[serde(default)]
         gap: u64,
     },
@@ -271,6 +343,8 @@ pub enum WorkerMsg {
         input_count: u64,
         chat_v1: bool,
         reason: Option<String>,
+        #[serde(default)]
+        unavailable: Vec<String>,
     },
     Activity {
         state: Activity,
@@ -291,6 +365,11 @@ pub enum WorkerMsg {
         /// queue. A writer error after queueing leaves it false.
         #[serde(default)]
         no_effect: bool,
+        /// Consumed (nothing written, `no_effect`): the input handed a
+        /// waiting approval to the agent's own dialog, which the user
+        /// hadn't seen yet (`APPROVAL_HANDED`).
+        #[serde(default)]
+        consumed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -304,7 +383,7 @@ pub enum WorkerMsg {
     /// The agent's permission prompt waits for a decision (its hook runs):
     /// what the card shows, redacted (`worker_approvals`). Sent only while a
     /// broker is connected; `always_rules` are the agent's own suggestions
-    /// (Claude; none for Codex).
+    /// (Claude) or the Atem session rule the card offers (Codex).
     ApprovalRequest {
         request_id: String,
         tool: String,
@@ -321,6 +400,32 @@ pub enum WorkerMsg {
     ApprovalApplied {
         request_id: String,
         outcome: ApplyOutcome,
+    },
+    /// The worker answered a request allow itself: it matched the Atem
+    /// session rule `rule_id` (r7.2). `tool`/`summary` redacted as on a
+    /// card; no approval was opened.
+    ApprovalAutoAllowed {
+        request_id: String,
+        rule_id: String,
+        tool: String,
+        summary: String,
+    },
+    /// The session's Atem session rules (the whole list, with what each
+    /// was granted under and whether this broker confirmed it), on every
+    /// connection when there are any and whenever they change.
+    ApprovalRules {
+        rules: Vec<HeldRule>,
+    },
+    /// The answer to `revoke_approval_rule`: `ok` when the rule was active.
+    ApprovalRuleRevoked {
+        rule_id: String,
+        ok: bool,
+    },
+    /// The hook took an `allow_always` choosing the request's session rule,
+    /// but the session holds 32: allowed once, the rule not kept. Sent
+    /// before that request's `approval_applied`.
+    ApprovalRuleNotKept {
+        request_id: String,
     },
 }
 
@@ -459,13 +564,15 @@ mod tests {
                 text: "fix it".into(),
                 input_epoch: 3,
                 not_after: None,
+                release_approvals: false,
             },
-            BrokerMsg::write_until(5, b"x", 3, Some(123_456_789)),
+            BrokerMsg::write_until(5, b"x", 3, Some(123_456_789), true),
             BrokerMsg::Paste {
                 seq: 6,
                 text: "go".into(),
                 input_epoch: 3,
                 not_after: Some(987_654_321),
+                release_approvals: true,
             },
             BrokerMsg::SetInputEpoch { epoch: 4 },
             BrokerMsg::Resize {
@@ -478,18 +585,26 @@ mod tests {
                 request_id: "a1".into(),
                 decision: ApprovalDecision::AllowAlways,
                 rule_id: Some("r0-ab".into()),
+                granted_under: Some(RuleGrant {
+                    account_id: "acct".into(),
+                    atem_device_id: "dev".into(),
+                    host_trust_gen: 3,
+                }),
                 message: None,
+            },
+            BrokerMsg::ConfirmApprovalRules {
+                rule_ids: vec!["r0-ab".into()],
             },
             BrokerMsg::ApprovalDecision {
                 request_id: "a1".into(),
                 decision: ApprovalDecision::Deny,
                 rule_id: None,
+                granted_under: None,
                 message: Some("no".into()),
             },
             BrokerMsg::ReleaseApproval {
                 request_id: "a1".into(),
             },
-            BrokerMsg::ReleaseApprovals,
             BrokerMsg::KnownApprovals {
                 request_ids: vec!["a1".into()],
             },
@@ -519,6 +634,7 @@ mod tests {
                 input_epoch: 2,
                 dropped: 1,
                 exited: None,
+                chat: true,
             },
             WorkerMsg::output(b"x", 9),
             WorkerMsg::Screen {
@@ -535,8 +651,12 @@ mod tests {
                         source: "startup".into(),
                         same_log: false,
                     },
-                    AgentEvent::PromptSubmitted { text: "hi".into() },
-                    AgentEvent::TurnEnded,
+                    AgentEvent::PromptSubmitted {
+                        text: "hi".into(),
+                        turn_id: Some("turn-1".into()),
+                        at_ms: Some(17),
+                    },
+                    AgentEvent::TurnEnded { at_ms: None },
                 ],
                 log: vec![
                     LogItem::AssistantPart {
@@ -551,11 +671,13 @@ mod tests {
                     LogItem::Backfill(Box::new(LogItem::TurnEnded {
                         turn_id: "t".into(),
                         outcome: Outcome::Done,
+                        at_ms: 5,
                     })),
                 ],
                 input_count: 2,
                 chat_v1: true,
                 reason: None,
+                unavailable: vec!["streaming".into(), "reasoning".into()],
                 gap: 3,
             },
             WorkerMsg::Activity {
@@ -569,6 +691,7 @@ mod tests {
                 bytes_written: 0,
                 dropped: true,
                 no_effect: false,
+                consumed: false,
                 error: None,
             },
             WorkerMsg::Error { text: "e".into() },
@@ -624,6 +747,7 @@ mod tests {
             text: "a".repeat(n),
             input_epoch: 0,
             not_after: None,
+            release_approvals: false,
         };
         assert!(decode_broker(&encode_broker(&paste(MAX_PASTE))).is_ok());
         assert!(decode_broker(&encode_broker(&paste(MAX_PASTE + 1))).is_err());
@@ -639,6 +763,7 @@ mod tests {
             request_id: "a".into(),
             decision: ApprovalDecision::Deny,
             rule_id: None,
+            granted_under: None,
             message: Some("m".repeat(n)),
         };
         assert!(decode_broker(&encode_broker(&deny(MAX_APPROVAL_MESSAGE_BYTES))).is_ok());
@@ -655,11 +780,13 @@ mod tests {
             text: "my password is hunter2".into(),
             input_epoch: 0,
             not_after: None,
+            release_approvals: false,
         };
         let deny = BrokerMsg::ApprovalDecision {
             request_id: "a1".into(),
             decision: ApprovalDecision::Deny,
             rule_id: None,
+            granted_under: None,
             message: Some("hunter2".into()),
         };
         let text = format!(

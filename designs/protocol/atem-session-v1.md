@@ -1,6 +1,13 @@
-# atem-session v1: sessions, control leases, receipts and approvals (r7.1: r7 plus hello replacement — for review)
+# atem-session v1: sessions, control leases, receipts and approvals (r7.2: r7.1 plus Atem session rules — for review)
 
-Status: r7.1 (2026-10-17) lets a second `hello` on a welcomed attachment
+Status: r7.2 (2026-10-17) adds Atem session rules (§6a): for an agent whose
+hook can't keep a persistent rule (Codex), its card offers "Always allow this
+command" with `scope: "session"`; Atem's worker keeps the rule for that agent
+process and answers a later byte-equal request itself (`auto_allowed`, no
+approval, no push, no lease). Attachments with `control` get the active rules
+(`approval_rules`) and revoke one with a `kind:"approval_rule_revoke"`
+submission. New fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule`.
+r7.1 (2026-10-17) lets a second `hello` on a welcomed attachment
 replace it instead of refusing it `unauthorized` (§3, compatibility mode):
 after a client reset (e.g. the Mac slept) the client says `hello` again on
 the same authenticated transport and gets a new attachment, with no lease
@@ -320,6 +327,7 @@ Kinds and payloads (v1):
 | `interrupt` | `{}` | the provider reports the turn interrupted, or the turn was already over (`detail`) |
 | `stop` | `{}` | the agent process exits |
 | `approval` | `{"approval_id", "decision", "rule_id"?, "message"?}` (§6a) | the agent reports it applied the decision |
+| `approval_rule_revoke` | `{"rule_id"}` (§6a, r7.2) | the runtime dropped the rule |
 
 - **Digest**: the host computes `payload_digest = sha256(JCS(payload))`, JCS =
   RFC 8785 over the supported domain (objects, arrays, strings, booleans, null,
@@ -345,7 +353,8 @@ Kinds and payloads (v1):
   that earlier target still returns its receipts.
 - **Scheduling**: `prompt`s are serialized per session (one paste at a time;
   later ones stay `accepted` until the previous one leaves `executing`);
-  `interrupt`, `stop` and `approval` are dispatched immediately.
+  `interrupt`, `stop`, `approval` and `approval_rule_revoke` are dispatched
+  immediately.
 - **States and transitions** (all others are invalid and never happen):
 
 | from | to | when |
@@ -378,6 +387,9 @@ Kinds and payloads (v1):
   - `approval`: the decision could not be handed to the agent's waiting
     prompt → `rejected`, `detail:"could not hand the decision to the agent"`;
     see §6a for the other outcomes.
+  - `approval_rule_revoke`: the runtime could not be asked → `rejected`,
+    `detail:"could not revoke the rule"`; the rule was no longer active
+    there → `rejected`, `detail:"the rule is no longer active"`.
   - A failure that cannot be classified as "no side effect" is
     `outcome_unknown`. Neither final failure state is ever retried
     automatically; a duplicate `submit` returns the recorded final receipt. A receipt's
@@ -418,6 +430,8 @@ takes the lease with the answer (`acquire`).
 | `submit` | C→H | §6 with `kind:"approval"`, `payload: {approval_id, decision, rule_id?, message?, acquire?}` |
 | `push_approval` | H→relay | `approval_id`, `atem_device_id`, `session_id`, `tool`, `summary`, `expires_at` |
 | `push_resolved` | H→relay | `approval_id`, `reason` (an `approval_closed` reason) |
+| `approval_rules` | H→C | `session_id`, `process_gen`, `rules: [{rule_id, label, scope}]` (r7.2; ≤ 32) |
+| `submit` | C→H | §6 with `kind:"approval_rule_revoke"`, `payload: {rule_id}` (r7.2) |
 
 ```json
 {"type":"session","data":{"v":1,"op":"approval_request","id":"…","approval_id":"88888888-…",
@@ -445,9 +459,10 @@ takes the lease with the answer (`acquire`).
   `always_rules` are the agent's own suggested rules, exactly as the agent
   proposes them (Claude: the hook's `permission_suggestions`); `label` says
   what the rule allows and `scope` where it is saved, so the card shows both
-  before the tap. `[]` when the agent offers none (e.g. Codex when its hook
-  can't take a persistent decision; the card then offers Allow once and Deny
-  only and says why). Bounds §1.
+  before the tap. `[]` when the agent offers none (the card then offers
+  Allow once and Deny only). For an agent whose hook can't take a persistent
+  decision (Codex) the host offers one Atem session rule instead (below).
+  Bounds §1.
 - **Recipients.** `approval_request` and `approval_closed` go to every
   attachment subscribed by `list` with `control` (a view-only attachment
   gets neither); after each `sessions` snapshot the pending ones are sent
@@ -514,9 +529,11 @@ takes the lease with the answer (`acquire`).
   (the hook's limit), `released` (Atem gave the prompt back to the agent:
   input reached a Codex session, which hides its prompt while the hook
   waits, so any input — local, or the lease holder's — first answers the
-  hook "no decision", and that input waits until the released hooks exited,
-  at most 500 ms, so it reaches Codex's own prompt; or the runtime
-  restarted), `process_ended` (the process
+  hook "no decision"; that input is consumed, never written, since the user
+  never saw the dialog it brings back: a remote `input` is answered
+  `written` with an error, a prompt or interrupt is `rejected`, and input
+  after it is consumed too while the released hooks still run, at most
+  500 ms; or the runtime restarted), `process_ended` (the process
   exited, was replaced, or the session closed or was removed).
   `answered_remote` is the host's own reason; the runtime reports the
   others. After a hand-off, a lost lease doesn't cancel the answer (§6:
@@ -537,6 +554,64 @@ takes the lease with the answer (`acquire`).
 - Local input to Claude needs no release (its dialog stays visible; first
   answer wins); it still revokes the remote lease (§5) without closing the
   approval.
+- **Atem session rules (r7.2).** For an agent whose hook can't keep a rule
+  (Codex: `updatedPermissions` fails closed) `always_rules` holds one rule
+  the host offers itself: `{rule_id, label: "Always allow `<command's first
+  line, redacted>` in <cwd> for this session", scope: "session"}`, only
+  for a shell command request: a string `command` with no other
+  `tool_input` key than `description` (any other key, such as a working
+  directory or environment, could change what runs: no rule), and the
+  hook's `cwd` — the agent session's working directory as the hook reports
+  it, not a per-command directory. File-change requests (patches) never
+  get one: their cards offer Allow once and Deny. An `apply_patch` the agent
+  runs as a shell heredoc is a shell command like any other: its rule is
+  byte-exact on the whole command, patch text included, so it matches only
+  that exact patch again. Answering `allow_always` with it
+  allows this request (the agent gets a plain allow) and, once the agent
+  took the answer, the runtime keeps the rule for that agent process: at
+  most 32 per session (a full session offers none); gone when the process
+  ends (a respawn has none); kept across a broker restart (the worker owns
+  it). The match uses the full, unredacted request: tool, the exact full
+  command (byte-equal) and the exact cwd — no prefix, glob or
+  normalisation — and only the session's own
+  agent (never a nested or foreign process of the same agent). A matching
+  request is allowed by the runtime without opening an approval: no
+  `approval_request`, no push, no lease; it appears in chat-v1 as a card in
+  state `auto_allowed` naming `rule_id`, and in the runtime's log as one
+  line without the command. The runtime does this only while a broker is
+  connected; otherwise "no decision" as ever.
+  The active rules go to every subscribed attachment with `control` as
+  `approval_rules{session_id, process_gen, rules}` whenever they change,
+  after each `sessions` snapshot (only for sessions that have any), and
+  with `rules: []` when the process ends. Revoking one is a §6 `submit`
+  with `kind:"approval_rule_revoke"` and `payload: {rule_id}` (strict:
+  exactly that field, an opaque id) under the current lease (no `acquire`
+  form): admission is the §6 order (`forbidden`, `session_closed`,
+  `stale_lease`), then the rule must be active for exactly the binding's
+  process, else `stale_target` (nothing recorded or dispatched). It is
+  dispatched to the runtime and completes once the runtime dropped the
+  rule; the new list follows. An allow the runtime wrote for that rule and
+  the agent hasn't taken yet is withdrawn ("no decision": the agent's own
+  prompt asks). A rule the session can't keep at the moment the agent takes
+  the answer (it already holds 32) is not kept: the request is allowed once
+  and its chat-v1 card ends `allowed` with a `note` saying so. Rules are
+  bound to the host's identity: each is kept with the account, device and
+  host trust generation it was granted under. When any of them changes
+  while the host runs, every runtime worker drops all its rules (viewers
+  get `rules: []`). After a broker restart the adopted workers' rules are
+  inactive (matching requests ask as usual) until the new host has checked
+  them: it accepts only rules granted under its current account, device
+  and trust generation, which allow and are listed again; the worker drops
+  every other one (e.g. after `atem unpair` then `atem pair`, or another
+  account or device).
+
+  ```json
+  {"type":"session","data":{"v":1,"op":"approval_rules","id":"…","session_id":"ses-aaaaaaaaaaaa",
+    "process_gen":"22222222-…","rules":[{"rule_id":"s-0123456789abcdef",
+    "label":"Always allow `npm test` in /home/user/proj for this session","scope":"session"}]}}
+  {"type":"session","data":{"v":1,"op":"submit","id":"…","binding":{…,"lease_epoch":7},
+    "request_id":"46464646-…","kind":"approval_rule_revoke","payload":{"rule_id":"s-0123456789abcdef"}}}
+  ```
 - **chat-v1 card.** A chat-v1 conversation shows each approval of its session
   as an assistant `message` (`messageId` `approval-<approval_id>`) with one
   part `{id:"approval", kind:"approval", approval_id, tool, summary,
@@ -545,12 +620,18 @@ takes the lease with the answer (`acquire`).
   handed over), `answered_terminal`, `expired` (timed out), or `closed`
   (interrupted, released, the process ended, or a remote answer the agent
   didn't take or whose outcome is unknown, including at the 630 s hand-off
-  deadline). A
+  deadline); `auto_allowed` (r7.2) is a request a session rule allowed
+  without asking, final when it arrives, with the part's `rule_id` naming
+  the rule and `always_rules: []`. A
   state change re-sends the whole `message` (same `messageId`; the client
   replaces it). Answering from chat is a chat-v1 `submit` with `approval`
   (the payload above) instead of `text`, its `binding` without `lease_epoch`
   when `acquire` is true; its `accepted`/`complete`/`error` follow the
-  receipt as for prompts.
+  receipt as for prompts. chat-v1 `opened` carries `approvalRules` (the
+  active session rules; `[]` for an attachment without `control`) and a
+  `rules{approvalRules}` event follows each change; a chat-v1 `submit` with
+  `approval_rule_revoke: {rule_id}` instead of `text` revokes one (its
+  binding with `lease_epoch`).
 
 ## 7. Errors
 
@@ -579,7 +660,7 @@ Errors are answered in the family of the request (ruling i):
 | `unsupported_version` | unknown `v`, out-of-range representation, or a removed op (§0) |
 | `unauthorized` | not authenticated, attachment fenced, or authorization expired |
 | `forbidden` | missing permission |
-| `stale_target` | trust generation, session or process generation mismatch; approval not pending (closed, answered or unknown) or `rule_id` not offered (§6a) |
+| `stale_target` | trust generation, session or process generation mismatch; approval not pending (closed, answered or unknown) or `rule_id` not offered, or a revoked `rule_id` not active (§6a) |
 | `unknown_session` | unknown or not visible to this attachment |
 | `lease_held` | another controller holds the lease (no takeover) |
 | `stale_lease` | wrong, expired or other-attachment lease epoch |
@@ -636,7 +717,10 @@ taking control from the holder, a late answer after `push_resolved`, a
 view-only attachment, a duplicate answer, and pending approvals after `list`
 on a new attachment. r7.1 adds a second `hello` replacing the attachment (old
 lease gone, old `attachment_gen` → `stale_target`, the receipt still
-queryable, another replacement within a second `busy`).
+queryable, another replacement within a second `busy`). r7.2 adds revoking
+an Atem session rule (`approval_rules` on change and after `list`; an
+inactive rule and a stale lease refused with no dispatch; the revoke
+completes and the empty list follows; revoking again is `stale_target`).
 
 ## 9. Gate: trust, freshness, channel and browser grants (joint)
 

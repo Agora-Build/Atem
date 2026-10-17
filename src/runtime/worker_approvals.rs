@@ -45,12 +45,32 @@
 //! session through a shell never answers through it. A decision is handed
 //! over only while the hook has more than 5 s left. Never an allow without
 //! the broker's decision.
+//!
+//! Atem session rules (Codex, r7.2): a Codex card for a shell command offers
+//! "Always allow this command" (`approvals::SessionRule`). Once the hook
+//! took an `allow_always` naming it, the worker keeps the rule for this
+//! agent process (at most `MAX_SESSION_RULES`, else `RuleNotKept`; gone when
+//! the process ends, kept across broker restarts since the worker owns it).
+//! A later request of this session's pinned Codex (`codex_owns`; a nested or
+//! foreign `codex` never) whose tool, full command and cwd are byte-equal to
+//! a rule's is answered allow by the worker itself while a broker is
+//! connected — no approval is opened — and reported `AutoAllowed`
+//! (redacted). Each rule keeps the identity and trust generation it was
+//! granted under (`RuleGrant`, from the decision; a decision without one
+//! keeps nothing). A rule allows only while confirmed by the broker
+//! connected now: one this broker granted is; after every new broker
+//! connection all are unconfirmed (`unconfirm_rules`) and matching requests
+//! ask as usual until the broker accepts the rules granted under its own
+//! identity and trust (`confirm_rules`, which drops the others). The broker
+//! can revoke a rule (`revoke`) or all of them (`revoke_all`: the host's
+//! identity or trust changed); an allow written for a revoked rule that the
+//! hook hasn't taken is withdrawn. Every change is reported as `Rules`.
 
 use crate::chat::adapter::ToolResultKind;
-use crate::chat::approvals::{self, Agent, Request};
-use crate::runtime::worker_protocol::ApplyOutcome;
+use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request, SessionRule};
+use crate::runtime::worker_protocol::{ApplyOutcome, HeldRule, RuleGrant};
 use crate::session_protocol::host::ApprovalInfo;
-use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision};
+use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision, MAX_SESSION_RULES};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -69,7 +89,6 @@ const CROSSED_MS: i64 = 100;
 const RESULT_SLACK_MS: i64 = 1000;
 /// Largest request or post file read.
 pub const MAX_FILE: u64 = 256 * 1024;
-const SHELLS: [&str; 8] = ["sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -85,6 +104,23 @@ pub enum Event {
         request_id: String,
         outcome: ApplyOutcome,
     },
+    /// Allowed by the session rule `rule_id` without asking (r7.2); `tool`
+    /// and `summary` are redacted as on a card.
+    AutoAllowed {
+        request_id: String,
+        rule_id: String,
+        tool: String,
+        summary: String,
+    },
+    /// The session's rules changed (the whole list).
+    Rules(Vec<HeldRule>),
+    /// The broker's `revoke_approval_rule`: whether the rule was active
+    /// (never produced by `Approvals`; the worker reports it).
+    RuleRevoked { rule_id: String, ok: bool },
+    /// The hook took an `allow_always` choosing a session rule, but the
+    /// session already holds `MAX_SESSION_RULES`: allowed once, not kept
+    /// (reported before its `Applied`).
+    RuleNotKept { request_id: String },
 }
 
 /// What the agent did, as the worker learns it besides the hook files.
@@ -105,7 +141,12 @@ pub enum Evidence {
         at_ms: i64,
     },
     /// A new prompt or the turn's end; `interrupted`: the user stopped it.
-    TurnEnded { interrupted: bool },
+    /// `at_ms`: when the agent reported it (unix ms); it answers only a
+    /// request opened by then (unknown: any).
+    TurnEnded {
+        interrupted: bool,
+        at_ms: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +176,14 @@ struct Waiting {
     opened_ms: i64,
     /// Sent to the broker.
     reported: bool,
+    /// This session's agent started its hook (Codex; Claude: always).
+    ours: bool,
+    /// The session rule an `allow_always` decision chose and what it was
+    /// granted under, kept once the hook took it.
+    pending_rule: Option<(SessionRule, RuleGrant)>,
+    /// The session rule whose allow the worker wrote for it (auto-allowed);
+    /// revoking the rule withdraws that allow while the hook hasn't taken it.
+    auto_rule: Option<String>,
     state: State,
 }
 
@@ -142,7 +191,8 @@ pub struct Approvals {
     dir: PathBuf,
     agent: Agent,
     /// The session's agent process (the PTY child).
-    agent_pid: Option<u32>,
+    /// Who a Codex hook must have been started by (`HookAgent`).
+    hook_agent: HookAgent,
     timeout: Duration,
     confirm: Duration,
     waiting: BTreeMap<String, Waiting>,
@@ -150,6 +200,19 @@ pub struct Approvals {
     codex_session: Option<String>,
     /// Events produced outside `poll`, sent with its next result.
     queued: Vec<Event>,
+    /// Codex: one of this session's requests got "no decision" since the
+    /// last `take_released`, so Codex shows its own dialog for it.
+    released: bool,
+    /// Codex: the Atem session rules of this agent process, oldest first.
+    rules: Vec<Kept>,
+}
+
+/// A session rule the worker keeps.
+struct Kept {
+    rule: SessionRule,
+    granted_under: RuleGrant,
+    /// Granted or accepted by the broker connected now: only then it allows.
+    confirmed: bool,
 }
 
 fn is_id(id: &str) -> bool {
@@ -196,45 +259,6 @@ fn hook_alive(pid: u32, start: Option<u64>) -> bool {
         }
 }
 
-fn is_shell(name: &str) -> bool {
-    SHELLS.contains(&name)
-}
-
-/// How a hook relates to the session's agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ancestry {
-    /// Its parent is the agent, or a shell (that didn't exec) whose parent is.
-    Direct,
-    /// Through a non-shell child of the agent: a wrapper such as npm's
-    /// `codex`, which runs the real binary as its child — or a `codex` the
-    /// agent itself started without a shell. Ambiguous.
-    Wrapped,
-    /// Not started by the agent (e.g. a `codex` started inside the session
-    /// through a shell is deeper).
-    Foreign,
-}
-
-fn started_by(parent: u32, agent: u32) -> Ancestry {
-    use super::adopt::process_parent_and_name;
-    let mut q = parent;
-    if q == agent {
-        return Ancestry::Direct;
-    }
-    let Some((up, name)) = process_parent_and_name(q) else {
-        return Ancestry::Foreign;
-    };
-    if is_shell(&name) {
-        q = up;
-        if q == agent {
-            return Ancestry::Direct;
-        }
-    }
-    match process_parent_and_name(q) {
-        Some((up, name)) if !is_shell(&name) && up == agent => Ancestry::Wrapped,
-        _ => Ancestry::Foreign,
-    }
-}
-
 /// Equal tool inputs (serde_json's maps compare regardless of key order).
 fn same_tool(r: &Request, tool_name: &str, input: &Value) -> bool {
     r.tool_name == tool_name && &r.tool_input == input
@@ -247,13 +271,127 @@ impl Approvals {
         Self {
             dir: approvals::approvals_dir(session_dir),
             agent,
-            agent_pid,
+            hook_agent: HookAgent::new(agent_pid),
             timeout: Duration::from_secs(agent.timeout_secs()),
             confirm: CONFIRM,
             waiting: BTreeMap::new(),
             codex_session: None,
             queued: Vec::new(),
+            released: false,
+            rules: Vec::new(),
         }
+    }
+
+    /// The session rules, oldest first, with what each was granted under
+    /// and whether the connected broker confirmed it.
+    pub fn rules(&self) -> Vec<HeldRule> {
+        self.rules
+            .iter()
+            .map(|r| HeldRule {
+                rule: r.rule.rule.clone(),
+                granted_under: r.granted_under.clone(),
+                confirmed: r.confirmed,
+            })
+            .collect()
+    }
+
+    /// A new broker connected: no rule allows until it confirms it.
+    pub fn unconfirm_rules(&mut self) {
+        for r in &mut self.rules {
+            r.confirmed = false;
+        }
+    }
+
+    /// The broker accepted the unconfirmed rules `rule_ids` (granted under
+    /// its identity and trust): they allow again. Every other unconfirmed
+    /// rule is dropped; confirmed ones (granted by this broker meanwhile)
+    /// stay.
+    pub fn confirm_rules(&mut self, rule_ids: &[String]) {
+        self.rules.retain_mut(|r| {
+            if !r.confirmed {
+                r.confirmed = rule_ids.contains(&r.rule.rule.rule_id);
+            }
+            r.confirmed
+        });
+    }
+
+    /// Revokes the session rule `rule_id`; false when it isn't held.
+    /// An allow it wrote that the hook hasn't taken yet is withdrawn ("no
+    /// decision": Codex's own dialog asks).
+    pub fn revoke(&mut self, rule_id: &str) -> bool {
+        let before = self.rules.len();
+        self.rules.retain(|r| r.rule.rule.rule_id != rule_id);
+        self.withdraw_auto(|r| r == rule_id);
+        self.rules.len() != before
+    }
+
+    /// Drops every session rule (the host's identity or trust generation
+    /// changed), withdrawing allows not yet taken, as `revoke`.
+    pub fn revoke_all(&mut self) {
+        self.rules.clear();
+        self.withdraw_auto(|_| true);
+    }
+
+    /// Withdraws the not-yet-taken allows written for the rules `which`
+    /// names: those hooks get "no decision" instead.
+    fn withdraw_auto(&mut self, which: impl Fn(&str) -> bool) {
+        let ids: Vec<String> = self
+            .waiting
+            .iter()
+            .filter(|(_, w)| w.auto_rule.as_deref().is_some_and(&which))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(w) = self.waiting.get_mut(&id) {
+                w.auto_rule = None;
+            }
+            if self.withdraw(&id) {
+                self.write_decision(&id, "");
+                self.released = true;
+            }
+        }
+    }
+
+    /// Keeps `rule`, granted under `granted_under`, confirmed (the hook
+    /// took the `allow_always` that chose it); false when the session
+    /// already holds as many as it may. One with the same matcher counts as
+    /// kept: it takes the new grant and is confirmed.
+    fn keep_rule(&mut self, rule: SessionRule, granted_under: RuleGrant) -> bool {
+        if let Some(held) = self
+            .rules
+            .iter_mut()
+            .find(|r| r.rule.matcher == rule.matcher)
+        {
+            if !held.confirmed || held.granted_under != granted_under {
+                held.confirmed = true;
+                held.granted_under = granted_under;
+                self.queued.push(Event::Rules(self.rules()));
+            }
+            return true;
+        }
+        if self.rules.len() >= MAX_SESSION_RULES {
+            eprintln!(
+                "atem worker: session rule {} not kept: the session holds {MAX_SESSION_RULES}",
+                rule.rule.rule_id
+            );
+            return false;
+        }
+        self.rules.push(Kept {
+            rule,
+            granted_under,
+            confirmed: true,
+        });
+        self.queued.push(Event::Rules(self.rules()));
+        true
+    }
+
+    /// The confirmed rule this request matches exactly, if any.
+    fn matching_rule(&self, request: &Request) -> Option<&SessionRule> {
+        let matcher = request.matcher.as_ref()?;
+        self.rules
+            .iter()
+            .find(|r| r.confirmed && &r.rule.matcher == matcher)
+            .map(|r| &r.rule)
     }
 
     #[cfg(test)]
@@ -321,8 +459,10 @@ impl Approvals {
             return;
         };
         let reported = w.reported;
+        let to_dialog = self.agent == Agent::Codex && w.ours;
         match w.state.clone() {
             State::Open => {
+                self.released |= to_dialog;
                 self.write_decision(id, "");
                 self.set(id, State::Released);
                 if reported {
@@ -334,6 +474,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
+                    self.released |= to_dialog;
                     self.write_decision(id, "");
                     self.set(id, State::Released);
                     self.queued.push(Event::Applied {
@@ -346,6 +487,12 @@ impl Approvals {
             }
             State::Claimed { .. } | State::Released => {}
         }
+    }
+
+    /// Codex: some of this session's requests got "no decision" (its own
+    /// dialog shows them) since the last call.
+    pub fn take_released(&mut self) -> bool {
+        std::mem::take(&mut self.released)
     }
 
     /// The broker's `release_approval` (the host closed it): "no decision".
@@ -394,11 +541,13 @@ impl Approvals {
 
     /// The broker's decision for `id`. `Some(Applied{not_delivered})` when
     /// it can't be handed over; the outcome otherwise follows from `poll`.
+    /// A session rule `rule_id` chooses is kept only with `granted_under`.
     pub fn decide(
         &mut self,
         id: &str,
         decision: ApprovalDecision,
         rule_id: Option<&str>,
+        granted_under: Option<&RuleGrant>,
         message: Option<&str>,
     ) -> Option<Event> {
         let refused = Some(Event::Applied {
@@ -425,6 +574,18 @@ impl Approvals {
         };
         if !self.write_decision(id, &output) {
             return refused;
+        }
+        let rule = w
+            .request
+            .as_ref()
+            .and_then(|r| r.session_rule.clone())
+            .filter(|r| {
+                decision == ApprovalDecision::AllowAlways
+                    && Some(r.rule.rule_id.as_str()) == rule_id
+            })
+            .zip(granted_under.cloned());
+        if let Some(w) = self.waiting.get_mut(id) {
+            w.pending_rule = rule;
         }
         let deny = (decision == ApprovalDecision::Deny).then(|| {
             message
@@ -476,6 +637,16 @@ impl Approvals {
     fn claimed(&mut self, id: &str, allow: bool, deny: Option<String>) {
         let claim_ms = self.take_claim(id).unwrap_or_else(now_ms);
         if self.agent == Agent::Codex {
+            // A rule the full session couldn't keep is said before the
+            // answer completes (its card is still known then).
+            if let Some((rule, granted_under)) =
+                self.waiting.get_mut(id).and_then(|w| w.pending_rule.take())
+                && !self.keep_rule(rule, granted_under)
+            {
+                self.queued.push(Event::RuleNotKept {
+                    request_id: id.into(),
+                });
+            }
             self.queued.push(Event::Applied {
                 request_id: id.into(),
                 outcome: ApplyOutcome::Ok,
@@ -579,7 +750,7 @@ impl Approvals {
         let req_path = self.path("req", id, ".json");
         let opened_ms = mtime_ms(&req_path).unwrap_or_else(now_ms);
         let value = read_capped(&req_path).and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        let request = value
+        let mut request = value
             .as_ref()
             .and_then(|v| approvals::request(self.agent, v));
         let ids: Vec<u32> = read_capped(&self.path("pid", id, ""))
@@ -598,6 +769,25 @@ impl Approvals {
             Agent::Claude => true,
             Agent::Codex => self.codex_owns(ids.get(1).copied(), value.as_ref()),
         };
+        // A session rule allows it: only this session's pinned agent, only
+        // while a broker is connected (it shows the note).
+        let auto = request
+            .as_ref()
+            .filter(|_| connected && ours && self.agent == Agent::Codex)
+            .and_then(|r| {
+                let rule = self.matching_rule(r)?;
+                Some(Event::AutoAllowed {
+                    request_id: id.to_string(),
+                    rule_id: rule.rule.rule_id.clone(),
+                    tool: r.info.tool.clone(),
+                    summary: r.info.summary.clone(),
+                })
+            });
+        if let Some(r) = request.as_mut()
+            && self.rules.len() >= MAX_SESSION_RULES
+        {
+            r.withdraw_session_rule();
+        }
         let info = request.as_ref().map(|r| r.info.clone());
         self.waiting.insert(
             id.to_string(),
@@ -607,9 +797,24 @@ impl Approvals {
                 opened: Instant::now(),
                 opened_ms,
                 reported: false,
+                ours,
+                pending_rule: None,
+                auto_rule: None,
                 state: State::Open,
             },
         );
+        if let Some(event) = auto
+            && self.write_decision(id, &approvals::allow_output())
+        {
+            // Done for the broker: the files go once the hook is gone.
+            if let (Some(w), Event::AutoAllowed { rule_id, .. }) =
+                (self.waiting.get_mut(id), &event)
+            {
+                w.auto_rule = Some(rule_id.clone());
+            }
+            self.set(id, State::Released);
+            return Some(event);
+        }
         match info {
             Some(info) if connected && ours => {
                 self.waiting.get_mut(id).unwrap().reported = true;
@@ -629,14 +834,15 @@ impl Approvals {
     /// session's agent. Started directly, its Codex session becomes the
     /// pinned one (so `/new` inside Codex keeps working); through a
     /// non-shell child (ambiguous: a wrapper, or a nested `codex`) it must be
-    /// the pinned session, or the first one seen. A request without a
-    /// session id can't be matched: only a hook whose parent is the agent
-    /// itself counts.
+    /// the pinned session, or the first one seen — which makes that child
+    /// (the real binary under npm's wrapper) the agent from then on
+    /// (`HookAgent`). A request without a session id can't be matched: only
+    /// a hook whose parent is the agent itself counts.
     fn codex_owns(&mut self, parent: Option<u32>, request: Option<&Value>) -> bool {
-        let (Some(agent), Some(parent)) = (self.agent_pid, parent) else {
+        let Some(parent) = parent else {
             return false;
         };
-        let ancestry = started_by(parent, agent);
+        let ancestry = self.hook_agent.ancestry(parent);
         if ancestry == Ancestry::Foreign {
             return false;
         }
@@ -645,7 +851,7 @@ impl Approvals {
             .and_then(Value::as_str);
         match (session, ancestry) {
             // Without a session id only a hook the agent started itself.
-            (None, Ancestry::Direct) => parent == agent,
+            (None, Ancestry::Direct) => self.hook_agent.is_agent(parent),
             (None, _) => false,
             (Some(session), Ancestry::Direct) => {
                 self.codex_session = Some(session.to_string());
@@ -655,6 +861,7 @@ impl Approvals {
                 Some(pinned) => pinned == session,
                 None => {
                     self.codex_session = Some(session.to_string());
+                    self.hook_agent.pinned_by(ancestry);
                     true
                 }
             },
@@ -682,11 +889,18 @@ impl Approvals {
 
     fn weigh(&mut self, ev: Evidence, out: &mut Vec<Event>) {
         match &ev {
-            Evidence::TurnEnded { .. } => {
+            Evidence::TurnEnded { at_ms, .. } => {
+                // A request opened after it (read in the same pass) is not
+                // what the turn's end or the new prompt answered. A
+                // whole-second time (a filesystem keeping seconds) counts
+                // to the end of its second.
+                let at = at_ms.map(|at| if at % 1000 == 0 { at + 999 } else { at });
                 let ids: Vec<String> = self
                     .waiting
                     .iter()
-                    .filter(|(_, w)| w.state != State::Released)
+                    .filter(|(_, w)| {
+                        w.state != State::Released && at.is_none_or(|at| at >= w.opened_ms)
+                    })
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in ids {
@@ -719,7 +933,9 @@ impl Approvals {
         };
         let reported = w.reported;
         let reason = match ev {
-            Evidence::TurnEnded { interrupted: true } => ApprovalCloseReason::Interrupted,
+            Evidence::TurnEnded {
+                interrupted: true, ..
+            } => ApprovalCloseReason::Interrupted,
             _ => ApprovalCloseReason::AnsweredTerminal,
         };
         match w.state.clone() {

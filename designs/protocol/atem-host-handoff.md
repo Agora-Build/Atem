@@ -130,7 +130,9 @@ terminal-v1:
   current lease.
 - Each `input` is answered with `written` (no `error`, or an error text;
   `"control changed; not written"` when the bytes were dropped at the write
-  boundary because control moved or the lease's deadline passed).
+  boundary because control moved or the lease's deadline passed;
+  `"the approval was handed to the terminal; not written"` when they
+  released a waiting Codex approval hook and were consumed).
 - Lease deadline at the write boundary: every remote write and paste the
   broker hands a worker carries `not_after`, the lease's deadline on
   `CLOCK_MONOTONIC`; the worker's PTY writer drops a chunk whose deadline has
@@ -154,19 +156,42 @@ chat-v1:
   session receipt.
 - At most 8 open conversations per session: a ninth `open` closes the oldest
   (`close`).
-- Codex has no chat (`capabilities: ["terminal-v1"]`; Claude:
-  `["terminal-v1","chat-v1"]`).
+- Claude: `capabilities: ["terminal-v1","chat-v1"]`. Codex has chat-v1
+  only with Atem's Codex hooks on (`[codex] hooks = true`; else
+  `["terminal-v1"]`, and a `prompt` there is `rejected` with "chat is not
+  available for this agent; use the terminal"). Before Codex's first prompt
+  its status is `unknown`
+  with the detail "type a first prompt in the terminal: …", and a chat
+  `submit` (or a `prompt` receipt) is `rejected` with that text as its
+  `detail`/`text`; a submit refused for the status (busy, a local draft) is
+  `rejected` with the reason too.
+- `opened` carries `unavailable`: an array of strings naming what the
+  agent's chat can't provide — `streaming`, `reasoning`, `error_details`
+  (all three for Codex, none for Claude) — and `approvalRules`, the
+  session's active Atem session rules (r7.2, below).
 
 Receipts (session-v1 `submit`), per kind:
 
-- `prompt`: pasted into Claude once its chat accepts it, completed when the
-  chat reports the turn's end (`turn_id`). On a session without chat (Codex)
-  it is `rejected` with no effect.
-- `interrupt`: writes Esc; completes when a turn ends, or at once when none
-  runs.
+- `prompt`: pasted into the agent once its chat accepts it (status
+  `ready`, no local draft), completed when the chat reports the turn's end
+  (`turn_id`). On a session without chat (Codex with its hooks off) it is
+  `rejected` with no effect.
+- `interrupt`: writes Esc only while the chat status says a turn runs
+  (`working`/`waiting`) and completes when it ends; in `ready` or `unknown`
+  it completes at once ("no turn was running") with nothing written. A
+  session without turn state — any agent: Codex with its hooks off, Claude
+  before its SessionStart or after its chat was withdrawn — gets it
+  `rejected` ("no turn state; use the terminal"), never Esc.
 - `stop`: stops the agent; completes at its exit.
 - `approval`: handed to the agent's waiting permission hook; completes when
   the agent applied it (see [Approvals](#approvals-r7-6a-on-featapprovals)).
+- `approval_rule_revoke` (r7.2): `{rule_id}` under the current lease;
+  dispatched to the session's worker, completed when it dropped the rule
+  (an inactive rule is `stale_target` at admission).
+- An `interrupt` (or `prompt`) whose write only handed a waiting Codex
+  approval to Codex's own dialog is `rejected` with "the approval was handed
+  to the terminal; interrupt again to stop the turn" ("…; not written" for a
+  prompt): show it as is; a second interrupt stops the turn.
 - A dispatch refused before anything was queued is `rejected` ("could not
   write to the terminal"); a writer failure after queueing is
   `outcome_unknown` ("write interrupted"). Work executing when the broker
@@ -186,6 +211,65 @@ Pairing, verification and unlock:
   the running operation only and dropped after it ends; a CLI that goes away
   ends it (`verifyAbort` for verification); a lost link ends it, never
   replayed.
+
+## Codex chat (for Astation)
+
+Codex now has a chat-v1 adapter (branch `feat/codex-chat`; design:
+`designs/agent-chat-host.md`, "Codex"). What changes for the relay and the
+web page:
+
+- **Availability.** `["terminal-v1","chat-v1"]` only when the user allowed
+  Atem's Codex hooks (`[codex] hooks = true`, asked once at the first
+  `atem agent launch codex`; with it on, every Codex worker keeps the hooks
+  merged, so menu launches get chat too; Codex also needs them trusted in
+  its `/hooks`).
+  Otherwise `["terminal-v1"]` and no turn state. Show chat per descriptor,
+  not per provider.
+- **`opened.unavailable`.** An array of strings naming what the agent's chat
+  cannot provide: `streaming`, `reasoning`, `error_details`. Codex sends all
+  three, Claude `[]`. Hide or disable the matching UI (no typing indicator
+  for partial text, no reasoning fold, no error detail). Unknown names must
+  be ignored. ("Always allow" is offered on Codex cards as an Atem session
+  rule, see below.)
+- **Typed chat-v1 decoder: accept unknown fields.** Astation's typed
+  chat-v1 decoder must accept (ignore) fields it doesn't know before Codex
+  `opened` messages arrive: `opened.unavailable` is new, and a decoder that
+  rejects unknown fields would drop every Codex `opened`.
+- **No streaming.** A Codex reply arrives whole, as the rollout records it
+  (commentary and final answers are separate messages; a command run is a
+  `Bash` tool part). Do not animate it as a stream.
+- **Activity is real.** Codex's `activity` (descriptor, `atem agent list`,
+  chat `status`) is `unknown` before its first prompt, then `working`,
+  `waiting` (a permission prompt is open) and `ready`. It no longer stays
+  `unknown`. The activity dot should follow process state: `exited` or an
+  unavailable session is not "ready", and `unknown` is grey, never green.
+- **First-prompt refusal.** Codex reports nothing until it gets a prompt, so
+  chat opens in status `unknown` with the detail "type a first prompt in the
+  terminal: Codex reports nothing before it (and Atem's Codex hooks must be
+  trusted in its /hooks)". A chat `submit` (or a session-v1 `prompt`
+  receipt) before then is refused: chat-v1 `error{text}` and the receipt's
+  `rejected` `detail` carry that same text. Show it and let the user type in
+  the terminal; chat prompts work once the status is `ready` (after that first turn ends).
+  Other refusals (busy, a local draft) now carry their reason the same way.
+  With hooks off, a prompt is `rejected` with "chat is not available for
+  this agent; use the terminal".
+- **Interrupt.** Esc is written only while the status is `working` or
+  `waiting`, and the receipt completes at that turn's end (chat `complete`
+  with outcome `interrupted`). In `ready` or `unknown` it completes at once
+  with nothing written. With no turn state (hooks off; Claude too, before its
+  SessionStart or after its chat was withdrawn) it is `rejected` ("no turn
+  state; use the terminal"). `outcome_unknown` after 10 s means no interrupt
+  was observed.
+- **Prompt origin.** Only a prompt after the paste can be the remote one; a
+  local prompt typed just before shows as `origin: local`. Compaction turns
+  produce no `complete`.
+- **Approvals** are unchanged: cards in the chat, allow once / deny only.
+- **Worker `hello.chat` is required** (an older worker is
+  `recovery_required` after a runtime upgrade; no compatibility).
+
+Known limits: filesystems and logs with whole-second times allow same-second
+races when pairing a prompt or a turn end; tool-result evidence keeps 1 s
+slack; a hook read after its npm-wrapper parent exited is dropped (harmless).
 
 ## Shared fixtures against the real runtime
 
@@ -296,7 +380,8 @@ Astation sees that changed since r6.2.
   pushed one never) and on reconnect sends `push_approval` only for
   approvals still pending and not expired, `push_resolved` only for ones it
   pushed.
-- **chat-v1 card.** In a Claude conversation (only for attachments with
+- **chat-v1 card.** In a chat conversation (Claude, or Codex with its hooks
+  on; only for attachments with
   `control`, live and in history) each approval is an assistant `message`
   `approval-<approval_id>` with one part `{id:"approval", kind:"approval",
   approval_id, tool, summary, always_rules, state}`; `state` is `pending`,
@@ -307,9 +392,52 @@ Astation sees that changed since r6.2.
   with the same `messageId`: replace it. Answer from chat with `submit`
   carrying `approval` (the payload above) instead of `text`; `accepted` /
   `complete` / `error{code}` follow the receipt as for prompts.
-- **Codex offers no "always allow".** Codex's hook docs reserve
-  `updatedPermissions` ("fail closed today"), so Codex requests have
-  `always_rules: []`; offer Allow once and Deny and say why.
+- **Codex: "Always allow this command" is an Atem session rule (r7.2).**
+  Codex's hook can't take a persistent rule (`updatedPermissions` fails
+  closed), so a Codex request's `always_rules` holds one Atem rule:
+  `{rule_id: "s-…", label: "Always allow `npm test` in /home/me/proj for
+  this session", scope: "session"}` for a shell command only (none for
+  file changes, for a command whose input carries anything besides
+  `command`/`description`, or when the session already holds 32). File-change
+  cards offer Allow once and Deny. Show it like Claude's rules: the
+  label on the button, the scope as "this Codex session only". Answering
+  `allow_always` with that `rule_id` allows this request; Atem keeps the
+  rule for the rest of that agent process.
+
+### Atem session rules: how to show them (r7.2)
+
+- **Auto-allowed requests.** A later request of the same Codex session with
+  the exact same command and folder is allowed by Atem without asking: no
+  `approval_request`, no push, no lease change. Each one appears in chat as
+  a card message `approval-<id>` whose part has `state: "auto_allowed"` and
+  `rule_id` (the rule that allowed it), `tool` and the redacted `summary`;
+  it is final (nothing to answer). Show it as a quiet note ("Allowed by your
+  session rule: `npm test`") with a link to the rule. runtime.log gets one
+  line naming the session, tool and rule, never the command.
+- **The rule list.** Attachments with `control` get
+  `{"op":"approval_rules","session_id","process_gen","rules":[{rule_id,
+  label, scope}]}` (session-v1) whenever it changes, after each `sessions`
+  snapshot when it isn't empty, and `rules: []` when the process ends; chat
+  conversations get `opened.approvalRules` and a `rules` op
+  (`approvalRules`) on change. Show the active rules on the session (e.g.
+  under the chat header or in the session's details), each with a
+  **Revoke** button.
+- **Revoke.** session-v1 `submit` with `kind:"approval_rule_revoke"`,
+  `payload: {"rule_id": "s-…"}` and the current `lease_epoch` (no
+  `acquire` form: take the lease first), or chat-v1 `submit` with
+  `approval_rule_revoke: {"rule_id": "s-…"}` instead of `text`. The receipt
+  completes once the worker dropped the rule (chat: `complete`), then the
+  new list arrives. An unknown or already revoked rule is `stale_target`
+  (refresh the list). A revoke also withdraws an allow written for that
+  rule that Codex hasn't taken yet (Codex's own dialog asks). A rule never
+  outlives the agent process: a respawn starts with none, and a new
+  account, device or trust generation drops every rule (`rules: []`).
+- **Rule not kept.** If the session filled up (32) between the card and the
+  answer, the request is allowed once and the card ends `allowed` with a
+  `note` ("allowed once; the rule wasn't kept: …"): show the note.
+- New shared fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule`
+  (core harness; the real-runtime runner lists it as not run, since its
+  agent is Claude, and the real-agent Codex test covers it end to end).
 
 ### Expected relay behaviour (Astation's side)
 
@@ -335,14 +463,21 @@ Astation sees that changed since r6.2.
   the card `answered_terminal`. `[claude] approvals_hook = false` in Atem's
   config.toml (default on, never asked) leaves the hook out of later
   launches: their prompts stay in the terminal.
-- Codex: one Atem entry in `~/.codex/hooks.json`, added after the first
-  `atem agent launch codex` asks once (`[codex] approvals_hook` in Atem's
-  config.toml; `false` removes it, and until it is `true` a Codex session
+- Codex: Atem's entries in `~/.codex/hooks.json` (one per Codex event;
+  PermissionRequest is the approval hook), added after the first
+  `atem agent launch codex` asks once (`[codex] hooks` in Atem's
+  config.toml; `false` removes them, and until it is `true` a Codex session
   watches nothing). Codex hides its prompt while the hook
-  waits, so any input to the session — local keys or the lease holder's —
-  first releases the waiting hooks (`approval_closed{released}`), and Atem
-  holds that input until they exited (≤ 500 ms) so it reaches Codex's own
-  prompt. Codex's hook only counts when the session's agent itself started
+  waits (showing "Running hook"), so any input to the session — local keys
+  or the lease holder's, typed or pasted — first releases the waiting hooks
+  (`approval_closed{released}`), and the input that released them is
+  consumed, never written: the user never saw the dialog it brings back, so
+  a `y` approves nothing. The local frontend shows "Codex's approval was
+  handed to the terminal; answer its dialog"; a remote `input` gets
+  `written` with `"the approval was handed to the terminal; not written"`
+  (a remote prompt or interrupt is `rejected`). Input after it is consumed
+  too while the released hooks still run (≤ 500 ms); the next key answers
+  Codex's own dialog. Codex's hook only counts when the session's agent itself started
   it.
 - Approvals live in the broker's memory: after a runtime restart every
   waiting hook gets "no decision" and an `accepted` answer is `rejected`.
@@ -368,7 +503,12 @@ Astation sees that changed since r6.2.
   `$FAKE_DIR/events` (`answer <n> allow|deny|none <message>`, `input <bytes>`).
 - `cargo test --bin atem host_bridge::tests` runs the in-process broker
   tests (card + push + acquire, deny with message, terminal answer, Codex
-  release before input, view-only link, the 630 s deadline);
+  release before input, view-only link, the 630 s deadline, and Codex chat:
+  `tests/fixtures/chat/fake-codex.py` runs the hooks.json Atem installed and
+  writes a rollout — first prompt local, then a remote prompt, an interrupt
+  and an approval);
+  `ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored`
+  runs the same against the real Claude Code and Codex (`codex_chat_end_to_end`);
   `cargo test --test runtime_fixtures_binary` runs the approval fixtures
   against the real runtime binary (table above).
 - The rejection text Claude writes for a terminal "No" (also with a typed

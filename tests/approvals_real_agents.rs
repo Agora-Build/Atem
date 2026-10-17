@@ -1,8 +1,8 @@
-//! Push-based approvals end to end with the REAL Claude Code and Codex CLIs:
-//! `atem agent launch` in a PTY (the local frontend), the real `atem
-//! runtime` and `atem worker`s, and a fake Astation on the runtime's link
-//! that answers the approvals (`kind:"approval"` submissions) and records
-//! the relay pushes.
+//! Push-based approvals, and Codex chat, end to end with the REAL Claude
+//! Code and Codex CLIs: `atem agent launch` in a PTY (the local frontend),
+//! the real `atem runtime` and `atem worker`s, and a fake Astation on the
+//! runtime's link that answers the approvals (`kind:"approval"`
+//! submissions), records the relay pushes and drives chat-v1.
 //!
 //! Costs real API calls, so it never runs in a normal `cargo test`:
 //!
@@ -319,6 +319,65 @@ impl Rig {
                           "host_trust_gen": TRUST_GEN, "session_id": sid,
                           "process_gen": generation},
                "attachment_gen": self.attachment_gen})
+    }
+
+    /// A lease on `sid` for this attachment; its epoch.
+    fn acquire(&mut self, sid: &str, generation: &str) -> u64 {
+        let id = uuid();
+        self.send(
+            json!({"type": "session", "data": {"v": 1, "op": "acquire", "id": id,
+            "binding": self.binding(sid, generation), "takeover": true}}),
+        );
+        let lease = self.wait(Duration::from_secs(10), "lease", |m| {
+            m["type"] == "session" && m["data"]["re"] == id.as_str()
+        });
+        assert_eq!(lease["data"]["op"], "lease", "{lease}");
+        lease["data"]["binding"]["lease_epoch"].as_u64().unwrap()
+    }
+
+    /// Submits `text` in chat conversation `conversation` under `lease`;
+    /// the request id.
+    fn chat_submit(
+        &mut self,
+        conversation: &str,
+        sid: &str,
+        generation: &str,
+        lease: u64,
+        text: &str,
+    ) -> String {
+        let request_id = uuid();
+        let mut binding = self.binding(sid, generation);
+        binding["lease_epoch"] = lease.into();
+        self.send(json!({"type": "agentChat", "data": {"v": 1, "op": "submit",
+            "conversationId": conversation, "agentId": sid, "binding": binding,
+            "generation": generation, "requestId": request_id, "text": text}}));
+        request_id
+    }
+
+    /// The `complete` or `error` of chat request `request_id`.
+    fn chat_done(&mut self, request_id: &str, time: Duration) -> Value {
+        let rid = request_id.to_string();
+        self.wait(time, "the chat request's end", |m| {
+            m["type"] == "agentChat"
+                && matches!(m["data"]["op"].as_str(), Some("complete" | "error"))
+                && m["data"]["requestId"] == rid.as_str()
+        })["data"]
+            .clone()
+    }
+
+    /// Waits until `sid`'s activity is `activity`.
+    fn activity(&mut self, sid: &str, activity: &str, time: Duration) {
+        let deadline = Instant::now() + time;
+        loop {
+            self.pump(Duration::from_millis(200));
+            if self
+                .descriptor(sid)
+                .is_some_and(|d| d["activity"] == activity)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{sid} never became {activity}");
+        }
     }
 
     /// The next `approval_request` for `sid` not in `known`.
@@ -832,13 +891,22 @@ fn codex_idle(text: &str) -> bool {
     !text.contains("esc to interrupt") && !text.contains("Working") && text.contains("›")
 }
 
-#[test]
-#[ignore = "real Codex; ATEM_REAL_AGENTS=1"]
-fn codex_approvals_end_to_end() {
-    if !enabled() {
-        return;
-    }
-    let mut rig = Rig::new(true);
+/// A Codex session launched through `atem agent launch codex` in the
+/// sandbox, its hooks consented to, merged and trusted, at its prompt.
+struct CodexRun {
+    fe: Frontend,
+    sid: String,
+    generation: String,
+    home: PathBuf,
+    work: PathBuf,
+    /// What the consent and hook review did (for the report).
+    setup: String,
+}
+
+/// Launches the real Codex (`--profile oss`, on-request approvals,
+/// read-only sandbox) in a temp CODEX_HOME: answers Atem's consent
+/// question, checks the hooks.json merge and trusts the hooks in Codex.
+fn launch_codex(rig: &mut Rig) -> CodexRun {
     let work = rig.sb.home.join("cproj");
     std::fs::create_dir_all(&work).unwrap();
     let home = rig.sb.dir.path().join("codex-home");
@@ -854,9 +922,8 @@ fn codex_approvals_end_to_end() {
         env.push((env_key.clone(), value));
     }
     let extra: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut report: Vec<String> = Vec::new();
 
-    // 5. Consent and the hooks.json merge.
+    // Consent and the hooks.json merge.
     let mut fe = rig.sb.spawn(
         &[
             "agent",
@@ -873,7 +940,7 @@ fn codex_approvals_end_to_end() {
         &extra,
     );
     screen_until(&fe, "the consent question", Duration::from_secs(20), |t| {
-        t.contains("Allow approvals from Astation for Codex?")
+        t.contains("Let Astation follow Codex sessions")
     });
     fe.send(b"y\r");
     let (sid, generation) = rig.new_session(&[]);
@@ -892,12 +959,9 @@ fn codex_approvals_end_to_end() {
     assert!(ours.starts_with(": atem-approval-hook;"), "{hooks}");
     let atem_config =
         std::fs::read_to_string(rig.sb.config().join("config.toml")).unwrap_or_default();
+    assert!(atem_config.contains("hooks = true"), "{atem_config}");
     assert!(
-        atem_config.contains("approvals_hook = true"),
-        "{atem_config}"
-    );
-    assert!(
-        fe.written().contains("Added Atem's approval hook to"),
+        fe.written().contains("Added Atem's hooks to"),
         "no setup notice"
     );
 
@@ -921,9 +985,35 @@ fn codex_approvals_end_to_end() {
     let trusted = std::fs::read_to_string(home.join("oss.config.toml")).unwrap_or_default()
         + &std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
     let trust_entries = trusted.matches("trusted_hash").count();
-    report.push(format!(
-        "5 consent: asked once, y → [codex] approvals_hook = true; hooks.json merged (Stop hook kept, backup = original); review screen shown: {reviewed}; trusted_hash entries written: {trust_entries}"
-    ));
+    let setup = format!(
+        "consent: asked once, y → [codex] hooks = true; hooks.json merged (Stop hook kept, backup = original); review screen shown: {reviewed}; trusted_hash entries written: {trust_entries}"
+    );
+    CodexRun {
+        fe,
+        sid,
+        generation,
+        home,
+        work,
+        setup,
+    }
+}
+
+#[test]
+#[ignore = "real Codex; ATEM_REAL_AGENTS=1"]
+fn codex_approvals_end_to_end() {
+    if !enabled() {
+        return;
+    }
+    let mut rig = Rig::new(true);
+    let CodexRun {
+        mut fe,
+        sid,
+        generation,
+        home,
+        work,
+        setup,
+    } = launch_codex(&mut rig);
+    let mut report: Vec<String> = vec![format!("5 {setup}")];
 
     let mut known: Vec<String> = Vec::new();
 
@@ -936,10 +1026,13 @@ fn codex_approvals_end_to_end() {
     let aid = request["approval_id"].as_str().unwrap().to_string();
     known.push(aid.clone());
     assert_eq!(request["process_gen"], generation.as_str());
+    // Codex's chat status while the hook waits (the worker's open approval).
+    rig.activity(&sid, "waiting", Duration::from_secs(10));
+    // Codex takes no persistent rule: the card offers an Atem session rule.
     assert!(
         request["always_rules"]
             .as_array()
-            .is_some_and(|r| r.is_empty()),
+            .is_some_and(|r| r.len() == 1 && r[0]["scope"] == "session"),
         "{request}"
     );
     let push = rig.push("push_approval", &aid, Duration::from_secs(10));
@@ -960,8 +1053,8 @@ fn codex_approvals_end_to_end() {
     });
     screen_until(&fe, "Codex idle", TURN, codex_idle);
     report.push(format!(
-        "6 allow_once: request tool={} summary={:?} rules=[]; receipt {states:?} (final {}); closed answered_remote; push expires_at-created_at={} ms; file created",
-        request["tool"], request["summary"], receipt["state"],
+        "6 allow_once: request tool={} summary={:?} rules={}; receipt {states:?} (final {}); closed answered_remote; push expires_at-created_at={} ms; file created",
+        request["tool"], request["summary"], request["always_rules"], receipt["state"],
         push["expires_at"].as_u64().unwrap_or(0).saturating_sub(request["created_at"].as_u64().unwrap_or(0))
     ));
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
@@ -999,7 +1092,9 @@ fn codex_approvals_end_to_end() {
         "the model never saw the deny message"
     );
 
-    // 8. a local key while the hook waits: released, Codex's own prompt.
+    // 8. a local key while the hook waits: it releases the hook and is
+    //    consumed (the user saw only "Running hook", never the dialog), so
+    //    even a 'y' approves nothing; Codex's own dialog then takes the key.
     type_line(
         &mut fe,
         "Run the shell command: touch codex-local.txt . Do nothing else.",
@@ -1008,48 +1103,289 @@ fn codex_approvals_end_to_end() {
     let aid = request["approval_id"].as_str().unwrap().to_string();
     known.push(aid.clone());
     std::thread::sleep(Duration::from_secs(1));
-    let before = fe.text();
-    let dialog_before = before.contains("Yes, proceed");
+    let dialog_before = fe.text().contains("Yes, proceed");
     fe.send(b"y");
     let reason = rig.closed(&aid, Duration::from_secs(10));
     let resolved = rig.push("push_resolved", &aid, Duration::from_secs(10));
-    let created = {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if work.join("codex-local.txt").exists() {
-                break true;
-            }
-            if Instant::now() > deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    let mut note = String::new();
-    if !created {
-        // The key didn't reach Codex's dialog: answer it now it shows.
-        note = format!(
-            "; the first 'y' did not answer Codex's dialog (screen after it, redacted):\n{}",
-            redact(&fe.text())
-        );
-        screen_until(&fe, "Codex's own dialog", Duration::from_secs(30), |t| {
-            t.contains("Yes, proceed")
-        });
-        fe.send(b"y");
-        within_secs("codex-local.txt", 60, || {
-            work.join("codex-local.txt").exists()
-        });
-    }
+    screen_until(&fe, "Codex's own dialog", Duration::from_secs(30), |t| {
+        t.contains("Yes, proceed")
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let consumed = !work.join("codex-local.txt").exists();
+    fe.send(b"y");
+    within_secs("codex-local.txt", 60, || {
+        work.join("codex-local.txt").exists()
+    });
     screen_until(&fe, "Codex idle", TURN, codex_idle);
     report.push(format!(
-        "8 local key while the hook waits: dialog visible before: {dialog_before}; closed {reason}; push_resolved {}; first 'y' answered Codex's own prompt: {created}{note}",
+        "8 local key while the hook waits: dialog visible before: {dialog_before}; closed {reason}; push_resolved {}; first 'y' consumed: {consumed}; 'y' at Codex's own dialog created the file",
         resolved["reason"]
     ));
     assert_eq!(reason, "released");
     assert_eq!(resolved["reason"], "released");
+    assert!(consumed, "the releasing key answered Codex's dialog");
+
+    // 9. "Always allow this command" (an Atem session rule): the same
+    //    command then runs with no approval, shown as an auto_allowed card.
+    rig.send(json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+        "conversationId": "conv-rules", "agentId": sid,
+        "binding": rig.binding(&sid, &generation)}}));
+    rig.wait(Duration::from_secs(10), "chat opened", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "opened"
+            && m["data"]["conversationId"] == "conv-rules"
+    });
+    let always =
+        "Run exactly this shell command, unchanged: touch codex-always.txt . Do nothing else.";
+    type_line(&mut fe, always);
+    let request = approval_or_screen(&mut rig, &fe, &sid, &known);
+    let aid = request["approval_id"].as_str().unwrap().to_string();
+    known.push(aid.clone());
+    let rule = request["always_rules"][0].clone();
+    assert_eq!(rule["scope"], "session", "{request}");
+    let rule_id = rule["rule_id"].as_str().unwrap().to_string();
+    let (_, rid) = rig.answer(
+        &sid,
+        &generation,
+        json!({"approval_id": aid, "decision": "allow_always", "rule_id": rule_id}),
+    );
+    let (receipt, states) = rig.receipt_final(&rid, Duration::from_secs(30));
+    assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
+    within_secs("codex-always.txt", 120, || {
+        work.join("codex-always.txt").exists()
+    });
+    let r = rule_id.clone();
+    rig.wait(Duration::from_secs(10), "approval_rules", move |m| {
+        m["data"]["op"] == "approval_rules" && m["data"]["rules"][0]["rule_id"] == r.as_str()
+    });
+    screen_until(&fe, "Codex idle", TURN, codex_idle);
+    std::fs::remove_file(work.join("codex-always.txt")).unwrap();
+    let before = rig.seen.len();
+    type_line(&mut fe, always);
+    within_secs("codex-always.txt again", 120, || {
+        rig.pump(Duration::from_millis(100));
+        work.join("codex-always.txt").exists()
+    });
+    let r = rule_id.clone();
+    let card = rig.wait(Duration::from_secs(10), "auto_allowed card", move |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["parts"][0]["state"] == "auto_allowed"
+            && m["data"]["parts"][0]["rule_id"] == r.as_str()
+    });
+    screen_until(&fe, "Codex idle", TURN, codex_idle);
+    rig.pump(Duration::from_millis(500));
+    let new_cards = rig.seen[before..]
+        .iter()
+        .filter(|m| m["data"]["op"] == "approval_request")
+        .count();
+    // (runtime_log() redacts ids, the rule's too.)
+    let log = rig.runtime_log();
+    let logged = log.lines().any(|l| l.contains("allowed by session rule"));
+    let leaked = log
+        .lines()
+        .filter(|l| l.contains("allowed by session rule"))
+        .any(|l| l.contains("touch") || l.contains("codex-always"));
+    report.push(format!(
+        "9 always allow (session rule {}): receipt {states:?}; rule listed; same command ran again with {new_cards} approval_request(s); auto_allowed card summary {:?}; runtime.log line: {logged}, command text in it: {leaked}",
+        rule["label"], card["data"]["parts"][0]["summary"]
+    ));
+    assert_eq!(new_cards, 0, "the same command asked again");
+    assert!(logged && !leaked, "runtime.log: {logged} {leaked}");
 
     eprintln!("CODEX REPORT:\n{}", report.join("\n"));
-    assert!(created, "the local key didn't answer Codex's own prompt");
+}
+
+/// The texts of the assistant messages chat delivered for `turn`.
+fn assistant_texts(rig: &Rig, turn: &str) -> Vec<String> {
+    rig.seen
+        .iter()
+        .filter(|m| {
+            m["type"] == "agentChat"
+                && m["data"]["op"] == "message"
+                && m["data"]["role"] == "assistant"
+                && m["data"]["turnId"] == turn
+        })
+        .flat_map(|m| {
+            m["data"]["parts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p["markdown"].as_str().map(str::to_string))
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "real Codex; ATEM_REAL_AGENTS=1"]
+fn codex_chat_end_to_end() {
+    if !enabled() {
+        return;
+    }
+    let mut rig = Rig::new(true);
+    let CodexRun {
+        mut fe,
+        sid,
+        generation,
+        setup,
+        ..
+    } = launch_codex(&mut rig);
+    let mut report: Vec<String> = vec![setup];
+
+    // 1. Chat opens before Codex's first prompt: unknown, with the hint,
+    //    and what Codex chat can't provide; a prompt is refused.
+    rig.send(json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+        "conversationId": "conv-1", "agentId": sid, "binding": rig.binding(&sid, &generation)}}));
+    let opened = rig.wait(Duration::from_secs(10), "chat opened", |m| {
+        m["type"] == "agentChat" && m["data"]["op"] == "opened"
+    })["data"]
+        .clone();
+    assert_eq!(opened["status"]["state"], "unknown", "{opened}");
+    assert!(
+        opened["status"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("type a first prompt in the terminal")),
+        "{opened}"
+    );
+    assert_eq!(
+        opened["unavailable"],
+        json!(["streaming", "reasoning", "error_details"])
+    );
+    let lease = rig.acquire(&sid, &generation);
+    let early = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Reply with exactly the word: early",
+    );
+    let refused = rig.chat_done(&early, Duration::from_secs(10));
+    assert_eq!(refused["code"], "rejected", "{refused}");
+    report.push(format!(
+        "1 before the first prompt: opened unknown ({:?}), unavailable {}; submit refused: {:?}",
+        opened["status"]["detail"], opened["unavailable"], refused["text"]
+    ));
+
+    // 2. The first prompt, typed in the terminal (the lease goes back to
+    //    the terminal).
+    type_line(&mut fe, "Reply with exactly the word: pong");
+    let local = rig.wait(TURN, "the local prompt in chat", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["origin"] == "local"
+            && m.to_string().contains("pong")
+    })["data"]
+        .clone();
+    let turn1 = local["turnId"].as_str().unwrap().to_string();
+    rig.activity(&sid, "ready", TURN);
+    let reply1 = assistant_texts(&rig, &turn1);
+    report.push(format!(
+        "2 local first prompt: turn {turn1}; reply {:?}; activity ready",
+        reply1.iter().map(|t| redact(t)).collect::<Vec<_>>()
+    ));
+    assert!(!reply1.is_empty(), "no reply for the local prompt");
+
+    // 3. A remote chat prompt: accepted, the reply, complete.
+    let lease = rig.acquire(&sid, &generation);
+    let rid = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Reply with exactly the word: ping",
+    );
+    let user = rig.wait(TURN, "the remote prompt's message", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["role"] == "user"
+            && m["data"]["requestId"] == rid.as_str()
+    })["data"]
+        .clone();
+    let done = rig.chat_done(&rid, TURN);
+    assert_eq!(done["outcome"], "done", "{done}");
+    let turn2 = done["turnId"].as_str().unwrap_or_default().to_string();
+    assert_eq!(user["turnId"], turn2.as_str());
+    let reply2 = assistant_texts(&rig, &turn2);
+    report.push(format!(
+        "3 remote prompt: user message origin {} with requestId; complete {} turn {turn2}; reply {:?}",
+        user["origin"],
+        done["outcome"],
+        reply2.iter().map(|t| redact(t)).collect::<Vec<_>>()
+    ));
+    assert!(!reply2.is_empty(), "no reply for the remote prompt");
+    assert!(rig.has(|m| m["type"] == "agentChat"
+        && m["data"]["op"] == "accepted"
+        && m["data"]["requestId"] == rid.as_str()));
+    rig.activity(&sid, "ready", TURN);
+
+    // 4. An interrupt while a remote turn runs: Esc, completed at the
+    //    turn's end, the chat request interrupted.
+    let rid = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Write a 600-word essay about the history of terminals. Do not run any commands.",
+    );
+    rig.wait(TURN, "the essay prompt's message", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["requestId"] == rid.as_str()
+    });
+    rig.activity(&sid, "working", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_millis(1500));
+    let interrupt = uuid();
+    let id = uuid();
+    let mut binding = rig.binding(&sid, &generation);
+    binding["lease_epoch"] = lease.into();
+    rig.send(
+        json!({"type": "session", "data": {"v": 1, "op": "submit", "id": id,
+        "binding": binding, "request_id": interrupt, "kind": "interrupt", "payload": {}}}),
+    );
+    let (receipt, states) = rig.receipt_final(&interrupt, Duration::from_secs(60));
+    let done = rig.chat_done(&rid, Duration::from_secs(60));
+    report.push(format!(
+        "4 interrupt: receipt {states:?} (final {}); chat request {} outcome {}",
+        receipt["state"], done["op"], done["outcome"]
+    ));
+    rig.activity(&sid, "ready", TURN);
+    assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
+    assert_eq!(done["outcome"], "interrupted", "{done}");
+
+    // 5. /new (npm's codex: the hooks come from the real binary under the
+    //    node wrapper): chat follows the new session, local and remote.
+    type_line(&mut fe, "/new");
+    std::thread::sleep(Duration::from_secs(2));
+    type_line(&mut fe, "Reply with exactly the word: fresh");
+    let local = rig.wait(TURN, "the local prompt after /new", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["origin"] == "local"
+            && m.to_string().contains("fresh")
+    })["data"]
+        .clone();
+    let turn5 = local["turnId"].as_str().unwrap().to_string();
+    rig.activity(&sid, "ready", TURN);
+    let lease = rig.acquire(&sid, &generation);
+    let rid = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Reply with exactly the word: again",
+    );
+    let done = rig.chat_done(&rid, TURN);
+    let turn6 = done["turnId"].as_str().unwrap_or_default().to_string();
+    report.push(format!(
+        "5 /new: local prompt in the new session turn {turn5} (reply {:?}); remote prompt {} outcome {} (reply {:?})",
+        assistant_texts(&rig, &turn5).iter().map(|t| redact(t)).collect::<Vec<_>>(),
+        done["op"],
+        done["outcome"],
+        assistant_texts(&rig, &turn6).iter().map(|t| redact(t)).collect::<Vec<_>>()
+    ));
+    eprintln!("CODEX CHAT REPORT:\n{}", report.join("\n"));
+    assert_eq!(done["outcome"], "done", "{done}");
 }
 
 /// The next approval of `sid`; on a timeout the panic shows the screen.

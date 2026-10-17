@@ -234,7 +234,22 @@ impl EventReader {
                 Ok(text) => {
                     let _ = std::fs::remove_file(&path);
                     if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                        out.extend(map_hook(&v));
+                        let at = mtime
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as i64);
+                        out.extend(map_hook(&v).map(|e| match e {
+                            AgentEvent::PromptSubmitted { text, turn_id, .. } => {
+                                AgentEvent::PromptSubmitted {
+                                    text,
+                                    turn_id,
+                                    at_ms: Some(at),
+                                }
+                            }
+                            AgentEvent::TurnEnded { .. } => {
+                                AgentEvent::TurnEnded { at_ms: Some(at) }
+                            }
+                            e => e,
+                        }));
                     }
                 }
                 Err(_) => {
@@ -264,6 +279,8 @@ pub fn map_hook(json: &Value) -> Option<AgentEvent> {
         }),
         "UserPromptSubmit" => Some(AgentEvent::PromptSubmitted {
             text: s("prompt")?.to_string(),
+            turn_id: None,
+            at_ms: None,
         }),
         "PreToolUse" => Some(AgentEvent::ToolStarted),
         "PostToolUse" => Some(AgentEvent::ToolFinished),
@@ -277,7 +294,7 @@ pub fn map_hook(json: &Value) -> Option<AgentEvent> {
                 detail: message.to_string(),
             })
         }
-        "Stop" => Some(AgentEvent::TurnEnded),
+        "Stop" => Some(AgentEvent::TurnEnded { at_ms: None }),
         _ => None,
     }
 }
@@ -541,12 +558,37 @@ mod tests {
         put(&dir, "ev.b.json", prompt, 3);
         put(&dir, "ev.c.json", tool, 2);
         let mut r = EventReader::new(dir.clone());
+        let now_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let events = r.poll();
+        // The prompt carries its file's time (written 3 s ago).
+        let Some(AgentEvent::PromptSubmitted {
+            at_ms: Some(at), ..
+        }) = events.first()
+        else {
+            panic!("{events:?}")
+        };
+        assert!(
+            (now_ms - 4000..=now_ms - 2000).contains(at),
+            "{at} {now_ms}"
+        );
+        // Stop's file was written 1 s ago.
+        let Some(AgentEvent::TurnEnded { at_ms: Some(stop) }) = events.last() else {
+            panic!("{events:?}")
+        };
+        assert!((now_ms - 2000..=now_ms).contains(stop), "{stop} {now_ms}");
         assert_eq!(
-            r.poll(),
+            events,
             vec![
-                AgentEvent::PromptSubmitted { text: "hi".into() },
+                AgentEvent::PromptSubmitted {
+                    text: "hi".into(),
+                    turn_id: None,
+                    at_ms: Some(*at),
+                },
                 AgentEvent::ToolStarted,
-                AgentEvent::TurnEnded
+                AgentEvent::TurnEnded { at_ms: Some(*stop) }
             ]
         );
         assert_eq!(fs::read_dir(dir.join("events")).unwrap().count(), 0);
@@ -573,9 +615,13 @@ mod tests {
                 .unwrap();
         }
         let mut r = EventReader::new(dir.clone());
+        let at = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
         assert_eq!(
             r.poll(),
-            vec![AgentEvent::ToolStarted, AgentEvent::TurnEnded]
+            vec![
+                AgentEvent::ToolStarted,
+                AgentEvent::TurnEnded { at_ms: Some(at) }
+            ]
         );
         assert_eq!(fs::read_dir(dir.join("events")).unwrap().count(), 0);
     }
@@ -629,7 +675,7 @@ mod tests {
         );
         assert!(matches!(
             map_hook(&fixture("02-user-prompt-submit.json")),
-            Some(AgentEvent::PromptSubmitted { text }) if !text.is_empty()
+            Some(AgentEvent::PromptSubmitted { text, turn_id: None, at_ms: None }) if !text.is_empty()
         ));
         assert_eq!(
             map_hook(&fixture("03-pre-tool-use.json")),
@@ -641,7 +687,7 @@ mod tests {
         );
         assert_eq!(
             map_hook(&fixture("05-stop.json")),
-            Some(AgentEvent::TurnEnded)
+            Some(AgentEvent::TurnEnded { at_ms: None })
         );
         assert_eq!(
             map_hook(&fixture("08-notification.json")),

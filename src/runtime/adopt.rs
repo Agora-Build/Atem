@@ -182,6 +182,8 @@ pub struct WorkerInfo {
     pub input_epoch: u64,
     pub dropped: u64,
     pub exited: Option<String>,
+    /// The worker runs a chat adapter (the session offers chat-v1).
+    pub chat: bool,
 }
 
 /// The broker's connection to one worker. Messages to it go out in the order
@@ -212,40 +214,52 @@ impl WorkerHandle {
     /// worker's write boundary → `write_result`.
     #[cfg(test)]
     pub fn write(&self, seq: u64, bytes: &[u8], input_epoch: u64) -> Result<()> {
-        self.write_until(seq, bytes, input_epoch, None)
+        self.write_until(seq, bytes, input_epoch, None, false)
     }
 
     /// A remote write: dropped at the worker's PTY write boundary once
-    /// `not_after` (`pty_session::monotonic_ns`) has passed.
+    /// `not_after` (`pty_session::monotonic_ns`) has passed. With
+    /// `release_approvals` (Codex) the waiting hooks get "no decision" first,
+    /// and input that released one is consumed.
     pub fn write_until(
         &self,
         seq: u64,
         bytes: &[u8],
         input_epoch: u64,
         not_after: Option<u64>,
+        release_approvals: bool,
     ) -> Result<()> {
-        self.send(&BrokerMsg::write_until(seq, bytes, input_epoch, not_after))
+        self.send(&BrokerMsg::write_until(
+            seq,
+            bytes,
+            input_epoch,
+            not_after,
+            release_approvals,
+        ))
     }
 
     /// A bracketed paste plus Enter, under the same rule → `write_result`.
     #[allow(dead_code)] // chat-v1 submit, with the session host
     pub fn paste(&self, seq: u64, text: &str, input_epoch: u64) -> Result<()> {
-        self.paste_until(seq, text, input_epoch, None)
+        self.paste_until(seq, text, input_epoch, None, false)
     }
 
-    /// `paste` with the remote write's deadline (see `write_until`).
+    /// `paste` with the remote write's deadline and the release (see
+    /// `write_until`).
     pub fn paste_until(
         &self,
         seq: u64,
         text: &str,
         input_epoch: u64,
         not_after: Option<u64>,
+        release_approvals: bool,
     ) -> Result<()> {
         self.send(&BrokerMsg::Paste {
             seq,
             text: text.into(),
             input_epoch,
             not_after,
+            release_approvals,
         })
     }
 
@@ -267,18 +281,21 @@ impl WorkerHandle {
         self.send(&BrokerMsg::RequestScreen)
     }
 
-    /// The lease holder's answer to a waiting approval → `approval_applied`.
+    /// The lease holder's answer to a waiting approval → `approval_applied`;
+    /// `rule`: the session rule it chose and what it is granted under.
     pub fn approval_decision(
         &self,
         request_id: &str,
         decision: crate::session_protocol::wire::ApprovalDecision,
-        rule_id: Option<String>,
+        rule: Option<(String, super::worker_protocol::RuleGrant)>,
         message: Option<String>,
     ) -> Result<()> {
+        let (rule_id, granted_under) = rule.unzip();
         self.send(&BrokerMsg::ApprovalDecision {
             request_id: request_id.into(),
             decision,
             rule_id,
+            granted_under,
             message,
         })
     }
@@ -290,14 +307,32 @@ impl WorkerHandle {
         })
     }
 
-    /// "No decision" for every waiting approval (before local input).
-    pub fn release_approvals(&self) -> Result<()> {
-        self.send(&BrokerMsg::ReleaseApprovals)
-    }
-
     /// After adoption: the approvals this broker knows (the rest released).
     pub fn known_approvals(&self, request_ids: Vec<String>) -> Result<()> {
         self.send(&BrokerMsg::KnownApprovals { request_ids })
+    }
+
+    /// Revokes one of the session's Atem session rules (r7.2).
+    pub fn revoke_approval_rule(&self, rule_id: &str) -> Result<()> {
+        self.send(&BrokerMsg::RevokeApprovalRule {
+            rule_id: rule_id.into(),
+        })
+    }
+
+    /// Drops every session rule of the session.
+    pub fn revoke_all_approval_rules(&self) -> Result<()> {
+        self.send(&BrokerMsg::RevokeAllApprovalRules)
+    }
+
+    /// Asks for the session's current rules (`approval_rules`).
+    pub fn request_approval_rules(&self) -> Result<()> {
+        self.send(&BrokerMsg::RequestApprovalRules)
+    }
+
+    /// Confirms the unconfirmed rules `rule_ids`, dropping the other
+    /// unconfirmed ones (`approval_rules` follows).
+    pub fn confirm_approval_rules(&self, rule_ids: Vec<String>) -> Result<()> {
+        self.send(&BrokerMsg::ConfirmApprovalRules { rule_ids })
     }
 
     /// The worker's next message; `None` once its connection closed.
@@ -367,6 +402,7 @@ impl WorkerHandle {
                 input_epoch,
                 dropped,
                 exited,
+                chat,
             } => WorkerInfo {
                 session_id,
                 process_gen,
@@ -377,6 +413,7 @@ impl WorkerHandle {
                 input_epoch,
                 dropped,
                 exited,
+                chat,
             },
             WorkerMsg::Error { text } => bail!("the worker refused: {text}"),
             other => bail!("the worker sent {other:?} before hello"),

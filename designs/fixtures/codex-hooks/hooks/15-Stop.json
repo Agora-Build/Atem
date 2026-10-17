@@ -1,0 +1,11 @@
+{
+  "session_id": "<session-A>",
+  "turn_id": "<turn-3>",
+  "transcript_path": "/home/user/.codex/sessions/2026/10/17/rollout-2026-10-17T05-32-36-<session-A>.jsonl",
+  "cwd": "/home/user/proj",
+  "hook_event_name": "Stop",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "last_assistant_message": "Hello, a little lantern lifted gently against the gathering night,\nA doorway opening softly where the walls once held tight.\nOne word can cross the distance neither map nor compass\nMeasures, finding hidden gardens underneath the silence growing between us.\nIt asks for nothing grander than a moment freely given,\nA glance, a breath, a welcome beneath an ordinary heaven.\nHello becomes the footbridge \u2026<truncated, 739 chars>"
+}

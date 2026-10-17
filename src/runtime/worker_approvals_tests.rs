@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::chat::adapter::ToolResultKind;
-use crate::runtime::worker_protocol::ApplyOutcome;
+use crate::runtime::worker_protocol::{ApplyOutcome, RuleGrant};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
@@ -226,9 +226,17 @@ fn a_request_is_reported_redacted_and_the_decision_reaches_the_hook() {
         "curl -H 'X-Key: [redacted]' https://api.example"
     );
     assert_eq!(info.always_rules[0].label, "Allow Bash(curl:*)");
+    // Claude offers its own suggestions only (no Atem session rule).
+    assert_eq!(info.always_rules.len(), 1);
     let rule = info.always_rules[0].rule_id.clone();
     assert_eq!(
-        a.decide(request_id, ApprovalDecision::AllowAlways, Some(&rule), None),
+        a.decide(
+            request_id,
+            ApprovalDecision::AllowAlways,
+            Some(&rule),
+            None,
+            None
+        ),
         None
     );
     assert_eq!(
@@ -246,7 +254,7 @@ fn a_remote_allow_and_its_post_in_the_same_poll_are_applied() {
     let mut a = watcher(&s, Agent::Claude).with_confirm(Duration::from_secs(60));
     let hook = s.hook("claude", 30, SECRET_BASH);
     let id = request_id(&events(&mut a, true)[0]);
-    a.decide(&id, ApprovalDecision::AllowOnce, None, None);
+    a.decide(&id, ApprovalDecision::AllowOnce, None, None, None);
     assert!(printed(hook).contains(r#""behavior":"allow""#));
     // The tool ran (PostToolUse) before the worker looked again.
     s.post(&post_body());
@@ -263,7 +271,7 @@ fn a_remote_deny_followed_by_the_tool_running_is_unknown() {
     let mut a = watcher(&s, Agent::Claude).with_confirm(Duration::from_secs(60));
     let hook = s.hook("claude", 30, SECRET_BASH);
     let id = request_id(&events(&mut a, true)[0]);
-    a.decide(&id, ApprovalDecision::Deny, None, Some("no"));
+    a.decide(&id, ApprovalDecision::Deny, None, None, Some("no"));
     assert!(printed(hook).contains(r#""behavior":"deny""#));
     assert!(
         a.poll(true, Vec::new()).is_empty(),
@@ -283,7 +291,7 @@ fn a_remote_deny_confirmed_by_its_tool_result_is_applied() {
     let mut a = watcher(&s, Agent::Claude).with_confirm(Duration::from_secs(60));
     let hook = s.hook("claude", 30, SECRET_BASH);
     let id = request_id(&events(&mut a, true)[0]);
-    a.decide(&id, ApprovalDecision::Deny, None, Some("use staging"));
+    a.decide(&id, ApprovalDecision::Deny, None, None, Some("use staging"));
     printed(hook);
     assert!(a.poll(true, Vec::new()).is_empty());
     let result = Evidence::Tool {
@@ -306,7 +314,7 @@ fn terminal_evidence_before_the_claim_is_unknown() {
     let mut sleeper = s.fake_request("abc", SECRET_BASH);
     mtime_ms_ago(&s.approvals().join("req-abc.json"), 5000);
     let id = request_id(&events(&mut a, true)[0]);
-    a.decide(&id, ApprovalDecision::AllowOnce, None, None);
+    a.decide(&id, ApprovalDecision::AllowOnce, None, None, None);
     // The hook claims it now; the terminal's answer (a post) is 2 s older.
     let taken = s.approvals().join("taken-abc.json");
     std::fs::rename(s.approvals().join("dec-abc.json"), &taken).unwrap();
@@ -330,7 +338,7 @@ fn a_decision_not_yet_taken_is_withdrawn_when_the_terminal_answers() {
     let mut a = watcher(&s, Agent::Claude);
     let mut sleeper = s.fake_request("abc", SECRET_BASH);
     let id = request_id(&events(&mut a, true)[0]);
-    a.decide(&id, ApprovalDecision::AllowOnce, None, None);
+    a.decide(&id, ApprovalDecision::AllowOnce, None, None, None);
     s.post(&post_body());
     assert_eq!(
         a.poll(true, Vec::new()),
@@ -354,19 +362,19 @@ fn deny_and_bad_decisions() {
     let id = request_id(&events(&mut a, true)[0]);
     let refused = |id: &str| Some(applied(id, ApplyOutcome::NotDelivered));
     assert_eq!(
-        a.decide(&id, ApprovalDecision::AllowAlways, Some("r0-x"), None),
+        a.decide(&id, ApprovalDecision::AllowAlways, Some("r0-x"), None, None),
         refused(&id)
     );
     assert_eq!(
-        a.decide("nope", ApprovalDecision::AllowOnce, None, None),
+        a.decide("nope", ApprovalDecision::AllowOnce, None, None, None),
         refused("nope")
     );
     assert_eq!(
-        a.decide(&id, ApprovalDecision::Deny, None, Some("not on prod")),
+        a.decide(&id, ApprovalDecision::Deny, None, None, Some("not on prod")),
         None
     );
     assert_eq!(
-        a.decide(&id, ApprovalDecision::AllowOnce, None, None),
+        a.decide(&id, ApprovalDecision::AllowOnce, None, None, None),
         refused(&id)
     );
     assert_eq!(
@@ -383,6 +391,9 @@ fn without_a_broker_the_hook_is_released_at_once() {
     let mut a = watcher(&s, Agent::Codex);
     let hook = s.hook("codex", 30, SECRET_BASH);
     known(&mut a, 1, false);
+    // Codex shows its own dialog for it: still waiting there.
+    assert!(a.take_released());
+    assert!(!a.take_released(), "reported once");
     assert_eq!(printed(hook), "");
     assert!(drained(&mut a).is_empty());
     assert!(s.files().is_empty());
@@ -396,9 +407,12 @@ fn adoption_releases_what_the_new_broker_does_not_know() {
     let one = request_id(&events(&mut a, true)[0]);
     let second = s.hook("codex", 30, SECRET_BASH);
     let two = request_id(&events(&mut a, true)[0]);
+    assert!(!a.take_released());
     a.keep_only(std::slice::from_ref(&two));
+    // the released one waits in Codex's own dialog
+    assert!(a.take_released());
     assert_eq!(printed(first), "");
-    a.decide(&two, ApprovalDecision::AllowOnce, None, None);
+    a.decide(&two, ApprovalDecision::AllowOnce, None, None, None);
     assert!(printed(second).contains(r#""behavior":"allow""#));
     // The released one closes `released`, so the broker drops its card.
     assert_eq!(
@@ -423,6 +437,7 @@ fn release_approvals_answers_every_waiting_hook_with_no_decision() {
         })
         .collect();
     a.release_all();
+    assert!(a.take_released());
     for h in hooks {
         assert_eq!(printed(h), "");
     }
@@ -448,7 +463,7 @@ fn a_killed_hook_is_interrupted_and_a_late_decision_refused() {
         vec![closed(&id, ApprovalCloseReason::Interrupted)]
     );
     assert_eq!(
-        a.decide(&id, ApprovalDecision::AllowOnce, None, None),
+        a.decide(&id, ApprovalDecision::AllowOnce, None, None, None),
         Some(applied(&id, ApplyOutcome::NotDelivered))
     );
     assert!(s.files().is_empty(), "{:?}", s.files());
@@ -531,7 +546,13 @@ fn turn_ends_and_exits_close_what_waits() {
         let hook = s.hook("claude", 30, SECRET_BASH);
         let id = request_id(&events(&mut a, true)[0]);
         assert_eq!(
-            a.poll(true, vec![Evidence::TurnEnded { interrupted }]),
+            a.poll(
+                true,
+                vec![Evidence::TurnEnded {
+                    interrupted,
+                    at_ms: Some(now_ms())
+                }]
+            ),
             vec![closed(&id, reason)]
         );
         assert_eq!(printed(hook), "");
@@ -563,7 +584,12 @@ fn a_nested_codex_is_released_without_a_report() {
         &format!("/bin/sh -c \"/bin/sh {script} codex 30; true\"; true"),
         SECRET_BASH,
     );
+    assert!(a.take_released(), "the session's own");
     known(&mut a, 1, true);
+    assert!(
+        !a.take_released(),
+        "a nested codex's dialog is not this session's"
+    );
     assert_eq!(printed(nested), "");
     assert!(drained(&mut a).is_empty());
 }
@@ -642,7 +668,10 @@ fn a_claimed_decision_always_reaches_the_hook_however_fast_the_worker_polls() {
     for i in 0..50 {
         let hook = s.hook("codex", 30, SECRET_BASH);
         let id = request_id(&events(&mut a, true)[0]);
-        assert_eq!(a.decide(&id, ApprovalDecision::AllowOnce, None, None), None);
+        assert_eq!(
+            a.decide(&id, ApprovalDecision::AllowOnce, None, None, None),
+            None
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let out = hook.wait_with_output().unwrap();
@@ -679,7 +708,7 @@ fn a_decision_near_the_timeout_is_refused() {
     let id = request_id(&events(&mut a, true)[0]);
     std::thread::sleep(Duration::from_millis(1850));
     assert_eq!(
-        a.decide(&id, ApprovalDecision::AllowOnce, None, None),
+        a.decide(&id, ApprovalDecision::AllowOnce, None, None, None),
         Some(applied(&id, ApplyOutcome::NotDelivered))
     );
     assert!(!s.files().iter().any(|f| f.starts_with("dec-")));
@@ -699,7 +728,10 @@ fn a_hook_ending_with_our_decision_untaken() {
         let mut a = watcher(&s, Agent::Claude).with_timeout(Duration::from_secs(2));
         let mut sleeper = s.fake_request("untaken", SECRET_BASH);
         let id = request_id(&events(&mut a, true)[0]);
-        assert_eq!(a.decide(&id, ApprovalDecision::AllowOnce, None, None), None);
+        assert_eq!(
+            a.decide(&id, ApprovalDecision::AllowOnce, None, None, None),
+            None
+        );
         std::thread::sleep(Duration::from_millis(wait_ms));
         let _ = sleeper.kill();
         let _ = sleeper.wait();
@@ -724,4 +756,486 @@ fn a_codex_request_without_a_session_id_must_come_from_the_agent_itself() {
     assert_eq!(request_id(&events(&mut a, true)[0]), "direct");
     let _ = direct.kill();
     let _ = direct.wait();
+}
+
+/// Evidence read in the same pass as a newer request (the turn's own
+/// prompt, a turn end reported before it) never closes it; evidence from
+/// after it does. Both agents.
+#[test]
+fn turn_evidence_older_than_a_request_leaves_it_open() {
+    for (agent, name) in [(Agent::Claude, "claude"), (Agent::Codex, "codex")] {
+        let s = Session::new();
+        let mut a = watcher(&s, agent);
+        let mut before = now_ms() - 2000;
+        if before % 1000 == 0 {
+            before -= 1;
+        }
+        let hook = s.hook(name, 30, SECRET_BASH);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.files().iter().any(|f| f.starts_with("req-")) {
+            assert!(Instant::now() < deadline, "no request");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // the request and older evidence in one pass: reported, still open
+        let out = a.poll(
+            true,
+            vec![Evidence::TurnEnded {
+                interrupted: false,
+                at_ms: Some(before),
+            }],
+        );
+        assert_eq!(out.len(), 1, "{name}: {out:?}");
+        let id = request_id(&out[0]);
+        assert_eq!(a.waiting(), 1, "{name}");
+        // evidence from after it closes it
+        let out = a.poll(
+            true,
+            vec![Evidence::TurnEnded {
+                interrupted: false,
+                at_ms: Some(now_ms() + 1),
+            }],
+        );
+        assert_eq!(
+            out,
+            vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)],
+            "{name}"
+        );
+        assert_eq!(printed(hook), "", "{name}");
+        assert!(drained(&mut a).is_empty());
+    }
+}
+
+/// A non-shell child of this process (the real binary under a wrapper,
+/// this process being the wrapper) with a non-shell child of its own (a
+/// codex it started without a shell): their pids.
+struct Wrapper {
+    real: Child,
+    nested: u32,
+}
+
+impl Wrapper {
+    fn start() -> Self {
+        use std::io::BufRead;
+        let mut real = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                "import subprocess, time\np = subprocess.Popen(['sleep', '30'])\nprint(p.pid, flush=True)\ntime.sleep(30)",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(real.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let nested = line.trim().parse().unwrap();
+        Self { real, nested }
+    }
+}
+
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.nested as libc::pid_t, libc::SIGKILL) };
+        let _ = self.real.kill();
+        let _ = self.real.wait();
+    }
+}
+
+/// npm's `codex`: the agent is node, the real binary its child. The first
+/// request through it pins its session and makes the real binary the
+/// agent: its `/new` re-pins (Direct), and a codex it started without a
+/// shell still can't (Wrapped, another session).
+#[test]
+fn under_a_wrapper_the_real_binary_becomes_the_agent() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let wrapper = Wrapper::start();
+    let real = wrapper.real.id();
+    let mut hooks = Vec::new();
+    let mut request = |id: &str, parent: u32, session: &str| {
+        let hook = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(
+            s.approvals().join(format!("pid-{id}")),
+            format!("{} {parent}\n", hook.id()),
+        )
+        .unwrap();
+        let body = SECRET_BASH.replace(
+            r#""session_id":"s1""#,
+            &format!(r#""session_id":"{session}""#),
+        );
+        std::fs::write(s.approvals().join(format!("req-{id}.json")), body).unwrap();
+        hooks.push(hook);
+    };
+    request("first", real, "s1");
+    assert_eq!(request_id(&events(&mut a, true)[0]), "first");
+    request("afternew", real, "s2");
+    assert_eq!(request_id(&events(&mut a, true)[0]), "afternew");
+    request("nested", wrapper.nested, "s3");
+    known(&mut a, 3, true);
+    request("nestedpinned", wrapper.nested, "s2");
+    assert_eq!(request_id(&events(&mut a, true)[0]), "nestedpinned");
+    for mut hook in hooks {
+        let _ = hook.kill();
+        let _ = hook.wait();
+    }
+}
+
+/// A Codex request with a cwd (so it offers an Atem session rule).
+fn codex_ask(command: &str, cwd: &str) -> String {
+    serde_json::json!({"hook_event_name": "PermissionRequest", "session_id": "s1",
+        "cwd": cwd, "tool_name": "Bash",
+        "tool_input": {"command": command, "description": "d"}})
+    .to_string()
+}
+
+/// What the tests' session rules are granted under.
+fn grant() -> RuleGrant {
+    RuleGrant {
+        account_id: "account-a".into(),
+        atem_device_id: "device-a".into(),
+        host_trust_gen: 3,
+    }
+}
+
+const ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+
+/// Answers a Codex request `allow_always` with its session rule: the rule
+/// id, once the hook took it (the session holds the rule then).
+fn always_allow(s: &Session, a: &mut Approvals, stdin: &str) -> String {
+    let hook = s.hook("codex", 30, stdin);
+    let got = events(a, true);
+    let Event::Request { request_id, info } = &got[0] else {
+        panic!("{got:?}")
+    };
+    let [rule] = info.always_rules.as_slice() else {
+        panic!("{info:?}")
+    };
+    assert_eq!(rule.scope, "session");
+    let rule_id = rule.rule_id.clone();
+    assert_eq!(
+        a.decide(
+            request_id,
+            ApprovalDecision::AllowAlways,
+            Some(&rule_id),
+            Some(&grant()),
+            None
+        ),
+        None
+    );
+    assert_eq!(printed(hook), ALLOW, "a plain allow: Codex takes no rule");
+    let done = drained(a);
+    assert!(
+        done.contains(&applied(request_id, ApplyOutcome::Ok)),
+        "{done:?}"
+    );
+    assert!(
+        done.iter()
+            .any(|e| matches!(e, Event::Rules(r) if r.iter().any(|x| x.rule.rule_id == rule_id))),
+        "{done:?}"
+    );
+    rule_id
+}
+
+#[test]
+fn a_codex_session_rule_allows_exactly_the_same_command_without_asking() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    let rule_id = always_allow(&s, &mut a, &ask);
+    assert_eq!(a.rules().len(), 1);
+    // The same command in the same cwd: allowed by the worker, no approval.
+    let hook = s.hook("codex", 30, &ask);
+    let got = events(&mut a, true);
+    let [
+        Event::AutoAllowed {
+            rule_id: by,
+            tool,
+            summary,
+            ..
+        },
+    ] = got.as_slice()
+    else {
+        panic!("{got:?}")
+    };
+    assert_eq!(
+        (by, tool.as_str(), summary.as_str()),
+        (&rule_id, "Bash", "npm test")
+    );
+    assert_eq!(printed(hook), ALLOW);
+    assert!(drained(&mut a).is_empty(), "nothing to report after it");
+    // Anything else still asks: more after it, another cwd, one byte more.
+    for other in [
+        codex_ask("npm test; rm -rf ~", "/p"),
+        codex_ask("npm test", "/q"),
+        codex_ask("npm test ", "/p"),
+        codex_ask("npm  test", "/p"),
+    ] {
+        let hook = s.hook("codex", 30, &other);
+        let id = request_id(&events(&mut a, true)[0]);
+        a.release(&id);
+        assert_eq!(printed(hook), "");
+        drained(&mut a);
+    }
+    // No broker connected: released as ever (the note couldn't be shown).
+    let hook = s.hook("codex", 30, &ask);
+    known(&mut a, 1, false);
+    assert_eq!(printed(hook), "");
+    drained(&mut a);
+}
+
+/// After a new broker connected the rules allow nothing until it confirms
+/// them: a matching request asks; confirmed, it is allowed again; a rule
+/// the broker didn't accept is dropped.
+#[test]
+fn rules_allow_only_once_the_connected_broker_confirmed_them() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    let kept = always_allow(&s, &mut a, &ask);
+    let dropped = always_allow(&s, &mut a, &codex_ask("make", "/p"));
+    a.unconfirm_rules();
+    assert!(
+        a.rules()
+            .iter()
+            .all(|r| !r.confirmed && r.granted_under == grant())
+    );
+    let hook = s.hook("codex", 30, &ask);
+    let got = events(&mut a, true);
+    assert!(matches!(&got[..], [Event::Request { .. }]), "asks: {got:?}");
+    a.release(&request_id(&got[0]));
+    assert_eq!(printed(hook), "");
+    drained(&mut a);
+    a.confirm_rules(std::slice::from_ref(&kept));
+    let rules = a.rules();
+    assert_eq!(rules.len(), 1, "{rules:?}");
+    assert_eq!(rules[0].rule.rule_id, kept);
+    assert!(rules[0].confirmed);
+    assert!(!rules.iter().any(|r| r.rule.rule_id == dropped));
+    let hook = s.hook("codex", 30, &ask);
+    let got = events(&mut a, true);
+    assert!(
+        matches!(&got[..], [Event::AutoAllowed { rule_id, .. }] if *rule_id == kept),
+        "{got:?}"
+    );
+    assert_eq!(printed(hook), ALLOW);
+    drained(&mut a);
+}
+
+/// An `allow_always` without what the rule is granted under keeps none.
+#[test]
+fn a_rule_without_a_grant_is_not_kept() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let hook = s.hook("codex", 30, &codex_ask("npm test", "/p"));
+    let got = events(&mut a, true);
+    let Event::Request { request_id, info } = &got[0] else {
+        panic!("{got:?}")
+    };
+    let rule_id = info.always_rules[0].rule_id.clone();
+    assert_eq!(
+        a.decide(
+            request_id,
+            ApprovalDecision::AllowAlways,
+            Some(&rule_id),
+            None,
+            None
+        ),
+        None
+    );
+    assert_eq!(printed(hook), ALLOW, "allowed once");
+    drained(&mut a);
+    assert!(a.rules().is_empty());
+}
+
+#[test]
+fn a_nested_codex_never_matches_a_session_rule() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    always_allow(&s, &mut a, &ask);
+    let script = approvals::shell_quote(&s.path().join(approvals::SCRIPT_NAME).to_string_lossy());
+    // A codex started inside the session (two levels of shell): never
+    // allowed by the rule, and not this session's to report either.
+    let nested = s.run(
+        &format!("/bin/sh -c \"/bin/sh {script} codex 30; true\"; true"),
+        &ask,
+    );
+    known(&mut a, 1, true);
+    assert_eq!(printed(nested), "");
+    assert!(drained(&mut a).is_empty());
+}
+
+#[test]
+fn a_revoked_rule_asks_again_and_a_new_process_has_none() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    let rule_id = always_allow(&s, &mut a, &ask);
+    assert!(a.revoke(&rule_id));
+    assert!(!a.revoke(&rule_id), "already gone");
+    assert!(a.rules().is_empty());
+    let hook = s.hook("codex", 30, &ask);
+    let id = request_id(&events(&mut a, true)[0]);
+    a.release(&id);
+    assert_eq!(printed(hook), "");
+    drained(&mut a);
+    // A respawn is a new agent process (a new worker): no rules.
+    always_allow(&s, &mut a, &ask);
+    let mut fresh = watcher(&s, Agent::Codex);
+    assert!(fresh.rules().is_empty());
+    let hook = s.hook("codex", 30, &ask);
+    let id = request_id(&events(&mut fresh, true)[0]);
+    fresh.release(&id);
+    assert_eq!(printed(hook), "");
+    drained(&mut fresh);
+}
+
+#[test]
+fn a_session_holds_at_most_32_rules() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let rule = |n: usize| {
+        let v: Value = serde_json::from_str(&codex_ask(&format!("echo {n}"), "/p")).unwrap();
+        approvals::request(Agent::Codex, &v)
+            .unwrap()
+            .session_rule
+            .unwrap()
+    };
+    for n in 0..MAX_SESSION_RULES {
+        a.keep_rule(rule(n), grant());
+    }
+    assert_eq!(a.rules().len(), 32);
+    a.keep_rule(rule(99), grant());
+    assert_eq!(a.rules().len(), 32, "the 33rd is not kept");
+    assert!(!a.rules().iter().any(|r| r.rule.label.contains("echo 99")));
+    // Each kept rule was reported (the whole list), the 33rd not.
+    let reported = a.poll(true, Vec::new());
+    assert_eq!(reported.len(), 32);
+    assert!(matches!(reported.last(), Some(Event::Rules(r)) if r.len() == 32));
+    // A full session offers no more session rules on its cards.
+    let hook = s.hook("codex", 30, &codex_ask("echo 100", "/p"));
+    let got = events(&mut a, true);
+    let Event::Request { request_id, info } = &got[0] else {
+        panic!("{got:?}")
+    };
+    assert!(info.always_rules.is_empty(), "{info:?}");
+    a.release(request_id);
+    assert_eq!(printed(hook), "");
+    drained(&mut a);
+    // Revoking one makes room again.
+    let first = a.rules()[0].rule.rule_id.clone();
+    assert!(a.revoke(&first));
+    a.keep_rule(rule(99), grant());
+    assert_eq!(a.rules().len(), 32);
+}
+
+#[test]
+fn a_codex_nested_through_one_shell_with_another_session_never_matches() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    always_allow(&s, &mut a, &codex_ask("npm test", "/p"));
+    // A non-shell process (`timeout`, standing in for a nested `codex`)
+    // started by the agent through one shell runs the hook, for another
+    // Codex session with the very same command and cwd.
+    let script = approvals::shell_quote(&s.path().join(approvals::SCRIPT_NAME).to_string_lossy());
+    let other = codex_ask("npm test", "/p").replace(r#""session_id":"s1""#, r#""session_id":"s9""#);
+    assert!(other.contains(r#""session_id":"s9""#));
+    let nested = s.run(
+        &format!("timeout 30 /bin/sh {script} codex 30; true"),
+        &other,
+    );
+    known(&mut a, 1, true);
+    assert_eq!(printed(nested), "", "never allowed by the rule");
+    assert!(drained(&mut a).is_empty(), "nor reported as this session's");
+}
+
+#[test]
+fn revoking_withdraws_an_allow_the_hook_has_not_taken() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    let rule_id = always_allow(&s, &mut a, &ask);
+    // A hook that hasn't read its decision yet (it never will).
+    let mut sleeper = s.fake_request("slow", &ask);
+    let got = events(&mut a, true);
+    assert!(matches!(&got[..], [Event::AutoAllowed { .. }]), "{got:?}");
+    let dec = s.approvals().join("dec-slow.json");
+    assert_eq!(
+        std::fs::read_to_string(&dec).unwrap(),
+        approvals::allow_output()
+    );
+    assert!(a.revoke(&rule_id));
+    assert_eq!(
+        std::fs::read_to_string(&dec).unwrap(),
+        "",
+        "no decision: Codex's own dialog asks"
+    );
+    assert!(a.take_released());
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    drained(&mut a);
+    // revoke_all does the same for every rule.
+    let rule_id = always_allow(&s, &mut a, &codex_ask("make", "/p"));
+    let mut sleeper2 = s.fake_request("slow2", &codex_ask("make", "/p"));
+    assert!(
+        matches!(&events(&mut a, true)[..], [Event::AutoAllowed { rule_id: r, .. }] if *r == rule_id)
+    );
+    a.revoke_all();
+    assert!(a.rules().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(s.approvals().join("dec-slow2.json")).unwrap(),
+        ""
+    );
+    let _ = sleeper2.kill();
+    let _ = sleeper2.wait();
+}
+
+#[test]
+fn a_rule_the_full_session_cannot_keep_is_reported_before_the_answer_completes() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let rule = |n: usize| {
+        let v: Value = serde_json::from_str(&codex_ask(&format!("echo {n}"), "/p")).unwrap();
+        approvals::request(Agent::Codex, &v)
+            .unwrap()
+            .session_rule
+            .unwrap()
+    };
+    for n in 0..MAX_SESSION_RULES - 1 {
+        assert!(a.keep_rule(rule(n), grant()));
+    }
+    a.poll(true, Vec::new());
+    // Offered while there was room…
+    let hook = s.hook("codex", 30, &codex_ask("npm test", "/p"));
+    let got = events(&mut a, true);
+    let Event::Request { request_id, info } = &got[0] else {
+        panic!("{got:?}")
+    };
+    let offered = info.always_rules[0].rule_id.clone();
+    // …but full by the time the hook takes the answer.
+    assert!(a.keep_rule(rule(99), grant()));
+    a.poll(true, Vec::new());
+    assert_eq!(
+        a.decide(
+            request_id,
+            ApprovalDecision::AllowAlways,
+            Some(&offered),
+            Some(&grant()),
+            None
+        ),
+        None
+    );
+    assert_eq!(printed(hook), ALLOW, "allowed once all the same");
+    let done = drained(&mut a);
+    assert_eq!(
+        done,
+        vec![
+            Event::RuleNotKept {
+                request_id: request_id.clone()
+            },
+            applied(request_id, ApplyOutcome::Ok)
+        ]
+    );
+    assert!(!a.rules().iter().any(|r| r.rule.rule_id == offered));
 }

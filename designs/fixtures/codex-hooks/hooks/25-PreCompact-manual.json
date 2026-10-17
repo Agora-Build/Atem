@@ -1,0 +1,9 @@
+{
+  "session_id": "<session-B>",
+  "turn_id": "<turn-8>",
+  "transcript_path": "/home/user/.codex/sessions/2026/10/17/rollout-2026-10-17T05-35-51-<session-B>.jsonl",
+  "cwd": "/home/user/proj",
+  "hook_event_name": "PreCompact",
+  "model": "gpt-6.1-sol",
+  "trigger": "manual"
+}

@@ -1,0 +1,26 @@
+[hooks.state."/home/user/.codex/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:9f127f6cac0a9eed83d30832b5fade505735bc4a849eacbdf664cc2f9698357e"
+[hooks.state."/home/user/.codex/hooks.json:permission_request:0:0"]
+trusted_hash = "sha256:0a004c1c88af7f94e21d3ab8565568dd251593f996c9e36ddd9cf326f954ae4f"
+[hooks.state."/home/user/.codex/hooks.json:post_tool_use:0:0"]
+trusted_hash = "sha256:2ccb365f9fafa2d795c6b1cd619013a1ce808186a8c9f63069c099bb1e314ff6"
+[hooks.state."/home/user/.codex/hooks.json:pre_compact:0:0"]
+trusted_hash = "sha256:0fb748667051e37ba787387ed94bcf38e84a8ae6c0d8191b152a7eca41343f0f"
+[hooks.state."/home/user/.codex/hooks.json:post_compact:0:0"]
+trusted_hash = "sha256:61d5b531c80493c83bf42281ebc4d85ae193ae5b3f81926371392d74f1fb04e8"
+[hooks.state."/home/user/.codex/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:481640fe1d43286e4f1474adedceac4651481b6ef2396236da8ad7adb649fb19"
+[hooks.state."/home/user/.codex/hooks.json:session_end:0:0"]
+trusted_hash = "sha256:2189f653b80149c54f78a33fd86d8ae4baeea48fbcec90fd4520b9007f973ca8"
+[hooks.state."/home/user/.codex/hooks.json:user_prompt_submit:0:0"]
+trusted_hash = "sha256:c1e2da6c8adff3ba2623a3bed6acaa781743934bb1948e51f6d2f802fb2d2195"
+[hooks.state."/home/user/.codex/hooks.json:subagent_start:0:0"]
+trusted_hash = "sha256:e54968fe03d889c79eeff914c11ec327559697ab744eda9cd411e421b44c74c3"
+[hooks.state."/home/user/.codex/hooks.json:subagent_stop:0:0"]
+trusted_hash = "sha256:f2179130fd8ae1270d4f17fcdc009823264de6b24aea747f4a25a1a9f7e46c84"
+[hooks.state."/home/user/.codex/hooks.json:stop:0:0"]
+trusted_hash = "sha256:0dce82bfbf691cfb1c08167660959d37517add259336e508f868277538fedc03"
+[hooks.state."/home/user/.codex/hooks.json:interrupt:0:0"]
+trusted_hash = "sha256:9683861c737c7e82d2bbf5344a0c457a37c4cc83b9e0d4894076452bf0d9c427"
+[hooks.state."/home/user/.codex/hooks.json:stop:1:0"]
+trusted_hash = "sha256:8dbcb65bfea9bb41f2ccc23339637197d5e552d5ed452480ecbfa631b79a570a"

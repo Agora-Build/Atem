@@ -1,0 +1,12 @@
+  >_ OpenAI Codex (v0.162.1)
+     /home/user/proj
+  PreToolUse hooks
+  1 hook needs review before it can run.
+› [!]  1  Unnamed hook · new
+  Event     PreToolUse
+  Source    User config - /home/user/.codex/hooks.json
+  Command   : atem-chat-hook; /home/user/tmp/hook.sh
+  Mode      Sync
+  Timeout   5s
+  Trust     New hook - review required
+  t trust · esc back

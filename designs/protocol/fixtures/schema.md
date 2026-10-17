@@ -1,4 +1,4 @@
-# Fixture format (atem-session v1, r7.1)
+# Fixture format (atem-session v1, r7.2)
 
 One scenario per `*.json` file; `digest-vectors.json` holds the canonical-digest
 known-answer vectors (`vectors`: payload → canonical string → sha256;
@@ -46,7 +46,8 @@ setup messages is visible to the steps.
 | `{"open_approval": session_id, "tool": t, "summary": s, "always_rules"?: [{rule_id, label, scope}]}` | the agent asks a permission prompt the runtime offers remotely (r7 §6a); the host opens an approval for the session's current process, or refuses silently (no live remote lease: the agent's own prompt asks). Capture its id from the `approval_request` |
 | `{"close_approval": approval_id, "reason": r}` | the runtime saw the prompt end without the remote answer (`answered_terminal`, `interrupted`, `timed_out`, `process_ended`) |
 | `{"approval_applied": approval_id, "ok": bool}` | the agent's report on a handed-over decision: applied (`completed`) or not known to be (`outcome_unknown`) |
-| `{"assert": {…}}` | host counters: `dispatch_attempts` (every dispatch the host started, including ones refused before any effect), `dispatches` (dispatches that reached the PTY/agent: attempts minus those that failed with no effect), `pty_bytes_written` (a number or `"unknown"`), `pty_writes` (terminal input written, split as `pty_writes_local`/`pty_writes_remote`; dispatches are counted separately), `pty_writes_dropped` (remote chunks refused at the write boundary), `resizes`, `stops`, `lease_holder`, `receipts_visible: {client: n}`; approvals: `approval_decisions` (every decision handed to the agent, in order: `[{approval_id, decision, rule_id?, message?}]`; an approval hand-off also counts as a dispatch), `approvals_pending` (on the only session), `approvals_released` (approvals the host closed itself, answered "no decision") |
+| `{"approval_rules": session_id, "rules": [{rule_id, label, scope}]}` | the runtime reports the session's active Atem session rules (r7.2); a revoke the host dispatches is answered at once by the harness: the rule is dropped (the receipt completes) and the rules left are reported |
+| `{"assert": {…}}` | host counters: `dispatch_attempts` (every dispatch the host started, including ones refused before any effect), `dispatches` (dispatches that reached the PTY/agent: attempts minus those that failed with no effect), `pty_bytes_written` (a number or `"unknown"`), `pty_writes` (terminal input written, split as `pty_writes_local`/`pty_writes_remote`; dispatches are counted separately), `pty_writes_dropped` (remote chunks refused at the write boundary), `resizes`, `stops`, `lease_holder`, `receipts_visible: {client: n}`; approvals: `approval_decisions` (every decision handed to the agent, in order: `[{approval_id, decision, rule_id?, message?}]`; an approval hand-off also counts as a dispatch), `approvals_pending` (on the only session), `approvals_released` (approvals the host closed itself, answered "no decision"), `rule_revokes` (rule ids the runtime was asked to revoke, in order; a revoke also counts as a dispatch) |
 | `{"assert_client": {…}}` | client state: `controls`, `deadline_ms`, `registry` (ids), `registry_state`, `runtime_epoch`, `seq`, `sent_list`, `input_enabled`, `approvals` (pending approval ids) |
 
 A host scenario fails if, after its last step, any client still has a queued
@@ -63,3 +64,6 @@ Expiry is `now >= deadline` everywhere.
 The approval fixtures (`approval-*.json`) run in the core harness; the
 real-runtime runner lists them as not run until the runtime opens approvals
 from the agents' permission hooks.
+`approval-rule-revoke-*` needs session rules, which only a Codex session's
+`allow_always` creates: the real-runtime runner (whose agent is Claude)
+lists it as not run.

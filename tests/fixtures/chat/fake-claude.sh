@@ -38,7 +38,9 @@ while IFS= read -r line; do
             text=${line#*"$esc[200~"}
             text=${text%"$esc[201~"*}
             t=$(json_escape "$text")
-            ts="2026-10-15T00:00:0$((n % 10)).000Z"
+            # Now, in ms (as Claude Code writes it): a remote prompt pairs
+            # only with a transcript entry from after its paste.
+            ts=$(python3 -I -c 'import time; t = time.time(); print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % (int(t * 1000) % 1000))')
             fire "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$session\",\"prompt\":\"$t\",\"prompt_id\":\"p-$n\"}"
             log "{\"type\":\"user\",\"uuid\":\"u-$n\",\"promptId\":\"p-$n\",\"timestamp\":\"$ts\",\"message\":{\"role\":\"user\",\"content\":\"$t\"}}"
             fire "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"$session\",\"tool_name\":\"Bash\"}"

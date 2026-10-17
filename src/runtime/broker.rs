@@ -25,11 +25,14 @@
 //! Approvals: the worker's `approval_request`/`approval_closed`/
 //! `approval_applied` are queued for the session host (`take_approvals`),
 //! which answers through `approval_decision`/`release_approval`. Codex hides
-//! its prompt while its hook waits, so every write to a Codex session first
-//! asks the worker to release its waiting hooks (`release_approvals`, in
-//! order on the same connection): any input — local or the lease holder's —
-//! goes to Codex's own prompt. Without a session host every request gets "no
-//! decision" at once (`release_untaken`).
+//! its prompt while its hook waits, so every write to a Codex session asks
+//! the worker to release its waiting hooks first (the write's
+//! `release_approvals`). Input that released one — local or the lease
+//! holder's — is consumed, never written: the user saw only Codex's hook
+//! wait, so a key must not answer the dialog it brings back. A local
+//! frontend gets a notice, a remote write `written` with an error. Without a
+//! session host every request gets "no decision" at once
+//! (`release_untaken`).
 //!
 //! Exit: once the broker recorded a worker's `exited` it sends the release
 //! `stop`, and the worker removes its record and ends; the session stays
@@ -78,6 +81,9 @@ pub struct WriteOutcome {
     pub dropped: bool,
     /// Refused before anything was queued: nothing was written.
     pub no_effect: bool,
+    /// Consumed (nothing written): it handed a waiting Codex approval to
+    /// the agent's own dialog (`worker_protocol::APPROVAL_HANDED`).
+    pub consumed: bool,
     pub error: Option<String>,
 }
 
@@ -168,6 +174,11 @@ pub struct BrokerSession {
     pub chat: ChatSession,
     pub chat_v1: bool,
     pub chat_reason: Option<String>,
+    /// The worker runs a chat adapter (its `hello`): the session offers
+    /// chat-v1 (Claude; Codex with Atem's Codex hooks on).
+    pub chat_offered: bool,
+    /// What its chat can't provide (`Capabilities::unavailable`).
+    pub chat_unavailable: Vec<String>,
     pub activity: Activity,
     pub activity_detail: Option<String>,
     /// The worker's approval reports, not taken by the session host yet.
@@ -228,6 +239,8 @@ impl BrokerSession {
             chat,
             chat_v1: false,
             chat_reason: None,
+            chat_offered: false,
+            chat_unavailable: Vec::new(),
             activity: Activity::Unknown,
             activity_detail: None,
             approval_events: Vec::new(),
@@ -312,6 +325,7 @@ impl BrokerSession {
         self.offset = handle.info.offset;
         self.tap.restart_at(self.offset);
         self.synced = synced;
+        self.chat_offered = handle.info.chat;
         let exited = handle.info.exited.clone();
         self.worker = Some(handle);
         if !synced {
@@ -434,12 +448,12 @@ impl BrokerSession {
         &self,
         request_id: &str,
         decision: crate::session_protocol::wire::ApprovalDecision,
-        rule_id: Option<String>,
+        rule: Option<(String, super::worker_protocol::RuleGrant)>,
         message: Option<String>,
     ) -> anyhow::Result<()> {
         match &self.worker {
             Some(worker) if self.is_live() => {
-                worker.approval_decision(request_id, decision, rule_id, message)
+                worker.approval_decision(request_id, decision, rule, message)
             }
             _ => anyhow::bail!("The session has ended"),
         }
@@ -453,6 +467,40 @@ impl BrokerSession {
         }
     }
 
+    /// Revokes one of the session's Atem session rules; the worker answers
+    /// `approval_rule_revoked`.
+    pub fn revoke_approval_rule(&self, rule_id: &str) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) if self.is_live() => worker.revoke_approval_rule(rule_id),
+            _ => anyhow::bail!("The session has ended"),
+        }
+    }
+
+    /// Drops every session rule (the host's identity or trust changed).
+    pub fn revoke_all_approval_rules(&self) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.revoke_all_approval_rules(),
+            None => Ok(()),
+        }
+    }
+
+    /// Asks the worker for its current session rules.
+    pub fn request_approval_rules(&self) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.request_approval_rules(),
+            None => Ok(()),
+        }
+    }
+
+    /// Confirms the worker's unconfirmed session rules `rule_ids` (granted
+    /// under the host's current identity and trust); it drops the others.
+    pub fn confirm_approval_rules(&self, rule_ids: Vec<String>) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.confirm_approval_rules(rule_ids),
+            None => Ok(()),
+        }
+    }
+
     /// After adoption: the approvals this broker knows; the worker answers
     /// every other waiting hook "no decision".
     pub fn known_approvals(&self, request_ids: Vec<String>) -> anyhow::Result<()> {
@@ -462,16 +510,11 @@ impl BrokerSession {
         }
     }
 
-    /// Before any input to Codex: its waiting hooks are released first
-    /// (Codex hides its prompt while one waits), so the input reaches
-    /// Codex's own prompt. Claude shows its dialog meanwhile: nothing to do.
-    fn release_before_input(&self) -> anyhow::Result<()> {
-        if self.provider == crate::session::Provider::Codex.as_str()
-            && let Some(worker) = &self.worker
-        {
-            worker.release_approvals()?;
-        }
-        Ok(())
+    /// Input to Codex releases its waiting hooks first (Codex hides its
+    /// prompt while one waits), and the worker consumes input that released
+    /// one. Claude shows its dialog meanwhile: nothing to do.
+    fn releases_approvals(&self) -> bool {
+        self.provider == crate::session::Provider::Codex.as_str()
     }
 
     /// Writes `bytes` under the current input epoch; its sequence number.
@@ -487,10 +530,10 @@ impl BrokerSession {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
-        self.release_before_input()?;
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
-        worker.write_until(seq, bytes, self.input_epoch, not_after)?;
+        let release = self.releases_approvals();
+        worker.write_until(seq, bytes, self.input_epoch, not_after, release)?;
         self.next_seq += 1;
         self.in_flight.insert(seq, (bytes.len(), tag));
         self.last_used = Instant::now();
@@ -504,10 +547,10 @@ impl BrokerSession {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
-        self.release_before_input()?;
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
-        worker.paste_until(seq, text, self.input_epoch, not_after)?;
+        let release = self.releases_approvals();
+        worker.paste_until(seq, text, self.input_epoch, not_after, release)?;
         self.next_seq += 1;
         self.in_flight.insert(seq, (text.len(), WriteTag::Host));
         self.last_used = Instant::now();
@@ -670,13 +713,14 @@ impl BrokerSession {
                 input_count,
                 chat_v1,
                 reason,
+                unavailable,
                 gap: _,
             } => {
                 // The App's order: events, the log, then turn ends.
                 let now = now_ms();
                 let (ends, others): (Vec<_>, Vec<_>) = events
                     .into_iter()
-                    .partition(|e| matches!(e, AgentEvent::TurnEnded));
+                    .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
                 let mut outs = Vec::new();
                 for event in others {
                     outs.extend(self.chat.on_event(event, now, input_count));
@@ -701,6 +745,7 @@ impl BrokerSession {
                 self.input_count = input_count;
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
+                self.chat_unavailable = unavailable;
             }
             WorkerMsg::Activity { state, detail } => {
                 if self.state == SessionState::Running {
@@ -718,6 +763,7 @@ impl BrokerSession {
                 ok,
                 dropped,
                 no_effect,
+                consumed,
                 error,
                 ..
             } => {
@@ -728,6 +774,7 @@ impl BrokerSession {
                         ok,
                         dropped,
                         no_effect,
+                        consumed,
                         error,
                     });
                     if dropped {
@@ -736,6 +783,10 @@ impl BrokerSession {
                 } else if dropped {
                     self.dropped_writes += 1;
                     pumped.dropped_bytes += bytes;
+                } else if consumed {
+                    pumped
+                        .notices
+                        .push(super::worker_protocol::APPROVAL_HANDED_NOTICE.into());
                 } else if !ok {
                     pumped
                         .failed
@@ -775,12 +826,33 @@ impl BrokerSession {
                 request_id,
                 outcome,
             }),
+            WorkerMsg::ApprovalAutoAllowed {
+                request_id,
+                rule_id,
+                tool,
+                summary,
+            } => self.approval_events.push(ApprovalEvent::AutoAllowed {
+                request_id,
+                rule_id,
+                tool,
+                summary,
+            }),
+            WorkerMsg::ApprovalRules { rules } => {
+                self.approval_events.push(ApprovalEvent::Rules(rules))
+            }
+            WorkerMsg::ApprovalRuleRevoked { rule_id, ok } => self
+                .approval_events
+                .push(ApprovalEvent::RuleRevoked { rule_id, ok }),
+            WorkerMsg::ApprovalRuleNotKept { request_id } => self
+                .approval_events
+                .push(ApprovalEvent::RuleNotKept { request_id }),
             WorkerMsg::Hello { .. } => {}
             WorkerMsg::ChatSnapshot {
                 snapshot,
                 input_count,
                 chat_v1,
                 reason,
+                unavailable,
             } => {
                 // The worker's chat session goes on here; open conversations
                 // (none for a fresh broker) reload it.
@@ -792,6 +864,7 @@ impl BrokerSession {
                 self.input_count = input_count;
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
+                self.chat_unavailable = unavailable;
                 self.chat_reset = Some(CHAT_SWITCHED);
             }
         }
@@ -868,6 +941,11 @@ pub struct InProcess {
     pub chat_root: PathBuf,
 }
 
+/// In a launch environment: the in-process worker runs as with
+/// `[codex] hooks = false`.
+#[cfg(test)]
+pub const NO_CODEX_HOOKS: &str = "ATEM_TEST_NO_CODEX_HOOKS";
+
 #[cfg(test)]
 impl InProcess {
     async fn spawn(self, request: SpawnRequest, env: LaunchEnv) -> anyhow::Result<WorkerHandle> {
@@ -896,7 +974,10 @@ impl InProcess {
             first_connect: std::time::Duration::from_secs(10),
             linger: std::time::Duration::from_secs(30),
             claude_approvals: true,
-            approval_script: Some(self.chat_root.join("approval-hook.sh")),
+            // `[codex] hooks = false` for a launch whose environment says
+            // so (tests of Codex without chat).
+            approval_script: (!env.0.iter().any(|(k, _)| k == NO_CODEX_HOOKS))
+                .then(|| self.chat_root.join("approval-hook.sh")),
         };
         let socket = spec.socket.clone();
         tokio::spawn(worker::serve(spec, listener, options));

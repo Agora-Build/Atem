@@ -11,8 +11,12 @@
 //! runs one stable command from `~/.codex/hooks.json` (`chat::codex`).
 //!
 //! Codex can't take a persistent decision: its docs reserve
-//! `updatedPermissions` ("fail closed today"), so Codex cards offer Allow
-//! once and Deny only (`always_rules` is empty).
+//! `updatedPermissions` ("fail closed today"). Its cards offer an Atem
+//! session rule instead (r7.2) for a shell command only: "Always allow this
+//! command" for the rest of this agent process (file-change cards offer
+//! Allow once and Deny), kept and matched by the worker
+//! (`runtime::worker_approvals`) on the exact, unredacted request
+//! (`RuleMatch`); the hook itself only ever gets a plain allow.
 
 use std::path::{Path, PathBuf};
 
@@ -60,9 +64,19 @@ impl Agent {
             Agent::Codex => "codex",
         }
     }
+
+    /// Its setting there: `[claude] approvals_hook` (the approval hook in
+    /// Claude's per-launch settings), `[codex] hooks` (all of Atem's
+    /// entries in Codex's hooks.json: approvals and chat).
+    fn config_key(self) -> &'static str {
+        match self {
+            Agent::Claude => "approvals_hook",
+            Agent::Codex => "hooks",
+        }
+    }
 }
 
-/// `[claude|codex] approvals_hook` in config.toml, when set.
+/// `[claude] approvals_hook` / `[codex] hooks` in config.toml, when set.
 pub fn read_setting(config: &Path, agent: Agent) -> anyhow::Result<Option<bool>> {
     use anyhow::Context;
     let text = match std::fs::read_to_string(config) {
@@ -74,14 +88,15 @@ pub fn read_setting(config: &Path, agent: Agent) -> anyhow::Result<Option<bool>>
         toml::from_str(&text).with_context(|| format!("{} isn't valid TOML", config.display()))?;
     Ok(value
         .get(agent.config_table())
-        .and_then(|c| c.get("approvals_hook"))
+        .and_then(|c| c.get(agent.config_key()))
         .and_then(toml::Value::as_bool))
 }
 
 /// Whether a session launched now gets approvals from Astation, from the
 /// profile's config.toml: Claude unless `[claude] approvals_hook = false`
-/// (never asked), Codex only once `[codex] approvals_hook = true` (asked by
-/// `atem agent launch codex`). An unreadable config.toml turns both off.
+/// (never asked), Codex only once `[codex] hooks = true` (asked by
+/// `atem agent launch codex`; it also covers Codex chat). An unreadable
+/// config.toml turns both off.
 pub fn enabled(config: &Path, agent: Agent) -> bool {
     match read_setting(config, agent) {
         Ok(set) => set.unwrap_or(agent == Agent::Claude),
@@ -259,6 +274,35 @@ fn rule_id(index: usize, suggestion: &Value) -> String {
     format!("r{index}-{hex}")
 }
 
+/// The scope of an Atem session rule.
+pub const SESSION_SCOPE: &str = "session";
+/// The command part of a session rule's label, at most.
+const LABEL_SUBJECT_BYTES: usize = 120;
+/// The cwd part of a session rule's label, at most.
+const LABEL_CWD_BYTES: usize = 80;
+/// The only `tool_input` keys a shell request may carry to get a session
+/// rule: anything else could change what runs and isn't matched.
+const RULE_INPUT_KEYS: [&str; 2] = ["command", "description"];
+
+/// What an Atem session rule allows, from the unredacted request: the tool
+/// and the exact full command in the exact cwd (the hook's session cwd).
+/// Compared byte for byte: no prefix, glob or normalisation. Only shell
+/// commands: file changes never get a rule. Never leaves the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleMatch {
+    pub tool: String,
+    pub command: String,
+    pub cwd: String,
+}
+
+/// An Atem session rule offered on a card (or kept by the worker): what
+/// the card shows, and what it matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRule {
+    pub rule: AlwaysRule,
+    pub matcher: RuleMatch,
+}
+
 /// A request as the hook wrote it, with the raw rules to echo back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
@@ -267,6 +311,71 @@ pub struct Request {
     pub rules: Vec<(String, Value)>,
     pub tool_name: String,
     pub tool_input: Value,
+    /// What the request is, for Atem session rules (Codex shell commands;
+    /// `None` otherwise: file changes, other tools, extra input, no cwd).
+    pub matcher: Option<RuleMatch>,
+    /// The Atem session rule its card offers (Codex), also in
+    /// `info.always_rules`.
+    pub session_rule: Option<SessionRule>,
+}
+
+/// What a Codex request is, exactly: a shell command (`Bash`, `shell`,
+/// `exec_command`) whose `tool_input` is a string `command` and at most a
+/// `description`, in the hook's session `cwd`. Anything else (file changes,
+/// other tools, extra input keys, no cwd) gets no rule.
+fn rule_match(tool: &str, input: &Value, cwd: Option<&str>) -> Option<RuleMatch> {
+    if !matches!(tool, "Bash" | "shell" | "exec_command") {
+        return None;
+    }
+    let cwd = cwd.filter(|c| !c.is_empty())?.to_string();
+    let fields = input.as_object()?;
+    if fields
+        .keys()
+        .any(|k| !RULE_INPUT_KEYS.contains(&k.as_str()))
+    {
+        return None;
+    }
+    let command = fields.get("command").and_then(Value::as_str)?;
+    Some(RuleMatch {
+        tool: tool.to_string(),
+        command: command.to_string(),
+        cwd,
+    })
+}
+
+/// A new session rule id: `s-` and 16 random hex characters.
+fn session_rule_id() -> String {
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    format!("s-{}", &hex[..16])
+}
+
+/// The rule a card offers for `matcher`: "Always allow `<command's first
+/// line>` in <cwd> for this session" (a longer command says how many more
+/// lines it has), redacted and bounded.
+fn session_rule(matcher: &RuleMatch) -> SessionRule {
+    let mut lines = matcher.command.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or("");
+    let more = lines.count();
+    let mut subject = format!("`{}`", redacted(first, LABEL_SUBJECT_BYTES));
+    if more > 0 {
+        subject.push_str(&format!(
+            " (+{more} more line{})",
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    let cwd = &matcher.cwd;
+    let label = format!(
+        "Always allow {subject} in {} for this session",
+        redacted(cwd, LABEL_CWD_BYTES)
+    );
+    SessionRule {
+        rule: AlwaysRule {
+            rule_id: session_rule_id(),
+            label: bounded(&label, MAX_RULE_TEXT_BYTES),
+            scope: SESSION_SCOPE.into(),
+        },
+        matcher: matcher.clone(),
+    }
 }
 
 /// What the card shows for `input` (the hook's stdin): tool, redacted
@@ -304,6 +413,20 @@ pub fn request(agent: Agent, input: &Value) -> Option<Request> {
             rules.push((id, suggestion.clone()));
         }
     }
+    // Codex: an Atem session rule for exactly this request.
+    let matcher = (agent == Agent::Codex)
+        .then(|| {
+            rule_match(
+                &tool_name,
+                &tool_input,
+                input.get("cwd").and_then(Value::as_str),
+            )
+        })
+        .flatten();
+    let session_rule = matcher.as_ref().map(session_rule);
+    if let Some(r) = &session_rule {
+        always_rules.push(r.rule.clone());
+    }
     Some(Request {
         info: ApprovalInfo {
             summary: summary(&tool_name, &tool_input),
@@ -313,7 +436,21 @@ pub fn request(agent: Agent, input: &Value) -> Option<Request> {
         rules,
         tool_name,
         tool_input,
+        matcher,
+        session_rule,
     })
+}
+
+impl Request {
+    /// The card no longer offers its session rule (the session holds as
+    /// many as it may).
+    pub fn withdraw_session_rule(&mut self) {
+        if let Some(r) = self.session_rule.take() {
+            self.info
+                .always_rules
+                .retain(|x| x.rule_id != r.rule.rule_id);
+        }
+    }
 }
 
 fn output(decision: &str) -> String {
@@ -322,10 +459,16 @@ fn output(decision: &str) -> String {
     )
 }
 
+/// A plain allow, as the hook prints it.
+pub fn allow_output() -> String {
+    output(r#"{"behavior":"allow"}"#)
+}
+
 /// What the hook prints for a decision: the same shape for both agents;
-/// `allow_always` echoes the chosen suggestion as `updatedPermissions`
-/// (`None` when it isn't one of `request`'s rules, or for Codex, which has
-/// none). A deny without a message gets `DEFAULT_DENY`.
+/// `allow_always` echoes the chosen suggestion as `updatedPermissions`, or
+/// for the request's Atem session rule is a plain allow (the worker keeps
+/// the rule); `None` when `rule_id` is neither. A deny without a message
+/// gets `DEFAULT_DENY`.
 pub fn decision_output(
     request: &Request,
     decision: ApprovalDecision,
@@ -333,9 +476,16 @@ pub fn decision_output(
     message: Option<&str>,
 ) -> Option<String> {
     Some(match decision {
-        ApprovalDecision::AllowOnce => output(r#"{"behavior":"allow"}"#),
+        ApprovalDecision::AllowOnce => allow_output(),
         ApprovalDecision::AllowAlways => {
             let id = rule_id?;
+            if request
+                .session_rule
+                .as_ref()
+                .is_some_and(|r| r.rule.rule_id == id)
+            {
+                return Some(allow_output());
+            }
             let (_, rule) = request.rules.iter().find(|(r, _)| r == id)?;
             output(&format!(
                 r#"{{"behavior":"allow","updatedPermissions":[{rule}]}}"#
@@ -352,6 +502,101 @@ pub fn decision_output(
             ))
         }
     })
+}
+
+const SHELLS: [&str; 8] = ["sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"];
+
+fn is_shell(name: &str) -> bool {
+    SHELLS.contains(&name)
+}
+
+/// How a hook process relates to the session's agent, from the hook's
+/// parent pid (the hook script records `$PPID`: in `pid-<id>` for a
+/// PermissionRequest, in each Codex event file's first line). Codex's hook
+/// command is the same for every session and its environment reaches a
+/// `codex` run by a tool too, so only this tells the session's own agent
+/// from a nested one (`runtime::worker_approvals`, `chat::codex::adapter`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    /// Its parent is the agent, or a shell (that didn't exec) whose parent is.
+    Direct,
+    /// Through a non-shell child of the agent (`child`): a wrapper such as
+    /// npm's `codex`, which runs the real binary as its child — or a
+    /// `codex` the agent itself started without a shell. Ambiguous.
+    Wrapped { child: u32 },
+    /// Not started by the agent (e.g. a `codex` started inside the session
+    /// through a shell is deeper).
+    Foreign,
+}
+
+/// How a hook whose parent is `parent` relates to the agent `agent`.
+pub fn started_by(parent: u32, agent: u32) -> Ancestry {
+    use crate::runtime::adopt::process_parent_and_name;
+    let mut q = parent;
+    if q == agent {
+        return Ancestry::Direct;
+    }
+    let Some((up, name)) = process_parent_and_name(q) else {
+        return Ancestry::Foreign;
+    };
+    if is_shell(&name) {
+        q = up;
+        if q == agent {
+            return Ancestry::Direct;
+        }
+    }
+    match process_parent_and_name(q) {
+        Some((up, name)) if !is_shell(&name) && up == agent => Ancestry::Wrapped { child: q },
+        _ => Ancestry::Foreign,
+    }
+}
+
+/// Who a Codex hook must have been started by: the session's agent (the
+/// PTY child) — or, once a hook through a wrapper pinned the session
+/// (npm's `codex` is node running the real binary as its child), that
+/// child, the real binary. Then the real binary's own hooks are `Direct`
+/// (so `/new` re-pins) and a `codex` it started without a shell is still
+/// `Wrapped` (it can't re-pin). Shared by the approvals and the Codex chat
+/// adapter, each with its own pin.
+///
+/// A wrapped hook read after its parent exited can't be traced: it counts
+/// as `Foreign` (dropped). Harmless for events: the rollout's end record
+/// is authoritative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HookAgent {
+    agent: Option<u32>,
+    /// The real binary, once a wrapped hook pinned the session.
+    real: Option<u32>,
+}
+
+impl HookAgent {
+    pub fn new(agent: Option<u32>) -> Self {
+        Self { agent, real: None }
+    }
+
+    /// How a hook whose parent is `parent` relates to the agent; `Foreign`
+    /// when the agent is unknown.
+    pub fn ancestry(&self, parent: u32) -> Ancestry {
+        match self.real.or(self.agent) {
+            Some(agent) => started_by(parent, agent),
+            None => Ancestry::Foreign,
+        }
+    }
+
+    /// `pid` is the agent itself (the real binary once known).
+    pub fn is_agent(&self, pid: u32) -> bool {
+        self.real.or(self.agent) == Some(pid)
+    }
+
+    /// A hook with `ancestry` pinned the session (nothing was pinned): one
+    /// through a wrapper makes the wrapper's child the agent from now on.
+    pub fn pinned_by(&mut self, ancestry: Ancestry) {
+        if let Ancestry::Wrapped { child } = ancestry
+            && self.real.is_none()
+        {
+            self.real = Some(child);
+        }
+    }
 }
 
 #[cfg(test)]

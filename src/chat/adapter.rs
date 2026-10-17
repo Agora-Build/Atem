@@ -27,7 +27,8 @@ impl Part {
 }
 
 /// What a chat-v1 approval card shows: the tool, the redacted summary, the
-/// agent's own "always allow" rules and the card's state.
+/// "always allow" rules it offers and the card's state; `rule_id` names the
+/// Atem session rule that allowed it (`auto_allowed`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalCard {
     pub id: String,
@@ -36,6 +37,11 @@ pub struct ApprovalCard {
     pub summary: String,
     pub always_rules: Vec<crate::session_protocol::wire::AlwaysRule>,
     pub state: ApprovalCardState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// A short note on how it ended (e.g. the session rule wasn't kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +54,8 @@ pub enum ApprovalCardState {
     AnsweredTerminal,
     Expired,
     Closed,
+    /// Allowed by an Atem session rule without asking (r7.2).
+    AutoAllowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,13 +80,32 @@ pub enum AgentEvent {
     },
     PromptSubmitted {
         text: String,
+        /// The turn the prompt starts, when the agent names it (Codex);
+        /// acceptance then needs the log's prompt of that turn.
+        #[serde(default)]
+        turn_id: Option<String>,
+        /// When the hook fired (its event file's time, unix ms): a remote
+        /// prompt pairs only with a hook from after its paste.
+        #[serde(default)]
+        at_ms: Option<i64>,
+    },
+    /// The agent can't take a prompt yet, and why (Codex before its first
+    /// prompt): the status stays unknown with this detail, and a chat
+    /// submit is refused with it.
+    NotReady {
+        detail: String,
     },
     ToolStarted,
     ToolFinished,
     WaitingForPermission {
         detail: String,
     },
-    TurnEnded,
+    TurnEnded {
+        /// When the agent reported it (its event file's time, unix ms): it
+        /// answers only a permission prompt opened before.
+        #[serde(default)]
+        at_ms: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +125,17 @@ pub enum LogItem {
         turn_id: String,
         created_at_ms: i64,
     },
-    /// The turn ended according to the log (end_turn or interrupt).
-    TurnEnded { turn_id: String, outcome: Outcome },
+    /// A turn started according to the log (Codex's `task_started`): the
+    /// agent is working, also on a turn without a prompt (compaction).
+    TurnStarted { turn_id: String },
+    /// The turn ended according to the log (end_turn or interrupt), at
+    /// `at_ms` (the entry's time, unix ms; 0 when it has none).
+    TurnEnded {
+        turn_id: String,
+        outcome: Outcome,
+        #[serde(default)]
+        at_ms: i64,
+    },
     /// Content that was already in a log the adapter switched to (a resume of
     /// another session): history only, never live events. Never nested.
     Backfill(Box<LogItem>),
@@ -131,7 +167,17 @@ pub enum ToolResultKind {
 pub struct Capabilities {
     pub chat_v1: bool,
     pub reason: Option<String>,
+    /// What this agent's chat can't provide (see the `UNAVAILABLE_*` names),
+    /// for clients to say so instead of waiting for it.
+    pub unavailable: &'static [&'static str],
 }
+
+/// Partial text while a reply is written (messages arrive whole).
+pub const UNAVAILABLE_STREAMING: &str = "streaming";
+/// The model's reasoning.
+pub const UNAVAILABLE_REASONING: &str = "reasoning";
+/// The model or API error behind a failed turn.
+pub const UNAVAILABLE_ERROR_DETAILS: &str = "error_details";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchPlan {

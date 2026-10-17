@@ -1,0 +1,10 @@
+{
+  "session_id": "<session-A>",
+  "turn_id": "<turn-6>",
+  "transcript_path": "/home/user/.codex/sessions/2026/10/17/rollout-2026-10-17T05-32-36-<session-A>.jsonl",
+  "cwd": "/home/user/proj",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "prompt": "Reply with exactly: resumed"
+}

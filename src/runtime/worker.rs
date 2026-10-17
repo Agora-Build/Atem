@@ -1,6 +1,7 @@
 //! `atem worker --state <dir> --session <id>` (hidden): owns one agent
-//! session — the agent process in its PTY, the canonical screen, the Claude
-//! chat adapter and the output stream — and outlives the broker that started
+//! session — the agent process in its PTY, the canonical screen, the chat
+//! adapter (Claude's, or Codex's when Atem's Codex hooks are on) and the
+//! output stream — and outlives the broker that started
 //! it. It serves one broker connection at a time on its socket
 //! (`<runtime dir>/atem/workers/<session_id>.sock`, 0600, directory 0700,
 //! same-user peers); when that broker goes away the agent keeps running and a
@@ -57,11 +58,11 @@ const SNAPSHOT_MESSAGES: usize = 200;
 const SNAPSHOT_BYTES: usize = 1024 * 1024;
 /// How often the chat adapter is read.
 const CHAT_POLL: Duration = Duration::from_millis(200);
-/// Input after `release_approvals` waits at most this long for the released
-/// hooks to exit (they notice within ~100 ms).
-const HOLD_INPUT: Duration = Duration::from_millis(500);
-/// How often held input checks the released hooks.
-const HOLD_CHECK: Duration = Duration::from_millis(10);
+/// Input after the one that released a waiting hook (which is consumed) is
+/// consumed too while the released hooks still run, at most this long (they
+/// notice within ~100 ms): the user saw only Codex's hook wait, never its
+/// dialog, so those keys must not answer it.
+const CONSUME_INPUT: Duration = Duration::from_millis(500);
 
 /// `<state>/workers`.
 pub fn workers_dir(state: &Path) -> PathBuf {
@@ -224,25 +225,68 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The session's chat adapter. Each owns its session directory (removed
+/// when it is dropped), which the approvals watch too.
+enum ChatAdapter {
+    Claude(Box<crate::chat::claude::ClaudeAdapter>),
+    Codex(Box<crate::chat::codex::adapter::CodexAdapter>),
+}
+
+impl ChatAdapter {
+    fn get(&mut self) -> &mut dyn AgentAdapter {
+        match self {
+            ChatAdapter::Claude(a) => a.as_mut(),
+            ChatAdapter::Codex(a) => a.as_mut(),
+        }
+    }
+}
+
 /// What `agent_command` starts.
 struct Launch {
     binary: String,
     args: Vec<String>,
-    adapter: Option<crate::chat::claude::ClaudeAdapter>,
+    adapter: Option<ChatAdapter>,
     /// The session directory the approval hook writes to, and for which agent.
     approvals: Option<(PathBuf, Agent)>,
-    /// A session directory the worker made (Codex) and removes at the end.
-    owned_dir: Option<PathBuf>,
+    /// Told to the session's frontends once the broker is connected.
+    notice: Option<String>,
+}
+
+/// The Codex home of a launch: `CODEX_HOME` in the launch environment
+/// (else the worker's own), else `$HOME/.codex`.
+fn launch_codex_home(env: Option<&[(OsString, OsString)]>) -> PathBuf {
+    let var = |name: &str| -> Option<OsString> {
+        match env {
+            Some(vars) => vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
+            #[cfg(not(test))]
+            None => std::env::var_os(name),
+            // Tests never fall back to the real profile.
+            #[cfg(test)]
+            None => None,
+        }
+        .filter(|v| !v.is_empty())
+    };
+    if let Some(home) = var("CODEX_HOME") {
+        return PathBuf::from(home);
+    }
+    match var("HOME") {
+        Some(home) => PathBuf::from(home).join(".codex"),
+        #[cfg(not(test))]
+        None => crate::chat::codex::codex_home(),
+        #[cfg(test)]
+        None => PathBuf::from("/nonexistent/codex-home"),
+    }
 }
 
 /// The binary, arguments and chat adapter for `spec`, exactly as the App
 /// launches a session: `CLAUDE_CLI_*`/`CODEX_CLI_*` from the launch
 /// environment (else the worker's own), the spec's arguments after them,
 /// and for Claude its chat hooks first (approvals included unless
-/// `claude_approvals` is off). With Codex approvals on (`script`), a Codex
-/// session gets its own session directory for the approval hook in
-/// `~/.codex/hooks.json` (`chat::codex`), whose stable script `script` is
-/// refreshed here.
+/// `claude_approvals` is off). With Atem's Codex hooks on (`script`), a
+/// Codex session gets the Codex chat adapter and its session directory
+/// (`approvals/` for the PermissionRequest hook, `events/` for the other
+/// events) for the hooks in `~/.codex/hooks.json` (`chat::codex`), whose
+/// stable script `script` is refreshed here.
 fn agent_command(
     spec: &WorkerSpec,
     env: Option<&[(OsString, OsString)]>,
@@ -277,33 +321,55 @@ fn agent_command(
             Launch {
                 binary: client.binary().to_string(),
                 args: [chat_args, launch_args].concat(),
-                adapter,
+                adapter: adapter.map(|a| ChatAdapter::Claude(Box::new(a))),
                 approvals,
-                owned_dir: None,
+                notice: None,
             }
         }
         Provider::Codex => {
             let client = env
                 .map(crate::codex_client::CodexClient::from_env)
                 .unwrap_or_else(crate::codex_client::CodexClient::new);
-            let dir = script.and_then(|script| {
+            let launch_args = [client.launch_args(), &spec.args[..]].concat();
+            let codex_home = launch_codex_home(env);
+            let mut notice = None;
+            let adapter = script.and_then(|script| {
                 if let Err(error) = crate::chat::approvals::install_script(script) {
                     eprintln!("atem worker: could not write {}: {error}", script.display());
                 }
-                match crate::chat::claude::hooks::create_session_dir(chat_root) {
-                    Ok(dir) => Some(dir),
+                // `[codex] hooks = true` (consent given): the idempotent merge,
+                // so a session launched from the menu gets every hook too.
+                // Never asks; a failure is a notice and Codex starts anyway.
+                if let Err(error) = crate::chat::codex::install(&codex_home, script) {
+                    let text = format!(
+                        "Atem's Codex hooks could not be merged into {}: {error:#}",
+                        codex_home.join("hooks.json").display()
+                    );
+                    eprintln!("atem worker: {text}");
+                    notice = Some(text);
+                }
+                match crate::chat::codex::adapter::prepare_chat(
+                    chat_root,
+                    codex_home.clone(),
+                    &launch_args,
+                ) {
+                    Ok((adapter, _)) => Some(adapter),
                     Err(error) => {
-                        eprintln!("atem worker: approvals are off for Codex: {error}");
+                        eprintln!("atem worker: Codex hooks are off: {error}");
                         None
                     }
                 }
             });
+            let approvals = adapter
+                .as_ref()
+                .and_then(|a| a.dir())
+                .map(|d| (d.to_path_buf(), Agent::Codex));
             Launch {
                 binary: client.binary().to_string(),
-                args: [client.launch_args(), &spec.args[..]].concat(),
-                adapter: None,
-                approvals: dir.clone().map(|d| (d, Agent::Codex)),
-                owned_dir: dir,
+                args: launch_args,
+                adapter: adapter.map(|a| ChatAdapter::Codex(Box::new(a))),
+                approvals,
+                notice,
             }
         }
     })
@@ -335,7 +401,7 @@ pub struct WorkerOptions {
     /// The worker's pid and OS start time (recorded, sent in `hello`).
     pub pid: u32,
     pub start_time: u64,
-    /// Root of Claude chat directories.
+    /// Root of the chat session directories (Claude's and Codex's).
     pub chat_root: PathBuf,
     /// Where session logs go (`<logs>/<session_id>/`).
     pub logs: PathBuf,
@@ -348,8 +414,8 @@ pub struct WorkerOptions {
     /// Claude sessions register the approval hook (`[claude] approvals_hook`,
     /// default on).
     pub claude_approvals: bool,
-    /// The stable approval hook script Codex's hooks.json names, when Codex
-    /// approvals are on (`[codex] approvals_hook = true`).
+    /// The stable hook script Codex's hooks.json names, when Atem's Codex
+    /// hooks are on (`[codex] hooks = true`).
     pub approval_script: Option<PathBuf>,
 }
 
@@ -457,18 +523,19 @@ struct Worker {
     log: super::session_log::SessionLog,
     offset: u64,
     dropped: u64,
-    adapter: Option<crate::chat::claude::ClaudeAdapter>,
+    adapter: Option<ChatAdapter>,
+    /// The session has a chat adapter (from its launch; told in `hello`).
+    has_chat: bool,
+    /// Approvals reported open: the only source of Codex's waiting status.
+    open_approvals: std::collections::HashSet<String>,
     /// The agent's waiting permission prompts (`worker_approvals`).
     approvals: Option<Approvals>,
     /// What the chat adapter saw that may end a waiting prompt.
     approval_evidence: Vec<super::worker_approvals::Evidence>,
-    /// After `release_approvals`: input waits here (in order) until the
-    /// released hooks exited, or until the deadline, so the agent's own
-    /// prompt — not its hook wait — gets the keys.
-    held_input: std::collections::VecDeque<BrokerMsg>,
-    hold: Option<(Instant, Vec<String>)>,
-    /// The Codex session directory, removed when the agent exited.
-    owned_dir: Option<PathBuf>,
+    /// After input released waiting hooks (that input was consumed): input
+    /// is consumed (never written) until they exited or the deadline passed,
+    /// so a key typed at Codex's hook wait never answers its dialog.
+    consume: Option<Consume>,
     chat: ChatSession,
     capabilities: Capabilities,
     /// Chat read and not yet sent (no broker connected).
@@ -546,15 +613,8 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
             rows,
             cols,
         });
-        match spawned {
-            Ok(pty) => Ok((pty, launch)),
-            Err(error) => {
-                if let Some(dir) = &launch.owned_dir {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-                Err(error)
-            }
-        }
+        // Not started: the adapter's directory goes with it.
+        spawned.map(|pty| (pty, launch))
     });
     let (pty, launch) = match launched {
         Ok(launched) => launched,
@@ -568,11 +628,14 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     };
     let agent_pid = pty.resize_handle.process_id();
     let Launch {
-        adapter,
+        mut adapter,
         approvals,
-        owned_dir,
+        notice,
         ..
     } = launch;
+    if let Some(ChatAdapter::Codex(codex)) = adapter.as_mut() {
+        codex.set_agent_pid(agent_pid);
+    }
     let record = WorkerRecord {
         session_id: spec.session_id.clone(),
         process_gen: spec.process_gen.clone(),
@@ -588,9 +651,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     };
     if let Err(error) = write_record(&options.state, &record) {
         let _ = pty.resize_handle.stop();
-        if let Some(dir) = &owned_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        drop(adapter);
         conn.send(&WorkerMsg::Error {
             text: format!("could not write the worker record: {error}"),
         });
@@ -608,14 +669,18 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         parser: vt100::Parser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS),
         offset: 0,
         dropped: 0,
+        has_chat: adapter.is_some(),
+        // The first `chat_snapshot` already names what the chat offers.
+        capabilities: adapter
+            .as_mut()
+            .map(|a| a.get().capabilities())
+            .unwrap_or_default(),
+        open_approvals: Default::default(),
         adapter,
         approvals: approvals.map(|(dir, agent)| Approvals::new(&dir, agent, agent_pid)),
         approval_evidence: Vec::new(),
-        held_input: std::collections::VecDeque::new(),
-        hold: None,
-        owned_dir,
+        consume: None,
         chat: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
-        capabilities: Capabilities::default(),
         chat_backlog: Default::default(),
         activity: (Activity::Unknown, None),
         exited: None,
@@ -624,6 +689,9 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         options,
     };
     worker.connected(conn);
+    if let Some(text) = notice {
+        worker.send(&WorkerMsg::Notice { text });
+    }
     let delivered = worker.run(&listener).await;
     if delivered {
         let _ = std::fs::remove_file(record_path(&worker.options.state, &worker.spec.session_id));
@@ -649,6 +717,7 @@ impl Worker {
             input_epoch: self.input.input_epoch(),
             dropped: self.dropped,
             exited: self.exited.clone(),
+            chat: self.has_chat,
         }
     }
 
@@ -670,8 +739,18 @@ impl Worker {
                 input_count: self.input.input_count(),
                 chat_v1: self.capabilities.chat_v1,
                 reason: self.capabilities.reason.clone(),
+                unavailable: self.unavailable(),
             };
             self.send(&snapshot);
+        }
+        // The session rules outlive a broker (the worker owns them), but
+        // allow nothing until this broker confirms them.
+        if let Some(a) = self.approvals.as_mut() {
+            a.unconfirm_rules();
+        }
+        let rules = self.approvals.as_ref().map(Approvals::rules);
+        if let Some(rules) = rules.filter(|r| !r.is_empty()) {
+            self.send(&WorkerMsg::ApprovalRules { rules });
         }
         if let Some(status) = self.exited.clone() {
             self.send(&WorkerMsg::Exited { status });
@@ -718,7 +797,7 @@ impl Worker {
                             // The broker went away; the agent keeps running.
                             // Its approvals went with it: the agent asks.
                             self.release_approvals();
-                            self.drop_held_input();
+                            self.consume = None;
                             let heard = self.conn.take().is_some_and(|c| c.exit_sent);
                             if heard {
                                 return true;
@@ -742,9 +821,6 @@ impl Worker {
                             self.connected(Conn::open(stream));
                         }
                     }
-                }
-                _ = tokio::time::sleep(HOLD_CHECK), if self.hold.is_some() => {
-                    self.check_hold();
                 }
                 _ = poll.tick() => {
                     self.poll_chat();
@@ -777,7 +853,7 @@ impl Worker {
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.release_approvals();
-                    self.drop_held_input();
+                    self.consume = None;
                     return self.conn.take().is_some_and(|c| c.exit_sent);
                 }
             }
@@ -830,6 +906,7 @@ impl Worker {
                         bytes_written: n,
                         dropped: false,
                         no_effect: false,
+                        consumed: false,
                         error: None,
                     },
                     FencedOutcome::Dropped => {
@@ -842,6 +919,7 @@ impl Worker {
                         bytes_written: 0,
                         dropped: false,
                         no_effect: false,
+                        consumed: false,
                         error: Some(error),
                     },
                 };
@@ -860,9 +938,8 @@ impl Worker {
             let events = approvals.process_ended();
             self.send_approval_events(events);
         }
-        if let Some(dir) = self.owned_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        // The approvals are done with the session directory: the adapter
+        // removes it.
         self.chat.on_process_exit(now_ms());
         self.adapter = None;
         self.set_activity(Activity::Unknown, None);
@@ -889,10 +966,19 @@ impl Worker {
 
     /// Handles one broker message; true when the worker should end now.
     fn broker_message(&mut self, message: BrokerMsg) -> bool {
-        if self.hold.is_some()
-            && matches!(message, BrokerMsg::Write { .. } | BrokerMsg::Paste { .. })
+        if let BrokerMsg::Write {
+            seq,
+            release_approvals,
+            ..
+        }
+        | BrokerMsg::Paste {
+            seq,
+            release_approvals,
+            ..
+        } = &message
+            && ((*release_approvals && self.release_for_input()) || self.consuming())
         {
-            self.held_input.push_back(message);
+            self.send(&consumed(*seq));
             return false;
         }
         match message {
@@ -904,6 +990,7 @@ impl Worker {
                 bytes,
                 input_epoch,
                 not_after,
+                ..
             } => {
                 let result = write_bytes(&bytes)
                     .map_err(|e| anyhow!(e))
@@ -924,6 +1011,7 @@ impl Worker {
                 text,
                 input_epoch,
                 not_after,
+                ..
             } => match self.admit(input_epoch) {
                 Ok(()) => {
                     if let Err(error) = self.input.paste_fenced(&text, input_epoch, seq, not_after)
@@ -965,6 +1053,7 @@ impl Worker {
                 request_id,
                 decision,
                 rule_id,
+                granted_under,
                 message,
             } => {
                 let refused = match self.approvals.as_mut() {
@@ -972,6 +1061,7 @@ impl Worker {
                         &request_id,
                         decision,
                         rule_id.as_deref(),
+                        granted_under.as_ref(),
                         message.as_deref(),
                     ),
                     None => Some(ApprovalEvent::Applied {
@@ -986,24 +1076,48 @@ impl Worker {
                     a.release(&request_id);
                 }
             }
-            BrokerMsg::ReleaseApprovals => {
-                // Input follows: it waits for the released hooks to exit.
-                let released = self.release_approvals();
-                let running = self
-                    .approvals
-                    .as_ref()
-                    .is_some_and(|a| a.hooks_running(&released));
-                if running {
-                    match &mut self.hold {
-                        Some((_, ids)) => ids.extend(released),
-                        None => self.hold = Some((Instant::now() + HOLD_INPUT, released)),
-                    }
-                }
-            }
             BrokerMsg::KnownApprovals { request_ids } => {
                 if let Some(a) = self.approvals.as_mut() {
                     a.keep_only(&request_ids);
                 }
+            }
+            BrokerMsg::RevokeApprovalRule { rule_id } => {
+                let revoked = self
+                    .approvals
+                    .as_mut()
+                    .map(|a| (a.revoke(&rule_id), a.rules()));
+                let ok = revoked.as_ref().is_some_and(|(ok, _)| *ok);
+                self.send(&WorkerMsg::ApprovalRuleRevoked { rule_id, ok });
+                if let Some((true, rules)) = revoked {
+                    self.send(&WorkerMsg::ApprovalRules { rules });
+                }
+                // A withdrawn allow goes to Codex's dialog: its waiting status.
+                self.send_approval_events(Vec::new());
+            }
+            BrokerMsg::RevokeAllApprovalRules => {
+                if let Some(a) = self.approvals.as_mut() {
+                    a.revoke_all();
+                }
+                self.send(&WorkerMsg::ApprovalRules { rules: Vec::new() });
+                // Withdrawn allows go to Codex's dialog: its waiting status.
+                self.send_approval_events(Vec::new());
+            }
+            BrokerMsg::RequestApprovalRules => {
+                let rules = self
+                    .approvals
+                    .as_ref()
+                    .map(Approvals::rules)
+                    .unwrap_or_default();
+                self.send(&WorkerMsg::ApprovalRules { rules });
+            }
+            BrokerMsg::ConfirmApprovalRules { rule_ids } => {
+                let rules = self.approvals.as_mut().map(|a| {
+                    a.confirm_rules(&rule_ids);
+                    a.rules()
+                });
+                self.send(&WorkerMsg::ApprovalRules {
+                    rules: rules.unwrap_or_default(),
+                });
             }
         }
         false
@@ -1017,32 +1131,38 @@ impl Worker {
         }
     }
 
-    /// Input held for a broker that went away is never written.
-    fn drop_held_input(&mut self) {
-        self.held_input.clear();
-        self.hold = None;
+    /// Input to Codex: every waiting hook gets "no decision". True when that
+    /// released one: the input is consumed, and so is input after it while
+    /// the released hooks still run (`consuming`).
+    fn release_for_input(&mut self) -> bool {
+        let released = self.release_approvals();
+        if released.is_empty() {
+            return false;
+        }
+        let mut ids = self.consume.take().map(|c| c.ids).unwrap_or_default();
+        ids.extend(released);
+        self.consume = Some(Consume {
+            until: Instant::now() + CONSUME_INPUT,
+            ids,
+        });
+        true
     }
 
-    /// Writes held input once the released hooks exited (or at the
-    /// deadline: then anyway).
-    fn check_hold(&mut self) {
-        let Some((until, ids)) = &self.hold else {
-            return;
+    /// Input after the one that released waiting hooks is consumed too
+    /// while they still run (at most `CONSUME_INPUT`).
+    fn consuming(&mut self) -> bool {
+        let Some(consume) = &self.consume else {
+            return false;
         };
-        let running = self
-            .approvals
-            .as_ref()
-            .is_some_and(|a| a.hooks_running(ids));
-        if running && Instant::now() < *until {
-            return;
+        let running = Instant::now() < consume.until
+            && self
+                .approvals
+                .as_ref()
+                .is_some_and(|a| a.hooks_running(&consume.ids));
+        if !running {
+            self.consume = None;
         }
-        self.hold = None;
-        while let Some(message) = self.held_input.pop_front() {
-            self.broker_message(message);
-            if self.hold.is_some() {
-                break;
-            }
-        }
+        running
     }
 
     /// Reads the approvals directory (a request with no broker connected is
@@ -1058,6 +1178,29 @@ impl Worker {
     }
 
     fn send_approval_events(&mut self, events: Vec<ApprovalEvent>) {
+        // Codex reports no permission wait of its own: the approvals the
+        // worker reports open (waiting for a remote answer) and the ones it
+        // gave back to Codex's own dialog are its waiting status, applied
+        // once per batch so a release never flaps it to working.
+        for event in &events {
+            match event {
+                ApprovalEvent::Request { request_id, .. } => {
+                    self.open_approvals.insert(request_id.clone());
+                }
+                ApprovalEvent::Closed { request_id, .. }
+                | ApprovalEvent::Applied { request_id, .. } => {
+                    self.open_approvals.remove(request_id);
+                }
+                ApprovalEvent::AutoAllowed { .. }
+                | ApprovalEvent::Rules(_)
+                | ApprovalEvent::RuleRevoked { .. }
+                | ApprovalEvent::RuleNotKept { .. } => {}
+            }
+        }
+        let released = self.approvals.as_mut().is_some_and(|a| a.take_released());
+        if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+            codex.set_approvals(self.open_approvals.len(), released);
+        }
         for event in events {
             let message = match event {
                 ApprovalEvent::Request { request_id, info } => WorkerMsg::ApprovalRequest {
@@ -1076,6 +1219,24 @@ impl Worker {
                     request_id,
                     outcome,
                 },
+                ApprovalEvent::AutoAllowed {
+                    request_id,
+                    rule_id,
+                    tool,
+                    summary,
+                } => WorkerMsg::ApprovalAutoAllowed {
+                    request_id,
+                    rule_id,
+                    tool,
+                    summary,
+                },
+                ApprovalEvent::Rules(rules) => WorkerMsg::ApprovalRules { rules },
+                ApprovalEvent::RuleRevoked { rule_id, ok } => {
+                    WorkerMsg::ApprovalRuleRevoked { rule_id, ok }
+                }
+                ApprovalEvent::RuleNotKept { request_id } => {
+                    WorkerMsg::ApprovalRuleNotKept { request_id }
+                }
             };
             self.send(&message);
         }
@@ -1114,7 +1275,8 @@ impl Worker {
     /// Reads the chat adapter (in the App's order: events, the log, then turn
     /// ends), keeps the activity from it and forwards what it read.
     fn poll_chat(&mut self) {
-        let Some(adapter) = self.adapter.as_mut() else {
+        let evidence = self.approvals.is_some();
+        let Some(adapter) = self.adapter.as_mut().map(ChatAdapter::get) else {
             return;
         };
         let input_count = self.input.input_count();
@@ -1124,23 +1286,28 @@ impl Worker {
         let capabilities = adapter.capabilities();
         // What may end a waiting permission prompt (applied with the next
         // approvals poll): a new prompt or the turn's end, a tool refused in
-        // the terminal. Tool results are the worker's only: never forwarded.
-        if self.approvals.is_some() {
+        // the terminal — each stamped with when the agent reported it, so
+        // it answers only a prompt opened before (one read in the same pass
+        // as a newer request doesn't). Tool results are the worker's only:
+        // never forwarded.
+        if evidence {
             use super::worker_approvals::Evidence;
             for e in &events {
-                if matches!(
-                    e,
-                    AgentEvent::PromptSubmitted { .. } | AgentEvent::TurnEnded
-                ) {
-                    self.approval_evidence
-                        .push(Evidence::TurnEnded { interrupted: false });
+                if let AgentEvent::PromptSubmitted { at_ms, .. } | AgentEvent::TurnEnded { at_ms } =
+                    e
+                {
+                    self.approval_evidence.push(Evidence::TurnEnded {
+                        interrupted: false,
+                        at_ms: *at_ms,
+                    });
                 }
             }
             for item in &log {
                 match item {
-                    LogItem::TurnEnded { outcome, .. } => {
+                    LogItem::TurnEnded { outcome, at_ms, .. } => {
                         self.approval_evidence.push(Evidence::TurnEnded {
                             interrupted: *outcome == crate::chat::adapter::Outcome::Interrupted,
+                            at_ms: (*at_ms != 0).then_some(*at_ms),
                         })
                     }
                     LogItem::ToolResult {
@@ -1172,7 +1339,7 @@ impl Worker {
         let (ends, others): (Vec<_>, Vec<_>) = events
             .iter()
             .cloned()
-            .partition(|e| matches!(e, AgentEvent::TurnEnded));
+            .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
         for event in others {
             self.chat.on_event(event, now, input_count);
         }
@@ -1204,6 +1371,15 @@ impl Worker {
         self.set_activity(state, detail);
     }
 
+    /// What the adapter's chat can't provide (`Capabilities::unavailable`).
+    fn unavailable(&self) -> Vec<String> {
+        self.capabilities
+            .unavailable
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     /// Sends the held chat batches (or, when `always`, at least the
     /// capability) to a connected broker.
     fn flush_chat(&mut self, always: bool) {
@@ -1216,6 +1392,7 @@ impl Worker {
                 input_count: self.input.input_count(),
                 chat_v1: self.capabilities.chat_v1,
                 reason: self.capabilities.reason.clone(),
+                unavailable: self.unavailable(),
                 gap: 0,
             });
         }
@@ -1226,6 +1403,7 @@ impl Worker {
                 input_count: chunk.input_count,
                 chat_v1: self.capabilities.chat_v1,
                 reason: self.capabilities.reason.clone(),
+                unavailable: self.unavailable(),
                 gap: chunk.gap,
             });
         }
@@ -1244,6 +1422,27 @@ impl std::fmt::Display for StaleEpoch {
 
 impl std::error::Error for StaleEpoch {}
 
+/// Input consumed after one released waiting hooks (`Worker::consuming`).
+struct Consume {
+    until: Instant,
+    /// The released hooks.
+    ids: Vec<String>,
+}
+
+/// Input consumed because it handed a waiting approval to the agent's own
+/// dialog (nothing written).
+fn consumed(seq: u64) -> WorkerMsg {
+    WorkerMsg::WriteResult {
+        seq,
+        ok: false,
+        bytes_written: 0,
+        dropped: false,
+        no_effect: true,
+        consumed: true,
+        error: Some(super::worker_protocol::APPROVAL_HANDED.into()),
+    }
+}
+
 fn dropped(seq: u64) -> WorkerMsg {
     WorkerMsg::WriteResult {
         seq,
@@ -1251,6 +1450,7 @@ fn dropped(seq: u64) -> WorkerMsg {
         bytes_written: 0,
         dropped: true,
         no_effect: false,
+        consumed: false,
         error: None,
     }
 }
@@ -1263,6 +1463,7 @@ fn failed(seq: u64, error: String) -> WorkerMsg {
         bytes_written: 0,
         dropped: false,
         no_effect: true,
+        consumed: false,
         error: Some(error),
     }
 }
@@ -1381,12 +1582,56 @@ mod approval_settings_tests {
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("hooks").join("approval-hook.sh");
         let off = agent_command(&spec("codex"), Some(&[]), root.path(), true, None).unwrap();
-        assert!(off.approvals.is_none() && off.owned_dir.is_none());
+        assert!(off.approvals.is_none() && off.adapter.is_none());
         assert!(!script.exists());
         let on =
             agent_command(&spec("codex"), Some(&[]), root.path(), true, Some(&script)).unwrap();
-        assert!(on.approvals.is_some());
+        assert!(matches!(on.adapter, Some(ChatAdapter::Codex(_))));
+        let dir = on.approvals.clone().unwrap().0;
+        assert!(dir.join("events").is_dir());
         assert!(script.exists());
-        let _ = std::fs::remove_dir_all(on.owned_dir.unwrap());
+        // The adapter owns the session directory.
+        drop(on);
+        assert!(!dir.exists());
+    }
+
+    /// `[codex] hooks = true` (a script): the worker merges every hook into
+    /// the launch's CODEX_HOME itself, never asking; unset or false (no
+    /// script): nothing written. A failed merge is a notice, Codex starts.
+    #[test]
+    fn a_consented_codex_launch_merges_the_hooks_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("hooks").join("approval-hook.sh");
+        let home = root.path().join("codex-home");
+        let env = [(OsString::from("CODEX_HOME"), home.clone().into_os_string())];
+        let hooks = home.join("hooks.json");
+        let off = agent_command(&spec("codex"), Some(&env), root.path(), true, None).unwrap();
+        assert!(off.notice.is_none());
+        assert!(!home.exists(), "never written without consent");
+        let on =
+            agent_command(&spec("codex"), Some(&env), root.path(), true, Some(&script)).unwrap();
+        assert!(on.notice.is_none(), "{:?}", on.notice);
+        let text = std::fs::read_to_string(&hooks).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for event in crate::chat::codex::EVENTS {
+            assert!(v["hooks"][event].is_array(), "{event}");
+        }
+        // idempotent
+        drop(on);
+        let again =
+            agent_command(&spec("codex"), Some(&env), root.path(), true, Some(&script)).unwrap();
+        assert!(again.notice.is_none());
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), text);
+        // a file it can't merge: left as it is, a notice, chat still set up
+        std::fs::write(&hooks, "not json").unwrap();
+        let bad =
+            agent_command(&spec("codex"), Some(&env), root.path(), true, Some(&script)).unwrap();
+        assert!(
+            bad.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("hooks.json"))
+        );
+        assert!(matches!(bad.adapter, Some(ChatAdapter::Codex(_))));
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), "not json");
     }
 }

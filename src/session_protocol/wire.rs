@@ -39,6 +39,8 @@ pub const MAX_APPROVAL_SUMMARY_BYTES: usize = 512;
 pub const MAX_RULE_TEXT_BYTES: usize = 256;
 pub const MAX_ALWAYS_RULES: usize = 8;
 pub const MAX_APPROVAL_MESSAGE_BYTES: usize = 512;
+/// Atem session rules (r7.2) a session holds at once.
+pub const MAX_SESSION_RULES: usize = 32;
 /// In-flight requests per attachment (enforced by the host; excess → `busy`).
 pub const MAX_IN_FLIGHT: usize = 64;
 
@@ -185,6 +187,8 @@ pub enum ReceiptKind {
     Stop,
     /// The answer to a pending approval (r7).
     Approval,
+    /// Revokes one of the session's Atem session rules (r7.2).
+    ApprovalRuleRevoke,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +375,43 @@ impl ApprovalAnswer {
     }
 }
 
+/// The payload of a `kind:"approval_rule_revoke"` submission (r7.2):
+/// exactly `{rule_id}`, an opaque id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleRevoke {
+    pub rule_id: String,
+}
+
+impl RuleRevoke {
+    pub fn parse(payload: &Value) -> Result<Self, String> {
+        let r: Self = serde_json::from_value(payload.clone())
+            .map_err(|e| format!("approval_rule_revoke: {e}"))?;
+        check(is_opaque_id(&r.rule_id), "rule_id")?;
+        Ok(r)
+    }
+}
+
+/// The active Atem session rules of a session (r7.2): ≤ 32, unique ids,
+/// one-line labels and scopes.
+pub fn validate_session_rules(rules: &[AlwaysRule]) -> Result<(), String> {
+    check(rules.len() <= MAX_SESSION_RULES, "rules count")?;
+    validate_rules(rules)
+}
+
+fn validate_rules(rules: &[AlwaysRule]) -> Result<(), String> {
+    for (i, r) in rules.iter().enumerate() {
+        check(is_opaque_id(&r.rule_id), "rule_id")?;
+        check(
+            rules[..i].iter().all(|o| o.rule_id != r.rule_id),
+            "duplicate rule_id",
+        )?;
+        text(&r.label, 1, MAX_RULE_TEXT_BYTES, &[], "rule label")?;
+        text(&r.scope, 1, MAX_RULE_TEXT_BYTES, &[], "rule scope")?;
+    }
+    Ok(())
+}
+
 /// The bounds of what an approval shows (r7): one-line `tool` and
 /// `summary`, ≤ 8 rules with unique ids and one-line labels and scopes.
 pub fn validate_approval_info(
@@ -381,16 +422,7 @@ pub fn validate_approval_info(
     text(tool, 1, MAX_APPROVAL_TOOL_BYTES, &[], "tool")?;
     text(summary, 0, MAX_APPROVAL_SUMMARY_BYTES, &[], "summary")?;
     check(always_rules.len() <= MAX_ALWAYS_RULES, "always_rules count")?;
-    for (i, r) in always_rules.iter().enumerate() {
-        check(is_opaque_id(&r.rule_id), "rule_id")?;
-        check(
-            always_rules[..i].iter().all(|o| o.rule_id != r.rule_id),
-            "duplicate rule_id",
-        )?;
-        text(&r.label, 1, MAX_RULE_TEXT_BYTES, &[], "rule label")?;
-        text(&r.scope, 1, MAX_RULE_TEXT_BYTES, &[], "rule scope")?;
-    }
-    Ok(())
+    validate_rules(always_rules)
 }
 
 impl ApprovalRequest {
@@ -493,6 +525,13 @@ pub enum Op {
     ApprovalClosed {
         approval_id: String,
         reason: ApprovalCloseReason,
+    },
+    /// The session's active Atem session rules (r7.2), whenever they change
+    /// and after each `sessions` snapshot (when there are any).
+    ApprovalRules {
+        session_id: String,
+        process_gen: String,
+        rules: Vec<AlwaysRule>,
     },
     Error {
         code: ErrorCode,
@@ -732,9 +771,14 @@ pub fn submit_binding_use(kind: ReceiptKind, payload: &Value) -> BindingUse {
     }
 }
 
+/// The chat-v1 `submit` field carrying a rule revocation (r7.2), named
+/// like its session-v1 kind.
+pub const RULE_REVOKE_FIELD: &str = "approval_rule_revoke";
+
 /// v1 payload shapes (§6): `prompt` is exactly `{"text": string}` (≤ 32 768
 /// bytes), `interrupt`/`stop` exactly `{}`, `approval` an `ApprovalAnswer`
-/// (r7). The canonical form is ≤ 64 KiB.
+/// (r7), `approval_rule_revoke` exactly `{"rule_id"}` (r7.2). The
+/// canonical form is ≤ 64 KiB.
 fn validate_payload(kind: ReceiptKind, payload: &Value) -> Result<(), String> {
     let canonical = canonical::jcs(payload).map_err(|e| format!("payload: {e:?}"))?;
     check(canonical.len() <= MAX_PAYLOAD_BYTES, "payload size")?;
@@ -750,6 +794,7 @@ fn validate_payload(kind: ReceiptKind, payload: &Value) -> Result<(), String> {
             check(obj.is_some_and(|o| o.is_empty()), "payload (must be {})")
         }
         ReceiptKind::Approval => ApprovalAnswer::parse(payload).map(|_| ()),
+        ReceiptKind::ApprovalRuleRevoke => RuleRevoke::parse(payload).map(|_| ()),
     }
 }
 
@@ -849,6 +894,15 @@ impl Op {
             Op::Receipts { receipts } => receipts.iter().try_for_each(Receipt::validate),
             Op::ApprovalRequest(r) => r.validate(),
             Op::ApprovalClosed { approval_id, .. } => uuid(approval_id, "approval_id"),
+            Op::ApprovalRules {
+                session_id,
+                process_gen,
+                rules,
+            } => {
+                check(is_session_id(session_id), "session_id")?;
+                uuid(process_gen, "process_gen")?;
+                validate_session_rules(rules)
+            }
             Op::Error { detail: d, .. } => detail(d),
         }
     }
@@ -1067,6 +1121,9 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
         uuid(field("generation"), "generation").map_err(bad)?;
         if let Some(answer) = env.body.get("approval") {
             ApprovalAnswer::parse(answer).map_err(bad)?;
+        }
+        if let Some(revoke) = env.body.get(RULE_REVOKE_FIELD) {
+            RuleRevoke::parse(revoke).map_err(bad)?;
         }
     }
     Ok(())

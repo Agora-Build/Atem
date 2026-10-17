@@ -200,6 +200,7 @@ async fn the_worker_runs_the_agent_and_drops_writes_of_a_stale_epoch() {
         dropped: true,
         error: None,
         no_effect: false,
+        consumed: false,
     }));
     assert!(results.contains(&WorkerMsg::WriteResult {
         seq: 2,
@@ -208,6 +209,7 @@ async fn the_worker_runs_the_agent_and_drops_writes_of_a_stale_epoch() {
         dropped: false,
         error: None,
         no_effect: false,
+        consumed: false,
     }));
     assert!(results.iter().any(|r| matches!(
         r,
@@ -723,10 +725,10 @@ async fn a_codex_hook_waits_for_the_brokers_decision() {
 }
 
 #[tokio::test]
-async fn release_approvals_and_adoption_give_no_decision() {
+async fn input_to_codex_and_adoption_give_no_decision() {
     let (running, mut handle) = start_approving().await;
     let id = approval_request(&mut handle, 1).await;
-    handle.release_approvals().unwrap();
+    handle.write_until(9, b"x", 0, None, true).unwrap();
     let seen = until(&mut handle, has_output("hook-done")).await;
     assert!(!output_text(&seen).contains("behavior"));
     // The next one: a broker that knows only other approvals (adoption).
@@ -742,6 +744,65 @@ async fn release_approvals_and_adoption_give_no_decision() {
         )),
         "a release reports nothing: {seen:?}"
     );
+    stop(running, handle).await;
+}
+
+#[tokio::test]
+async fn input_that_releases_a_waiting_hook_is_consumed() {
+    let (running, mut handle) = start_approving().await;
+    approval_request(&mut handle, 1).await;
+    // As the broker sends any input to Codex: releasing the waiting hooks.
+    handle.write_until(2, b"zap\r", 0, None, true).unwrap();
+    let seen = until(&mut handle, |m| {
+        matches!(m, WorkerMsg::WriteResult { seq: 2, .. })
+    })
+    .await;
+    assert_eq!(
+        seen.last(),
+        Some(&WorkerMsg::WriteResult {
+            seq: 2,
+            ok: false,
+            bytes_written: 0,
+            dropped: false,
+            no_effect: true,
+            consumed: true,
+            error: Some(super::super::worker_protocol::APPROVAL_HANDED.into()),
+        })
+    );
+    until(&mut handle, has_output("hook-done")).await;
+    // Input with no hook waiting is written as before (the agent's next
+    // line asks again).
+    handle.write_until(3, b"next\r", 0, None, true).unwrap();
+    let seen = until(&mut handle, |m| {
+        matches!(m, WorkerMsg::ApprovalRequest { .. })
+    })
+    .await;
+    assert!(seen.iter().any(|m| matches!(
+        m,
+        WorkerMsg::WriteResult {
+            seq: 3,
+            ok: true,
+            consumed: false,
+            ..
+        }
+    )));
+    let all = output_text(&seen);
+    assert!(all.contains("next") && !all.contains("zap"), "{all}");
+    // A paste that releases one is consumed the same way.
+    handle.paste_until(4, "pasted", 0, None, true).unwrap();
+    let seen = until(&mut handle, |m| {
+        matches!(
+            m,
+            WorkerMsg::WriteResult {
+                seq: 4,
+                consumed: true,
+                ..
+            }
+        )
+    })
+    .await;
+    until(&mut handle, has_output("hook-done")).await;
+    assert!(!output_text(&seen).contains("pasted"));
     stop(running, handle).await;
 }
 

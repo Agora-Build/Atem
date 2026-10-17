@@ -411,7 +411,7 @@ fn launch_runs_the_agent_in_the_launching_directory_and_never_logs_its_environme
 }
 
 #[test]
-fn codex_launch_asks_once_and_merges_the_approval_hook() {
+fn codex_launch_asks_once_and_merges_the_hooks() {
     let sandbox = Sandbox::new();
     std::fs::remove_file(sandbox.config().join("config.toml")).unwrap();
     let codex_home = sandbox.home.join(".codex");
@@ -427,11 +427,11 @@ fn codex_launch_asks_once_and_merges_the_approval_hook() {
         &sandbox.home,
         &[("CODEX_CLI_BIN", agent.to_str().unwrap())],
     );
-    frontend.shows("Allow approvals from Astation for Codex?");
+    frontend.shows("Let Astation follow Codex sessions");
     frontend.send(b"y\r");
     frontend.shows("AGENT_READY");
     let written = frontend.written();
-    assert!(written.contains("Added Atem's approval hook"), "{written}");
+    assert!(written.contains("Added Atem's hooks"), "{written}");
     assert!(written.contains("/hooks"), "{written}");
     // The session's own directory, under the sandbox's runtime dir.
     let dir_line = frontend
@@ -455,6 +455,24 @@ fn codex_launch_asks_once_and_merges_the_approval_hook() {
     let ours = groups[1]["hooks"][0]["command"].as_str().unwrap();
     assert!(ours.starts_with(": atem-approval-hook;"), "{ours}");
     assert_eq!(groups[1]["hooks"][0]["timeout"], 300);
+    // One entry per Codex event, the same script.
+    for event in [
+        "SessionStart",
+        "SessionEnd",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PreCompact",
+        "PostCompact",
+        "Stop",
+        "Interrupt",
+    ] {
+        let cmd = hooks["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.starts_with(": atem-approval-hook;"), "{event}: {cmd}");
+        assert!(cmd.ends_with(&format!(" event {event}")), "{event}: {cmd}");
+    }
     assert_eq!(
         std::fs::read_to_string(codex_home.join("hooks.json.atem-bak")).unwrap(),
         mine
@@ -463,7 +481,7 @@ fn codex_launch_asks_once_and_merges_the_approval_hook() {
     assert!(ours.contains(script.to_str().unwrap()), "{ours}");
     assert!(script.exists());
     let config = std::fs::read_to_string(sandbox.config().join("config.toml")).unwrap();
-    assert!(config.contains("approvals_hook = true"), "{config}");
+    assert!(config.contains("hooks = true"), "{config}");
     let sid = frontend.detach();
     sandbox.track();
     let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);

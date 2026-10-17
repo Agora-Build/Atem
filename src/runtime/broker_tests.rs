@@ -142,3 +142,63 @@ async fn too_many_writes_in_flight_hold_further_input() {
     pump_until(&mut session, &mut output, |s, _| s.can_write()).await;
     session.stop().unwrap();
 }
+
+/// A Codex worker with Atem's hooks on says what its chat offers from its
+/// first `chat_snapshot` on (chat-v1 open, the unavailable list).
+#[tokio::test]
+async fn the_first_chat_snapshot_names_the_chat_capabilities() {
+    let dir = tempfile::Builder::new()
+        .prefix("atem-b")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let agent = dir.path().join("agent");
+    std::fs::write(&agent, "#!/bin/sh\nexec cat\n").unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let launcher = Launcher::InProcess(InProcess {
+        state: dir.path().join("state"),
+        socket_dir: dir.path().join("ws"),
+        chat_root: dir.path().join("chat"),
+    });
+    let request = SpawnRequest {
+        session_id: SessionId::new(),
+        process_gen: uuid::Uuid::new_v4().to_string(),
+        provider: Provider::Codex,
+        args: vec![],
+        cwd: dir.path().to_path_buf(),
+        rows: 24,
+        cols: 80,
+    };
+    let env = LaunchEnv(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("CODEX_CLI_BIN".into(), agent.display().to_string()),
+    ]);
+    let (mut handle, _) = launcher.spawn(request, env).await.unwrap();
+    assert!(handle.info.chat, "hello says the session has chat");
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match handle.recv().await.expect("the worker closed") {
+                WorkerMsg::ChatSnapshot {
+                    chat_v1,
+                    unavailable,
+                    ..
+                } => return (chat_v1, unavailable),
+                WorkerMsg::Chat { .. } => panic!("a chat batch before the snapshot"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("no chat_snapshot");
+    assert_eq!(
+        snapshot,
+        (
+            true,
+            vec![
+                "streaming".to_string(),
+                "reasoning".into(),
+                "error_details".into()
+            ]
+        )
+    );
+    let _ = handle.stop();
+}

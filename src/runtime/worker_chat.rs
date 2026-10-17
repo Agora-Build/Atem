@@ -68,22 +68,22 @@ fn cut_item(item: &mut LogItem, max: usize) {
         LogItem::ToolResult { text, .. } => {
             cut(text, max);
         }
-        LogItem::TurnEnded { .. } => {}
+        LogItem::TurnStarted { .. } | LogItem::TurnEnded { .. } => {}
     }
 }
 
 fn cut_event(event: &mut AgentEvent, max: usize) {
     match event {
-        AgentEvent::PromptSubmitted { text } => {
+        AgentEvent::PromptSubmitted { text, .. } => {
             cut(text, max);
         }
-        AgentEvent::WaitingForPermission { detail } => {
+        AgentEvent::WaitingForPermission { detail } | AgentEvent::NotReady { detail } => {
             cut(detail, max);
         }
         AgentEvent::SessionStarted { source, .. } => {
             cut(source, max);
         }
-        AgentEvent::ToolStarted | AgentEvent::ToolFinished | AgentEvent::TurnEnded => {}
+        AgentEvent::ToolStarted | AgentEvent::ToolFinished | AgentEvent::TurnEnded { .. } => {}
     }
 }
 
@@ -206,7 +206,7 @@ impl ChatBacklog {
             let (ends, others): (Vec<_>, Vec<_>) = batch
                 .events
                 .into_iter()
-                .partition(|e| matches!(e, AgentEvent::TurnEnded));
+                .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
             enum Item {
                 Event(AgentEvent),
                 Log(LogItem),
@@ -295,6 +295,7 @@ mod tests {
             input_count: chunk.input_count,
             chat_v1: true,
             reason: None,
+            unavailable: Vec::new(),
             gap: chunk.gap,
         })
     }
@@ -312,8 +313,13 @@ mod tests {
         log.push(LogItem::TurnEnded {
             turn_id: "t".into(),
             outcome: Outcome::Done,
+            at_ms: 1,
         });
-        backlog.push(vec![started("s"), AgentEvent::TurnEnded], log, 7);
+        backlog.push(
+            vec![started("s"), AgentEvent::TurnEnded { at_ms: None }],
+            log,
+            7,
+        );
         let chunks = backlog.take();
         assert!(chunks.len() > 5, "{}", chunks.len());
         for chunk in &chunks {
@@ -324,7 +330,10 @@ mod tests {
         }
         // Order kept: the session start first, the turn end last, every item once.
         assert_eq!(chunks[0].events, vec![started("s")]);
-        assert_eq!(chunks.last().unwrap().events, vec![AgentEvent::TurnEnded]);
+        assert_eq!(
+            chunks.last().unwrap().events,
+            vec![AgentEvent::TurnEnded { at_ms: None }]
+        );
         let log: Vec<&LogItem> = chunks.iter().flat_map(|c| &c.log).collect();
         assert_eq!(log.len(), 402);
         let LogItem::Backfill(big) = log[400] else {
@@ -356,11 +365,15 @@ mod tests {
         assert!(text.ends_with(TRUNCATED) && text.len() <= MAX_TEXT + TRUNCATED.len());
         let event = cap_event(AgentEvent::PromptSubmitted {
             text: "a".repeat(MAX_TEXT + 1),
+            turn_id: None,
+            at_ms: None,
         });
         assert_eq!(
             event,
             AgentEvent::PromptSubmitted {
-                text: format!("{}{TRUNCATED}", "a".repeat(MAX_TEXT))
+                text: format!("{}{TRUNCATED}", "a".repeat(MAX_TEXT)),
+                turn_id: None,
+                at_ms: None,
             }
         );
         let small = part("fine".into());
@@ -371,7 +384,11 @@ mod tests {
     fn each_batch_keeps_its_own_input_count() {
         let mut backlog = ChatBacklog::default();
         backlog.push(
-            vec![AgentEvent::PromptSubmitted { text: "a".into() }],
+            vec![AgentEvent::PromptSubmitted {
+                text: "a".into(),
+                turn_id: None,
+                at_ms: None,
+            }],
             vec![],
             1,
         );

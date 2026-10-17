@@ -187,6 +187,7 @@ impl TranscriptReader {
                 out.push(LogItem::TurnEnded {
                     turn_id,
                     outcome: Outcome::Interrupted,
+                    at_ms: ts,
                 });
                 return;
             }
@@ -255,6 +256,7 @@ impl TranscriptReader {
             out.push(LogItem::TurnEnded {
                 turn_id: self.turn_id.clone(),
                 outcome: Outcome::Done,
+                at_ms: ts,
             });
         }
     }
@@ -328,7 +330,7 @@ fn created_at_ms(v: &Value) -> i64 {
 }
 
 /// Minimal RFC 3339 parser (`YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`) to unix ms.
-fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !(b[10] == b'T' || b[10] == b't') {
         return None;
@@ -505,7 +507,9 @@ mod tests {
             last,
             &L::TurnEnded {
                 turn_id: "64707c1e-bb7f-4bb8-9065-1514059dcb0d".into(),
-                outcome: Outcome::Interrupted
+                outcome: Outcome::Interrupted,
+                // the entry's timestamp, 2026-10-15T03:27:56.783Z
+                at_ms: 1792034876783,
             }
         );
         // the aborted partial text still produced a part
@@ -543,14 +547,16 @@ mod tests {
             items[1],
             L::TurnEnded {
                 turn_id: "p1".into(),
-                outcome: Outcome::Interrupted
+                outcome: Outcome::Interrupted,
+                at_ms: 1_792_026_123_456,
             }
         );
         assert_eq!(
             items[3],
             L::TurnEnded {
                 turn_id: "p3".into(),
-                outcome: Outcome::Interrupted
+                outcome: Outcome::Interrupted,
+                at_ms: 1_792_026_123_456,
             }
         );
     }

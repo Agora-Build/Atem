@@ -1,0 +1,9 @@
+{
+  "session_id": "<session-A>",
+  "transcript_path": "/home/user/.codex/sessions/2026/10/17/rollout-2026-10-17T05-32-36-<session-A>.jsonl",
+  "cwd": "/home/user/proj",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "source": "startup"
+}

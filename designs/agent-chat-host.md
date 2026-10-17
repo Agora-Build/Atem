@@ -16,9 +16,10 @@ a mobile app later uses the same events, so the host side is client-neutral.
 The host side is **adapter-based**: everything agent-specific (how Atem hooks
 in, which events mean what, how the session log is parsed) lives in one
 adapter per agent; the chat state, message model, wire protocol, security and
-reconnect handling are shared. v1 ships one adapter, **Claude Code**. Codex is
-the next adapter (its own, smaller design: rollout JSONL plus its hooks, which
-need per-installation trust); other agents (Gemini CLI, OpenCode, Copilot CLI,
+reconnect handling are shared. Two adapters: **Claude Code**, and **Codex**
+(its rollout JSONL plus Atem's Codex hooks, which need per-installation trust;
+`src/chat/codex/adapter.rs`, spec `designs/fixtures/codex-hooks/README.md`,
+plan `designs/plans/2026-10-17-codex-chat.md`); other agents (Gemini CLI, OpenCode, Copilot CLI,
 Aider, …) get an adapter only once their logs and events are checked. An agent
 without an adapter keeps the shared terminal, reports status `unknown` and has
 no `chat-v1` capability.
@@ -47,6 +48,32 @@ no `chat-v1` capability.
   stay. Approvals pending before a broker restart or adoption are released
   without `push_resolved`: a phone notification may linger until its
   `expires_at`, and a tap gets `stale_target` ("already answered").
+- **Atem session rules for Codex** (since 2026-10-17, contract §6a r7.2).
+  Codex's hook can't take a persistent rule, so a Codex card offers one
+  Atem rule instead, for a shell command only: "Always allow `<command>` in
+  <cwd> for this session" (`scope: "session"`; no rule for file changes or
+  for a command whose input carries anything besides `command` and
+  `description`; `cwd` is the hook's session cwd). Answering `allow_always` with it allows this request
+  and makes the worker keep the rule for the rest of this agent process (at
+  most 32; a respawn starts with none). Each rule keeps the account, device
+  and trust generation it was granted under; after a broker restart the
+  adopted worker's rules allow nothing until the new host accepted them,
+  which it does only under the same account, device and trust generation
+  (the worker drops the others). A later
+  request of the session's own pinned Codex with byte-equal tool, full
+  command and cwd is allowed by the worker
+  without a card: an `auto_allowed` card naming `rule_id` appears in the
+  conversation, runtime.log gets one line without the command, nothing is
+  pushed and no lease is taken. A nested `codex`, another cwd or any other
+  command still asks. The active rules are listed in `opened.approvalRules`
+  and re-sent with `rules` when they change; a `submit` with
+  `approval_rule_revoke: {rule_id}` instead of `text` revokes one (lease
+  required; an allow it wrote that Codex hasn't taken yet is withdrawn). A
+  rule the session can't keep when Codex takes the answer (32 already) is
+  not kept: the card ends `allowed` with a `note`. A new account, device or
+  trust generation while the host runs drops every rule. An `apply_patch`
+  run as a shell heredoc is a command like any other: its rule is
+  byte-exact, patch text included. Claude's rules are unchanged.
 - **Never merge with a local draft.** A chat prompt is refused when anyone
   typed into the terminal since Claude's last turn ended.
 - **Never resend.** A prompt whose delivery is unknown is reported, not retried.
@@ -285,13 +312,21 @@ message {
   parts: [ { id, kind: "text", markdown } | { id, kind: "tool", name, summary }
          | { id: "approval", kind: "approval", approval_id, tool, summary,
              always_rules: [{rule_id, label, scope}],
-             state: pending|allowed|always_allowed|denied|answered_terminal|expired|closed } ],
+             state: pending|allowed|always_allowed|denied|answered_terminal|expired|closed
+                    |auto_allowed,
+             rule_id?,       // auto_allowed: the Atem session rule that allowed it
+             note? } ],      // e.g. an allow_always whose rule wasn't kept
   history?: true      // backfill on open / page
 }
-delta { messageId, part: { id, kind, … } }   // append one part; a part id
-                                             // already present is ignored
+delta { messageId, part: { id, kind, … } }   // a later part appended to a
+                                             // message already sent; a part
+                                             // id already present is ignored
 ```
 
+- `delta` (both agents) means a later part (text, tool, …) was appended to a
+  message already sent, e.g. a tool call after the text of the same
+  assistant message. It is not a token stream: each part arrives whole
+  (`unavailable` lists `streaming`).
 - Markdown is CommonMark without raw HTML, so native apps can render it
   without a web view.
 - IDs never change, so clients can cache messages and merge updates.
@@ -301,6 +336,9 @@ delta { messageId, part: { id, kind, … } }   // append one part; a part id
   state changes the whole message is sent again with the same `messageId`
   (replace it). A chat `submit` with `approval` (the §6a payload) instead of
   `text` answers it; its binding has no `lease_epoch` when `acquire` is true.
+- An `auto_allowed` card (Codex, r7.2) is final when it arrives: the worker
+  allowed the request by the session rule `rule_id` without asking; it
+  offers nothing to answer (`always_rules: []`).
 - `waiting` and `complete` are the events a mobile app can turn into push
   notifications (delivery is Astation's/the app's concern).
 
@@ -312,17 +350,37 @@ on the existing authenticated Astation connection.
 | op | Direction | Fields |
 |---|---|---|
 | `open` | Astation → Atem | `conversationId`, `agentId`, optional `before` (messageId) |
-| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
-| `submit` | Astation → Atem | `generation`, `requestId` (UUID), `text` |
+| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), `approvalRules` (the session's active Atem session rules `[{rule_id, label, scope}]`; `[]` without `control`), then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
+| `submit` | Astation → Atem | `generation`, `requestId` (UUID), and one of `text`, `approval` (§6a answer) or `approval_rule_revoke` (`{rule_id}`, r7.2) |
+| `rules` | Atem → Astation | `approvalRules` (the whole list, when it changed; conversations with `control` only) |
 | `accepted` | Atem → Astation | `requestId` |
 | `message` / `delta` | Atem → Astation | see the message model |
 | `status` | Atem → Astation | `state: ready|working|waiting|unknown`, `since`, optional `detail` |
-| `complete` | Atem → Astation | `turnId`, optional `requestId`, `outcome: "done"|"interrupted"` |
-| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
+| `complete` | Atem → Astation | `turnId`, optional `requestId`, `outcome: "done"|"interrupted"` (below) |
+| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`, and `code` on every `error` the session host makes: `rejected` or `outcome_unknown` (a submit's receipt), a session-v1 code from admission (`stale_target`, `stale_lease`, `lease_held`, `forbidden`, …), `unsupported_version` (a malformed chat message) or `busy` (`open` without chat-v1, below); the chat's own errors (the agent exited or was restarted, the conversation was switched, chat withdrawn) carry no `code`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
 | `close` | either | `conversationId` |
 
 - `open` with `before` on an open conversation reopens it (`opened`,
   sequence 0) and sends that older page.
+- `open` on a running session whose chat-v1 is off (Claude before its
+  SessionStart or after chat was withdrawn, Codex without Atem's hooks or
+  before its first hook) is answered `error{code:"busy"}` with the text
+  "chat is not available for this agent" (`: <reason>` when the adapter
+  gave one) and opens nothing. An exited agent's history stays readable.
+- `complete.outcome` is the adapter's turn end: `interrupted` when the turn
+  ended interrupted (Esc, a deny at a permission prompt, Codex's
+  `turn_aborted`), else `done`. A remote prompt's `complete` follows its
+  completed receipt and carries the outcome the broker remembered for that
+  request; a duplicate `submit` after a broker restart (the receipt says
+  only "completed") gets `done`.
+- `opened.unavailable` names what this agent's chat can't provide, so a
+  client says so instead of waiting for it: `streaming` (no partial text:
+  messages arrive whole), `reasoning`, `error_details` (no model/API error
+  behind a failed turn). Claude: `streaming` (transcript blocks arrive
+  whole) and `reasoning` (thinking blocks aren't shown); Codex: all three
+  (its "always allow" is an Atem session rule, so it is not listed). It comes from the adapter's
+  `Capabilities.unavailable`, carried by the worker's `chat` and
+  `chat_snapshot` messages (field `unavailable`).
 - Every Atem event in a conversation carries `generation` and the next
   `sequence` (1, 2, …; at most 2^53−1). A gap or a different generation means
   the client reopens.
@@ -415,8 +473,72 @@ Additive to `mem_b3ccce1f`:
 
 ## Out of scope (v1)
 
-Adapters other than Claude Code (Codex next, as its own design; Codex
-approvals already work through its hook, without chat); streaming
+Adapters other than Claude Code and Codex; streaming
 token-by-token (the transcript holds whole content blocks); end-to-end
 encryption of chat; push delivery of chat messages (approvals ask the relay
 to push, §6a); attachments/images.
+
+## Codex
+
+The Codex adapter (`src/chat/codex/adapter.rs`) runs in the worker when
+`[codex] hooks = true` (one consent for approvals and chat). Atem's entries
+in `$CODEX_HOME/hooks.json` run `approval-hook.sh event <Event>`, which
+writes each event to the session's `events/` as `ev-<seq>-<Event>.json`:
+first a line with the hook's `$$ $PPID`, then its stdin. The rollout JSONL
+named by `transcript_path` carries every message and turn boundary. With
+the setting on, each Codex worker runs the idempotent hooks.json merge
+itself (backup, read-back, restore) in the launch's `CODEX_HOME` before
+spawning, so a session launched from the bare `atem` menu gets every hook
+too; it never asks and never writes when the setting is unset or false,
+and a failure is a session notice (Codex starts anyway).
+
+- **Ownership.** Only hooks the session's agent started count
+  (`approvals::HookAgent` over `started_by`, shared with approvals): with
+  the hook's parent the agent (or one shell under it) a hook may pin or
+  re-pin (`/new`); through a non-shell child (npm's wrapper: node runs the
+  real binary) only the pinned session's, or the first — which makes that
+  child the agent, so the real binary's `/new` re-pins and a `codex` it
+  starts without a shell still can't; deeper (a `codex` a tool ran) never.
+  A wrapped hook read after its parent exited counts as foreign (harmless:
+  the rollout's end record is authoritative).
+- **Session switches.** A SessionStart of another session re-pins (the
+  old rollout is read to its end first). The agent's own UserPromptSubmit
+  of another session read before that SessionStart (async hooks publish in
+  either order after `/new`) re-pins the same way, and the SessionStart
+  read later is then no restart. A resumed rollout is read to its end at
+  the switch, however many 8 MiB reads that takes, so all of it is history
+  (except a turn still running at its end).
+- **Status.** `unknown` until the first hook (SessionStart is lazy: it
+  fires at the first prompt), with the detail "type a first prompt in the
+  terminal: …"; chat opens, but `submit` is refused with that text (a
+  remote prompt needs `ready`: text typed into Codex's startup dialogs could
+  answer them). Then `working` from UserPromptSubmit or the rollout's
+  `task_started`, `waiting` while the worker has approvals of this session
+  open for a remote answer (its set is the only source: Codex has no event
+  of its own; after a re-pin with some open it is waiting again) or has
+  released one to Codex's own dialog ("no decision": input to Codex — which
+  is consumed, never written, so it can't answer the dialog the user hadn't
+  seen; a remote prompt or interrupt that released one is `rejected` — no
+  broker, an adopting broker that doesn't know it) — that one until its
+  PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
+  rollout item — `ready` at `task_complete` / `turn_aborted`.
+- **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
+  UserPromptSubmit and the rollout's UserMessage both name it, with the same
+  `turn_id`; completed at that turn's end (interrupted at `turn_aborted`).
+  `interrupt` writes Esc only while a turn is known to run (`working` or
+  `waiting`) and completes at the next turn end; in `ready` or `unknown`
+  it completes at once with nothing written (Esc on Codex's startup trust
+  dialog quits Codex). A session without turn state, for any agent (Codex
+  with its hooks off, Claude before its SessionStart or after its chat was
+  withdrawn), gets `interrupt` `rejected` ("no turn state; use the
+  terminal") and never an Esc.
+- **Approvals and chat evidence.** A new prompt or a turn end (stamped with
+  its hook file's or log entry's time) answers only a permission prompt
+  opened before it, for both agents: one read in the same pass as a newer
+  request leaves it open.
+- **Pairing a remote prompt.** Only a hook (its event file's time) and a log
+  entry (its timestamp) from after the paste can be the remote prompt's, and
+  only the first of each whose turn isn't known to be another: a local
+  prompt with the same text typed just before is a local turn. A
+  whole-second time counts up to the end of its second. This applies to
+  Claude as well.
