@@ -3,6 +3,8 @@
 //! signals only the runtime, workers and agents this sandbox started.
 #![allow(dead_code)]
 
+pub mod astation;
+
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;

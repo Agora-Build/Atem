@@ -66,8 +66,9 @@
 //! to 5 s until they match (`SETTLE_COUNTERS`).
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -75,11 +76,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use tokio_tungstenite::tungstenite::Message;
+use support::astation::{Event, FakeAstation, write_verified_pairing};
 
-const ASTATION: &str = "astation-fixtures";
 const WAIT: Duration = Duration::from_secs(15);
 /// Time the runtime gets to act on what it was sent before the next event.
 const SETTLE: Duration = Duration::from_millis(400);
@@ -102,126 +102,6 @@ const PASTE_END: &[u8] = b"\x1b[201~\r";
 /// call asked for in `$FAKE_DIR/ask-<n>.json` runs the real
 /// `PermissionRequest` hook Atem configured and acts on its answer.
 const FAKE_AGENT: &str = include_str!("fixtures/approvals/fake-agent.py");
-
-// ── The fake Astation ─────────────────────────────────────────────────────
-
-enum Event {
-    /// Connection `n` authenticated.
-    Authenticated(u64),
-    Message(u64, Value),
-}
-
-enum Cmd {
-    Send(String),
-    Close,
-}
-
-struct FakeAstation {
-    url: String,
-    events: mpsc::Receiver<Event>,
-    /// The command channel of each connection, by number.
-    links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>>,
-}
-
-impl FakeAstation {
-    fn start() -> Self {
-        let (url_tx, url_rx) = mpsc::channel();
-        let (events_tx, events) = mpsc::channel();
-        let links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>> =
-            Arc::default();
-        let shared = links.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                url_tx
-                    .send(format!("ws://{}/ws", listener.local_addr().unwrap()))
-                    .unwrap();
-                let mut next = 0u64;
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        return;
-                    };
-                    next += 1;
-                    let n = next;
-                    let events = events_tx.clone();
-                    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-                    shared.lock().unwrap().insert(n, cmd_tx);
-                    tokio::spawn(link(n, stream, events, cmd_rx));
-                }
-            });
-        });
-        let url = url_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        Self { url, events, links }
-    }
-
-    fn send(&self, link: u64, text: String) {
-        if let Some(tx) = self.links.lock().unwrap().get(&link) {
-            let _ = tx.send(Cmd::Send(text));
-        }
-    }
-
-    fn close(&self, link: u64) {
-        if let Some(tx) = self.links.lock().unwrap().remove(&link) {
-            let _ = tx.send(Cmd::Close);
-        }
-    }
-}
-
-/// One link: authenticates the runtime (any proof), then relays.
-async fn link(
-    n: u64,
-    stream: tokio::net::TcpStream,
-    events: mpsc::Sender<Event>,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
-) {
-    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
-        return;
-    };
-    let challenge = json!({"type": "statusUpdate", "data": {"status": "auth_required",
-        "data": {"astation_id": ASTATION, "challenge": "b".repeat(64),
-                 "transport": "lan", "protocol": "2"}}});
-    if socket
-        .send(Message::Text(challenge.to_string()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    loop {
-        tokio::select! {
-            frame = socket.next() => {
-                let Some(Ok(frame)) = frame else { return };
-                let Message::Text(text) = frame else { continue };
-                let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
-                if value["type"] == "statusUpdate" && value["data"]["status"] == "auth" {
-                    let ok = json!({"type": "statusUpdate",
-                                    "data": {"status": "authenticated", "data": {}}});
-                    if socket.send(Message::Text(ok.to_string())).await.is_err() {
-                        return;
-                    }
-                    let _ = events.send(Event::Authenticated(n));
-                } else {
-                    let _ = events.send(Event::Message(n, value));
-                }
-            }
-            command = commands.recv() => match command {
-                Some(Cmd::Send(text)) => {
-                    if socket.send(Message::Text(text)).await.is_err() {
-                        return;
-                    }
-                }
-                Some(Cmd::Close) | None => {
-                    let _ = socket.close(None).await;
-                    return;
-                }
-            },
-        }
-    }
-}
 
 // ── The local frontend ────────────────────────────────────────────────────
 
@@ -369,37 +249,7 @@ impl Sandbox {
     /// Paired with `ASTATION` in `trust_gen` and verified as `account` /
     /// `device`; the next runtime epoch is `epoch`.
     fn profile(&self, account: &str, device: &str, trust_gen: u64, epoch: u64) {
-        let config = self.config();
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join("pairing.json"),
-            json!({"version": 1, "host_trust_gen": trust_gen, "binding_id": "binding-1",
-                   "astation_id": ASTATION, "created_at": 1})
-            .to_string(),
-        )
-        .unwrap();
-        let entry = json!({
-            "device_id": device, "data_account": account, "sign_gen": 1,
-            "astation_sign_pub": "", "astation_enc_pub": "", "recovery_sign_pub": "",
-            "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
-            "safety_code": "", "epoch_floor": 0, "account_state": null, "account_epoch": 0,
-        });
-        std::fs::write(
-            config.join("cred_state.json"),
-            json!({"version": 1, "astations": {ASTATION: entry}}).to_string(),
-        )
-        .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        std::fs::write(
-            config.join("sessions.json"),
-            json!({"sessions": {ASTATION: {"session_id": "session-1", "token": "token-1",
-                   "astation_id": ASTATION, "hostname": "h", "last_activity": now}}})
-            .to_string(),
-        )
-        .unwrap();
+        write_verified_pairing(&self.config(), account, device, trust_gen);
         self.next_epoch(epoch);
     }
 

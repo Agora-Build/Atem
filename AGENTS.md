@@ -25,6 +25,7 @@ cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
 cargo test                               # Run tests (1,450+; use -- --test-threads=1 if a test flakes); tests must inject a temp profile (src/test_profile.rs)
 cargo test --test runtime_fixtures_binary # Shared atem-session host fixtures against the real runtime (ATEM_FIXTURE=<name> runs one)
+ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored --nocapture --test-threads=1 # Approvals with the REAL claude/codex CLIs (real API calls; credentials from the environment; Codex runs --profile oss)
 cargo test -p atem-core -p atem-core-ffi # Token library + C ABI tests (workspace members)
 ./scripts/check-atem-core-ffi.sh         # Build libatem_core_ffi.a, drive it from C (and Swift on macOS)
 cargo check                              # Type-check without building
@@ -164,8 +165,9 @@ native/                  # RTM C++ (kept, unused: nothing in the App calls rtm_c
 └── src/atem_rtm_real.cpp # Real RTM using the Agora SDK (feature: real_rtm)
 tests/                   # binary tests on temp HOME/XDG_RUNTIME_DIR (never the real profile)
 ├── runtime_fixtures_binary.rs # the shared atem-session host fixtures against the real runtime, workers and a fake Astation
+├── approvals_real_agents.rs # #[ignore], ATEM_REAL_AGENTS=1: approvals answered from a fake Astation with the real Claude Code and Codex in temp HOME/CODEX_HOME
 ├── runtime_binary.rs, worker_binary.rs, agent_launch_binary.rs, terminal_ui_binary.rs, astation_op_binary.rs, key_agent_binary.rs
-└── support/             # Sandbox: temp profile, `atem` in a PTY, cleanup of what it started
+└── support/             # Sandbox: temp profile, `atem` in a PTY, cleanup of what it started; astation.rs: fake Astation peer + verified pairing profile
 npm/
 ├── package.json         # @agora-build/atem npm wrapper
 ├── install.js           # Postinstall binary downloader from GitHub releases
