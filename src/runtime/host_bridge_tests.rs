@@ -796,6 +796,7 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         );
         let receipts = peer.reply(&id).await;
         assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
+        assert_eq!(receipts["receipts"][0]["detail"], "done", "{receipts}");
         let old_attachment = peer.attachment.clone();
 
         // The broker restarts; its worker survives and is adopted.
@@ -859,6 +860,104 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         let complete = events.last().unwrap();
         assert!(is_chat(complete, "complete"), "{complete}");
         assert!(events.iter().any(|v| v.to_string().contains("reply 2")));
+        rt.shutdown().await;
+    });
+}
+
+/// The sequences `conversation` got, in arrival order (`opened` is 0).
+fn sequences(seen: &[Value], conversation: &str) -> Vec<u64> {
+    seen.iter()
+        .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == conversation)
+        .filter_map(|v| v["data"]["sequence"].as_u64())
+        .collect()
+}
+
+#[test]
+fn paging_older_history_continues_the_live_sequence_and_unknown_cursors_are_refused() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let session = rt.launch(&mut client, "claude", &fake_claude(), None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        let lease = peer.acquire(&sid, &pg).await;
+        for text in ["first", "second"] {
+            let rid = uuid::Uuid::new_v4().to_string();
+            let events = submit_until_complete(peer, "conv-1", &sid, &pg, lease, &rid, text).await;
+            assert!(is_chat(events.last().unwrap(), "complete"));
+        }
+        peer.drain(Duration::from_millis(300)).await;
+        let live = sequences(&peer.seen, "conv-1");
+        let last = *live.last().unwrap();
+
+        // An older page of the open conversation: no `opened`, the page at
+        // the next sequences, nothing reset.
+        let from = peer.seen.len();
+        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "u-2"}));
+        peer.drain(Duration::from_millis(500)).await;
+        let page: Vec<&Value> = peer.seen[from..]
+            .iter()
+            .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1")
+            .collect();
+        assert!(!page.iter().any(|v| is_chat(v, "opened")), "{page:#?}");
+        let ids: Vec<&str> = page
+            .iter()
+            .map(|v| v["data"]["messageId"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, ["u-1", "msg-1"], "{page:#?}");
+        assert!(page.iter().all(|v| v["data"]["history"] == true));
+        assert_eq!(page[0]["data"]["sequence"], last + 1);
+        assert_eq!(page[1]["data"]["sequence"], last + 2);
+
+        // Live events go on after the page.
+        let rid = uuid::Uuid::new_v4().to_string();
+        submit_until_complete(peer, "conv-1", &sid, &pg, lease, &rid, "third").await;
+        peer.drain(Duration::from_millis(300)).await;
+        let all = sequences(&peer.seen, "conv-1");
+        assert_eq!(
+            all,
+            (0..all.len() as u64).collect::<Vec<_>>(),
+            "never reset or reused"
+        );
+
+        // A cursor that isn't retained is refused, never an empty page: in
+        // the open conversation (sequenced, it stays open) ...
+        let from = peer.seen.len();
+        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "nope"}));
+        let at = peer
+            .wait_from(from, |v| {
+                is_chat(v, "error") && v["data"]["conversationId"] == "conv-1"
+            })
+            .await;
+        let error = peer.seen[at]["data"].clone();
+        assert_eq!(error["code"], "stale_target", "{error}");
+        assert_eq!(error["sequence"], all.len() as u64);
+        // ... and on a new one (not opened).
+        let from = peer.seen.len();
+        peer.chat("open", "conv-2", &sid, &pg, json!({"before": "nope"}));
+        let at = peer
+            .wait_from(from, |v| {
+                v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-2"
+            })
+            .await;
+        let error = peer.seen[at]["data"].clone();
+        assert_eq!(error["op"], "error", "{error}");
+        assert_eq!(error["code"], "stale_target");
+        assert!(error.get("sequence").is_none());
+        // The oldest message as the cursor is the start: an empty page.
+        let from = peer.seen.len();
+        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "u-1"}));
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            !peer.seen[from..]
+                .iter()
+                .any(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1"),
+            "{:#?}",
+            &peer.seen[from..]
+        );
         rt.shutdown().await;
     });
 }
@@ -2494,6 +2593,17 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         .await;
         let at_done = peer.wait_from(from, completed(r3.clone())).await;
         assert_eq!(peer.seen[at_done]["data"]["outcome"], "interrupted");
+        // The prompt's receipt carries the outcome too (journaled, no text).
+        let id = peer.request(
+            "receipt_query",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_ids": [r3]}),
+        );
+        let receipts = peer.reply(&id).await;
+        assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
+        assert_eq!(
+            receipts["receipts"][0]["detail"], "interrupted",
+            "{receipts}"
+        );
         activity_until(peer, &sid, "ready").await;
 
         // An approval in a remote turn: waiting, its card, answered from

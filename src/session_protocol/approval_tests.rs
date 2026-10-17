@@ -1353,7 +1353,8 @@ fn a_rule_revoked_from_chat_completes_in_chat() {
             ChatReply::Accepted { request_id: rid(7) },
             ChatReply::Complete {
                 request_id: rid(7),
-                turn_id: None
+                turn_id: None,
+                interrupted: false
             }
         ]
     );

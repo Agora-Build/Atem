@@ -72,8 +72,8 @@ use crate::chat::wire::{self as chat_wire, ChatEnvelope, Inbound};
 use crate::session::{Provider, SessionId};
 use crate::session_protocol::file_journal::FileJournal;
 use crate::session_protocol::host::{
-    Attach, ChatReply, DispatchReport, Effect, HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin,
-    SessionHost, SessionSpec, random_ids,
+    Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
+    HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
 };
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
@@ -105,6 +105,9 @@ const HISTORY_BYTES: usize = 256 * 1024;
 const MAX_CONVERSATIONS: usize = 8;
 const RESTARTED: &str = "the agent was restarted; reopen the chat";
 const NOT_AVAILABLE: &str = "chat is not available for this agent";
+/// `open{before}` naming a message no longer retained (`stale_target`).
+const UNKNOWN_CURSOR: &str =
+    "that message is no longer in the history; reopen without before to get the newest page";
 const NO_TURN: &str = "no turn was running";
 /// An interrupt on a session without chat: nothing knows whether a turn runs.
 const NO_TURN_STATE: &str = "no turn state; use the terminal";
@@ -128,8 +131,6 @@ const RUNTIME_EPOCH_FILE: &str = "runtime_epoch";
 const CAPTURE_CHECK: Duration = Duration::from_secs(5);
 /// Session messages remembered for duplicate detection, at most.
 const MAX_SEEN: usize = 4096;
-/// Turn outcomes kept for duplicate submits (cleared beyond it).
-const MAX_OUTCOMES: usize = 4096;
 
 /// The broker's monotonic clock in milliseconds, and wall time (tests move
 /// either forward).
@@ -380,8 +381,6 @@ pub struct HostBridge {
     /// terminal-v1 messages in order (frames, acks, errors) waiting for the
     /// bounded terminal queue.
     terminal_out: VecDeque<Queued>,
-    /// The outcome a prompt's turn ended with, until its receipt is reported.
-    outcomes: HashMap<String, crate::chat::adapter::Outcome>,
     /// approval_id → open approvals.
     approvals: HashMap<String, OpenApproval>,
     /// Rule revocations sent to a worker: request id → (session, rule id).
@@ -433,7 +432,6 @@ impl HostBridge {
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
-            outcomes: HashMap::new(),
             approvals: HashMap::new(),
             revokes: HashMap::new(),
             pushes: Default::default(),
@@ -1637,7 +1635,7 @@ impl HostBridge {
         let Some(session) = session_of(cx, sid) else {
             return;
         };
-        let out = session.chat.approval_card(card, wall_ms() as i64);
+        let out = session.approval_card(card, wall_ms() as i64);
         self.broadcast_to(sid, &out, None, true, cx);
     }
 
@@ -1933,7 +1931,7 @@ impl HostBridge {
         let Some(session) = session_of(cx, &sid) else {
             return;
         };
-        let out = session.chat.approval_card(card, wall_ms() as i64);
+        let out = session.approval_card(card, wall_ms() as i64);
         self.broadcast_to(&sid, &out, None, true, cx);
     }
 
@@ -2121,6 +2119,54 @@ impl HostBridge {
         // Approval cards and session rules only for an attachment that may
         // answer them.
         let control = self.host.attachment_can(attachment, Permission::Control);
+        // An open conversation of this attachment pages: the older page
+        // continues its live sequence (no `opened`, nothing reset).
+        let paging = before.is_some()
+            && self
+                .chats
+                .get(sid)
+                .and_then(|c| c.conversations.get(conversation))
+                .is_some_and(|c| c.attachment == attachment);
+        // A cursor no longer retained (evicted, another generation, never
+        // sent) is refused, never answered with an empty page that would
+        // look like the start of history.
+        if let Some(id) = before
+            && !session.chat.retains(id)
+        {
+            let head = if paging {
+                self.next_head(sid, conversation, cx)
+            } else {
+                None
+            };
+            let env = chat_error(
+                conversation,
+                sid,
+                head,
+                None,
+                "stale_target",
+                UNKNOWN_CURSOR,
+            );
+            self.send_chat(env, cx);
+            return;
+        }
+        if paging {
+            let history = session
+                .chat
+                .history(before, HISTORY_MESSAGES, HISTORY_BYTES);
+            for message in history.into_iter().filter(|m| control || !is_card(m)) {
+                if let Some((generation, sequence)) = self.next_head(sid, conversation, cx) {
+                    let env = chat_wire::history_message(
+                        conversation,
+                        sid,
+                        &generation,
+                        sequence,
+                        &message,
+                    );
+                    self.send_chat(env, cx);
+                }
+            }
+            return;
+        }
         let rules = if control {
             self.host.approval_rules(sid)
         } else {
@@ -2214,15 +2260,15 @@ impl HostBridge {
             ChatReply::Complete {
                 request_id,
                 turn_id,
+                interrupted,
             } => {
                 self.submitters.remove(&request_id);
-                // A turn ended interrupted says so (a duplicate after a
-                // restart only knows it completed).
-                let outcome = self
-                    .outcomes
-                    .get(&request_id)
-                    .copied()
-                    .unwrap_or(crate::chat::adapter::Outcome::Done);
+                // The receipt's detail keeps the outcome (also after a restart).
+                let outcome = if interrupted {
+                    crate::chat::adapter::Outcome::Interrupted
+                } else {
+                    crate::chat::adapter::Outcome::Done
+                };
                 complete_envelope(conversation, sid, head, request_id, turn_id, outcome)
             }
             ChatReply::Error {
@@ -2267,12 +2313,14 @@ impl HostBridge {
                     if let Some(request_id) = request_id {
                         except = self.submitters.get(request_id).map(|(_, c)| c.clone());
                         if self.prompts.remove(request_id).is_some() {
-                            if self.outcomes.len() >= MAX_OUTCOMES {
-                                self.outcomes.clear();
-                            }
-                            self.outcomes.insert(request_id.clone(), *outcome);
+                            let detail = match outcome {
+                                crate::chat::adapter::Outcome::Done => DETAIL_TURN_DONE,
+                                crate::chat::adapter::Outcome::Interrupted => {
+                                    DETAIL_TURN_INTERRUPTED
+                                }
+                            };
                             let report = DispatchReport::Completed {
-                                detail: None,
+                                detail: Some(detail.to_string()),
                                 turn_id: Some(turn_id.clone()),
                             };
                             let effects = self.host.dispatch_report(request_id, report);

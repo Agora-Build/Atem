@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-const MAX_HISTORY_MESSAGES: usize = 500;
-const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+/// History kept per session (oldest evicted first; the newest always stays).
+pub const MAX_HISTORY_MESSAGES: usize = 500;
+pub const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REQUESTS: usize = 1000;
 const MAX_MESSAGE_BYTES: usize = 131_072;
 const MAX_PROMPT_BYTES: usize = 32_768;
@@ -347,6 +348,72 @@ impl ChatSession {
 
     pub fn status(&self) -> &Status {
         &self.status
+    }
+
+    /// `message_id` is still in the retained history (a valid `before`).
+    pub fn retains(&self, message_id: &str) -> bool {
+        self.history.iter().any(|m| m.message_id == message_id)
+    }
+
+    /// The whole retained history replaced by `history` (the worker's, after
+    /// its backlog dropped items); status, turns and requests stay.
+    pub fn replace_history(&mut self, history: Vec<ChatMessage>) {
+        self.history.clear();
+        self.history_bytes = 0;
+        for message in history {
+            self.push_message(message);
+        }
+    }
+
+    /// An approval card message the broker made (`approval_card`), kept in
+    /// this (the worker's) history so a later broker gets it with the
+    /// snapshot: replaces the message with its id, or is appended. Anything
+    /// but one assistant message with exactly one approval part is ignored.
+    pub fn put_card(&mut self, message: ChatMessage) -> bool {
+        let card = message.role == Role::Assistant
+            && message.message_id.starts_with("approval-")
+            && matches!(message.parts.as_slice(), [Part::Approval(_)]);
+        if !card {
+            return false;
+        }
+        if let Some(m) = self
+            .history
+            .iter_mut()
+            .find(|m| m.message_id == message.message_id)
+        {
+            let old = m.bytes();
+            *m = message;
+            let new = m.bytes();
+            self.history_bytes = self.history_bytes - old + new;
+            return true;
+        }
+        self.push_message(message);
+        true
+    }
+
+    /// Every card still `pending` becomes `closed` with `note` (a broker
+    /// restart released its approval): the changed messages.
+    pub fn close_pending_cards(&mut self, note: &str) -> Vec<ChatMessage> {
+        let mut changed = Vec::new();
+        for m in self.history.iter_mut() {
+            let old = m.bytes();
+            let mut touched = false;
+            for part in m.parts.iter_mut() {
+                if let Part::Approval(card) = part
+                    && card.state == crate::chat::adapter::ApprovalCardState::Pending
+                {
+                    card.state = crate::chat::adapter::ApprovalCardState::Closed;
+                    card.note = Some(note.to_string());
+                    touched = true;
+                }
+            }
+            if touched {
+                let new = m.bytes();
+                self.history_bytes = self.history_bytes - old + new;
+                changed.push(m.clone());
+            }
+        }
+        changed
     }
 
     pub fn heartbeat(&self) -> Out {
