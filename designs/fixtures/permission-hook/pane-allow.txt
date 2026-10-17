@@ -1,0 +1,8 @@
+  ⎿  (No output)
+  ⎿  Allowed by PermissionRequest hook
+● The command ran and completed with no output, so /tmp/phprobe-out4.txt should contain probe4. I didn't read it back to confirm.
+✻ Worked for 3s · done 5:58 PM
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

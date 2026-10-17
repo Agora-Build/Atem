@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Atem — one pairing, many devices (§9 proposal)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --font-head: 'Fraunces', Georgia, serif;
+    --font-body: 'IBM Plex Sans', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
+    --bg: #f7f3ea; --surface: #fffdf8; --surface2: #efe8da;
+    --border: rgba(60, 40, 10, 0.10); --text: #2b2218; --text-dim: #7a6a55;
+    --trust: #1f6f5c; --trust-dim: rgba(31,111,92,.10);
+    --relay: #8a6a2f; --relay-dim: rgba(138,106,47,.10);
+    --atem: #2d4f8a; --atem-dim: rgba(45,79,138,.10);
+    --danger: #a3372b; --danger-dim: rgba(163,55,43,.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17140f; --surface: #1f1b15; --surface2: #2a251d;
+      --border: rgba(255,240,210,.09); --text: #efe6d6; --text-dim: #b3a48c;
+      --trust: #5cc3a6; --trust-dim: rgba(92,195,166,.12);
+      --relay: #d6b06a; --relay-dim: rgba(214,176,106,.12);
+      --atem: #8fb2ee; --atem-dim: rgba(143,178,238,.12);
+      --danger: #ee8a7d; --danger-dim: rgba(238,138,125,.12);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: var(--font-body); color: var(--text); background: var(--bg);
+    background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 28px 28px; line-height: 1.55;
+  }
+  main { max-width: 1120px; margin: 0 auto; padding: 48px 24px 80px; }
+  h1 { font-family: var(--font-head); font-size: 40px; margin: 0 0 6px; letter-spacing: -.01em; }
+  .sub { color: var(--text-dim); margin: 0 0 32px; font-size: 16px; }
+  .sub a { color: var(--atem); }
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px 24px 18px; margin: 0 0 26px; min-width: 0;
+    animation: fadeUp .5s ease both; }
+  section:nth-of-type(2) { animation-delay: .06s; } section:nth-of-type(3) { animation-delay: .12s; }
+  section:nth-of-type(4) { animation-delay: .18s; } section:nth-of-type(5) { animation-delay: .24s; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { section { animation: none; } }
+  h2 { font-family: var(--font-head); font-size: 24px; margin: 0 0 4px; }
+  .lede { color: var(--text-dim); margin: 0 0 14px; font-size: 15px; }
+  .hero { background: linear-gradient(135deg, var(--trust-dim), var(--atem-dim)); border-color: var(--trust); }
+  .rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 10px; }
+  .rule { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--trust); border-radius: 10px; padding: 12px 14px; font-size: 14.5px; min-width: 0; overflow-wrap: break-word; }
+  .rule.no { border-left-color: var(--danger); }
+  .rule b { display: block; font-family: var(--font-mono); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 4px; }
+  .mermaid-wrap { position: relative; border: 1px solid var(--border); border-radius: 10px; background: var(--surface2); overflow: hidden; cursor: grab; }
+  .mermaid-wrap.dragging { cursor: grabbing; }
+  .mermaid-inner { transform-origin: 0 0; padding: 18px; }
+  .zoom { position: absolute; right: 10px; top: 10px; display: flex; gap: 6px; z-index: 2; }
+  .zoom button { font-family: var(--font-mono); background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; width: 30px; height: 28px; cursor: pointer; }
+  code { font-family: var(--font-mono); font-size: 13px; background: var(--surface2); padding: 1px 5px; border-radius: 4px; }
+  .mermaid .nodeLabel { font-family: var(--font-body); font-size: 15px; }
+  .mermaid .edgeLabel { font-family: var(--font-mono); font-size: 12.5px; }
+  .mermaid .messageText { font-family: var(--font-body) !important; font-size: 14px !important; }
+  .mermaid .noteText { font-family: var(--font-body) !important; font-size: 13px !important; }
+  footer { color: var(--text-dim); font-size: 13px; margin-top: 30px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>One pairing, many devices</h1>
+  <p class="sub">§9 proposal for Atem + Astation — same account, no repeated pairing, no forwarding through the Mac, no trust in the account login.
+    Full text: <a href="account-trust.md">account-trust.md</a></p>
+
+  <section class="hero">
+    <h2>The idea</h2>
+    <p class="lede">The account keeps a small <b>signed device list</b>. Atem pins its start when it pairs once, then accepts exactly the devices that list names — whoever relays the traffic.</p>
+    <div class="rules">
+      <div class="rule"><b>Pair</b>once per Atem, with any one trusted Astation (today's safety-code ceremony).</div>
+      <div class="rule"><b>Add a device</b>once per device: an already-trusted device approves it with Touch ID / password.</div>
+      <div class="rule"><b>Connect</b>any listed device reaches every Atem of the account, over relay or direct :8080.</div>
+      <div class="rule"><b>Remove</b>Settings → Devices → Remove. Atem stops accepting it within 24 h at most (usually at once).</div>
+      <div class="rule no"><b>Not trusted</b>the account login, the relay, presence, or a device's own claims.</div>
+      <div class="rule no"><b>Not needed</b>the Mac staying online, or pairing each device with each Atem.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Who holds what</h2>
+    <p class="lede">Each device keeps its own key. The relay only stores the list; signatures make it trustworthy.</p>
+    <div class="mermaid-wrap"><div class="zoom"><button data-z="in">+</button><button data-z="out">−</button><button data-z="reset">⟲</button></div>
+    <div class="mermaid-inner"><pre class="mermaid">
+flowchart LR
+  subgraph ACC["Account: alice"]
+    direction TB
+    MAC["Mac Astation<br/>device key in Secure Enclave<br/>roles: manage · control · view"]
+    PHONE["iPhone Astation<br/>own device key<br/>roles: control · view"]
+    IPAD["iPad Astation<br/>own device key<br/>roles: view"]
+  end
+  LOG[("Membership log<br/>1 add Mac (genesis)<br/>2 add iPhone — signed by Mac<br/>3 add iPad — signed by Mac")]
+  RELAY["Relay<br/>routes traffic + stores the log<br/>(untrusted)"]
+  subgraph HOSTS["Your machines"]
+    direction TB
+    A1["Atem on Genie<br/>pins: account + genesis hash<br/>+ newest seq seen"]
+    A2["Atem on laptop<br/>same pin"]
+  end
+  MAC -- "appends signed entries" --> LOG
+  LOG --- RELAY
+  PHONE <-- "session channel" --> RELAY
+  RELAY <-- "session channel" --> A1
+  IPAD <-. "direct :8080 (LAN)" .-> A2
+  RELAY <--> A2
+  A1 -. "verifies chain back to its pin" .-> LOG
+    </pre></div></div>
+  </section>
+
+  <section>
+    <h2>Adding the iPhone — once</h2>
+    <p class="lede">The approval is a signature by a trusted device after the user compares a code and authenticates. Logging in alone produces nothing Atem accepts.</p>
+    <div class="mermaid-wrap"><div class="zoom"><button data-z="in">+</button><button data-z="out">−</button><button data-z="reset">⟲</button></div>
+    <div class="mermaid-inner"><pre class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as You
+  participant P as iPhone Astation
+  participant R as Relay
+  participant M as Mac Astation (manager)
+  participant A as Atem (any host)
+  U->>P: sign in to the same account
+  P->>P: create device key (Secure Enclave)
+  P->>R: "please add me" + key + short code ABCD-1234
+  R->>M: pending request
+  M->>U: "Allow iPhone? code ABCD-1234"
+  U->>M: codes match → Touch ID / password
+  M->>M: sign entry seq 2: add iPhone, roles control+view
+  M->>R: append entry (relay stores, can't forge)
+  Note over A: no action on any Atem — it learns entry 2<br/>the next time any device connects or it polls the head
+    </pre></div></div>
+  </section>
+
+  <section>
+    <h2>The iPhone connects to Atem</h2>
+    <p class="lede">Atem checks the chain from its pin, a fresh head, and that the device really holds its key — then grants exactly its roles.</p>
+    <div class="mermaid-wrap"><div class="zoom"><button data-z="in">+</button><button data-z="out">−</button><button data-z="reset">⟲</button></div>
+    <div class="mermaid-inner"><pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant P as iPhone Astation
+  participant R as Relay
+  participant M as Any online manager
+  participant A as Atem
+  P->>A: hello (via relay or direct :8080)
+  A->>P: challenge nonce + Atem's newest seq (2)
+  P->>M: head attestation for nonce, please
+  M->>P: signed {seq 3, head hash, nonce, time}
+  P->>A: entries 3 + attestation + signature over (nonce, atem id, trust gen, ephemeral keys)
+  A->>A: entries chain from pinned hash? attestation by a listed manager, not older than seq 2?
+  A->>A: iPhone listed, not removed, roles control+view? signature valid?
+  A->>P: welcome — roles control+view, 24 h window starts now
+  Note over P,A: Step 2 of the proposal: both derive session keys from the ephemeral exchange<br/>so the relay can't read terminal or chat traffic
+    </pre></div></div>
+  </section>
+
+  <section>
+    <h2>Removing a device, and staying safe offline</h2>
+    <p class="lede">Removal is just another signed entry. Atem never moves backwards and never trusts a list older than 24 h.</p>
+    <div class="mermaid-wrap"><div class="zoom"><button data-z="in">+</button><button data-z="out">−</button><button data-z="reset">⟲</button></div>
+    <div class="mermaid-inner"><pre class="mermaid">
+flowchart TD
+  RM["Mac: Settings → Devices → Remove Old iPad<br/>(Touch ID)"] --> E4["entry seq 4: remove Old iPad<br/>signed by Mac"]
+  E4 --> REL[("Relay stores seq 4")]
+  REL --> C1{"Next connection to Atem<br/>brings entries up to the head"}
+  C1 -- "Atem sees seq 4" --> GONE["Old iPad refused<br/>its live attachment is fenced"]
+  C1 -- "relay withholds seq 4" --> WIN{"Attestation the iPad shows<br/>older than 24 h?"}
+  WIN -- "yes" --> PAUSE["refused / paused<br/>(no fresh proof)"]
+  WIN -- "no" --> LATE["accepted at most until the<br/>24 h window ends — the approved bound"]
+  HW["Atem keeps the highest seq it has seen<br/>— a list older than that is always refused"] -.-> C1
+  LOST["All manager devices lost?"] --> REC["local atem unpair + atem pair<br/>→ new genesis, new trust generation<br/>(data and keys kept)"]
+    </pre></div></div>
+  </section>
+
+  <footer>Atem agent · draft for review with the Astation agent · 2026-10-16</footer>
+</main>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad: true, theme: 'base', look: 'classic',
+    themeVariables: dark ? {
+      fontFamily: 'IBM Plex Sans', fontSize: '15px', background: '#2a251d', primaryColor: '#1f2b27', primaryBorderColor: '#5cc3a6',
+      primaryTextColor: '#efe6d6', lineColor: '#b3a48c', secondaryColor: '#232a36', tertiaryColor: '#2a251d',
+      actorBkg: '#1f2b27', actorBorder: '#5cc3a6', actorTextColor: '#efe6d6', signalColor: '#d6b06a', signalTextColor: '#efe6d6',
+      noteBkgColor: '#3a3122', noteTextColor: '#efe6d6', noteBorderColor: '#d6b06a', clusterBkg: '#221e18', clusterBorder: '#5a4d39'
+    } : {
+      fontFamily: 'IBM Plex Sans', fontSize: '15px', background: '#efe8da', primaryColor: '#e3f0ea', primaryBorderColor: '#1f6f5c',
+      primaryTextColor: '#2b2218', lineColor: '#7a6a55', secondaryColor: '#e4eaf6', tertiaryColor: '#efe8da',
+      actorBkg: '#e3f0ea', actorBorder: '#1f6f5c', actorTextColor: '#2b2218', signalColor: '#8a6a2f', signalTextColor: '#2b2218',
+      noteBkgColor: '#f6ead0', noteTextColor: '#2b2218', noteBorderColor: '#8a6a2f', clusterBkg: '#f7f1e4', clusterBorder: '#cdbb98'
+    } });
+  document.querySelectorAll('.mermaid-wrap').forEach(wrap => {
+    const inner = wrap.querySelector('.mermaid-inner');
+    let s = 1, x = 0, y = 0, drag = null;
+    const apply = () => inner.style.transform = `translate(${x}px,${y}px) scale(${s})`;
+    wrap.querySelectorAll('.zoom button').forEach(b => b.addEventListener('click', e => {
+      e.stopPropagation(); const z = b.dataset.z;
+      if (z === 'in') s = Math.min(s * 1.2, 4); else if (z === 'out') s = Math.max(s / 1.2, .4); else { s = 1; x = 0; y = 0; }
+      apply();
+    }));
+    wrap.addEventListener('wheel', e => { if (!(e.ctrlKey || e.metaKey)) return; e.preventDefault();
+      s = Math.min(Math.max(s * (e.deltaY < 0 ? 1.1 : 1 / 1.1), .4), 4); apply(); }, { passive: false });
+    wrap.addEventListener('mousedown', e => { if (e.target.closest('.zoom')) return; drag = { sx: e.clientX - x, sy: e.clientY - y }; wrap.classList.add('dragging'); });
+    window.addEventListener('mousemove', e => { if (!drag) return; x = e.clientX - drag.sx; y = e.clientY - drag.sy; apply(); });
+    window.addEventListener('mouseup', () => { drag = null; wrap.classList.remove('dragging'); });
+  });
+</script>
+</body>
+</html>

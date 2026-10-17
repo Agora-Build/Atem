@@ -1,0 +1,14 @@
+{
+    "session_id": "01a14623-4f76-7f53-b17b-9f9e7d3239fc",
+    "turn_id": "01a14623-c9c0-7ac2-ad86-e247cfcc4603",
+    "transcript_path": "/home/user/home/sessions/2026/10/16/rollout-2026-10-16T19-14-41-01a14623-4f76-7f53-b17b-9f9e7d3239fc.jsonl",
+    "cwd": "/home/user/proj",
+    "hook_event_name": "PermissionRequest",
+    "model": "gpt-6.1-sol",
+    "permission_mode": "default",
+    "tool_name": "Bash",
+    "tool_input": {
+        "command": "touch probe.txt",
+        "description": "Do you want to allow creating probe.txt in the read-only workspace?"
+    }
+}

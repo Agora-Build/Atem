@@ -1,0 +1,2 @@
+{"hooks":{"PermissionRequest":[{"matcher":"","hooks":[{"type":"command","command":"/tmp/PROBE/hook/perm.sh","timeout":5}]}],
+"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/tmp/PROBE/hook/notif.sh"}]}]}}
