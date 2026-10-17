@@ -264,6 +264,7 @@ pub fn map_hook(json: &Value) -> Option<AgentEvent> {
         }),
         "UserPromptSubmit" => Some(AgentEvent::PromptSubmitted {
             text: s("prompt")?.to_string(),
+            turn_id: None,
         }),
         "PreToolUse" => Some(AgentEvent::ToolStarted),
         "PostToolUse" => Some(AgentEvent::ToolFinished),
@@ -544,7 +545,10 @@ mod tests {
         assert_eq!(
             r.poll(),
             vec![
-                AgentEvent::PromptSubmitted { text: "hi".into() },
+                AgentEvent::PromptSubmitted {
+                    text: "hi".into(),
+                    turn_id: None
+                },
                 AgentEvent::ToolStarted,
                 AgentEvent::TurnEnded
             ]
@@ -629,7 +633,7 @@ mod tests {
         );
         assert!(matches!(
             map_hook(&fixture("02-user-prompt-submit.json")),
-            Some(AgentEvent::PromptSubmitted { text }) if !text.is_empty()
+            Some(AgentEvent::PromptSubmitted { text, turn_id: None }) if !text.is_empty()
         ));
         assert_eq!(
             map_hook(&fixture("03-pre-tool-use.json")),

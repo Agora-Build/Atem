@@ -74,10 +74,10 @@ fn cut_item(item: &mut LogItem, max: usize) {
 
 fn cut_event(event: &mut AgentEvent, max: usize) {
     match event {
-        AgentEvent::PromptSubmitted { text } => {
+        AgentEvent::PromptSubmitted { text, .. } => {
             cut(text, max);
         }
-        AgentEvent::WaitingForPermission { detail } => {
+        AgentEvent::WaitingForPermission { detail } | AgentEvent::NotReady { detail } => {
             cut(detail, max);
         }
         AgentEvent::SessionStarted { source, .. } => {
@@ -356,11 +356,13 @@ mod tests {
         assert!(text.ends_with(TRUNCATED) && text.len() <= MAX_TEXT + TRUNCATED.len());
         let event = cap_event(AgentEvent::PromptSubmitted {
             text: "a".repeat(MAX_TEXT + 1),
+            turn_id: None,
         });
         assert_eq!(
             event,
             AgentEvent::PromptSubmitted {
-                text: format!("{}{TRUNCATED}", "a".repeat(MAX_TEXT))
+                text: format!("{}{TRUNCATED}", "a".repeat(MAX_TEXT)),
+                turn_id: None,
             }
         );
         let small = part("fine".into());
@@ -371,7 +373,10 @@ mod tests {
     fn each_batch_keeps_its_own_input_count() {
         let mut backlog = ChatBacklog::default();
         backlog.push(
-            vec![AgentEvent::PromptSubmitted { text: "a".into() }],
+            vec![AgentEvent::PromptSubmitted {
+                text: "a".into(),
+                turn_id: None,
+            }],
             vec![],
             1,
         );

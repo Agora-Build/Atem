@@ -115,6 +115,10 @@ struct Pending {
     pasted_at: Option<Instant>,
     hook_seen: bool,
     log_seen: bool,
+    /// The turn the agent named for the prompt (hook) and the turn of its
+    /// log entry: both halves must agree when both are known.
+    hook_turn: Option<String>,
+    log_turn: Option<String>,
 }
 
 /// A chat session's state, for a broker that connects to a running agent's
@@ -181,8 +185,12 @@ pub fn clean_prompt(text: &str) -> Result<&str, &'static str> {
     Ok(text)
 }
 
+/// The prompt as sent and as the agent recorded it: equal once trimmed,
+/// or equal but for whitespace (an agent may store a pasted prompt as
+/// several text blocks, which the adapter joins with newlines).
 fn same_prompt(a: &str, b: &str) -> bool {
-    a.trim() == b.trim()
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    a.trim() == b.trim() || squash(a) == squash(b)
 }
 
 fn truncate_at(text: &str, max: usize) -> &str {
@@ -382,11 +390,17 @@ impl ChatSession {
                 self.input_mark = input_count;
                 self.set_status(State::Ready, None, now_ms, &mut out);
             }
-            AgentEvent::PromptSubmitted { text } => {
+            AgentEvent::PromptSubmitted { text, turn_id } => {
                 if let Some(p) = &mut self.pending
+                    && !p.hook_seen
                     && same_prompt(&p.text, &text)
+                    && match (&p.log_turn, &turn_id) {
+                        (Some(log), Some(hook)) => log == hook,
+                        _ => true,
+                    }
                 {
                     p.hook_seen = true;
+                    p.hook_turn = turn_id;
                 }
                 if self.live() {
                     self.set_status(State::Working, None, now_ms, &mut out);
@@ -403,6 +417,11 @@ impl ChatSession {
             AgentEvent::ToolFinished => {
                 if self.live() && self.status.state == State::Waiting {
                     self.set_status(State::Working, None, now_ms, &mut out);
+                }
+            }
+            AgentEvent::NotReady { detail } => {
+                if !self.started {
+                    self.set_status(State::Unknown, Some(&detail), now_ms, &mut out);
                 }
             }
             AgentEvent::WaitingForPermission { .. } => {
@@ -445,12 +464,17 @@ impl ChatSession {
         }
     }
 
+    /// A turn ended. One with neither a prompt nor a request (Codex's
+    /// compaction) completes nothing a client asked for: no `Complete`.
     fn complete(&mut self, turn_id: String, outcome: Outcome, out: &mut Vec<Out>) {
         self.last_completed = Some(turn_id.clone());
-        let request_id = match &self.current_turn {
-            Some((t, r)) if *t == turn_id => r.clone(),
-            _ => None,
+        let (prompted, request_id) = match &self.current_turn {
+            Some((t, r)) if *t == turn_id => (true, r.clone()),
+            _ => (false, None),
         };
+        if !prompted {
+            return;
+        }
         if let Some(r) = &request_id {
             self.record(
                 r,
@@ -486,8 +510,10 @@ impl ChatSession {
                 if let Some(p) = &mut self.pending
                     && !p.log_seen
                     && same_prompt(&p.text, &text)
+                    && p.hook_turn.as_ref().is_none_or(|t| *t == turn_id)
                 {
                     p.log_seen = true;
+                    p.log_turn = Some(turn_id.clone());
                     request_id = Some(p.request_id.clone());
                 }
                 // The timed-out link may only match the NEXT user entry.
@@ -719,7 +745,8 @@ impl ChatSession {
             Err(e) => return err(e),
         };
         if self.status.state == State::Unknown {
-            return err("chat is not ready yet");
+            let detail = self.status.detail.clone();
+            return err(detail.as_deref().unwrap_or("chat is not ready yet"));
         }
         if self.status.state != State::Ready || self.pending.is_some() {
             return err("the agent is busy; wait for the current turn to finish");
@@ -737,6 +764,8 @@ impl ChatSession {
             pasted_at: None,
             hook_seen: false,
             log_seen: false,
+            hook_turn: None,
+            log_turn: None,
         });
         self.record(request_id, RequestState::Pending);
         Ok(text.to_string())
@@ -1028,15 +1057,62 @@ mod tests {
                 detail: None
             })]
         );
-        // a turn without a prompt (compaction) completes no request
+        // a turn without a prompt (compaction): no Complete, ready again
         let o = s.on_log(end("t", Outcome::Done), 4, 0);
+        assert!(
+            !o.iter().any(|o| matches!(o, Out::Complete { .. })),
+            "{o:?}"
+        );
+        assert_eq!(s.status().state, State::Ready);
+        assert!(s.history(None, 50, 1 << 20).is_empty());
+        // a prompted turn still completes
+        s.on_log(user("u1", "t2", "go"), 5, 0);
+        let o = s.on_log(end("t2", Outcome::Done), 6, 0);
         assert!(o.contains(&Out::Complete {
-            turn_id: "t".into(),
+            turn_id: "t2".into(),
             request_id: None,
             outcome: Outcome::Done
         }));
-        assert_eq!(s.status().state, State::Ready);
-        assert!(s.history(None, 50, 1 << 20).is_empty());
+    }
+
+    #[test]
+    fn acceptance_needs_the_hooks_turn() {
+        let hook = |turn: &str| AgentEvent::PromptSubmitted {
+            text: "go".into(),
+            turn_id: Some(turn.into()),
+        };
+        let mut s = ChatSession::new("g".into(), 0);
+        s.on_event(started(), 1, 0);
+        s.submit("r", "g", "go", 0, false).unwrap();
+        // the remote prompt's hook names turn R; a local prompt with the
+        // same text logged in turn L is not it
+        s.on_event(hook("R"), 2, 0);
+        let o = s.on_log(user("uL", "L", "go"), 3, 0);
+        assert!(!o.iter().any(|o| matches!(o, Out::Accepted { .. })));
+        assert!(o.iter().any(|o| matches!(o, Out::Message(m)
+            if m.origin == Some(Origin::Local) && m.request_id.is_none())));
+        let o = s.on_log(user("uR", "R", "go"), 4, 0);
+        assert!(o.contains(&Out::Accepted {
+            request_id: "r".into()
+        }));
+        // log first: the hook must name the logged turn
+        let mut s = ChatSession::new("g".into(), 0);
+        s.on_event(started(), 1, 0);
+        s.submit("r", "g", "go", 0, false).unwrap();
+        s.on_log(user("uR", "R", "go"), 2, 0);
+        let o = s.on_event(hook("L"), 3, 0);
+        assert!(!o.iter().any(|o| matches!(o, Out::Accepted { .. })));
+        let o = s.on_event(hook("R"), 4, 0);
+        assert!(o.contains(&Out::Accepted {
+            request_id: "r".into()
+        }));
+    }
+
+    #[test]
+    fn prompts_compare_whitespace_blind() {
+        assert!(same_prompt("a b\nc ", "a b\nc"));
+        assert!(same_prompt("two\nlines", "two\n\nlines"));
+        assert!(!same_prompt("ab", "a c"));
     }
 
     #[test]
@@ -1050,8 +1126,15 @@ mod tests {
         assert!(s.on_log(end("t", Outcome::Done), 1, 9).is_empty());
         assert_eq!(s.status().state, State::Unknown);
         assert!(
-            s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 1, 0)
-                .is_empty()
+            s.on_event(
+                AgentEvent::PromptSubmitted {
+                    text: "x".into(),
+                    turn_id: None
+                },
+                1,
+                0
+            )
+            .is_empty()
         );
         let o = s.on_event(started(), 10, 0);
         assert_eq!(
@@ -1065,7 +1148,14 @@ mod tests {
         // repeated Ready is no change
         assert!(s.on_event(AgentEvent::TurnEnded, 11, 0).is_empty());
         assert_eq!(s.status().since_ms, 10);
-        s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 20, 0);
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "x".into(),
+                turn_id: None,
+            },
+            20,
+            0,
+        );
         assert_eq!(
             (s.status().state, s.status().since_ms),
             (State::Working, 20)
@@ -1209,6 +1299,7 @@ mod tests {
             submit_ok(&mut s, "r1", "do it\n");
             let hook = AgentEvent::PromptSubmitted {
                 text: "do it".into(), // trailing whitespace is trimmed on both sides
+                turn_id: None,
             };
             let log = user("u1", "t1", "do it");
             let (a, b) = if hook_first {
@@ -1279,7 +1370,14 @@ mod tests {
         s.on_log(user("u1", "t1", "go"), 2, 0);
         let o = s.on_log(asst("m1", text_part("p", "ok"), "t1"), 3, 0);
         assert!(matches!(&o[0], Out::Message(m) if m.request_id.as_deref() == Some("r1")));
-        s.on_event(AgentEvent::PromptSubmitted { text: "go".into() }, 3, 0);
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "go".into(),
+                turn_id: None,
+            },
+            3,
+            0,
+        );
         let o = s.on_log(end("t1", Outcome::Done), 4, 0);
         assert!(matches!(
             completes(&o)[0],
@@ -1340,7 +1438,14 @@ mod tests {
         let mut s = ready();
         submit_ok(&mut s, "r1", "go");
         assert!(s.submit("r1", "g1", "go", 0, false).unwrap_err().is_empty());
-        s.on_event(AgentEvent::PromptSubmitted { text: "go".into() }, 2, 0);
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "go".into(),
+                turn_id: None,
+            },
+            2,
+            0,
+        );
         s.on_log(user("u1", "t1", "go"), 2, 0);
         assert_eq!(
             s.submit("r1", "g1", "go", 0, false).unwrap_err(),
@@ -1363,7 +1468,14 @@ mod tests {
     #[test]
     fn typing_after_turn_end_blocks_submit_and_next_turn_end_clears_it() {
         let mut s = ready();
-        s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 2, 0);
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "x".into(),
+                turn_id: None,
+            },
+            2,
+            0,
+        );
         s.on_event(AgentEvent::TurnEnded, 3, 5);
         assert!(s.submit("r1", "g1", "hi", 5, false).is_ok());
         let mut s = ready();
@@ -1372,6 +1484,7 @@ mod tests {
         s.on_event(
             AgentEvent::PromptSubmitted {
                 text: "typed".into(),
+                turn_id: None,
             },
             4,
             6,
@@ -1501,7 +1614,14 @@ mod tests {
         for source in ["compact", "resume"] {
             let mut s = ready();
             submit_ok(&mut s, "r1", "go");
-            s.on_event(AgentEvent::PromptSubmitted { text: "go".into() }, 2, 0);
+            s.on_event(
+                AgentEvent::PromptSubmitted {
+                    text: "go".into(),
+                    turn_id: None,
+                },
+                2,
+                0,
+            );
             let since = s.status().since_ms;
             // typing during the turn moved the input count; compaction must not
             // hide it, nor end the pending prompt or the turn
@@ -1523,7 +1643,14 @@ mod tests {
         }
         // any SessionStarted on the same log while a turn is in progress keeps it
         let mut s = ready();
-        s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 2, 0);
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "x".into(),
+                turn_id: None,
+            },
+            2,
+            0,
+        );
         assert!(s.on_event(restart("", true), 3, 4).is_empty());
         assert_eq!(s.status().state, State::Working);
         // compact while idle keeps the input mark too
@@ -1539,7 +1666,14 @@ mod tests {
     fn startup_clear_or_a_new_log_resets_to_ready() {
         for (source, same_log) in [("startup", true), ("clear", true), ("resume", false)] {
             let mut s = ready();
-            s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 2, 0);
+            s.on_event(
+                AgentEvent::PromptSubmitted {
+                    text: "x".into(),
+                    turn_id: None,
+                },
+                2,
+                0,
+            );
             let o = s.on_event(restart(source, same_log), 3, 4);
             assert_eq!(
                 o,
@@ -1557,7 +1691,14 @@ mod tests {
     #[test]
     fn backfill_lands_in_history_without_outs_or_status() {
         let mut s = ready();
-        s.on_event(AgentEvent::PromptSubmitted { text: "x".into() }, 2, 0);
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "x".into(),
+                turn_id: None,
+            },
+            2,
+            0,
+        );
         // on_backfill returns nothing: no Outs by construction
         s.on_backfill(user("u1", "t1", "old prompt"));
         s.on_backfill(asst("m1", text_part("p1", "old reply"), "t1"));
@@ -1615,7 +1756,14 @@ mod tests {
     fn prompt_match_ignores_leading_whitespace_too() {
         let mut s = ready();
         submit_ok(&mut s, "r1", "  go");
-        s.on_event(AgentEvent::PromptSubmitted { text: "go".into() }, 2, 0);
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "go".into(),
+                turn_id: None,
+            },
+            2,
+            0,
+        );
         let o = s.on_log(user("u1", "t1", "go "), 2, 0);
         assert!(o.contains(&Out::Accepted {
             request_id: "r1".into()

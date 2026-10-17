@@ -535,7 +535,10 @@ mod tests {
                         source: "startup".into(),
                         same_log: false,
                     },
-                    AgentEvent::PromptSubmitted { text: "hi".into() },
+                    AgentEvent::PromptSubmitted {
+                        text: "hi".into(),
+                        turn_id: None,
+                    },
                     AgentEvent::TurnEnded,
                 ],
                 log: vec![

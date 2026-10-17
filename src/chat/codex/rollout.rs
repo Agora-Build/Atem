@@ -33,6 +33,10 @@ use crate::chat::adapter::{LogItem, Outcome, Part};
 use crate::chat::claude::transcript::{parse_rfc3339_ms, summarize_tool};
 
 const SEEN_CAP: usize = 10_000;
+/// Bytes read per poll (the rest waits for the next).
+const MAX_READ: u64 = 8 * 1024 * 1024;
+/// A line longer than this is skipped (with a notice).
+const MAX_LINE: usize = 8 * 1024 * 1024;
 /// The tool name a command execution is shown under (Codex's hooks call
 /// its shell tool `Bash` too).
 pub const COMMAND_TOOL: &str = "Bash";
@@ -49,6 +53,10 @@ pub struct RolloutReader {
     /// Tasks started inside `active` (compaction): their ends are not the
     /// turn's.
     nested: HashSet<String>,
+    /// Dropping the rest of an over-long line, up to its newline.
+    skipping: bool,
+    max_read: u64,
+    max_line: usize,
 }
 
 impl RolloutReader {
@@ -62,6 +70,9 @@ impl RolloutReader {
             seen_cap: SEEN_CAP,
             active: None,
             nested: HashSet::new(),
+            skipping: false,
+            max_read: MAX_READ,
+            max_line: MAX_LINE,
         }
     }
 
@@ -75,29 +86,57 @@ impl RolloutReader {
         self.pending.clear();
     }
 
-    /// Read new complete lines since the last call and map them to LogItems.
+    /// Read new complete lines since the last call (at most `MAX_READ`
+    /// bytes) and map them to LogItems. The rollout is never read through a
+    /// symlink.
     pub fn poll(&mut self) -> Vec<LogItem> {
+        use std::os::unix::fs::OpenOptionsExt;
         let mut out = Vec::new();
-        let Ok(mut file) = std::fs::File::open(&self.path) else {
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.path)
+        else {
             return out;
         };
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return out;
+        }
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         if len < self.offset {
             // truncated or replaced: start over (the seen set prevents duplicates)
             self.offset = 0;
             self.pending.clear();
+            self.skipping = false;
         }
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return out;
         }
         let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_err() {
+        if (&mut file)
+            .take(self.max_read)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
             return out;
         }
         self.offset += buf.len() as u64;
         self.pending.extend_from_slice(&buf);
+        if self.skipping {
+            match self.pending.iter().position(|b| *b == b'\n') {
+                Some(nl) => {
+                    self.pending.drain(..=nl);
+                    self.skipping = false;
+                }
+                None => {
+                    self.pending.clear();
+                    return out;
+                }
+            }
+        }
 
         let Some(last_nl) = self.pending.iter().rposition(|b| *b == b'\n') else {
+            self.check_line_length(&mut out);
             return out;
         };
         let rest = self.pending.split_off(last_nl + 1);
@@ -120,7 +159,21 @@ impl RolloutReader {
                 }
             }
         }
+        self.check_line_length(&mut out);
         out
+    }
+
+    /// An unfinished line already longer than `max_line` is dropped, up to
+    /// its newline.
+    fn check_line_length(&mut self, out: &mut Vec<LogItem>) {
+        if self.pending.len() > self.max_line {
+            self.pending.clear();
+            self.skipping = true;
+            out.push(LogItem::Problem {
+                detail: "skipped a rollout line longer than 8 MiB".into(),
+                fatal: false,
+            });
+        }
     }
 
     fn remember(&mut self, key: String) -> bool {
@@ -594,6 +647,36 @@ mod tests {
         assert!(later.poll().is_empty());
         std::fs::write(later.path(), line(ROLLOUT_A, 9)).unwrap();
         assert_eq!(later.poll().len(), 1);
+    }
+
+    #[test]
+    fn reads_are_bounded_and_an_over_long_line_is_skipped() {
+        let good = line(ROLLOUT_A, 9);
+        let long = format!(
+            "{{\"type\": \"x\", \"pad\": \"{}\"}}\n",
+            "a".repeat(2 * good.len())
+        );
+        let (_d, mut r) = reader_with(&(long.clone() + &good));
+        r.max_line = good.len() + 10;
+        r.max_read = 64;
+        let mut items = Vec::new();
+        for _ in 0..40 {
+            items.extend(r.poll());
+        }
+        assert!(
+            matches!(&items[..], [L::Problem { fatal: false, .. }, L::UserMessage { id, .. }]
+            if id == "<id-2>"),
+            "{items:?}"
+        );
+        assert!(r.pending.is_empty());
+    }
+
+    #[test]
+    fn a_symlinked_rollout_is_not_followed() {
+        let (d, _r) = reader_with(&line(ROLLOUT_A, 9));
+        let link = d.path().join("link.jsonl");
+        std::os::unix::fs::symlink(d.path().join("r.jsonl"), &link).unwrap();
+        assert!(RolloutReader::new(link).poll().is_empty());
     }
 
     #[test]

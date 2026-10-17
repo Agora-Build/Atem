@@ -36,10 +36,22 @@ fn fx() -> Fx {
 }
 
 impl Fx {
-    fn adapter(&self) -> CodexAdapter {
+    fn fresh(&self) -> CodexAdapter {
         let (a, args) =
             prepare_chat(&self.root.path().join("run"), self.home.clone(), &[]).unwrap();
         assert!(args.is_empty());
+        a
+    }
+
+    /// A fresh adapter whose first `NotReady` was taken.
+    fn adapter(&self) -> CodexAdapter {
+        let mut a = self.fresh();
+        assert_eq!(
+            a.poll_events(),
+            [AgentEvent::NotReady {
+                detail: FIRST_PROMPT.into()
+            }]
+        );
         a
     }
 
@@ -168,17 +180,32 @@ fn ev_files(a: &CodexAdapter) -> usize {
 #[test]
 fn session_a_then_new_and_compact_through_the_real_hook_script() {
     let f = fx();
-    let mut a = f.adapter();
+    let mut a = f.fresh();
     let mut chat = ChatSession::new(GEN.into(), 0);
 
-    // Before the first prompt: no chat, a reason, status unknown.
+    // Before the first prompt: chat opens, status unknown with the hint,
+    // a submit is refused with it.
     let caps = a.capabilities();
-    assert!(!caps.chat_v1);
-    assert_eq!(caps.reason.as_deref(), Some(FIRST_PROMPT));
+    assert!(caps.chat_v1);
+    assert_eq!(caps.reason, None);
     assert_eq!(caps.unavailable, UNAVAILABLE);
-    assert!(tick(&mut a, &mut chat).events.is_empty());
+    let t = tick(&mut a, &mut chat);
+    assert_eq!(
+        t.events,
+        [AgentEvent::NotReady {
+            detail: FIRST_PROMPT.into()
+        }]
+    );
     assert_eq!(chat.status().state, State::Unknown);
-    assert!(chat.submit("r0", GEN, "hi", 0, false).is_err());
+    assert_eq!(chat.status().detail.as_deref(), Some(FIRST_PROMPT));
+    assert_eq!(
+        chat.submit("r0", GEN, "hi", 0, false),
+        Err(vec![Out::Error {
+            text: FIRST_PROMPT.into(),
+            request_id: Some("r0".into())
+        }])
+    );
+    assert!(tick(&mut a, &mut chat).events.is_empty(), "said once");
 
     // Turn 1, typed in the terminal.
     f.fire(&a, "01-SessionStart-startup.json");
@@ -187,9 +214,9 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
     let t = tick(&mut a, &mut chat);
     assert!(matches!(&t.events[..], [
         AgentEvent::SessionStarted { session_id, source, same_log: false, log_path },
-        AgentEvent::PromptSubmitted { text },
+        AgentEvent::PromptSubmitted { text, turn_id: Some(turn) },
     ] if session_id == "<session-A>" && source == "startup" && *log_path == f.a
-        && text == "Reply with exactly the word: pong"));
+        && text == "Reply with exactly the word: pong" && turn == "<turn-1>"));
     assert!(!t.log.iter().any(|i| matches!(i, LogItem::Backfill(_))));
     assert_eq!(message_ids(&t.outs), ["<id-2>"]);
     assert_eq!(chat.status().state, State::Working);
@@ -231,7 +258,7 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
         [AgentEvent::ToolStarted],
         "no PermissionRequest event"
     );
-    a.approval_opened();
+    a.approval_opened(1_792_215_205_000);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     f.fire(&a, "07-PostToolUse-after-approval.json");
@@ -303,7 +330,7 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
     f.fire(&a, "20-PermissionRequest.json");
     rollout_upto(&f.a, A, 69);
     tick(&mut a, &mut chat);
-    a.approval_opened();
+    a.approval_opened(1_792_215_329_000);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
@@ -342,7 +369,7 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
         [("<turn-7>".into(), None, Outcome::Done)]
     );
 
-    // /compact: working, no message, then ready; no request completes.
+    // /compact: working, no message, then ready; no Complete (no prompt).
     f.fire(&a, "25-PreCompact-manual.json");
     rollout_upto(&f.b, B, 17);
     let t = tick(&mut a, &mut chat);
@@ -353,10 +380,11 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
     rollout_upto(&f.b, B, 26);
     let t = tick(&mut a, &mut chat);
     assert!(message_ids(&t.outs).is_empty());
-    assert_eq!(
-        completes(&t.outs),
-        [("<turn-8>".into(), None, Outcome::Done)]
-    );
+    assert!(completes(&t.outs).is_empty());
+    assert!(t.log.contains(&LogItem::TurnEnded {
+        turn_id: "<turn-8>".into(),
+        outcome: Outcome::Done
+    }));
     assert_eq!(chat.status().state, State::Ready);
 
     // Quit: both sessions' SessionEnd, nothing for chat.
@@ -494,7 +522,7 @@ fn another_sessions_hooks_never_count() {
     rollout_upto(&f.a, A, 9);
     tick(&mut a, &mut chat);
     // a nested codex's events while turn 1 runs: its prompt is ignored, its
-    // start too (with a notice)
+    // start waits (with a notice)
     f.fire(&a, "23-UserPromptSubmit.json");
     f.fire(&a, "22-SessionStart-after-new.json");
     let t = tick(&mut a, &mut chat);
@@ -509,11 +537,11 @@ fn another_sessions_hooks_never_count() {
         [LogItem::Problem { fatal: false, .. }]
     ));
     assert_eq!(a.session_id(), Some("<session-A>"));
-    // once the turn ended, a start of another session re-pins (/new)
+    // once the turn ended, the waiting start re-pins (/new)
     rollout_upto(&f.a, A, 14);
     tick(&mut a, &mut chat);
-    f.fire(&a, "22-SessionStart-after-new.json");
-    tick(&mut a, &mut chat);
+    let t = tick(&mut a, &mut chat);
+    assert!(t.events.is_empty(), "held one poll");
     let t = tick(&mut a, &mut chat);
     assert!(matches!(&t.events[..], [AgentEvent::SessionStarted { .. }]));
     assert_eq!(a.session_id(), Some("<session-B>"));
@@ -567,11 +595,7 @@ fn a_rollout_that_is_not_the_sessions_own_is_ignored() {
             matches!(&a.poll_log()[..], [LogItem::Problem { fatal: false, .. }]),
             "{i}"
         );
-        assert_eq!(
-            a.capabilities().reason.as_deref(),
-            Some(FIRST_PROMPT),
-            "{i}"
-        );
+        assert_eq!(a.capabilities().reason, None, "{i}");
         assert_eq!(a.session_id(), None);
     }
 }
@@ -644,10 +668,11 @@ fn a_format_change_withdraws_chat() {
 #[test]
 fn approvals_are_counted() {
     let mut a = CodexAdapter::new(PathBuf::from("/nonexistent"));
+    a.announced = true;
     a.approval_closed();
     assert!(a.poll_events().is_empty(), "nothing open");
-    a.approval_opened();
-    a.approval_opened();
+    a.approval_opened(5);
+    a.approval_opened(6);
     assert_eq!(
         a.poll_events(),
         [AgentEvent::WaitingForPermission {
@@ -704,12 +729,26 @@ fn events_are_read_by_seq_and_nothing_else_is_touched() {
         .set_modified(SystemTime::now() - Duration::from_secs(120))
         .unwrap();
     let mut r = EventReader::new(a.dir().unwrap().to_path_buf());
-    let names: Vec<String> = r
+    let names: Vec<Option<String>> = r
         .poll()
         .iter()
-        .map(|v| v["hook_event_name"].as_str().unwrap().to_string())
+        .map(|v| {
+            v.as_ref()
+                .map(|v| v["hook_event_name"].as_str().unwrap().to_string())
+        })
         .collect();
-    assert_eq!(names, ["PostToolUse", "PreToolUse", "Stop"]);
+    let some = |s: &str| Some(s.to_string());
+    // the bad and the oversized one come as None (deleted all the same)
+    assert_eq!(
+        names,
+        [
+            some("PostToolUse"),
+            some("PreToolUse"),
+            some("Stop"),
+            None,
+            None
+        ]
+    );
     let mut left: Vec<String> = fs::read_dir(&dir)
         .unwrap()
         .flatten()
@@ -804,8 +843,8 @@ fn prepare_refuses_foreign_dirs_and_drop_removes_only_the_session_dir() {
     assert_eq!(
         a.capabilities(),
         Capabilities {
-            chat_v1: false,
-            reason: Some(FIRST_PROMPT.into()),
+            chat_v1: true,
+            reason: None,
             unavailable: UNAVAILABLE,
         }
     );
@@ -835,4 +874,190 @@ fn compaction_turn_parts_never_reach_chat() {
         })
         .collect();
     assert_eq!(texts, ["ok"]);
+}
+
+#[test]
+fn an_unreadable_event_gives_a_notice() {
+    let f = fx();
+    let mut a = f.adapter();
+    f.put(&a, 1, "Stop", "not json");
+    assert!(a.poll_events().is_empty());
+    assert!(matches!(
+        &a.poll_log()[..],
+        [LogItem::Problem { fatal: false, .. }]
+    ));
+    assert_eq!(ev_files(&a), 0);
+}
+
+#[test]
+fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "04-UserPromptSubmit-approval-turn.json");
+    rollout_upto(&f.a, A, 19);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Working);
+    // the hook's PreToolUse and the worker's approval in one pass
+    f.fire(&a, "05-PreToolUse-before-approval.json");
+    a.approval_opened(1_792_215_205_000);
+    let t = tick(&mut a, &mut chat);
+    // (the PreToolUse came before the approval: dropped; and the wait is
+    // returned after the pass's hook events anyway)
+    assert!(
+        matches!(&t.events[..], [AgentEvent::WaitingForPermission { .. }]),
+        "{:?}",
+        t.events
+    );
+    assert_eq!(chat.status().state, State::Waiting);
+    // a PreToolUse read while it waits is dropped
+    f.fire(&a, "05-PreToolUse-before-approval.json");
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert_eq!(chat.status().state, State::Waiting);
+    // the worker's reports follow the pass's hooks: a PostToolUse read with
+    // a new approval leaves it waiting
+    a.approval_closed();
+    a.approval_opened(1_792_215_206_000);
+    f.fire(&a, "07-PostToolUse-after-approval.json");
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(
+            &t.events[..],
+            [
+                AgentEvent::ToolFinished,
+                AgentEvent::ToolFinished,
+                AgentEvent::WaitingForPermission { .. },
+            ]
+        ),
+        "{:?}",
+        t.events
+    );
+    assert_eq!(chat.status().state, State::Waiting);
+}
+
+#[test]
+fn the_turns_next_item_ends_the_wait() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "09-UserPromptSubmit.json");
+    // the commentary (completed before the approval) doesn't end it
+    rollout_upto(&f.a, A, 35);
+    tick(&mut a, &mut chat);
+    f.fire(&a, "12-PreToolUse-escalated.json");
+    a.approval_opened(1_792_215_270_000);
+    rollout_upto(&f.a, A, 43);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    // the command ran (no PostToolUse read, no close reported yet)
+    rollout_upto(&f.a, A, 45);
+    let t = tick(&mut a, &mut chat);
+    assert_eq!(message_ids(&t.outs), ["<exec-3>"]);
+    let t = tick(&mut a, &mut chat);
+    assert_eq!(t.events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Working);
+    // a late close changes nothing
+    a.approval_closed();
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+}
+
+#[test]
+fn a_new_session_waiting_for_a_turn_end_follows_its_stop_hook() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "01-SessionStart-startup.json");
+    f.fire(&a, "02-UserPromptSubmit.json");
+    rollout_upto(&f.a, A, 9);
+    tick(&mut a, &mut chat);
+    a.approval_opened(1);
+    // /new while the turn still counts as running (its rollout end never
+    // came): held, then waiting
+    f.fire(&a, "22-SessionStart-after-new.json");
+    tick(&mut a, &mut chat);
+    let t = tick(&mut a, &mut chat);
+    assert!(matches!(
+        &t.log[..],
+        [LogItem::Problem { fatal: false, .. }]
+    ));
+    assert_eq!(a.session_id(), Some("<session-A>"));
+    // the turn's Stop hook ends it: the start goes ahead (after its hold)
+    f.fire(&a, "03-Stop.json");
+    f.fire(&a, "23-UserPromptSubmit.json");
+    rollout_upto(&f.b, B, 9);
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(&t.events[..], [
+        AgentEvent::SessionStarted { session_id, .. },
+        AgentEvent::PromptSubmitted { turn_id: Some(turn), .. },
+    ] if session_id == "<session-B>" && turn == "<turn-7>"),
+        "{:?}",
+        t.events
+    );
+    assert_eq!(a.session_id(), Some("<session-B>"));
+    assert_eq!(
+        a.approvals, 0,
+        "a re-pin forgets the old session's approvals"
+    );
+    assert_eq!(message_ids(&t.outs), ["<id-15>"]);
+}
+
+#[test]
+fn hook_prompts_equal_the_rollouts() {
+    // what acceptance compares: each UserPromptSubmit's prompt and turn
+    // against the rollout's UserMessage of that turn
+    let mut prompts = Vec::new();
+    for e in fs::read_dir(format!("{FX}/hooks")).unwrap() {
+        let v: Value =
+            serde_json::from_str(&fs::read_to_string(e.unwrap().path()).unwrap()).unwrap();
+        if let Some(h) = Hook::parse(&v).filter(|h| h.prompt.is_some()) {
+            prompts.push((h.turn_id.unwrap(), h.prompt.unwrap()));
+        }
+    }
+    let mut users = Vec::new();
+    for src in [A, B] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("r.jsonl");
+        rollout_upto(&p, src, u64::MAX);
+        for item in super::super::rollout::RolloutReader::new(p).poll() {
+            if let LogItem::UserMessage { turn_id, text, .. } = item {
+                users.push((turn_id, text));
+            }
+        }
+    }
+    prompts.sort();
+    users.sort();
+    assert_eq!(prompts.len(), 7);
+    assert_eq!(prompts, users);
+}
+
+#[test]
+fn a_symlinked_rollout_is_never_read() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    // the day directory is a symlink out of the sessions directory
+    let outside = f.root.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let day = f.home.join("sessions/2026/10/17");
+    fs::remove_dir_all(&day).unwrap();
+    std::os::unix::fs::symlink(&outside, &day).unwrap();
+    f.fire(&a, "01-SessionStart-startup.json");
+    let t = tick(&mut a, &mut chat);
+    assert!(t.events.is_empty());
+    assert!(matches!(
+        &t.log[..],
+        [LogItem::Problem { fatal: false, .. }]
+    ));
+    // the rollout file itself a symlink: accepted as named, never followed
+    fs::remove_file(&day).unwrap();
+    fs::create_dir_all(&day).unwrap();
+    let real = outside.join("real.jsonl");
+    rollout_upto(&real, A, 14);
+    std::os::unix::fs::symlink(&real, &f.a).unwrap();
+    f.fire(&a, "01-SessionStart-startup.json");
+    let t = tick(&mut a, &mut chat);
+    assert!(matches!(&t.events[..], [AgentEvent::SessionStarted { .. }]));
+    assert!(t.log.is_empty(), "{:?}", t.log);
 }

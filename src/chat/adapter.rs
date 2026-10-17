@@ -72,6 +72,16 @@ pub enum AgentEvent {
     },
     PromptSubmitted {
         text: String,
+        /// The turn the prompt starts, when the agent names it (Codex);
+        /// acceptance then needs the log's prompt of that turn.
+        #[serde(default)]
+        turn_id: Option<String>,
+    },
+    /// The agent can't take a prompt yet, and why (Codex before its first
+    /// prompt): the status stays unknown with this detail, and a chat
+    /// submit is refused with it.
+    NotReady {
+        detail: String,
     },
     ToolStarted,
     ToolFinished,

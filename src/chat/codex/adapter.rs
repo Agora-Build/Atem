@@ -4,36 +4,41 @@
 //! start and turn end (`designs/fixtures/codex-hooks/README.md`).
 //!
 //! - Session: Codex says nothing before its first prompt (SessionStart is
-//!   lazy), so chat stays unavailable until the first hook with the reason
-//!   [`FIRST_PROMPT`]: the first prompt is typed in the terminal (the
-//!   2026-10-17 ruling: text typed into Codex's startup dialogs could
-//!   answer them). The first hook pins its session (a missed SessionStart,
-//!   e.g. a hook not yet trusted, is made up from it) and names the
-//!   rollout, which must be `rollout-*-<session_id>.jsonl` under
-//!   `$CODEX_HOME/sessions` (else the hook is ignored with a notice).
+//!   lazy). Chat is available from the launch, but the status stays
+//!   unknown (`NotReady` with [`FIRST_PROMPT`]) and a chat submit is
+//!   refused with that hint until the first hook: the first prompt is typed
+//!   in the terminal (the 2026-10-17 ruling: text typed into Codex's
+//!   startup dialogs could answer them). The first hook pins its session (a
+//!   missed SessionStart, e.g. a hook not yet trusted, is made up from it)
+//!   and names the rollout, which must be `rollout-*-<session_id>.jsonl`
+//!   under `$CODEX_HOME/sessions`, also once symlinks are resolved (else
+//!   the hook is ignored with a notice).
 //! - Only the pinned session's hooks count. A SessionStart of another
 //!   session re-pins (`/new` → `startup`, a resume of another conversation
 //!   → `resume`): the old rollout is read to its end first (the switch
 //!   waits one poll), a `startup` rollout is live from its first line,
 //!   anything else is history (`Backfill`) up to a turn still running. A
-//!   start of another session while the pinned one's turn runs is ignored
-//!   with a notice: a `codex` run by a tool inside the turn has this
-//!   session's environment too and would otherwise take the chat over (the
-//!   event files carry no process ancestry, unlike approval requests).
+//!   start of another session while the pinned one's turn runs waits (with
+//!   a notice) until that turn ends (its rollout end, or its Stop/Interrupt
+//!   hook): a `codex` run by a tool inside the turn has this session's
+//!   environment too and would otherwise take the chat over (the event
+//!   files carry no process ancestry, unlike approval requests).
 //! - Status (`ChatSession`): `UserPromptSubmit` → working (and the hook
-//!   half of a prompt's acceptance), PreToolUse/PostToolUse → tool events,
-//!   the rollout's `task_started` → working, `task_complete` /
-//!   `turn_aborted` → ready. Stop and Interrupt only wake the reader (the
-//!   rollout's end record follows them and is authoritative), so they map
-//!   to nothing, as do PreCompact/PostCompact (the compaction's own task
-//!   does) and SessionEnd (the process exit is the worker's).
+//!   half of a prompt's acceptance, with its `turn_id`), PreToolUse /
+//!   PostToolUse → tool events, the rollout's `task_started` → working,
+//!   `task_complete` / `turn_aborted` → ready. Stop and Interrupt only wake
+//!   the reader (the rollout's end record follows them and is
+//!   authoritative), as do PreCompact/PostCompact (the compaction's own
+//!   task marks it) and SessionEnd (the process exit is the worker's).
 //! - Waiting: PermissionRequest never reaches `events/` (it is the
 //!   approvals' own protocol, `runtime/worker_approvals.rs`), so the worker
 //!   reports each approval it opens and closes for this session
 //!   ([`CodexAdapter::approval_opened`], [`CodexAdapter::approval_closed`]):
-//!   the first open is `WaitingForPermission`, the last close
-//!   `ToolFinished` (back to working), both with the next `poll_events`.
-//!   A turn's end forgets any still counted.
+//!   the first open is `WaitingForPermission`, the last close — or a
+//!   rollout item of the turn completed after the open — `ToolFinished`
+//!   (back to working), returned after that poll's hook events. A
+//!   PreToolUse read while an approval is open is dropped (Codex holds the
+//!   tool while the hook waits); a turn's end or a re-pin forgets them.
 //! - A format change in the rollout withdraws chat, as for Claude.
 //!   Messages arrive whole, never streamed; [`UNAVAILABLE`] says so.
 
@@ -49,8 +54,8 @@ use crate::chat::adapter::{
     UNAVAILABLE_ERROR_DETAILS, UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
 };
 
-/// Why chat is unavailable before Codex's first hook.
-pub const FIRST_PROMPT: &str = "type a first prompt in the terminal: Codex reports nothing before it (and Atem's Codex hooks must be trusted in Codex's /hooks)";
+/// Why a chat prompt is refused before Codex's first hook.
+pub const FIRST_PROMPT: &str = "type a first prompt in the terminal: Codex reports nothing before it (and Atem's Codex hooks must be trusted in its /hooks)";
 /// What Codex chat can't provide: no partial text (whole messages only),
 /// no reasoning (encrypted), no persistent approval rule (Codex fails
 /// closed), no model/API error details (none recorded).
@@ -82,8 +87,17 @@ pub struct CodexAdapter {
     switch_waited: bool,
     /// Log items returned before the reader's own at the next `poll_log`.
     queued: Vec<LogItem>,
-    /// Events returned first at the next `poll_events` (approvals).
+    /// Events returned after the hooks' at the next `poll_events`
+    /// (approvals: a PreToolUse read in the same pass came first).
     extra: Vec<AgentEvent>,
+    /// A start of another session ignored while the pinned turn ran: tried
+    /// again once that turn ends (a turn end, or its Stop/Interrupt hook).
+    deferred: Option<Hook>,
+    /// `NotReady` was sent (before the first hook).
+    announced: bool,
+    /// When the first open approval opened (unix ms): a rollout item of the
+    /// turn completed later means it was answered.
+    approval_since: i64,
     /// The pinned session's turn runs (a prompt or a live `task_started`,
     /// no live turn end yet).
     turn_open: bool,
@@ -107,6 +121,9 @@ impl CodexAdapter {
             switch_waited: false,
             queued: Vec::new(),
             extra: Vec::new(),
+            deferred: None,
+            announced: false,
+            approval_since: 0,
             turn_open: false,
             approvals: 0,
             session_started: false,
@@ -125,11 +142,12 @@ impl CodexAdapter {
         self.pinned.as_deref()
     }
 
-    /// The worker opened an approval for this session (reported it): the
-    /// first one makes the status waiting.
-    pub fn approval_opened(&mut self) {
+    /// The worker opened an approval for this session (reported it) at
+    /// `at_ms` (unix ms): the first one makes the status waiting.
+    pub fn approval_opened(&mut self, at_ms: i64) {
         self.approvals += 1;
         if self.approvals == 1 {
+            self.approval_since = at_ms;
             self.extra.push(AgentEvent::WaitingForPermission {
                 detail: APPROVAL_DETAIL.into(),
             });
@@ -195,15 +213,13 @@ pub fn rollout_path_ok(codex_home: &Path, session_id: &str, path: &Path) -> bool
         return false;
     }
     let sessions = codex_home.join("sessions");
-    if path.starts_with(&sessions) && path != sessions {
-        return true;
-    }
-    match (
-        sessions.canonicalize(),
-        path.parent().and_then(|p| p.canonicalize().ok()),
-    ) {
+    let parent = path.parent().and_then(|p| p.canonicalize().ok());
+    match (sessions.canonicalize(), parent) {
+        // Where it really is decides (no symlink out of the sessions dir).
         (Ok(sessions), Some(parent)) => parent.starts_with(sessions),
-        _ => false,
+        // Not there yet: as written. The reader never follows a symlinked
+        // rollout file.
+        _ => path.starts_with(&sessions) && path != sessions,
     }
 }
 
@@ -252,11 +268,19 @@ impl CodexAdapter {
             "UserPromptSubmit" => {
                 if let Some(text) = hook.prompt {
                     self.turn_open = true;
-                    out.push(AgentEvent::PromptSubmitted { text });
+                    out.push(AgentEvent::PromptSubmitted {
+                        text,
+                        turn_id: hook.turn_id,
+                    });
                 }
             }
-            "PreToolUse" => out.push(AgentEvent::ToolStarted),
+            // While an approval waits Codex holds the tool: a PreToolUse
+            // read now came before it.
+            "PreToolUse" if self.approvals == 0 => out.push(AgentEvent::ToolStarted),
             "PostToolUse" => out.push(AgentEvent::ToolFinished),
+            // Only wake-ups for the reader (the rollout's end record is the
+            // turn's end), but the turn is over: a deferred start may go.
+            "Stop" | "Interrupt" => self.turn_open = false,
             _ => {}
         }
     }
@@ -276,17 +300,39 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn poll_events(&mut self) -> Vec<AgentEvent> {
-        let mut out = std::mem::take(&mut self.extra);
+        let mut out = Vec::new();
+        if !self.announced && !self.session_started {
+            self.announced = true;
+            out.push(AgentEvent::NotReady {
+                detail: FIRST_PROMPT.into(),
+            });
+        }
         let Some(reader) = self.events.as_mut() else {
+            out.append(&mut self.extra);
             return out;
         };
+        let read = reader.poll();
         let mut incoming = std::mem::take(&mut self.held);
-        incoming.extend(reader.poll().iter().filter_map(Hook::parse));
+        let mut bad = 0;
+        for v in read {
+            match v.as_ref().and_then(Hook::parse) {
+                Some(hook) => incoming.push_back(hook),
+                None => bad += 1,
+            }
+        }
+        if bad > 0 {
+            self.notice("ignored a Codex hook event that could not be read");
+        }
         while let Some(hook) = incoming.pop_front() {
             let start = hook.event == "SessionStart";
             let ours = self.pinned.as_deref() == Some(hook.session_id.as_str());
             if ours && !start {
                 self.map(hook, &mut out);
+                if !self.turn_open
+                    && let Some(deferred) = self.deferred.take()
+                {
+                    incoming.push_front(deferred);
+                }
                 continue;
             }
             if !ours && !start && self.pinned.is_some() {
@@ -319,7 +365,8 @@ impl AgentAdapter for CodexAdapter {
             }
             self.switch_waited = false;
             if !ours && self.turn_open {
-                self.notice("ignored a start of another Codex session while a turn runs");
+                self.notice("held a start of another Codex session until the current turn ends");
+                self.deferred = Some(hook);
                 continue;
             }
             // A hook other than SessionStart first: its SessionStart was
@@ -332,6 +379,8 @@ impl AgentAdapter for CodexAdapter {
             self.switch_to(hook.transcript_path.clone(), &source);
             self.pinned = Some(hook.session_id.clone());
             self.turn_open = false;
+            self.approvals = 0;
+            self.deferred = None;
             self.session_started = true;
             out.push(AgentEvent::SessionStarted {
                 session_id: hook.session_id.clone(),
@@ -343,6 +392,7 @@ impl AgentAdapter for CodexAdapter {
                 self.map(hook, &mut out);
             }
         }
+        out.append(&mut self.extra);
         out
     }
 
@@ -363,6 +413,16 @@ impl AgentAdapter for CodexAdapter {
                 LogItem::TurnEnded { .. } => {
                     self.turn_open = false;
                     self.approvals = 0;
+                    if let Some(deferred) = self.deferred.take() {
+                        self.held.push_front(deferred);
+                    }
+                }
+                // The turn went on after the approval: it was answered.
+                LogItem::AssistantPart { created_at_ms, .. }
+                    if self.approvals > 0 && *created_at_ms >= self.approval_since =>
+                {
+                    self.approvals = 0;
+                    self.extra.push(AgentEvent::ToolFinished);
                 }
                 _ => {}
             }
@@ -371,14 +431,11 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        let (chat_v1, reason) = match (&self.withdrawn, self.session_started) {
-            (Some(reason), _) => (false, Some(reason.clone())),
-            (None, true) => (true, None),
-            (None, false) => (false, Some(FIRST_PROMPT.to_string())),
-        };
+        // Open before the first hook too (status unknown, submit refused
+        // with `FIRST_PROMPT`); only a format change withdraws chat.
         Capabilities {
-            chat_v1,
-            reason,
+            chat_v1: self.withdrawn.is_none(),
+            reason: self.withdrawn.clone(),
             unavailable: UNAVAILABLE,
         }
     }
@@ -403,6 +460,8 @@ pub struct Hook {
     pub source: String,
     /// UserPromptSubmit's `prompt`.
     pub prompt: Option<String>,
+    /// The turn of a turn-scoped hook.
+    pub turn_id: Option<String>,
 }
 
 impl Hook {
@@ -414,6 +473,7 @@ impl Hook {
             transcript_path: PathBuf::from(s("transcript_path")?),
             source: s("source").unwrap_or_default().to_string(),
             prompt: s("prompt").map(str::to_string),
+            turn_id: s("turn_id").map(str::to_string),
         })
     }
 }
@@ -466,7 +526,9 @@ impl EventReader {
         Self { dir }
     }
 
-    pub fn poll(&mut self) -> Vec<Value> {
+    /// The events in order; `None` for one that was too big or not JSON
+    /// (deleted all the same).
+    pub fn poll(&mut self) -> Vec<Option<Value>> {
         let Ok(rd) = std::fs::read_dir(self.dir.join("events")) else {
             return Vec::new();
         };
@@ -490,9 +552,7 @@ impl EventReader {
             match read_event(&path) {
                 Ok(text) => {
                     let _ = std::fs::remove_file(&path);
-                    if let Some(v) = text.and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
-                        out.push(v);
-                    }
+                    out.push(text.and_then(|t| serde_json::from_str::<Value>(&t).ok()));
                 }
                 Err(_) => {
                     // Unreadable: kept for now, dropped once stale.
