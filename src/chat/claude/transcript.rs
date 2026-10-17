@@ -328,7 +328,7 @@ fn created_at_ms(v: &Value) -> i64 {
 }
 
 /// Minimal RFC 3339 parser (`YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`) to unix ms.
-fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !(b[10] == b'T' || b[10] == b't') {
         return None;

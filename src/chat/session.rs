@@ -519,6 +519,11 @@ impl ChatSession {
                 let part = redact_part(part);
                 self.assistant_part(message_id, part, turn_id, created_at_ms, &mut out);
             }
+            LogItem::TurnStarted { .. } => {
+                if self.live() {
+                    self.set_status(State::Working, None, now_ms, &mut out);
+                }
+            }
             LogItem::TurnEnded { .. } if !self.started => {}
             LogItem::TurnEnded { turn_id, outcome } => {
                 self.expired = None;
@@ -854,7 +859,10 @@ impl ChatSession {
                 self.current_turn = current;
             }
             LogItem::Backfill(item) => self.on_backfill(*item),
-            LogItem::TurnEnded { .. } | LogItem::Problem { .. } | LogItem::ToolResult { .. } => {}
+            LogItem::TurnStarted { .. }
+            | LogItem::TurnEnded { .. }
+            | LogItem::Problem { .. }
+            | LogItem::ToolResult { .. } => {}
         }
     }
 
@@ -1000,6 +1008,35 @@ mod tests {
             cards[0].parts,
             vec![Part::Approval(card(ApprovalCardState::Denied))]
         );
+    }
+
+    #[test]
+    fn a_log_turn_start_means_working() {
+        let start = || LogItem::TurnStarted {
+            turn_id: "t".into(),
+        };
+        let mut s = ChatSession::new("g".into(), 0);
+        assert!(s.on_log(start(), 1, 0).is_empty(), "not started yet");
+        s.on_event(started(), 2, 0);
+        s.on_backfill(start());
+        assert_eq!(s.status().state, State::Ready, "history only");
+        assert_eq!(
+            s.on_log(start(), 3, 0),
+            vec![Out::Status(Status {
+                state: State::Working,
+                since_ms: 3,
+                detail: None
+            })]
+        );
+        // a turn without a prompt (compaction) completes no request
+        let o = s.on_log(end("t", Outcome::Done), 4, 0);
+        assert!(o.contains(&Out::Complete {
+            turn_id: "t".into(),
+            request_id: None,
+            outcome: Outcome::Done
+        }));
+        assert_eq!(s.status().state, State::Ready);
+        assert!(s.history(None, 50, 1 << 20).is_empty());
     }
 
     #[test]

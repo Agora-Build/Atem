@@ -204,18 +204,21 @@ impl AgentAdapter for ClaudeAdapter {
             return Capabilities {
                 chat_v1: false,
                 reason: Some(reason.clone()),
+                ..Capabilities::default()
             };
         }
         if self.session_started {
             return Capabilities {
                 chat_v1: true,
                 reason: None,
+                ..Capabilities::default()
             };
         }
         let reason = (self.started_at.elapsed() >= HOOKS_WAIT).then(|| HOOKS_INACTIVE.to_string());
         Capabilities {
             chat_v1: false,
             reason,
+            ..Capabilities::default()
         }
     }
 }
@@ -285,7 +288,8 @@ mod tests {
             a.capabilities(),
             Capabilities {
                 chat_v1: false,
-                reason: None
+                reason: None,
+                ..Capabilities::default()
             }
         );
         a.started_at = Instant::now() - Duration::from_secs(16);
@@ -298,7 +302,8 @@ mod tests {
             a.capabilities(),
             Capabilities {
                 chat_v1: true,
-                reason: None
+                reason: None,
+                ..Capabilities::default()
             }
         );
         a.withdrawn = Some("format changed".into());

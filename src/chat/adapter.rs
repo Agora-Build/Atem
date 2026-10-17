@@ -98,6 +98,9 @@ pub enum LogItem {
         turn_id: String,
         created_at_ms: i64,
     },
+    /// A turn started according to the log (Codex's `task_started`): the
+    /// agent is working, also on a turn without a prompt (compaction).
+    TurnStarted { turn_id: String },
     /// The turn ended according to the log (end_turn or interrupt).
     TurnEnded { turn_id: String, outcome: Outcome },
     /// Content that was already in a log the adapter switched to (a resume of
@@ -131,7 +134,23 @@ pub enum ToolResultKind {
 pub struct Capabilities {
     pub chat_v1: bool,
     pub reason: Option<String>,
+    /// What this agent's chat can't provide (see the `UNAVAILABLE_*` names),
+    /// for clients to say so instead of waiting for it.
+    pub unavailable: &'static [&'static str],
 }
+
+/// Partial text while a reply is written (messages arrive whole).
+#[allow(dead_code)] // used by the Codex adapter, wired next
+pub const UNAVAILABLE_STREAMING: &str = "streaming";
+/// The model's reasoning.
+#[allow(dead_code)] // used by the Codex adapter, wired next
+pub const UNAVAILABLE_REASONING: &str = "reasoning";
+/// "Always allow" on approval cards (a persistent rule).
+#[allow(dead_code)] // used by the Codex adapter, wired next
+pub const UNAVAILABLE_ALWAYS_ALLOW: &str = "always_allow";
+/// The model or API error behind a failed turn.
+#[allow(dead_code)] // used by the Codex adapter, wired next
+pub const UNAVAILABLE_ERROR_DETAILS: &str = "error_details";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchPlan {
