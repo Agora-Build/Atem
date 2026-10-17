@@ -5,7 +5,10 @@
 //! Attachment: the App's authenticated Astation link (direct or relay; the
 //! App holds one at a time) is one attachment, created when the link becomes
 //! authenticated (`App::astation_link_gen` counts those) and fenced when it
-//! drops or Astation re-authenticates it. Only the Astation this profile is
+//! drops or Astation re-authenticates it. A second `hello` on the link (a
+//! client reset, e.g. after sleep) replaces it: the host fences the old
+//! attachment and the link's messages go to the new one (`Effect::Replaced`;
+//! r7.1). Each `hello`'s outcome is one line in runtime.log. Only the Astation this profile is
 //! paired with (the pairing binding the link captured) and verified with
 //! (`cred_state.json`) gets one, with `view` and `control`; any
 //! other link — unpaired, unverified, or another Astation — gets no
@@ -702,6 +705,12 @@ impl HostBridge {
     fn drop_attachment(&mut self, attachment: &str, cx: &mut Cx) {
         let effects = self.host.disconnect(attachment);
         self.exec(effects, cx);
+        self.forget_attachment(attachment);
+    }
+
+    /// The broker's side of a fenced attachment: its frame streams, chat
+    /// conversations, queued terminal messages and remote writes go.
+    fn forget_attachment(&mut self, attachment: &str) {
         self.streams.retain(|(att, _), _| att != attachment);
         for chats in self.chats.values_mut() {
             chats
@@ -724,6 +733,12 @@ impl HostBridge {
 
     fn receive(&mut self, link_gen: u64, text: &str, cx: &mut Cx) {
         let decoded = wire::decode(text.as_bytes());
+        let hello = match &decoded {
+            Ok(Envelope::Session(m)) if matches!(m.op, wire::Op::Hello { .. }) => {
+                Some(m.id.clone())
+            }
+            _ => None,
+        };
         let Some(attachment) = self
             .link
             .as_ref()
@@ -738,6 +753,9 @@ impl HostBridge {
                     Err(e) => e.id.clone(),
                 };
                 let _ = cx.client.try_send_wire(unauthorized(re), false);
+                if hello.is_some() {
+                    log_handshake("refused unauthorized (no attachment on this link)");
+                }
             }
             return;
         };
@@ -754,6 +772,9 @@ impl HostBridge {
             }
         }
         let effects = self.host.receive_decoded(&attachment, decoded, now);
+        if let Some(id) = &hello {
+            log_hello(id, &effects);
+        }
         self.exec(effects, cx);
     }
 
@@ -826,6 +847,14 @@ impl HostBridge {
                 } => self.send(&attachment, &message, cx),
                 // A fenced attachment of this link's client: already gone.
                 Effect::Close { .. } => {}
+                // A second `hello` on the link: the link's attachment is now
+                // `new`; what belonged to `old` goes (the host fenced it).
+                Effect::Replaced { old, new } => {
+                    if let Some(link) = self.link.as_mut().filter(|l| l.attachment == old) {
+                        link.attachment = new;
+                        self.forget_attachment(&old);
+                    }
+                }
                 Effect::PtyWrite {
                     session_id,
                     bytes,
@@ -2211,6 +2240,59 @@ fn chat_error(
     body.insert("code".into(), Value::String(code.into()));
     body.insert("text".into(), Value::String(text.into()));
     chat_envelope(conversation, sid, "error", head, body)
+}
+
+/// One line in runtime.log per session handshake outcome of the `hello`
+/// `id`: welcomed, replaced (and welcomed) or refused with its code. Never a
+/// payload; attachments by their first 8 characters.
+fn log_hello(id: &str, effects: &[Effect]) {
+    use crate::session_protocol::wire::{Op, SessionMessage};
+    let short = |a: &str| a.chars().take(8).collect::<String>();
+    let mut replaced = None;
+    for effect in effects {
+        match effect {
+            Effect::Replaced { old, new } => replaced = Some((short(old), short(new))),
+            Effect::Send {
+                message:
+                    Envelope::Session(SessionMessage {
+                        re: Some(re), op, ..
+                    }),
+                ..
+            } if re == id => match op {
+                Op::Welcome { attachment_gen, .. } => {
+                    let line = match &replaced {
+                        Some((old, new)) => {
+                            format!("replaced attachment {old} with {new}; welcome")
+                        }
+                        None => format!("welcome (attachment {})", short(attachment_gen)),
+                    };
+                    return log_handshake(&line);
+                }
+                Op::Error { code, .. } => {
+                    let code = serde_json::to_value(code)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    return log_handshake(&format!("refused {code}"));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn log_handshake(what: &str) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        % 86_400;
+    eprintln!(
+        "{:02}:{:02}:{:02} atem runtime: session hello: {what}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    );
 }
 
 /// A session `error{code:"unauthorized"}` for a link without an attachment.

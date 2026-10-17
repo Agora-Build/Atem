@@ -409,6 +409,17 @@ impl<J: Journal> FakeRuntime<J> {
                 Effect::Close { attachment } => {
                     self.live.remove(&attachment);
                 }
+                // A second `hello` replaced the client's attachment on the
+                // same transport: its messages go to the new one.
+                Effect::Replaced { old, new } => {
+                    if let Some(name) = self.live.remove(&old) {
+                        if let Some(c) = self.clients.get_mut(&name) {
+                            c.attachment_gen = new.clone();
+                        }
+                        self.names.insert(new.clone(), name.clone());
+                        self.live.insert(new, name);
+                    }
+                }
                 Effect::PtyWrite { ref origin, .. } => {
                     if self.hold_writes && matches!(origin, Origin::Remote { .. }) {
                         self.queued_writes.push(effect);

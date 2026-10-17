@@ -1,0 +1,233 @@
+{
+ "name": "second-hello-replaces-the-attachment",
+ "setup": {
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "holds_lease_epoch": 1,
+    "client_kind": "native"
+   }
+  ],
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  }
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000201",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-444444444444",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-444444444444",
+    "state": "accepted"
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-444444444444",
+    "state": "executing"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000202"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "welcome",
+    "re": "11111111-1111-4111-8111-000000000202",
+    "account_id": "account-a",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   },
+   "capture": {
+    "gen2": "attachment_gen"
+   }
+  },
+  {
+   "assert": {
+    "lease_holder": null
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "renew",
+     "id": "11111111-1111-4111-8111-000000000203",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000203",
+    "code": "stale_target"
+   }
+  },
+  {
+   "turn_complete": "ses-aaaaaaaaaaaa",
+   "turn_id": "turn-1"
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000204",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "${gen2}"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-444444444444"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "receipts",
+    "re": "11111111-1111-4111-8111-000000000204",
+    "receipts.#": 1,
+    "receipts.0.request_id": "44444444-4444-4444-8444-444444444444",
+    "receipts.0.state": "completed"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000205",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "${gen2}"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000205",
+    "binding.attachment_gen": "${gen2}",
+    "binding.lease_epoch": 3
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000206"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000206",
+    "code": "busy"
+   }
+  },
+  {
+   "assert": {
+    "lease_holder": "c1",
+    "dispatches": 1
+   }
+  }
+ ],
+ "note": "Compatibility mode (r7.1): a second hello on an attachment that was already welcomed replaces it on the same authenticated transport, as a link drop would fence it: its lease ends (none is carried over), and anything naming the old attachment_gen is stale_target. The receipt it submitted stays queryable from the new attachment, and the new attachment acquires at the next epoch without takeover. Another replacement within a second is busy."
+}

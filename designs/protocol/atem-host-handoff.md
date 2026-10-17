@@ -89,6 +89,18 @@ Attachments and identity:
 - Every connect and every re-authentication (`auth_required` over an open
   socket) is a **new attachment**: send `hello` again; a message bound to an
   old `attachment_gen` is `stale_target`. Leases are not inherited.
+- r7.1: a `hello` again on the same, still authenticated link (Astation reset
+  its session client, e.g. after the Mac slept) is **accepted** and replaces
+  the attachment: new `attachment_gen` and `controller_session`, the old one's
+  leases end (none carried over), its streams and conversations close, the
+  old `attachment_gen` is `stale_target`; receipts stay queryable and pending
+  approvals are sent again. The link's 24 h authorization is not renewed. At
+  most one replacement a second (`busy`). When the socket is down, retry by
+  reconnecting rather than re-sending `hello`. This is not a verification
+  problem: the "Complete verification" UI text is wrong for it (a refused
+  `hello` meant the client already had an attachment, never that the device
+  needs verifying). runtime.log has one `HH:MM:SS` UTC line per `hello`:
+  `welcome`, `replaced attachment … with …; welcome`, or `refused <code>`.
 - `welcome`: `account_id` = the verified `data_account` from
   `cred_state.json`; `atem_device_id` = this device's verified `device_id`;
   `host_trust_gen` = `pairing.json`'s generation (moves on every
@@ -200,6 +212,7 @@ and `written` acks are not queued for `expect` (the acks count toward
 | lease-expires-without-renewal | pass |
 | local-input-revokes-the-lease-and-drops-queued-bytes | pass |
 | reconnect-restarts-the-registry-sequence | pass |
+| second-hello-replaces-the-attachment | pass (r7.1) |
 | removed-ops-have-no-effect | pass folded onto one attachment (the lease holder itself sends every removed op, with and without the lease; `lease_changed` for the second client left out); the two-attachment original runs in the core harness |
 | receipt-query-is-scoped-to-the-exact-target | core harness only (3 attachments) |
 | takeover-moves-control-and-the-old-holder-becomes-a-viewer | core harness only (3 attachments) |

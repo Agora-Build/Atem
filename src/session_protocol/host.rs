@@ -60,6 +60,9 @@ pub const TOMBSTONE_MS: u64 = 10 * 60 * 1000;
 pub const RECEIPT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// An interrupt or stop that shows no effect within this is `outcome_unknown`.
 pub const OBSERVE_MS: u64 = 10_000;
+/// A transport's attachment is replaced by a second `hello` at most once per
+/// this interval (r7.1); more often is `busy`.
+pub const REPLACE_INTERVAL_MS: u64 = 1_000;
 /// Lease epochs are reserved durably in blocks, so an epoch is never issued
 /// twice across restarts without an fsync per grant.
 pub const LEASE_EPOCH_BLOCK: u64 = 64;
@@ -165,6 +168,14 @@ pub enum Effect {
     /// The attachment is fenced: close its transport.
     Close {
         attachment: String,
+    },
+    /// A second `hello` on the welcomed attachment `old` fenced it and
+    /// replaced it with `new` on the same transport (compatibility mode,
+    /// r7.1): route that transport's messages to `new` from now on. Comes
+    /// before anything sent to `new`.
+    Replaced {
+        old: String,
+        new: String,
     },
     PtyWrite {
         session_id: String,
@@ -350,6 +361,9 @@ struct Attachment {
     registry_seq: Option<u64>,
     /// session_id → terminal-v1 stream id.
     streams: HashMap<String, String>,
+    /// When this attachment replaced an earlier one with a second `hello`
+    /// (host clock); a replacement within `REPLACE_INTERVAL_MS` is `busy`.
+    replaced_at: Option<u64>,
 }
 
 impl Attachment {
@@ -576,6 +590,7 @@ impl<J: Journal> SessionHost<J> {
                 authorization_deadline: deadline,
                 registry_seq: None,
                 streams: HashMap::new(),
+                replaced_at: None,
             },
         );
         Ok(self.take())
@@ -1382,19 +1397,24 @@ impl<J: Journal> SessionHost<J> {
         }
     }
 
-    /// Compatibility mode (§3): no resume; every `hello` on a fresh attachment
-    /// gets a new `controller_session` and holds no lease.
+    /// Compatibility mode (§3, r7.1): no resume; every `hello` gets a new
+    /// `controller_session` and holds no lease. A `hello` on an attachment
+    /// that was already welcomed replaces it (`replace`); each attachment is
+    /// still welcomed once.
     fn hello(&mut self, att: &str, re: Option<String>, resume: bool) -> Checked {
         if resume {
-            return Err(ErrorCode::Unauthorized);
-        }
-        if self.attachments[att].welcomed() {
-            // One welcome per attachment; a new one needs a new attachment.
             return Err(ErrorCode::Unauthorized);
         }
         if self.now >= self.attachments[att].authorization_deadline {
             return Err(ErrorCode::Paused);
         }
+        let replaced;
+        let att = if self.attachments[att].welcomed() {
+            replaced = self.replace(att)?;
+            replaced.as_str()
+        } else {
+            att
+        };
         let controller_session = self.new_id();
         let (now, wall) = (self.now, self.wall());
         let a = self.attachments.get_mut(att).unwrap();
@@ -1413,6 +1433,50 @@ impl<J: Journal> SessionHost<J> {
         };
         self.send(att, re, op);
         Ok(())
+    }
+
+    /// Fences the welcomed attachment `old` as a transport drop would, and
+    /// puts a new, unwelcomed attachment of the same client in its place:
+    /// same permissions, kind and authorization deadline (not renewed). Its
+    /// leases end now (none is carried over); its streams close and its
+    /// replies stop. Receipts and pending approvals stay. At most one
+    /// replacement per `REPLACE_INTERVAL_MS` and transport (`busy`).
+    fn replace(&mut self, old: &str) -> Checked<String> {
+        let a = self.attachments[old].clone();
+        if a.replaced_at
+            .is_some_and(|t| self.now < t.saturating_add(REPLACE_INTERVAL_MS))
+        {
+            return Err(ErrorCode::Busy);
+        }
+        let new = uuid::Uuid::new_v4().to_string();
+        self.out.push(Effect::Replaced {
+            old: old.to_string(),
+            new: new.clone(),
+        });
+        let held: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.lease.as_ref().is_some_and(|l| l.attachment == old))
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.drop_attachment(old);
+        for sid in held {
+            self.end_lease(&sid, LeaseChangeReason::Released, None);
+        }
+        self.attachments.insert(
+            new.clone(),
+            Attachment {
+                client: a.client,
+                controller_session: None,
+                permissions: a.permissions,
+                client_kind: a.client_kind,
+                authorization_deadline: a.authorization_deadline,
+                registry_seq: None,
+                streams: HashMap::new(),
+                replaced_at: Some(self.now),
+            },
+        );
+        Ok(new)
     }
 
     /// The binding names this host, this attachment and a live session the

@@ -277,9 +277,16 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     assert_eq!(w["client_kind"], "native");
     assert_eq!(w["authorization_ms_left"], AUTHORIZATION_MS - 1000);
     assert!(wire::is_uuid_v4(w["controller_session"].as_str().unwrap()));
-    // One welcome per attachment.
+    // A second hello replaces the attachment (r7.1); one more within a
+    // second is busy.
     rt.send("n", &session("hello", json!({})));
-    assert_error(&only(&mut rt, "n"), "unauthorized");
+    let w2 = only(&mut rt, "n");
+    assert_eq!(w2["op"], "welcome");
+    assert_ne!(w2["attachment_gen"], fresh);
+    assert_ne!(w2["controller_session"], w["controller_session"]);
+    assert_eq!(w2["authorization_ms_left"], AUTHORIZATION_MS - 1000);
+    rt.send("n", &session("hello", json!({})));
+    assert_error(&only(&mut rt, "n"), "busy");
     // Host-only ops are not requests.
     rt.send("n", &session("lease_released", json!({})));
     assert_error(&only(&mut rt, "n"), "unsupported_version");
@@ -295,6 +302,85 @@ fn every_hello_gets_its_own_controller_and_no_lease() {
     let m = acquire(&rt, "c1", S1, false);
     rt.send("c1", &m);
     assert_error(&only(&mut rt, "c1"), "lease_held");
+}
+
+#[test]
+fn a_second_hello_replaces_the_attachment() {
+    let mut rt = setup();
+    let stream = subscribe(&mut rt, "c1");
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "interrupt");
+    rt.send("c1", &m);
+    got(&mut rt, "c1");
+    rt.set_now(2000);
+    rt.effects.clear();
+    let hello = session("hello", json!({}));
+    rt.send("c1", &hello);
+    // Only the welcome reaches the client: the old attachment's lease end
+    // and stream close are not sent to it.
+    let w = only(&mut rt, "c1");
+    assert_eq!(w["op"], "welcome");
+    assert_eq!(w["re"], hello["data"]["id"]);
+    let new = w["attachment_gen"].as_str().unwrap().to_string();
+    assert_ne!(new, C1);
+    assert_eq!(rt.attachment("c1"), new);
+    assert_eq!(w["permissions"], json!(["view", "control"]));
+    // Same authorization deadline, not renewed.
+    assert_eq!(w["authorization_ms_left"], AUTHORIZATION_MS - 2000);
+    assert!(
+        rt.effects
+            .iter()
+            .any(|e| matches!(e, Effect::Replaced { old, new: n } if old == C1 && *n == new))
+    );
+    assert!(rt.effects.iter().any(
+        |e| matches!(e, Effect::StreamClosed { attachment, stream_id, .. } if attachment == C1 && *stream_id == stream)
+    ));
+    // The lease ended (no carry-over); the old attachment is fenced.
+    assert_eq!(rt.host.lease_holder(S1), None);
+    rt.effects.clear();
+    let old_renew = renew(&rt, "c1", S1, e);
+    rt.send_on(C1, &old_renew);
+    assert!(rt.effects.iter().any(|e| matches!(e,
+        Effect::Send { attachment, message: Envelope::Session(s) }
+            if attachment == C1 && matches!(s.op, Op::Error { code: wire::ErrorCode::Unauthorized, .. }))));
+    // Naming the old attachment_gen on the new attachment is stale_target.
+    let mut stale = renew(&rt, "c1", S1, e);
+    stale["data"]["binding"]["attachment_gen"] = json!(C1);
+    rt.send("c1", &stale);
+    assert_error(&only(&mut rt, "c1"), "stale_target");
+    // The receipt is still there for the new attachment.
+    let q = query(&rt, "c1", target_with(S1, 1), vec![rid(1)]);
+    rt.send("c1", &q);
+    let r = only(&mut rt, "c1");
+    assert_eq!(r["receipts"].as_array().unwrap().len(), 1, "{r}");
+    // A new lease without takeover, at the next epoch.
+    assert_eq!(hold(&mut rt, "c1", S1), e + 2);
+    // At most one replacement a second.
+    rt.set_now(2999);
+    got(&mut rt, "c1");
+    rt.send("c1", &session("hello", json!({})));
+    assert_error(&only(&mut rt, "c1"), "busy");
+    assert_eq!(rt.attachment("c1"), new);
+    assert!(rt.host.lease_holder(S1).is_some());
+    rt.set_now(3000);
+    got(&mut rt, "c1");
+    rt.send("c1", &session("hello", json!({})));
+    assert_eq!(only(&mut rt, "c1")["op"], "welcome");
+    assert_ne!(rt.attachment("c1"), new);
+}
+
+#[test]
+fn a_second_hello_after_the_authorization_deadline_is_paused() {
+    let mut rt = setup();
+    let short = "88888888-8888-4888-8888-888888888888";
+    rt.connect_only("s", short, vec![Permission::View], 5000);
+    rt.send("s", &session("hello", json!({})));
+    got(&mut rt, "s");
+    rt.set_now(5000);
+    got(&mut rt, "s");
+    rt.send("s", &session("hello", json!({})));
+    assert_error(&only(&mut rt, "s"), "paused");
+    assert_eq!(rt.attachment("s"), short);
 }
 
 #[test]

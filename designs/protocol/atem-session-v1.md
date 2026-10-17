@@ -1,6 +1,13 @@
-# atem-session v1: sessions, control leases, receipts and approvals (r7: r6 plus approvals — for review)
+# atem-session v1: sessions, control leases, receipts and approvals (r7.1: r7 plus hello replacement — for review)
 
-Status: r7 (2026-10-16) adds approvals (§6a): any device with `control`
+Status: r7.1 (2026-10-17) lets a second `hello` on a welcomed attachment
+replace it instead of refusing it `unauthorized` (§3, compatibility mode):
+after a client reset (e.g. the Mac slept) the client says `hello` again on
+the same authenticated transport and gets a new attachment, with no lease
+carried over and the old `attachment_gen` `stale_target`; at most one
+replacement a second (`busy`). New fixture:
+`second-hello-replaces-the-attachment`.
+r7 (2026-10-16) adds approvals (§6a): any device with `control`
 gets the agent's own permission prompts (pushed through the relay, whoever
 holds the lease) and answers them — allow once, always allow (one of the
 rules the agent itself suggested) or deny — bound to the exact prompt,
@@ -146,8 +153,20 @@ Every request that targets a session carries one **binding** object:
 - Compatibility mode: no `challenge`/`resume_proof`; every `hello` gets a new
   `controller_session` and `attachment_gen` and holds no lease. A `hello`
   with `resume`, and any `resume_proof`, is refused `unauthorized`. A second
-  `hello` on an attachment that was already welcomed is refused
-  `unauthorized` (a new welcome needs a new attachment).
+  `hello` (without `resume`) on an attachment that was already welcomed
+  replaces it (r7.1): the host fences the old attachment as a transport drop
+  or re-authentication would — its leases end (none is carried over), its
+  subscriptions, streams and chat conversations close, its pending replies
+  are dropped — and answers `welcome` on a new attachment over the same
+  authenticated transport: new `attachment_gen` and `controller_session`,
+  the same permissions and client kind, and the same authorization deadline
+  (not renewed). Anything naming the old `attachment_gen` is then
+  `stale_target`. Receipts are untouched (queryable from the new
+  attachment); pending approvals stay pending and are sent to the new
+  attachment like to any new one. Past the authorization deadline the reply
+  is `paused`. At most one replacement per second per transport; more often
+  is `busy`. A transport without an attachment still gets `unauthorized`.
+  Each attachment is still welcomed once.
 - A broker restart (new `runtime_gen`) invalidates all attachments and leases;
   workers and receipts stay addressable by `session_id`/`process_gen`.
 
@@ -567,7 +586,7 @@ Errors are answered in the family of the request (ruling i):
 | `request_id_reused` | same request id, different bound values |
 | `receipt_limit` | the session's receipt journal is full |
 | `session_closed` | the session no longer accepts submissions |
-| `busy` | the agent or attachment can't take it now |
+| `busy` | the agent or attachment can't take it now (incl. a second `hello` replacement within a second, §3) |
 | `paused` | authorization freshness deadline passed; viewing/control paused |
 
 ## 8. Fixtures
@@ -615,7 +634,9 @@ answering first, an approval staying pending when the lease ends, one opened
 with no lease holder and answered with `acquire`, an answer with `acquire`
 taking control from the holder, a late answer after `push_resolved`, a
 view-only attachment, a duplicate answer, and pending approvals after `list`
-on a new attachment.
+on a new attachment. r7.1 adds a second `hello` replacing the attachment (old
+lease gone, old `attachment_gen` → `stale_target`, the receipt still
+queryable, another replacement within a second `busy`).
 
 ## 9. Gate: trust, freshness, channel and browser grants (joint)
 

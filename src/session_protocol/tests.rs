@@ -165,10 +165,10 @@ fn strict_parser_rules() {
 // ── fixtures: every wire message decodes and round-trips ─────────────────
 
 /// Replaces harness placeholders (`${name}`) with a valid value (a captured
-/// approval id is a UUID).
+/// approval id or attachment generation is a UUID).
 fn substitute(v: &mut Value) {
     match v {
-        Value::String(s) if s == "${aid}" => {
+        Value::String(s) if s == "${aid}" || s == "${gen2}" => {
             *s = "88888888-8888-4888-8888-888888888888".to_string()
         }
         Value::String(s) if s.contains("${") => *s = "stream-0001".to_string(),

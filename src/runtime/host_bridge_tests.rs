@@ -1015,6 +1015,69 @@ fn re_authentication_fences_the_attachment_and_its_lease_expires() {
     });
 }
 
+/// Astation reset its session client (e.g. after the Mac slept) and says
+/// `hello` again on the same authenticated link: the attachment is replaced.
+#[test]
+fn a_second_hello_on_the_link_replaces_the_attachment() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        let first = peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        let epoch = peer.acquire(&sid, &pg).await;
+        let old = peer.binding(&sid, &pg, Some(epoch));
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": old, "request_id": request_id, "kind": "interrupt", "payload": {}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+
+        let welcome = peer.hello().await;
+        assert_ne!(welcome["attachment_gen"], first["attachment_gen"]);
+        assert_ne!(welcome["controller_session"], first["controller_session"]);
+        assert_eq!(welcome["permissions"], first["permissions"]);
+        assert!(
+            welcome["authorization_ms_left"].as_u64().unwrap()
+                <= first["authorization_ms_left"].as_u64().unwrap()
+        );
+        // No lease carried over; the old attachment_gen is stale.
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
+        let id = peer.request("renew", json!({"binding": old}));
+        assert_eq!(peer.reply(&id).await["code"], "stale_target");
+        let from = peer.seen.len();
+        let mut input = json!({"v": 1, "op": "input", "terminal_id": sid, "generation": pg,
+            "binding": old, "stream_id": stream, "sequence": 0,
+            "bytes": STANDARD.encode("OLD\r")});
+        input["binding"]["lease_epoch"] = epoch.into();
+        peer.send(json!({"type": "terminal", "data": input}));
+        let refused = peer.wait_from(from, |v| is_terminal(v, "error")).await;
+        assert_eq!(peer.seen[refused]["data"]["code"], "stale_target");
+        // The receipt is still there.
+        let id = peer.request(
+            "receipt_query",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_ids": [request_id]}),
+        );
+        let receipts = peer.reply(&id).await;
+        assert_eq!(receipts["receipts"][0]["request_id"], request_id.as_str());
+        // Control again without takeover.
+        assert!(peer.acquire(&sid, &pg).await > epoch);
+        // At most one replacement a second.
+        let id = peer.request("hello", json!({}));
+        assert_eq!(peer.reply(&id).await["code"], "busy");
+        rt.clock.skip(1_000);
+        let again = rt.peer.hello().await;
+        assert_ne!(again["attachment_gen"], welcome["attachment_gen"]);
+        rt.shutdown().await;
+    });
+}
+
 #[test]
 fn a_stop_submission_completes_when_the_agent_exits() {
     local(async {
