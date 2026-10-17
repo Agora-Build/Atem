@@ -98,6 +98,10 @@ pub const DETAIL_STOP_FAILED: &str = "stop failed";
 pub const DETAIL_STILL_RUNNING: &str = "process still running";
 pub const DETAIL_UNRECONCILED: &str = "outcome could not be established";
 pub const DETAIL_REPAIR: &str = "host counters exhausted; pair again";
+/// A completed `prompt` receipt's `detail`: its turn's outcome (chat-v1
+/// `complete.outcome`), kept in the journal as one of these two words.
+pub const DETAIL_TURN_DONE: &str = "done";
+pub const DETAIL_TURN_INTERRUPTED: &str = "interrupted";
 
 // ── Inputs and outputs ────────────────────────────────────────────────────
 
@@ -278,10 +282,12 @@ pub enum ChatReply {
     Accepted {
         request_id: String,
     },
-    /// The turn ended (`outcome: "done"`); `turn_id` is the provider's turn.
+    /// The turn ended (`outcome: "done"`, or `"interrupted"` when
+    /// `interrupted`); `turn_id` is the provider's turn.
     Complete {
         request_id: String,
         turn_id: Option<String>,
+        interrupted: bool,
     },
     /// `code` is a §7 error code for refusals, or `rejected` /
     /// `outcome_unknown` for a final receipt; `text` its bounded detail.
@@ -2836,6 +2842,8 @@ fn chat_reply(e: &Entry) -> ChatReply {
         ReceiptState::Completed => ChatReply::Complete {
             request_id: request_id.clone(),
             turn_id: e.turn_id.clone(),
+            interrupted: s.kind == ReceiptKind::Prompt
+                && s.detail.as_deref() == Some(DETAIL_TURN_INTERRUPTED),
         },
         ReceiptState::Rejected => error("rejected"),
         ReceiptState::OutcomeUnknown => error("outcome_unknown"),

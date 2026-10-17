@@ -23,6 +23,8 @@ pub struct ChatEnvelope {
 pub enum Inbound {
     Open {
         before: Option<String>,
+        /// The generation the client's `before` came from (optional).
+        generation: Option<String>,
     },
     Submit {
         generation: String,
@@ -77,7 +79,12 @@ pub fn parse_inbound(env: &ChatEnvelope) -> Result<Inbound, String> {
                 Some(Value::String(s)) if s.len() <= MAX_ID => Some(s.clone()),
                 Some(_) => return Err("invalid before".into()),
             };
-            Ok(Inbound::Open { before })
+            let generation = match env.body.get("generation") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if s.len() <= MAX_ID => Some(s.clone()),
+                Some(_) => return Err("invalid generation".into()),
+            };
+            Ok(Inbound::Open { before, generation })
         }
         "submit" => {
             let generation = str_field(env, "generation")?;
@@ -581,12 +588,16 @@ mod tests {
     fn parse_each_op() {
         assert_eq!(
             parse_inbound(&env("open", json!({}))).unwrap(),
-            Inbound::Open { before: None }
+            Inbound::Open {
+                before: None,
+                generation: None
+            }
         );
         assert_eq!(
-            parse_inbound(&env("open", json!({"before":"m9"}))).unwrap(),
+            parse_inbound(&env("open", json!({"before":"m9","generation":"g"}))).unwrap(),
             Inbound::Open {
-                before: Some("m9".into())
+                before: Some("m9".into()),
+                generation: Some("g".into())
             }
         );
         assert_eq!(

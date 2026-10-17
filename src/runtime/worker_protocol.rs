@@ -166,6 +166,16 @@ pub enum BrokerMsg {
     ConfirmApprovalRules {
         rule_ids: Vec<String>,
     },
+    /// An approval card message the broker put in its chat history (made
+    /// and updated only there): the worker keeps a copy in its history, so
+    /// a later broker gets the card with the `chat_snapshot`.
+    ChatCard {
+        message: crate::chat::session::ChatMessage,
+    },
+    /// The broker's history is incomplete (a `chat` came with `gap`) →
+    /// `chat_history_part`s, then `chat_history` with the worker's whole
+    /// retained history.
+    RequestChatHistory,
 }
 
 /// The identity and trust generation an Atem session rule was granted
@@ -239,6 +249,8 @@ impl std::fmt::Debug for BrokerMsg {
             BrokerMsg::ConfirmApprovalRules { rule_ids } => {
                 write!(f, "ConfirmApprovalRules({rule_ids:?})")
             }
+            BrokerMsg::ChatCard { message } => write!(f, "ChatCard({})", message.message_id),
+            BrokerMsg::RequestChatHistory => f.write_str("RequestChatHistory"),
         }
     }
 }
@@ -338,6 +350,9 @@ pub enum WorkerMsg {
     /// On every connection, before any `chat`: the worker's chat session
     /// (authoritative; it read everything held back meanwhile), so a broker
     /// that adopts this worker goes on from its status and history.
+    /// `snapshot.history` holds the newest messages only when the whole
+    /// retained history doesn't fit one line: the older ones come first, in
+    /// `chat_history_part`s (oldest first) that the broker prepends.
     ChatSnapshot {
         snapshot: crate::chat::session::ChatSnapshot,
         input_count: u64,
@@ -345,6 +360,18 @@ pub enum WorkerMsg {
         reason: Option<String>,
         #[serde(default)]
         unavailable: Vec<String>,
+    },
+    /// Older history ahead of a `chat_snapshot` or `chat_history`, at most
+    /// `worker_chat::SNAPSHOT_CHUNK_BYTES` of messages per line.
+    ChatHistoryPart {
+        history: Vec<crate::chat::session::ChatMessage>,
+    },
+    /// Answers `request_chat_history`: the worker's chat state (status,
+    /// turns, input mark) with the newest messages of its retained history
+    /// in `snapshot.history` (older ones in the `chat_history_part`s before
+    /// it).
+    ChatHistory {
+        snapshot: crate::chat::session::ChatSnapshot,
     },
     Activity {
         state: Activity,

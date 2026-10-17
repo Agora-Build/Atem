@@ -156,6 +156,30 @@ chat-v1:
   session receipt.
 - At most 8 open conversations per session: a ninth `open` closes the oldest
   (`close`).
+- History pages (fix/chat-history, 2026-10-17): `open{before}` on a
+  conversation the attachment already has open sends no `opened` and
+  resets nothing; the older page arrives as `message{history:true}` at the
+  conversation's next sequence numbers (the live sequence continues). Merge
+  paged messages by `messageId`/history order, not by `sequence`. Every
+  page ends with a sequenced `status` carrying `page: {before, count,
+  start}` (`start: true`: the oldest retained message was reached; an empty
+  page is the marker alone, `count: 0, start: true`). Cards are left out of
+  a view-only attachment's pages before the limits. `open` may carry the
+  `generation` of its `before`. A `before` that isn't retained, or named
+  with another `generation`, is `error{code:"stale_target"}` ("that message is no
+  longer in the history; reopen without before to get the newest page"):
+  sequenced on an open conversation (it stays open), without
+  `generation`/`sequence` on a new one (nothing opened). `open` without
+  `before` on an open conversation still resynchronizes it (`opened` at 0).
+- When the worker dropped chat items before the broker got them, the broker
+  reloads the worker's whole history and chat state (a turn end it missed
+  completes then, with its receipt), then open conversations get `error`
+  "the chat history was incomplete (some items were dropped) and was
+  reloaded; reopen the chat" and `close`. Reopen: the history is complete.
+- After a broker restart or adoption the chat history is whole (500
+  messages / 8 MiB) and keeps its approval cards; a card still pending
+  becomes `closed` with the note "Atem's runtime restarted; answer in the
+  terminal".
 - Claude: `capabilities: ["terminal-v1","chat-v1"]`. Codex has chat-v1
   only with Atem's Codex hooks on (`[codex] hooks = true`; else
   `["terminal-v1"]`, and a `prompt` there is `rejected` with "chat is not
@@ -174,7 +198,9 @@ Receipts (session-v1 `submit`), per kind:
 
 - `prompt`: pasted into the agent once its chat accepts it (status
   `ready`, no local draft), completed when the chat reports the turn's end
-  (`turn_id`). On a session without chat (Codex with its hooks off) it is
+  (`turn_id`), with `detail` `"done"` or `"interrupted"` (the turn's
+  outcome, as chat `complete.outcome`; journaled, so it survives a broker
+  restart). On a session without chat (Codex with its hooks off) it is
   `rejected` with no effect.
 - `interrupt`: writes Esc only while the chat status says a turn runs
   (`working`/`waiting`) and completes when it ends; in `ready` or `unknown`

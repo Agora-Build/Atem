@@ -53,9 +53,6 @@ pub const OUTPUT_BACKLOG: usize = 1024 * 1024;
 const HANDSHAKE: Duration = Duration::from_secs(2);
 /// The refusal a second broker gets while one is connected.
 pub const ANOTHER_BROKER: &str = "another broker is connected to this worker";
-/// History a chat snapshot carries at most (well below the line bound).
-const SNAPSHOT_MESSAGES: usize = 200;
-const SNAPSHOT_BYTES: usize = 1024 * 1024;
 /// How often the chat adapter is read.
 const CHAT_POLL: Duration = Duration::from_millis(200);
 /// Input after the one that released a waiting hook (which is consumed) is
@@ -734,14 +731,16 @@ impl Worker {
             // The snapshot covers what the backlog held (the worker's chat
             // session read it already), so the backlog is not sent too.
             self.chat_backlog.take();
-            let snapshot = WorkerMsg::ChatSnapshot {
-                snapshot: self.chat.snapshot(SNAPSHOT_MESSAGES, SNAPSHOT_BYTES),
-                input_count: self.input.input_count(),
-                chat_v1: self.capabilities.chat_v1,
-                reason: self.capabilities.reason.clone(),
-                unavailable: self.unavailable(),
-            };
-            self.send(&snapshot);
+            let messages = snapshot_messages(
+                &self.chat,
+                self.input.input_count(),
+                self.capabilities.chat_v1,
+                self.capabilities.reason.clone(),
+                self.unavailable(),
+            );
+            for message in &messages {
+                self.send(message);
+            }
         }
         // The session rules outlive a broker (the worker owns them), but
         // allow nothing until this broker confirms them.
@@ -1119,6 +1118,14 @@ impl Worker {
                     rules: rules.unwrap_or_default(),
                 });
             }
+            BrokerMsg::ChatCard { message } => {
+                self.chat.put_card(message);
+            }
+            BrokerMsg::RequestChatHistory => {
+                for message in history_messages(&self.chat) {
+                    self.send(&message);
+                }
+            }
         }
         false
     }
@@ -1408,6 +1415,58 @@ impl Worker {
             });
         }
     }
+}
+
+/// The worker's whole retained chat history (500 messages / 8 MiB) cut
+/// for the line bound: `chat_history_part`s with the older messages, then
+/// `last` with the newest.
+fn history_lines(
+    chat: &ChatSession,
+    last: impl FnOnce(Vec<crate::chat::session::ChatMessage>) -> WorkerMsg,
+) -> Vec<WorkerMsg> {
+    use super::worker_chat::{SNAPSHOT_CHUNK_BYTES, split_history};
+    use crate::chat::session::{MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES};
+    let history = chat.history(None, MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES);
+    let mut runs = split_history(history, SNAPSHOT_CHUNK_BYTES);
+    let newest = runs.pop().unwrap_or_default();
+    let mut lines: Vec<WorkerMsg> = runs
+        .into_iter()
+        .map(|history| WorkerMsg::ChatHistoryPart { history })
+        .collect();
+    lines.push(last(newest));
+    lines
+}
+
+/// The `chat_snapshot` a broker gets on connecting (with the parts ahead
+/// of it): the chat's state and its whole retained history, approval
+/// cards included.
+pub(super) fn snapshot_messages(
+    chat: &ChatSession,
+    input_count: u64,
+    chat_v1: bool,
+    reason: Option<String>,
+    unavailable: Vec<String>,
+) -> Vec<WorkerMsg> {
+    let mut snapshot = chat.snapshot(0, 0);
+    history_lines(chat, move |history| {
+        snapshot.history = history;
+        WorkerMsg::ChatSnapshot {
+            snapshot,
+            input_count,
+            chat_v1,
+            reason,
+            unavailable,
+        }
+    })
+}
+
+/// The answer to `request_chat_history`.
+pub(super) fn history_messages(chat: &ChatSession) -> Vec<WorkerMsg> {
+    let mut snapshot = chat.snapshot(0, 0);
+    history_lines(chat, move |history| {
+        snapshot.history = history;
+        WorkerMsg::ChatHistory { snapshot }
+    })
 }
 
 /// A write refused for its stale input epoch.
