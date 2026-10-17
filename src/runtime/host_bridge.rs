@@ -54,8 +54,10 @@
 //! `rules`); its `approval_auto_allowed` becomes an `auto_allowed` card in
 //! the session's conversations and one runtime.log line naming the rule
 //! (never the command) — no approval, no push, no lease. A revoke
-//! (`approval_rule_revoke`) goes to the worker as `revoke_approval_rule`
-//! and completes on its `approval_rule_revoked`. Each rule carries the
+//! (`approval_rule_revoke`, from any attachment with `control`, lease or
+//! not: r7.3) goes to the worker as `revoke_approval_rule` and completes on
+//! its `approval_rule_revoked` (one runtime.log line: rule and session,
+//! never the command). Each rule carries the
 //! account, device and trust generation it was granted under (sent with the
 //! `allow_always` decision): a broker that registers an adopted worker's
 //! session accepts only the rules granted under its current identity and
@@ -1586,6 +1588,7 @@ impl HostBridge {
                         continue;
                     };
                     self.revokes.remove(&rid);
+                    eprintln!("{}", rule_revoked_line(sid, &rule_id, ok));
                     let report = if ok {
                         DispatchReport::Completed {
                             detail: None,
@@ -2645,6 +2648,16 @@ fn log_handshake(what: &str) {
 /// the tool and the rule, never the command or its summary.
 pub(super) fn auto_allowed_line(sid: &str, tool: &str, rule_id: &str) -> String {
     format!("atem runtime: {sid}: {tool} allowed by session rule {rule_id}")
+}
+
+/// The runtime.log line for a remote rule revocation: the rule and the
+/// session only, never the command.
+pub(super) fn rule_revoked_line(sid: &str, rule_id: &str, ok: bool) -> String {
+    if ok {
+        format!("atem runtime: {sid}: session rule {rule_id} revoked")
+    } else {
+        format!("atem runtime: {sid}: session rule {rule_id} not revoked (no longer active)")
+    }
 }
 
 /// A session `error{code:"unauthorized"}` for a link without an attachment.

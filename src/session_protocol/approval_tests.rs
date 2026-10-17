@@ -1241,14 +1241,22 @@ fn rule_revoke_payloads_decode_strictly() {
     ] {
         assert!(!decodes(&with(bad.clone())), "{bad}");
     }
-    // The lease is required: no `acquire` form.
+    // r7.3: the lease doesn't govern a revoke, so `lease_epoch` is optional;
+    // `acquire` is refused (the payload is exactly `{rule_id}`).
     let mut m = with(json!({"rule_id": "s-1"}));
     m["data"]["binding"]
         .as_object_mut()
         .unwrap()
         .remove("lease_epoch");
+    assert!(decodes(&m));
+    assert!(!decodes(&with(json!({"rule_id": "s-1", "acquire": true}))));
+    let mut m = with(json!({"rule_id": "s-1", "acquire": true}));
+    m["data"]["binding"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lease_epoch");
     assert!(!decodes(&m));
-    // chat-v1: `approval_rule_revoke` instead of `text`, with the lease.
+    // chat-v1: `approval_rule_revoke` instead of `text`, lease or not.
     let chat = |revoke: Value, lease: Option<u64>| {
         let mut b = json!({"target": target(P1), "attachment_gen": C1});
         if let Some(e) = lease {
@@ -1259,8 +1267,12 @@ fn rule_revoke_payloads_decode_strictly() {
                "approval_rule_revoke": revoke, "binding": b}})
     };
     assert!(decodes(&chat(json!({"rule_id": "s-1"}), Some(1))));
-    assert!(!decodes(&chat(json!({"rule_id": "s-1"}), None)));
+    assert!(decodes(&chat(json!({"rule_id": "s-1"}), None)));
     assert!(!decodes(&chat(json!({"rule_id": "s 1"}), Some(1))));
+    assert!(!decodes(&chat(
+        json!({"rule_id": "s-1", "acquire": true}),
+        None
+    )));
     // `approval_rules` from the host: ≤ 32 rules, unique ids.
     let rules =
         |n: usize| -> Vec<AlwaysRule> { (0..n).map(|i| session_rule(&format!("s-{i}"))).collect() };
@@ -1311,9 +1323,9 @@ fn session_rules_reach_control_viewers_and_end_with_the_process() {
     assert_eq!(ops(&got(&mut rt, "r")), ["sessions"]);
     rt.send("r", &revoke(&rt, "r", Some(epoch), 1, "s-1"));
     assert_eq!(got(&mut rt, "r")[0]["code"], "forbidden");
-    // The holder of a stale epoch can't revoke.
-    rt.send("c1", &revoke(&rt, "c1", Some(epoch + 1), 2, "s-1"));
-    assert_eq!(got(&mut rt, "c1")[0]["code"], "stale_lease");
+    // An inactive rule is stale, whatever the lease epoch says.
+    rt.send("c1", &revoke(&rt, "c1", Some(epoch + 1), 2, "s-9"));
+    assert_eq!(got(&mut rt, "c1")[0]["code"], "stale_target");
     // The process ends: the list empties for viewers, and a revoke of the
     // old process's rule is stale.
     let fx = rt.host.process_exited(S1, None);
@@ -1322,6 +1334,66 @@ fn session_rules_reach_control_viewers_and_end_with_the_process() {
     let empty = c1.iter().find(|m| m["op"] == "approval_rules").unwrap();
     assert_eq!(empty["rules"], json!([]));
     assert!(rt.host.approval_rules(S1).is_empty());
+}
+
+/// r7.3: any attachment with `control` revokes, lease or not; the lease
+/// holder keeps its lease, epoch and deadline.
+#[test]
+fn a_control_attachment_revokes_without_the_lease_and_leaves_it_alone() {
+    let mut rt = setup();
+    let epoch = list_and_hold(&mut rt, "c1");
+    rt.send("v", &msg("list", json!({})));
+    let fx = rt
+        .host
+        .set_approval_rules(S1, P1, vec![session_rule("s-1"), session_rule("s-2")])
+        .unwrap();
+    rt.apply(fx);
+    got(&mut rt, "c1");
+    got(&mut rt, "v");
+    // Another process's rule: stale_target, nothing dispatched.
+    let mut other = revoke(&rt, "v", None, 1, "s-1");
+    other["data"]["binding"]["target"]["process_gen"] = json!(P1B);
+    rt.send("v", &other);
+    assert_eq!(got(&mut rt, "v")[0]["code"], "stale_target");
+    // An unknown rule: stale_target.
+    rt.send("v", &revoke(&rt, "v", None, 2, "s-9"));
+    assert_eq!(got(&mut rt, "v")[0]["code"], "stale_target");
+    assert!(rt.host.receipt(&rid(1)).is_none() && rt.host.receipt(&rid(2)).is_none());
+    // No lease, no lease_epoch: revoked.
+    rt.send("v", &revoke(&rt, "v", None, 3, "s-1"));
+    let v = got(&mut rt, "v");
+    let states: Vec<_> = v
+        .iter()
+        .filter(|m| m["op"] == "receipt")
+        .map(|m| m["state"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(states, ["accepted", "executing", "completed"]);
+    // A lease epoch it doesn't hold (the holder's, or a stale one) is ignored.
+    rt.send("v", &revoke(&rt, "v", Some(epoch + 5), 4, "s-2"));
+    let v = got(&mut rt, "v");
+    assert!(
+        v.iter()
+            .any(|m| m["op"] == "receipt" && m["state"] == "completed")
+    );
+    assert!(rt.host.approval_rules(S1).is_empty());
+    // The holder saw only the shorter lists: no lease or session change.
+    let c1 = got(&mut rt, "c1");
+    assert_eq!(ops(&c1), ["approval_rules", "approval_rules"]);
+    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("c1").as_str()));
+    assert_eq!(rt.host.lease_epoch(S1), Some(epoch));
+    // It still renews at the same epoch.
+    rt.send(
+        "c1",
+        &msg("renew", json!({"binding": binding(&rt, "c1", Some(epoch))})),
+    );
+    assert_eq!(ops(&got(&mut rt, "c1")), ["lease"]);
+    // Both receipts are durable approval_rule_revoke receipts.
+    for n in [3, 4] {
+        assert_eq!(
+            rt.host.receipt(&rid(n)).unwrap().kind,
+            ReceiptKind::ApprovalRuleRevoke
+        );
+    }
 }
 
 #[test]
@@ -1337,8 +1409,9 @@ fn a_rule_revoked_from_chat_completes_in_chat() {
     let m = json!({"type": "agentChat", "data": {"v": 1, "op": "submit", "conversationId": "conv",
         "agentId": S1, "generation": P1, "requestId": rid(7),
         "approval_rule_revoke": {"rule_id": "s-1"},
-        "binding": binding(&rt, "c1", Some(epoch))}});
-    rt.send("c1", &m);
+        "binding": binding(&rt, "v", None)}});
+    // r7.3: from another control attachment, without the lease c1 holds.
+    rt.send("v", &m);
     let chats: Vec<ChatReply> = rt
         .effects
         .iter()
@@ -1363,6 +1436,8 @@ fn a_rule_revoked_from_chat_completes_in_chat() {
         rt.host.receipt(&rid(7)).unwrap().kind,
         ReceiptKind::ApprovalRuleRevoke
     );
+    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("c1").as_str()));
+    assert_eq!(rt.host.lease_epoch(S1), Some(epoch));
 }
 
 #[test]

@@ -44,9 +44,11 @@
 //! Atem session rules (r7.2): the runtime reports a session's active rules
 //! (`set_approval_rules`; the worker owns them); attachments with `control`
 //! get `approval_rules` on every change and after each `sessions` snapshot.
-//! The lease holder revokes one with a `kind:"approval_rule_revoke"`
-//! submission (an active rule only, else `stale_target`), dispatched to the
-//! runtime like other work.
+//! Any attachment with `control` revokes one with a
+//! `kind:"approval_rule_revoke"` submission (r7.3: with or without the
+//! lease, which it never needs, checks, takes or moves; an active rule of
+//! that exact process only, else `stale_target`), dispatched to the runtime
+//! like other work.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 use super::journal::{self, Journal, JournalError, Record, Stored};
@@ -1909,7 +1911,17 @@ impl<J: Journal> SessionHost<J> {
             _ => None,
         };
         let acquire = answer.as_ref().is_some_and(ApprovalAnswer::acquires);
-        if acquire {
+        if kind == ReceiptKind::ApprovalRuleRevoke {
+            // r7.3: `control` and a running session; the lease is neither
+            // needed nor checked (a stale `lease_epoch` is ignored), and a
+            // revoke never takes, renews or moves it.
+            if !self.attachments[att].can(Permission::Control) {
+                return Err(ErrorCode::Forbidden);
+            }
+            if self.sessions[sid].state != SessionState::Running {
+                return Err(ErrorCode::SessionClosed);
+            }
+        } else if acquire {
             // Takes the lease with the answer: `control` and a session that
             // accepts work, but no current lease needed.
             if !self.attachments[att].can(Permission::Control) {
@@ -2749,8 +2761,7 @@ impl<J: Journal> SessionHost<J> {
         let sid = s.spec.session_id.clone();
         let data = f.data.as_ref().ok_or(ErrorCode::UnsupportedVersion)?;
         match data["op"].as_str() {
-            // An approval card answered from chat: the §6a submission.
-            // A session rule revoked from chat (r7.2).
+            // A session rule revoked from chat (r7.3: `control`, no lease).
             Some("submit") if data.get(wire::RULE_REVOKE_FIELD).is_some() => {
                 let request_id = data["requestId"]
                     .as_str()

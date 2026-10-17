@@ -249,11 +249,14 @@ pub struct Binding {
     pub lease_epoch: Option<u64>,
 }
 
-/// Whether a binding belongs to a read (no `lease_epoch`) or a mutation (required).
+/// Whether a binding belongs to a read (no `lease_epoch`), a mutation
+/// (required), or a submission the lease doesn't govern (`lease_epoch`
+/// optional and ignored: a rule revocation, r7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingUse {
     Read,
     Mutation,
+    LeaseIgnored,
 }
 
 // ── Descriptors and receipts ──────────────────────────────────────────────
@@ -705,7 +708,8 @@ impl Binding {
     }
 
     /// Representation rules plus §2: `lease_epoch` is required for mutations
-    /// and absent for reads.
+    /// and absent for reads; a submission the lease doesn't govern may carry
+    /// one or not (r7.3), and it is never checked.
     pub fn validate(&self, use_: BindingUse) -> Result<(), String> {
         self.validate_shape()?;
         match (use_, self.lease_epoch) {
@@ -761,13 +765,15 @@ impl Receipt {
 }
 
 /// A submission's binding is a mutation's (`lease_epoch` required), except
-/// an approval answer with `acquire: true`, which takes the lease with it.
+/// an approval answer with `acquire: true`, which takes the lease with it,
+/// and a rule revocation, which needs only `control` (r7.3: `lease_epoch`
+/// optional and ignored).
 pub fn submit_binding_use(kind: ReceiptKind, payload: &Value) -> BindingUse {
     let acquire = payload.get("acquire") == Some(&Value::Bool(true));
-    if kind == ReceiptKind::Approval && acquire {
-        BindingUse::Read
-    } else {
-        BindingUse::Mutation
+    match kind {
+        ReceiptKind::ApprovalRuleRevoke => BindingUse::LeaseIgnored,
+        ReceiptKind::Approval if acquire => BindingUse::Read,
+        _ => BindingUse::Mutation,
     }
 }
 
@@ -1097,9 +1103,11 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
     let use_ = match op {
         "open" | "close" => BindingUse::Read,
         // An approval answer (r7) may take the lease with it.
-        "submit" => match m.get("approval") {
-            Some(answer) => submit_binding_use(ReceiptKind::Approval, answer),
-            None => BindingUse::Mutation,
+        // A rule revocation (r7.3) needs no lease: `lease_epoch` optional.
+        "submit" => match (m.get(RULE_REVOKE_FIELD), m.get("approval")) {
+            (Some(revoke), _) => submit_binding_use(ReceiptKind::ApprovalRuleRevoke, revoke),
+            (None, Some(answer)) => submit_binding_use(ReceiptKind::Approval, answer),
+            (None, None) => BindingUse::Mutation,
         },
         _ if binding.is_some() => {
             return Err(fail(None, format!("agentChat {op} cannot carry a binding")));

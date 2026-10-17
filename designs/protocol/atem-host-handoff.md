@@ -211,7 +211,8 @@ Receipts (session-v1 `submit`), per kind:
 - `stop`: stops the agent; completes at its exit.
 - `approval`: handed to the agent's waiting permission hook; completes when
   the agent applied it (see [Approvals](#approvals-r7-6a-on-featapprovals)).
-- `approval_rule_revoke` (r7.2): `{rule_id}` under the current lease;
+- `approval_rule_revoke` (r7.2; r7.3): `{rule_id}` from any attachment
+  with `control`, lease or not (`lease_epoch` optional and ignored);
   dispatched to the session's worker, completed when it dropped the rule
   (an inactive rule is `stale_target` at admission).
 - An `interrupt` (or `prompt`) whose write only handed a waiting Codex
@@ -448,10 +449,18 @@ Astation sees that changed since r6.2.
   (`approvalRules`) on change. Show the active rules on the session (e.g.
   under the chat header or in the session's details), each with a
   **Revoke** button.
-- **Revoke.** session-v1 `submit` with `kind:"approval_rule_revoke"`,
-  `payload: {"rule_id": "s-…"}` and the current `lease_epoch` (no
-  `acquire` form: take the lease first), or chat-v1 `submit` with
-  `approval_rule_revoke: {"rule_id": "s-…"}` instead of `text`. The receipt
+- **Revoke (r7.3: needs only `control`, no lease, no `acquire`).**
+  session-v1 `submit` with `kind:"approval_rule_revoke"`,
+  `payload: {"rule_id": "s-…"}`, or chat-v1 `submit` with
+  `approval_rule_revoke: {"rule_id": "s-…"}` instead of `text`. Send it from
+  any attachment with `control`, whether or not it holds the lease: don't
+  acquire or take over first, and omit `lease_epoch` (one sent is ignored,
+  even a stale one). Don't put `acquire` in the payload: it is exactly
+  `{rule_id}`, so `acquire` fails to decode (`unsupported_version`). A
+  revoke never moves the lease, so whoever holds control keeps it. A
+  view-only attachment is `forbidden`. (r7.2 required the lease; a Revoke
+  tapped without control was refused `stale_lease` and the rule kept
+  allowing.) The receipt
   completes once the worker dropped the rule (chat: `complete`), then the
   new list arrives. An unknown or already revoked rule is `stale_target`
   (refresh the list). A revoke also withdraws an allow written for that
@@ -461,8 +470,9 @@ Astation sees that changed since r6.2.
 - **Rule not kept.** If the session filled up (32) between the card and the
   answer, the request is allowed once and the card ends `allowed` with a
   `note` ("allowed once; the rule wasn't kept: …"): show the note.
-- New shared fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule`
-  (core harness; the real-runtime runner lists it as not run, since its
+- Shared fixture: `approval-rule-revoke-needs-control-not-the-lease` (r7.3,
+  replaces `approval-rule-revoke-needs-the-lease-and-an-active-rule`; core
+  harness; the real-runtime runner lists it as not run, since its
   agent is Claude, and the real-agent Codex test covers it end to end).
 
 ### Expected relay behaviour (Astation's side)
