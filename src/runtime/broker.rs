@@ -81,6 +81,9 @@ pub struct WriteOutcome {
     pub dropped: bool,
     /// Refused before anything was queued: nothing was written.
     pub no_effect: bool,
+    /// Consumed (nothing written): it handed a waiting Codex approval to
+    /// the agent's own dialog (`worker_protocol::APPROVAL_HANDED`).
+    pub consumed: bool,
     pub error: Option<String>,
 }
 
@@ -464,6 +467,15 @@ impl BrokerSession {
         }
     }
 
+    /// Revokes one of the session's Atem session rules; the worker answers
+    /// `approval_rule_revoked`.
+    pub fn revoke_approval_rule(&self, rule_id: &str) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) if self.is_live() => worker.revoke_approval_rule(rule_id),
+            _ => anyhow::bail!("The session has ended"),
+        }
+    }
+
     /// After adoption: the approvals this broker knows; the worker answers
     /// every other waiting hook "no decision".
     pub fn known_approvals(&self, request_ids: Vec<String>) -> anyhow::Result<()> {
@@ -737,6 +749,7 @@ impl BrokerSession {
                         ok,
                         dropped,
                         no_effect,
+                        consumed,
                         error,
                     });
                     if dropped {
@@ -788,6 +801,23 @@ impl BrokerSession {
                 request_id,
                 outcome,
             }),
+            WorkerMsg::ApprovalAutoAllowed {
+                request_id,
+                rule_id,
+                tool,
+                summary,
+            } => self.approval_events.push(ApprovalEvent::AutoAllowed {
+                request_id,
+                rule_id,
+                tool,
+                summary,
+            }),
+            WorkerMsg::ApprovalRules { rules } => {
+                self.approval_events.push(ApprovalEvent::Rules(rules))
+            }
+            WorkerMsg::ApprovalRuleRevoked { rule_id, ok } => self
+                .approval_events
+                .push(ApprovalEvent::RuleRevoked { rule_id, ok }),
             WorkerMsg::Hello { .. } => {}
             WorkerMsg::ChatSnapshot {
                 snapshot,

@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::fs;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -230,18 +231,34 @@ fn codex_round_trip_with_the_stable_command() {
     let r = request(Agent::Codex, &value).unwrap();
     assert_eq!(r.info.tool, "Bash");
     assert_eq!(r.info.summary, "touch probe.txt");
-    assert!(
-        r.info.always_rules.is_empty(),
-        "Codex takes no persistent rule"
+    // Codex takes no persistent rule: the card offers an Atem session rule,
+    // and the hook only ever gets a plain allow.
+    let [rule] = r.info.always_rules.as_slice() else {
+        panic!("one session rule: {:?}", r.info.always_rules)
+    };
+    assert_eq!(
+        rule.label,
+        "Always allow `touch probe.txt` in /home/user/proj for this session"
     );
-    for (decision, message, expected) in [
+    assert_eq!(rule.scope, "session");
+    assert!(rule.rule_id.starts_with("s-") && rule.rule_id.len() == 18);
+    let rule_id = rule.rule_id.clone();
+    for (decision, rule_id, message, expected) in [
         (
             ApprovalDecision::AllowOnce,
+            None,
+            None,
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
+        ),
+        (
+            ApprovalDecision::AllowAlways,
+            Some(rule_id.as_str()),
             None,
             r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
         ),
         (
             ApprovalDecision::Deny,
+            None,
             Some("Denied by phone"),
             r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied by phone"}}}"#,
         ),
@@ -251,7 +268,7 @@ fn codex_round_trip_with_the_stable_command() {
         decide(
             s.path(),
             &id,
-            &decision_output(&r, decision, None, message).unwrap(),
+            &decision_output(&r, decision, rule_id, message).unwrap(),
         );
         let (ok, stdout, stderr) = finish(child);
         assert!(ok && stderr.is_empty());
@@ -409,4 +426,98 @@ fn settings_default_to_claude_on_and_codex_off() {
     fs::write(&config, "not = = toml").unwrap();
     assert!(!enabled(&config, Agent::Claude));
     assert!(!enabled(&config, Agent::Codex));
+}
+
+#[test]
+fn a_codex_session_rule_matches_exactly_what_was_asked() {
+    let ask = |tool: &str, input: Value, cwd: Option<&str>| {
+        let mut v = json!({"tool_name": tool, "tool_input": input});
+        if let Some(cwd) = cwd {
+            v["cwd"] = json!(cwd);
+        }
+        request(Agent::Codex, &v).unwrap()
+    };
+    let r = ask("Bash", json!({"command": "npm test"}), Some("/p"));
+    assert_eq!(
+        r.matcher,
+        Some(RuleMatch::Command {
+            tool: "Bash".into(),
+            command: "npm test".into(),
+            cwd: "/p".into(),
+        })
+    );
+    // Each request offers its own rule id.
+    let again = ask("Bash", json!({"command": "npm test"}), Some("/p"));
+    assert_eq!(r.matcher, again.matcher);
+    assert_ne!(
+        r.info.always_rules[0].rule_id,
+        again.info.always_rules[0].rule_id
+    );
+    // Not the same request: anything that differs at all.
+    for other in [
+        ask("Bash", json!({"command": "npm test; rm -rf ~"}), Some("/p")),
+        ask("Bash", json!({"command": "npm test "}), Some("/p")),
+        ask("Bash", json!({"command": "npm test"}), Some("/q")),
+        ask("shell", json!({"command": "npm test"}), Some("/p")),
+    ] {
+        assert_ne!(r.matcher, other.matcher, "{:?}", other.matcher);
+    }
+    // No cwd, or a tool it can't tell exactly: no rule offered.
+    for none in [
+        ask("Bash", json!({"command": "npm test"}), None),
+        ask("Bash", json!({"command": ["npm", "test"]}), Some("/p")),
+        ask("WebFetch", json!({"url": "https://x"}), Some("/p")),
+    ] {
+        assert!(none.matcher.is_none() && none.session_rule.is_none());
+        assert!(none.info.always_rules.is_empty());
+    }
+    // A multi-line command: the label shows its first line and says how
+    // many more there are; the rule matches all of it.
+    let multi = ask(
+        "Bash",
+        json!({"command": "echo one\necho two\necho three"}),
+        Some("/p"),
+    );
+    assert_eq!(
+        multi.info.always_rules[0].label,
+        "Always allow `echo one` (+2 more lines) in /p for this session"
+    );
+    // File changes: exact paths and kinds.
+    let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** Add File: b.txt\n+hi\n*** End Patch";
+    let p = ask("apply_patch", json!({"command": patch}), Some("/p"));
+    assert_eq!(
+        p.matcher,
+        Some(RuleMatch::Files {
+            tool: "apply_patch".into(),
+            changes: vec![
+                ("update".into(), "src/a.rs".into()),
+                ("add".into(), "b.txt".into())
+            ],
+            cwd: "/p".into(),
+        })
+    );
+    assert_eq!(
+        p.info.always_rules[0].label,
+        "Always allow update src/a.rs, add b.txt in /p for this session"
+    );
+}
+
+#[test]
+fn a_session_rule_label_is_redacted_and_claude_gets_none() {
+    let secret = "sk-proj-abcdef1234567890ABCDEF";
+    let v = json!({"tool_name": "Bash", "cwd": "/p",
+                   "tool_input": {"command": format!("curl -H 'x-api-key: {secret}' https://x")}});
+    let r = request(Agent::Codex, &v).unwrap();
+    let label = &r.info.always_rules[0].label;
+    assert!(!label.contains(secret), "{label}");
+    // The matcher keeps the exact command (it never leaves the worker).
+    assert!(
+        matches!(&r.matcher, Some(RuleMatch::Command { command, .. }) if command.contains(secret))
+    );
+    // An allow_always naming another id is not deliverable.
+    assert!(decision_output(&r, ApprovalDecision::AllowAlways, Some("s-other"), None).is_none());
+    // Claude keeps its own suggestions only.
+    let claude = request(Agent::Claude, &v).unwrap();
+    assert!(claude.matcher.is_none() && claude.session_rule.is_none());
+    assert!(claude.info.always_rules.is_empty());
 }

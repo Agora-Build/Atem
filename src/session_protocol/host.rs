@@ -40,6 +40,13 @@
 //! approval and tells the runtime to answer "no decision"
 //! (`Effect::ApprovalReleased`); the terminal can always answer instead
 //! (`close_approval(answered_terminal)`), and lease changes never close one.
+//!
+//! Atem session rules (r7.2): the runtime reports a session's active rules
+//! (`set_approval_rules`; the worker owns them); attachments with `control`
+//! get `approval_rules` on every change and after each `sessions` snapshot.
+//! The lease holder revokes one with a `kind:"approval_rule_revoke"`
+//! submission (an active rule only, else `stale_target`), dispatched to the
+//! runtime like other work.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 use super::journal::{self, Journal, JournalError, Record, Stored};
@@ -47,7 +54,7 @@ use super::wire::{
     self, Activity, AlwaysRule, ApprovalAnswer, ApprovalCloseReason, ApprovalDecision,
     ApprovalRequest, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
     FamilyMessage, LeaseChangeReason, MAX_IN_FLIGHT, MAX_PROMPT_BYTES, Op, Permission, Receipt,
-    ReceiptKind, ReceiptState, SessionMessage, SessionState, Target, TerminalRequest,
+    ReceiptKind, ReceiptState, RuleRevoke, SessionMessage, SessionState, Target, TerminalRequest,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -78,6 +85,7 @@ pub const DETAIL_APPROVAL_CLOSED: &str = "the approval closed before the answer 
 pub const DETAIL_APPROVAL_CROSSED: &str = "the terminal answered too; which answer won is unknown";
 pub const DETAIL_APPROVAL_UNCONFIRMED: &str = "the agent did not confirm the decision";
 pub const DETAIL_DECISION_NOT_DELIVERED: &str = "could not hand the decision to the agent";
+pub const DETAIL_RULE_NOT_REVOKED: &str = "could not revoke the rule";
 pub const DETAIL_TRUST_CHANGED: &str = "host trust changed";
 pub const DETAIL_SESSION_CLOSED: &str = "session closed";
 pub const DETAIL_NOT_RECORDED: &str = "could not record the request";
@@ -424,6 +432,10 @@ pub struct SessionHost<J: Journal> {
     /// agent's report). Not persisted: a restart releases them.
     approvals: BTreeMap<String, Approval>,
     approvals_opened: u64,
+    /// session_id → (process_gen, its active Atem session rules), as the
+    /// runtime reported them (r7.2). Not persisted: the workers report
+    /// them again.
+    rules: BTreeMap<String, (String, Vec<AlwaysRule>)>,
     /// Admission order of the next new request.
     next_order: u64,
     /// Final transitions whose durable write failed, retried on `advance`.
@@ -458,6 +470,7 @@ impl<J: Journal> SessionHost<J> {
             lease_floors: HashMap::new(),
             approvals: BTreeMap::new(),
             approvals_opened: 0,
+            rules: BTreeMap::new(),
             next_order: 0,
             retry: Vec::new(),
             out: Vec::new(),
@@ -790,6 +803,7 @@ impl<J: Journal> SessionHost<J> {
                     match kind {
                         ReceiptKind::Prompt => DETAIL_NO_TERMINAL_WRITE,
                         ReceiptKind::Approval => DETAIL_DECISION_NOT_DELIVERED,
+                        ReceiptKind::ApprovalRuleRevoke => DETAIL_RULE_NOT_REVOKED,
                         ReceiptKind::Interrupt => DETAIL_INTERRUPT_NOT_SENT,
                         ReceiptKind::Stop => DETAIL_STOP_FAILED,
                     }
@@ -805,6 +819,7 @@ impl<J: Journal> SessionHost<J> {
                     match kind {
                         ReceiptKind::Prompt => DETAIL_WRITE_INTERRUPTED,
                         ReceiptKind::Approval => DETAIL_APPROVAL_UNCONFIRMED,
+                        ReceiptKind::ApprovalRuleRevoke => DETAIL_UNRECONCILED,
                         ReceiptKind::Interrupt => DETAIL_NO_INTERRUPT,
                         ReceiptKind::Stop => DETAIL_STILL_RUNNING,
                     }
@@ -881,6 +896,7 @@ impl<J: Journal> SessionHost<J> {
         s.exit_status = exit_status;
         s.activity_since = wall;
         self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
+        self.clear_rules(session_id);
         self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
         self.process_gone(session_id);
         self.registry_changed(session_id);
@@ -926,6 +942,7 @@ impl<J: Journal> SessionHost<J> {
         s.state = SessionState::Closed;
         self.ended.entry(session_id.to_string()).or_insert(self.now);
         self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
+        self.clear_rules(session_id);
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         if process_gone {
@@ -978,6 +995,7 @@ impl<J: Journal> SessionHost<J> {
             return Err("process_gen already used".into());
         }
         self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
+        self.clear_rules(session_id);
         self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         self.process_gone(session_id);
@@ -1002,6 +1020,7 @@ impl<J: Journal> SessionHost<J> {
             return Vec::new();
         }
         self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
+        self.clear_rules(session_id);
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         self.process_gone(session_id);
@@ -1094,6 +1113,8 @@ impl<J: Journal> SessionHost<J> {
                 });
             }
         }
+        // The workers report their rules to the new broker.
+        self.rules.clear();
         self.install(replayed);
         for (sid, s) in self.sessions.iter_mut() {
             let floor = self.lease_floors.get(sid).copied().unwrap_or(0);
@@ -1597,6 +1618,20 @@ impl<J: Journal> SessionHost<J> {
         for r in requests {
             self.send(att, None, Op::ApprovalRequest(r));
         }
+        // And the sessions' active session rules (r7.2).
+        let rules: Vec<Op> = self
+            .rules
+            .iter()
+            .filter(|(_, (_, r))| !r.is_empty())
+            .map(|(sid, (process_gen, r))| Op::ApprovalRules {
+                session_id: sid.clone(),
+                process_gen: process_gen.clone(),
+                rules: r.clone(),
+            })
+            .collect();
+        for op in rules {
+            self.send(att, None, op);
+        }
         Ok(())
     }
 
@@ -1878,6 +1913,12 @@ impl<J: Journal> SessionHost<J> {
             && !self.answerable(&b.target, answer)
         {
             return Err(ErrorCode::StaleTarget);
+        }
+        if kind == ReceiptKind::ApprovalRuleRevoke {
+            let revoke = RuleRevoke::parse(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?;
+            if !self.rule_active(&b.target, &revoke.rule_id) {
+                return Err(ErrorCode::StaleTarget);
+            }
         }
         let held = self.by_session.get(sid).map_or(0, BTreeSet::len);
         if held >= self.config.max_receipts_per_session {
@@ -2300,6 +2341,75 @@ impl<J: Journal> SessionHost<J> {
         });
     }
 
+    // ── Atem session rules (r7.2) ──
+
+    /// The runtime's report of `session_id`'s active session rules for its
+    /// process `process_gen` (the worker owns them). A change goes to every
+    /// subscribed attachment with `control` as `approval_rules`. Refused
+    /// for another process or out-of-bounds rules.
+    pub fn set_approval_rules(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+        rules: Vec<AlwaysRule>,
+    ) -> Result<Vec<Effect>, String> {
+        wire::validate_session_rules(&rules)?;
+        self.sessions
+            .get(session_id)
+            .filter(|s| s.state == SessionState::Running && s.spec.process_gen == process_gen)
+            .ok_or("no running session with that process")?;
+        let unchanged = self
+            .rules
+            .get(session_id)
+            .is_some_and(|(g, r)| g == process_gen && *r == rules)
+            || (rules.is_empty() && !self.rules.contains_key(session_id));
+        if !unchanged {
+            if rules.is_empty() {
+                self.rules.remove(session_id);
+            } else {
+                self.rules.insert(
+                    session_id.to_string(),
+                    (process_gen.to_string(), rules.clone()),
+                );
+            }
+            self.rules_changed(session_id, process_gen, rules);
+        }
+        Ok(self.take())
+    }
+
+    /// `session_id`'s active session rules (none for an unknown session).
+    pub fn approval_rules(&self, session_id: &str) -> Vec<AlwaysRule> {
+        self.rules
+            .get(session_id)
+            .map(|(_, r)| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// `rule_id` is one of the target process's active rules.
+    fn rule_active(&self, t: &Target, rule_id: &str) -> bool {
+        self.rules
+            .get(&t.session_id)
+            .is_some_and(|(g, r)| *g == t.process_gen && r.iter().any(|x| x.rule_id == rule_id))
+    }
+
+    fn rules_changed(&mut self, sid: &str, process_gen: &str, rules: Vec<AlwaysRule>) {
+        for att in self.approval_viewers() {
+            let op = Op::ApprovalRules {
+                session_id: sid.to_string(),
+                process_gen: process_gen.to_string(),
+                rules: rules.clone(),
+            };
+            self.send(&att, None, op);
+        }
+    }
+
+    /// The process ended: its rules went with it (an empty list says so).
+    fn clear_rules(&mut self, sid: &str) {
+        if let Some((process_gen, _)) = self.rules.remove(sid) {
+            self.rules_changed(sid, &process_gen, Vec::new());
+        }
+    }
+
     /// Welcomed attachments subscribed to the registry (`list`) with `view`.
     fn subscribers(&self) -> Vec<String> {
         self.attachments
@@ -2628,6 +2738,28 @@ impl<J: Journal> SessionHost<J> {
         let data = f.data.as_ref().ok_or(ErrorCode::UnsupportedVersion)?;
         match data["op"].as_str() {
             // An approval card answered from chat: the §6a submission.
+            // A session rule revoked from chat (r7.2).
+            Some("submit") if data.get(wire::RULE_REVOKE_FIELD).is_some() => {
+                let request_id = data["requestId"]
+                    .as_str()
+                    .ok_or(ErrorCode::UnsupportedVersion)?
+                    .to_string();
+                let payload = data[wire::RULE_REVOKE_FIELD].clone();
+                let reply = Reply::Chat {
+                    conversation_id: data["conversationId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                self.submit(
+                    att,
+                    reply,
+                    b,
+                    &request_id,
+                    ReceiptKind::ApprovalRuleRevoke,
+                    payload,
+                )
+            }
             Some("submit") if data.get("approval").is_some() => {
                 let request_id = data["requestId"]
                     .as_str()

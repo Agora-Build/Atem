@@ -42,7 +42,8 @@
 //! more than one client (the runtime holds one Astation link, so one
 //! attachment at a time), `close_session` (the runtime never closes a
 //! running session), `disconnect`/`resume` (no resume in compatibility
-//! mode), `fail_next_fsync`, `change_trust_gen`, and approval closes other
+//! mode), `fail_next_fsync`, `change_trust_gen`, `approval_rules` (session
+//! rules come only from a Codex session), and approval closes other
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
 //! false`.
 //!
@@ -495,6 +496,10 @@ fn unsupported(scenario: &Value) -> Option<String> {
             (
                 "change_trust_gen",
                 "trust generations change only by pairing",
+            ),
+            (
+                "approval_rules",
+                "session rules come from a Codex session's allow_always (the fixture agent is Claude); covered by the core harness and the real-agent Codex test",
             ),
         ] {
             if step.get(action).is_some() {
@@ -1414,6 +1419,7 @@ fn scenarios() -> Vec<Value> {
 const NOT_RUN: &[&str] = &[
     "approval-answer-with-acquire-takes-control-from-the-holder",
     "approval-needs-control-and-the-lease",
+    "approval-rule-revoke-needs-the-lease-and-an-active-rule",
     "approval-survives-takeover",
     "closed-session-refuses-work-before-the-lease-check",
     "receipt-query-is-scoped-to-the-exact-target",

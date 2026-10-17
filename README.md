@@ -214,7 +214,7 @@ once on the first `atem agent launch codex`, see below): Atem reads Codex's
 own session log, so Codex shows ready, working, waiting or unknown. Codex
 reports nothing before its first prompt, so type the first prompt in the
 terminal; after that chat prompts work. Replies arrive whole (no streaming),
-and Codex's chat has no reasoning text, "always allow" or error details.
+and Codex's chat has no reasoning text or error details.
 Interrupt from chat stops a running turn only. See
 [`designs/agent-chat-host.md`](designs/agent-chat-host.md).
 
@@ -223,8 +223,12 @@ asks for permission to run a tool, Astation shows the request as a card (in
 a Claude chat view too) and Atem asks the relay to notify your devices
 with control. A card shows the tool and a short summary — the command's first
 line or the file path, never file contents — and offers **Allow once**,
-**Always allow** (one of the rules the agent itself suggests, with where it
-is saved; Claude only) or **Deny** (with an optional note for the agent).
+**Always allow** (Claude: one of the rules Claude itself suggests, with where
+it is saved; Codex: **Always allow this command** — exactly this command in
+this folder, for the rest of this Codex process, kept by Atem; later runs of
+the very same command are allowed without asking and show as "auto allowed",
+and the rule can be revoked from Astation) or **Deny** (with an optional
+note for the agent).
 Answering takes control of the session for that device. The terminal can
 always answer instead: Claude keeps its own dialog on screen (the first
 answer wins), and for Codex any key you type in the terminal hands the

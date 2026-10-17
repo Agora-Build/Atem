@@ -48,6 +48,8 @@ pub struct Pty {
     pub approvals_released: u64,
     /// Push requests to the relay, in order: `{op, approval_id, reason?}`.
     pub pushes: Vec<Value>,
+    /// Session rules the runtime was asked to revoke, in order.
+    pub rule_revokes: Vec<String>,
 }
 
 impl Default for Pty {
@@ -66,6 +68,7 @@ impl Default for Pty {
             approval_decisions: Vec::new(),
             approvals_released: 0,
             pushes: Vec::new(),
+            rule_revokes: Vec::new(),
         }
     }
 }
@@ -448,6 +451,25 @@ impl<J: Journal> FakeRuntime<J> {
                             self.turns
                                 .insert(target.session_id.clone(), request_id.clone());
                         }
+                        if kind == ReceiptKind::ApprovalRuleRevoke {
+                            // The worker drops the rule at once: it answers,
+                            // then reports the rules left.
+                            let rule_id = payload["rule_id"].as_str().unwrap_or_default();
+                            self.pty.rule_revokes.push(rule_id.to_string());
+                            let sid = &target.session_id;
+                            let mut left = self.host.approval_rules(sid);
+                            left.retain(|r| r.rule_id != rule_id);
+                            let report = DispatchReport::Completed {
+                                detail: None,
+                                turn_id: None,
+                            };
+                            work.extend(self.host.dispatch_report(&request_id, report));
+                            work.extend(
+                                self.host
+                                    .set_approval_rules(sid, &target.process_gen, left)
+                                    .unwrap_or_default(),
+                            );
+                        }
                         // Written; completion comes from the provider later.
                         None
                     };
@@ -710,6 +732,11 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             HostEvent::ApprovalApplied { approval_id, ok } => {
                 self.host.approval_applied(approval_id, *ok)
             }
+            HostEvent::ApprovalRules { session_id, rules } => {
+                let process_gen = self.process_gen(session_id);
+                self.host
+                    .set_approval_rules(session_id, &process_gen, rules.clone())?
+            }
         };
         self.apply(fx);
         Ok(())
@@ -735,6 +762,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             "approval_decisions" => Value::from(p.approval_decisions.clone()),
             "approvals_released" => p.approvals_released.into(),
             "pushes" => Value::from(p.pushes.clone()),
+            "rule_revokes" => Value::from(p.rule_revokes.clone()),
             "approvals_pending" => self
                 .host
                 .pending_approvals(&self.only_session()?)

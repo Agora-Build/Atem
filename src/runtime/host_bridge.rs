@@ -48,6 +48,14 @@
 //! finish them (`not_delivered` → the hand-off failed with no effect). An
 //! adopted worker is told the approvals this broker knows (none), so it
 //! releases what it held for the previous broker.
+//!
+//! Atem session rules (§6a r7.2): a worker's `approval_rules` go to the host
+//! (`approval_rules` for attachments with `control`, chat-v1 `opened` and
+//! `rules`); its `approval_auto_allowed` becomes an `auto_allowed` card in
+//! the session's conversations and one runtime.log line naming the rule
+//! (never the command) — no approval, no push, no lease. A revoke
+//! (`approval_rule_revoke`) goes to the worker as `revoke_approval_rule`
+//! and completes on its `approval_rule_revoked`.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
 use super::worker_approvals::Event as ApprovalEvent;
 use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome};
@@ -95,6 +103,12 @@ const NOT_AVAILABLE: &str = "chat is not available for this agent";
 const NO_TURN: &str = "no turn was running";
 /// An interrupt on a session without chat: nothing knows whether a turn runs.
 const NO_TURN_STATE: &str = "no turn state; use the terminal";
+/// An interrupt whose Esc only handed a waiting Codex approval to Codex's
+/// own dialog (the worker consumed it).
+const INTERRUPT_HANDED: &str =
+    "the approval was handed to the terminal; interrupt again to stop the turn";
+/// A revoke whose rule the worker no longer held.
+const RULE_GONE: &str = "the rule is no longer active";
 /// Esc interrupts Claude Code's and Codex's current turn.
 const INTERRUPT_KEY: &[u8] = b"\x1b";
 /// Identity of a host without a verified pairing (no attachment is ever
@@ -361,6 +375,8 @@ pub struct HostBridge {
     outcomes: HashMap<String, crate::chat::adapter::Outcome>,
     /// approval_id → open approvals.
     approvals: HashMap<String, OpenApproval>,
+    /// Rule revocations sent to a worker: request id → (session, rule id).
+    revokes: HashMap<String, (String, String)>,
     /// Push requests for the relay (`push_queue`).
     pushes: super::push_queue::PushQueue,
 }
@@ -410,6 +426,7 @@ impl HostBridge {
             terminal_out: VecDeque::new(),
             outcomes: HashMap::new(),
             approvals: HashMap::new(),
+            revokes: HashMap::new(),
             pushes: Default::default(),
         })
     }
@@ -1094,6 +1111,18 @@ impl HostBridge {
             },
             // Approval answers are handed over with `Effect::Approval`.
             ReceiptKind::Approval => Some(DispatchReport::FailedNoEffect),
+            // The worker owns the rules; its answer completes it.
+            ReceiptKind::ApprovalRuleRevoke => {
+                let rule_id = payload.get("rule_id").and_then(Value::as_str).unwrap_or("");
+                match session.revoke_approval_rule(rule_id) {
+                    Ok(()) => {
+                        self.revokes
+                            .insert(request_id.into(), (sid.into(), rule_id.into()));
+                        None
+                    }
+                    Err(_) => Some(DispatchReport::FailedNoEffect),
+                }
+            }
         }
     }
 
@@ -1116,6 +1145,7 @@ impl HostBridge {
             self.end_conversations(&sid, RESTARTED, cx);
             self.streams.retain(|(_, s), _| s != &sid);
             self.interrupts.remove(&sid);
+            self.revokes.retain(|_, (s, _)| s != &sid);
         }
         let ids: Vec<SessionId> = cx.sessions.keys().cloned().collect();
         for id in ids {
@@ -1205,6 +1235,7 @@ impl HostBridge {
             // Nothing more is answered for this process's writes.
             self.pending.retain(|(s, _), _| s != sid);
             self.prompts.retain(|_, s| s != sid);
+            self.revokes.retain(|_, (s, _)| s != sid);
             self.exec(effects, cx);
             return;
         }
@@ -1404,6 +1435,14 @@ impl HostBridge {
                 );
             }
             Pending::Prompt(request_id) => {
+                // It only handed a waiting Codex approval to Codex's dialog.
+                let failure = if result.consumed {
+                    Some(DispatchReport::Refused {
+                        detail: super::worker_protocol::APPROVAL_HANDED.into(),
+                    })
+                } else {
+                    failure
+                };
                 if let Some(report) = failure {
                     self.prompts.remove(&request_id);
                     if let Some(session) = session_of(cx, sid) {
@@ -1415,6 +1454,13 @@ impl HostBridge {
                 }
             }
             Pending::Interrupt(request_id) => {
+                let failure = if result.consumed {
+                    Some(DispatchReport::Refused {
+                        detail: INTERRUPT_HANDED.into(),
+                    })
+                } else {
+                    failure
+                };
                 if let Some(report) = failure {
                     if let Some(waiting) = self.interrupts.get_mut(sid) {
                         waiting.retain(|r| r != &request_id);
@@ -1477,6 +1523,114 @@ impl HostBridge {
                     self.exec(effects, cx);
                     self.approvals.remove(&id);
                 }
+                ApprovalEvent::AutoAllowed {
+                    request_id: _,
+                    rule_id,
+                    tool,
+                    summary,
+                } => self.auto_allowed(sid, rule_id, tool, summary, cx),
+                ApprovalEvent::Rules(rules) => self.rules_reported(sid, rules, cx),
+                ApprovalEvent::RuleRevoked { rule_id, ok } => {
+                    let rid = self
+                        .revokes
+                        .iter()
+                        .find(|(_, (s, r))| s == sid && *r == rule_id)
+                        .map(|(rid, _)| rid.clone());
+                    let Some(rid) = rid else {
+                        continue;
+                    };
+                    self.revokes.remove(&rid);
+                    let report = if ok {
+                        DispatchReport::Completed {
+                            detail: None,
+                            turn_id: None,
+                        }
+                    } else {
+                        DispatchReport::Refused {
+                            detail: RULE_GONE.into(),
+                        }
+                    };
+                    let effects = self.host.dispatch_report(&rid, report);
+                    self.exec(effects, cx);
+                }
+            }
+        }
+    }
+
+    /// A request the worker allowed by a session rule: one runtime.log line
+    /// (the rule and the tool, never the command) and an `auto_allowed`
+    /// card in the session's conversations. No approval, push or lease.
+    fn auto_allowed(
+        &mut self,
+        sid: &str,
+        rule_id: String,
+        tool: String,
+        summary: String,
+        cx: &mut Cx,
+    ) {
+        eprintln!("{}", auto_allowed_line(sid, &tool, &rule_id));
+        let chat = self
+            .host
+            .descriptor_of(sid)
+            .is_some_and(|d| d.capabilities.iter().any(|c| c == "chat-v1"));
+        if !chat {
+            return;
+        }
+        let card = ApprovalCard {
+            id: "approval".into(),
+            approval_id: uuid::Uuid::new_v4().to_string(),
+            tool,
+            summary,
+            always_rules: Vec::new(),
+            state: ApprovalCardState::AutoAllowed,
+            rule_id: Some(rule_id),
+        };
+        let Some(session) = session_of(cx, sid) else {
+            return;
+        };
+        let out = session.chat.approval_card(card, wall_ms() as i64);
+        self.broadcast_to(sid, &out, None, true, cx);
+    }
+
+    /// A worker's active session rules: to the host (session-v1
+    /// `approval_rules`) and to the session's conversations with `control`
+    /// (chat-v1 `rules`) when they changed.
+    fn rules_reported(&mut self, sid: &str, rules: Vec<wire::AlwaysRule>, cx: &mut Cx) {
+        let Some(process_gen) = session_of(cx, sid).map(|s| s.process_gen.clone()) else {
+            return;
+        };
+        if !self.per.get(sid).is_some_and(|p| p.registered) {
+            return;
+        }
+        if self.host.approval_rules(sid) == rules {
+            return;
+        }
+        match self.host.set_approval_rules(sid, &process_gen, rules) {
+            Ok(effects) => self.exec(effects, cx),
+            Err(error) => {
+                eprintln!("atem runtime: {sid}: session rules not shown: {error}");
+                return;
+            }
+        }
+        let rules = self.host.approval_rules(sid);
+        let ids: Vec<String> = self
+            .chats
+            .get(sid)
+            .map(|c| {
+                c.conversations
+                    .iter()
+                    .filter(|(_, c)| self.current(&c.attachment))
+                    .filter(|(_, c)| self.host.attachment_can(&c.attachment, Permission::Control))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ids {
+            if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
+                self.send_chat(
+                    chat_wire::rules(&id, sid, &generation, sequence, &rules),
+                    cx,
+                );
             }
         }
     }
@@ -1615,6 +1769,7 @@ impl HostBridge {
                 summary: request.summary.clone(),
                 always_rules: request.always_rules.clone(),
                 state: ApprovalCardState::Pending,
+                rule_id: None,
             };
             self.card(
                 &request.approval_id,
@@ -1836,7 +1991,11 @@ impl HostBridge {
                             chats.conversations.remove(&conversation);
                         }
                     }
-                    Ok(Inbound::Submit { .. } | Inbound::Answer { .. }) => {}
+                    Ok(
+                        Inbound::Submit { .. }
+                        | Inbound::Answer { .. }
+                        | Inbound::RevokeRule { .. },
+                    ) => {}
                     Err(text) => {
                         let env = chat_error(
                             &conversation,
@@ -1876,19 +2035,26 @@ impl HostBridge {
             return;
         }
         let generation = session.chat.generation().to_string();
+        // Approval cards and session rules only for an attachment that may
+        // answer them.
+        let control = self.host.attachment_can(attachment, Permission::Control);
+        let rules = if control {
+            self.host.approval_rules(sid)
+        } else {
+            Vec::new()
+        };
         let mut envelopes = vec![chat_wire::opened(
             conversation,
             sid,
             &generation,
             session.chat.status(),
             &session.chat_unavailable,
+            &rules,
         )];
         let history = session
             .chat
             .history(before, HISTORY_MESSAGES, HISTORY_BYTES);
         let mut sequence = 1;
-        // Approval cards only for an attachment that may answer them.
-        let control = self.host.attachment_can(attachment, Permission::Control);
         for message in history.iter().filter(|m| control || !is_card(m)) {
             envelopes.push(chat_wire::history_message(
                 conversation,
@@ -2325,6 +2491,12 @@ fn log_handshake(what: &str) {
         secs / 60 % 60,
         secs % 60
     );
+}
+
+/// runtime.log's line for a request allowed by a session rule: the session,
+/// the tool and the rule, never the command or its summary.
+pub(super) fn auto_allowed_line(sid: &str, tool: &str, rule_id: &str) -> String {
+    format!("atem runtime: {sid}: {tool} allowed by session rule {rule_id}")
 }
 
 /// A session `error{code:"unauthorized"}` for a link without an attachment.

@@ -166,8 +166,9 @@ chat-v1:
   `detail`/`text`; a submit refused for the status (busy, a local draft) is
   `rejected` with the reason too.
 - `opened` carries `unavailable`: an array of strings naming what the
-  agent's chat can't provide — `streaming`, `reasoning`, `always_allow`,
-  `error_details` (all four for Codex, none for Claude).
+  agent's chat can't provide — `streaming`, `reasoning`, `error_details`
+  (all three for Codex, none for Claude) — and `approvalRules`, the
+  session's active Atem session rules (r7.2, below).
 
 Receipts (session-v1 `submit`), per kind:
 
@@ -184,6 +185,13 @@ Receipts (session-v1 `submit`), per kind:
 - `stop`: stops the agent; completes at its exit.
 - `approval`: handed to the agent's waiting permission hook; completes when
   the agent applied it (see [Approvals](#approvals-r7-6a-on-featapprovals)).
+- `approval_rule_revoke` (r7.2): `{rule_id}` under the current lease;
+  dispatched to the session's worker, completed when it dropped the rule
+  (an inactive rule is `stale_target` at admission).
+- An `interrupt` (or `prompt`) whose write only handed a waiting Codex
+  approval to Codex's own dialog is `rejected` with "the approval was handed
+  to the terminal; interrupt again to stop the turn" ("…; not written" for a
+  prompt): show it as is; a second interrupt stops the turn.
 - A dispatch refused before anything was queued is `rejected` ("could not
   write to the terminal"); a writer failure after queueing is
   `outcome_unknown` ("write interrupted"). Work executing when the broker
@@ -218,10 +226,11 @@ web page:
   Otherwise `["terminal-v1"]` and no turn state. Show chat per descriptor,
   not per provider.
 - **`opened.unavailable`.** An array of strings naming what the agent's chat
-  cannot provide: `streaming`, `reasoning`, `always_allow`, `error_details`.
-  Codex sends all four, Claude `[]`. Hide or disable the matching UI (no
-  typing indicator for partial text, no "always allow" button, no reasoning
-  fold, no error detail). Unknown names must be ignored.
+  cannot provide: `streaming`, `reasoning`, `error_details`. Codex sends all
+  three, Claude `[]`. Hide or disable the matching UI (no typing indicator
+  for partial text, no reasoning fold, no error detail). Unknown names must
+  be ignored. ("Always allow" is offered on Codex cards as an Atem session
+  rule, see below.)
 - **Typed chat-v1 decoder: accept unknown fields.** Astation's typed
   chat-v1 decoder must accept (ignore) fields it doesn't know before Codex
   `opened` messages arrive: `opened.unavailable` is new, and a decoder that
@@ -383,9 +392,45 @@ Astation sees that changed since r6.2.
   with the same `messageId`: replace it. Answer from chat with `submit`
   carrying `approval` (the payload above) instead of `text`; `accepted` /
   `complete` / `error{code}` follow the receipt as for prompts.
-- **Codex offers no "always allow".** Codex's hook docs reserve
-  `updatedPermissions` ("fail closed today"), so Codex requests have
-  `always_rules: []`; offer Allow once and Deny and say why.
+- **Codex: "Always allow this command" is an Atem session rule (r7.2).**
+  Codex's hook can't take a persistent rule (`updatedPermissions` fails
+  closed), so a Codex request's `always_rules` holds one Atem rule:
+  `{rule_id: "s-…", label: "Always allow `npm test` in /home/me/proj for
+  this session", scope: "session"}` (none when the request has no exact
+  form, or the session already holds 32). Show it like Claude's rules: the
+  label on the button, the scope as "this Codex session only". Answering
+  `allow_always` with that `rule_id` allows this request; Atem keeps the
+  rule for the rest of that agent process.
+
+### Atem session rules: how to show them (r7.2)
+
+- **Auto-allowed requests.** A later request of the same Codex session with
+  the exact same command and folder is allowed by Atem without asking: no
+  `approval_request`, no push, no lease change. Each one appears in chat as
+  a card message `approval-<id>` whose part has `state: "auto_allowed"` and
+  `rule_id` (the rule that allowed it), `tool` and the redacted `summary`;
+  it is final (nothing to answer). Show it as a quiet note ("Allowed by your
+  session rule: `npm test`") with a link to the rule. runtime.log gets one
+  line naming the session, tool and rule, never the command.
+- **The rule list.** Attachments with `control` get
+  `{"op":"approval_rules","session_id","process_gen","rules":[{rule_id,
+  label, scope}]}` (session-v1) whenever it changes, after each `sessions`
+  snapshot when it isn't empty, and `rules: []` when the process ends; chat
+  conversations get `opened.approvalRules` and a `rules` op
+  (`approvalRules`) on change. Show the active rules on the session (e.g.
+  under the chat header or in the session's details), each with a
+  **Revoke** button.
+- **Revoke.** session-v1 `submit` with `kind:"approval_rule_revoke"`,
+  `payload: {"rule_id": "s-…"}` and the current `lease_epoch` (no
+  `acquire` form: take the lease first), or chat-v1 `submit` with
+  `approval_rule_revoke: {"rule_id": "s-…"}` instead of `text`. The receipt
+  completes once the worker dropped the rule (chat: `complete`), then the
+  new list arrives. An unknown or already revoked rule is `stale_target`
+  (refresh the list). A rule never outlives the agent process: a respawn
+  starts with none.
+- New shared fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule`
+  (core harness; the real-runtime runner lists it as not run, since its
+  agent is Claude, and the real-agent Codex test covers it end to end).
 
 ### Expected relay behaviour (Astation's side)
 

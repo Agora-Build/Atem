@@ -309,6 +309,13 @@ impl WorkerHandle {
         self.send(&BrokerMsg::KnownApprovals { request_ids })
     }
 
+    /// Revokes one of the session's Atem session rules (r7.2).
+    pub fn revoke_approval_rule(&self, rule_id: &str) -> Result<()> {
+        self.send(&BrokerMsg::RevokeApprovalRule {
+            rule_id: rule_id.into(),
+        })
+    }
+
     /// The worker's next message; `None` once its connection closed.
     #[cfg(test)]
     pub async fn recv(&mut self) -> Option<WorkerMsg> {

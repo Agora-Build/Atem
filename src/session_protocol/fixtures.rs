@@ -146,6 +146,11 @@ pub enum HostEvent {
         approval_id: String,
         ok: bool,
     },
+    /// The runtime reports the session's active Atem session rules (r7.2).
+    ApprovalRules {
+        session_id: String,
+        rules: Vec<AlwaysRule>,
+    },
 }
 
 /// The host authority under test (`fake_runtime::FakeRuntime`).
@@ -466,6 +471,7 @@ impl Runner {
             ("open_approval", &["tool", "summary", "always_rules"]),
             ("close_approval", &["reason"]),
             ("approval_applied", &["ok"]),
+            ("approval_rules", &["rules"]),
             ("assert", &[]),
             ("assert_client", &[]),
         ];
@@ -670,6 +676,11 @@ impl Runner {
             "approval_applied" => HostEvent::ApprovalApplied {
                 approval_id: as_str(arg, "approval_applied")?.into(),
                 ok: take(step, "ok")?.as_bool().ok_or("ok must be a boolean")?,
+            },
+            "approval_rules" => HostEvent::ApprovalRules {
+                session_id: as_str(arg, "approval_rules")?.into(),
+                rules: serde_json::from_value(take(step, "rules")?.clone())
+                    .map_err(|e| format!("rules: {e}"))?,
             },
             other => return Err(format!("{other} is not a host event")),
         })

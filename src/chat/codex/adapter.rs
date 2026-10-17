@@ -65,20 +65,20 @@ use serde_json::Value;
 
 use super::rollout::RolloutReader;
 use crate::chat::adapter::{
-    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_ALWAYS_ALLOW,
-    UNAVAILABLE_ERROR_DETAILS, UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
+    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_ERROR_DETAILS,
+    UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
 };
 use crate::chat::approvals::{Ancestry, HookAgent};
 
 /// Why a chat prompt is refused before Codex's first hook.
 pub const FIRST_PROMPT: &str = "type a first prompt in the terminal: Codex reports nothing before it (and Atem's Codex hooks must be trusted in its /hooks)";
 /// What Codex chat can't provide: no partial text (whole messages only),
-/// no reasoning (encrypted), no persistent approval rule (Codex fails
-/// closed), no model/API error details (none recorded).
+/// no reasoning (encrypted), no model/API error details (none recorded).
+/// "Always allow" is offered as an Atem session rule (Codex itself fails
+/// closed on a persistent rule; `chat::approvals`).
 pub const UNAVAILABLE: &[&str] = &[
     UNAVAILABLE_STREAMING,
     UNAVAILABLE_REASONING,
-    UNAVAILABLE_ALWAYS_ALLOW,
     UNAVAILABLE_ERROR_DETAILS,
 ];
 /// The status detail while an approval waits (`ChatSession` shows its own).

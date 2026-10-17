@@ -226,6 +226,8 @@ fn a_request_is_reported_redacted_and_the_decision_reaches_the_hook() {
         "curl -H 'X-Key: [redacted]' https://api.example"
     );
     assert_eq!(info.always_rules[0].label, "Allow Bash(curl:*)");
+    // Claude offers its own suggestions only (no Atem session rule).
+    assert_eq!(info.always_rules.len(), 1);
     let rule = info.always_rules[0].rule_id.clone();
     assert_eq!(
         a.decide(request_id, ApprovalDecision::AllowAlways, Some(&rule), None),
@@ -865,4 +867,179 @@ fn under_a_wrapper_the_real_binary_becomes_the_agent() {
         let _ = hook.kill();
         let _ = hook.wait();
     }
+}
+
+/// A Codex request with a cwd (so it offers an Atem session rule).
+fn codex_ask(command: &str, cwd: &str) -> String {
+    serde_json::json!({"hook_event_name": "PermissionRequest", "session_id": "s1",
+        "cwd": cwd, "tool_name": "Bash",
+        "tool_input": {"command": command, "description": "d"}})
+    .to_string()
+}
+
+const ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+
+/// Answers a Codex request `allow_always` with its session rule: the rule
+/// id, once the hook took it (the session holds the rule then).
+fn always_allow(s: &Session, a: &mut Approvals, stdin: &str) -> String {
+    let hook = s.hook("codex", 30, stdin);
+    let got = events(a, true);
+    let Event::Request { request_id, info } = &got[0] else {
+        panic!("{got:?}")
+    };
+    let [rule] = info.always_rules.as_slice() else {
+        panic!("{info:?}")
+    };
+    assert_eq!(rule.scope, "session");
+    let rule_id = rule.rule_id.clone();
+    assert_eq!(
+        a.decide(
+            request_id,
+            ApprovalDecision::AllowAlways,
+            Some(&rule_id),
+            None
+        ),
+        None
+    );
+    assert_eq!(printed(hook), ALLOW, "a plain allow: Codex takes no rule");
+    let done = drained(a);
+    assert!(
+        done.contains(&applied(request_id, ApplyOutcome::Ok)),
+        "{done:?}"
+    );
+    assert!(
+        done.iter()
+            .any(|e| matches!(e, Event::Rules(r) if r.iter().any(|x| x.rule_id == rule_id))),
+        "{done:?}"
+    );
+    rule_id
+}
+
+#[test]
+fn a_codex_session_rule_allows_exactly_the_same_command_without_asking() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    let rule_id = always_allow(&s, &mut a, &ask);
+    assert_eq!(a.rules().len(), 1);
+    // The same command in the same cwd: allowed by the worker, no approval.
+    let hook = s.hook("codex", 30, &ask);
+    let got = events(&mut a, true);
+    let [
+        Event::AutoAllowed {
+            rule_id: by,
+            tool,
+            summary,
+            ..
+        },
+    ] = got.as_slice()
+    else {
+        panic!("{got:?}")
+    };
+    assert_eq!(
+        (by, tool.as_str(), summary.as_str()),
+        (&rule_id, "Bash", "npm test")
+    );
+    assert_eq!(printed(hook), ALLOW);
+    assert!(drained(&mut a).is_empty(), "nothing to report after it");
+    // Anything else still asks: more after it, another cwd, one byte more.
+    for other in [
+        codex_ask("npm test; rm -rf ~", "/p"),
+        codex_ask("npm test", "/q"),
+        codex_ask("npm test ", "/p"),
+        codex_ask("npm  test", "/p"),
+    ] {
+        let hook = s.hook("codex", 30, &other);
+        let id = request_id(&events(&mut a, true)[0]);
+        a.release(&id);
+        assert_eq!(printed(hook), "");
+        drained(&mut a);
+    }
+    // No broker connected: released as ever (the note couldn't be shown).
+    let hook = s.hook("codex", 30, &ask);
+    known(&mut a, 1, false);
+    assert_eq!(printed(hook), "");
+    drained(&mut a);
+}
+
+#[test]
+fn a_nested_codex_never_matches_a_session_rule() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    always_allow(&s, &mut a, &ask);
+    let script = approvals::shell_quote(&s.path().join(approvals::SCRIPT_NAME).to_string_lossy());
+    // A codex started inside the session (two levels of shell): never
+    // allowed by the rule, and not this session's to report either.
+    let nested = s.run(
+        &format!("/bin/sh -c \"/bin/sh {script} codex 30; true\"; true"),
+        &ask,
+    );
+    known(&mut a, 1, true);
+    assert_eq!(printed(nested), "");
+    assert!(drained(&mut a).is_empty());
+}
+
+#[test]
+fn a_revoked_rule_asks_again_and_a_new_process_has_none() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let ask = codex_ask("npm test", "/p");
+    let rule_id = always_allow(&s, &mut a, &ask);
+    assert!(a.revoke(&rule_id));
+    assert!(!a.revoke(&rule_id), "already gone");
+    assert!(a.rules().is_empty());
+    let hook = s.hook("codex", 30, &ask);
+    let id = request_id(&events(&mut a, true)[0]);
+    a.release(&id);
+    assert_eq!(printed(hook), "");
+    drained(&mut a);
+    // A respawn is a new agent process (a new worker): no rules.
+    always_allow(&s, &mut a, &ask);
+    let mut fresh = watcher(&s, Agent::Codex);
+    assert!(fresh.rules().is_empty());
+    let hook = s.hook("codex", 30, &ask);
+    let id = request_id(&events(&mut fresh, true)[0]);
+    fresh.release(&id);
+    assert_eq!(printed(hook), "");
+    drained(&mut fresh);
+}
+
+#[test]
+fn a_session_holds_at_most_32_rules() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let rule = |n: usize| {
+        let v: Value = serde_json::from_str(&codex_ask(&format!("echo {n}"), "/p")).unwrap();
+        approvals::request(Agent::Codex, &v)
+            .unwrap()
+            .session_rule
+            .unwrap()
+    };
+    for n in 0..MAX_SESSION_RULES {
+        a.keep_rule(rule(n));
+    }
+    assert_eq!(a.rules().len(), 32);
+    a.keep_rule(rule(99));
+    assert_eq!(a.rules().len(), 32, "the 33rd is not kept");
+    assert!(!a.rules().iter().any(|r| r.label.contains("echo 99")));
+    // Each kept rule was reported (the whole list), the 33rd not.
+    let reported = a.poll(true, Vec::new());
+    assert_eq!(reported.len(), 32);
+    assert!(matches!(reported.last(), Some(Event::Rules(r)) if r.len() == 32));
+    // A full session offers no more session rules on its cards.
+    let hook = s.hook("codex", 30, &codex_ask("echo 100", "/p"));
+    let got = events(&mut a, true);
+    let Event::Request { request_id, info } = &got[0] else {
+        panic!("{got:?}")
+    };
+    assert!(info.always_rules.is_empty(), "{info:?}");
+    a.release(request_id);
+    assert_eq!(printed(hook), "");
+    drained(&mut a);
+    // Revoking one makes room again.
+    let first = a.rules()[0].rule_id.clone();
+    assert!(a.revoke(&first));
+    a.keep_rule(rule(99));
+    assert_eq!(a.rules().len(), 32);
 }

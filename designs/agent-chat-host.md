@@ -48,6 +48,21 @@ no `chat-v1` capability.
   stay. Approvals pending before a broker restart or adoption are released
   without `push_resolved`: a phone notification may linger until its
   `expires_at`, and a tap gets `stale_target` ("already answered").
+- **Atem session rules for Codex** (since 2026-10-17, contract §6a r7.2).
+  Codex's hook can't take a persistent rule, so a Codex card offers one
+  Atem rule instead: "Always allow `<command>` in <cwd> for this session"
+  (`scope: "session"`). Answering `allow_always` with it allows this request
+  and makes the worker keep the rule for the rest of this agent process (at
+  most 32; a respawn starts with none; a broker restart keeps them). A later
+  request of the session's own pinned Codex with byte-equal tool, full
+  command (file changes: kinds and paths) and cwd is allowed by the worker
+  without a card: an `auto_allowed` card naming `rule_id` appears in the
+  conversation, runtime.log gets one line without the command, nothing is
+  pushed and no lease is taken. A nested `codex`, another cwd or any other
+  command still asks. The active rules are listed in `opened.approvalRules`
+  and re-sent with `rules` when they change; a `submit` with
+  `approval_rule_revoke: {rule_id}` instead of `text` revokes one (lease
+  required). Claude's rules are unchanged.
 - **Never merge with a local draft.** A chat prompt is refused when anyone
   typed into the terminal since Claude's last turn ended.
 - **Never resend.** A prompt whose delivery is unknown is reported, not retried.
@@ -286,7 +301,9 @@ message {
   parts: [ { id, kind: "text", markdown } | { id, kind: "tool", name, summary }
          | { id: "approval", kind: "approval", approval_id, tool, summary,
              always_rules: [{rule_id, label, scope}],
-             state: pending|allowed|always_allowed|denied|answered_terminal|expired|closed } ],
+             state: pending|allowed|always_allowed|denied|answered_terminal|expired|closed
+                    |auto_allowed,
+             rule_id? } ],   // auto_allowed: the Atem session rule that allowed it
   history?: true      // backfill on open / page
 }
 delta { messageId, part: { id, kind, … } }   // append one part; a part id
@@ -302,6 +319,9 @@ delta { messageId, part: { id, kind, … } }   // append one part; a part id
   state changes the whole message is sent again with the same `messageId`
   (replace it). A chat `submit` with `approval` (the §6a payload) instead of
   `text` answers it; its binding has no `lease_epoch` when `acquire` is true.
+- An `auto_allowed` card (Codex, r7.2) is final when it arrives: the worker
+  allowed the request by the session rule `rule_id` without asking; it
+  offers nothing to answer (`always_rules: []`).
 - `waiting` and `complete` are the events a mobile app can turn into push
   notifications (delivery is Astation's/the app's concern).
 
@@ -313,8 +333,9 @@ on the existing authenticated Astation connection.
 | op | Direction | Fields |
 |---|---|---|
 | `open` | Astation → Atem | `conversationId`, `agentId`, optional `before` (messageId) |
-| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
-| `submit` | Astation → Atem | `generation`, `requestId` (UUID), `text` |
+| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), `approvalRules` (the session's active Atem session rules `[{rule_id, label, scope}]`; `[]` without `control`), then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
+| `submit` | Astation → Atem | `generation`, `requestId` (UUID), and one of `text`, `approval` (§6a answer) or `approval_rule_revoke` (`{rule_id}`, r7.2) |
+| `rules` | Atem → Astation | `approvalRules` (the whole list, when it changed; conversations with `control` only) |
 | `accepted` | Atem → Astation | `requestId` |
 | `message` / `delta` | Atem → Astation | see the message model |
 | `status` | Atem → Astation | `state: ready|working|waiting|unknown`, `since`, optional `detail` |
@@ -326,9 +347,9 @@ on the existing authenticated Astation connection.
   sequence 0) and sends that older page.
 - `opened.unavailable` names what this agent's chat can't provide, so a
   client says so instead of waiting for it: `streaming` (no partial text:
-  messages arrive whole), `reasoning`, `always_allow` (approval cards offer
-  no persistent rule), `error_details` (no model/API error behind a failed
-  turn). Empty for Claude; all four for Codex. It comes from the adapter's
+  messages arrive whole), `reasoning`, `error_details` (no model/API error
+  behind a failed turn). Empty for Claude; all three for Codex (its "always
+  allow" is an Atem session rule, so it is no longer listed). It comes from the adapter's
   `Capabilities.unavailable`, carried by the worker's `chat` and
   `chat_snapshot` messages (field `unavailable`).
 - Every Atem event in a conversation carries `generation` and the next

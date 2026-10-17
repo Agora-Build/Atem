@@ -11,8 +11,11 @@
 //! runs one stable command from `~/.codex/hooks.json` (`chat::codex`).
 //!
 //! Codex can't take a persistent decision: its docs reserve
-//! `updatedPermissions` ("fail closed today"), so Codex cards offer Allow
-//! once and Deny only (`always_rules` is empty).
+//! `updatedPermissions` ("fail closed today"). Its cards offer an Atem
+//! session rule instead (r7.2): "Always allow this command" for the rest of
+//! this agent process, kept and matched by the worker
+//! (`runtime::worker_approvals`) on the exact, unredacted request
+//! (`RuleMatch`); the hook itself only ever gets a plain allow.
 
 use std::path::{Path, PathBuf};
 
@@ -270,6 +273,40 @@ fn rule_id(index: usize, suggestion: &Value) -> String {
     format!("r{index}-{hex}")
 }
 
+/// The scope of an Atem session rule.
+pub const SESSION_SCOPE: &str = "session";
+/// The command (or file list) part of a session rule's label, at most.
+const LABEL_SUBJECT_BYTES: usize = 120;
+/// The cwd part of a session rule's label, at most.
+const LABEL_CWD_BYTES: usize = 80;
+
+/// What an Atem session rule allows, from the unredacted request: the tool
+/// and the exact full command, or the exact file changes (kind, path), in
+/// the exact cwd. Compared byte for byte: no prefix, glob or normalisation.
+/// Never leaves the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleMatch {
+    Command {
+        tool: String,
+        command: String,
+        cwd: String,
+    },
+    Files {
+        tool: String,
+        /// `(add|update|delete|move, path)` in patch order.
+        changes: Vec<(String, String)>,
+        cwd: String,
+    },
+}
+
+/// An Atem session rule offered on a card (or kept by the worker): what
+/// the card shows, and what it matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRule {
+    pub rule: AlwaysRule,
+    pub matcher: RuleMatch,
+}
+
 /// A request as the hook wrote it, with the raw rules to echo back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
@@ -278,6 +315,94 @@ pub struct Request {
     pub rules: Vec<(String, Value)>,
     pub tool_name: String,
     pub tool_input: Value,
+    /// What the request is, for Atem session rules (Codex; `None` when it
+    /// can't be told exactly: another tool, no cwd).
+    pub matcher: Option<RuleMatch>,
+    /// The Atem session rule its card offers (Codex), also in
+    /// `info.always_rules`.
+    pub session_rule: Option<SessionRule>,
+}
+
+/// What a Codex request is, exactly: a shell command (`Bash`, `shell`,
+/// `exec_command` with a string `command`) or `apply_patch`'s file
+/// changes, in the request's `cwd`.
+fn rule_match(tool: &str, input: &Value, cwd: Option<&str>) -> Option<RuleMatch> {
+    let cwd = cwd.filter(|c| !c.is_empty())?.to_string();
+    let command = input.get("command").and_then(Value::as_str)?;
+    match tool {
+        "Bash" | "shell" | "exec_command" => Some(RuleMatch::Command {
+            tool: tool.to_string(),
+            command: command.to_string(),
+            cwd,
+        }),
+        "apply_patch" => {
+            let changes: Vec<(String, String)> = command
+                .lines()
+                .filter_map(|l| {
+                    [
+                        ("*** Add File: ", "add"),
+                        ("*** Update File: ", "update"),
+                        ("*** Delete File: ", "delete"),
+                        ("*** Move to: ", "move"),
+                    ]
+                    .iter()
+                    .find_map(|(p, kind)| {
+                        l.strip_prefix(p)
+                            .map(|path| (kind.to_string(), path.to_string()))
+                    })
+                })
+                .collect();
+            (!changes.is_empty()).then(|| RuleMatch::Files {
+                tool: tool.to_string(),
+                changes,
+                cwd,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A new session rule id: `s-` and 16 random hex characters.
+fn session_rule_id() -> String {
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    format!("s-{}", &hex[..16])
+}
+
+/// The rule a card offers for `matcher`: "Always allow `<command's first
+/// line>` in <cwd> for this session" (a longer command says how many more
+/// lines it has), redacted and bounded.
+fn session_rule(matcher: &RuleMatch) -> SessionRule {
+    let (subject, cwd) = match matcher {
+        RuleMatch::Command { command, cwd, .. } => {
+            let mut lines = command.lines().filter(|l| !l.trim().is_empty());
+            let first = lines.next().unwrap_or("");
+            let more = lines.count();
+            let mut subject = format!("`{}`", redacted(first, LABEL_SUBJECT_BYTES));
+            if more > 0 {
+                subject.push_str(&format!(
+                    " (+{more} more line{})",
+                    if more == 1 { "" } else { "s" }
+                ));
+            }
+            (subject, cwd)
+        }
+        RuleMatch::Files { changes, cwd, .. } => {
+            let list: Vec<String> = changes.iter().map(|(k, p)| format!("{k} {p}")).collect();
+            (redacted(&list.join(", "), LABEL_SUBJECT_BYTES), cwd)
+        }
+    };
+    let label = format!(
+        "Always allow {subject} in {} for this session",
+        redacted(cwd, LABEL_CWD_BYTES)
+    );
+    SessionRule {
+        rule: AlwaysRule {
+            rule_id: session_rule_id(),
+            label: bounded(&label, MAX_RULE_TEXT_BYTES),
+            scope: SESSION_SCOPE.into(),
+        },
+        matcher: matcher.clone(),
+    }
 }
 
 /// What the card shows for `input` (the hook's stdin): tool, redacted
@@ -315,6 +440,20 @@ pub fn request(agent: Agent, input: &Value) -> Option<Request> {
             rules.push((id, suggestion.clone()));
         }
     }
+    // Codex: an Atem session rule for exactly this request.
+    let matcher = (agent == Agent::Codex)
+        .then(|| {
+            rule_match(
+                &tool_name,
+                &tool_input,
+                input.get("cwd").and_then(Value::as_str),
+            )
+        })
+        .flatten();
+    let session_rule = matcher.as_ref().map(session_rule);
+    if let Some(r) = &session_rule {
+        always_rules.push(r.rule.clone());
+    }
     Some(Request {
         info: ApprovalInfo {
             summary: summary(&tool_name, &tool_input),
@@ -324,7 +463,21 @@ pub fn request(agent: Agent, input: &Value) -> Option<Request> {
         rules,
         tool_name,
         tool_input,
+        matcher,
+        session_rule,
     })
+}
+
+impl Request {
+    /// The card no longer offers its session rule (the session holds as
+    /// many as it may).
+    pub fn withdraw_session_rule(&mut self) {
+        if let Some(r) = self.session_rule.take() {
+            self.info
+                .always_rules
+                .retain(|x| x.rule_id != r.rule.rule_id);
+        }
+    }
 }
 
 fn output(decision: &str) -> String {
@@ -333,10 +486,16 @@ fn output(decision: &str) -> String {
     )
 }
 
+/// A plain allow, as the hook prints it.
+pub fn allow_output() -> String {
+    output(r#"{"behavior":"allow"}"#)
+}
+
 /// What the hook prints for a decision: the same shape for both agents;
-/// `allow_always` echoes the chosen suggestion as `updatedPermissions`
-/// (`None` when it isn't one of `request`'s rules, or for Codex, which has
-/// none). A deny without a message gets `DEFAULT_DENY`.
+/// `allow_always` echoes the chosen suggestion as `updatedPermissions`, or
+/// for the request's Atem session rule is a plain allow (the worker keeps
+/// the rule); `None` when `rule_id` is neither. A deny without a message
+/// gets `DEFAULT_DENY`.
 pub fn decision_output(
     request: &Request,
     decision: ApprovalDecision,
@@ -344,9 +503,16 @@ pub fn decision_output(
     message: Option<&str>,
 ) -> Option<String> {
     Some(match decision {
-        ApprovalDecision::AllowOnce => output(r#"{"behavior":"allow"}"#),
+        ApprovalDecision::AllowOnce => allow_output(),
         ApprovalDecision::AllowAlways => {
             let id = rule_id?;
+            if request
+                .session_rule
+                .as_ref()
+                .is_some_and(|r| r.rule.rule_id == id)
+            {
+                return Some(allow_output());
+            }
             let (_, rule) = request.rules.iter().find(|(r, _)| r == id)?;
             output(&format!(
                 r#"{{"behavior":"allow","updatedPermissions":[{rule}]}}"#

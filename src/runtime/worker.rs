@@ -743,6 +743,11 @@ impl Worker {
             };
             self.send(&snapshot);
         }
+        // The session rules outlive a broker (the worker owns them).
+        let rules = self.approvals.as_ref().map(Approvals::rules);
+        if let Some(rules) = rules.filter(|r| !r.is_empty()) {
+            self.send(&WorkerMsg::ApprovalRules { rules });
+        }
         if let Some(status) = self.exited.clone() {
             self.send(&WorkerMsg::Exited { status });
             if let Some(conn) = &mut self.conn {
@@ -1070,6 +1075,17 @@ impl Worker {
                     a.keep_only(&request_ids);
                 }
             }
+            BrokerMsg::RevokeApprovalRule { rule_id } => {
+                let revoked = self
+                    .approvals
+                    .as_mut()
+                    .map(|a| (a.revoke(&rule_id), a.rules()));
+                let ok = revoked.as_ref().is_some_and(|(ok, _)| *ok);
+                self.send(&WorkerMsg::ApprovalRuleRevoked { rule_id, ok });
+                if let Some((true, rules)) = revoked {
+                    self.send(&WorkerMsg::ApprovalRules { rules });
+                }
+            }
         }
         false
     }
@@ -1142,6 +1158,9 @@ impl Worker {
                 | ApprovalEvent::Applied { request_id, .. } => {
                     self.open_approvals.remove(request_id);
                 }
+                ApprovalEvent::AutoAllowed { .. }
+                | ApprovalEvent::Rules(_)
+                | ApprovalEvent::RuleRevoked { .. } => {}
             }
         }
         let released = self.approvals.as_mut().is_some_and(|a| a.take_released());
@@ -1166,6 +1185,21 @@ impl Worker {
                     request_id,
                     outcome,
                 },
+                ApprovalEvent::AutoAllowed {
+                    request_id,
+                    rule_id,
+                    tool,
+                    summary,
+                } => WorkerMsg::ApprovalAutoAllowed {
+                    request_id,
+                    rule_id,
+                    tool,
+                    summary,
+                },
+                ApprovalEvent::Rules(rules) => WorkerMsg::ApprovalRules { rules },
+                ApprovalEvent::RuleRevoked { rule_id, ok } => {
+                    WorkerMsg::ApprovalRuleRevoked { rule_id, ok }
+                }
             };
             self.send(&message);
         }

@@ -36,6 +36,13 @@ pub enum Inbound {
         request_id: String,
         approval: Value,
     },
+    /// An Atem session rule revoked from chat (`approval_rule_revoke`
+    /// instead of `text`, r7.2): the session-v1 revoke payload as it is.
+    RevokeRule {
+        generation: String,
+        request_id: String,
+        revoke: Value,
+    },
     Close,
 }
 
@@ -78,10 +85,25 @@ pub fn parse_inbound(env: &ChatEnvelope) -> Result<Inbound, String> {
             if !valid_id(&request_id) {
                 return Err("invalid requestId".into());
             }
-            if let Some(approval) = env.body.get("approval") {
-                if env.body.contains_key("text") {
-                    return Err("a submit carries text or approval, not both".into());
+            let field = crate::session_protocol::wire::RULE_REVOKE_FIELD;
+            let carried = ["text", "approval", field]
+                .iter()
+                .filter(|k| env.body.contains_key(**k))
+                .count();
+            if carried > 1 {
+                return Err(format!("a submit carries one of text, approval or {field}"));
+            }
+            if let Some(revoke) = env.body.get(field) {
+                if !revoke.is_object() {
+                    return Err(format!("invalid {field}"));
                 }
+                return Ok(Inbound::RevokeRule {
+                    generation,
+                    request_id,
+                    revoke: revoke.clone(),
+                });
+            }
+            if let Some(approval) = env.body.get("approval") {
                 if !approval.is_object() {
                     return Err("invalid approval".into());
                 }
@@ -126,8 +148,17 @@ struct OpenedBody<'a> {
     sequence: u64,
     status: StatusBody<'a>,
     /// What this agent's chat can't provide (`streaming`, `reasoning`,
-    /// `always_allow`, `error_details`); empty for Claude.
+    /// `error_details`); empty for Claude.
     unavailable: &'a [String],
+    /// The session's active Atem session rules (r7.2; `[]` for a
+    /// conversation of an attachment without `control`).
+    approval_rules: &'a [crate::session_protocol::wire::AlwaysRule],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RulesBody<'a> {
+    approval_rules: &'a [crate::session_protocol::wire::AlwaysRule],
 }
 
 #[derive(Serialize)]
@@ -149,6 +180,8 @@ enum PartBody<'a> {
         summary: &'a str,
         always_rules: &'a [crate::session_protocol::wire::AlwaysRule],
         state: super::adapter::ApprovalCardState,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule_id: Option<&'a str>,
     },
 }
 
@@ -226,6 +259,7 @@ fn part_body(p: &Part) -> PartBody<'_> {
             summary: &c.summary,
             always_rules: &c.always_rules,
             state: c.state,
+            rule_id: c.rule_id.as_deref(),
         },
     }
 }
@@ -278,6 +312,7 @@ pub fn opened(
     generation: &str,
     status: &Status,
     unavailable: &[String],
+    approval_rules: &[crate::session_protocol::wire::AlwaysRule],
 ) -> ChatEnvelope {
     envelope(
         conv,
@@ -289,7 +324,29 @@ pub fn opened(
             sequence: 0,
             status: status_body(status),
             unavailable,
+            approval_rules,
         },
+    )
+}
+
+/// The session's active Atem session rules changed (r7.2): `rules` with
+/// the whole list.
+pub fn rules(
+    conv: &str,
+    agent: &str,
+    generation: &str,
+    sequence: u64,
+    approval_rules: &[crate::session_protocol::wire::AlwaysRule],
+) -> ChatEnvelope {
+    envelope(
+        conv,
+        agent,
+        "rules",
+        Some(Head {
+            generation,
+            sequence,
+        }),
+        RulesBody { approval_rules },
     )
 }
 
@@ -454,6 +511,7 @@ mod tests {
                 scope: "this project".into(),
             }],
             state: ApprovalCardState::AlwaysAllowed,
+            rule_id: None,
         })];
         let e = body(&event("c1", "claude", "g", 3, &Out::Message(m)));
         assert_eq!(
@@ -462,6 +520,55 @@ mod tests {
                    "summary": "npm test", "state": "always_allowed",
                    "always_rules": [{"rule_id": "r0-1", "label": "Allow Bash(npm test:*)",
                                      "scope": "this project"}]})
+        );
+    }
+
+    #[test]
+    fn a_rule_revoke_is_a_submit_with_approval_rule_revoke() {
+        let revoke = json!({"rule_id": "s-1"});
+        assert_eq!(
+            parse_inbound(&env(
+                "submit",
+                json!({"generation": "g", "requestId": "r1", "approval_rule_revoke": revoke.clone()})
+            ))
+            .unwrap(),
+            Inbound::RevokeRule {
+                generation: "g".into(),
+                request_id: "r1".into(),
+                revoke: revoke.clone(),
+            }
+        );
+        for bad in [
+            json!({"generation": "g", "requestId": "r1", "approval_rule_revoke": revoke, "text": "hi"}),
+            json!({"generation": "g", "requestId": "r1", "approval_rule_revoke": revoke,
+                   "approval": {"approval_id": "a"}}),
+            json!({"generation": "g", "requestId": "r1", "approval_rule_revoke": "s-1"}),
+        ] {
+            assert!(parse_inbound(&env("submit", bad.clone())).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_auto_allowed_card_names_its_rule() {
+        use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
+        let mut m = msg();
+        m.role = Role::Assistant;
+        m.origin = None;
+        m.parts = vec![Part::Approval(ApprovalCard {
+            id: "approval".into(),
+            approval_id: "a1".into(),
+            tool: "Bash".into(),
+            summary: "ls".into(),
+            always_rules: Vec::new(),
+            state: ApprovalCardState::AutoAllowed,
+            rule_id: Some("s-1".into()),
+        })];
+        let e = body(&event("c1", "codex", "g", 3, &Out::Message(m)));
+        assert_eq!(
+            e["parts"][0],
+            json!({"id": "approval", "kind": "approval", "approval_id": "a1", "tool": "Bash",
+                   "summary": "ls", "state": "auto_allowed", "always_rules": [],
+                   "rule_id": "s-1"})
         );
     }
 
@@ -562,14 +669,35 @@ mod tests {
             detail: None,
         };
         assert_eq!(
-            body(&opened("c1", "claude", "g", &st, &[])),
+            body(&opened("c1", "claude", "g", &st, &[], &[])),
             json!({"v":1,"op":"opened","conversationId":"c1","agentId":"claude","generation":"g","sequence":0,
-                   "status":{"state":"working","since":5},"unavailable":[]})
+                   "status":{"state":"working","since":5},"unavailable":[],"approvalRules":[]})
         );
-        let codex = ["streaming".to_string(), "always_allow".to_string()];
+        let codex = ["streaming".to_string(), "reasoning".to_string()];
+        let rule = crate::session_protocol::wire::AlwaysRule {
+            rule_id: "s-1".into(),
+            label: "Always allow `ls` in /p for this session".into(),
+            scope: "session".into(),
+        };
+        let v = body(&opened(
+            "c1",
+            "codex",
+            "g",
+            &st,
+            &codex,
+            std::slice::from_ref(&rule),
+        ));
+        assert_eq!(v["unavailable"], json!(["streaming", "reasoning"]));
         assert_eq!(
-            body(&opened("c1", "codex", "g", &st, &codex))["unavailable"],
-            json!(["streaming", "always_allow"])
+            v["approvalRules"],
+            json!([{"rule_id": "s-1", "label": "Always allow `ls` in /p for this session",
+                    "scope": "session"}])
+        );
+        assert_eq!(
+            body(&rules("c1", "codex", "g", 4, &[rule])),
+            json!({"v":1,"op":"rules","conversationId":"c1","agentId":"codex","generation":"g",
+                   "sequence":4,"approvalRules":[{"rule_id": "s-1",
+                   "label": "Always allow `ls` in /p for this session", "scope": "session"}]})
         );
         let st = Status {
             state: State::Waiting,
@@ -577,7 +705,7 @@ mod tests {
             detail: Some("Bash".into()),
         };
         assert_eq!(
-            body(&opened("c1", "claude", "g", &st, &[]))["status"],
+            body(&opened("c1", "claude", "g", &st, &[], &[]))["status"],
             json!({"state":"waiting","since":6,"detail":"Bash"})
         );
     }

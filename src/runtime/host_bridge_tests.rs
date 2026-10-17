@@ -1182,6 +1182,7 @@ fn classification_follows_section_6() {
         ok,
         dropped,
         no_effect,
+        consumed: false,
         error: None,
     };
     assert_eq!(super::classify(&outcome(true, false, false)), None);
@@ -2382,7 +2383,7 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         );
         assert_eq!(
             opened["data"]["unavailable"],
-            json!(["streaming", "reasoning", "always_allow", "error_details"])
+            json!(["streaming", "reasoning", "error_details"])
         );
         let lease = peer.acquire(&sid, &pg).await;
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -2739,4 +2740,197 @@ async fn open_chat_any(peer: &mut Peer, conversation: &str, sid: &str, pg: &str)
         })
         .await;
     peer.seen[at].clone()
+}
+
+/// Atem session rules (§6a r7.2): a Codex card's "Always allow this
+/// command" keeps a rule in the worker; the same command then runs with no
+/// approval (an `auto_allowed` card), the rule is listed in session-v1 and
+/// chat-v1 until it is revoked from chat; an interrupt that only hands a
+/// waiting approval to Codex's dialog says so.
+#[test]
+fn codex_session_rules_allow_the_same_command_until_revoked() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt
+            .launch_fake_codex(&mut client, &fake, &fake_codex())
+            .await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        rt.peer.hello().await;
+        listed(&mut rt.peer, &sid).await;
+        attach_client(&mut client, &sid, 24, 80).await;
+        client
+            .send(&ClientMsg::input(&sid, b"one\r"))
+            .await
+            .unwrap();
+        agent_event(&fake, "prompt turn-1 one").await;
+        let peer = &mut rt.peer;
+        peer.chat("open", "conv-1", &sid, &pg, json!({}));
+        let opened = peer.wait(|v| is_chat(v, "opened")).await;
+        assert_eq!(opened["data"]["approvalRules"], json!([]));
+
+        // The card offers a session rule; allow_always keeps it.
+        let touch = json!({"tool_name": "Bash", "tool_input": {"command": "touch a.txt"}});
+        ask(&fake, 1, touch.clone());
+        let request = peer.wait(|v| is_session(v, "approval_request")).await["data"].clone();
+        let aid = request["approval_id"].as_str().unwrap().to_string();
+        let rule = request["always_rules"][0].clone();
+        assert_eq!(rule["scope"], "session", "{request}");
+        assert!(
+            rule["label"]
+                .as_str()
+                .unwrap()
+                .starts_with("Always allow `touch a.txt` in "),
+            "{rule}"
+        );
+        let rule_id = rule["rule_id"].as_str().unwrap().to_string();
+        let from = peer.seen.len();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": uuid::Uuid::new_v4().to_string(),
+                   "approval": {"approval_id": aid, "decision": "allow_always",
+                                "rule_id": rule_id, "acquire": true}}),
+        );
+        agent_event(&fake, "answer 1 allow").await;
+        let peer = &mut rt.peer;
+        let r = rule_id.clone();
+        let listed_rules = peer
+            .wait_from(from, move |v| {
+                is_session(v, "approval_rules") && v["data"]["rules"][0]["rule_id"] == r.as_str()
+            })
+            .await;
+        assert_eq!(peer.seen[listed_rules]["data"]["process_gen"], pg.as_str());
+        let r = rule_id.clone();
+        peer.wait_from(from, move |v| {
+            is_chat(v, "rules") && v["data"]["approvalRules"][0]["rule_id"] == r.as_str()
+        })
+        .await;
+
+        // The same command again: allowed by the worker, no approval.
+        let from = peer.seen.len();
+        ask(&fake, 2, touch.clone());
+        agent_event(&fake, "answer 2 allow").await;
+        let peer = &mut rt.peer;
+        let r = rule_id.clone();
+        let card = peer
+            .wait_from(from, move |v| {
+                is_chat(v, "message")
+                    && v["data"]["parts"][0]["state"] == "auto_allowed"
+                    && v["data"]["parts"][0]["rule_id"] == r.as_str()
+            })
+            .await;
+        assert_eq!(
+            peer.seen[card]["data"]["parts"][0]["summary"],
+            "touch a.txt"
+        );
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            !peer.seen[from..]
+                .iter()
+                .any(|v| is_session(v, "approval_request") || v["type"] == "relay"),
+            "no approval and no push for an auto-allowed request"
+        );
+        // A new conversation lists the rule.
+        peer.chat("open", "conv-2", &sid, &pg, json!({}));
+        let opened = peer
+            .wait(|v| is_chat(v, "opened") && v["data"]["conversationId"] == "conv-2")
+            .await;
+        assert_eq!(
+            opened["data"]["approvalRules"][0]["rule_id"],
+            rule_id.as_str()
+        );
+
+        // The broker restarts: the worker kept the rule, the new broker
+        // lists it after the snapshot and it still allows the command.
+        drop(client);
+        let dir = rt.shutdown().await;
+        let mut rt = Runtime::start_in(dir, "rt2.sock").await;
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        let from = peer.seen.len();
+        listed(peer, &sid).await;
+        let r = rule_id.clone();
+        peer.wait_from(from, move |v| {
+            is_session(v, "approval_rules") && v["data"]["rules"][0]["rule_id"] == r.as_str()
+        })
+        .await;
+        peer.chat("open", "conv-3", &sid, &pg, json!({}));
+        let opened = peer
+            .wait(|v| is_chat(v, "opened") && v["data"]["conversationId"] == "conv-3")
+            .await;
+        assert_eq!(
+            opened["data"]["approvalRules"][0]["rule_id"],
+            rule_id.as_str()
+        );
+        let from = peer.seen.len();
+        ask(&fake, 4, touch.clone());
+        agent_event(&fake, "answer 4 allow").await;
+        let peer = &mut rt.peer;
+        let r = rule_id.clone();
+        peer.wait_from(from, move |v| {
+            is_chat(v, "message")
+                && v["data"]["parts"][0]["state"] == "auto_allowed"
+                && v["data"]["parts"][0]["rule_id"] == r.as_str()
+        })
+        .await;
+
+        // Revoked from chat (with the lease): completed, the list empties.
+        let lease = peer.acquire(&sid, &pg).await;
+        let revoke = uuid::Uuid::new_v4().to_string();
+        let from = peer.seen.len();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": revoke, "lease_epoch": lease,
+                   "approval_rule_revoke": {"rule_id": rule_id}}),
+        );
+        let rv = revoke.clone();
+        peer.wait_from(from, move |v| {
+            is_chat(v, "complete") && v["data"]["requestId"] == rv.as_str()
+        })
+        .await;
+        peer.wait_from(from, |v| {
+            is_session(v, "approval_rules") && v["data"]["rules"] == json!([])
+        })
+        .await;
+
+        // The same command asks again; an interrupt now only hands the
+        // waiting approval to Codex's dialog, and says so.
+        ask(&fake, 5, touch);
+        let peer = &mut rt.peer;
+        let from = peer.seen.len();
+        peer.wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        activity_until(peer, &sid, "waiting").await;
+        let interrupt = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)),
+                   "request_id": interrupt, "kind": "interrupt", "payload": {}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+        let rejected = final_receipt(peer, &interrupt).await;
+        assert_eq!(rejected["state"], "rejected", "{rejected}");
+        assert_eq!(
+            rejected["detail"],
+            "the approval was handed to the terminal; interrupt again to stop the turn"
+        );
+        agent_event(&fake, "answer 5 none").await;
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn the_auto_allowed_log_line_names_the_rule_never_the_command() {
+    let line = super::auto_allowed_line("ses-aaaaaaaaaaaa", "Bash", "s-0123456789abcdef");
+    assert_eq!(
+        line,
+        "atem runtime: ses-aaaaaaaaaaaa: Bash allowed by session rule s-0123456789abcdef"
+    );
 }

@@ -196,7 +196,6 @@ async fn the_first_chat_snapshot_names_the_chat_capabilities() {
             vec![
                 "streaming".to_string(),
                 "reasoning".into(),
-                "always_allow".into(),
                 "error_details".into()
             ]
         )

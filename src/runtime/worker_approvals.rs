@@ -45,12 +45,25 @@
 //! session through a shell never answers through it. A decision is handed
 //! over only while the hook has more than 5 s left. Never an allow without
 //! the broker's decision.
+//!
+//! Atem session rules (Codex, r7.2): a Codex card offers "Always allow this
+//! command" (`approvals::SessionRule`). Once the hook took an `allow_always`
+//! naming it, the worker keeps the rule for this agent process (at most
+//! `MAX_SESSION_RULES`; gone when the process ends, kept across broker
+//! restarts since the worker owns it). A later request of this session's
+//! pinned Codex (`codex_owns`; a nested or foreign `codex` never) whose
+//! tool, full command (or file changes) and cwd are byte-equal to a rule's
+//! is answered allow by the worker itself while a broker is connected — no
+//! approval is opened — and reported `AutoAllowed` (redacted). The broker
+//! can revoke a rule (`revoke`); every change is reported as `Rules`.
 
 use crate::chat::adapter::ToolResultKind;
-use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request};
+use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request, SessionRule};
 use crate::runtime::worker_protocol::ApplyOutcome;
 use crate::session_protocol::host::ApprovalInfo;
-use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision};
+use crate::session_protocol::wire::{
+    AlwaysRule, ApprovalCloseReason, ApprovalDecision, MAX_SESSION_RULES,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -84,6 +97,19 @@ pub enum Event {
         request_id: String,
         outcome: ApplyOutcome,
     },
+    /// Allowed by the session rule `rule_id` without asking (r7.2); `tool`
+    /// and `summary` are redacted as on a card.
+    AutoAllowed {
+        request_id: String,
+        rule_id: String,
+        tool: String,
+        summary: String,
+    },
+    /// The session's active rules changed (the whole list).
+    Rules(Vec<AlwaysRule>),
+    /// The broker's `revoke_approval_rule`: whether the rule was active
+    /// (never produced by `Approvals`; the worker reports it).
+    RuleRevoked { rule_id: String, ok: bool },
 }
 
 /// What the agent did, as the worker learns it besides the hook files.
@@ -141,6 +167,9 @@ struct Waiting {
     reported: bool,
     /// This session's agent started its hook (Codex; Claude: always).
     ours: bool,
+    /// The session rule an `allow_always` decision chose, kept once the
+    /// hook took it.
+    pending_rule: Option<SessionRule>,
     state: State,
 }
 
@@ -160,6 +189,8 @@ pub struct Approvals {
     /// Codex: one of this session's requests got "no decision" since the
     /// last `take_released`, so Codex shows its own dialog for it.
     released: bool,
+    /// Codex: the Atem session rules of this agent process, oldest first.
+    rules: Vec<SessionRule>,
 }
 
 fn is_id(id: &str) -> bool {
@@ -225,7 +256,43 @@ impl Approvals {
             codex_session: None,
             queued: Vec::new(),
             released: false,
+            rules: Vec::new(),
         }
+    }
+
+    /// The active session rules as cards show them, oldest first.
+    pub fn rules(&self) -> Vec<AlwaysRule> {
+        self.rules.iter().map(|r| r.rule.clone()).collect()
+    }
+
+    /// Revokes the session rule `rule_id`; false when it isn't active.
+    pub fn revoke(&mut self, rule_id: &str) -> bool {
+        let before = self.rules.len();
+        self.rules.retain(|r| r.rule.rule_id != rule_id);
+        self.rules.len() != before
+    }
+
+    /// Keeps `rule` (the hook took the `allow_always` that chose it), unless
+    /// the session holds as many as it may or one that matches the same.
+    fn keep_rule(&mut self, rule: SessionRule) {
+        if self.rules.iter().any(|r| r.matcher == rule.matcher) {
+            return;
+        }
+        if self.rules.len() >= MAX_SESSION_RULES {
+            eprintln!(
+                "atem worker: session rule {} not kept: the session holds {MAX_SESSION_RULES}",
+                rule.rule.rule_id
+            );
+            return;
+        }
+        self.rules.push(rule);
+        self.queued.push(Event::Rules(self.rules()));
+    }
+
+    /// The active rule this request matches exactly, if any.
+    fn matching_rule(&self, request: &Request) -> Option<&SessionRule> {
+        let matcher = request.matcher.as_ref()?;
+        self.rules.iter().find(|r| &r.matcher == matcher)
     }
 
     #[cfg(test)]
@@ -407,6 +474,17 @@ impl Approvals {
         if !self.write_decision(id, &output) {
             return refused;
         }
+        let rule = w
+            .request
+            .as_ref()
+            .and_then(|r| r.session_rule.clone())
+            .filter(|r| {
+                decision == ApprovalDecision::AllowAlways
+                    && Some(r.rule.rule_id.as_str()) == rule_id
+            });
+        if let Some(w) = self.waiting.get_mut(id) {
+            w.pending_rule = rule;
+        }
         let deny = (decision == ApprovalDecision::Deny).then(|| {
             message
                 .map(str::trim)
@@ -462,6 +540,9 @@ impl Approvals {
                 outcome: ApplyOutcome::Ok,
             });
             self.set(id, State::Released);
+            if let Some(rule) = self.waiting.get_mut(id).and_then(|w| w.pending_rule.take()) {
+                self.keep_rule(rule);
+            }
         } else {
             self.set(
                 id,
@@ -560,7 +641,7 @@ impl Approvals {
         let req_path = self.path("req", id, ".json");
         let opened_ms = mtime_ms(&req_path).unwrap_or_else(now_ms);
         let value = read_capped(&req_path).and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        let request = value
+        let mut request = value
             .as_ref()
             .and_then(|v| approvals::request(self.agent, v));
         let ids: Vec<u32> = read_capped(&self.path("pid", id, ""))
@@ -579,6 +660,25 @@ impl Approvals {
             Agent::Claude => true,
             Agent::Codex => self.codex_owns(ids.get(1).copied(), value.as_ref()),
         };
+        // A session rule allows it: only this session's pinned agent, only
+        // while a broker is connected (it shows the note).
+        let auto = request
+            .as_ref()
+            .filter(|_| connected && ours && self.agent == Agent::Codex)
+            .and_then(|r| {
+                let rule = self.matching_rule(r)?;
+                Some(Event::AutoAllowed {
+                    request_id: id.to_string(),
+                    rule_id: rule.rule.rule_id.clone(),
+                    tool: r.info.tool.clone(),
+                    summary: r.info.summary.clone(),
+                })
+            });
+        if let Some(r) = request.as_mut()
+            && self.rules.len() >= MAX_SESSION_RULES
+        {
+            r.withdraw_session_rule();
+        }
         let info = request.as_ref().map(|r| r.info.clone());
         self.waiting.insert(
             id.to_string(),
@@ -589,9 +689,17 @@ impl Approvals {
                 opened_ms,
                 reported: false,
                 ours,
+                pending_rule: None,
                 state: State::Open,
             },
         );
+        if let Some(event) = auto
+            && self.write_decision(id, &approvals::allow_output())
+        {
+            // Done for the broker: the files go once the hook is gone.
+            self.set(id, State::Released);
+            return Some(event);
+        }
         match info {
             Some(info) if connected && ours => {
                 self.waiting.get_mut(id).unwrap().reported = true;

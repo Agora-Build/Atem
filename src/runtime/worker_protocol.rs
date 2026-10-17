@@ -144,6 +144,11 @@ pub enum BrokerMsg {
     KnownApprovals {
         request_ids: Vec<String>,
     },
+    /// Revokes the Atem session rule `rule_id` (r7.2) →
+    /// `approval_rule_revoked`, then `approval_rules` when it was active.
+    RevokeApprovalRule {
+        rule_id: String,
+    },
 }
 
 impl std::fmt::Debug for BrokerMsg {
@@ -191,6 +196,7 @@ impl std::fmt::Debug for BrokerMsg {
             BrokerMsg::KnownApprovals { request_ids } => {
                 write!(f, "KnownApprovals({} ids)", request_ids.len())
             }
+            BrokerMsg::RevokeApprovalRule { rule_id } => write!(f, "RevokeApprovalRule({rule_id})"),
         }
     }
 }
@@ -335,7 +341,7 @@ pub enum WorkerMsg {
     /// The agent's permission prompt waits for a decision (its hook runs):
     /// what the card shows, redacted (`worker_approvals`). Sent only while a
     /// broker is connected; `always_rules` are the agent's own suggestions
-    /// (Claude; none for Codex).
+    /// (Claude) or the Atem session rule the card offers (Codex).
     ApprovalRequest {
         request_id: String,
         tool: String,
@@ -352,6 +358,25 @@ pub enum WorkerMsg {
     ApprovalApplied {
         request_id: String,
         outcome: ApplyOutcome,
+    },
+    /// The worker answered a request allow itself: it matched the Atem
+    /// session rule `rule_id` (r7.2). `tool`/`summary` redacted as on a
+    /// card; no approval was opened.
+    ApprovalAutoAllowed {
+        request_id: String,
+        rule_id: String,
+        tool: String,
+        summary: String,
+    },
+    /// The session's active Atem session rules (the whole list), on every
+    /// connection when there are any and whenever they change.
+    ApprovalRules {
+        rules: Vec<AlwaysRule>,
+    },
+    /// The answer to `revoke_approval_rule`: `ok` when the rule was active.
+    ApprovalRuleRevoked {
+        rule_id: String,
+        ok: bool,
     },
 }
 

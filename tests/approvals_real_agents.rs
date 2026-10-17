@@ -1028,10 +1028,11 @@ fn codex_approvals_end_to_end() {
     assert_eq!(request["process_gen"], generation.as_str());
     // Codex's chat status while the hook waits (the worker's open approval).
     rig.activity(&sid, "waiting", Duration::from_secs(10));
+    // Codex takes no persistent rule: the card offers an Atem session rule.
     assert!(
         request["always_rules"]
             .as_array()
-            .is_some_and(|r| r.is_empty()),
+            .is_some_and(|r| r.len() == 1 && r[0]["scope"] == "session"),
         "{request}"
     );
     let push = rig.push("push_approval", &aid, Duration::from_secs(10));
@@ -1052,8 +1053,8 @@ fn codex_approvals_end_to_end() {
     });
     screen_until(&fe, "Codex idle", TURN, codex_idle);
     report.push(format!(
-        "6 allow_once: request tool={} summary={:?} rules=[]; receipt {states:?} (final {}); closed answered_remote; push expires_at-created_at={} ms; file created",
-        request["tool"], request["summary"], receipt["state"],
+        "6 allow_once: request tool={} summary={:?} rules={}; receipt {states:?} (final {}); closed answered_remote; push expires_at-created_at={} ms; file created",
+        request["tool"], request["summary"], request["always_rules"], receipt["state"],
         push["expires_at"].as_u64().unwrap_or(0).saturating_sub(request["created_at"].as_u64().unwrap_or(0))
     ));
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
@@ -1122,9 +1123,77 @@ fn codex_approvals_end_to_end() {
     ));
     assert_eq!(reason, "released");
     assert_eq!(resolved["reason"], "released");
+    assert!(consumed, "the releasing key answered Codex's dialog");
+
+    // 9. "Always allow this command" (an Atem session rule): the same
+    //    command then runs with no approval, shown as an auto_allowed card.
+    rig.send(json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+        "conversationId": "conv-rules", "agentId": sid,
+        "binding": rig.binding(&sid, &generation)}}));
+    rig.wait(Duration::from_secs(10), "chat opened", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "opened"
+            && m["data"]["conversationId"] == "conv-rules"
+    });
+    let always =
+        "Run exactly this shell command, unchanged: touch codex-always.txt . Do nothing else.";
+    type_line(&mut fe, always);
+    let request = approval_or_screen(&mut rig, &fe, &sid, &known);
+    let aid = request["approval_id"].as_str().unwrap().to_string();
+    known.push(aid.clone());
+    let rule = request["always_rules"][0].clone();
+    assert_eq!(rule["scope"], "session", "{request}");
+    let rule_id = rule["rule_id"].as_str().unwrap().to_string();
+    let (_, rid) = rig.answer(
+        &sid,
+        &generation,
+        json!({"approval_id": aid, "decision": "allow_always", "rule_id": rule_id}),
+    );
+    let (receipt, states) = rig.receipt_final(&rid, Duration::from_secs(30));
+    assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
+    within_secs("codex-always.txt", 120, || {
+        work.join("codex-always.txt").exists()
+    });
+    let r = rule_id.clone();
+    rig.wait(Duration::from_secs(10), "approval_rules", move |m| {
+        m["data"]["op"] == "approval_rules" && m["data"]["rules"][0]["rule_id"] == r.as_str()
+    });
+    screen_until(&fe, "Codex idle", TURN, codex_idle);
+    std::fs::remove_file(work.join("codex-always.txt")).unwrap();
+    let before = rig.seen.len();
+    type_line(&mut fe, always);
+    within_secs("codex-always.txt again", 120, || {
+        rig.pump(Duration::from_millis(100));
+        work.join("codex-always.txt").exists()
+    });
+    let r = rule_id.clone();
+    let card = rig.wait(Duration::from_secs(10), "auto_allowed card", move |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["parts"][0]["state"] == "auto_allowed"
+            && m["data"]["parts"][0]["rule_id"] == r.as_str()
+    });
+    screen_until(&fe, "Codex idle", TURN, codex_idle);
+    rig.pump(Duration::from_millis(500));
+    let new_cards = rig.seen[before..]
+        .iter()
+        .filter(|m| m["data"]["op"] == "approval_request")
+        .count();
+    // (runtime_log() redacts ids, the rule's too.)
+    let log = rig.runtime_log();
+    let logged = log.lines().any(|l| l.contains("allowed by session rule"));
+    let leaked = log
+        .lines()
+        .filter(|l| l.contains("allowed by session rule"))
+        .any(|l| l.contains("touch") || l.contains("codex-always"));
+    report.push(format!(
+        "9 always allow (session rule {}): receipt {states:?}; rule listed; same command ran again with {new_cards} approval_request(s); auto_allowed card summary {:?}; runtime.log line: {logged}, command text in it: {leaked}",
+        rule["label"], card["data"]["parts"][0]["summary"]
+    ));
+    assert_eq!(new_cards, 0, "the same command asked again");
+    assert!(logged && !leaked, "runtime.log: {logged} {leaked}");
 
     eprintln!("CODEX REPORT:\n{}", report.join("\n"));
-    assert!(consumed, "the releasing key answered Codex's dialog");
 }
 
 /// The texts of the assistant messages chat delivered for `turn`.
@@ -1181,7 +1250,7 @@ fn codex_chat_end_to_end() {
     );
     assert_eq!(
         opened["unavailable"],
-        json!(["streaming", "reasoning", "always_allow", "error_details"])
+        json!(["streaming", "reasoning", "error_details"])
     );
     let lease = rig.acquire(&sid, &generation);
     let early = rig.chat_submit(

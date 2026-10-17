@@ -1203,3 +1203,163 @@ fn welcome_permissions_have_no_approve() {
     );
     assert!(!decodes(&m));
 }
+
+// ── Atem session rules (r7.2) ──
+
+fn session_rule(id: &str) -> AlwaysRule {
+    AlwaysRule {
+        rule_id: id.into(),
+        label: format!("Always allow `{id}` in /p for this session"),
+        scope: "session".into(),
+    }
+}
+
+fn revoke(rt: &FakeRuntime, client: &str, epoch: Option<u64>, n: u64, rule_id: &str) -> Value {
+    msg(
+        "submit",
+        json!({"binding": binding(rt, client, epoch), "request_id": rid(n),
+               "kind": "approval_rule_revoke", "payload": {"rule_id": rule_id}}),
+    )
+}
+
+#[test]
+fn rule_revoke_payloads_decode_strictly() {
+    let with = |payload: Value| {
+        msg(
+            "submit",
+            json!({"binding": {"target": target(P1), "attachment_gen": C1, "lease_epoch": 1},
+                   "request_id": rid(1), "kind": "approval_rule_revoke", "payload": payload}),
+        )
+    };
+    assert!(decodes(&with(json!({"rule_id": "s-0123456789abcdef"}))));
+    for bad in [
+        json!({}),
+        json!({"rule_id": "bad rule"}),
+        json!({"rule_id": "s-1", "extra": 1}),
+        json!({"rule_id": null}),
+        json!("s-1"),
+    ] {
+        assert!(!decodes(&with(bad.clone())), "{bad}");
+    }
+    // The lease is required: no `acquire` form.
+    let mut m = with(json!({"rule_id": "s-1"}));
+    m["data"]["binding"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lease_epoch");
+    assert!(!decodes(&m));
+    // chat-v1: `approval_rule_revoke` instead of `text`, with the lease.
+    let chat = |revoke: Value, lease: Option<u64>| {
+        let mut b = json!({"target": target(P1), "attachment_gen": C1});
+        if let Some(e) = lease {
+            b["lease_epoch"] = json!(e);
+        }
+        json!({"type": "agentChat", "data": {"v": 1, "op": "submit", "conversationId": "c1",
+               "agentId": S1, "generation": P1, "requestId": rid(2),
+               "approval_rule_revoke": revoke, "binding": b}})
+    };
+    assert!(decodes(&chat(json!({"rule_id": "s-1"}), Some(1))));
+    assert!(!decodes(&chat(json!({"rule_id": "s-1"}), None)));
+    assert!(!decodes(&chat(json!({"rule_id": "s 1"}), Some(1))));
+    // `approval_rules` from the host: ≤ 32 rules, unique ids.
+    let rules =
+        |n: usize| -> Vec<AlwaysRule> { (0..n).map(|i| session_rule(&format!("s-{i}"))).collect() };
+    let op = |rules: Vec<AlwaysRule>| {
+        msg(
+            "approval_rules",
+            json!({"session_id": S1, "process_gen": P1, "rules": rules}),
+        )
+    };
+    assert!(decodes(&op(rules(32))));
+    assert!(!decodes(&op(rules(33))));
+    assert!(!decodes(&op(vec![
+        session_rule("s-1"),
+        session_rule("s-1")
+    ])));
+}
+
+#[test]
+fn session_rules_reach_control_viewers_and_end_with_the_process() {
+    let mut rt = setup();
+    let epoch = list_and_hold(&mut rt, "c1");
+    rt.send("r", &msg("list", json!({})));
+    got(&mut rt, "r");
+    let fx = rt
+        .host
+        .set_approval_rules(S1, P1, vec![session_rule("s-1")])
+        .unwrap();
+    rt.apply(fx);
+    let c1 = got(&mut rt, "c1");
+    assert_eq!(ops(&c1), ["approval_rules"]);
+    assert_eq!(c1[0]["rules"][0]["rule_id"], "s-1");
+    assert_eq!(c1[0]["process_gen"], P1);
+    assert!(got(&mut rt, "r").is_empty(), "view-only gets no rules");
+    // The same list again changes nothing; another process is refused.
+    let fx = rt
+        .host
+        .set_approval_rules(S1, P1, vec![session_rule("s-1")])
+        .unwrap();
+    rt.apply(fx);
+    assert!(got(&mut rt, "c1").is_empty());
+    assert!(rt.host.set_approval_rules(S1, P1B, vec![]).is_err());
+    // A late subscriber with control gets them after its snapshot.
+    got(&mut rt, "v");
+    rt.send("v", &msg("list", json!({})));
+    assert_eq!(ops(&got(&mut rt, "v")), ["sessions", "approval_rules"]);
+    // A view-only one doesn't, and can't revoke either.
+    rt.send("r", &msg("list", json!({})));
+    assert_eq!(ops(&got(&mut rt, "r")), ["sessions"]);
+    rt.send("r", &revoke(&rt, "r", Some(epoch), 1, "s-1"));
+    assert_eq!(got(&mut rt, "r")[0]["code"], "forbidden");
+    // The holder of a stale epoch can't revoke.
+    rt.send("c1", &revoke(&rt, "c1", Some(epoch + 1), 2, "s-1"));
+    assert_eq!(got(&mut rt, "c1")[0]["code"], "stale_lease");
+    // The process ends: the list empties for viewers, and a revoke of the
+    // old process's rule is stale.
+    let fx = rt.host.process_exited(S1, None);
+    rt.apply(fx);
+    let c1 = got(&mut rt, "c1");
+    let empty = c1.iter().find(|m| m["op"] == "approval_rules").unwrap();
+    assert_eq!(empty["rules"], json!([]));
+    assert!(rt.host.approval_rules(S1).is_empty());
+}
+
+#[test]
+fn a_rule_revoked_from_chat_completes_in_chat() {
+    let mut rt = setup();
+    let epoch = list_and_hold(&mut rt, "c1");
+    let fx = rt
+        .host
+        .set_approval_rules(S1, P1, vec![session_rule("s-1")])
+        .unwrap();
+    rt.apply(fx);
+    got(&mut rt, "c1");
+    let m = json!({"type": "agentChat", "data": {"v": 1, "op": "submit", "conversationId": "conv",
+        "agentId": S1, "generation": P1, "requestId": rid(7),
+        "approval_rule_revoke": {"rule_id": "s-1"},
+        "binding": binding(&rt, "c1", Some(epoch))}});
+    rt.send("c1", &m);
+    let chats: Vec<ChatReply> = rt
+        .effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Chat { reply, .. } => Some(reply.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chats,
+        [
+            ChatReply::Accepted { request_id: rid(7) },
+            ChatReply::Complete {
+                request_id: rid(7),
+                turn_id: None
+            }
+        ]
+    );
+    assert!(rt.host.approval_rules(S1).is_empty());
+    assert_eq!(
+        rt.host.receipt(&rid(7)).unwrap().kind,
+        ReceiptKind::ApprovalRuleRevoke
+    );
+}

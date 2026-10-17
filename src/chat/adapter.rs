@@ -27,7 +27,8 @@ impl Part {
 }
 
 /// What a chat-v1 approval card shows: the tool, the redacted summary, the
-/// agent's own "always allow" rules and the card's state.
+/// "always allow" rules it offers and the card's state; `rule_id` names the
+/// Atem session rule that allowed it (`auto_allowed`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalCard {
     pub id: String,
@@ -36,6 +37,8 @@ pub struct ApprovalCard {
     pub summary: String,
     pub always_rules: Vec<crate::session_protocol::wire::AlwaysRule>,
     pub state: ApprovalCardState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +51,8 @@ pub enum ApprovalCardState {
     AnsweredTerminal,
     Expired,
     Closed,
+    /// Allowed by an Atem session rule without asking (r7.2).
+    AutoAllowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,8 +173,6 @@ pub struct Capabilities {
 pub const UNAVAILABLE_STREAMING: &str = "streaming";
 /// The model's reasoning.
 pub const UNAVAILABLE_REASONING: &str = "reasoning";
-/// "Always allow" on approval cards (a persistent rule).
-pub const UNAVAILABLE_ALWAYS_ALLOW: &str = "always_allow";
 /// The model or API error behind a failed turn.
 pub const UNAVAILABLE_ERROR_DETAILS: &str = "error_details";
 
