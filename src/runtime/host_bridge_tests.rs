@@ -797,6 +797,23 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         let receipts = peer.reply(&id).await;
         assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
         assert_eq!(receipts["receipts"][0]["detail"], "done", "{receipts}");
+        // The journal keeps no prompt text once the request left `accepted`.
+        let journal = rt.dir.path().join("state").join("journal");
+        let mut files = 0;
+        let mut stack = vec![journal];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                stack.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            } else {
+                files += 1;
+                let bytes = std::fs::read(&path).unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(!text.contains("run the tests"), "{}", path.display());
+                assert!(!text.contains("no lease"), "{}", path.display());
+            }
+        }
+        assert!(files > 0, "no journal files");
+        let peer = &mut rt.peer;
         let old_attachment = peer.attachment.clone();
 
         // The broker restarts; its worker survives and is adopted.
@@ -894,23 +911,37 @@ fn paging_older_history_continues_the_live_sequence_and_unknown_cursors_are_refu
         let last = *live.last().unwrap();
 
         // An older page of the open conversation: no `opened`, the page at
-        // the next sequences, nothing reset.
+        // the next sequences, nothing reset, then its end marker (a
+        // `status` naming the page).
         let from = peer.seen.len();
         peer.chat("open", "conv-1", &sid, &pg, json!({"before": "u-2"}));
-        peer.drain(Duration::from_millis(500)).await;
-        let page: Vec<&Value> = peer.seen[from..]
+        let end = peer
+            .wait_from(from, |v| {
+                is_chat(v, "status") && v["data"].get("page").is_some()
+            })
+            .await;
+        let page: Vec<&Value> = peer.seen[from..=end]
             .iter()
             .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1")
             .collect();
         assert!(!page.iter().any(|v| is_chat(v, "opened")), "{page:#?}");
         let ids: Vec<&str> = page
             .iter()
+            .filter(|v| is_chat(v, "message"))
             .map(|v| v["data"]["messageId"].as_str().unwrap_or(""))
             .collect();
         assert_eq!(ids, ["u-1", "msg-1"], "{page:#?}");
-        assert!(page.iter().all(|v| v["data"]["history"] == true));
+        assert_eq!(page.len(), 3, "the page, then its marker: {page:#?}");
+        assert!(page[..2].iter().all(|v| v["data"]["history"] == true));
         assert_eq!(page[0]["data"]["sequence"], last + 1);
         assert_eq!(page[1]["data"]["sequence"], last + 2);
+        let marker = &page[2]["data"];
+        assert_eq!(marker["sequence"], last + 3);
+        assert_eq!(marker["state"], "ready");
+        assert_eq!(
+            marker["page"],
+            json!({"before": "u-2", "count": 2, "start": true})
+        );
 
         // Live events go on after the page.
         let rid = uuid::Uuid::new_v4().to_string();
@@ -947,16 +978,50 @@ fn paging_older_history_continues_the_live_sequence_and_unknown_cursors_are_refu
         assert_eq!(error["op"], "error", "{error}");
         assert_eq!(error["code"], "stale_target");
         assert!(error.get("sequence").is_none());
-        // The oldest message as the cursor is the start: an empty page.
+        // A cursor named with another generation is refused too.
         let from = peer.seen.len();
-        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "u-1"}));
-        peer.drain(Duration::from_millis(300)).await;
-        assert!(
-            !peer.seen[from..]
-                .iter()
-                .any(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1"),
-            "{:#?}",
-            &peer.seen[from..]
+        peer.chat(
+            "open",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"before": "u-2", "generation": "another-generation"}),
+        );
+        let at = peer
+            .wait_from(from, |v| {
+                is_chat(v, "error") && v["data"]["conversationId"] == "conv-1"
+            })
+            .await;
+        assert_eq!(peer.seen[at]["data"]["code"], "stale_target");
+        // The oldest message as the cursor: an empty page, whose marker
+        // says it is the start.
+        let from = peer.seen.len();
+        peer.chat(
+            "open",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"before": "u-1", "generation": pg}),
+        );
+        let end = peer
+            .wait_from(from, |v| {
+                is_chat(v, "status") && v["data"].get("page").is_some()
+            })
+            .await;
+        let got: Vec<&Value> = peer.seen[from..=end]
+            .iter()
+            .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1")
+            .collect();
+        assert_eq!(got.len(), 1, "only the marker: {got:#?}");
+        assert_eq!(
+            got[0]["data"]["page"],
+            json!({"before": "u-1", "count": 0, "start": true})
+        );
+        let all = sequences(&peer.seen, "conv-1");
+        assert_eq!(
+            all,
+            (0..all.len() as u64).collect::<Vec<_>>(),
+            "never reset or reused"
         );
         rt.shutdown().await;
     });

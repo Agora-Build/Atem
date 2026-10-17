@@ -2060,11 +2060,12 @@ impl HostBridge {
                 };
                 let conversation = env.conversation_id.clone();
                 match chat_wire::parse_inbound(&env) {
-                    Ok(Inbound::Open { before }) => self.open_conversation(
+                    Ok(Inbound::Open { before, generation }) => self.open_conversation(
                         attachment,
                         sid,
                         &conversation,
                         before.as_deref(),
+                        generation.as_deref(),
                         cx,
                     ),
                     Ok(Inbound::Close) => {
@@ -2100,6 +2101,7 @@ impl HostBridge {
         sid: &str,
         conversation: &str,
         before: Option<&str>,
+        before_generation: Option<&str>,
         cx: &mut Cx,
     ) {
         let Some(session) = session_of(cx, sid) else {
@@ -2131,7 +2133,7 @@ impl HostBridge {
         // sent) is refused, never answered with an empty page that would
         // look like the start of history.
         if let Some(id) = before
-            && !session.chat.retains(id)
+            && !session.chat.retains(id, before_generation)
         {
             let head = if paging {
                 self.next_head(sid, conversation, cx)
@@ -2149,11 +2151,16 @@ impl HostBridge {
             self.send_chat(env, cx);
             return;
         }
+        // Cards are left out before the limits (a view-only page of cards
+        // still pages on to older messages).
+        let keep = |m: &crate::chat::session::ChatMessage| control || !is_card(m);
         if paging {
-            let history = session
+            let (page, start) = session
                 .chat
-                .history(before, HISTORY_MESSAGES, HISTORY_BYTES);
-            for message in history.into_iter().filter(|m| control || !is_card(m)) {
+                .page(before, HISTORY_MESSAGES, HISTORY_BYTES, keep);
+            let status = Out::Status(session.chat.status().clone());
+            let count = page.len();
+            for message in page {
                 if let Some((generation, sequence)) = self.next_head(sid, conversation, cx) {
                     let env = chat_wire::history_message(
                         conversation,
@@ -2164,6 +2171,16 @@ impl HostBridge {
                     );
                     self.send_chat(env, cx);
                 }
+            }
+            // Every page ends with a sequenced `status` naming it, so an
+            // empty page (the start) is an answer too, never silence.
+            if let Some((generation, sequence)) = self.next_head(sid, conversation, cx) {
+                let mut env = chat_wire::event(conversation, sid, &generation, sequence, &status);
+                env.body.insert(
+                    "page".into(),
+                    json!({"before": before, "count": count, "start": start}),
+                );
+                self.send_chat(env, cx);
             }
             return;
         }
@@ -2180,11 +2197,11 @@ impl HostBridge {
             &session.chat_unavailable,
             &rules,
         )];
-        let history = session
+        let (history, _) = session
             .chat
-            .history(before, HISTORY_MESSAGES, HISTORY_BYTES);
+            .page(before, HISTORY_MESSAGES, HISTORY_BYTES, keep);
         let mut sequence = 1;
-        for message in history.iter().filter(|m| control || !is_card(m)) {
+        for message in history.iter() {
             envelopes.push(chat_wire::history_message(
                 conversation,
                 sid,

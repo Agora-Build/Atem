@@ -366,10 +366,12 @@ pub enum WorkerMsg {
     ChatHistoryPart {
         history: Vec<crate::chat::session::ChatMessage>,
     },
-    /// Answers `request_chat_history`: the newest messages of the worker's
-    /// retained history (older ones in the `chat_history_part`s before it).
+    /// Answers `request_chat_history`: the worker's chat state (status,
+    /// turns, input mark) with the newest messages of its retained history
+    /// in `snapshot.history` (older ones in the `chat_history_part`s before
+    /// it).
     ChatHistory {
-        history: Vec<crate::chat::session::ChatMessage>,
+        snapshot: crate::chat::session::ChatSnapshot,
     },
     Activity {
         state: Activity,

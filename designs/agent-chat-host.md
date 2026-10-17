@@ -349,7 +349,7 @@ on the existing authenticated Astation connection.
 
 | op | Direction | Fields |
 |---|---|---|
-| `open` | Astation → Atem | `conversationId`, `agentId`, optional `before` (messageId) |
+| `open` | Astation → Atem | `conversationId`, `agentId`, optional `before` (messageId) and `generation` (the one `before` came from) |
 | `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), `approvalRules` (the session's active Atem session rules `[{rule_id, label, scope}]`; `[]` without `control`), then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
 | `submit` | Astation → Atem | `generation`, `requestId` (UUID), and one of `text`, `approval` (§6a answer) or `approval_rule_revoke` (`{rule_id}`, r7.2) |
 | `rules` | Atem → Astation | `approvalRules` (the whole list, when it changed; conversations with `control` only) |
@@ -368,13 +368,21 @@ on the existing authenticated Astation connection.
   with or overtakes a page and the client keeps applying `last + 1`. The
   page holds older messages than ones already sent: place messages by
   `messageId` (a whole message replaces an earlier copy) and order them by
-  `createdAt`/history position, not by `sequence`. An empty page means
-  `before` was the oldest retained message (the start). `open` without
+`createdAt`/history position, not by `sequence`. Every such page ends
+  with a sequenced `status` (the current status) carrying
+  `page: {before, count, start}`: `count` is the number of messages the
+  page held, `start: true` means it reached the oldest retained message (no
+  older page to ask for). An empty page is that marker alone
+  (`count: 0, start: true`), never silence. Approval cards are left out of
+  a view-only attachment's pages before the 50-message / 256 KiB limits,
+  so a stretch of cards never yields an empty page while older messages
+  exist (the same holds for the newest page on `opened`). `open` without
   `before` on an open conversation is a resynchronization: a new `opened`
   at 0 and the newest page; replace the cache. `open` with `before` on a
   conversation that isn't open opens it (`opened` at 0) with that page.
-- A `before` that isn't in the retained history (evicted, from another
-  generation, never sent) is refused with `error{code:"stale_target"}`,
+- `open` may carry the optional `generation` its `before` came from. A
+  `before` that isn't in the retained history (evicted, never sent), or
+  named with another `generation`, is refused with `error{code:"stale_target"}`,
   text "that message is no longer in the history; reopen without before to
   get the newest page", never an empty page. On an open conversation the
   error is sequenced and the conversation stays open; on a new one it
@@ -453,7 +461,7 @@ on the existing authenticated Astation connection.
 | Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason (open conversations get `error` and `close`); terminal unaffected |
 | No acceptance within 10 s of a paste | `error` "delivery unknown"; never resent |
 | Astation disconnects / re-authenticates | conversations close; Claude keeps running; a new `open` restores status and history |
-| The worker dropped chat items before they reached the broker (its backlog overflowed in one read, `chat.gap > 0`) | the broker asks the worker for its whole retained history (`request_chat_history` → `chat_history_part`s + `chat_history`), replaces its own with it (keeping its newer approval card states), then open conversations get `error` "the chat history was incomplete (some items were dropped) and was reloaded; reopen the chat" (no `code`, like the chat's other own errors) and `close`; a reopen gets the complete history. Without a worker to ask they get the same `error` and `close` at once |
+| The worker dropped chat items before they reached the broker (its backlog overflowed in one read, `chat.gap > 0`) | the broker asks the worker for its whole retained history (`request_chat_history` → `chat_history_part`s + `chat_history`), replaces its own with it (keeping its newer approval card states) and catches up with the worker's chat state carried in `chat_history` (status, current and last completed turn with its outcome, input mark: a turn end it missed completes then, and so does its prompt's receipt), then open conversations get `error` "the chat history was incomplete (some items were dropped) and was reloaded; reopen the chat" (no `code`, like the chat's other own errors) and `close`; a reopen gets the complete history. Without a worker to ask, when the worker goes away before answering, or when the reload exceeds 1000 messages (all its parts are dropped, the history stays as it was, never with a hole), they get the same `error` and `close` |
 | Broker restart or adoption | the worker's `chat_snapshot` carries its whole retained history (500 messages / 8 MiB), older messages first in `chat_history_part` lines of at most 1 MiB each, approval cards included (the broker copies every card to the worker, `chat_card`); a card still `pending` becomes `closed` with the note "Atem's runtime restarted; answer in the terminal" (the new broker released its approval). Prompt acceptance in flight is not carried |
 | Atem exits | the terminal and Claude end with it (as today); a new Atem has a new generation |
 

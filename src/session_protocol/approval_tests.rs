@@ -1396,3 +1396,54 @@ fn a_trust_change_or_restart_clears_the_session_rules() {
     rt.apply(fx);
     assert!(rt.host.approval_rules(S1).is_empty());
 }
+
+/// The outcome of a chat prompt's turn lives in its receipt's detail, so a
+/// duplicate submit after a runtime restart still says it was interrupted.
+#[test]
+fn a_duplicate_chat_prompt_after_a_restart_keeps_its_interrupted_outcome() {
+    let mut rt = setup();
+    let epoch = list_and_hold(&mut rt, "c1");
+    let submit = |rt: &FakeRuntime, epoch: u64| {
+        json!({"type": "agentChat", "data": {"v": 1, "op": "submit", "conversationId": "conv",
+            "agentId": S1, "generation": P1, "requestId": rid(5), "text": "run it",
+            "binding": binding(rt, "c1", Some(epoch))}})
+    };
+    rt.send("c1", &submit(&rt, epoch));
+    let fx = rt.host.dispatch_report(
+        &rid(5),
+        DispatchReport::Completed {
+            detail: Some(DETAIL_TURN_INTERRUPTED.into()),
+            turn_id: Some("t1".into()),
+        },
+    );
+    rt.apply(fx);
+    assert_eq!(
+        rt.host.receipt(&rid(5)).unwrap().detail.as_deref(),
+        Some("interrupted")
+    );
+    let fx = rt
+        .host
+        .restart("99999999-9999-4999-8999-999999999999", 8)
+        .unwrap();
+    rt.apply(fx);
+    rt.attach("c1", C1B).unwrap();
+    let epoch = list_and_hold(&mut rt, "c1");
+    rt.effects.clear();
+    rt.send("c1", &submit(&rt, epoch));
+    let chats: Vec<ChatReply> = rt
+        .effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Chat { reply, .. } => Some(reply.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chats,
+        [ChatReply::Complete {
+            request_id: rid(5),
+            turn_id: None,
+            interrupted: true
+        }]
+    );
+}

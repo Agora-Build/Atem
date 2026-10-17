@@ -315,15 +315,28 @@ async fn the_chat_snapshot_carries_the_whole_history_and_the_cards() {
 }
 
 /// A `chat` batch with a gap (the worker dropped items before they reached
-/// the broker): the broker reloads the whole history from the worker (which
-/// holds the cards the broker gave it) and open conversations must reopen.
+/// the broker): the broker reloads the whole history from the worker, which
+/// brings back what the broker missed; the broker's own card states win
+/// over the worker's copies; open conversations must reopen.
 #[tokio::test]
 async fn a_chat_gap_reloads_the_history_from_the_worker() {
-    use crate::chat::adapter::ApprovalCardState;
+    use crate::chat::adapter::{ApprovalCardState, Part};
     let Setup { mut session, _dir } = launch("exec cat").await;
     settle(&mut session).await;
     let _ = session.take_chat_reset();
+    // a1 goes to both; the broker then denies it (the copy to the worker
+    // is "in flight", i.e. never sent here).
     session.approval_card(card("a1", ApprovalCardState::Pending), 5);
+    session
+        .chat
+        .approval_card(card("a1", ApprovalCardState::Denied), 6);
+    // What the broker missed: in the worker's history only.
+    let mut missed = ChatSession::new("x".into(), 0);
+    let Out::Message(missed) = missed.approval_card(card("a0", ApprovalCardState::Expired), 4)
+    else {
+        panic!("a message");
+    };
+    session.worker.as_ref().unwrap().chat_card(missed).unwrap();
     let mut pumped = Pumped::default();
     session.apply(
         WorkerMsg::Chat {
@@ -344,12 +357,84 @@ async fn a_chat_gap_reloads_the_history_from_the_worker() {
     );
     pump_while(&mut session, |s| s.chat_reset.is_some()).await;
     assert_eq!(session.take_chat_reset(), Some(CHAT_INCOMPLETE));
+    let history = session.chat.history(None, usize::MAX, usize::MAX);
+    let states: Vec<(String, ApprovalCardState)> = history
+        .iter()
+        .map(|m| match m.parts.as_slice() {
+            [Part::Approval(c)] => (m.message_id.clone(), c.state),
+            _ => panic!("{m:?}"),
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("approval-a1".to_string(), ApprovalCardState::Denied),
+            ("approval-a0".to_string(), ApprovalCardState::Expired)
+        ],
+        "the missed card is back; the broker's a1 state wins"
+    );
+    session.stop().unwrap();
+}
+
+/// A worker that goes away while a reload is pending: conversations reopen
+/// on what the broker has, nothing waits for an answer.
+#[tokio::test]
+async fn a_worker_lost_during_a_reload_ends_the_conversations() {
+    let Setup { mut session, _dir } = launch("sleep 1; exit 0").await;
+    let Out::Message(part) = ChatSession::new("x".into(), 0).approval_card(
+        card("a9", crate::chat::adapter::ApprovalCardState::Expired),
+        1,
+    ) else {
+        panic!("a message");
+    };
+    session.history_requested = true;
+    session.history_parts.push(part);
+    // The agent exits, the worker is released and its connection closes.
+    pump_while(&mut session, |s| s.worker.is_none()).await;
+    assert!(!session.history_requested && session.history_parts.is_empty());
+    assert_eq!(session.take_chat_reset(), Some(CHAT_INCOMPLETE));
+}
+
+/// Parts beyond their bound are all dropped, and the reload falls back to
+/// "incomplete" on what is here (never a history with a hole); the state
+/// still catches up.
+#[tokio::test]
+async fn an_oversized_reload_keeps_the_history_and_says_it_is_incomplete() {
+    use crate::chat::adapter::ApprovalCardState;
+    let Setup { mut session, _dir } = launch("exec cat").await;
+    settle(&mut session).await;
+    let _ = session.take_chat_reset();
+    session.approval_card(card("keep", ApprovalCardState::Denied), 1);
+    let mut source = ChatSession::new("x".into(), 0);
+    let mut many = Vec::new();
+    for i in 0..(2 * crate::chat::session::MAX_HISTORY_MESSAGES + 1) {
+        if let Out::Message(m) =
+            source.approval_card(card(&format!("p{i}"), ApprovalCardState::Expired), 1)
+        {
+            many.push(m);
+        }
+    }
+    let mut pumped = Pumped::default();
+    session.history_requested = true;
+    for chunk in many.chunks(100) {
+        session.apply(
+            WorkerMsg::ChatHistoryPart {
+                history: chunk.to_vec(),
+            },
+            &mut pumped,
+        );
+    }
+    let mut snapshot = source.snapshot(0, 0);
+    snapshot.history = Vec::new();
+    session.apply(WorkerMsg::ChatHistory { snapshot }, &mut pumped);
+    assert_eq!(session.take_chat_reset(), Some(CHAT_INCOMPLETE));
+    assert!(session.history_parts.is_empty() && !session.history_overflow);
     let ids: Vec<String> = session
         .chat
         .history(None, usize::MAX, usize::MAX)
         .into_iter()
         .map(|m| m.message_id)
         .collect();
-    assert_eq!(ids, ["approval-a1"], "the worker's copy of the card");
+    assert_eq!(ids, ["approval-keep"]);
     session.stop().unwrap();
 }

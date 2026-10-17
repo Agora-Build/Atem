@@ -195,6 +195,8 @@ pub struct BrokerSession {
     history_parts: Vec<crate::chat::session::ChatMessage>,
     /// `request_chat_history` was sent and not answered yet.
     history_requested: bool,
+    /// The `chat_history_part`s went over their bound and were dropped.
+    history_overflow: bool,
 }
 
 /// What one pass over a worker's messages changed.
@@ -258,6 +260,7 @@ impl BrokerSession {
             approval_events: Vec::new(),
             history_parts: Vec::new(),
             history_requested: false,
+            history_overflow: false,
         }
     }
 
@@ -690,6 +693,12 @@ impl BrokerSession {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.worker = None;
+                    // A reload it never answered: conversations reopen on
+                    // what is here.
+                    if std::mem::take(&mut self.history_requested) {
+                        self.history_parts.clear();
+                        self.chat_reset = Some(CHAT_INCOMPLETE);
+                    }
                     if self.state == SessionState::Running {
                         eprintln!(
                             "atem runtime: the worker of {} went away without an exit",
@@ -794,32 +803,51 @@ impl BrokerSession {
                 }
             }
             WorkerMsg::ChatHistoryPart { history } => {
-                // Bounded like the history it rebuilds.
-                if self.history_parts.len() + history.len()
-                    <= 2 * crate::chat::session::MAX_HISTORY_MESSAGES
+                // Bounded like the history it rebuilds; beyond that nothing
+                // of it is used (`history_overflow`), never a silent hole.
+                if self.history_overflow
+                    || self.history_parts.len() + history.len()
+                        > 2 * crate::chat::session::MAX_HISTORY_MESSAGES
                 {
+                    self.history_parts.clear();
+                    self.history_overflow = true;
+                } else {
                     self.history_parts.extend(history);
                 }
             }
-            WorkerMsg::ChatHistory { history } => {
-                let mut all = std::mem::take(&mut self.history_parts);
-                all.extend(history);
-                // This broker's cards win over the worker's copies (an update
-                // may have crossed the request).
-                let cards: Vec<_> = self
-                    .chat
-                    .history(None, usize::MAX, usize::MAX)
-                    .into_iter()
-                    .filter(|m| m.message_id.starts_with("approval-"))
-                    .collect();
-                self.chat.replace_history(all);
-                for card in cards {
-                    if self.chat.retains(&card.message_id) {
-                        self.chat.put_card(card);
-                    }
-                }
+            WorkerMsg::ChatHistory { snapshot } => {
                 self.history_requested = false;
                 self.chat_reset = Some(CHAT_INCOMPLETE);
+                let mut snapshot = snapshot;
+                let mut all = std::mem::take(&mut self.history_parts);
+                if std::mem::take(&mut self.history_overflow) {
+                    // Too large to rebuild: the history stays as it is
+                    // (conversations still reopen); the state catches up.
+                    eprintln!(
+                        "atem runtime: {}: the worker's history was too large to reload",
+                        self.id
+                    );
+                } else {
+                    all.append(&mut snapshot.history);
+                    // This broker's cards win over the worker's copies (an
+                    // update may have crossed the request).
+                    let cards: Vec<_> = self
+                        .chat
+                        .history(None, usize::MAX, usize::MAX)
+                        .into_iter()
+                        .filter(|m| m.message_id.starts_with("approval-"))
+                        .collect();
+                    self.chat.replace_history(all);
+                    for card in cards {
+                        if self.chat.retains(&card.message_id, None) {
+                            self.chat.put_card(card);
+                        }
+                    }
+                }
+                // A turn end dropped on the way completes here now (and its
+                // prompt's receipt), and the status follows the worker's.
+                let outs = self.chat.catch_up(&snapshot);
+                self.chat_out.extend(outs);
             }
             WorkerMsg::Activity { state, detail } => {
                 if self.state == SessionState::Running {
@@ -932,6 +960,15 @@ impl BrokerSession {
                 // (none for a fresh broker) reload it.
                 let mut snapshot = snapshot;
                 let mut all = std::mem::take(&mut self.history_parts);
+                if std::mem::take(&mut self.history_overflow) {
+                    // Too large to rebuild: only the newest part (older
+                    // history is cut, as if evicted, never holed).
+                    eprintln!(
+                        "atem runtime: {}: the worker's snapshot was too large; kept its newest part",
+                        self.id
+                    );
+                    all.clear();
+                }
                 all.append(&mut snapshot.history);
                 snapshot.history = all;
                 self.chat = ChatSession::restore(self.process_gen.clone(), snapshot);

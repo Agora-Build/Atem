@@ -1462,7 +1462,11 @@ pub(super) fn snapshot_messages(
 
 /// The answer to `request_chat_history`.
 pub(super) fn history_messages(chat: &ChatSession) -> Vec<WorkerMsg> {
-    history_lines(chat, |history| WorkerMsg::ChatHistory { history })
+    let mut snapshot = chat.snapshot(0, 0);
+    history_lines(chat, move |history| {
+        snapshot.history = history;
+        WorkerMsg::ChatHistory { snapshot }
+    })
 }
 
 /// A write refused for its stale input epoch.

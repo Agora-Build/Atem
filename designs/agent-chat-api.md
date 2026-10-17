@@ -115,10 +115,17 @@ Reply, in order: `opened`, then history as `message` events.
   conversation's next sequence numbers, so keep applying `last + 1`; live
   events before and after it keep their own sequence numbers. Insert paged
   messages by `messageId` and history order (they are older than what you
-  have), never by `sequence`. An empty page (nothing arrives) means you
-  reached the oldest retained message.
-- A `before` Atem no longer retains (evicted, or from another `generation`)
-  is answered `error{code:"stale_target", text:"that message is no longer in
+  have), never by `sequence`. Every page ends with a sequenced `status`
+  that also carries `page`:
+  `{"op":"status",…,"state":"ready","since":…,"page":{"before":"m40","count":50,"start":false}}`.
+  `count` is how many messages the page held; `start: true` means it
+  reached the oldest message Atem retains, so stop paging. An empty page is
+  just that marker (`count: 0, start: true`). Treat it as a normal status
+  update too. Without `control`, approval cards are left out before the
+  page limits, so you still get older messages after a run of cards.
+- Send `generation` (the one from `opened`) with `before`. A `before` Atem
+  no longer retains (evicted), or one named with another `generation`, is
+  answered `error{code:"stale_target", text:"that message is no longer in
   the history; reopen without before to get the newest page"}`, never an
   empty page: "no more history" and "cursor unknown" are different. On an
   open conversation the error is sequenced and the conversation stays open.
