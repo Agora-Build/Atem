@@ -108,8 +108,22 @@ Reply, in order: `opened`, then history as `message` events.
 - History is the latest 50 messages / 256 KiB, sent whole (never as deltas),
   each with `history: true` and the next `sequence`. Replace anything you cached
   with the same `messageId`.
-- Older pages: `open` again with `before: "<messageId>"`. This re-opens the
-  conversation (a new `opened`, `sequence` 0) and sends that older page.
+- Older pages: `open` again on the same open conversation with
+  `before: "<messageId>"` (usually the oldest `messageId` you hold). No
+  `opened` comes and nothing is reset: the older page (50 messages / 256 KiB
+  before that message) arrives as `message{history:true}` at the
+  conversation's next sequence numbers, so keep applying `last + 1`; live
+  events before and after it keep their own sequence numbers. Insert paged
+  messages by `messageId` and history order (they are older than what you
+  have), never by `sequence`. An empty page (nothing arrives) means you
+  reached the oldest retained message.
+- A `before` Atem no longer retains (evicted, or from another `generation`)
+  is answered `error{code:"stale_target", text:"that message is no longer in
+  the history; reopen without before to get the newest page"}`, never an
+  empty page: "no more history" and "cursor unknown" are different. On an
+  open conversation the error is sequenced and the conversation stays open.
+- `open` without `before` on an open conversation resynchronizes it: a new
+  `opened` at `sequence` 0 and the newest page; replace your cache.
 - `opened.unavailable` lists what this agent's chat can't provide:
   `streaming` (no partial text), `reasoning`, `error_details` (no model/API
   error behind a failed turn). Hide the matching UI. Unknown names are
@@ -134,7 +148,7 @@ All carry `generation` and `sequence` (apply only `last + 1`):
 | `delta` | `messageId`, `part`: a later part appended to a message already sent (both agents; not a token stream); a part id already present is ignored |
 | `status` | `state` (`ready`/`working`/`waiting`/`unknown`), `since`, optional `detail`; re-sent every 15 s with the original `since` |
 | `accepted` | `requestId`: your prompt reached the agent |
-| `complete` | `turnId`, optional `requestId`, `outcome`: `interrupted` when the turn ended interrupted (Esc, a deny at the agent's prompt, Codex's `turn_aborted`), else `done`; a duplicate submit after a broker restart gets `done` (the receipt only says completed) |
+| `complete` | `turnId`, optional `requestId`, `outcome`: `interrupted` when the turn ended interrupted (Esc, a deny at the agent's prompt, Codex's `turn_aborted`), else `done`; for your own submit it comes from the receipt, whose `detail` keeps the outcome, so a duplicate after a broker restart says the same |
 | `error` | `text`, optional `requestId`, and `code` on host-made errors: `rejected`/`outcome_unknown` (your submit's receipt), a session-v1 admission code (`stale_target`, `stale_lease`, `lease_held`, `forbidden`, `session_closed`, `busy`, `paused`, ...), `unsupported_version` (malformed message), `busy` (open without chat). The chat's own notices (agent restarted, conversation switched, chat withdrawn) have no `code` |
 | `rules` | `approvalRules`: the whole list of active Atem session rules, when it changed (conversations with `control` only) |
 | `close` | the conversation ended |
@@ -174,6 +188,7 @@ marks the cut). Text and summaries pass the credential redactor.
 | Another session resumed inside the agent (`/resume`, Codex `/new`) | `error` "the conversation was switched; reopen the chat", `close`; same `generation` | open again; the earlier turns are history only |
 | Agent exits | status `unknown`, errors to open conversations, generation retired | history stays readable |
 | Chat withdrawn (log format changed) | `error`, `close`; descriptor loses `chat-v1` | fall back to the terminal view |
+| Atem dropped chat items before they reached the runtime (a huge burst of agent output) | `error` "the chat history was incomplete (some items were dropped) and was reloaded; reopen the chat", `close`; same `generation` | open again: the history is complete again |
 
 A new `open` always restores status and history. Atem keeps the newest 500
 messages / 8 MiB per agent process.
@@ -264,7 +279,10 @@ A draft typed during a running turn is not detected (v1 limit).
 
 Reply `receipts` (<= 64 ids, only those bound to that exact target). Receipts
 survive broker restarts. A session-v1 `receipt` has `request_id`, `target`,
-`kind`, `state`, `detail?`, `updated_at`. Work executing across a broker restart
+`kind`, `state`, `detail?`, `updated_at`. A `completed` `prompt` receipt's
+`detail` is the turn's outcome: `"done"` or `"interrupted"` (the same as the
+chat `complete.outcome`; the journal keeps only that word, never prompt or
+reply text). Work executing across a broker restart
 becomes `outcome_unknown` and is never retried. Replay after a reconnect of the
 same chat submit is safe because the same `requestId` returns the recorded
 outcome, but the right first move is `receipt_query`.
@@ -545,5 +563,8 @@ Ops: `hello`, `list`, `acquire`, chat `open`/`submit` or session-v1 `submit`
   session; deny `message` 512 bytes.
 - No semantic turn-completion signal beyond the agent's own turn end; no
   reasoning; no Discord adapter in Atem (the bridge above is yours).
-- Approvals do not survive a broker restart. Atem session rules do, inactive
-  until the new host confirms them (section 5.5).
+- Approvals do not survive a broker restart. Their cards stay in history; one
+  still pending becomes `closed` with the note "Atem's runtime restarted;
+  answer in the terminal". Atem session rules survive, inactive until the new
+  host confirms them (section 5.5). Chat history (500 messages / 8 MiB)
+  survives a broker restart whole.

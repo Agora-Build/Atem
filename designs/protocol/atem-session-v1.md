@@ -7,6 +7,8 @@ process and answers a later byte-equal request itself (`auto_allowed`, no
 approval, no push, no lease). Attachments with `control` get the active rules
 (`approval_rules`) and revoke one with a `kind:"approval_rule_revoke"`
 submission. New fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule`.
+Clarified the same day (no new field): a `completed` `prompt` receipt's
+`detail` is its turn's outcome, `"done"` or `"interrupted"` (§6, §7).
 r7.1 (2026-10-17) lets a second `hello` on a welcomed attachment
 replace it instead of refusing it `unauthorized` (§3, compatibility mode):
 after a client reset (e.g. the Mac slept) the client says `hello` again on
@@ -323,7 +325,7 @@ Kinds and payloads (v1):
 
 | kind | payload | completes when |
 |---|---|---|
-| `prompt` | `{"text": string}` | the provider confirms the turn ended (chat-v1 `complete`) |
+| `prompt` | `{"text": string}` | the provider confirms the turn ended (chat-v1 `complete`); `detail` is the turn's outcome, `"done"` or `"interrupted"` |
 | `interrupt` | `{}` | the provider reports the turn interrupted, or the turn was already over (`detail`) |
 | `stop` | `{}` | the agent process exits |
 | `approval` | `{"approval_id", "decision", "rule_id"?, "message"?}` (§6a) | the agent reports it applied the decision |
@@ -648,7 +650,8 @@ Errors are answered in the family of the request (ruling i):
   A chat `submit` hears about its request only through chat-v1 ops mapped
   from its receipt, never a session `receipt`: `accepted`/`executing` →
   `accepted{requestId}`; `completed` → `complete{requestId, turnId?,
-  outcome:"done"}`; `rejected` → `error{requestId, code:"rejected", text:
+  outcome}` (`outcome` is the receipt's `detail` for a prompt, `"done"`
+  or `"interrupted"`; `"done"` for the other kinds); `rejected` → `error{requestId, code:"rejected", text:
   detail}`; `outcome_unknown` → `error{requestId, code:"outcome_unknown",
   text: detail}`. Refusals at admission use the §7 code.
 - Removed forms (§0) and requests that don't decode — of any family — get a

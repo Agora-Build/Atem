@@ -360,19 +360,41 @@ on the existing authenticated Astation connection.
 | `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`, and `code` on every `error` the session host makes: `rejected` or `outcome_unknown` (a submit's receipt), a session-v1 code from admission (`stale_target`, `stale_lease`, `lease_held`, `forbidden`, …), `unsupported_version` (a malformed chat message) or `busy` (`open` without chat-v1, below); the chat's own errors (the agent exited or was restarted, the conversation was switched, chat withdrawn) carry no `code`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
 | `close` | either | `conversationId` |
 
-- `open` with `before` on an open conversation reopens it (`opened`,
-  sequence 0) and sends that older page.
+- History pages (since 2026-10-17). `open` with `before` on a conversation
+  this attachment already has open pages it: no `opened`, nothing reset.
+  The older page (up to 50 messages / 256 KiB strictly before `before`)
+  arrives as `message{history:true}` at that conversation's next sequence
+  numbers, continuing its live sequence, so a live event never collides
+  with or overtakes a page and the client keeps applying `last + 1`. The
+  page holds older messages than ones already sent: place messages by
+  `messageId` (a whole message replaces an earlier copy) and order them by
+  `createdAt`/history position, not by `sequence`. An empty page means
+  `before` was the oldest retained message (the start). `open` without
+  `before` on an open conversation is a resynchronization: a new `opened`
+  at 0 and the newest page; replace the cache. `open` with `before` on a
+  conversation that isn't open opens it (`opened` at 0) with that page.
+- A `before` that isn't in the retained history (evicted, from another
+  generation, never sent) is refused with `error{code:"stale_target"}`,
+  text "that message is no longer in the history; reopen without before to
+  get the newest page", never an empty page. On an open conversation the
+  error is sequenced and the conversation stays open; on a new one it
+  carries no `generation`/`sequence` and opens nothing. `stale_target` is
+  the contract's code for a reference to something the host no longer
+  holds (§7: a closed approval, a revoked rule); no other §7 code fits.
 - `open` on a running session whose chat-v1 is off (Claude before its
-  SessionStart or after chat was withdrawn, Codex without Atem's hooks or
-  before its first hook) is answered `error{code:"busy"}` with the text
-  "chat is not available for this agent" (`: <reason>` when the adapter
-  gave one) and opens nothing. An exited agent's history stays readable.
+  SessionStart or after chat was withdrawn, Codex without Atem's hooks) is
+  answered `error{code:"busy"}` with the text "chat is not available for
+  this agent" (`: <reason>` when the adapter gave one) and opens nothing.
+  Codex with Atem's hooks offers chat-v1 from launch: `open` before its
+  first hook succeeds with status `unknown` and the detail "type a first
+  prompt in the terminal: …", and a `submit` is refused with that text
+  until the first hook arrives. An exited agent's history stays readable.
 - `complete.outcome` is the adapter's turn end: `interrupted` when the turn
   ended interrupted (Esc, a deny at a permission prompt, Codex's
   `turn_aborted`), else `done`. A remote prompt's `complete` follows its
-  completed receipt and carries the outcome the broker remembered for that
-  request; a duplicate `submit` after a broker restart (the receipt says
-  only "completed") gets `done`.
+  completed receipt, whose `detail` is the outcome (`"done"` or
+  `"interrupted"`, journaled as that word only), so a duplicate `submit`
+  after a broker restart gets the real outcome too.
 - `opened.unavailable` names what this agent's chat can't provide, so a
   client says so instead of waiting for it: `streaming` (no partial text:
   messages arrive whole), `reasoning`, `error_details` (no model/API error
@@ -431,6 +453,8 @@ on the existing authenticated Astation connection.
 | Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason (open conversations get `error` and `close`); terminal unaffected |
 | No acceptance within 10 s of a paste | `error` "delivery unknown"; never resent |
 | Astation disconnects / re-authenticates | conversations close; Claude keeps running; a new `open` restores status and history |
+| The worker dropped chat items before they reached the broker (its backlog overflowed in one read, `chat.gap > 0`) | the broker asks the worker for its whole retained history (`request_chat_history` → `chat_history_part`s + `chat_history`), replaces its own with it (keeping its newer approval card states), then open conversations get `error` "the chat history was incomplete (some items were dropped) and was reloaded; reopen the chat" (no `code`, like the chat's other own errors) and `close`; a reopen gets the complete history. Without a worker to ask they get the same `error` and `close` at once |
+| Broker restart or adoption | the worker's `chat_snapshot` carries its whole retained history (500 messages / 8 MiB), older messages first in `chat_history_part` lines of at most 1 MiB each, approval cards included (the broker copies every card to the worker, `chat_card`); a card still `pending` becomes `closed` with the note "Atem's runtime restarted; answer in the terminal" (the new broker released its approval). Prompt acceptance in flight is not carried |
 | Atem exits | the terminal and Claude end with it (as today); a new Atem has a new generation |
 
 ## Testing
