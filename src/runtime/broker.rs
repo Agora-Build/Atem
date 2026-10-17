@@ -25,11 +25,14 @@
 //! Approvals: the worker's `approval_request`/`approval_closed`/
 //! `approval_applied` are queued for the session host (`take_approvals`),
 //! which answers through `approval_decision`/`release_approval`. Codex hides
-//! its prompt while its hook waits, so every write to a Codex session first
-//! asks the worker to release its waiting hooks (`release_approvals`, in
-//! order on the same connection): any input — local or the lease holder's —
-//! goes to Codex's own prompt. Without a session host every request gets "no
-//! decision" at once (`release_untaken`).
+//! its prompt while its hook waits, so every write to a Codex session asks
+//! the worker to release its waiting hooks first (the write's
+//! `release_approvals`). Input that released one — local or the lease
+//! holder's — is consumed, never written: the user saw only Codex's hook
+//! wait, so a key must not answer the dialog it brings back. A local
+//! frontend gets a notice, a remote write `written` with an error. Without a
+//! session host every request gets "no decision" at once
+//! (`release_untaken`).
 //!
 //! Exit: once the broker recorded a worker's `exited` it sends the release
 //! `stop`, and the worker removes its record and ends; the session stays
@@ -470,16 +473,11 @@ impl BrokerSession {
         }
     }
 
-    /// Before any input to Codex: its waiting hooks are released first
-    /// (Codex hides its prompt while one waits), so the input reaches
-    /// Codex's own prompt. Claude shows its dialog meanwhile: nothing to do.
-    fn release_before_input(&self) -> anyhow::Result<()> {
-        if self.provider == crate::session::Provider::Codex.as_str()
-            && let Some(worker) = &self.worker
-        {
-            worker.release_approvals()?;
-        }
-        Ok(())
+    /// Input to Codex releases its waiting hooks first (Codex hides its
+    /// prompt while one waits), and the worker consumes input that released
+    /// one. Claude shows its dialog meanwhile: nothing to do.
+    fn releases_approvals(&self) -> bool {
+        self.provider == crate::session::Provider::Codex.as_str()
     }
 
     /// Writes `bytes` under the current input epoch; its sequence number.
@@ -495,10 +493,10 @@ impl BrokerSession {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
-        self.release_before_input()?;
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
-        worker.write_until(seq, bytes, self.input_epoch, not_after)?;
+        let release = self.releases_approvals();
+        worker.write_until(seq, bytes, self.input_epoch, not_after, release)?;
         self.next_seq += 1;
         self.in_flight.insert(seq, (bytes.len(), tag));
         self.last_used = Instant::now();
@@ -512,10 +510,10 @@ impl BrokerSession {
         if !self.is_live() {
             anyhow::bail!("The session has ended");
         }
-        self.release_before_input()?;
         let worker = self.worker.as_ref().expect("live");
         let seq = self.next_seq;
-        worker.paste_until(seq, text, self.input_epoch, not_after)?;
+        let release = self.releases_approvals();
+        worker.paste_until(seq, text, self.input_epoch, not_after, release)?;
         self.next_seq += 1;
         self.in_flight.insert(seq, (text.len(), WriteTag::Host));
         self.last_used = Instant::now();
@@ -728,6 +726,7 @@ impl BrokerSession {
                 ok,
                 dropped,
                 no_effect,
+                consumed,
                 error,
                 ..
             } => {
@@ -746,6 +745,10 @@ impl BrokerSession {
                 } else if dropped {
                     self.dropped_writes += 1;
                     pumped.dropped_bytes += bytes;
+                } else if consumed {
+                    pumped
+                        .notices
+                        .push(super::worker_protocol::APPROVAL_HANDED_NOTICE.into());
                 } else if !ok {
                     pumped
                         .failed

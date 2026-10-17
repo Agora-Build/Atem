@@ -1755,6 +1755,18 @@ async fn agent_event(fake: &Path, line: &str) {
     });
 }
 
+/// Waits until the fake agent's terminal delivered exactly `bytes`.
+async fn agent_input(fake: &Path, bytes: &[u8]) {
+    let path = fake.join("input");
+    tokio::time::timeout(WAIT, async {
+        while std::fs::read(&path).unwrap_or_default() != bytes {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the agent's input: {:?}", std::fs::read(&path)));
+}
+
 fn is_relay(v: &Value, op: &str, approval_id: &str) -> bool {
     v["type"] == "relay" && v["data"]["op"] == op && v["data"]["approval_id"] == approval_id
 }
@@ -1983,7 +1995,8 @@ fn input_to_codex_releases_its_waiting_hooks_first() {
         listed(peer, &sid).await;
 
         // Local input: Codex hides its prompt while the hook waits, so the
-        // hook is released first and the card closes `released`.
+        // hook is released first and the card closes `released`; the key
+        // itself is consumed (the user never saw Codex's dialog).
         ask(
             &fake,
             1,
@@ -2018,6 +2031,19 @@ fn input_to_codex_releases_its_waiting_hooks_first() {
             .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
             .await;
         assert_eq!(peer.seen[at]["data"]["reason"], "released");
+        expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text }
+                if text == crate::runtime::worker_protocol::APPROVAL_HANDED_NOTICE =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        // The next key reaches Codex's own dialog.
+        client.send(&ClientMsg::input(&sid, b"M")).await.unwrap();
+        agent_input(&fake, b"M").await;
+        let peer = &mut rt.peer;
 
         // The lease holder's terminal input releases it the same way.
         ask(
@@ -2051,11 +2077,31 @@ fn input_to_codex_releases_its_waiting_hooks_first() {
             })
             .await;
         assert_eq!(closed["data"]["reason"], "released");
+        // Acked as not written.
+        let at = peer.wait_from(0, |v| is_terminal(v, "written")).await;
+        let written = &peer.seen[at];
+        assert_eq!(written["data"]["sequence"], 0);
+        assert_eq!(
+            written["data"]["error"],
+            crate::runtime::worker_protocol::APPROVAL_HANDED
+        );
         agent_event(&fake, "answer 2 none ").await;
-        // Both inputs reached Codex, each only after its released hook had
-        // exited (so Codex's own prompt, not its hook wait, gets the keys).
+        // The next one is written.
+        peer.terminal(
+            "input",
+            &sid,
+            &pg,
+            json!({"stream_id": stream, "sequence": 1, "bytes": STANDARD.encode("S")}),
+            Some(lease),
+        );
+        let from = peer.seen.len();
+        let at = peer.wait_from(from, |v| is_terminal(v, "written")).await;
+        assert_eq!(peer.seen[at]["data"]["sequence"], 1);
+        assert_eq!(peer.seen[at]["data"]["error"], Value::Null);
+        agent_input(&fake, b"MS").await;
+        // Only the keys typed at Codex's own dialog reached it.
         let input = std::fs::read(fake.join("input")).unwrap_or_default();
-        assert!(input.contains(&b'L') && input.contains(&b'R'), "{input:?}");
+        assert_eq!(input, b"MS", "{input:?}");
         let events = std::fs::read_to_string(fake.join("events")).unwrap();
         let lines: Vec<&str> = events.lines().collect();
         let at = |prefix: &str| lines.iter().position(|l| l.starts_with(prefix)).unwrap();
@@ -2546,7 +2592,8 @@ fn codex_stays_waiting_at_its_own_dialog_after_a_release() {
         let peer = &mut rt.peer;
         peer.wait(|v| is_session(v, "approval_request")).await;
         activity_until(peer, &sid, "waiting").await;
-        // typing in the terminal releases it: Codex shows its own dialog
+        // typing in the terminal releases it (the key is consumed): Codex
+        // shows its own dialog
         client.send(&ClientMsg::input(&sid, b"a")).await.unwrap();
         agent_event(&fake, "answer 1 none").await;
         let peer = &mut rt.peer;

@@ -130,7 +130,9 @@ terminal-v1:
   current lease.
 - Each `input` is answered with `written` (no `error`, or an error text;
   `"control changed; not written"` when the bytes were dropped at the write
-  boundary because control moved or the lease's deadline passed).
+  boundary because control moved or the lease's deadline passed;
+  `"the approval was handed to the terminal; not written"` when they
+  released a waiting Codex approval hook and were consumed).
 - Lease deadline at the write boundary: every remote write and paste the
   broker hands a worker carries `not_after`, the lease's deadline on
   `CLOCK_MONOTONIC`; the worker's PTY writer drops a chunk whose deadline has
@@ -414,10 +416,16 @@ Astation sees that changed since r6.2.
   `atem agent launch codex` asks once (`[codex] hooks` in Atem's
   config.toml; `false` removes them, and until it is `true` a Codex session
   watches nothing). Codex hides its prompt while the hook
-  waits, so any input to the session — local keys or the lease holder's —
-  first releases the waiting hooks (`approval_closed{released}`), and Atem
-  holds that input until they exited (≤ 500 ms) so it reaches Codex's own
-  prompt. Codex's hook only counts when the session's agent itself started
+  waits (showing "Running hook"), so any input to the session — local keys
+  or the lease holder's, typed or pasted — first releases the waiting hooks
+  (`approval_closed{released}`), and the input that released them is
+  consumed, never written: the user never saw the dialog it brings back, so
+  a `y` approves nothing. The local frontend shows "Codex's approval was
+  handed to the terminal; answer its dialog"; a remote `input` gets
+  `written` with `"the approval was handed to the terminal; not written"`
+  (a remote prompt or interrupt is `rejected`). Input after it is consumed
+  too while the released hooks still run (≤ 500 ms); the next key answers
+  Codex's own dialog. Codex's hook only counts when the session's agent itself started
   it.
 - Approvals live in the broker's memory: after a runtime restart every
   waiting hook gets "no decision" and an `accepted` answer is `rejected`.

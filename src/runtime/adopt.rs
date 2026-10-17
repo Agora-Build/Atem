@@ -214,40 +214,52 @@ impl WorkerHandle {
     /// worker's write boundary → `write_result`.
     #[cfg(test)]
     pub fn write(&self, seq: u64, bytes: &[u8], input_epoch: u64) -> Result<()> {
-        self.write_until(seq, bytes, input_epoch, None)
+        self.write_until(seq, bytes, input_epoch, None, false)
     }
 
     /// A remote write: dropped at the worker's PTY write boundary once
-    /// `not_after` (`pty_session::monotonic_ns`) has passed.
+    /// `not_after` (`pty_session::monotonic_ns`) has passed. With
+    /// `release_approvals` (Codex) the waiting hooks get "no decision" first,
+    /// and input that released one is consumed.
     pub fn write_until(
         &self,
         seq: u64,
         bytes: &[u8],
         input_epoch: u64,
         not_after: Option<u64>,
+        release_approvals: bool,
     ) -> Result<()> {
-        self.send(&BrokerMsg::write_until(seq, bytes, input_epoch, not_after))
+        self.send(&BrokerMsg::write_until(
+            seq,
+            bytes,
+            input_epoch,
+            not_after,
+            release_approvals,
+        ))
     }
 
     /// A bracketed paste plus Enter, under the same rule → `write_result`.
     #[allow(dead_code)] // chat-v1 submit, with the session host
     pub fn paste(&self, seq: u64, text: &str, input_epoch: u64) -> Result<()> {
-        self.paste_until(seq, text, input_epoch, None)
+        self.paste_until(seq, text, input_epoch, None, false)
     }
 
-    /// `paste` with the remote write's deadline (see `write_until`).
+    /// `paste` with the remote write's deadline and the release (see
+    /// `write_until`).
     pub fn paste_until(
         &self,
         seq: u64,
         text: &str,
         input_epoch: u64,
         not_after: Option<u64>,
+        release_approvals: bool,
     ) -> Result<()> {
         self.send(&BrokerMsg::Paste {
             seq,
             text: text.into(),
             input_epoch,
             not_after,
+            release_approvals,
         })
     }
 
@@ -290,11 +302,6 @@ impl WorkerHandle {
         self.send(&BrokerMsg::ReleaseApproval {
             request_id: request_id.into(),
         })
-    }
-
-    /// "No decision" for every waiting approval (before local input).
-    pub fn release_approvals(&self) -> Result<()> {
-        self.send(&BrokerMsg::ReleaseApprovals)
     }
 
     /// After adoption: the approvals this broker knows (the rest released).

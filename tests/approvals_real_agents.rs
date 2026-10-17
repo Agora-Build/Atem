@@ -1091,7 +1091,9 @@ fn codex_approvals_end_to_end() {
         "the model never saw the deny message"
     );
 
-    // 8. a local key while the hook waits: released, Codex's own prompt.
+    // 8. a local key while the hook waits: it releases the hook and is
+    //    consumed (the user saw only "Running hook", never the dialog), so
+    //    even a 'y' approves nothing; Codex's own dialog then takes the key.
     type_line(
         &mut fe,
         "Run the shell command: touch codex-local.txt . Do nothing else.",
@@ -1100,48 +1102,29 @@ fn codex_approvals_end_to_end() {
     let aid = request["approval_id"].as_str().unwrap().to_string();
     known.push(aid.clone());
     std::thread::sleep(Duration::from_secs(1));
-    let before = fe.text();
-    let dialog_before = before.contains("Yes, proceed");
+    let dialog_before = fe.text().contains("Yes, proceed");
     fe.send(b"y");
     let reason = rig.closed(&aid, Duration::from_secs(10));
     let resolved = rig.push("push_resolved", &aid, Duration::from_secs(10));
-    let created = {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if work.join("codex-local.txt").exists() {
-                break true;
-            }
-            if Instant::now() > deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    let mut note = String::new();
-    if !created {
-        // The key didn't reach Codex's dialog: answer it now it shows.
-        note = format!(
-            "; the first 'y' did not answer Codex's dialog (screen after it, redacted):\n{}",
-            redact(&fe.text())
-        );
-        screen_until(&fe, "Codex's own dialog", Duration::from_secs(30), |t| {
-            t.contains("Yes, proceed")
-        });
-        fe.send(b"y");
-        within_secs("codex-local.txt", 60, || {
-            work.join("codex-local.txt").exists()
-        });
-    }
+    screen_until(&fe, "Codex's own dialog", Duration::from_secs(30), |t| {
+        t.contains("Yes, proceed")
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let consumed = !work.join("codex-local.txt").exists();
+    fe.send(b"y");
+    within_secs("codex-local.txt", 60, || {
+        work.join("codex-local.txt").exists()
+    });
     screen_until(&fe, "Codex idle", TURN, codex_idle);
     report.push(format!(
-        "8 local key while the hook waits: dialog visible before: {dialog_before}; closed {reason}; push_resolved {}; first 'y' answered Codex's own prompt: {created}{note}",
+        "8 local key while the hook waits: dialog visible before: {dialog_before}; closed {reason}; push_resolved {}; first 'y' consumed: {consumed}; 'y' at Codex's own dialog created the file",
         resolved["reason"]
     ));
     assert_eq!(reason, "released");
     assert_eq!(resolved["reason"], "released");
 
     eprintln!("CODEX REPORT:\n{}", report.join("\n"));
-    assert!(created, "the local key didn't answer Codex's own prompt");
+    assert!(consumed, "the releasing key answered Codex's dialog");
 }
 
 /// The texts of the assistant messages chat delivered for `turn`.

@@ -514,9 +514,11 @@ takes the lease with the answer (`acquire`).
   (the hook's limit), `released` (Atem gave the prompt back to the agent:
   input reached a Codex session, which hides its prompt while the hook
   waits, so any input — local, or the lease holder's — first answers the
-  hook "no decision", and that input waits until the released hooks exited,
-  at most 500 ms, so it reaches Codex's own prompt; or the runtime
-  restarted), `process_ended` (the process
+  hook "no decision"; that input is consumed, never written, since the user
+  never saw the dialog it brings back: a remote `input` is answered
+  `written` with an error, a prompt or interrupt is `rejected`, and input
+  after it is consumed too while the released hooks still run, at most
+  500 ms; or the runtime restarted), `process_ended` (the process
   exited, was replaced, or the session closed or was removed).
   `answered_remote` is the host's own reason; the runtime reports the
   others. After a hand-off, a lost lease doesn't cancel the answer (§6:

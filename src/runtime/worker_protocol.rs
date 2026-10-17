@@ -28,6 +28,12 @@ pub const MAX_OUTPUT: usize = 16 * 1024;
 pub const MAX_WRITE: usize = crate::pty_session::MAX_FENCED;
 /// Most bytes of text in one `paste`.
 pub const MAX_PASTE: usize = 256 * 1024;
+/// Why a consumed write (`consumed`) wasn't written: the remote `written`
+/// ack's error.
+pub const APPROVAL_HANDED: &str = "the approval was handed to the terminal; not written";
+/// The local frontend's notice for consumed input.
+pub const APPROVAL_HANDED_NOTICE: &str =
+    "Codex's approval was handed to the terminal; answer its dialog";
 
 /// What the broker asks a new worker to run. Written to
 /// `<state>/workers/<session_id>.spec.json` (0600) — without the environment,
@@ -89,6 +95,11 @@ pub enum BrokerMsg {
         input_epoch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         not_after: Option<u64>,
+        /// Codex: every waiting hook gets "no decision" first (Codex hides
+        /// its prompt while one waits); when that released one, this input
+        /// is consumed, never written (`write_result` with `consumed`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        release_approvals: bool,
     },
     /// A bracketed paste plus Enter, under the same rules → `write_result`.
     Paste {
@@ -97,6 +108,8 @@ pub enum BrokerMsg {
         input_epoch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         not_after: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        release_approvals: bool,
     },
     /// Raises the current input epoch (a lower one is ignored).
     SetInputEpoch {
@@ -126,9 +139,6 @@ pub enum BrokerMsg {
     ReleaseApproval {
         request_id: String,
     },
-    /// "No decision" for every waiting hook (before local input is written:
-    /// Codex hides its prompt while a hook waits).
-    ReleaseApprovals,
     /// After adoption: the approvals this broker knows; every other waiting
     /// hook gets "no decision".
     KnownApprovals {
@@ -178,7 +188,6 @@ impl std::fmt::Debug for BrokerMsg {
                 message.as_ref().map_or(0, String::len)
             ),
             BrokerMsg::ReleaseApproval { request_id } => write!(f, "ReleaseApproval({request_id})"),
-            BrokerMsg::ReleaseApprovals => f.write_str("ReleaseApprovals"),
             BrokerMsg::KnownApprovals { request_ids } => {
                 write!(f, "KnownApprovals({} ids)", request_ids.len())
             }
@@ -189,16 +198,24 @@ impl std::fmt::Debug for BrokerMsg {
 impl BrokerMsg {
     #[cfg(test)]
     pub fn write(seq: u64, bytes: &[u8], input_epoch: u64) -> Self {
-        Self::write_until(seq, bytes, input_epoch, None)
+        Self::write_until(seq, bytes, input_epoch, None, false)
     }
 
-    /// A write that must not reach the PTY at or after `not_after`.
-    pub fn write_until(seq: u64, bytes: &[u8], input_epoch: u64, not_after: Option<u64>) -> Self {
+    /// A write that must not reach the PTY at or after `not_after`, after
+    /// releasing the waiting approvals when `release_approvals` (Codex).
+    pub fn write_until(
+        seq: u64,
+        bytes: &[u8],
+        input_epoch: u64,
+        not_after: Option<u64>,
+        release_approvals: bool,
+    ) -> Self {
         BrokerMsg::Write {
             seq,
             bytes: STANDARD.encode(bytes),
             input_epoch,
             not_after,
+            release_approvals,
         }
     }
 }
@@ -300,6 +317,11 @@ pub enum WorkerMsg {
         /// queue. A writer error after queueing leaves it false.
         #[serde(default)]
         no_effect: bool,
+        /// Consumed (nothing written, `no_effect`): the input handed a
+        /// waiting approval to the agent's own dialog, which the user
+        /// hadn't seen yet (`APPROVAL_HANDED`).
+        #[serde(default)]
+        consumed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -468,13 +490,15 @@ mod tests {
                 text: "fix it".into(),
                 input_epoch: 3,
                 not_after: None,
+                release_approvals: false,
             },
-            BrokerMsg::write_until(5, b"x", 3, Some(123_456_789)),
+            BrokerMsg::write_until(5, b"x", 3, Some(123_456_789), true),
             BrokerMsg::Paste {
                 seq: 6,
                 text: "go".into(),
                 input_epoch: 3,
                 not_after: Some(987_654_321),
+                release_approvals: true,
             },
             BrokerMsg::SetInputEpoch { epoch: 4 },
             BrokerMsg::Resize {
@@ -498,7 +522,6 @@ mod tests {
             BrokerMsg::ReleaseApproval {
                 request_id: "a1".into(),
             },
-            BrokerMsg::ReleaseApprovals,
             BrokerMsg::KnownApprovals {
                 request_ids: vec!["a1".into()],
             },
@@ -585,6 +608,7 @@ mod tests {
                 bytes_written: 0,
                 dropped: true,
                 no_effect: false,
+                consumed: false,
                 error: None,
             },
             WorkerMsg::Error { text: "e".into() },
@@ -640,6 +664,7 @@ mod tests {
             text: "a".repeat(n),
             input_epoch: 0,
             not_after: None,
+            release_approvals: false,
         };
         assert!(decode_broker(&encode_broker(&paste(MAX_PASTE))).is_ok());
         assert!(decode_broker(&encode_broker(&paste(MAX_PASTE + 1))).is_err());
@@ -671,6 +696,7 @@ mod tests {
             text: "my password is hunter2".into(),
             input_epoch: 0,
             not_after: None,
+            release_approvals: false,
         };
         let deny = BrokerMsg::ApprovalDecision {
             request_id: "a1".into(),

@@ -466,7 +466,9 @@ and a failure is a session notice (Codex starts anyway).
   `task_started`, `waiting` while the worker has approvals of this session
   open for a remote answer (its set is the only source: Codex has no event
   of its own; after a re-pin with some open it is waiting again) or has
-  released one to Codex's own dialog ("no decision": input to Codex, no
+  released one to Codex's own dialog ("no decision": input to Codex — which
+  is consumed, never written, so it can't answer the dialog the user hadn't
+  seen; a remote prompt or interrupt that released one is `rejected` — no
   broker, an adopting broker that doesn't know it) — that one until its
   PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
   rollout item — `ready` at `task_complete` / `turn_aborted`.

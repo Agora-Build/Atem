@@ -209,7 +209,9 @@ What that means for Atem with Codex:
    the runtime, which revokes the remote lease before writing them; for Codex it
    also answers "no decision" to a waiting hook first, so Codex shows its prompt
    and the user answers it in the terminal (the keystroke that released it is
-   delivered after the prompt appears).
+   consumed, never written: the user saw only "Running hook", so it must not
+   answer the prompt it brings back; the frontend says "Codex's approval was
+   handed to the terminal; answer its dialog").
 2. **Hook timeout 300 s for Codex** (long enough to answer from a locked phone);
    any local key releases it earlier; on timeout Codex shows its own prompt.
 3. On Esc the runtime closes the request itself (the hook may keep running; its
