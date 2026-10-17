@@ -435,7 +435,12 @@ The Codex adapter (`src/chat/codex/adapter.rs`) runs in the worker when
 in `$CODEX_HOME/hooks.json` run `approval-hook.sh event <Event>`, which
 writes each event to the session's `events/` as `ev-<seq>-<Event>.json`:
 first a line with the hook's `$$ $PPID`, then its stdin. The rollout JSONL
-named by `transcript_path` carries every message and turn boundary.
+named by `transcript_path` carries every message and turn boundary. With
+the setting on, each Codex worker runs the idempotent hooks.json merge
+itself (backup, read-back, restore) in the launch's `CODEX_HOME` before
+spawning, so a session launched from the bare `atem` menu gets every hook
+too; it never asks and never writes when the setting is unset or false,
+and a failure is a session notice (Codex starts anyway).
 
 - **Ownership.** Only hooks the session's agent started count
   (`approvals::HookAgent` over `started_by`, shared with approvals): with
@@ -446,24 +451,35 @@ named by `transcript_path` carries every message and turn boundary.
   starts without a shell still can't; deeper (a `codex` a tool ran) never.
   A wrapped hook read after its parent exited counts as foreign (harmless:
   the rollout's end record is authoritative).
+- **Session switches.** A SessionStart of another session re-pins (the
+  old rollout is read to its end first). The agent's own UserPromptSubmit
+  of another session read before that SessionStart (async hooks publish in
+  either order after `/new`) re-pins the same way, and the SessionStart
+  read later is then no restart. A resumed rollout is read to its end at
+  the switch, however many 8 MiB reads that takes, so all of it is history
+  (except a turn still running at its end).
 - **Status.** `unknown` until the first hook (SessionStart is lazy: it
   fires at the first prompt), with the detail "type a first prompt in the
   terminal: …"; chat opens, but `submit` is refused with that text (a
   remote prompt needs `ready`: text typed into Codex's startup dialogs could
   answer them). Then `working` from UserPromptSubmit or the rollout's
   `task_started`, `waiting` while the worker has approvals of this session
-  open (its set is the only source: Codex has no event of its own; after a
-  re-pin with some open it is waiting again), `ready` at `task_complete` /
-  `turn_aborted`.
+  open for a remote answer (its set is the only source: Codex has no event
+  of its own; after a re-pin with some open it is waiting again) or has
+  released one to Codex's own dialog ("no decision": input to Codex, no
+  broker, an adopting broker that doesn't know it) — that one until its
+  PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
+  rollout item — `ready` at `task_complete` / `turn_aborted`.
 - **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
   UserPromptSubmit and the rollout's UserMessage both name it, with the same
   `turn_id`; completed at that turn's end (interrupted at `turn_aborted`).
   `interrupt` writes Esc only while a turn is known to run (`working` or
   `waiting`) and completes at the next turn end; in `ready` or `unknown`
   it completes at once with nothing written (Esc on Codex's startup trust
-  dialog quits Codex). A session without chat (Codex with its hooks off)
-  has no turn state: `interrupt` is `rejected` ("no turn state; use the
-  terminal") and never writes Esc.
+  dialog quits Codex). A session without turn state, for any agent (Codex
+  with its hooks off, Claude before its SessionStart or after its chat was
+  withdrawn), gets `interrupt` `rejected` ("no turn state; use the
+  terminal") and never an Esc.
 - **Approvals and chat evidence.** A new prompt or a turn end (stamped with
   its hook file's or log entry's time) answers only a permission prompt
   opened before it, for both agents: one read in the same pass as a newer

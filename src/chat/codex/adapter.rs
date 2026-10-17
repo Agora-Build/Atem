@@ -12,7 +12,10 @@
 //!   missed SessionStart, e.g. a hook not yet trusted, is made up from it)
 //!   and names the rollout, which must be `rollout-*-<session_id>.jsonl`
 //!   under `$CODEX_HOME/sessions`, also once symlinks are resolved (else
-//!   the hook is ignored with a notice).
+//!   the hook is ignored with a notice). The agent's own UserPromptSubmit
+//!   of another session re-pins the same way (its SessionStart may be
+//!   published after it after `/new`; that SessionStart, read later, is
+//!   then no restart).
 //! - Ownership: each event file's first line is the hook's `$$ $PPID`.
 //!   Only hooks the session's agent started count (`approvals::HookAgent`,
 //!   the rule approvals use): directly (its parent is the agent, or one
@@ -40,13 +43,17 @@
 //!   task marks it) and SessionEnd (the process exit is the worker's).
 //! - Waiting: PermissionRequest never reaches `events/` (it is the
 //!   approvals' own protocol, `runtime/worker_approvals.rs`), so the worker
-//!   reports how many approvals of this session are open
-//!   ([`CodexAdapter::set_open_approvals`]; its set is the only source):
-//!   none → some is `WaitingForPermission`, some → none `ToolFinished`
-//!   (back to working), returned after that poll's hook events; after a
-//!   re-pin with some open, `WaitingForPermission` again. A PreToolUse read
-//!   while an approval is open is dropped (Codex holds the tool while the
-//!   hook waits).
+//!   reports how many approvals of this session wait for a remote answer
+//!   and whether it gave some back to Codex's own dialog ("no decision":
+//!   input to Codex, no broker, a broker that doesn't know them)
+//!   ([`CodexAdapter::set_approvals`]; its set is the only source of the
+//!   first). Waiting while either holds: not waiting → waiting is
+//!   `WaitingForPermission`, back `ToolFinished` (working), returned after
+//!   that poll's hook events. Codex's own dialog counts until its
+//!   PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
+//!   rollout item (a re-pin drops it); after a re-pin with approvals
+//!   open, `WaitingForPermission` again. A PreToolUse read while waiting is
+//!   dropped (Codex holds the tool while the hook or its dialog waits).
 //! - A format change in the rollout withdraws chat, as for Claude.
 //!   Messages arrive whole, never streamed; [`UNAVAILABLE`] says so.
 
@@ -112,10 +119,22 @@ pub struct CodexAdapter {
     /// The pinned session's turn runs (a prompt or a live `task_started`,
     /// no live turn end yet).
     turn_open: bool,
-    /// Approvals open for this session (the worker's count).
+    /// Approvals open for this session (the worker's count: waiting for a
+    /// remote answer).
     approvals: usize,
+    /// An approval was released ("no decision"): Codex shows its own
+    /// dialog, so the status stays waiting until its PostToolUse or
+    /// Interrupt hook, a turn end, or the turn's next rollout item.
+    terminal_wait: bool,
+    /// The pinned session was pinned by a hook other than its SessionStart
+    /// (async hooks publish in either order): that SessionStart, read
+    /// later on the same rollout, is no restart.
+    start_unseen: bool,
     session_started: bool,
     withdrawn: Option<String>,
+    /// Rollout bytes read per poll (tests).
+    #[cfg(test)]
+    max_read: Option<u64>,
 }
 
 impl CodexAdapter {
@@ -137,8 +156,12 @@ impl CodexAdapter {
             announced: false,
             turn_open: false,
             approvals: 0,
+            terminal_wait: false,
+            start_unseen: false,
             session_started: false,
             withdrawn: None,
+            #[cfg(test)]
+            max_read: None,
         }
     }
 
@@ -159,19 +182,45 @@ impl CodexAdapter {
         self.pinned.as_deref()
     }
 
-    /// The worker's approvals of this session now open: `n` (reported to
-    /// the broker and not closed). Some after none is waiting; none after
-    /// some is working again. The worker's count is authoritative: turn
-    /// ends and re-pins never change it.
+    /// [`Self::set_approvals`] with nothing released.
+    #[cfg(test)]
     pub fn set_open_approvals(&mut self, n: usize) {
-        if self.approvals == 0 && n > 0 {
-            self.extra.push(AgentEvent::WaitingForPermission {
-                detail: APPROVAL_DETAIL.into(),
-            });
-        } else if self.approvals > 0 && n == 0 {
-            self.extra.push(AgentEvent::ToolFinished);
+        self.set_approvals(n, false);
+    }
+
+    /// The worker's report after a pass: `open` approvals wait for a remote
+    /// answer, and `released` says some of this session's were given back
+    /// to Codex's own dialog ("no decision": input to Codex, no broker, a
+    /// broker that doesn't know them). Waiting while either holds.
+    pub fn set_approvals(&mut self, open: usize, released: bool) {
+        let before = self.waiting();
+        self.approvals = open;
+        self.terminal_wait |= released;
+        self.status_change(before);
+    }
+
+    /// Waiting for an approval: a remote answer or Codex's own dialog.
+    fn waiting(&self) -> bool {
+        self.approvals > 0 || self.terminal_wait
+    }
+
+    /// Codex's own dialog was answered (or the turn went on, or ended).
+    fn end_terminal_wait(&mut self) {
+        if self.terminal_wait {
+            let before = self.waiting();
+            self.terminal_wait = false;
+            self.status_change(before);
         }
-        self.approvals = n;
+    }
+
+    fn status_change(&mut self, before: bool) {
+        match (before, self.waiting()) {
+            (false, true) => self.extra.push(AgentEvent::WaitingForPermission {
+                detail: APPROVAL_DETAIL.into(),
+            }),
+            (true, false) => self.extra.push(AgentEvent::ToolFinished),
+            _ => {}
+        }
     }
 }
 
@@ -238,11 +287,18 @@ impl CodexAdapter {
     /// still running at its end (its prompt was just typed).
     fn switch_to(&mut self, path: PathBuf, source: &str) {
         if let Some(old) = self.rollout.as_mut() {
-            self.queued.extend(old.poll());
+            let items = old.read_to_end();
+            self.queued.extend(items);
         }
         let mut reader = RolloutReader::new(path);
+        #[cfg(test)]
+        if let Some(max) = self.max_read {
+            reader.set_max_read(max);
+        }
         if source != "startup" {
-            let items = reader.poll();
+            // All of it (a poll reads at most 8 MiB): what a later poll
+            // returned would be live.
+            let items = reader.read_to_end();
             let open = items
                 .iter()
                 .rposition(|i| matches!(i, LogItem::TurnStarted { .. }))
@@ -285,11 +341,20 @@ impl CodexAdapter {
             }
             // While an approval waits Codex holds the tool: a PreToolUse
             // read now came before it.
-            "PreToolUse" if self.approvals == 0 => out.push(AgentEvent::ToolStarted),
-            "PostToolUse" => out.push(AgentEvent::ToolFinished),
+            "PreToolUse" if !self.waiting() => out.push(AgentEvent::ToolStarted),
+            "PostToolUse" => {
+                // The tool ran: a dialog Codex showed was answered (its
+                // `ToolFinished` is this one).
+                self.terminal_wait = false;
+                out.push(AgentEvent::ToolFinished);
+            }
             // Only wake-ups for the reader (the rollout's end record is the
-            // turn's end), but the turn is over: a deferred start may go.
-            "Stop" | "Interrupt" => self.turn_open = false,
+            // turn's end), but the turn is over: a deferred start may go,
+            // and a dialog Codex showed is gone.
+            "Stop" | "Interrupt" => {
+                self.turn_open = false;
+                self.end_terminal_wait();
+            }
             _ => {}
         }
     }
@@ -355,11 +420,33 @@ impl AgentAdapter for CodexAdapter {
                 }
                 continue;
             }
-            if !ours && !start && self.pinned.is_some() {
-                continue; // another session's (an old one's SessionEnd, a nested codex)
+            // The agent's own prompt in another session: its SessionStart
+            // may come later (async hooks publish in either order after
+            // `/new`), so it re-pins as a first hook would. Anything else of
+            // another session (an old one's SessionEnd) never counts, nor
+            // does a nested codex (never `Direct`).
+            let prompt_first = hook.event == "UserPromptSubmit" && ancestry == Ancestry::Direct;
+            if !ours && !start && self.pinned.is_some() && !prompt_first {
+                continue;
+            }
+            if !ours
+                && !start
+                && let Some(at) = incoming
+                    .iter()
+                    .position(|h| h.event == "SessionStart" && h.session_id == hook.session_id)
+            {
+                // its SessionStart came in the same pass: that goes first
+                let session_start = incoming.remove(at).unwrap();
+                incoming.push_front(hook);
+                incoming.push_front(session_start);
+                continue;
             }
             let current = self.rollout.as_ref().map(|r| r.path().to_path_buf());
             if ours && current.as_deref() == Some(hook.transcript_path.as_path()) {
+                if std::mem::take(&mut self.start_unseen) && hook.source == "startup" {
+                    // the SessionStart of a session its prompt pinned
+                    continue;
+                }
                 // compaction or a resume of the conversation being read
                 out.push(AgentEvent::SessionStarted {
                     session_id: hook.session_id,
@@ -385,8 +472,25 @@ impl AgentAdapter for CodexAdapter {
             }
             self.switch_waited = false;
             if !ours && self.turn_open {
-                self.notice("held a start of another Codex session until the current turn ends");
-                self.deferred = Some(hook);
+                let same = self
+                    .deferred
+                    .as_ref()
+                    .filter(|d| d.session_id == hook.session_id);
+                match same {
+                    // its SessionStart (or prompt) already waits: a start
+                    // replaces a prompt, a prompt adds nothing
+                    Some(d) => {
+                        if start && d.event != "SessionStart" {
+                            self.deferred = Some(hook);
+                        }
+                    }
+                    None => {
+                        self.notice(
+                            "held a start of another Codex session until the current turn ends",
+                        );
+                        self.deferred = Some(hook);
+                    }
+                }
                 continue;
             }
             // A hook other than SessionStart first: its SessionStart was
@@ -404,10 +508,13 @@ impl AgentAdapter for CodexAdapter {
                 self.hook_agent.pinned_by(ancestry);
             }
             self.pinned = Some(hook.session_id.clone());
+            self.start_unseen = !start;
             self.turn_open = false;
             // The chat restarts at ready: queued status changes are moot,
-            // and approvals still open (the worker's count) wait again.
+            // a dialog of the old session is gone, and approvals still open
+            // (the worker's count) wait again.
             self.extra.clear();
+            self.terminal_wait = false;
             if self.approvals > 0 {
                 self.extra.push(AgentEvent::WaitingForPermission {
                     detail: APPROVAL_DETAIL.into(),
@@ -451,6 +558,16 @@ impl AgentAdapter for CodexAdapter {
                 }
                 _ => {}
             }
+        }
+        // The turn went on (or ended): a dialog Codex showed was answered.
+        let went_on = items.iter().any(|i| {
+            !matches!(
+                i,
+                LogItem::Problem { .. } | LogItem::Backfill(_) | LogItem::TurnStarted { .. }
+            )
+        });
+        if went_on {
+            self.end_terminal_wait();
         }
         items
     }

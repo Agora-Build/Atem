@@ -139,6 +139,8 @@ struct Waiting {
     opened_ms: i64,
     /// Sent to the broker.
     reported: bool,
+    /// This session's agent started its hook (Codex; Claude: always).
+    ours: bool,
     state: State,
 }
 
@@ -155,6 +157,9 @@ pub struct Approvals {
     codex_session: Option<String>,
     /// Events produced outside `poll`, sent with its next result.
     queued: Vec<Event>,
+    /// Codex: one of this session's requests got "no decision" since the
+    /// last `take_released`, so Codex shows its own dialog for it.
+    released: bool,
 }
 
 fn is_id(id: &str) -> bool {
@@ -219,6 +224,7 @@ impl Approvals {
             waiting: BTreeMap::new(),
             codex_session: None,
             queued: Vec::new(),
+            released: false,
         }
     }
 
@@ -287,8 +293,10 @@ impl Approvals {
             return;
         };
         let reported = w.reported;
+        let to_dialog = self.agent == Agent::Codex && w.ours;
         match w.state.clone() {
             State::Open => {
+                self.released |= to_dialog;
                 self.write_decision(id, "");
                 self.set(id, State::Released);
                 if reported {
@@ -300,6 +308,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
+                    self.released |= to_dialog;
                     self.write_decision(id, "");
                     self.set(id, State::Released);
                     self.queued.push(Event::Applied {
@@ -312,6 +321,12 @@ impl Approvals {
             }
             State::Claimed { .. } | State::Released => {}
         }
+    }
+
+    /// Codex: some of this session's requests got "no decision" (its own
+    /// dialog shows them) since the last call.
+    pub fn take_released(&mut self) -> bool {
+        std::mem::take(&mut self.released)
     }
 
     /// The broker's `release_approval` (the host closed it): "no decision".
@@ -573,6 +588,7 @@ impl Approvals {
                 opened: Instant::now(),
                 opened_ms,
                 reported: false,
+                ours,
                 state: State::Open,
             },
         );

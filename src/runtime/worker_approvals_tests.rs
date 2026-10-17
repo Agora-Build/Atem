@@ -383,6 +383,9 @@ fn without_a_broker_the_hook_is_released_at_once() {
     let mut a = watcher(&s, Agent::Codex);
     let hook = s.hook("codex", 30, SECRET_BASH);
     known(&mut a, 1, false);
+    // Codex shows its own dialog for it: still waiting there.
+    assert!(a.take_released());
+    assert!(!a.take_released(), "reported once");
     assert_eq!(printed(hook), "");
     assert!(drained(&mut a).is_empty());
     assert!(s.files().is_empty());
@@ -396,7 +399,10 @@ fn adoption_releases_what_the_new_broker_does_not_know() {
     let one = request_id(&events(&mut a, true)[0]);
     let second = s.hook("codex", 30, SECRET_BASH);
     let two = request_id(&events(&mut a, true)[0]);
+    assert!(!a.take_released());
     a.keep_only(std::slice::from_ref(&two));
+    // the released one waits in Codex's own dialog
+    assert!(a.take_released());
     assert_eq!(printed(first), "");
     a.decide(&two, ApprovalDecision::AllowOnce, None, None);
     assert!(printed(second).contains(r#""behavior":"allow""#));
@@ -423,6 +429,7 @@ fn release_approvals_answers_every_waiting_hook_with_no_decision() {
         })
         .collect();
     a.release_all();
+    assert!(a.take_released());
     for h in hooks {
         assert_eq!(printed(h), "");
     }
@@ -569,7 +576,12 @@ fn a_nested_codex_is_released_without_a_report() {
         &format!("/bin/sh -c \"/bin/sh {script} codex 30; true\"; true"),
         SECRET_BASH,
     );
+    assert!(a.take_released(), "the session's own");
     known(&mut a, 1, true);
+    assert!(
+        !a.take_released(),
+        "a nested codex's dialog is not this session's"
+    );
     assert_eq!(printed(nested), "");
     assert!(drained(&mut a).is_empty());
 }

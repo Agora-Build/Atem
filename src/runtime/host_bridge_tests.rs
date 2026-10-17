@@ -2518,6 +2518,48 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
     });
 }
 
+/// Local input gives a waiting Codex approval back to Codex's own dialog
+/// ("no decision"): the session stays waiting until the tool runs there.
+#[test]
+fn codex_stays_waiting_at_its_own_dialog_after_a_release() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt
+            .launch_fake_codex(&mut client, &fake, &fake_codex())
+            .await;
+        let sid = session.id.clone();
+        rt.peer.hello().await;
+        listed(&mut rt.peer, &sid).await;
+        attach_client(&mut client, &sid, 24, 80).await;
+        client
+            .send(&ClientMsg::input(&sid, b"one\r"))
+            .await
+            .unwrap();
+        agent_event(&fake, "prompt turn-1 one").await;
+        ask(
+            &fake,
+            1,
+            json!({"tool_name": "Bash", "tool_input": {"command": "touch one.txt"}}),
+        );
+        let peer = &mut rt.peer;
+        peer.wait(|v| is_session(v, "approval_request")).await;
+        activity_until(peer, &sid, "waiting").await;
+        // typing in the terminal releases it: Codex shows its own dialog
+        client.send(&ClientMsg::input(&sid, b"a")).await.unwrap();
+        agent_event(&fake, "answer 1 none").await;
+        let peer = &mut rt.peer;
+        peer.drain(Duration::from_millis(500)).await;
+        assert_eq!(listed(peer, &sid).await["activity"], "waiting");
+        // allowed there: the tool runs (PostToolUse), working again
+        client.send(&ClientMsg::input(&sid, b"y")).await.unwrap();
+        agent_event(&fake, "dialog 1 allow").await;
+        activity_until(&mut rt.peer, &sid, "working").await;
+        rt.shutdown().await;
+    });
+}
+
 /// Codex behind npm's wrapper (the agent is the wrapper, the real binary
 /// its child): `/new` re-pins chat and approvals, and remote prompts and
 /// approvals go on in the new session.

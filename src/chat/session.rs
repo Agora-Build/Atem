@@ -207,10 +207,11 @@ pub fn clean_prompt(text: &str) -> Result<&str, &'static str> {
 }
 
 /// The prompt as sent and as the agent recorded it: equal once trimmed,
-/// or equal but for whitespace (an agent may store a pasted prompt as
-/// several text blocks, which the adapter joins with newlines).
+/// or equal but for the length and kind of whitespace runs (an agent may
+/// store a pasted prompt as several text blocks, which the adapter joins
+/// with newlines).
 fn same_prompt(a: &str, b: &str) -> bool {
-    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     a.trim() == b.trim() || squash(a) == squash(b)
 }
 
@@ -1252,6 +1253,9 @@ mod tests {
         assert!(same_prompt("a b\nc ", "a b\nc"));
         assert!(same_prompt("two\nlines", "two\n\nlines"));
         assert!(!same_prompt("ab", "a c"));
+        // whitespace runs are one space, never nothing
+        assert!(!same_prompt("ab", "a b"));
+        assert!(same_prompt("a  b", "a\n\tb"));
     }
 
     #[test]

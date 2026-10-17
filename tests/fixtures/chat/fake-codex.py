@@ -16,11 +16,12 @@
 #   ask-<n>.json   a tool call needing approval ({tool_name, tool_input}):
 #                  PreToolUse, then the PermissionRequest hook runs with it;
 #                  allowed: PostToolUse and a CommandExecution item
+#                  no decision: its own dialog, where a typed "y" allows
 #   deaf           Esc is ignored (the turn goes on)
 #   exit           the agent exits (SessionEnd)
 # What it saw, in $FAKE_DIR/events: "started", "new <session>",
 # "prompt <turn> <text>",
-# "completed <turn>", "interrupted <turn>", "asked <n>", "answer <n> <behavior>".
+# "completed <turn>", "interrupted <turn>", "asked <n>", "answer <n> <behavior>", "dialog <n> allow".
 import json, os, select, subprocess, sys, time, tty, uuid
 
 ctl = os.environ["FAKE_DIR"]
@@ -84,6 +85,13 @@ def item(turn, it):
 
 
 turn, n_turns = None, 0
+
+
+def allowed(n, request):
+    fire("PostToolUse", dict(request, turn_id=turn, tool_use_id="exec-%d" % n, tool_response="ok"))
+    item(turn, {"type": "CommandExecution", "id": "exec-%d" % n,
+                "command": ["/bin/bash", "-lc", request["tool_input"]["command"]],
+                "status": "completed", "aggregated_output": "ok", "exit_code": 0})
 
 
 def submit(text):
@@ -153,7 +161,14 @@ while True:
                 elif turn is None:
                     submit(text)
         else:
-            composer += buf[:1]
+            dialog = [n for n, a in asks.items() if a.get("dialog")]
+            if dialog and turn and buf[:1] == b"y":
+                n = dialog[0]
+                asks[n]["dialog"] = False
+                events.write("dialog %d allow\n" % n)
+                allowed(n, asks[n]["request"])
+            else:
+                composer += buf[:1]
             buf = buf[1:]
     if os.path.exists(os.path.join(ctl, "exit")):
         break
@@ -185,9 +200,7 @@ while True:
             behavior = json.loads(out)["hookSpecificOutput"]["decision"].get("behavior", "none")
         events.write("answer %d %s\n" % (n, behavior))
         if behavior == "allow" and turn:
-            request = ask["request"]
-            fire("PostToolUse", dict(request, turn_id=turn, tool_use_id="exec-%d" % n, tool_response="ok"))
-            item(turn, {"type": "CommandExecution", "id": "exec-%d" % n,
-                        "command": ["/bin/bash", "-lc", request["tool_input"]["command"]],
-                        "status": "completed", "aggregated_output": "ok", "exit_code": 0})
+            allowed(n, ask["request"])
+        elif behavior == "none" and turn:
+            ask["dialog"] = True
 fire("SessionEnd", {"reason": "other"})

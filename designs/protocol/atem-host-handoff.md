@@ -176,8 +176,9 @@ Receipts (session-v1 `submit`), per kind:
 - `interrupt`: writes Esc only while the chat status says a turn runs
   (`working`/`waiting`) and completes when it ends; in `ready` or `unknown`
   it completes at once ("no turn was running") with nothing written. A
-  session without chat (Codex with its hooks off) has no turn state: the
-  interrupt is `rejected` ("no turn state; use the terminal"), never Esc.
+  session without turn state — any agent: Codex with its hooks off, Claude
+  before its SessionStart or after its chat was withdrawn — gets it
+  `rejected` ("no turn state; use the terminal"), never Esc.
 - `stop`: stops the agent; completes at its exit.
 - `approval`: handed to the agent's waiting permission hook; completes when
   the agent applied it (see [Approvals](#approvals-r7-6a-on-featapprovals)).
@@ -209,7 +210,9 @@ web page:
 
 - **Availability.** `["terminal-v1","chat-v1"]` only when the user allowed
   Atem's Codex hooks (`[codex] hooks = true`, asked once at the first
-  `atem agent launch codex`; Codex also needs them trusted in its `/hooks`).
+  `atem agent launch codex`; with it on, every Codex worker keeps the hooks
+  merged, so menu launches get chat too; Codex also needs them trusted in
+  its `/hooks`).
   Otherwise `["terminal-v1"]` and no turn state. Show chat per descriptor,
   not per provider.
 - **`opened.unavailable`.** An array of strings naming what the agent's chat
@@ -217,6 +220,10 @@ web page:
   Codex sends all four, Claude `[]`. Hide or disable the matching UI (no
   typing indicator for partial text, no "always allow" button, no reasoning
   fold, no error detail). Unknown names must be ignored.
+- **Typed chat-v1 decoder: accept unknown fields.** Astation's typed
+  chat-v1 decoder must accept (ignore) fields it doesn't know before Codex
+  `opened` messages arrive: `opened.unavailable` is new, and a decoder that
+  rejects unknown fields would drop every Codex `opened`.
 - **No streaming.** A Codex reply arrives whole, as the rollout records it
   (commentary and final answers are separate messages; a command run is a
   `Bash` tool part). Do not animate it as a stream.
@@ -238,7 +245,8 @@ web page:
 - **Interrupt.** Esc is written only while the status is `working` or
   `waiting`, and the receipt completes at that turn's end (chat `complete`
   with outcome `interrupted`). In `ready` or `unknown` it completes at once
-  with nothing written. With no chat (hooks off) it is `rejected` ("no turn
+  with nothing written. With no turn state (hooks off; Claude too, before its
+  SessionStart or after its chat was withdrawn) it is `rejected` ("no turn
   state; use the terminal"). `outcome_unknown` after 10 s means no interrupt
   was observed.
 - **Prompt origin.** Only a prompt after the paste can be the remote one; a

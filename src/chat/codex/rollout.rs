@@ -80,6 +80,32 @@ impl RolloutReader {
         &self.path
     }
 
+    /// Bytes read per poll (tests: a small one splits a rollout over
+    /// several polls).
+    #[cfg(test)]
+    pub fn set_max_read(&mut self, max_read: u64) {
+        self.max_read = max_read;
+    }
+
+    /// Everything there now: polls until the reader reached the file's
+    /// length as it is at the call (a poll reads at most `max_read`), or a
+    /// poll makes no progress. Lines appended meanwhile may come too.
+    pub fn read_to_end(&mut self) -> Vec<LogItem> {
+        let len = std::fs::symlink_metadata(&self.path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map_or(0, |m| m.len());
+        let mut out = self.poll();
+        while self.offset < len {
+            let before = self.offset;
+            out.extend(self.poll());
+            if self.offset <= before {
+                break;
+            }
+        }
+        out
+    }
+
     #[cfg(test)]
     fn reread_from_start(&mut self) {
         self.offset = 0;

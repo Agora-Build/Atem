@@ -2,6 +2,8 @@
 //! merged into `$CODEX_HOME/hooks.json` (default `~/.codex`), set up by
 //! `atem agent launch codex` after asking once (remembered as
 //! `[codex] hooks` in config.toml; one answer covers approvals and chat).
+//! With that answer yes, each Codex worker runs the same merge (`install`)
+//! before spawning, never asking, so menu launches get every hook too.
 //!
 //! - Merged, never overwritten: the user's hooks stay as they are (ours are
 //!   appended after theirs, so their entries keep their positions and
@@ -517,8 +519,19 @@ pub enum Installed {
 }
 
 /// Merges our entries for `script` into `codex_home/hooks.json`, writing
-/// `hooks.json.atem-bak` before the first change of an existing file.
+/// `hooks.json.atem-bak` before the first change of an existing file; the
+/// result is read back and checked, else the file is restored (or removed,
+/// when there was none).
 pub fn install(codex_home: &Path, script: &Path) -> Result<Installed> {
+    install_with(codex_home, script, &write_keeping, &write_keeping)
+}
+
+pub fn install_with(
+    codex_home: &Path,
+    script: &Path,
+    write: Writer,
+    restore: Writer,
+) -> Result<Installed> {
     let path = codex_home.join("hooks.json");
     let existing = match std::fs::symlink_metadata(&path) {
         Ok(meta) if !meta.is_file() => {
@@ -547,8 +560,23 @@ pub fn install(codex_home: &Path, script: &Path) -> Result<Installed> {
             .with_context(|| format!("writing {}", bak.display()))?;
     }
     let backup = existing.is_some().then_some(bak);
-    write_keeping(&path, text.as_bytes(), mode)
-        .with_context(|| format!("writing {}", path.display()))?;
+    write(&path, text.as_bytes(), mode).with_context(|| format!("writing {}", path.display()))?;
+    let want = serde_json::from_str::<Value>(&text).ok();
+    let landed = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    if want.is_none() || landed != want {
+        match existing.as_deref() {
+            Some(original) => restore(&path, original.as_bytes(), mode)
+                .with_context(|| format!("restoring {}", path.display()))?,
+            None => std::fs::remove_file(&path)
+                .with_context(|| format!("removing {}", path.display()))?,
+        }
+        bail!(
+            "{} didn't read back as intended; it was put back as it was",
+            path.display()
+        );
+    }
     Ok(Installed::Changed { backup })
 }
 

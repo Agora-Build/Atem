@@ -1370,3 +1370,197 @@ fn under_a_wrapper_new_re_pins_and_a_nested_codex_still_cannot() {
     }
     assert_eq!(a.session_id(), Some("<session-B>"));
 }
+
+#[test]
+fn resuming_a_rollout_bigger_than_one_read_is_all_history() {
+    let f = fx();
+    let mut a = f.adapter();
+    // 64 bytes a poll: the conversation so far takes many reads
+    a.max_read = Some(64);
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    rollout_upto(&f.a, A, 77);
+    f.fire(&a, "29-SessionStart-resume.json");
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        t.log.iter().all(|i| matches!(i, LogItem::Backfill(_))),
+        "{:?}",
+        t.log
+    );
+    assert!(message_ids(&t.outs).is_empty() && completes(&t.outs).is_empty());
+    assert_eq!(chat.history(None, 100, 1 << 20).len(), 10);
+    assert_eq!(chat.status().state, State::Ready);
+    // nothing old comes later as live
+    for _ in 0..50 {
+        let t = tick(&mut a, &mut chat);
+        assert!(t.log.is_empty() && t.outs.is_empty(), "{:?}", t.log);
+    }
+    assert_eq!(chat.status().state, State::Ready);
+    // the next turn is live, read 64 bytes at a time
+    f.fire(&a, "30-UserPromptSubmit.json");
+    rollout_upto(&f.a, A, 86);
+    let mut outs = Vec::new();
+    for _ in 0..2000 {
+        outs.extend(tick(&mut a, &mut chat).outs);
+        if !completes(&outs).is_empty() {
+            break;
+        }
+    }
+    assert_eq!(message_ids(&outs), ["<id-12>", "<msg-17>"]);
+    assert_eq!(completes(&outs), [("<turn-6>".into(), None, Outcome::Done)]);
+}
+
+/// Turn 2 of session A waits for an approval the worker reported open.
+fn waiting_for_an_approval(f: &Fx) -> (CodexAdapter, ChatSession) {
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "04-UserPromptSubmit-approval-turn.json");
+    rollout_upto(&f.a, A, 19);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Working);
+    a.set_approvals(1, false);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    (a, chat)
+}
+
+#[test]
+fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    // input to Codex: released ("no decision"), Codex shows its own dialog
+    a.set_approvals(0, true);
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+        assert_eq!(chat.status().state, State::Waiting);
+    }
+    // a PreToolUse read meanwhile came before it
+    f.fire(&a, "05-PreToolUse-before-approval.json");
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    // answered there: the tool ran
+    f.fire(&a, "07-PostToolUse-after-approval.json");
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Working);
+}
+
+#[test]
+fn codexs_own_dialog_ends_with_the_turns_next_item() {
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    a.set_approvals(0, true);
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    // the command ran (no PostToolUse read yet)
+    rollout_upto(&f.a, A, 22);
+    let t = tick(&mut a, &mut chat);
+    assert!(!message_ids(&t.outs).is_empty());
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Working);
+}
+
+#[test]
+fn released_with_no_remote_wait_before_is_waiting_until_an_interrupt() {
+    // after an adoption (the new broker knows none) or with no broker: no
+    // approval was open for a remote answer, the dialog is Codex's own
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "18-UserPromptSubmit-multiline-paste.json");
+    rollout_upto(&f.a, A, 67);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Working);
+    a.set_approvals(0, true);
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(&t.events[..], [AgentEvent::WaitingForPermission { .. }]),
+        "{:?}",
+        t.events
+    );
+    // no input: it stays
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+    }
+    assert_eq!(chat.status().state, State::Waiting);
+    // Esc at Codex's dialog
+    f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_ne!(chat.status().state, State::Waiting);
+}
+
+/// Session A with turn 1 over.
+fn after_turn_one(f: &Fx) -> (CodexAdapter, ChatSession) {
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "01-SessionStart-startup.json");
+    f.fire(&a, "02-UserPromptSubmit.json");
+    rollout_upto(&f.a, A, 14);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Ready);
+    (a, chat)
+}
+
+#[test]
+fn after_new_a_prompt_read_before_its_session_start_re_pins() {
+    let f = fx();
+    let (mut a, mut chat) = after_turn_one(&f);
+    // /new: the async hooks published the prompt first
+    f.fire(&a, "23-UserPromptSubmit.json");
+    rollout_upto(&f.b, B, 9);
+    assert!(tick(&mut a, &mut chat).events.is_empty(), "held one poll");
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(&t.events[..], [
+            AgentEvent::SessionStarted { session_id, .. },
+            AgentEvent::PromptSubmitted { .. },
+        ] if session_id == "<session-B>"),
+        "{:?}",
+        t.events
+    );
+    assert_eq!(a.session_id(), Some("<session-B>"));
+    assert_eq!(message_ids(&t.outs), ["<id-15>"]);
+    assert_eq!(chat.status().state, State::Working);
+    // its SessionStart, read later, restarts nothing
+    f.fire(&a, "22-SessionStart-after-new.json");
+    let t = tick(&mut a, &mut chat);
+    assert!(t.events.is_empty() && t.outs.is_empty(), "{:?}", t.events);
+    assert_eq!(chat.status().state, State::Working);
+}
+
+#[test]
+fn a_prompt_and_its_session_start_in_one_pass_start_with_the_start() {
+    let f = fx();
+    let (mut a, mut chat) = after_turn_one(&f);
+    f.fire(&a, "23-UserPromptSubmit.json");
+    f.fire(&a, "22-SessionStart-after-new.json");
+    rollout_upto(&f.b, B, 9);
+    tick(&mut a, &mut chat);
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(&t.events[..], [
+            AgentEvent::SessionStarted { session_id, source, .. },
+            AgentEvent::PromptSubmitted { .. },
+        ] if session_id == "<session-B>" && source == "startup"),
+        "{:?}",
+        t.events
+    );
+    assert_eq!(chat.status().state, State::Working);
+}
+
+#[test]
+fn a_nested_codexs_prompt_of_another_session_never_re_pins() {
+    let f = fx();
+    let (mut a, mut chat) = after_turn_one(&f);
+    rollout_upto(&f.b, B, 9);
+    // a codex a tool ran (not started by the agent): pid 1 is no child of
+    // this process
+    f.put_from(
+        &a,
+        900,
+        "UserPromptSubmit",
+        &f.hook("23-UserPromptSubmit.json"),
+        1,
+    );
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+    }
+    assert_eq!(a.session_id(), Some("<session-A>"));
+    assert_eq!(chat.status().state, State::Ready);
+}

@@ -248,6 +248,8 @@ struct Launch {
     adapter: Option<ChatAdapter>,
     /// The session directory the approval hook writes to, and for which agent.
     approvals: Option<(PathBuf, Agent)>,
+    /// Told to the session's frontends once the broker is connected.
+    notice: Option<String>,
 }
 
 /// The Codex home of a launch: `CODEX_HOME` in the launch environment
@@ -321,6 +323,7 @@ fn agent_command(
                 args: [chat_args, launch_args].concat(),
                 adapter: adapter.map(|a| ChatAdapter::Claude(Box::new(a))),
                 approvals,
+                notice: None,
             }
         }
         Provider::Codex => {
@@ -328,13 +331,26 @@ fn agent_command(
                 .map(crate::codex_client::CodexClient::from_env)
                 .unwrap_or_else(crate::codex_client::CodexClient::new);
             let launch_args = [client.launch_args(), &spec.args[..]].concat();
+            let codex_home = launch_codex_home(env);
+            let mut notice = None;
             let adapter = script.and_then(|script| {
                 if let Err(error) = crate::chat::approvals::install_script(script) {
                     eprintln!("atem worker: could not write {}: {error}", script.display());
                 }
+                // `[codex] hooks = true` (consent given): the idempotent merge,
+                // so a session launched from the menu gets every hook too.
+                // Never asks; a failure is a notice and Codex starts anyway.
+                if let Err(error) = crate::chat::codex::install(&codex_home, script) {
+                    let text = format!(
+                        "Atem's Codex hooks could not be merged into {}: {error:#}",
+                        codex_home.join("hooks.json").display()
+                    );
+                    eprintln!("atem worker: {text}");
+                    notice = Some(text);
+                }
                 match crate::chat::codex::adapter::prepare_chat(
                     chat_root,
-                    launch_codex_home(env),
+                    codex_home.clone(),
                     &launch_args,
                 ) {
                     Ok((adapter, _)) => Some(adapter),
@@ -353,6 +369,7 @@ fn agent_command(
                 args: launch_args,
                 adapter: adapter.map(|a| ChatAdapter::Codex(Box::new(a))),
                 approvals,
+                notice,
             }
         }
     })
@@ -614,6 +631,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     let Launch {
         mut adapter,
         approvals,
+        notice,
         ..
     } = launch;
     if let Some(ChatAdapter::Codex(codex)) = adapter.as_mut() {
@@ -673,6 +691,9 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         options,
     };
     worker.connected(conn);
+    if let Some(text) = notice {
+        worker.send(&WorkerMsg::Notice { text });
+    }
     let delivered = worker.run(&listener).await;
     if delivered {
         let _ = std::fs::remove_file(record_path(&worker.options.state, &worker.spec.session_id));
@@ -1108,10 +1129,12 @@ impl Worker {
     }
 
     fn send_approval_events(&mut self, events: Vec<ApprovalEvent>) {
-        for event in events {
-            // Codex reports no permission wait of its own: the approvals
-            // the worker reports open are its waiting status.
-            match &event {
+        // Codex reports no permission wait of its own: the approvals the
+        // worker reports open (waiting for a remote answer) and the ones it
+        // gave back to Codex's own dialog are its waiting status, applied
+        // once per batch so a release never flaps it to working.
+        for event in &events {
+            match event {
                 ApprovalEvent::Request { request_id, .. } => {
                     self.open_approvals.insert(request_id.clone());
                 }
@@ -1120,9 +1143,12 @@ impl Worker {
                     self.open_approvals.remove(request_id);
                 }
             }
-            if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
-                codex.set_open_approvals(self.open_approvals.len());
-            }
+        }
+        let released = self.approvals.as_mut().is_some_and(|a| a.take_released());
+        if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+            codex.set_approvals(self.open_approvals.len(), released);
+        }
+        for event in events {
             let message = match event {
                 ApprovalEvent::Request { request_id, info } => WorkerMsg::ApprovalRequest {
                     request_id,
@@ -1473,5 +1499,45 @@ mod approval_settings_tests {
         // The adapter owns the session directory.
         drop(on);
         assert!(!dir.exists());
+    }
+
+    /// `[codex] hooks = true` (a script): the worker merges every hook into
+    /// the launch's CODEX_HOME itself, never asking; unset or false (no
+    /// script): nothing written. A failed merge is a notice, Codex starts.
+    #[test]
+    fn a_consented_codex_launch_merges_the_hooks_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("hooks").join("approval-hook.sh");
+        let home = root.path().join("codex-home");
+        let env = [(OsString::from("CODEX_HOME"), home.clone().into_os_string())];
+        let hooks = home.join("hooks.json");
+        let off = agent_command(&spec("codex"), Some(&env), root.path(), true, None).unwrap();
+        assert!(off.notice.is_none());
+        assert!(!home.exists(), "never written without consent");
+        let on =
+            agent_command(&spec("codex"), Some(&env), root.path(), true, Some(&script)).unwrap();
+        assert!(on.notice.is_none(), "{:?}", on.notice);
+        let text = std::fs::read_to_string(&hooks).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for event in crate::chat::codex::EVENTS {
+            assert!(v["hooks"][event].is_array(), "{event}");
+        }
+        // idempotent
+        drop(on);
+        let again =
+            agent_command(&spec("codex"), Some(&env), root.path(), true, Some(&script)).unwrap();
+        assert!(again.notice.is_none());
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), text);
+        // a file it can't merge: left as it is, a notice, chat still set up
+        std::fs::write(&hooks, "not json").unwrap();
+        let bad =
+            agent_command(&spec("codex"), Some(&env), root.path(), true, Some(&script)).unwrap();
+        assert!(
+            bad.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("hooks.json"))
+        );
+        assert!(matches!(bad.adapter, Some(ChatAdapter::Codex(_))));
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), "not json");
     }
 }

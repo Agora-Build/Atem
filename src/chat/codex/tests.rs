@@ -699,6 +699,30 @@ fn a_removal_that_does_not_verify_is_restored() {
 }
 
 #[test]
+fn an_install_that_does_not_verify_is_put_back() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    fs::create_dir_all(&home).unwrap();
+    let bad = |path: &Path, bytes: &[u8], mode: u32| {
+        let wrong = if path.ends_with("hooks.json") {
+            b"{}".to_vec()
+        } else {
+            bytes.to_vec()
+        };
+        write_keeping(path, &wrong, mode)
+    };
+    // there was a file: restored as it was
+    fs::write(home.join("hooks.json"), MINE).unwrap();
+    let error = install_with(&home, Path::new(SCRIPT), &bad, &write_keeping).unwrap_err();
+    assert!(format!("{error:#}").contains("put back"), "{error:#}");
+    assert_eq!(hooks_text(&home), MINE);
+    // there was none: none again
+    fs::remove_file(home.join("hooks.json")).unwrap();
+    install_with(&home, Path::new(SCRIPT), &bad, &write_keeping).unwrap_err();
+    assert!(!home.join("hooks.json").exists());
+}
+
+#[test]
 fn declining_later_removes_our_hook_once() {
     let root = tempfile::tempdir().unwrap();
     let p = paths(root.path());
@@ -796,12 +820,11 @@ mod script {
             cmd.env(ENV, dir);
         }
         let mut child = cmd.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
+        // A command that exits at once (outside Atem) may not read it.
+        match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            written => written.unwrap(),
+        }
         let out = child.wait_with_output().unwrap();
         (
             out.status.success(),
