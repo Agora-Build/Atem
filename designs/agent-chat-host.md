@@ -55,7 +55,11 @@ no `chat-v1` capability.
   for a command whose input carries anything besides `command` and
   `description`; `cwd` is the hook's session cwd). Answering `allow_always` with it allows this request
   and makes the worker keep the rule for the rest of this agent process (at
-  most 32; a respawn starts with none; a broker restart keeps them). A later
+  most 32; a respawn starts with none). Each rule keeps the account, device
+  and trust generation it was granted under; after a broker restart the
+  adopted worker's rules allow nothing until the new host accepted them,
+  which it does only under the same account, device and trust generation
+  (the worker drops the others). A later
   request of the session's own pinned Codex with byte-equal tool, full
   command and cwd is allowed by the worker
   without a card: an `auto_allowed` card naming `rule_id` appears in the
@@ -67,7 +71,9 @@ no `chat-v1` capability.
   required; an allow it wrote that Codex hasn't taken yet is withdrawn). A
   rule the session can't keep when Codex takes the answer (32 already) is
   not kept: the card ends `allowed` with a `note`. A new account, device or
-  trust generation drops every rule. Claude's rules are unchanged.
+  trust generation while the host runs drops every rule. An `apply_patch`
+  run as a shell heredoc is a command like any other: its rule is
+  byte-exact, patch text included. Claude's rules are unchanged.
 - **Never merge with a local draft.** A chat prompt is refused when anyone
   typed into the terminal since Claude's last turn ended.
 - **Never resend.** A prompt whose delivery is unknown is reported, not retried.
@@ -312,10 +318,15 @@ message {
              note? } ],      // e.g. an allow_always whose rule wasn't kept
   history?: true      // backfill on open / page
 }
-delta { messageId, part: { id, kind, … } }   // append one part; a part id
-                                             // already present is ignored
+delta { messageId, part: { id, kind, … } }   // a later part appended to a
+                                             // message already sent; a part
+                                             // id already present is ignored
 ```
 
+- `delta` (both agents) means a later part (text, tool, …) was appended to a
+  message already sent, e.g. a tool call after the text of the same
+  assistant message. It is not a token stream: each part arrives whole
+  (`unavailable` lists `streaming`).
 - Markdown is CommonMark without raw HTML, so native apps can render it
   without a web view.
 - IDs never change, so clients can cache messages and merge updates.
@@ -345,17 +356,29 @@ on the existing authenticated Astation connection.
 | `accepted` | Atem → Astation | `requestId` |
 | `message` / `delta` | Atem → Astation | see the message model |
 | `status` | Atem → Astation | `state: ready|working|waiting|unknown`, `since`, optional `detail` |
-| `complete` | Atem → Astation | `turnId`, optional `requestId`, `outcome: "done"|"interrupted"` |
-| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
+| `complete` | Atem → Astation | `turnId`, optional `requestId`, `outcome: "done"|"interrupted"` (below) |
+| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`, and `code` on every `error` the session host makes: `rejected` or `outcome_unknown` (a submit's receipt), a session-v1 code from admission (`stale_target`, `stale_lease`, `lease_held`, `forbidden`, …), `unsupported_version` (a malformed chat message) or `busy` (`open` without chat-v1, below); the chat's own errors (the agent exited or was restarted, the conversation was switched, chat withdrawn) carry no `code`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
 | `close` | either | `conversationId` |
 
 - `open` with `before` on an open conversation reopens it (`opened`,
   sequence 0) and sends that older page.
+- `open` on a running session whose chat-v1 is off (Claude before its
+  SessionStart or after chat was withdrawn, Codex without Atem's hooks or
+  before its first hook) is answered `error{code:"busy"}` with the text
+  "chat is not available for this agent" (`: <reason>` when the adapter
+  gave one) and opens nothing. An exited agent's history stays readable.
+- `complete.outcome` is the adapter's turn end: `interrupted` when the turn
+  ended interrupted (Esc, a deny at a permission prompt, Codex's
+  `turn_aborted`), else `done`. A remote prompt's `complete` follows its
+  completed receipt and carries the outcome the broker remembered for that
+  request; a duplicate `submit` after a broker restart (the receipt says
+  only "completed") gets `done`.
 - `opened.unavailable` names what this agent's chat can't provide, so a
   client says so instead of waiting for it: `streaming` (no partial text:
   messages arrive whole), `reasoning`, `error_details` (no model/API error
-  behind a failed turn). Empty for Claude; all three for Codex (its "always
-  allow" is an Atem session rule, so it is no longer listed). It comes from the adapter's
+  behind a failed turn). Claude: `streaming` (transcript blocks arrive
+  whole) and `reasoning` (thinking blocks aren't shown); Codex: all three
+  (its "always allow" is an Atem session rule, so it is not listed). It comes from the adapter's
   `Capabilities.unavailable`, carried by the worker's `chat` and
   `chat_snapshot` messages (field `unavailable`).
 - Every Atem event in a conversation carries `generation` and the next

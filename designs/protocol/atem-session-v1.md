@@ -563,7 +563,10 @@ takes the lease with the answer (`acquire`).
   directory or environment, could change what runs: no rule), and the
   hook's `cwd` — the agent session's working directory as the hook reports
   it, not a per-command directory. File-change requests (patches) never
-  get one: their cards offer Allow once and Deny. Answering `allow_always` with it
+  get one: their cards offer Allow once and Deny. An `apply_patch` the agent
+  runs as a shell heredoc is a shell command like any other: its rule is
+  byte-exact on the whole command, patch text included, so it matches only
+  that exact patch again. Answering `allow_always` with it
   allows this request (the agent gets a plain allow) and, once the agent
   took the answer, the runtime keeps the rule for that agent process: at
   most 32 per session (a full session offers none); gone when the process
@@ -592,10 +595,15 @@ takes the lease with the answer (`acquire`).
   prompt asks). A rule the session can't keep at the moment the agent takes
   the answer (it already holds 32) is not kept: the request is allowed once
   and its chat-v1 card ends `allowed` with a `note` saying so. Rules are
-  bound to the host's identity: when the account, the device or the host
-  trust generation changes, every runtime worker drops all its rules
-  (viewers get `rules: []`); a host that lost only its copy under the same
-  identity and trust (a restart) gets the workers' rules again.
+  bound to the host's identity: each is kept with the account, device and
+  host trust generation it was granted under. When any of them changes
+  while the host runs, every runtime worker drops all its rules (viewers
+  get `rules: []`). After a broker restart the adopted workers' rules are
+  inactive (matching requests ask as usual) until the new host has checked
+  them: it accepts only rules granted under its current account, device
+  and trust generation, which allow and are listed again; the worker drops
+  every other one (e.g. after `atem unpair` then `atem pair`, or another
+  account or device).
 
   ```json
   {"type":"session","data":{"v":1,"op":"approval_rules","id":"…","session_id":"ses-aaaaaaaaaaaa",
