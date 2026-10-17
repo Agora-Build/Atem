@@ -253,11 +253,18 @@ struct Process {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
 }
 
+/// How long a hung-up agent gets to exit on its own before it is killed.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn stop_child(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>) {
     std::thread::spawn(move || {
-        let mut child = child.lock().unwrap();
-        // Serialize reaping and signalling: never signal a recycled PID.
-        if matches!(child.try_wait(), Ok(None)) {
+        // Serialize reaping and signalling (each under the lock): never signal
+        // a recycled PID.
+        {
+            let mut child = child.lock().unwrap();
+            if !matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
             #[cfg(unix)]
             if let Some(pid) = child.process_id() {
                 // The PTY child owns a session/process group. Notify its tools too.
@@ -265,7 +272,21 @@ fn stop_child(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>) {
                     libc::kill(-(pid as i32), libc::SIGHUP);
                 }
             }
-            let _ = child.kill();
+        }
+        // A clean exit (the agent saves its session, runs its end hooks),
+        // else killed.
+        let deadline = std::time::Instant::now() + STOP_GRACE;
+        loop {
+            let mut child = child.lock().unwrap();
+            if !matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                return;
+            }
+            drop(child);
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     });
 }
@@ -724,5 +745,41 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// The exit status `stop` leads to for `script` (run by `sh -c`).
+    async fn status_after_stop(script: &str) -> String {
+        let mut session = spawn("sh", &["-c".into(), script.into()]).unwrap();
+        while !matches!(session.receiver.recv().await.unwrap(), PtyEvent::Output(_)) {}
+        session.resize_handle.stop().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let PtyEvent::Exit(status) = session.receiver.recv().await.unwrap() {
+                    return status;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stop_lets_the_agent_exit_on_its_own_hangup() {
+        // Exits 7 on SIGHUP, as an agent saving its session would exit by itself.
+        let status =
+            status_after_stop("trap 'exit 7' HUP; echo up; while :; do sleep 0.05; done").await;
+        assert!(!status.contains("Killed"), "{status}");
+        assert!(status.contains('7'), "{status}");
+    }
+
+    #[tokio::test]
+    async fn stop_kills_an_agent_that_ignores_its_hangup_after_the_grace() {
+        let started = std::time::Instant::now();
+        let status = status_after_stop("trap '' HUP; echo up; while :; do sleep 0.05; done").await;
+        assert!(started.elapsed() >= STOP_GRACE, "{status}");
+        assert!(
+            status.contains("Killed") || status.contains('9'),
+            "{status}"
+        );
     }
 }
