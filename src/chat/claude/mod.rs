@@ -7,10 +7,16 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::chat::adapter::{AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem};
+use crate::chat::adapter::{
+    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_REASONING,
+    UNAVAILABLE_STREAMING,
+};
 use hooks::EventReader;
 use transcript::TranscriptReader;
 
+/// What Claude chat can't provide: no partial text (transcript blocks
+/// arrive whole), no reasoning (thinking blocks are not shown).
+pub const UNAVAILABLE: &[&str] = &[UNAVAILABLE_STREAMING, UNAVAILABLE_REASONING];
 const HOOKS_WAIT: Duration = Duration::from_secs(15);
 const HOOKS_INACTIVE: &str =
     "Claude hooks are not active: disabled, --bare, or an unsupported version";
@@ -211,7 +217,7 @@ impl AgentAdapter for ClaudeAdapter {
             return Capabilities {
                 chat_v1: true,
                 reason: None,
-                ..Capabilities::default()
+                unavailable: UNAVAILABLE,
             };
         }
         let reason = (self.started_at.elapsed() >= HOOKS_WAIT).then(|| HOOKS_INACTIVE.to_string());
@@ -303,7 +309,7 @@ mod tests {
             Capabilities {
                 chat_v1: true,
                 reason: None,
-                ..Capabilities::default()
+                unavailable: &["streaming", "reasoning"],
             }
         );
         a.withdrawn = Some("format changed".into());

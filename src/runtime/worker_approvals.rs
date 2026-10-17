@@ -55,18 +55,22 @@
 //! foreign `codex` never) whose tool, full command and cwd are byte-equal to
 //! a rule's is answered allow by the worker itself while a broker is
 //! connected — no approval is opened — and reported `AutoAllowed`
-//! (redacted). The broker can revoke a rule (`revoke`) or all of them
-//! (`revoke_all`: the host's identity or trust changed); an allow written
-//! for a revoked rule that the hook hasn't taken is withdrawn. Every change
-//! is reported as `Rules`.
+//! (redacted). Each rule keeps the identity and trust generation it was
+//! granted under (`RuleGrant`, from the decision; a decision without one
+//! keeps nothing). A rule allows only while confirmed by the broker
+//! connected now: one this broker granted is; after every new broker
+//! connection all are unconfirmed (`unconfirm_rules`) and matching requests
+//! ask as usual until the broker accepts the rules granted under its own
+//! identity and trust (`confirm_rules`, which drops the others). The broker
+//! can revoke a rule (`revoke`) or all of them (`revoke_all`: the host's
+//! identity or trust changed); an allow written for a revoked rule that the
+//! hook hasn't taken is withdrawn. Every change is reported as `Rules`.
 
 use crate::chat::adapter::ToolResultKind;
 use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request, SessionRule};
-use crate::runtime::worker_protocol::ApplyOutcome;
+use crate::runtime::worker_protocol::{ApplyOutcome, HeldRule, RuleGrant};
 use crate::session_protocol::host::ApprovalInfo;
-use crate::session_protocol::wire::{
-    AlwaysRule, ApprovalCloseReason, ApprovalDecision, MAX_SESSION_RULES,
-};
+use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision, MAX_SESSION_RULES};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,8 +112,8 @@ pub enum Event {
         tool: String,
         summary: String,
     },
-    /// The session's active rules changed (the whole list).
-    Rules(Vec<AlwaysRule>),
+    /// The session's rules changed (the whole list).
+    Rules(Vec<HeldRule>),
     /// The broker's `revoke_approval_rule`: whether the rule was active
     /// (never produced by `Approvals`; the worker reports it).
     RuleRevoked { rule_id: String, ok: bool },
@@ -174,9 +178,9 @@ struct Waiting {
     reported: bool,
     /// This session's agent started its hook (Codex; Claude: always).
     ours: bool,
-    /// The session rule an `allow_always` decision chose, kept once the
-    /// hook took it.
-    pending_rule: Option<SessionRule>,
+    /// The session rule an `allow_always` decision chose and what it was
+    /// granted under, kept once the hook took it.
+    pending_rule: Option<(SessionRule, RuleGrant)>,
     /// The session rule whose allow the worker wrote for it (auto-allowed);
     /// revoking the rule withdraws that allow while the hook hasn't taken it.
     auto_rule: Option<String>,
@@ -200,7 +204,15 @@ pub struct Approvals {
     /// last `take_released`, so Codex shows its own dialog for it.
     released: bool,
     /// Codex: the Atem session rules of this agent process, oldest first.
-    rules: Vec<SessionRule>,
+    rules: Vec<Kept>,
+}
+
+/// A session rule the worker keeps.
+struct Kept {
+    rule: SessionRule,
+    granted_under: RuleGrant,
+    /// Granted or accepted by the broker connected now: only then it allows.
+    confirmed: bool,
 }
 
 fn is_id(id: &str) -> bool {
@@ -270,17 +282,45 @@ impl Approvals {
         }
     }
 
-    /// The active session rules as cards show them, oldest first.
-    pub fn rules(&self) -> Vec<AlwaysRule> {
-        self.rules.iter().map(|r| r.rule.clone()).collect()
+    /// The session rules, oldest first, with what each was granted under
+    /// and whether the connected broker confirmed it.
+    pub fn rules(&self) -> Vec<HeldRule> {
+        self.rules
+            .iter()
+            .map(|r| HeldRule {
+                rule: r.rule.rule.clone(),
+                granted_under: r.granted_under.clone(),
+                confirmed: r.confirmed,
+            })
+            .collect()
     }
 
-    /// Revokes the session rule `rule_id`; false when it isn't active.
+    /// A new broker connected: no rule allows until it confirms it.
+    pub fn unconfirm_rules(&mut self) {
+        for r in &mut self.rules {
+            r.confirmed = false;
+        }
+    }
+
+    /// The broker accepted the unconfirmed rules `rule_ids` (granted under
+    /// its identity and trust): they allow again. Every other unconfirmed
+    /// rule is dropped; confirmed ones (granted by this broker meanwhile)
+    /// stay.
+    pub fn confirm_rules(&mut self, rule_ids: &[String]) {
+        self.rules.retain_mut(|r| {
+            if !r.confirmed {
+                r.confirmed = rule_ids.contains(&r.rule.rule.rule_id);
+            }
+            r.confirmed
+        });
+    }
+
+    /// Revokes the session rule `rule_id`; false when it isn't held.
     /// An allow it wrote that the hook hasn't taken yet is withdrawn ("no
     /// decision": Codex's own dialog asks).
     pub fn revoke(&mut self, rule_id: &str) -> bool {
         let before = self.rules.len();
-        self.rules.retain(|r| r.rule.rule_id != rule_id);
+        self.rules.retain(|r| r.rule.rule.rule_id != rule_id);
         self.withdraw_auto(|r| r == rule_id);
         self.rules.len() != before
     }
@@ -312,11 +352,21 @@ impl Approvals {
         }
     }
 
-    /// Keeps `rule` (the hook took the `allow_always` that chose it); false
-    /// when the session already holds as many as it may (one that matches
-    /// the same counts as kept).
-    fn keep_rule(&mut self, rule: SessionRule) -> bool {
-        if self.rules.iter().any(|r| r.matcher == rule.matcher) {
+    /// Keeps `rule`, granted under `granted_under`, confirmed (the hook
+    /// took the `allow_always` that chose it); false when the session
+    /// already holds as many as it may. One with the same matcher counts as
+    /// kept: it takes the new grant and is confirmed.
+    fn keep_rule(&mut self, rule: SessionRule, granted_under: RuleGrant) -> bool {
+        if let Some(held) = self
+            .rules
+            .iter_mut()
+            .find(|r| r.rule.matcher == rule.matcher)
+        {
+            if !held.confirmed || held.granted_under != granted_under {
+                held.confirmed = true;
+                held.granted_under = granted_under;
+                self.queued.push(Event::Rules(self.rules()));
+            }
             return true;
         }
         if self.rules.len() >= MAX_SESSION_RULES {
@@ -326,15 +376,22 @@ impl Approvals {
             );
             return false;
         }
-        self.rules.push(rule);
+        self.rules.push(Kept {
+            rule,
+            granted_under,
+            confirmed: true,
+        });
         self.queued.push(Event::Rules(self.rules()));
         true
     }
 
-    /// The active rule this request matches exactly, if any.
+    /// The confirmed rule this request matches exactly, if any.
     fn matching_rule(&self, request: &Request) -> Option<&SessionRule> {
         let matcher = request.matcher.as_ref()?;
-        self.rules.iter().find(|r| &r.matcher == matcher)
+        self.rules
+            .iter()
+            .find(|r| r.confirmed && &r.rule.matcher == matcher)
+            .map(|r| &r.rule)
     }
 
     #[cfg(test)]
@@ -484,11 +541,13 @@ impl Approvals {
 
     /// The broker's decision for `id`. `Some(Applied{not_delivered})` when
     /// it can't be handed over; the outcome otherwise follows from `poll`.
+    /// A session rule `rule_id` chooses is kept only with `granted_under`.
     pub fn decide(
         &mut self,
         id: &str,
         decision: ApprovalDecision,
         rule_id: Option<&str>,
+        granted_under: Option<&RuleGrant>,
         message: Option<&str>,
     ) -> Option<Event> {
         let refused = Some(Event::Applied {
@@ -523,7 +582,8 @@ impl Approvals {
             .filter(|r| {
                 decision == ApprovalDecision::AllowAlways
                     && Some(r.rule.rule_id.as_str()) == rule_id
-            });
+            })
+            .zip(granted_under.cloned());
         if let Some(w) = self.waiting.get_mut(id) {
             w.pending_rule = rule;
         }
@@ -579,8 +639,9 @@ impl Approvals {
         if self.agent == Agent::Codex {
             // A rule the full session couldn't keep is said before the
             // answer completes (its card is still known then).
-            if let Some(rule) = self.waiting.get_mut(id).and_then(|w| w.pending_rule.take())
-                && !self.keep_rule(rule)
+            if let Some((rule, granted_under)) =
+                self.waiting.get_mut(id).and_then(|w| w.pending_rule.take())
+                && !self.keep_rule(rule, granted_under)
             {
                 self.queued.push(Event::RuleNotKept {
                     request_id: id.into(),

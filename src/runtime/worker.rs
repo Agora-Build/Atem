@@ -743,7 +743,11 @@ impl Worker {
             };
             self.send(&snapshot);
         }
-        // The session rules outlive a broker (the worker owns them).
+        // The session rules outlive a broker (the worker owns them), but
+        // allow nothing until this broker confirms them.
+        if let Some(a) = self.approvals.as_mut() {
+            a.unconfirm_rules();
+        }
         let rules = self.approvals.as_ref().map(Approvals::rules);
         if let Some(rules) = rules.filter(|r| !r.is_empty()) {
             self.send(&WorkerMsg::ApprovalRules { rules });
@@ -1049,6 +1053,7 @@ impl Worker {
                 request_id,
                 decision,
                 rule_id,
+                granted_under,
                 message,
             } => {
                 let refused = match self.approvals.as_mut() {
@@ -1056,6 +1061,7 @@ impl Worker {
                         &request_id,
                         decision,
                         rule_id.as_deref(),
+                        granted_under.as_ref(),
                         message.as_deref(),
                     ),
                     None => Some(ApprovalEvent::Applied {
@@ -1103,6 +1109,15 @@ impl Worker {
                     .map(Approvals::rules)
                     .unwrap_or_default();
                 self.send(&WorkerMsg::ApprovalRules { rules });
+            }
+            BrokerMsg::ConfirmApprovalRules { rule_ids } => {
+                let rules = self.approvals.as_mut().map(|a| {
+                    a.confirm_rules(&rule_ids);
+                    a.rules()
+                });
+                self.send(&WorkerMsg::ApprovalRules {
+                    rules: rules.unwrap_or_default(),
+                });
             }
         }
         false

@@ -448,12 +448,12 @@ impl BrokerSession {
         &self,
         request_id: &str,
         decision: crate::session_protocol::wire::ApprovalDecision,
-        rule_id: Option<String>,
+        rule: Option<(String, super::worker_protocol::RuleGrant)>,
         message: Option<String>,
     ) -> anyhow::Result<()> {
         match &self.worker {
             Some(worker) if self.is_live() => {
-                worker.approval_decision(request_id, decision, rule_id, message)
+                worker.approval_decision(request_id, decision, rule, message)
             }
             _ => anyhow::bail!("The session has ended"),
         }
@@ -488,6 +488,15 @@ impl BrokerSession {
     pub fn request_approval_rules(&self) -> anyhow::Result<()> {
         match &self.worker {
             Some(worker) => worker.request_approval_rules(),
+            None => Ok(()),
+        }
+    }
+
+    /// Confirms the worker's unconfirmed session rules `rule_ids` (granted
+    /// under the host's current identity and trust); it drops the others.
+    pub fn confirm_approval_rules(&self, rule_ids: Vec<String>) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.confirm_approval_rules(rule_ids),
             None => Ok(()),
         }
     }

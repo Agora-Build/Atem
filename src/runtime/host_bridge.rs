@@ -55,10 +55,15 @@
 //! the session's conversations and one runtime.log line naming the rule
 //! (never the command) — no approval, no push, no lease. A revoke
 //! (`approval_rule_revoke`) goes to the worker as `revoke_approval_rule`
-//! and completes on its `approval_rule_revoked`.
+//! and completes on its `approval_rule_revoked`. Each rule carries the
+//! account, device and trust generation it was granted under (sent with the
+//! `allow_always` decision): a broker that registers an adopted worker's
+//! session accepts only the rules granted under its current identity and
+//! trust (`confirm_approval_rules`; the worker drops the rest, and allows by
+//! none until then), and a rebind or trust change drops them all.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
 use super::worker_approvals::Event as ApprovalEvent;
-use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome};
+use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome, HeldRule, RuleGrant};
 use crate::app::App;
 use crate::app::hosted::{HostedSession, refusal};
 use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
@@ -685,7 +690,7 @@ impl HostBridge {
                         return false;
                     }
                 }
-                self.rules_after_rebind(&ctx, cx);
+                self.drop_all_rules(cx);
             }
             return true;
         }
@@ -715,7 +720,7 @@ impl HostBridge {
                 }
                 self.exec(effects, cx);
                 self.sync_all(cx);
-                self.rules_after_rebind(&ctx, cx);
+                self.drop_all_rules(cx);
                 true
             }
             Err(error) => {
@@ -727,23 +732,22 @@ impl HostBridge {
         }
     }
 
-    /// After the host was rebound or its trust moved on from `previous`:
-    /// session rules were granted under the old account, device or trust
-    /// generation, so with any of them changed every worker drops all its
-    /// rules (the host already cleared its copy); under the same identity
-    /// and trust the host lost only its copy, so the workers send theirs
-    /// again.
-    fn rules_after_rebind(&mut self, previous: &HostContext, cx: &mut Cx) {
-        let now = self.host.context();
-        let changed = now.account_id != previous.account_id
-            || now.atem_device_id != previous.atem_device_id
-            || now.host_trust_gen != previous.host_trust_gen;
+    /// After the host was rebound or its trust moved on: every session rule
+    /// was granted under the old account, device or trust generation, so
+    /// every worker drops all of them (the host already cleared its copy).
+    fn drop_all_rules(&mut self, cx: &mut Cx) {
         for session in cx.sessions.values() {
-            let _ = if changed {
-                session.revoke_all_approval_rules()
-            } else {
-                session.request_approval_rules()
-            };
+            let _ = session.revoke_all_approval_rules();
+        }
+    }
+
+    /// What a session rule granted now is granted under.
+    fn rule_grant(&self) -> RuleGrant {
+        let ctx = self.host.context();
+        RuleGrant {
+            account_id: ctx.account_id.clone(),
+            atem_device_id: ctx.atem_device_id.clone(),
+            host_trust_gen: ctx.host_trust_gen,
         }
     }
 
@@ -1212,7 +1216,9 @@ impl HostBridge {
         let registered = match result {
             Ok(effects) => {
                 self.exec(effects, cx);
-                // Its session rules, which it may have sent before this.
+                // Its session rules (an adopted worker's are unconfirmed
+                // until `rules_reported` accepts them), which it may have
+                // sent before this.
                 if let Some(session) = cx.sessions.get(id) {
                     let _ = session.request_approval_rules();
                 }
@@ -1635,19 +1641,44 @@ impl HostBridge {
         self.broadcast_to(sid, &out, None, true, cx);
     }
 
-    /// A worker's active session rules: to the host (session-v1
-    /// `approval_rules`) and to the session's conversations with `control`
-    /// (chat-v1 `rules`) when they changed.
-    fn rules_reported(&mut self, sid: &str, rules: Vec<wire::AlwaysRule>, cx: &mut Cx) {
-        let Some(process_gen) = session_of(cx, sid).map(|s| s.process_gen.clone()) else {
+    /// A worker's session rules. Unconfirmed ones (an adopted worker's)
+    /// are accepted only when granted under the host's current account,
+    /// device and trust generation: the worker confirms those and drops the
+    /// others, then reports again. Confirmed rules under the current
+    /// identity go to the host (session-v1 `approval_rules`) and to the
+    /// session's conversations with `control` (chat-v1 `rules`) when they
+    /// changed.
+    fn rules_reported(&mut self, sid: &str, held: Vec<HeldRule>, cx: &mut Cx) {
+        let Some(session) = session_of(cx, sid) else {
             return;
         };
+        let process_gen = session.process_gen.clone();
         // Rules a worker reports before its session is registered with the
         // host (e.g. right after adoption) are dropped here: `register`
         // asks the worker for them again once it is.
         if !self.per.get(sid).is_some_and(|p| p.registered) {
             return;
         }
+        let grant = self.rule_grant();
+        if held.iter().any(|r| !r.confirmed) {
+            let accepted = held
+                .iter()
+                .filter(|r| !r.confirmed && r.granted_under == grant)
+                .map(|r| r.rule.rule_id.clone())
+                .collect();
+            if let Err(error) = session.confirm_approval_rules(accepted) {
+                eprintln!("atem runtime: {sid}: session rules not confirmed: {error}");
+            }
+            // Its next report lists what it kept.
+            return;
+        }
+        // A confirmed rule under another identity is being dropped by a
+        // `revoke_all_approval_rules` already on its way.
+        let rules: Vec<wire::AlwaysRule> = held
+            .into_iter()
+            .filter(|r| r.granted_under == grant)
+            .map(|r| r.rule)
+            .collect();
         if self.host.approval_rules(sid) == rules {
             return;
         }
@@ -1768,7 +1799,12 @@ impl HostBridge {
         let worker_id = self.approvals.get(approval_id).map(|a| a.worker_id.clone());
         let sent = match (worker_id, session_of(cx, sid)) {
             (Some(worker_id), Some(session)) => session
-                .approval_decision(&worker_id, decision, rule_id, message)
+                .approval_decision(
+                    &worker_id,
+                    decision,
+                    rule_id.map(|r| (r, self.rule_grant())),
+                    message,
+                )
                 .is_ok(),
             _ => false,
         };

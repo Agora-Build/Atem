@@ -131,6 +131,10 @@ pub enum BrokerMsg {
         decision: ApprovalDecision,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule_id: Option<String>,
+        /// With `rule_id`: the identity and trust the rule is granted
+        /// under, kept with it. A rule without one is never kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        granted_under: Option<RuleGrant>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -153,8 +157,34 @@ pub enum BrokerMsg {
     /// generation changed) → `approval_rules` (empty).
     RevokeAllApprovalRules,
     /// → `approval_rules` with the current list (even when empty): a broker
-    /// that registered the session, or rebound its host, asks again.
+    /// that registered the session asks for them.
     RequestApprovalRules,
+    /// The broker accepted the unconfirmed rules `rule_ids` (granted under
+    /// its current identity and trust): they allow again. Every other
+    /// unconfirmed rule is dropped; confirmed ones are untouched →
+    /// `approval_rules`.
+    ConfirmApprovalRules {
+        rule_ids: Vec<String>,
+    },
+}
+
+/// The identity and trust generation an Atem session rule was granted
+/// under (r7.2): a later broker accepts the rule only under the same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleGrant {
+    pub account_id: String,
+    pub atem_device_id: String,
+    pub host_trust_gen: u64,
+}
+
+/// One Atem session rule a worker holds. `confirmed`: granted or accepted
+/// by the broker connected now; a rule is unconfirmed after every new
+/// broker connection and allows nothing until the broker confirms it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldRule {
+    pub rule: AlwaysRule,
+    pub granted_under: RuleGrant,
+    pub confirmed: bool,
 }
 
 impl std::fmt::Debug for BrokerMsg {
@@ -193,6 +223,7 @@ impl std::fmt::Debug for BrokerMsg {
                 decision,
                 rule_id,
                 message,
+                ..
             } => write!(
                 f,
                 "ApprovalDecision({request_id}, {decision:?}, rule {rule_id:?}, {} message bytes)",
@@ -205,6 +236,9 @@ impl std::fmt::Debug for BrokerMsg {
             BrokerMsg::RevokeApprovalRule { rule_id } => write!(f, "RevokeApprovalRule({rule_id})"),
             BrokerMsg::RevokeAllApprovalRules => f.write_str("RevokeAllApprovalRules"),
             BrokerMsg::RequestApprovalRules => f.write_str("RequestApprovalRules"),
+            BrokerMsg::ConfirmApprovalRules { rule_ids } => {
+                write!(f, "ConfirmApprovalRules({rule_ids:?})")
+            }
         }
     }
 }
@@ -376,10 +410,11 @@ pub enum WorkerMsg {
         tool: String,
         summary: String,
     },
-    /// The session's active Atem session rules (the whole list), on every
+    /// The session's Atem session rules (the whole list, with what each
+    /// was granted under and whether this broker confirmed it), on every
     /// connection when there are any and whenever they change.
     ApprovalRules {
-        rules: Vec<AlwaysRule>,
+        rules: Vec<HeldRule>,
     },
     /// The answer to `revoke_approval_rule`: `ok` when the rule was active.
     ApprovalRuleRevoked {
@@ -550,12 +585,21 @@ mod tests {
                 request_id: "a1".into(),
                 decision: ApprovalDecision::AllowAlways,
                 rule_id: Some("r0-ab".into()),
+                granted_under: Some(RuleGrant {
+                    account_id: "acct".into(),
+                    atem_device_id: "dev".into(),
+                    host_trust_gen: 3,
+                }),
                 message: None,
+            },
+            BrokerMsg::ConfirmApprovalRules {
+                rule_ids: vec!["r0-ab".into()],
             },
             BrokerMsg::ApprovalDecision {
                 request_id: "a1".into(),
                 decision: ApprovalDecision::Deny,
                 rule_id: None,
+                granted_under: None,
                 message: Some("no".into()),
             },
             BrokerMsg::ReleaseApproval {
@@ -719,6 +763,7 @@ mod tests {
             request_id: "a".into(),
             decision: ApprovalDecision::Deny,
             rule_id: None,
+            granted_under: None,
             message: Some("m".repeat(n)),
         };
         assert!(decode_broker(&encode_broker(&deny(MAX_APPROVAL_MESSAGE_BYTES))).is_ok());
@@ -741,6 +786,7 @@ mod tests {
             request_id: "a1".into(),
             decision: ApprovalDecision::Deny,
             rule_id: None,
+            granted_under: None,
             message: Some("hunter2".into()),
         };
         let text = format!(

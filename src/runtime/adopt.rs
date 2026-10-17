@@ -281,18 +281,21 @@ impl WorkerHandle {
         self.send(&BrokerMsg::RequestScreen)
     }
 
-    /// The lease holder's answer to a waiting approval → `approval_applied`.
+    /// The lease holder's answer to a waiting approval → `approval_applied`;
+    /// `rule`: the session rule it chose and what it is granted under.
     pub fn approval_decision(
         &self,
         request_id: &str,
         decision: crate::session_protocol::wire::ApprovalDecision,
-        rule_id: Option<String>,
+        rule: Option<(String, super::worker_protocol::RuleGrant)>,
         message: Option<String>,
     ) -> Result<()> {
+        let (rule_id, granted_under) = rule.unzip();
         self.send(&BrokerMsg::ApprovalDecision {
             request_id: request_id.into(),
             decision,
             rule_id,
+            granted_under,
             message,
         })
     }
@@ -324,6 +327,12 @@ impl WorkerHandle {
     /// Asks for the session's current rules (`approval_rules`).
     pub fn request_approval_rules(&self) -> Result<()> {
         self.send(&BrokerMsg::RequestApprovalRules)
+    }
+
+    /// Confirms the unconfirmed rules `rule_ids`, dropping the other
+    /// unconfirmed ones (`approval_rules` follows).
+    pub fn confirm_approval_rules(&self, rule_ids: Vec<String>) -> Result<()> {
+        self.send(&BrokerMsg::ConfirmApprovalRules { rule_ids })
     }
 
     /// The worker's next message; `None` once its connection closed.
