@@ -1,13 +1,92 @@
-# Agent control API: Atem's response to Astation's proposal r1
+# Agent control API: Atem's response to Astation's proposal (r2)
 
-Status: Atem response r1, 2026-10-17, to "Agent control API: Astation and
-Atem joint proposal" r1 ([Astation #52](https://github.com/Agora-Build/Astation/issues/52)).
-Baseline: Atem `main` at `af56d39` (#73), contract
-[atem-session v1 r7.2](atem-session-v1.md), [agent chat host](../agent-chat-host.md),
-[chat developer guide](../agent-chat-api.md). Every paragraph is marked
-**Today** (in the code at `af56d39`) or **Proposed** (not built and not agreed
-yet). Nothing **Proposed** is emitted before §6's feature markers and fixtures
-exist.
+Status: Atem response r2, 2026-10-17. r1 answered "Agent control API:
+Astation and Atem joint proposal" r1 ([Astation #52](https://github.com/Agora-Build/Astation/issues/52));
+r2 answers Astation's review of r1 (four required points, accepted
+corrections) and its proposal r2. Baseline: Atem `main` at `53577a7` (#75),
+contract [atem-session v1 r7.2](atem-session-v1.md), [agent chat host](../agent-chat-host.md),
+[chat developer guide](../agent-chat-api.md). **Today** means in the code at
+`53577a7`; **r8** means the draft in the contract's appendix "r8 draft"
+(exact wire shapes) with the `r8-*` fixtures in `fixtures/` (parsed, not run
+until r8 ships). Nothing r8 is emitted before both sides pass its fixtures.
+
+## 0. Answers to the r1 review
+
+**1. Version admission (high).** Agreed. r8 `hello` carries `revision: 8`;
+an r8 host refuses a `hello` without it, or with another value, with
+`error{code:"unsupported_version", revision: 8}` before any attachment or
+session work, and keeps refusing everything until a correct `hello` is
+welcomed. `welcome` echoes `revision` and `features`; the client checks the
+revision before anything else, refuses an older host outright and enables
+only advertised features. Removed forms (`open.before`, `open.generation`,
+the `status.page` marker) are refused explicitly with
+`unsupported_version`, never read as a newest-page open. The envelope stays
+`v: 1`: one gate for every family, at admission, with an explicit refusal; a
+new `v` would need the same check in three parsers and still carry no
+feature list. Appendix A. Fixtures: `r8-hello-without-revision-8-is-refused-before-any-attachment`,
+`r8-client-refuses-a-host-without-revision-8`,
+`r8-client-enables-only-advertised-features`, `r8-open-with-before-is-refused`.
+
+**2. Page/live ordering (medium).** Resolved by an explicit ordered-stream
+guarantee, no new host field. r1's unsequenced `history_page` is dropped:
+every page, lookups included, is snapshotted and enqueued in one step of the
+broker's single-threaded pass, as sequenced envelopes in the conversation's
+one stream, between live events. **Today** this already holds for the open
+page and for #75's `open{before}` page (synchronous `ChatSession::page`,
+each envelope numbered by `next_head`, ending with `status.page`). A
+message's `sequence` is its position: newer versions always carry higher
+sequences, so a client keeps the highest-sequence version per `messageId`
+and a page never replaces a newer one. Astation puts its HTTP/SSE cursor
+(the conversation sequence) on each page and applies the same rule; a reopen
+starts a new stream. Appendix B. Fixture:
+`r8-history-page-and-live-events-share-one-ordered-stream` (host side; the
+delayed-HTTP-page merge fixture is Astation's).
+
+**3. Bounded recovery (medium).** Agreed. `history` takes exactly one of
+`before`, `turn_id`, `request_id`, `next` (validated formats and lengths;
+otherwise the new `invalid_request`). Every page is bounded by 50 messages,
+256 KiB content and 1 MiB serialized (sum of its envelopes), lookups
+included. A continuation is an opaque `next` bound to attachment,
+conversation, target, generation, selector and snapshot; out of context or
+stale it is `stale_target`. `end: true` means the selected result is
+exhausted. `coverage` is `complete`|`partial`|`unavailable`.
+`receipt.result.reply_message_ids` holds at most 32 ids plus `more: true`;
+`history{request_id}` pages carry the rest; a `receipts` reply is bounded by
+construction (≤ 64 × ≤ 6 KiB). Appendix B, D. Fixtures:
+`r8-long-turn-is-recovered-in-bounded-pages`,
+`r8-receipt-result-bounds-reply-message-ids`,
+`r8-history-selectors-are-exclusive-and-validated`,
+`r8-stale-or-foreign-next-token-is-stale-target`.
+
+**4. Truncation vs gaps (medium).** Agreed; r1's "any truncated flag means
+reopen" is withdrawn. Truncation is persistent coverage information
+(`oldest_retained`, `truncated: true`), shown and never a reset. Interior
+holes (worker backlog drops a reload can't restore) are reported as
+persistent `holes: [{after_message_id, before_message_id, count?}]`, in
+`history_end` and in a sequenced `coverage` event; reopen can't repair them.
+A client resyncs only on a sequence gap, a fenced conversation, another
+generation or `close` with a `reason`. **r8 implementation change:** today
+(#75) a backlog gap makes the broker reload the worker's history and then
+send `error` + `close`, forcing a reopen; in r8 it reloads, sends the
+recovered messages in sequence (`after_message_id`), and reports what stayed
+missing as a hole, with no close. Appendix C. Fixtures:
+`r8-truncated-history-reopens-once-then-stays-live`,
+`r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap`,
+`r8-backlog-hole-is-reported-not-reopened`.
+
+**Accepted corrections.** All of them, as Astation states them. Codex chat is
+built (#73; Codex 0.162.1 with trusted hooks; first prompt typed in the
+terminal; `opened.unavailable` adds `error_details`). Always allow is not
+Claude-only (Codex: an Atem session rule, exact command and cwd, this
+process). One host conversation per target and attachment, fanned out by
+Astation. Pages are batches, not pending jobs; the end marker is now
+`history_end`. A completed prompt receipt can be an interrupted turn (today
+`detail: "done"|"interrupted"`, #75). `receipt.result` reply ids are a
+projection of retained history. **Today after #75:** a broker restart
+restores the worker's whole retained history (500 / 8 MiB) with approval
+cards, and a card pending at adoption becomes `closed` (the host released
+that approval), so recovered cards never revive a released approval; this
+still needs the joint test.
 
 ## 1. Agreement and ownership
 
@@ -52,8 +131,7 @@ holds in the code:
   a chat submit is refused with `FIRST_PROMPT` ("type a first prompt in the
   terminal: …"). This follows the 2026-10-17 ruling: text typed into Codex's
   startup dialogs could answer them. The first hook pins the session and names
-  the rollout. Fix: `agent-chat-host.md` still says that Codex `open` before
-  its first hook is `busy`.
+  the rollout. (`agent-chat-host.md` was corrected in #75.)
 - **Correction to the proposal.** "Always allow uses an exact provider-offered
   rule, Claude only" is wrong since r7.2. Codex cards offer allow once, deny,
   and "Always allow `<command>` in <cwd> for this session". Atem's worker keeps
@@ -76,114 +154,39 @@ holds in the code:
   The reader skips record types and items it doesn't know. Claude behaves the
   same way for a transcript format change.
 
-## 3. Q2: history page end
+## 3. History
 
-**Today** (`host_bridge.rs` `open_conversation`). `open` sends `opened`
-(`sequence` 0), then the newest page (50 messages / 256 KiB) as
-`message{history:true}` at sequences 1…n. The conversation's live sequence then
-continues at n+1. All of this happens in one broker pass, so no live event
-falls between those messages. There are three defects:
-1. Nothing marks the end of the page. A quiet socket and a finished page look
-   the same.
-2. `open{before}` on an open conversation reopens it: a new `opened` at 0, and
-   the live counter is reset to the page length. Paging therefore restarts
-   the live sequence, and a live event can collide with or precede history.
-3. An unknown or evicted `before` returns an empty page, which can't be told
-   apart from "no older messages". The worker's backlog `gap` (messages dropped
-   while no broker was attached) is ignored by the broker (`broker.rs`,
-   `gap: _`), so incomplete history is never reported.
+**Today** (`53577a7`): `open` sends `opened` (0) and the newest page (50
+messages / 256 KiB) as sequenced `message{history:true}`, with no end
+marker. `open{before}` on an open conversation pages without a reset: the
+older page continues the live sequence and ends with a sequenced `status`
+carrying `page{before, count, start}` (an empty page is the marker alone).
+A `before` not retained, or of another `generation`, is `stale_target`. A
+worker backlog `gap` triggers a reload of the worker's history, then `error`
+"the chat history was incomplete…" and `close`. Retention: 500 messages /
+8 MiB per `process_gen` in the broker and the worker (one message ≤ 128 KiB);
+the worker's backlog while no broker reads it is 4096 items / 8 MiB, oldest
+dropped first (`gap`); adoption restores the whole retained history with
+cards. No chat history on disk. `/clear`, resume and Codex `/new` keep the
+generation and close conversations ("switched"); a new process starts empty.
 
-**Proposed** (feature `chat.history_end`, `chat.history_page`):
-- `open` takes no `before`. Its reply is `opened`, the newest page as sequenced
-  `message{history:true}`, then a sequenced `history_end`. Live events follow
-  from `history_end.sequence + 1`. The host builds all of it in one pass, so
-  every event produced after the snapshot comes after `history_end`.
-- Older pages use a new unsequenced request, `history`. Its reply,
-  `history_page`, carries no `sequence` and never touches the live counter.
-  Paging and live delivery are independent, and a page is never merged with
-  live events by sequence. A client merges by `messageId`, and a whole
-  message always replaces an earlier copy.
-- A `before` that is no longer retained gets `end:"unknown_cursor"`, never an
-  empty page that claims to be the start.
+**r8** (appendix B, C): `open` ends with `history_end`; `history` with one
+selector; bounded pages with `next`, `end`, `coverage`, `oldest_retained`,
+`truncated`, `holes`; the `coverage` event; `close.reason`.
 
-```json
-{"type":"agentChat","data":{"v":1,"op":"history_end","conversationId":"c1","agentId":"ses-aaaaaaaaaaaa",
- "generation":"<process_gen>","sequence":51,"page":{"count":50,"next_before":"m-0451",
- "end":"more","oldest_retained":"m-0001","truncated":true,"retained":{"messages":500,"bytes":7340032}}}}
-{"type":"agentChat","data":{"v":1,"op":"history","conversationId":"c1","agentId":"ses-aaaaaaaaaaaa",
- "binding":{…},"page_id":"p7","before":"m-0451"}}
-{"type":"agentChat","data":{"v":1,"op":"history_page","conversationId":"c1","agentId":"ses-aaaaaaaaaaaa",
- "generation":"<process_gen>","page_id":"p7","messages":[{"messageId":"m-0401",…}],
- "page":{"count":50,"next_before":"m-0401","end":"more","oldest_retained":"m-0001","truncated":true}}}
-```
+## 4. Request → reply recovery
 
-- `end` is one of: `more` (`next_before` names the oldest message in this page),
-  `start` (the oldest retained message was sent), or `unknown_cursor`.
-  `truncated: true` means messages older than `oldest_retained` existed and were
-  lost: evicted, cut by an adoption snapshot, or dropped as a worker backlog gap.
-  The broker then stops ignoring `gap`. Approval cards filtered out for a
-  view-only attachment are not truncation.
-- `generation` is the agent's `process_gen` (the chat generation equals it
-  **today**). Another `generation` means another process: discard the cache.
-- Retention (**today**, unchanged by this proposal):
+**Today:** a completed `prompt` receipt's `detail` is the turn outcome
+(`done`|`interrupted`, journaled as that word only). Messages carry
+`turnId`, and a remote prompt's messages carry its `requestId`. The broker's
+turn id per receipt is in memory only.
 
-| Where | Bound | Survives |
-|---|---|---|
-| Broker `ChatSession` (serves pages) | newest 500 messages / 8 MiB per `process_gen`; one message ≤ 128 KiB (cut with "… (truncated)") | agent exit (readable until the session is removed) |
-| Worker `ChatSession` | the same 500 / 8 MiB; backlog while no broker is attached: 4096 items / 8 MiB, oldest first dropped (`gap`) | broker restart |
-| Broker restart or adoption | rebuilt from the worker's `chat_snapshot`: newest **200 messages / 1 MiB**; approval cards are lost (only the broker makes them); in-flight prompt acceptance and the in-memory turn outcomes are lost | — |
-| `/clear`, `/resume`, Codex `/new` | same generation; history kept (resumed content backfilled); conversations get "the conversation was switched; reopen the chat" | — |
-| New process (relaunch) or session removed | none; a new `process_gen` starts empty | — |
-
-Atem stores no chat history on disk. The providers' own transcript files are
-theirs. **Proposed:** the adoption snapshot grows to the full 500 / 8 MiB, in
-chunks under the line bound, so a broker restart loses nothing except approval
-cards.
-
-## 4. Q3: request → reply recovery
-
-**Today.** A completed `prompt` receipt carries only `request_id`, `target`,
-`kind`, `state`, `detail?` and `updated_at`. The broker knows the turn and
-outcome in memory only (`host.rs` entry `turn_id`, `host_bridge.rs`
-`outcomes`, capped at 4096). Both are lost on broker restart, and neither is
-journaled. A prompt receipt is `completed` for an **interrupted** turn too:
-only the chat `complete.outcome` tells the two apart. The user message
-and the assistant messages of a remote prompt's turn carry its `requestId`,
-and every message carries `turnId`.
-
-**Proposed** (feature `receipt.result`):
-- A `prompt` receipt in `completed` carries `result`. Only ids are journaled
-  (`turn_id`, `user_message_id`, `outcome`), written with the `completed`
-  transition. `reply_message_ids` is computed when the receipt is sent,
-  from retained history. The journal never holds prompt or reply text, and the
-  payload is already dropped when the receipt leaves `accepted`.
-
-```json
-{"type":"session","data":{"v":1,"op":"receipt","request_id":"46464646-…","target":{…},"kind":"prompt",
- "state":"completed","updated_at":1760600000000,
- "result":{"turn_id":"t-9","user_message_id":"m-0412","outcome":"done",
-           "reply_message_ids":["m-0413","m-0414"],"replies":"retained"}}}
-```
-
-- `outcome` is `done` or `interrupted`. `replies` is `retained` (every message
-  of the turn is still in history), `partial` (the oldest were evicted) or
-  `unavailable` (the turn was evicted or the process is gone; then
-  `reply_message_ids` is `[]`). A turn may complete before late content arrives,
-  so `reply_message_ids` is as of the moment the receipt is sent. A later
-  `receipt_query` may list more.
-- `receipt_query` after a reconnect or broker restart returns `result` from the
-  journal, plus reply ids recomputed from retained history.
-- Recovering the messages uses chat `history` with `turn_id` or `request_id`
-  in place of `before`. The reply is one `history_page` holding that turn's
-  retained messages (`end:"start"`), or `end:"unknown_cursor"` once they were
-  evicted.
-- An `executing` prompt whose broker restarted stays `outcome_unknown`. It
-  gets no `result` and is never re-run. Its messages can still be found by
-  `history{request_id}`, because the worker's snapshot keeps `requestId` on
-  each message. After eviction or a new process the answer is `unavailable`.
-  Nothing is recreated by running the request again.
-- `interrupt` receipts may carry `result{turn_id, outcome}` when a turn ended.
-  `stop` and `approval` receipts carry none.
+**r8** (appendix D): `result{turn_id, user_message_id, outcome,
+reply_message_ids ≤ 32, more, replies}`; ids only in the journal, reply ids
+computed from retained history when sent; the rest by
+`history{request_id}`. An `executing` prompt across a broker restart stays
+`outcome_unknown` without `result`, is never re-run, and its messages remain
+findable by `history{request_id}` while retained.
 
 ## 5. Q4: approval parts
 
@@ -219,65 +222,51 @@ message, and the client replaces it:
 - Withdrawal: when chat is withdrawn, switched or restarted, conversations
   get `error` and `close`. The approval stays in the session inbox and can be
   answered there (approvals are not a chat capability). A broker restart
-  releases every approval ("no decision", `approval_closed{released}`), and its
-  cards vanish from history (see §3).
+  releases every approval ("no decision", `approval_closed{released}`); since
+  #75 its cards survive in history as `closed`.
 
-**Proposed** (feature `approval.card_reason`): every final card except
+**r8** (feature `approval.card_reason`): every final card except
 `auto_allowed` carries `reason`, the `approval_closed` reason
 (`answered_remote`, `answered_terminal`, `interrupted`, `timed_out`,
 `released`, `process_ended`). Clients then never have to map `closed` back to a
 cause. The state names above stay as they are.
 
-## 6. Q5: versioning
+## 6. Versioning
 
-Recommend **r8**, not r7.3. r7.x revisions only added things. r8 changes
-semantics: `open` loses `before`, and a page no longer resets the live sequence.
-Clients built for r7 would page incorrectly. **Proposed:** `welcome` gains a
-required `revision: "r8"` and `features: [string]`. Unknown fields are ignored
-today (§1), so the field is safe to add. Per-session abilities stay in the
-descriptor's `capabilities`.
-
-```json
-{"type":"session","data":{"v":1,"op":"welcome",…,"revision":"r8",
- "features":["chat.history_end","chat.history_page","receipt.result","approval.session_rules","approval.card_reason"]}}
-```
-
-A side emits a feature only after the shared fixture for it is in
-`designs/protocol/fixtures/` and passes in Rust (Atem) and Swift (Astation). An
-r8 host never advertises a feature it hasn't implemented. `approval.session_rules`
-names what r7.2 already ships.
+r8, gated by `hello.revision` (appendix A, answer 0.1). Features:
+`chat.history_end`, `chat.history`, `chat.lookup`, `chat.coverage`,
+`receipt.result`, `approval.session_rules` (r7.2, shipped),
+`approval.card_reason`. A side advertises or uses a feature only after its
+`r8-*` fixtures pass in Rust (Atem) and Swift (Astation).
 
 ## 7. Work
 
-**Atem work** (S ≤ 1 day, M ≤ 3 days, L > 3 days):
+**Atem work** (S ≤ 1 day, M ≤ 3 days):
 
 | # | Item | Size |
 |---|---|---|
-| A1 | `history_end` after `opened`; `history`/`history_page` unsequenced; drop `open.before`; `unknown_cursor` | M |
-| A2 | Track truncation in `ChatSession` (eviction, snapshot cut, worker `gap` stops being ignored); `oldest_retained`, `retained` | S |
-| A3 | Full adoption snapshot (500 / 8 MiB, chunked) | S |
-| A4 | Journal `turn_id`/`user_message_id`/`outcome` with `completed`; `result` in `receipt`/`receipts`; `replies` computed from history | M |
-| A5 | `history{turn_id|request_id}` lookup | S |
-| A6 | Card `reason`; `welcome.revision`/`features`; contract r8 text; docs (`agent-chat-host.md` Codex `busy` fix, `agent-chat-api.md`) | S |
-| A7 | Live check: Claude 2.1.301 and Codex 0.162.1 through the r8 fixtures with a real runtime (`tests/runtime_fixtures_binary.rs`) | M |
+| A1 | `hello.revision` admission, `welcome.revision`/`features`, refusal of removed forms | S |
+| A2 | `history_end`; `history` with selectors, validation, three bounds, `next` tokens (MAC, context binding) | M |
+| A3 | Coverage: `oldest_retained`, `truncated`, holes; backlog gap → reload + `coverage` event (replaces #75's error + close); `close.reason` | M |
+| A4 | `receipt.result` (journal ids with `completed`; reply ids from history, ≤ 32 + `more`) | M |
+| A5 | Card `reason`; contract r8 text replaces r7.2 parts; docs | S |
+| A6 | Fixture runner actions (schema.md "r8 draft"), drop `requires`; live check with Claude 2.1.301 and Codex 0.162.1 | M |
 
-**Joint fixtures** (new `designs/protocol/fixtures/*.json`, written before
-either side emits the feature):
-- `chat-open-ends-with-history-end`
-- `chat-live-after-history-end-continues-the-sequence`
-- `chat-history-page-does-not-touch-the-live-sequence`
-- `chat-history-unknown-cursor`
-- `chat-history-truncated-after-eviction`
-- `chat-history-truncated-after-adoption-gap`
-- `chat-history-by-turn-and-request`
-- `receipt-result-on-completed-prompt`
-- `receipt-result-interrupted-turn`
-- `receipt-result-after-broker-restart`
-- `receipt-replies-unavailable-after-eviction`
-- `executing-prompt-after-restart-is-unknown-without-result`
-- `approval-card-reason-matches-approval-closed`
-- `approval-card-withdrawn-with-chat-inbox-still-answers`
-- `welcome-features-gate-emission`
+**Joint fixtures** (in `fixtures/`, r8 draft, NOT RUN until r8 ships):
+`r8-hello-without-revision-8-is-refused-before-any-attachment`,
+`r8-client-refuses-a-host-without-revision-8`,
+`r8-client-enables-only-advertised-features`,
+`r8-open-with-before-is-refused`,
+`r8-history-page-and-live-events-share-one-ordered-stream`,
+`r8-long-turn-is-recovered-in-bounded-pages`,
+`r8-truncated-history-reopens-once-then-stays-live`,
+`r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap`,
+`r8-backlog-hole-is-reported-not-reopened`,
+`r8-receipt-result-bounds-reply-message-ids`,
+`r8-history-selectors-are-exclusive-and-validated`,
+`r8-stale-or-foreign-next-token-is-stale-target`.
+Still to write with the implementation: card `reason`, `receipt.result`
+after a broker restart and for an interrupted turn.
 
 ## 8. Notes on Astation's API layer (suggestions, Astation owns these)
 
@@ -290,10 +279,11 @@ either side emits the feature):
   cards, so open the shared conversation from the controlling attachment and
   filter per reader.
 - **SSE replay is Astation's.** Atem provides `generation`, a per-conversation
-  `sequence`, the session registry `seq`/`runtime_epoch`, receipts and gap
-  signals: a sequence gap, another generation, a `close`, or `truncated`. Any
-  of these means resynchronize by reopening. Atem keeps no replay window per
-  client.
+  `sequence` (also each message version's position), the session registry
+  `seq`/`runtime_epoch` and receipts. Resynchronize by reopening only on a
+  sequence gap, a fenced conversation, another generation or `close` with a
+  `reason`; truncation, holes and `coverage` events are shown, never a
+  reason to reopen. Atem keeps no replay window per client.
 - **Notification triggers** from host events:
 
 | Notification | Host event |

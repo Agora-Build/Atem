@@ -1,0 +1,542 @@
+{
+ "name": "r8-backlog-hole-is-reported-not-reopened",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "chat_history": "ses-aaaaaaaaaaaa",
+   "messages": [
+    {
+     "messageId": "m-0001",
+     "role": "user",
+     "turnId": "turn-1",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 1"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0002",
+     "role": "assistant",
+     "turnId": "turn-1",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 2"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0003",
+     "role": "user",
+     "turnId": "turn-2",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 3"
+      }
+     ],
+     "origin": "local"
+    }
+   ]
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 1,
+    "messageId": "m-0001",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 2,
+    "messageId": "m-0002",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 3,
+    "messageId": "m-0003",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 4,
+    "page.end": true,
+    "page.coverage": "complete"
+   }
+  },
+  {
+   "chat_message": "ses-aaaaaaaaaaaa",
+   "message": {
+    "messageId": "m-0004",
+    "role": "assistant",
+    "turnId": "turn-2",
+    "createdAt": 1760600000000,
+    "parts": [
+     {
+      "id": "p1",
+      "kind": "text",
+      "markdown": "message 4"
+     }
+    ]
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 5,
+    "messageId": "m-0004"
+   }
+  },
+  {
+   "worker_gap": "ses-aaaaaaaaaaaa",
+   "dropped": [
+    "m-0005",
+    "m-0006",
+    "m-0007"
+   ],
+   "recoverable": [
+    "m-0006",
+    "m-0007"
+   ],
+   "delivered_after": [
+    {
+     "messageId": "m-0008",
+     "role": "assistant",
+     "turnId": "turn-4",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 8"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 6,
+    "messageId": "m-0008"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 7,
+    "messageId": "m-0006",
+    "history": true,
+    "after_message_id": "m-0004"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 8,
+    "messageId": "m-0007",
+    "history": true,
+    "after_message_id": "m-0006"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "coverage",
+    "sequence": 9,
+    "holes": [
+     {
+      "after_message_id": "m-0004",
+      "before_message_id": "m-0006",
+      "count": 1
+     }
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "chat_message": "ses-aaaaaaaaaaaa",
+   "message": {
+    "messageId": "m-0009",
+    "role": "user",
+    "turnId": "turn-5",
+    "createdAt": 1760600000000,
+    "parts": [
+     {
+      "id": "p1",
+      "kind": "text",
+      "markdown": "message 9"
+     }
+    ],
+    "origin": "local"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 10,
+    "messageId": "m-0009"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p1",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "before": "m-0009"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 11,
+    "messageId": "m-0001",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 12,
+    "messageId": "m-0002",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 13,
+    "messageId": "m-0003",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 14,
+    "messageId": "m-0004",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 15,
+    "messageId": "m-0006",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 16,
+    "messageId": "m-0007",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 17,
+    "messageId": "m-0008",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 18,
+    "page_id": "p1",
+    "page.end": true,
+    "page.truncated": false,
+    "page.coverage": "partial",
+    "page.holes": [
+     {
+      "after_message_id": "m-0004",
+      "before_message_id": "m-0006",
+      "count": 1
+     }
+    ]
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "close",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa"
+    }
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 1,
+    "messageId": "m-0001",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 2,
+    "messageId": "m-0002",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 3,
+    "messageId": "m-0003",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 4,
+    "messageId": "m-0004",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 5,
+    "messageId": "m-0006",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 6,
+    "messageId": "m-0007",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 7,
+    "messageId": "m-0008",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 8,
+    "messageId": "m-0009",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 9,
+    "page.coverage": "partial",
+    "page.holes.#": 1
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 1000
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 0,
+    "pty_writes": 0,
+    "lease_holder": null,
+    "chat_closes": 0,
+    "chat_opens": 2,
+    "dispatches": 0
+   }
+  }
+ ],
+ "note": "r8 implementation change from #75 (which answers a worker backlog gap with a reload, then error and close): the worker's backlog dropped m-0005..m-0007 while the broker was busy. The host reloads the worker's history and sends what it recovered (m-0006, m-0007) as sequenced message{history: true} with after_message_id, in timeline order, then the live stream goes on. m-0005 is no longer in the worker's history either, so a coverage event reports a persistent hole between m-0004 and m-0006 inside the retained timeline (not truncation: oldest_retained is unchanged). No error, no close, no reopen loop; reopening shows the same hole, which nothing can repair."
+}

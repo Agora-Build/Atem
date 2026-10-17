@@ -1,0 +1,575 @@
+{
+ "name": "r8-truncated-history-reopens-once-then-stays-live",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "chat_history": "ses-aaaaaaaaaaaa",
+   "messages": [
+    {
+     "messageId": "m-0001",
+     "role": "user",
+     "turnId": "turn-1",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 1"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0002",
+     "role": "assistant",
+     "turnId": "turn-1",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 2"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0003",
+     "role": "user",
+     "turnId": "turn-2",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 3"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0004",
+     "role": "assistant",
+     "turnId": "turn-2",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 4"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0005",
+     "role": "user",
+     "turnId": "turn-3",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 5"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0006",
+     "role": "assistant",
+     "turnId": "turn-3",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 6"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0007",
+     "role": "user",
+     "turnId": "turn-4",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 7"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0008",
+     "role": "assistant",
+     "turnId": "turn-4",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 8"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0009",
+     "role": "user",
+     "turnId": "turn-5",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 9"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0010",
+     "role": "assistant",
+     "turnId": "turn-5",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 10"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "chat_evict": "ses-aaaaaaaaaaaa",
+   "count": 4
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 1,
+    "messageId": "m-0005",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 2,
+    "messageId": "m-0006",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 3,
+    "messageId": "m-0007",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 4,
+    "messageId": "m-0008",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 5,
+    "messageId": "m-0009",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 6,
+    "messageId": "m-0010",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 7,
+    "page.end": true,
+    "page.count": 6,
+    "page.truncated": true,
+    "page.oldest_retained": "m-0005",
+    "page.coverage": "partial",
+    "page.holes.#": 0
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "close",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa"
+    }
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 1,
+    "messageId": "m-0005",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 2,
+    "messageId": "m-0006",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 3,
+    "messageId": "m-0007",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 4,
+    "messageId": "m-0008",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 5,
+    "messageId": "m-0009",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 6,
+    "messageId": "m-0010",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 7,
+    "page.end": true,
+    "page.count": 6,
+    "page.truncated": true,
+    "page.oldest_retained": "m-0005",
+    "page.coverage": "partial",
+    "page.holes.#": 0
+   }
+  },
+  {
+   "chat_message": "ses-aaaaaaaaaaaa",
+   "message": {
+    "messageId": "m-0011",
+    "role": "user",
+    "turnId": "turn-6",
+    "createdAt": 1760600000000,
+    "parts": [
+     {
+      "id": "p1",
+      "kind": "text",
+      "markdown": "message 11"
+     }
+    ],
+    "origin": "local"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 8,
+    "messageId": "m-0011"
+   }
+  },
+  {
+   "chat_message": "ses-aaaaaaaaaaaa",
+   "message": {
+    "messageId": "m-0012",
+    "role": "assistant",
+    "turnId": "turn-6",
+    "createdAt": 1760600000000,
+    "parts": [
+     {
+      "id": "p1",
+      "kind": "text",
+      "markdown": "message 12"
+     }
+    ]
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 9,
+    "messageId": "m-0012"
+   }
+  },
+  {
+   "chat_evict": "ses-aaaaaaaaaaaa",
+   "count": 2
+  },
+  {
+   "chat_message": "ses-aaaaaaaaaaaa",
+   "message": {
+    "messageId": "m-0013",
+    "role": "user",
+    "turnId": "turn-7",
+    "createdAt": 1760600000000,
+    "parts": [
+     {
+      "id": "p1",
+      "kind": "text",
+      "markdown": "message 13"
+     }
+    ],
+    "origin": "local"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 10,
+    "messageId": "m-0013"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p1",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "before": "m-0011"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 11,
+    "messageId": "m-0007",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 12,
+    "messageId": "m-0008",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 13,
+    "messageId": "m-0009",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 14,
+    "messageId": "m-0010",
+    "history": true,
+    "page_id": "p1"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 15,
+    "page_id": "p1",
+    "page.end": true,
+    "page.truncated": true,
+    "page.oldest_retained": "m-0007",
+    "page.coverage": "partial"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 1000
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 0,
+    "pty_writes": 0,
+    "lease_holder": null,
+    "chat_opens": 2,
+    "chat_closes": 0,
+    "dispatches": 0
+   }
+  }
+ ],
+ "note": "Retention evicted m-0001..m-0004. Every history_end says truncated: true with oldest_retained, coverage partial: persistent information to display, never a reset. The client reopens once (close, open), gets the same truncated page, and then consumes live messages at consecutive sequences; further eviction only moves oldest_retained in later pages. The host sends no close, error or new opened, and nothing is dispatched (no prompt replay)."
+}

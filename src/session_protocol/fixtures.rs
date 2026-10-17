@@ -52,6 +52,9 @@ pub struct ClientSetup {
     pub client_kind: ClientKind,
     #[serde(default)]
     pub holds_lease_epoch: Option<u64>,
+    /// r8 draft: `false` leaves the client without the harness's `hello`.
+    #[serde(default)]
+    pub welcome: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +80,10 @@ pub struct Scenario {
     pub name: String,
     #[serde(default)]
     pub side: Side,
+    /// A contract revision this runner doesn't implement yet (`"r8"`): the
+    /// scenario is parsed and reported as not run.
+    #[serde(default)]
+    pub requires: Option<String>,
     pub setup: Setup,
     pub steps: Vec<Value>,
     /// Documentation for readers; not interpreted.
@@ -176,12 +183,15 @@ pub type HostFactory<'a> = &'a dyn Fn(&Setup) -> Result<Box<dyn HostUnderTest>, 
 pub enum Outcome {
     Passed,
     Skipped,
+    /// Needs a contract revision not implemented yet (`requires`).
+    NotRun,
 }
 
 #[derive(Debug, Default)]
 pub struct Report {
     pub passed: Vec<String>,
     pub skipped: Vec<String>,
+    pub not_run: Vec<String>,
     pub failed: Vec<(String, String)>,
 }
 
@@ -227,6 +237,7 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
         match result {
             Ok(Outcome::Passed) => report.passed.push(name),
             Ok(Outcome::Skipped) => report.skipped.push(name),
+            Ok(Outcome::NotRun) => report.not_run.push(name),
             Err(e) => report.failed.push((name, e)),
         }
     }
@@ -237,6 +248,12 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
 pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, String> {
     let scenario: Scenario =
         serde_json::from_value(file.clone()).map_err(|e| format!("scenario: {e}"))?;
+    if scenario.requires.is_some() {
+        return Ok(Outcome::NotRun);
+    }
+    if scenario.setup.clients.iter().any(|c| c.welcome.is_some()) {
+        return Err(format!("{}: welcome needs requires", scenario.name));
+    }
     let mut runner = match scenario.side {
         Side::Host => match host {
             None => return Ok(Outcome::Skipped),
@@ -942,6 +959,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The scenarios this runner implements (r8-draft ones, with
+    /// `requires`, are left out; see `r8_draft_fixtures_parse_and_are_not_run`).
     fn scenario_files() -> Vec<(String, Value)> {
         scenario_paths(&fixtures_dir())
             .into_iter()
@@ -949,7 +968,25 @@ mod tests {
                 let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
                 (p.file_name().unwrap().to_string_lossy().into_owned(), v)
             })
+            .filter(|(_, v)| v.get("requires").is_none())
             .collect()
+    }
+
+    #[test]
+    fn r8_draft_fixtures_parse_and_are_not_run() {
+        let mut draft = Vec::new();
+        for p in scenario_paths(&fixtures_dir()) {
+            let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            if v.get("requires").is_some() {
+                let s: Scenario = serde_json::from_value(v.clone()).expect("r8 fixture parses");
+                assert_eq!(s.requires.as_deref(), Some("r8"), "{}", s.name);
+                assert_eq!(run_scenario(&v, Some(&fake_runtime)), Ok(Outcome::NotRun));
+                draft.push(s.name);
+            }
+        }
+        assert!(!draft.is_empty(), "r8 draft fixtures missing");
+        let report = run_all(&fixtures_dir(), Some(&fake_runtime));
+        assert_eq!(report.not_run, draft);
     }
 
     fn fake_runtime(setup: &Setup) -> Result<Box<dyn HostUnderTest>, String> {

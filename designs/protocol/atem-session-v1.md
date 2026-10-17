@@ -1,5 +1,9 @@
 # atem-session v1: sessions, control leases, receipts and approvals (r7.2: r7.1 plus Atem session rules — for review)
 
+Draft (not implemented): r8 — required `hello.revision`, `welcome.features`,
+history pages in the sequenced stream with bounded selectors and coverage,
+`receipt.result`, removal of `open.before` — is in the appendix "r8 draft"
+at the end; this r7.2 text stays authoritative until r8 ships.
 Status: r7.2 (2026-10-17) adds Atem session rules (§6a): for an agent whose
 hook can't keep a persistent rule (Codex), its card offers "Always allow this
 command" with `scope: "session"`; Atem's worker keeps the rule for that agent
@@ -737,3 +741,217 @@ reconnection, an old signature or a relay timestamp; rollback protection and
 conservative restart/clock handling), channel key establishment with
 replay/downgrade protection binding endpoint keys, account, roles, permissions
 and generations, the `resume_proof` format, and QR grant binding.
+
+## Appendix: r8 draft (not implemented; r7.2 above stays authoritative)
+
+Status: **draft**, 2026-10-17, answering Astation's review of Atem's agent
+control API response r1 (`agent-control-api-atem.md` r2). Nothing here is
+emitted or accepted by any build until r8 ships on both sides together and
+the `r8-*` fixtures (`fixtures/schema.md`, "r8 draft fixtures") pass in Rust
+and Swift. Then this appendix replaces the affected r7.2 text. No backward
+compatibility: an r8 host and an r8 client refuse every r7 peer.
+
+### A. Version admission
+
+The envelope stays `v: 1`; the revision named in `hello` is the gate. One
+mechanism covers every family (a new `v` would need the same check in
+session, terminal and chat parsers and still say nothing about features), and
+the refusal is explicit at admission rather than a silent misreading later.
+
+| op | dir | r8 fields |
+|---|---|---|
+| `hello` | C→H | **`revision`** (required, the JSON integer `8`), `resume?` |
+| `welcome` | H→C | r7.2 fields plus **`revision: 8`** and **`features: [string]`** |
+
+- An r8 host answers a `hello` with no `revision`, another number or a
+  non-integer with session `error{re, code:"unsupported_version", revision:
+  8, detail}` and does nothing else: no attachment, no `welcome`, no lease,
+  receipt, subscription or conversation. Every later request on that
+  transport is refused as before `welcome` (in its family,
+  `unsupported_version`) until a `hello{revision: 8}` is welcomed.
+- The client checks `welcome.revision == 8` before anything else; without
+  it (an r7 host ignores the unknown `hello.revision` and welcomes without
+  one) the client refuses the attachment: it sends nothing further and
+  applies nothing it receives, and tells the user the host's Atem must be
+  updated.
+- `features` lists what this host implements. The client enables only the
+  advertised features it knows (unknown names are ignored) and never sends
+  an op of a feature it didn't see; an operation that needs a missing
+  feature is shown unavailable. A host never advertises a feature before its
+  fixtures pass; an op of an unadvertised feature is `unsupported_version`.
+  Per-session abilities stay in the descriptor's `capabilities`.
+
+| feature | adds |
+|---|---|
+| `chat.history_end` | `open` ends with a sequenced `history_end` (§B) |
+| `chat.history` | `history{before|next}` pages in the sequenced stream (§B) |
+| `chat.lookup` | `history{turn_id|request_id}` (§B) |
+| `chat.coverage` | `oldest_retained`, `truncated`, `holes`, `coverage`, the `coverage` event, `close.reason` (§C) |
+| `receipt.result` | `result` on completed `prompt` receipts (§D) |
+| `approval.session_rules` | r7.2 session rules (already shipped) |
+| `approval.card_reason` | final cards carry `reason` (the `approval_closed` reason) |
+
+- **Removed in r8**, refused explicitly with `unsupported_version` and no
+  effect (never read as another form): chat `open.before`, `open.generation`
+  (the r7.2/#75 paging form; an open conversation is not reset and no new
+  one opens), the `status.page` marker (replaced by `history_end`), and a
+  `hello` without `revision`.
+
+### B. History pages in the ordered conversation stream
+
+**Ordering guarantee.** A conversation is one ordered stream with one
+`sequence` counter. The host builds a page in a single step of its
+single-threaded broker pass: it snapshots the retained history and enqueues
+the page's envelopes with consecutive sequences, and no live event of that
+conversation is enqueued between them. Every live event produced after the
+snapshot has a higher sequence. (Today's code already does this:
+`host_bridge.rs` `open_conversation` builds the open page and, since #75, the
+`open{before}` page plus its `status.page` marker synchronously from
+`ChatSession::page`, numbering every envelope with the conversation's
+`next_head`; r8 makes it a contract.)
+
+Each message envelope's `sequence` is its position: a message version
+carried at a higher sequence is newer. A client keeps, per `messageId`, the
+version with the highest sequence and never lets a page replace a newer
+version. No per-message revision is needed because the stream is the order.
+Astation, which returns pages over HTTP and changes over SSE, attaches its
+own replay cursor (the conversation sequence) to each page and applies the
+same rule. A reopen starts a new stream (`opened` at 0), so positions are
+compared within one `opened` only.
+
+`open` (no `before`, no `generation`) replies `opened` (sequence 0), the
+newest page as `message{history: true}`, then `history_end`. Older pages
+and lookups:
+
+```json
+{"type":"agentChat","data":{"v":1,"op":"history","conversationId":"conv-1","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-2222-4222-8222-222222222222","page_id":"p7","turn_id":"turn-9",
+ "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
+```
+
+- **Selectors**: exactly one of `before` (a retained `messageId`: the page
+  ends just before it), `turn_id`, `request_id` (the turn whose user message
+  carries it) or `next` (a continuation token, which carries its selector).
+  None, two or more → chat `error{code:"invalid_request"}`.
+- **Validation**: `before`, `turn_id`: 1–128 bytes of `[A-Za-z0-9._:-]`;
+  `request_id`: lowercase v4 UUID; `next`: 1–512 bytes of base64url;
+  `page_id`: 1–64 bytes of `[A-Za-z0-9._:-]`, chosen by the client;
+  `generation` must equal `binding.target.process_gen` and the conversation
+  must be open on this attachment (`stale_target`). At most 8 history
+  requests a second per conversation (`busy`).
+- **Reply**: `message{history: true, page_id}` envelopes, then
+  `history_end`, all sequenced:
+
+```json
+{"type":"agentChat","data":{"v":1,"op":"history_end","conversationId":"conv-1","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-…","sequence":58,"page_id":"p7",
+ "page":{"selector":"turn_id","count":28,"content_bytes":168000,"wire_bytes":1017000,
+         "end":false,"next":"<opaque>","coverage":"complete",
+         "oldest_retained":"m-0001","truncated":true,"holes":[]}}}
+```
+
+  `page_id` is absent on the open's `history_end` (`selector: "newest"`).
+- **Order**: `newest`/`before` pages go backwards (each page lists its
+  messages oldest first; `next` continues with older ones). `turn_id`/
+  `request_id` pages go forwards from the turn's oldest retained message to
+  its newest message at the first page's snapshot; later messages of the
+  turn arrive live.
+- **Bounds** (every page, lookups included): ≤ 50 messages, ≤ 256 KiB of
+  content (message bytes as counted by `ChatSession`), and ≤ 1 MiB
+  serialized (the sum of the page's envelopes, so Astation can return it as
+  one body); a page stops before the message that would pass any bound and
+  holds at least one message when one remains (a message is ≤ 128 KiB of
+  content, < 1 MiB however escaped). Cards filtered out for a view-only
+  attachment don't count.
+- **`end`**: `true` when the selected result is exhausted (no older retained
+  message, or the turn's last message at the snapshot was sent); then there
+  is no `next`.
+- **`next`**: opaque, made by the host (MAC under a key of this runtime),
+  binding the attachment, `conversationId`, full target (session and
+  `process_gen`), selector and value, the continuation point and the history
+  snapshot (the history's reload count). Used in another conversation,
+  attachment or target, altered, after its continuation point was evicted,
+  after a history reload, or after a runtime restart → chat
+  `error{code:"stale_target", page_id}`; the client starts a new selection.
+- **`before` not retained** → `stale_target` (as #75). A `turn_id`/
+  `request_id` with nothing retained is not an error: `count: 0`, `end:
+  true`, `coverage: "unavailable"`.
+- Errors for a history request are sequenced in the conversation and carry
+  its `page_id` when that was valid; nothing else is sent and nothing resets.
+
+### C. Coverage: truncation and holes
+
+- **`coverage`** of the selected result: `complete` (every message of it is
+  retained), `partial` (some were evicted or fall in a hole; for a lookup,
+  the turn's oldest messages were evicted or a hole lies inside the turn),
+  `unavailable` (none is retained).
+- **Truncation** is persistent: `oldest_retained` (the oldest retained
+  `messageId`, `null` when empty) and `truncated: true` once anything of this
+  process's history was evicted (retention 500 messages / 8 MiB, or an
+  adoption cut). It is shown, never a reset; clients keep consuming the
+  stream and never reopen because of it.
+- **Holes** are gaps inside the retained timeline: items the worker's
+  backlog dropped (`gap`) that a reload of the worker's history could not
+  restore. `holes: [{after_message_id, before_message_id, count?}]` names the
+  retained neighbours (`before_message_id: null` at the live edge until the
+  next message); `count` when known. A `history_end` lists the holes whose
+  `before_message_id` is in its page (≤ 16, then `holes_more: true`); holes
+  older than `oldest_retained` become truncation. Holes are persistent and
+  no reopen repairs them.
+- **Backlog gap handling (r8 implementation change from #75).** Today a
+  worker chunk with `gap > 0` makes the broker reload the worker's history
+  and then send every open conversation `error` "the chat history was
+  incomplete…" and `close`, forcing a reopen. In r8 the broker reloads, sends
+  each recovered message to open conversations as a sequenced
+  `message{history: true, after_message_id}` (timeline order; `after_message_id`
+  is the retained message it follows), and reports what stayed missing in a
+  sequenced event, with no `error` or `close`:
+
+```json
+{"type":"agentChat","data":{"v":1,"op":"coverage","conversationId":"conv-1","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-…","sequence":9,"oldest_retained":"m-0001","truncated":false,
+ "holes":[{"after_message_id":"m-0004","before_message_id":"m-0006","count":1}]}}
+```
+
+  A reload that fails (worker gone, over the reload bound) reports the gap as
+  a hole with `count` when known.
+- **Resync** (reopen) only on: a sequence gap in the conversation, a fenced
+  conversation (`stale_target` for its attachment, a new attachment), another
+  `generation`, or `close` with a `reason`. r8 `close` carries `reason`:
+  `switched` (`/clear`, resume, `/new`), `withdrawn` (chat withdrawn),
+  `restarted` (new process), `evicted` (a ninth conversation), `fenced`,
+  `reset` (any other host reset). Truncation, holes and `coverage` events
+  never ask for one.
+
+### D. `receipt.result`
+
+```json
+{"type":"session","data":{"v":1,"op":"receipt","request_id":"44444444-…","target":{…},"kind":"prompt",
+ "state":"completed","detail":"done","updated_at":1760600000000,
+ "result":{"turn_id":"turn-7","user_message_id":"turn-7-u","outcome":"done",
+           "reply_message_ids":["turn-7-a-0001","…","turn-7-a-0032"],"more":true,"replies":"complete"}}}
+```
+
+- On `completed` `prompt` receipts only. `turn_id`, `user_message_id` and
+  `outcome` (`done`|`interrupted`, equal to `detail`) are journaled with the
+  `completed` transition (ids only, never text). `reply_message_ids` (the
+  turn's assistant messages, timeline order, **at most 32**), `more` (true
+  when more replies are retained) and `replies` (`complete`|`partial`|
+  `unavailable`, the turn's coverage as in §C) are computed from retained
+  history each time the receipt is sent, so they may change with late
+  content or eviction. The rest come from `history{request_id}`; nothing is
+  ever re-run to recover replies. An `outcome_unknown` prompt has no
+  `result`.
+- Bounds: a receipt with `result` is ≤ 6 KiB (32 ids ≤ 128 bytes each, plus
+  r7.2 bounds); a `receipts` reply holds ≤ 64 receipts (r7.2's
+  `request_ids` bound), so ≤ 384 KiB, below the 1 MiB message bound without
+  continuation.
+
+### E. Errors (r8 additions)
+
+| code | when |
+|---|---|
+| `unsupported_version` | also: `hello` without `revision: 8`; anything before such a `welcome`; `open.before`/`open.generation`; an op of an unadvertised feature |
+| `invalid_request` | new: a well-formed message of a known op whose fields break its rules (history selector count, field formats or lengths) |
+| `stale_target` | also: a `next` token used out of its context or stale; a `before` no longer retained |
+| `busy` | also: more than 8 history requests a second in a conversation |

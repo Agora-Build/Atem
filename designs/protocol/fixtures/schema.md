@@ -67,3 +67,62 @@ from the agents' permission hooks.
 `approval-rule-revoke-*` needs session rules, which only a Codex session's
 `allow_always` creates: the real-runtime runner (whose agent is Claude)
 lists it as not run.
+
+## r8 draft fixtures (not run until r8 ships)
+
+`r8-*.json` scenarios carry `"requires": "r8"` and exercise the **r8
+draft** in `../atem-session-v1.md` (appendix "r8 draft"). Both runners
+(`src/session_protocol/fixtures.rs`, `tests/runtime_fixtures_binary.rs`)
+parse them and report them as NOT RUN (`requires r8`); nothing below is
+implemented yet. When r8 ships, `requires` is removed and the runners gain
+these actions.
+
+- In an r8 scenario the harness's setup `hello` carries `"revision": 8` and
+  the `welcome` must echo `revision: 8` and carry `features`.
+- `clients[].welcome: false`: the harness sends no `hello` for that client
+  (the steps do).
+
+| step (r8 draft) | meaning |
+|---|---|
+| `{"chat_history": session_id, "messages": [message]}` | the session's retained chat history before any step reads it (complete chat-v1 message bodies, oldest first) |
+| `{"chat_message": session_id, "message": message}` | the agent produced a message, new or a whole replacement of one with the same `messageId` |
+| `{"chat_evict": session_id, "count": n}` | retention evicted the oldest `n` messages (`oldest_retained` moves, `truncated` becomes true) |
+| `{"chat_turn": session_id, "turn_id": t, "request_id"?: r, "origin": o, "assistant_messages": n, "text_bytes": b, "escape"?: "control"}` | one turn arrives live: a user message `<t>-u` (origin `o`, `requestId` `r` when given) and `n` assistant messages `<t>-a-0001`…, each one text part of `b` bytes; `escape: "control"` fills the text with U+0001 (6 bytes once JSON-escaped), else `x` |
+| `{"worker_gap": session_id, "dropped": [id], "recoverable": [id], "delivered_after": [message]}` | the worker's backlog dropped `dropped`, then delivered `delivered_after` with `gap > 0`; the host's reload of the worker's history finds only `recoverable` (the rest is gone from the worker too) |
+| `{"open_approval": …, "turn_id": t}` | as before; `turn_id` is the card's `turnId` |
+| `{"expect_live": client, "message_ids": [id], "sequence_from": n}` | takes that many chat `message`s (no `history`), with those ids in order and consecutive sequences from `n` |
+| `{"recover": client, "request": msg, "message_ids": [id], "min_pages": n, "max_count": c, "max_content_bytes": b, "max_wire_bytes": w, "end": {path: value}}` | sends `request` (a chat `history` or `open`), takes its page (`opened` first for an `open`; `message{history:true}`s then `history_end`), and while `page.end` is false sends `history{next}` with the same binding and conversation (page id `<page_id>-2`, …) and takes the next page. Every page: consecutive sequences, ≤ `c` messages, ≤ `b` content bytes, ≤ `w` serialized bytes (the sum of its envelopes), and no `end: true` before the last. Newest-first selections are reassembled oldest first. The messages taken equal `message_ids` exactly (no gap, no duplicate); the last `history_end` matches `end`; at least `n` pages |
+| `{"client_try": client, "json": msg, "refused": text}` | client side: the client is asked to send `msg` and must refuse locally with that reason (nothing is sent) |
+| `{"client_open_chat": client, "conversation": id, "session_id": s}` | client side: the client opens a chat (its `open` is consumed by the fixture) |
+
+New `assert` keys (r8 draft): `attachments` (live attachments on the host),
+`chat_opens` / `chat_closes` (`opened` / `close` the host sent, all
+conversations), `chat_conversations` (open conversations).
+
+New `assert_client` keys (r8 draft): `admitted` (the welcome passed the
+revision check), `revision`, `features_enabled` (advertised features the
+client knows and enabled), `lookup_enabled`, `coverage_enabled`,
+`chat_enabled`, `chat_loaded` (a `history_end` arrived), `chat_truncated`,
+`chat_messages` (ids in timeline order), `chat_reopens` (opens the client
+sent after the first), `sent` (messages sent since the last check).
+
+The r8 draft scenarios:
+
+| fixture | side | checks |
+|---|---|---|
+| `r8-hello-without-revision-8-is-refused-before-any-attachment` | host | r7/missing/other revision refused `unsupported_version` before any attachment or session work |
+| `r8-client-refuses-a-host-without-revision-8` | client | r8 client against an older host: no attachment, no feature |
+| `r8-client-enables-only-advertised-features` | client | a missing required feature is never used |
+| `r8-open-with-before-is-refused` | host | `open.before` refused explicitly, never read as a newest-page open |
+| `r8-history-page-and-live-events-share-one-ordered-stream` | host | page snapshot and enqueue are one step in the sequenced stream |
+| `r8-long-turn-is-recovered-in-bounded-pages` | host | > 50 messages / > 256 KiB / escaping overhead, bounded pages, `next` |
+| `r8-truncated-history-reopens-once-then-stays-live` | host | truncation is persistent information, no reset |
+| `r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap` | client | no reopen loop; resync on a real sequence gap |
+| `r8-backlog-hole-is-reported-not-reopened` | host | worker backlog gap: reload, then a persistent hole (changes #75's error + close) |
+| `r8-receipt-result-bounds-reply-message-ids` | host | `reply_message_ids` ≤ 32 + `more`, rest by `history{request_id}` |
+| `r8-history-selectors-are-exclusive-and-validated` | host | exactly one selector; formats and lengths |
+| `r8-stale-or-foreign-next-token-is-stale-target` | host | `next` bound to its context; evicted turn `unavailable`, partly evicted `partial` |
+
+Astation's API-level merge fixture (a delayed HTTP page against newer SSE
+versions) is Astation's; the host side of it is
+`r8-history-page-and-live-events-share-one-ordered-stream`.

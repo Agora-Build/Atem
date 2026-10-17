@@ -224,6 +224,10 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let file = read_fixture(&name);
+        // r8-draft fixtures use wire forms the r7.2 decoder doesn't know yet.
+        if file.get("requires").is_some() {
+            continue;
+        }
         let steps = file["steps"].as_array().unwrap();
         for (i, step) in steps.iter().enumerate() {
             let mut msgs = Vec::new();

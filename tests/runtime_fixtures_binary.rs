@@ -45,7 +45,8 @@
 //! mode), `fail_next_fsync`, `change_trust_gen`, `approval_rules` (session
 //! rules come only from a Codex session), and approval closes other
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
-//! false`.
+//! false`. r8-draft scenarios (`requires: "r8"`) are reported as not run
+//! (`requires r8`) until r8 ships.
 //!
 //! A scenario the real runtime fails would be listed in `KNOWN_DEVIATIONS`
 //! with the failure it must keep showing, and why (none today).
@@ -1438,9 +1439,13 @@ fn run_named(scenarios: &[Value], only: Option<&str>) -> Vec<(String, Result<(),
             .filter(|s| only.is_none_or(|o| s["name"] == o))
             .map(|s| {
                 let name = s["name"].as_str().unwrap().to_string();
-                let handle = scope.spawn(move || match unsupported(s) {
-                    Some(why) => Err(format!("not run: {why}")),
-                    None => run(s),
+                let handle = scope.spawn(move || match s.get("requires") {
+                    // r8-draft fixtures: parsed, not run until r8 ships.
+                    Some(r) => Err(format!("not run: requires {}", r.as_str().unwrap_or("?"))),
+                    None => match unsupported(s) {
+                        Some(why) => Err(format!("not run: {why}")),
+                        None => run(s),
+                    },
                 });
                 (name, handle)
             })
@@ -1458,10 +1463,15 @@ fn shared_host_fixtures_run_against_the_real_runtime() {
     assert!(scenarios.len() >= 13, "host fixtures missing");
     let only = std::env::var("ATEM_FIXTURE").ok();
     let results = run_named(&scenarios, only.as_deref());
+    let draft: Vec<&str> = scenarios
+        .iter()
+        .filter(|s| s.get("requires").is_some())
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
     let mut failed = Vec::new();
     for (name, result) in &results {
         let known = KNOWN_DEVIATIONS.iter().find(|(n, _)| n == name);
-        let not_run = NOT_RUN.contains(&name.as_str());
+        let not_run = NOT_RUN.contains(&name.as_str()) || draft.contains(&name.as_str());
         match (result, known) {
             (Err(e), _) if e.starts_with("not run:") && not_run => {
                 eprintln!("NOT RUN  {name} ({})", &e["not run: ".len()..])

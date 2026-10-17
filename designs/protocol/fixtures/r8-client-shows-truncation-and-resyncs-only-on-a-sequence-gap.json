@@ -1,0 +1,262 @@
+{
+ "name": "r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap",
+ "side": "client",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "revision": 8
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "welcome",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "re": "11111111-1111-4111-8111-000000000900",
+     "account_id": "account-a",
+     "atem_device_id": "host-a",
+     "host_trust_gen": 1,
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "controller_session": "12121212-1212-4212-8212-121212121212",
+     "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+     "client_kind": "native",
+     "permissions": [
+      "view",
+      "control"
+     ],
+     "authorization_ms_left": 86400000,
+     "server_time": 1760500000000,
+     "revision": 8,
+     "features": [
+      "chat.history_end",
+      "chat.history",
+      "chat.lookup",
+      "chat.coverage",
+      "receipt.result",
+      "approval.session_rules",
+      "approval.card_reason"
+     ]
+    }
+   }
+  },
+  {
+   "client_open_chat": "c1",
+   "conversation": "conv-1",
+   "session_id": "ses-aaaaaaaaaaaa"
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "opened",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "status": {
+      "state": "ready",
+      "since": 1760600000000
+     },
+     "unavailable": [
+      "streaming",
+      "reasoning"
+     ],
+     "approvalRules": [],
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "sequence": 0
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "message",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "history": true,
+     "messageId": "m-0005",
+     "role": "user",
+     "turnId": "turn-3",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 5"
+      }
+     ],
+     "origin": "local",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "sequence": 1
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history_end",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "page": {
+      "selector": "newest",
+      "count": 1,
+      "content_bytes": 9,
+      "wire_bytes": 300,
+      "end": true,
+      "coverage": "partial",
+      "oldest_retained": "m-0005",
+      "truncated": true,
+      "holes": []
+     },
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "sequence": 2
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "chat_truncated": true,
+    "chat_reopens": 0,
+    "chat_loaded": true
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "message",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "messageId": "m-0006",
+     "role": "assistant",
+     "turnId": "turn-3",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 6"
+      }
+     ],
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "sequence": 3
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "message",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "messageId": "m-0007",
+     "role": "user",
+     "turnId": "turn-4",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 7"
+      }
+     ],
+     "origin": "local",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "sequence": 4
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "chat_messages": [
+     "m-0005",
+     "m-0006",
+     "m-0007"
+    ],
+    "chat_reopens": 0,
+    "sent": []
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "message",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "messageId": "m-0009",
+     "role": "user",
+     "turnId": "turn-5",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "message 9"
+      }
+     ],
+     "origin": "local",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "sequence": 6
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "chat_reopens": 1
+   }
+  }
+ ],
+ "note": "Client side: truncated: true and coverage partial are shown and the client keeps consuming the live stream; it does not reopen for them. It reopens once on an actual sequence gap (5 missing before 6). Resync triggers are only a sequence gap, a fenced conversation, another generation, or close with a reason."
+}

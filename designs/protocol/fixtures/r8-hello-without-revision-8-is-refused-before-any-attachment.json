@@ -1,0 +1,237 @@
+{
+ "name": "r8-hello-without-revision-8-is-refused-before-any-attachment",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native",
+    "welcome": false
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000001"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "code": "unsupported_version",
+    "revision": 8
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "revision": 7
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "code": "unsupported_version",
+    "revision": 8
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "revision": "r8"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000004"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000004",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000005",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000005",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "error",
+    "code": "unsupported_version",
+    "conversationId": "conv-1"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 1000
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 0,
+    "pty_writes": 0,
+    "lease_holder": null,
+    "attachments": 0,
+    "receipts_visible": {
+     "c1": 0
+    }
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000006",
+     "revision": 8
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "welcome",
+    "re": "11111111-1111-4111-8111-000000000006",
+    "revision": 8,
+    "features": [
+     "chat.history_end",
+     "chat.history",
+     "chat.lookup",
+     "chat.coverage",
+     "receipt.result",
+     "approval.session_rules",
+     "approval.card_reason"
+    ]
+   },
+   "capture": {
+    "ag": "attachment_gen"
+   }
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 0,
+    "pty_writes": 0,
+    "lease_holder": null,
+    "attachments": 1
+   }
+  }
+ ],
+ "note": "An r8 host admits only hello{revision: 8}. A hello without revision (an r7 client), with another number, or with a non-integer is refused with session error unsupported_version (carrying the host's revision) before any attachment exists; session, terminal and chat requests stay refused as before welcome. No attachment, lease, receipt, dispatch or chat conversation results. A corrected hello is then welcomed with revision 8 and the host's features."
+}
