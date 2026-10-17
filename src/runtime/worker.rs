@@ -239,8 +239,9 @@ struct Launch {
 /// launches a session: `CLAUDE_CLI_*`/`CODEX_CLI_*` from the launch
 /// environment (else the worker's own), the spec's arguments after them,
 /// and for Claude its chat hooks first (approvals included unless
-/// `claude_approvals` is off). With Codex approvals on (`script`), a Codex
-/// session gets its own session directory for the approval hook in
+/// `claude_approvals` is off). With Atem's Codex hooks on (`script`), a
+/// Codex session gets its own session directory (`approvals/` for the
+/// PermissionRequest hook, `events/` for the other events) for the hooks in
 /// `~/.codex/hooks.json` (`chat::codex`), whose stable script `script` is
 /// refreshed here.
 fn agent_command(
@@ -293,7 +294,7 @@ fn agent_command(
                 match crate::chat::claude::hooks::create_session_dir(chat_root) {
                     Ok(dir) => Some(dir),
                     Err(error) => {
-                        eprintln!("atem worker: approvals are off for Codex: {error}");
+                        eprintln!("atem worker: Codex hooks are off: {error}");
                         None
                     }
                 }
@@ -348,8 +349,8 @@ pub struct WorkerOptions {
     /// Claude sessions register the approval hook (`[claude] approvals_hook`,
     /// default on).
     pub claude_approvals: bool,
-    /// The stable approval hook script Codex's hooks.json names, when Codex
-    /// approvals are on (`[codex] approvals_hook = true`).
+    /// The stable hook script Codex's hooks.json names, when Atem's Codex
+    /// hooks are on (`[codex] hooks = true`).
     pub approval_script: Option<PathBuf>,
 }
 

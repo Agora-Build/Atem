@@ -395,6 +395,11 @@ fn settings_default_to_claude_on_and_codex_off() {
     assert!(enabled(&config, Agent::Claude));
     assert!(!enabled(&config, Agent::Codex));
     fs::write(&config, "[codex]\napprovals_hook = true\n").unwrap();
+    assert!(
+        !enabled(&config, Agent::Codex),
+        "the setting is [codex] hooks"
+    );
+    fs::write(&config, "[codex]\nhooks = true\n").unwrap();
     assert!(enabled(&config, Agent::Claude));
     assert!(enabled(&config, Agent::Codex));
     fs::write(&config, "[claude]\napprovals_hook = false\n").unwrap();

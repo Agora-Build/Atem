@@ -60,9 +60,19 @@ impl Agent {
             Agent::Codex => "codex",
         }
     }
+
+    /// Its setting there: `[claude] approvals_hook` (the approval hook in
+    /// Claude's per-launch settings), `[codex] hooks` (all of Atem's
+    /// entries in Codex's hooks.json: approvals and chat).
+    fn config_key(self) -> &'static str {
+        match self {
+            Agent::Claude => "approvals_hook",
+            Agent::Codex => "hooks",
+        }
+    }
 }
 
-/// `[claude|codex] approvals_hook` in config.toml, when set.
+/// `[claude] approvals_hook` / `[codex] hooks` in config.toml, when set.
 pub fn read_setting(config: &Path, agent: Agent) -> anyhow::Result<Option<bool>> {
     use anyhow::Context;
     let text = match std::fs::read_to_string(config) {
@@ -74,14 +84,15 @@ pub fn read_setting(config: &Path, agent: Agent) -> anyhow::Result<Option<bool>>
         toml::from_str(&text).with_context(|| format!("{} isn't valid TOML", config.display()))?;
     Ok(value
         .get(agent.config_table())
-        .and_then(|c| c.get("approvals_hook"))
+        .and_then(|c| c.get(agent.config_key()))
         .and_then(toml::Value::as_bool))
 }
 
 /// Whether a session launched now gets approvals from Astation, from the
 /// profile's config.toml: Claude unless `[claude] approvals_hook = false`
-/// (never asked), Codex only once `[codex] approvals_hook = true` (asked by
-/// `atem agent launch codex`). An unreadable config.toml turns both off.
+/// (never asked), Codex only once `[codex] hooks = true` (asked by
+/// `atem agent launch codex`; it also covers Codex chat). An unreadable
+/// config.toml turns both off.
 pub fn enabled(config: &Path, agent: Agent) -> bool {
     match read_setting(config, agent) {
         Ok(set) => set.unwrap_or(agent == Agent::Claude),

@@ -58,15 +58,11 @@ impl Sandbox {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&run).unwrap();
         std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
-        // Codex approvals answered "no" up front: `atem agent launch codex`
-        // asks only in tests that remove this.
+        // Atem's Codex hooks answered "no" up front: `atem agent launch
+        // codex` asks only in tests that remove this.
         let config = home.join(".config").join("atem");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join("config.toml"),
-            "[codex]\napprovals_hook = false\n",
-        )
-        .unwrap();
+        std::fs::write(config.join("config.toml"), "[codex]\nhooks = false\n").unwrap();
         Self {
             dir,
             home,

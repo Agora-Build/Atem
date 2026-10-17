@@ -873,7 +873,7 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(parsed["kept"].as_bool(), Some(true));
         assert_eq!(parsed["atem_id"].as_str(), Some("h-1"));
-        assert_eq!(parsed["codex"]["approvals_hook"].as_bool(), Some(true));
+        assert_eq!(parsed["codex"]["hooks"].as_bool(), Some(true));
         assert_eq!(mode(&target), 0o640);
         // Malformed TOML is left as it is.
         fs::write(&target, "not = = toml").unwrap();

@@ -335,9 +335,10 @@ Astation sees that changed since r6.2.
   the card `answered_terminal`. `[claude] approvals_hook = false` in Atem's
   config.toml (default on, never asked) leaves the hook out of later
   launches: their prompts stay in the terminal.
-- Codex: one Atem entry in `~/.codex/hooks.json`, added after the first
-  `atem agent launch codex` asks once (`[codex] approvals_hook` in Atem's
-  config.toml; `false` removes it, and until it is `true` a Codex session
+- Codex: Atem's entries in `~/.codex/hooks.json` (one per Codex event;
+  PermissionRequest is the approval hook), added after the first
+  `atem agent launch codex` asks once (`[codex] hooks` in Atem's
+  config.toml; `false` removes them, and until it is `true` a Codex session
   watches nothing). Codex hides its prompt while the hook
   waits, so any input to the session — local keys or the lease holder's —
   first releases the waiting hooks (`approval_closed{released}`), and Atem

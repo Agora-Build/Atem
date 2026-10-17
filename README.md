@@ -228,11 +228,11 @@ terminal as usual. Claude gets the hook with `--settings` for each launch;
 to turn it off, set `approvals_hook = false` under `[claude]` in
 `~/.config/atem/config.toml` (Claude sessions launched afterwards keep their
 prompts in the terminal).
-The first `atem agent launch codex` asks once whether to add Atem's hook to
-`~/.codex/hooks.json` (a backup is kept as `hooks.json.atem-bak`); to turn it
-off later, set `approvals_hook = false` under `[codex]` in
-`~/.config/atem/config.toml` — the next `atem agent launch codex` removes the
-hook. See [§6a of the session protocol](designs/protocol/atem-session-v1.md).
+The first `atem agent launch codex` asks once whether to add Atem's hooks
+(one per Codex event, for approvals and chat) to `~/.codex/hooks.json`, after
+your own (a backup is kept as `hooks.json.atem-bak`); to turn them off later,
+set `hooks = false` under `[codex]` in `~/.config/atem/config.toml` — the next
+`atem agent launch codex` removes them. See [§6a of the session protocol](designs/protocol/atem-session-v1.md).
 
 ### Vault (shared cross-agent context)
 

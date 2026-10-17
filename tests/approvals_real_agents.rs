@@ -873,7 +873,7 @@ fn codex_approvals_end_to_end() {
         &extra,
     );
     screen_until(&fe, "the consent question", Duration::from_secs(20), |t| {
-        t.contains("Allow approvals from Astation for Codex?")
+        t.contains("Let Astation follow Codex sessions")
     });
     fe.send(b"y\r");
     let (sid, generation) = rig.new_session(&[]);
@@ -892,12 +892,9 @@ fn codex_approvals_end_to_end() {
     assert!(ours.starts_with(": atem-approval-hook;"), "{hooks}");
     let atem_config =
         std::fs::read_to_string(rig.sb.config().join("config.toml")).unwrap_or_default();
+    assert!(atem_config.contains("hooks = true"), "{atem_config}");
     assert!(
-        atem_config.contains("approvals_hook = true"),
-        "{atem_config}"
-    );
-    assert!(
-        fe.written().contains("Added Atem's approval hook to"),
+        fe.written().contains("Added Atem's hooks to"),
         "no setup notice"
     );
 
@@ -922,7 +919,7 @@ fn codex_approvals_end_to_end() {
         + &std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
     let trust_entries = trusted.matches("trusted_hash").count();
     report.push(format!(
-        "5 consent: asked once, y → [codex] approvals_hook = true; hooks.json merged (Stop hook kept, backup = original); review screen shown: {reviewed}; trusted_hash entries written: {trust_entries}"
+        "5 consent: asked once, y → [codex] hooks = true; hooks.json merged (Stop hook kept, backup = original); review screen shown: {reviewed}; trusted_hash entries written: {trust_entries}"
     ));
 
     let mut known: Vec<String> = Vec::new();
