@@ -509,7 +509,7 @@ struct Worker {
     adapter: Option<ChatAdapter>,
     /// The session has a chat adapter (from its launch; told in `hello`).
     has_chat: bool,
-    /// Approvals reported open (Codex: the adapter's waiting status).
+    /// Approvals reported open: the only source of Codex's waiting status.
     open_approvals: std::collections::HashSet<String>,
     /// The agent's waiting permission prompts (`worker_approvals`).
     approvals: Option<Approvals>,
@@ -653,6 +653,11 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         offset: 0,
         dropped: 0,
         has_chat: adapter.is_some(),
+        // The first `chat_snapshot` already names what the chat offers.
+        capabilities: adapter
+            .as_mut()
+            .map(|a| a.get().capabilities())
+            .unwrap_or_default(),
         open_approvals: Default::default(),
         adapter,
         approvals: approvals.map(|(dir, agent)| Approvals::new(&dir, agent, agent_pid)),
@@ -660,7 +665,6 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         held_input: std::collections::VecDeque::new(),
         hold: None,
         chat: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
-        capabilities: Capabilities::default(),
         chat_backlog: Default::default(),
         activity: (Activity::Unknown, None),
         exited: None,
@@ -1107,20 +1111,17 @@ impl Worker {
         for event in events {
             // Codex reports no permission wait of its own: the approvals
             // the worker reports open are its waiting status.
-            if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
-                match &event {
-                    ApprovalEvent::Request { request_id, .. } => {
-                        if self.open_approvals.insert(request_id.clone()) {
-                            codex.approval_opened(now_ms());
-                        }
-                    }
-                    ApprovalEvent::Closed { request_id, .. }
-                    | ApprovalEvent::Applied { request_id, .. } => {
-                        if self.open_approvals.remove(request_id) {
-                            codex.approval_closed();
-                        }
-                    }
+            match &event {
+                ApprovalEvent::Request { request_id, .. } => {
+                    self.open_approvals.insert(request_id.clone());
                 }
+                ApprovalEvent::Closed { request_id, .. }
+                | ApprovalEvent::Applied { request_id, .. } => {
+                    self.open_approvals.remove(request_id);
+                }
+            }
+            if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+                codex.set_open_approvals(self.open_approvals.len());
             }
             let message = match event {
                 ApprovalEvent::Request { request_id, info } => WorkerMsg::ApprovalRequest {
@@ -1177,12 +1178,7 @@ impl Worker {
     /// Reads the chat adapter (in the App's order: events, the log, then turn
     /// ends), keeps the activity from it and forwards what it read.
     fn poll_chat(&mut self) {
-        // Claude shows its own dialog while the hook waits, so the
-        // terminal may answer it: what the transcript shows is evidence.
-        // Codex holds its prompt until the hook ends (and input releases
-        // the hooks first): nothing it reports answers one.
-        let evidence =
-            self.approvals.is_some() && matches!(self.adapter, Some(ChatAdapter::Claude(_)));
+        let evidence = self.approvals.is_some();
         let Some(adapter) = self.adapter.as_mut().map(ChatAdapter::get) else {
             return;
         };
@@ -1193,23 +1189,28 @@ impl Worker {
         let capabilities = adapter.capabilities();
         // What may end a waiting permission prompt (applied with the next
         // approvals poll): a new prompt or the turn's end, a tool refused in
-        // the terminal. Tool results are the worker's only: never forwarded.
+        // the terminal — each stamped with when the agent reported it, so
+        // it answers only a prompt opened before (one read in the same pass
+        // as a newer request doesn't). Tool results are the worker's only:
+        // never forwarded.
         if evidence {
             use super::worker_approvals::Evidence;
             for e in &events {
-                if matches!(
-                    e,
-                    AgentEvent::PromptSubmitted { .. } | AgentEvent::TurnEnded
-                ) {
-                    self.approval_evidence
-                        .push(Evidence::TurnEnded { interrupted: false });
+                if let AgentEvent::PromptSubmitted { at_ms, .. } | AgentEvent::TurnEnded { at_ms } =
+                    e
+                {
+                    self.approval_evidence.push(Evidence::TurnEnded {
+                        interrupted: false,
+                        at_ms: *at_ms,
+                    });
                 }
             }
             for item in &log {
                 match item {
-                    LogItem::TurnEnded { outcome, .. } => {
+                    LogItem::TurnEnded { outcome, at_ms, .. } => {
                         self.approval_evidence.push(Evidence::TurnEnded {
                             interrupted: *outcome == crate::chat::adapter::Outcome::Interrupted,
+                            at_ms: (*at_ms != 0).then_some(*at_ms),
                         })
                     }
                     LogItem::ToolResult {
@@ -1241,7 +1242,7 @@ impl Worker {
         let (ends, others): (Vec<_>, Vec<_>) = events
             .iter()
             .cloned()
-            .partition(|e| matches!(e, AgentEvent::TurnEnded));
+            .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
         for event in others {
             self.chat.on_event(event, now, input_count);
         }

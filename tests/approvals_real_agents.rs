@@ -1026,6 +1026,8 @@ fn codex_approvals_end_to_end() {
     let aid = request["approval_id"].as_str().unwrap().to_string();
     known.push(aid.clone());
     assert_eq!(request["process_gen"], generation.as_str());
+    // Codex's chat status while the hook waits (the worker's open approval).
+    rig.activity(&sid, "waiting", Duration::from_secs(10));
     assert!(
         request["always_rules"]
             .as_array()
@@ -1296,9 +1298,42 @@ fn codex_chat_end_to_end() {
         receipt["state"], done["op"], done["outcome"]
     ));
     rig.activity(&sid, "ready", TURN);
-    eprintln!("CODEX CHAT REPORT:\n{}", report.join("\n"));
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
     assert_eq!(done["outcome"], "interrupted", "{done}");
+
+    // 5. /new (npm's codex: the hooks come from the real binary under the
+    //    node wrapper): chat follows the new session, local and remote.
+    type_line(&mut fe, "/new");
+    std::thread::sleep(Duration::from_secs(2));
+    type_line(&mut fe, "Reply with exactly the word: fresh");
+    let local = rig.wait(TURN, "the local prompt after /new", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["origin"] == "local"
+            && m.to_string().contains("fresh")
+    })["data"]
+        .clone();
+    let turn5 = local["turnId"].as_str().unwrap().to_string();
+    rig.activity(&sid, "ready", TURN);
+    let lease = rig.acquire(&sid, &generation);
+    let rid = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Reply with exactly the word: again",
+    );
+    let done = rig.chat_done(&rid, TURN);
+    let turn6 = done["turnId"].as_str().unwrap_or_default().to_string();
+    report.push(format!(
+        "5 /new: local prompt in the new session turn {turn5} (reply {:?}); remote prompt {} outcome {} (reply {:?})",
+        assistant_texts(&rig, &turn5).iter().map(|t| redact(t)).collect::<Vec<_>>(),
+        done["op"],
+        done["outcome"],
+        assistant_texts(&rig, &turn6).iter().map(|t| redact(t)).collect::<Vec<_>>()
+    ));
+    eprintln!("CODEX CHAT REPORT:\n{}", report.join("\n"));
+    assert_eq!(done["outcome"], "done", "{done}");
 }
 
 /// The next approval of `sid`; on a timeout the panic shows the screen.

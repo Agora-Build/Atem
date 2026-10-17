@@ -438,7 +438,10 @@ mod tests {
         append(&t1, &user_line("u3", "three"));
         let evs = a.poll_events();
         assert!(matches!(evs[0], AgentEvent::SessionStarted { .. }));
-        assert_eq!(evs[1], AgentEvent::TurnEnded, "later events follow");
+        assert!(
+            matches!(evs[1], AgentEvent::TurnEnded { at_ms: Some(_) }),
+            "later events follow"
+        );
         let items = a.poll_log();
         assert!(matches!(&items[..], [LogItem::UserMessage { id, .. }] if id == "u3"));
         assert_eq!(a.transcript.as_ref().unwrap().path(), t2);

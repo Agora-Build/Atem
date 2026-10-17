@@ -245,6 +245,9 @@ impl EventReader {
                                     at_ms: Some(at),
                                 }
                             }
+                            AgentEvent::TurnEnded { .. } => {
+                                AgentEvent::TurnEnded { at_ms: Some(at) }
+                            }
                             e => e,
                         }));
                     }
@@ -291,7 +294,7 @@ pub fn map_hook(json: &Value) -> Option<AgentEvent> {
                 detail: message.to_string(),
             })
         }
-        "Stop" => Some(AgentEvent::TurnEnded),
+        "Stop" => Some(AgentEvent::TurnEnded { at_ms: None }),
         _ => None,
     }
 }
@@ -571,6 +574,11 @@ mod tests {
             (now_ms - 4000..=now_ms - 2000).contains(at),
             "{at} {now_ms}"
         );
+        // Stop's file was written 1 s ago.
+        let Some(AgentEvent::TurnEnded { at_ms: Some(stop) }) = events.last() else {
+            panic!("{events:?}")
+        };
+        assert!((now_ms - 2000..=now_ms).contains(stop), "{stop} {now_ms}");
         assert_eq!(
             events,
             vec![
@@ -580,7 +588,7 @@ mod tests {
                     at_ms: Some(*at),
                 },
                 AgentEvent::ToolStarted,
-                AgentEvent::TurnEnded
+                AgentEvent::TurnEnded { at_ms: Some(*stop) }
             ]
         );
         assert_eq!(fs::read_dir(dir.join("events")).unwrap().count(), 0);
@@ -607,9 +615,13 @@ mod tests {
                 .unwrap();
         }
         let mut r = EventReader::new(dir.clone());
+        let at = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
         assert_eq!(
             r.poll(),
-            vec![AgentEvent::ToolStarted, AgentEvent::TurnEnded]
+            vec![
+                AgentEvent::ToolStarted,
+                AgentEvent::TurnEnded { at_ms: Some(at) }
+            ]
         );
         assert_eq!(fs::read_dir(dir.join("events")).unwrap().count(), 0);
     }
@@ -675,7 +687,7 @@ mod tests {
         );
         assert_eq!(
             map_hook(&fixture("05-stop.json")),
-            Some(AgentEvent::TurnEnded)
+            Some(AgentEvent::TurnEnded { at_ms: None })
         );
         assert_eq!(
             map_hook(&fixture("08-notification.json")),

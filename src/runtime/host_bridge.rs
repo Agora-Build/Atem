@@ -93,6 +93,8 @@ const MAX_CONVERSATIONS: usize = 8;
 const RESTARTED: &str = "the agent was restarted; reopen the chat";
 const NOT_AVAILABLE: &str = "chat is not available for this agent";
 const NO_TURN: &str = "no turn was running";
+/// An interrupt on a session without chat: nothing knows whether a turn runs.
+const NO_TURN_STATE: &str = "no turn state; use the terminal";
 /// Esc interrupts Claude Code's and Codex's current turn.
 const INTERRUPT_KEY: &[u8] = b"\x1b";
 /// Identity of a host without a verified pairing (no attachment is ever
@@ -1009,7 +1011,11 @@ impl HostBridge {
                 let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
                 if !session.chat_v1 {
                     // No chat to observe the turn's end: nothing is typed.
-                    return Some(DispatchReport::FailedNoEffect);
+                    let detail = match &session.chat_reason {
+                        Some(reason) => format!("{NOT_AVAILABLE}: {reason}"),
+                        None => format!("{NOT_AVAILABLE}; use the terminal"),
+                    };
+                    return Some(DispatchReport::Refused { detail });
                 }
                 let generation = session.chat.generation().to_string();
                 let input_count = session.input_count;
@@ -1050,11 +1056,17 @@ impl HostBridge {
                 }
             }
             ReceiptKind::Interrupt => {
-                // Ready: no turn runs. Unknown (Codex before its first
-                // prompt, whose hooks may not be trusted yet): Esc all the
-                // same, and the next turn end completes it.
+                // Esc only while a turn is known to run: without chat
+                // there is no turn state, and in `ready` or `unknown` (Codex
+                // before its first prompt: Esc on its startup trust dialog
+                // quits it) nothing is written.
+                if !session.chat_v1 {
+                    return Some(DispatchReport::Refused {
+                        detail: NO_TURN_STATE.into(),
+                    });
+                }
                 let state = session.chat.status().state;
-                if session.chat_v1 && state == ChatState::Ready {
+                if !matches!(state, ChatState::Working | ChatState::Waiting) {
                     return Some(DispatchReport::Completed {
                         detail: Some(NO_TURN.into()),
                         turn_id: None,

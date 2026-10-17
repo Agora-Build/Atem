@@ -531,7 +531,13 @@ fn turn_ends_and_exits_close_what_waits() {
         let hook = s.hook("claude", 30, SECRET_BASH);
         let id = request_id(&events(&mut a, true)[0]);
         assert_eq!(
-            a.poll(true, vec![Evidence::TurnEnded { interrupted }]),
+            a.poll(
+                true,
+                vec![Evidence::TurnEnded {
+                    interrupted,
+                    at_ms: Some(now_ms())
+                }]
+            ),
             vec![closed(&id, reason)]
         );
         assert_eq!(printed(hook), "");
@@ -724,4 +730,127 @@ fn a_codex_request_without_a_session_id_must_come_from_the_agent_itself() {
     assert_eq!(request_id(&events(&mut a, true)[0]), "direct");
     let _ = direct.kill();
     let _ = direct.wait();
+}
+
+/// Evidence read in the same pass as a newer request (the turn's own
+/// prompt, a turn end reported before it) never closes it; evidence from
+/// after it does. Both agents.
+#[test]
+fn turn_evidence_older_than_a_request_leaves_it_open() {
+    for (agent, name) in [(Agent::Claude, "claude"), (Agent::Codex, "codex")] {
+        let s = Session::new();
+        let mut a = watcher(&s, agent);
+        let mut before = now_ms() - 2000;
+        if before % 1000 == 0 {
+            before -= 1;
+        }
+        let hook = s.hook(name, 30, SECRET_BASH);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.files().iter().any(|f| f.starts_with("req-")) {
+            assert!(Instant::now() < deadline, "no request");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // the request and older evidence in one pass: reported, still open
+        let out = a.poll(
+            true,
+            vec![Evidence::TurnEnded {
+                interrupted: false,
+                at_ms: Some(before),
+            }],
+        );
+        assert_eq!(out.len(), 1, "{name}: {out:?}");
+        let id = request_id(&out[0]);
+        assert_eq!(a.waiting(), 1, "{name}");
+        // evidence from after it closes it
+        let out = a.poll(
+            true,
+            vec![Evidence::TurnEnded {
+                interrupted: false,
+                at_ms: Some(now_ms() + 1),
+            }],
+        );
+        assert_eq!(
+            out,
+            vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)],
+            "{name}"
+        );
+        assert_eq!(printed(hook), "", "{name}");
+        assert!(drained(&mut a).is_empty());
+    }
+}
+
+/// A non-shell child of this process (the real binary under a wrapper,
+/// this process being the wrapper) with a non-shell child of its own (a
+/// codex it started without a shell): their pids.
+struct Wrapper {
+    real: Child,
+    nested: u32,
+}
+
+impl Wrapper {
+    fn start() -> Self {
+        use std::io::BufRead;
+        let mut real = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                "import subprocess, time\np = subprocess.Popen(['sleep', '30'])\nprint(p.pid, flush=True)\ntime.sleep(30)",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(real.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let nested = line.trim().parse().unwrap();
+        Self { real, nested }
+    }
+}
+
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.nested as libc::pid_t, libc::SIGKILL) };
+        let _ = self.real.kill();
+        let _ = self.real.wait();
+    }
+}
+
+/// npm's `codex`: the agent is node, the real binary its child. The first
+/// request through it pins its session and makes the real binary the
+/// agent: its `/new` re-pins (Direct), and a codex it started without a
+/// shell still can't (Wrapped, another session).
+#[test]
+fn under_a_wrapper_the_real_binary_becomes_the_agent() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let wrapper = Wrapper::start();
+    let real = wrapper.real.id();
+    let mut hooks = Vec::new();
+    let mut request = |id: &str, parent: u32, session: &str| {
+        let hook = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(
+            s.approvals().join(format!("pid-{id}")),
+            format!("{} {parent}\n", hook.id()),
+        )
+        .unwrap();
+        let body = SECRET_BASH.replace(
+            r#""session_id":"s1""#,
+            &format!(r#""session_id":"{session}""#),
+        );
+        std::fs::write(s.approvals().join(format!("req-{id}.json")), body).unwrap();
+        hooks.push(hook);
+    };
+    request("first", real, "s1");
+    assert_eq!(request_id(&events(&mut a, true)[0]), "first");
+    request("afternew", real, "s2");
+    assert_eq!(request_id(&events(&mut a, true)[0]), "afternew");
+    request("nested", wrapper.nested, "s3");
+    known(&mut a, 3, true);
+    request("nestedpinned", wrapper.nested, "s2");
+    assert_eq!(request_id(&events(&mut a, true)[0]), "nestedpinned");
+    for mut hook in hooks {
+        let _ = hook.kill();
+        let _ = hook.wait();
+    }
 }

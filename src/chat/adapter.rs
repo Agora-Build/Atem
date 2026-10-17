@@ -92,7 +92,12 @@ pub enum AgentEvent {
     WaitingForPermission {
         detail: String,
     },
-    TurnEnded,
+    TurnEnded {
+        /// When the agent reported it (its event file's time, unix ms): it
+        /// answers only a permission prompt opened before.
+        #[serde(default)]
+        at_ms: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,8 +120,14 @@ pub enum LogItem {
     /// A turn started according to the log (Codex's `task_started`): the
     /// agent is working, also on a turn without a prompt (compaction).
     TurnStarted { turn_id: String },
-    /// The turn ended according to the log (end_turn or interrupt).
-    TurnEnded { turn_id: String, outcome: Outcome },
+    /// The turn ended according to the log (end_turn or interrupt), at
+    /// `at_ms` (the entry's time, unix ms; 0 when it has none).
+    TurnEnded {
+        turn_id: String,
+        outcome: Outcome,
+        #[serde(default)]
+        at_ms: i64,
+    },
     /// Content that was already in a log the adapter switched to (a resume of
     /// another session): history only, never live events. Never nested.
     Backfill(Box<LogItem>),

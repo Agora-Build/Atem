@@ -550,7 +550,7 @@ mod tests {
                         turn_id: Some("turn-1".into()),
                         at_ms: Some(17),
                     },
-                    AgentEvent::TurnEnded,
+                    AgentEvent::TurnEnded { at_ms: None },
                 ],
                 log: vec![
                     LogItem::AssistantPart {
@@ -565,6 +565,7 @@ mod tests {
                     LogItem::Backfill(Box::new(LogItem::TurnEnded {
                         turn_id: "t".into(),
                         outcome: Outcome::Done,
+                        at_ms: 5,
                     })),
                 ],
                 input_count: 2,

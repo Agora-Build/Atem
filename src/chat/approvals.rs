@@ -381,10 +381,10 @@ fn is_shell(name: &str) -> bool {
 pub enum Ancestry {
     /// Its parent is the agent, or a shell (that didn't exec) whose parent is.
     Direct,
-    /// Through a non-shell child of the agent: a wrapper such as npm's
-    /// `codex`, which runs the real binary as its child — or a `codex` the
-    /// agent itself started without a shell. Ambiguous.
-    Wrapped,
+    /// Through a non-shell child of the agent (`child`): a wrapper such as
+    /// npm's `codex`, which runs the real binary as its child — or a
+    /// `codex` the agent itself started without a shell. Ambiguous.
+    Wrapped { child: u32 },
     /// Not started by the agent (e.g. a `codex` started inside the session
     /// through a shell is deeper).
     Foreign,
@@ -407,8 +407,56 @@ pub fn started_by(parent: u32, agent: u32) -> Ancestry {
         }
     }
     match process_parent_and_name(q) {
-        Some((up, name)) if !is_shell(&name) && up == agent => Ancestry::Wrapped,
+        Some((up, name)) if !is_shell(&name) && up == agent => Ancestry::Wrapped { child: q },
         _ => Ancestry::Foreign,
+    }
+}
+
+/// Who a Codex hook must have been started by: the session's agent (the
+/// PTY child) — or, once a hook through a wrapper pinned the session
+/// (npm's `codex` is node running the real binary as its child), that
+/// child, the real binary. Then the real binary's own hooks are `Direct`
+/// (so `/new` re-pins) and a `codex` it started without a shell is still
+/// `Wrapped` (it can't re-pin). Shared by the approvals and the Codex chat
+/// adapter, each with its own pin.
+///
+/// A wrapped hook read after its parent exited can't be traced: it counts
+/// as `Foreign` (dropped). Harmless for events: the rollout's end record
+/// is authoritative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HookAgent {
+    agent: Option<u32>,
+    /// The real binary, once a wrapped hook pinned the session.
+    real: Option<u32>,
+}
+
+impl HookAgent {
+    pub fn new(agent: Option<u32>) -> Self {
+        Self { agent, real: None }
+    }
+
+    /// How a hook whose parent is `parent` relates to the agent; `Foreign`
+    /// when the agent is unknown.
+    pub fn ancestry(&self, parent: u32) -> Ancestry {
+        match self.real.or(self.agent) {
+            Some(agent) => started_by(parent, agent),
+            None => Ancestry::Foreign,
+        }
+    }
+
+    /// `pid` is the agent itself (the real binary once known).
+    pub fn is_agent(&self, pid: u32) -> bool {
+        self.real.or(self.agent) == Some(pid)
+    }
+
+    /// A hook with `ancestry` pinned the session (nothing was pinned): one
+    /// through a wrapper makes the wrapper's child the agent from now on.
+    pub fn pinned_by(&mut self, ancestry: Ancestry) {
+        if let Ancestry::Wrapped { child } = ancestry
+            && self.real.is_none()
+        {
+            self.real = Some(child);
+        }
     }
 }
 

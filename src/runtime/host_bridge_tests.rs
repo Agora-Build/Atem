@@ -1278,20 +1278,89 @@ fn a_new_identity_restarts_the_host_under_it() {
     });
 }
 
+/// The first receipt of `rid` past accepted/executing.
+async fn final_receipt(peer: &mut Peer, rid: &str) -> Value {
+    let rid = rid.to_string();
+    let at = peer
+        .wait_from(0, move |v| {
+            is_session(v, "receipt")
+                && v["data"]["request_id"] == rid.as_str()
+                && v["data"]["state"] != "accepted"
+                && v["data"]["state"] != "executing"
+        })
+        .await;
+    peer.seen[at]["data"].clone()
+}
+
+/// An agent writing every byte its terminal delivers to `input`.
+fn recording_agent(dir: &Path, input: &Path) -> PathBuf {
+    script(
+        dir,
+        "recording-agent",
+        &format!(
+            "stty raw -echo\nprintf 'READY\\r\\n'\nexec cat > '{}'",
+            input.display()
+        ),
+    )
+}
+
+/// Esc is written only while a turn is known to run: Claude ready and
+/// Codex before its first prompt (status unknown) complete at once with
+/// nothing written; Codex without chat (its hooks off) has no turn state:
+/// interrupts and prompts are refused with the reason, and its descriptor
+/// offers terminal-v1 only.
 #[test]
-fn interrupts_complete_at_once_without_a_turn_and_are_unknown_when_unobserved() {
+fn interrupts_write_esc_only_while_a_turn_is_known_to_run() {
     local(async {
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
         let claude = rt.launch(&mut client, "claude", &fake_claude(), None).await;
-        let codex = rt
-            .launch(&mut client, "codex", &echo_agent(rt.dir.path()), None)
-            .await;
+        let unknown_input = rt.dir.path().join("codex-unknown.input");
+        let agent = recording_agent(rt.dir.path(), &unknown_input);
+        let codex = rt.launch(&mut client, "codex", &agent, None).await;
+        let off_input = rt.dir.path().join("codex-off.input");
+        let off_agent = script(
+            rt.dir.path(),
+            "recording-agent-off",
+            &format!(
+                "stty raw -echo\nprintf 'READY\\r\\n'\nexec cat > '{}'",
+                off_input.display()
+            ),
+        );
+        client
+            .send(&ClientMsg::Launch {
+                provider: "codex".into(),
+                args: vec![],
+                cwd: rt.dir.path().to_path_buf(),
+                env: LaunchEnv(vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    ("CODEX_CLI_BIN".into(), off_agent.display().to_string()),
+                    (crate::runtime::broker::NO_CODEX_HOOKS.into(), "1".into()),
+                ]),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        let off = expect(&mut client, |m| match m {
+            RuntimeMsg::Launched { session } => Some(session),
+            RuntimeMsg::Error { text, .. } => panic!("launch failed: {text}"),
+            _ => None,
+        })
+        .await;
         let peer = &mut rt.peer;
         peer.hello().await;
+        assert_eq!(
+            listed(peer, &codex.id).await["capabilities"],
+            json!(["terminal-v1", "chat-v1"])
+        );
+        assert_eq!(
+            listed(peer, &off.id).await["capabilities"],
+            json!(["terminal-v1"])
+        );
         open_chat(peer, "conv-1", &claude.id, &claude.generation).await;
         let mut ids = Vec::new();
-        for session in [&claude, &codex] {
+        for session in [&claude, &codex, &off] {
             let epoch = peer.acquire(&session.id, &session.generation).await;
             let request_id = uuid::Uuid::new_v4().to_string();
             let id = peer.request(
@@ -1302,30 +1371,34 @@ fn interrupts_complete_at_once_without_a_turn_and_are_unknown_when_unobserved() 
             assert_eq!(peer.reply(&id).await["state"], "accepted");
             ids.push(request_id);
         }
-        // Claude is ready: no turn runs, so the interrupt completes at once.
-        let done = peer
-            .wait_from(0, |v| {
-                is_session(v, "receipt")
-                    && v["data"]["request_id"] == ids[0].as_str()
-                    && v["data"]["state"] == "completed"
-            })
-            .await;
-        assert_eq!(peer.seen[done]["data"]["detail"], "no turn was running");
-        // Codex reported no first prompt (its status is unknown): Esc is
-        // written, and nothing observes it within 10 s.
-        rt.clock.skip(10_001);
-        let peer = &mut rt.peer;
-        let unknown = peer
-            .wait_from(0, |v| {
-                is_session(v, "receipt")
-                    && v["data"]["request_id"] == ids[1].as_str()
-                    && v["data"]["state"] == "outcome_unknown"
-            })
-            .await;
-        assert_eq!(
-            peer.seen[unknown]["data"]["detail"],
-            "no interrupt observed"
+        for rid in &ids[..2] {
+            let done = final_receipt(peer, rid).await;
+            assert_eq!(done["state"], "completed", "{done}");
+            assert_eq!(done["detail"], "no turn was running");
+        }
+        let refused = final_receipt(peer, &ids[2]).await;
+        assert_eq!(refused["state"], "rejected", "{refused}");
+        assert_eq!(refused["detail"], "no turn state; use the terminal");
+        // A prompt to the session without chat: refused, with the reason.
+        let epoch = peer.acquire(&off.id, &off.generation).await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&off.id, &off.generation, Some(epoch)),
+                   "request_id": request_id, "kind": "prompt", "payload": {"text": "hi"}}),
         );
+        peer.reply(&id).await;
+        let refused = final_receipt(peer, &request_id).await;
+        assert_eq!(refused["state"], "rejected", "{refused}");
+        assert_eq!(
+            refused["detail"],
+            "chat is not available for this agent; use the terminal"
+        );
+        // Neither Codex got a byte.
+        peer.drain(Duration::from_millis(300)).await;
+        for input in [&unknown_input, &off_input] {
+            assert_eq!(std::fs::read(input).unwrap_or_default(), b"", "{input:?}");
+        }
         rt.shutdown().await;
     });
 }
@@ -2156,8 +2229,10 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
     });
 }
 
-fn fake_codex() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/fake-codex.py");
+fn fixture_program(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/chat")
+        .join(name);
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     if perms.mode() & 0o111 != 0o111 {
         perms.set_mode(0o755);
@@ -2166,11 +2241,26 @@ fn fake_codex() -> PathBuf {
     path
 }
 
+fn fake_codex() -> PathBuf {
+    fixture_program("fake-codex.py")
+}
+
+/// npm's `codex` stand-in: runs fake-codex.py as its child.
+fn codex_wrapper() -> PathBuf {
+    fake_codex();
+    fixture_program("codex-wrapper.py")
+}
+
 impl Runtime {
     /// Launches Codex as the fake Codex TUI (control files in `fake`), with
     /// Atem's hooks installed in its own `CODEX_HOME` as `atem agent launch
     /// codex` installs them.
-    async fn launch_fake_codex(&self, client: &mut RuntimeClient, fake: &Path) -> SessionSummary {
+    async fn launch_fake_codex(
+        &self,
+        client: &mut RuntimeClient,
+        fake: &Path,
+        binary: &Path,
+    ) -> SessionSummary {
         let home = self.dir.path().join("codex-home");
         crate::chat::codex::install(&home, &self.dir.path().join("run/approval-hook.sh")).unwrap();
         client
@@ -2180,7 +2270,7 @@ impl Runtime {
                 cwd: self.dir.path().to_path_buf(),
                 env: LaunchEnv(vec![
                     ("PATH".into(), "/usr/bin:/bin".into()),
-                    ("CODEX_CLI_BIN".into(), fake_codex().display().to_string()),
+                    ("CODEX_CLI_BIN".into(), binary.display().to_string()),
                     ("CODEX_HOME".into(), home.display().to_string()),
                     ("FAKE_DIR".into(), fake.display().to_string()),
                 ]),
@@ -2220,7 +2310,9 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
         let fake = rt.dir.path().join("fake");
-        let session = rt.launch_fake_codex(&mut client, &fake).await;
+        let session = rt
+            .launch_fake_codex(&mut client, &fake, &fake_codex())
+            .await;
         let (sid, pg) = (session.id.clone(), session.generation.clone());
         let peer = &mut rt.peer;
         peer.hello().await;
@@ -2392,6 +2484,170 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
             && v["data"]["parts"][0]["kind"] == "tool"
             && v.to_string().contains("touch made.txt")));
         activity_until(peer, &sid, "ready").await;
+
+        // An interrupt Codex ignores: no turn end within 10 s, unknown.
+        std::fs::write(fake.join("deaf"), "").unwrap();
+        let lease = peer.acquire(&sid, &pg).await;
+        let r5 = uuid::Uuid::new_v4().to_string();
+        let from = peer.seen.len();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": r5, "text": "remote five", "lease_epoch": lease}),
+        );
+        agent_event(&fake, "prompt turn-5 remote five").await;
+        let peer = &mut rt.peer;
+        activity_until(peer, &sid, "working").await;
+        let interrupt = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)),
+                   "request_id": interrupt, "kind": "interrupt", "payload": {}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+        peer.drain(Duration::from_millis(300)).await;
+        rt.clock.skip(10_001);
+        let peer = &mut rt.peer;
+        let unknown = final_receipt(peer, &interrupt).await;
+        assert_eq!(unknown["state"], "outcome_unknown", "{unknown}");
+        assert_eq!(unknown["detail"], "no interrupt observed");
+        let _ = from;
         rt.shutdown().await;
     });
+}
+
+/// Codex behind npm's wrapper (the agent is the wrapper, the real binary
+/// its child): `/new` re-pins chat and approvals, and remote prompts and
+/// approvals go on in the new session.
+#[test]
+fn codex_behind_a_wrapper_keeps_chat_and_approvals_across_new() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt
+            .launch_fake_codex(&mut client, &fake, &codex_wrapper())
+            .await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        rt.peer.hello().await;
+        listed(&mut rt.peer, &sid).await;
+        open_chat_any(&mut rt.peer, "conv-1", &sid, &pg).await;
+        attach_client(&mut client, &sid, 24, 80).await;
+        client
+            .send(&ClientMsg::input(&sid, b"one\r"))
+            .await
+            .unwrap();
+        agent_event(&fake, "prompt turn-1 one").await;
+        // an approval in the first session (pins the approvals through the
+        // wrapper)
+        ask(
+            &fake,
+            1,
+            json!({"tool_name": "Bash", "tool_input": {"command": "touch one.txt"}}),
+        );
+        let peer = &mut rt.peer;
+        let request = peer.wait(|v| is_session(v, "approval_request")).await["data"].clone();
+        let aid = request["approval_id"].as_str().unwrap().to_string();
+        activity_until(peer, &sid, "waiting").await;
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval", "payload": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        peer.reply(&id).await;
+        agent_event(&fake, "answer 1 allow").await;
+        std::fs::write(fake.join("complete"), "").unwrap();
+        agent_event(&fake, "completed turn-1").await;
+        activity_until(&mut rt.peer, &sid, "ready").await;
+        // /new, then a prompt typed in the new session
+        client
+            .send(&ClientMsg::input(&sid, b"/new\r"))
+            .await
+            .unwrap();
+        client
+            .send(&ClientMsg::input(&sid, b"two\r"))
+            .await
+            .unwrap();
+        agent_event(&fake, "prompt turn-2 two").await;
+        let peer = &mut rt.peer;
+        peer.wait_from(0, |v| {
+            is_chat(v, "message")
+                && v["data"]["origin"] == "local"
+                && v.to_string().contains("\"two\"")
+        })
+        .await;
+        activity_until(peer, &sid, "working").await;
+        std::fs::write(fake.join("complete"), "").unwrap();
+        agent_event(&fake, "completed turn-2").await;
+        let peer = &mut rt.peer;
+        activity_until(peer, &sid, "ready").await;
+        // a remote prompt in the new session: accepted, completed
+        let lease = peer.acquire(&sid, &pg).await;
+        let rid = uuid::Uuid::new_v4().to_string();
+        let from = peer.seen.len();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": rid, "text": "three", "lease_epoch": lease}),
+        );
+        let r = rid.clone();
+        peer.wait_from(from, move |v| {
+            is_chat(v, "message")
+                && v["data"]["role"] == "user"
+                && v["data"]["requestId"] == r.as_str()
+        })
+        .await;
+        // and an approval of the new session: reported, waiting
+        ask(
+            &fake,
+            2,
+            json!({"tool_name": "Bash", "tool_input": {"command": "touch three.txt"}}),
+        );
+        let peer = &mut rt.peer;
+        let request = peer
+            .wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        let aid = peer.seen[request]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        activity_until(peer, &sid, "waiting").await;
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval", "payload": {"approval_id": aid, "decision": "deny"}}),
+        );
+        peer.reply(&id).await;
+        agent_event(&fake, "answer 2 deny").await;
+        let peer = &mut rt.peer;
+        activity_until(peer, &sid, "working").await;
+        std::fs::write(fake.join("complete"), "").unwrap();
+        let r = rid.clone();
+        let done = peer
+            .wait_from(from, move |v| {
+                (is_chat(v, "complete") || is_chat(v, "error"))
+                    && v["data"]["requestId"] == r.as_str()
+            })
+            .await;
+        assert!(is_chat(&peer.seen[done], "complete"), "{}", peer.seen[done]);
+        assert_eq!(peer.seen[done]["data"]["turnId"], "turn-3");
+        rt.shutdown().await;
+    });
+}
+
+/// Opens `conversation` (any status).
+async fn open_chat_any(peer: &mut Peer, conversation: &str, sid: &str, pg: &str) -> Value {
+    let from = peer.seen.len();
+    peer.chat("open", conversation, sid, pg, json!({}));
+    let c = conversation.to_string();
+    let at = peer
+        .wait_from(from, move |v| {
+            is_chat(v, "opened") && v["data"]["conversationId"] == c.as_str()
+        })
+        .await;
+    peer.seen[at].clone()
 }

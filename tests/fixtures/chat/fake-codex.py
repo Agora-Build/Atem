@@ -8,15 +8,18 @@
 # task_started, UserPromptSubmit, the UserMessage item, ... task_complete.
 #
 # Terminal input: typed text, or a bracketed paste, goes into the composer;
-# Enter submits it as a prompt; a lone Esc interrupts the running turn
-# (Interrupt hook, turn_aborted).
+# Enter submits it as a prompt ("/new": a new session and rollout, its
+# SessionStart at the next prompt, as Codex does); a lone Esc interrupts the
+# running turn (Interrupt hook, turn_aborted).
 # Control files in $FAKE_DIR (written by the test):
 #   complete       the running turn answers "reply <n>" and ends
 #   ask-<n>.json   a tool call needing approval ({tool_name, tool_input}):
 #                  PreToolUse, then the PermissionRequest hook runs with it;
 #                  allowed: PostToolUse and a CommandExecution item
+#   deaf           Esc is ignored (the turn goes on)
 #   exit           the agent exits (SessionEnd)
-# What it saw, in $FAKE_DIR/events: "started", "prompt <turn> <text>",
+# What it saw, in $FAKE_DIR/events: "started", "new <session>",
+# "prompt <turn> <text>",
 # "completed <turn>", "interrupted <turn>", "asked <n>", "answer <n> <behavior>".
 import json, os, select, subprocess, sys, time, tty, uuid
 
@@ -33,12 +36,19 @@ try:
 except Exception:
     pass
 
-session = str(uuid.uuid4())
 day = os.path.join(home, "sessions", "2026", "10", "17")
 os.makedirs(day, exist_ok=True)
-rollout = os.path.join(day, "rollout-2026-10-17T00-00-00-%s.jsonl" % session)
-ordinal = 0
-started = False
+
+
+def new_session():
+    global session, rollout, ordinal, started
+    session = str(uuid.uuid4())
+    rollout = os.path.join(day, "rollout-2026-10-17T00-00-00-%s.jsonl" % session)
+    ordinal = 0
+    started = False
+
+
+new_session()
 
 
 def commands(event):
@@ -130,14 +140,17 @@ while True:
             if len(buf) > 1 and START.startswith(buf):
                 break  # the rest of a paste start follows
             buf = buf[1:]
-            if turn:
+            if turn and not os.path.exists(os.path.join(ctl, "deaf")):
                 end(True)
         elif buf[:1] in (b"\r", b"\n"):
             buf = buf[1:]
             if composer.strip():
                 text = composer.decode("utf-8", "replace")
                 composer = b""
-                if turn is None:
+                if text == "/new":
+                    new_session()
+                    events.write("new %s\n" % session)
+                elif turn is None:
                     submit(text)
         else:
             composer += buf[:1]

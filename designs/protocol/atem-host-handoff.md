@@ -156,7 +156,9 @@ chat-v1:
   (`close`).
 - Claude: `capabilities: ["terminal-v1","chat-v1"]`. Codex has chat-v1
   only with Atem's Codex hooks on (`[codex] hooks = true`; else
-  `["terminal-v1"]`). Before Codex's first prompt its status is `unknown`
+  `["terminal-v1"]`, and a `prompt` there is `rejected` with "chat is not
+  available for this agent; use the terminal"). Before Codex's first prompt
+  its status is `unknown`
   with the detail "type a first prompt in the terminal: …", and a chat
   `submit` (or a `prompt` receipt) is `rejected` with that text as its
   `detail`/`text`; a submit refused for the status (busy, a local draft) is
@@ -171,8 +173,11 @@ Receipts (session-v1 `submit`), per kind:
   `ready`, no local draft), completed when the chat reports the turn's end
   (`turn_id`). On a session without chat (Codex with its hooks off) it is
   `rejected` with no effect.
-- `interrupt`: writes Esc; completes when a turn ends, or at once when the
-  status is `ready` (no turn runs).
+- `interrupt`: writes Esc only while the chat status says a turn runs
+  (`working`/`waiting`) and completes when it ends; in `ready` or `unknown`
+  it completes at once ("no turn was running") with nothing written. A
+  session without chat (Codex with its hooks off) has no turn state: the
+  interrupt is `rejected` ("no turn state; use the terminal"), never Esc.
 - `stop`: stops the agent; completes at its exit.
 - `approval`: handed to the agent's waiting permission hook; completes when
   the agent applied it (see [Approvals](#approvals-r7-6a-on-featapprovals)).

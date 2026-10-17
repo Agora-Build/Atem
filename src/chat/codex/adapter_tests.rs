@@ -152,7 +152,7 @@ fn tick(a: &mut CodexAdapter, chat: &mut ChatSession) -> Tick {
     let (ends, others): (Vec<_>, Vec<_>) = events
         .iter()
         .cloned()
-        .partition(|e| matches!(e, AgentEvent::TurnEnded));
+        .partition(|e| matches!(e, AgentEvent::TurnEnded { at_ms: None }));
     for e in others {
         outs.extend(chat.on_event(e, 0, 0));
     }
@@ -278,11 +278,11 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
         [AgentEvent::ToolStarted],
         "no PermissionRequest event"
     );
-    a.approval_opened(1_792_215_205_000);
+    a.set_open_approvals(1);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     f.fire(&a, "07-PostToolUse-after-approval.json");
-    a.approval_closed();
+    a.set_open_approvals(0);
     let t = tick(&mut a, &mut chat);
     assert_eq!(
         t.events,
@@ -350,7 +350,7 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
     f.fire(&a, "20-PermissionRequest.json");
     rollout_upto(&f.a, A, 69);
     tick(&mut a, &mut chat);
-    a.approval_opened(1_792_215_329_000);
+    a.set_open_approvals(1);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
@@ -361,9 +361,10 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
         [("<turn-5>".into(), None, Outcome::Interrupted)]
     );
     assert_eq!(chat.status().state, State::Ready);
-    a.approval_closed();
+    // the worker's late close: no longer waiting, and the chat stays ready
+    a.set_open_approvals(0);
     let t = tick(&mut a, &mut chat);
-    assert!(t.events.is_empty(), "the turn's end forgot it");
+    assert_eq!(t.events, [AgentEvent::ToolFinished]);
     assert_eq!(chat.status().state, State::Ready);
 
     // /new: session B, its rollout live from the first line.
@@ -401,10 +402,9 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
     let t = tick(&mut a, &mut chat);
     assert!(message_ids(&t.outs).is_empty());
     assert!(completes(&t.outs).is_empty());
-    assert!(t.log.contains(&LogItem::TurnEnded {
-        turn_id: "<turn-8>".into(),
-        outcome: Outcome::Done
-    }));
+    assert!(t.log.iter().any(|i| matches!(i, LogItem::TurnEnded {
+        turn_id, outcome: Outcome::Done, ..
+    } if turn_id == "<turn-8>")));
     assert_eq!(chat.status().state, State::Ready);
 
     // Quit: both sessions' SessionEnd, nothing for chat.
@@ -689,21 +689,20 @@ fn a_format_change_withdraws_chat() {
 fn approvals_are_counted() {
     let mut a = CodexAdapter::new(PathBuf::from("/nonexistent"));
     a.announced = true;
-    a.approval_closed();
+    a.set_open_approvals(0);
     assert!(a.poll_events().is_empty(), "nothing open");
-    a.approval_opened(5);
-    a.approval_opened(6);
+    a.set_open_approvals(2);
     assert_eq!(
         a.poll_events(),
         [AgentEvent::WaitingForPermission {
             detail: APPROVAL_DETAIL.into()
         }]
     );
-    a.approval_closed();
+    a.set_open_approvals(1);
     assert!(a.poll_events().is_empty(), "one still open");
-    a.approval_closed();
+    a.set_open_approvals(0);
     assert_eq!(a.poll_events(), [AgentEvent::ToolFinished]);
-    a.approval_closed();
+    a.set_open_approvals(0);
     assert!(a.poll_events().is_empty());
 }
 
@@ -927,7 +926,7 @@ fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
     assert_eq!(chat.status().state, State::Working);
     // the hook's PreToolUse and the worker's approval in one pass
     f.fire(&a, "05-PreToolUse-before-approval.json");
-    a.approval_opened(1_792_215_205_000);
+    a.set_open_approvals(1);
     let t = tick(&mut a, &mut chat);
     // (the PreToolUse came before the approval: dropped; and the wait is
     // returned after the pass's hook events anyway)
@@ -943,8 +942,8 @@ fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
     assert_eq!(chat.status().state, State::Waiting);
     // the worker's reports follow the pass's hooks: a PostToolUse read with
     // a new approval leaves it waiting
-    a.approval_closed();
-    a.approval_opened(1_792_215_206_000);
+    a.set_open_approvals(0);
+    a.set_open_approvals(1);
     f.fire(&a, "07-PostToolUse-after-approval.json");
     let t = tick(&mut a, &mut chat);
     assert!(
@@ -963,29 +962,28 @@ fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
 }
 
 #[test]
-fn the_turns_next_item_ends_the_wait() {
+fn only_the_workers_close_ends_the_wait() {
     let f = fx();
     let mut a = f.adapter();
     let mut chat = ChatSession::new(GEN.into(), 0);
     f.fire(&a, "09-UserPromptSubmit.json");
-    // the commentary (completed before the approval) doesn't end it
     rollout_upto(&f.a, A, 35);
     tick(&mut a, &mut chat);
     f.fire(&a, "12-PreToolUse-escalated.json");
-    a.approval_opened(1_792_215_270_000);
+    a.set_open_approvals(1);
     rollout_upto(&f.a, A, 43);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
-    // the command ran (no PostToolUse read, no close reported yet)
+    // the turn's next item (the command ran) is no close: still waiting
     rollout_upto(&f.a, A, 45);
     let t = tick(&mut a, &mut chat);
     assert_eq!(message_ids(&t.outs), ["<exec-3>"]);
-    let t = tick(&mut a, &mut chat);
-    assert_eq!(t.events, [AgentEvent::ToolFinished]);
-    assert_eq!(chat.status().state, State::Working);
-    // a late close changes nothing
-    a.approval_closed();
     assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert_eq!(chat.status().state, State::Waiting);
+    // the worker's close is
+    a.set_open_approvals(0);
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Working);
 }
 
 #[test]
@@ -997,7 +995,6 @@ fn a_new_session_waiting_for_a_turn_end_follows_its_stop_hook() {
     f.fire(&a, "02-UserPromptSubmit.json");
     rollout_upto(&f.a, A, 9);
     tick(&mut a, &mut chat);
-    a.approval_opened(1);
     // /new while the turn still counts as running (its rollout end never
     // came): held, then waiting
     f.fire(&a, "22-SessionStart-after-new.json");
@@ -1023,10 +1020,6 @@ fn a_new_session_waiting_for_a_turn_end_follows_its_stop_hook() {
         t.events
     );
     assert_eq!(a.session_id(), Some("<session-B>"));
-    assert_eq!(
-        a.approvals, 0,
-        "a re-pin forgets the old session's approvals"
-    );
     assert_eq!(message_ids(&t.outs), ["<id-15>"]);
 }
 
@@ -1227,7 +1220,7 @@ fn a_wrapped_agent_pins_the_first_session() {
 }
 
 #[test]
-fn a_re_pin_drops_a_wait_still_queued() {
+fn approvals_open_across_a_re_pin_keep_waiting() {
     let f = fx();
     let mut a = f.adapter();
     let mut chat = ChatSession::new(GEN.into(), 0);
@@ -1237,20 +1230,143 @@ fn a_re_pin_drops_a_wait_still_queued() {
     tick(&mut a, &mut chat);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Ready);
-    // /new: the switch waits one poll; an approval of the old session is
-    // reported in between
+    // /new: the switch waits one poll; two approvals are reported open in
+    // between (the worker's count is the only source)
     f.fire(&a, "22-SessionStart-after-new.json");
     assert!(tick(&mut a, &mut chat).events.is_empty());
-    a.approval_opened(0);
+    a.set_open_approvals(2);
     let t = tick(&mut a, &mut chat);
     assert!(
-        matches!(&t.events[..], [AgentEvent::SessionStarted { session_id, .. }] if session_id == "<session-B>"),
+        matches!(&t.events[..], [
+            AgentEvent::SessionStarted { session_id, .. },
+            AgentEvent::WaitingForPermission { .. },
+        ] if session_id == "<session-B>"),
+        "the wait is sent again after the re-pin: {:?}",
+        t.events
+    );
+    assert_eq!(chat.status().state, State::Waiting);
+    // one closes: still waiting
+    a.set_open_approvals(1);
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert_eq!(chat.status().state, State::Waiting);
+    // the last one: working again
+    a.set_open_approvals(0);
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Working);
+}
+
+/// npm's `codex` as Codex's hooks see it: this process is the wrapper
+/// (the agent), `real` the real binary (its non-shell child), `nested` a
+/// codex the real binary started without a shell.
+struct Wrapper {
+    real: std::process::Child,
+    nested: u32,
+}
+
+impl Wrapper {
+    fn start() -> Self {
+        use std::io::BufRead;
+        let mut real = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                "import subprocess, time\np = subprocess.Popen(['sleep', '30'])\nprint(p.pid, flush=True)\ntime.sleep(30)",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(real.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let nested = line.trim().parse().unwrap();
+        Self { real, nested }
+    }
+}
+
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.nested as libc::pid_t, libc::SIGKILL) };
+        let _ = self.real.kill();
+        let _ = self.real.wait();
+    }
+}
+
+#[test]
+fn under_a_wrapper_new_re_pins_and_a_nested_codex_still_cannot() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    let w = Wrapper::start();
+    let real = w.real.id();
+    // the real binary's first hooks (through the wrapper) pin session A
+    f.put_from(
+        &a,
+        1,
+        "SessionStart",
+        &f.hook("01-SessionStart-startup.json"),
+        real,
+    );
+    f.put_from(
+        &a,
+        2,
+        "UserPromptSubmit",
+        &f.hook("02-UserPromptSubmit.json"),
+        real,
+    );
+    rollout_upto(&f.a, A, 14);
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(
+            &t.events[..],
+            [
+                AgentEvent::SessionStarted { .. },
+                AgentEvent::PromptSubmitted { .. }
+            ]
+        ),
         "{:?}",
         t.events
     );
-    assert!(tick(&mut a, &mut chat).events.is_empty());
+    tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Ready);
-    // and its late close is harmless
-    a.approval_closed();
-    assert!(a.poll_events().is_empty());
+    // its /new: the real binary is the agent now, so it re-pins
+    f.put_from(
+        &a,
+        3,
+        "SessionStart",
+        &f.hook("22-SessionStart-after-new.json"),
+        real,
+    );
+    f.put_from(
+        &a,
+        4,
+        "UserPromptSubmit",
+        &f.hook("23-UserPromptSubmit.json"),
+        real,
+    );
+    rollout_upto(&f.b, B, 9);
+    assert!(tick(&mut a, &mut chat).events.is_empty(), "held one poll");
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(&t.events[..], [AgentEvent::SessionStarted { session_id, .. }, AgentEvent::PromptSubmitted { .. }] if session_id == "<session-B>"),
+        "{:?}",
+        t.events
+    );
+    assert_eq!(a.session_id(), Some("<session-B>"));
+    assert_eq!(chat.status().state, State::Working);
+    // a codex the real binary started (no shell): wrapped, another session:
+    // it can't re-pin, even once the turn ended
+    rollout_upto(&f.b, B, 14);
+    tick(&mut a, &mut chat);
+    f.put_from(
+        &a,
+        5,
+        "SessionStart",
+        &f.hook("29-SessionStart-resume.json"),
+        w.nested,
+    );
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+    }
+    assert_eq!(a.session_id(), Some("<session-B>"));
 }

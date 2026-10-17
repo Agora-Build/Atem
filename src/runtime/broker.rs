@@ -685,7 +685,7 @@ impl BrokerSession {
                 let now = now_ms();
                 let (ends, others): (Vec<_>, Vec<_>) = events
                     .into_iter()
-                    .partition(|e| matches!(e, AgentEvent::TurnEnded));
+                    .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
                 let mut outs = Vec::new();
                 for event in others {
                     outs.extend(self.chat.on_event(event, now, input_count));
@@ -880,6 +880,11 @@ pub struct InProcess {
     pub chat_root: PathBuf,
 }
 
+/// In a launch environment: the in-process worker runs as with
+/// `[codex] hooks = false`.
+#[cfg(test)]
+pub const NO_CODEX_HOOKS: &str = "ATEM_TEST_NO_CODEX_HOOKS";
+
 #[cfg(test)]
 impl InProcess {
     async fn spawn(self, request: SpawnRequest, env: LaunchEnv) -> anyhow::Result<WorkerHandle> {
@@ -908,7 +913,10 @@ impl InProcess {
             first_connect: std::time::Duration::from_secs(10),
             linger: std::time::Duration::from_secs(30),
             claude_approvals: true,
-            approval_script: Some(self.chat_root.join("approval-hook.sh")),
+            // `[codex] hooks = false` for a launch whose environment says
+            // so (tests of Codex without chat).
+            approval_script: (!env.0.iter().any(|(k, _)| k == NO_CODEX_HOOKS))
+                .then(|| self.chat_root.join("approval-hook.sh")),
         };
         let socket = spec.socket.clone();
         tokio::spawn(worker::serve(spec, listener, options));

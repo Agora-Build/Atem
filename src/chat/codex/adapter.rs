@@ -14,12 +14,15 @@
 //!   under `$CODEX_HOME/sessions`, also once symlinks are resolved (else
 //!   the hook is ignored with a notice).
 //! - Ownership: each event file's first line is the hook's `$$ $PPID`.
-//!   Only hooks the session's agent started count (`approvals::started_by`,
+//!   Only hooks the session's agent started count (`approvals::HookAgent`,
 //!   the rule approvals use): directly (its parent is the agent, or one
 //!   shell under it) a hook may pin or re-pin; through a non-shell child (a
 //!   wrapper such as npm's `codex`) only the pinned session's, or the first
-//!   one; anything deeper (a `codex` a tool ran) never counts, so a nested
-//!   Codex can't take over the chat or the status.
+//!   one — which makes that child (the real binary) the agent, so its
+//!   `/new` re-pins; anything deeper (a `codex` a tool ran) never counts,
+//!   so a nested Codex can't take over the chat or the status. A wrapped
+//!   hook read after its parent exited counts as foreign: harmless, the
+//!   rollout's end record is authoritative.
 //! - Only the pinned session's hooks count. A SessionStart of another
 //!   session re-pins (`/new` → `startup`, a resume of another conversation
 //!   → `resume`): the old rollout is read to its end first (the switch
@@ -37,13 +40,13 @@
 //!   task marks it) and SessionEnd (the process exit is the worker's).
 //! - Waiting: PermissionRequest never reaches `events/` (it is the
 //!   approvals' own protocol, `runtime/worker_approvals.rs`), so the worker
-//!   reports each approval it opens and closes for this session
-//!   ([`CodexAdapter::approval_opened`], [`CodexAdapter::approval_closed`]):
-//!   the first open is `WaitingForPermission`, the last close — or a
-//!   rollout item of the turn completed after the open — `ToolFinished`
-//!   (back to working), returned after that poll's hook events. A
-//!   PreToolUse read while an approval is open is dropped (Codex holds the
-//!   tool while the hook waits); a turn's end or a re-pin forgets them.
+//!   reports how many approvals of this session are open
+//!   ([`CodexAdapter::set_open_approvals`]; its set is the only source):
+//!   none → some is `WaitingForPermission`, some → none `ToolFinished`
+//!   (back to working), returned after that poll's hook events; after a
+//!   re-pin with some open, `WaitingForPermission` again. A PreToolUse read
+//!   while an approval is open is dropped (Codex holds the tool while the
+//!   hook waits).
 //! - A format change in the rollout withdraws chat, as for Claude.
 //!   Messages arrive whole, never streamed; [`UNAVAILABLE`] says so.
 
@@ -58,7 +61,7 @@ use crate::chat::adapter::{
     AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_ALWAYS_ALLOW,
     UNAVAILABLE_ERROR_DETAILS, UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
 };
-use crate::chat::approvals::{Ancestry, started_by};
+use crate::chat::approvals::{Ancestry, HookAgent};
 
 /// Why a chat prompt is refused before Codex's first hook.
 pub const FIRST_PROMPT: &str = "type a first prompt in the terminal: Codex reports nothing before it (and Atem's Codex hooks must be trusted in its /hooks)";
@@ -73,6 +76,8 @@ pub const UNAVAILABLE: &[&str] = &[
 ];
 /// The status detail while an approval waits (`ChatSession` shows its own).
 const APPROVAL_DETAIL: &str = "approve in the terminal";
+/// Event files read per poll; the rest wait for the next.
+const EVENTS_PER_POLL: usize = 256;
 /// Largest event file read; a bigger one is dropped.
 const MAX_EVENT: u64 = 1024 * 1024;
 /// A `tmp.*` left by a killed hook, or an unreadable event file, goes
@@ -81,9 +86,9 @@ const LEFTOVER: Duration = Duration::from_secs(60);
 
 pub struct CodexAdapter {
     codex_home: PathBuf,
-    /// The session's agent process (the PTY child): only hooks it started
-    /// count. Unknown: none does.
-    agent_pid: Option<u32>,
+    /// Who hooks must have been started by (the PTY child, or the real
+    /// binary under a wrapper): only those count. Unknown: none does.
+    hook_agent: HookAgent,
     dir: Option<PathBuf>,
     events: Option<EventReader>,
     rollout: Option<RolloutReader>,
@@ -104,13 +109,10 @@ pub struct CodexAdapter {
     deferred: Option<Hook>,
     /// `NotReady` was sent (before the first hook).
     announced: bool,
-    /// When the first open approval opened (unix ms): a rollout item of the
-    /// turn completed later means it was answered.
-    approval_since: i64,
     /// The pinned session's turn runs (a prompt or a live `task_started`,
     /// no live turn end yet).
     turn_open: bool,
-    /// Approvals open for this session (as the worker reported them).
+    /// Approvals open for this session (the worker's count).
     approvals: usize,
     session_started: bool,
     withdrawn: Option<String>,
@@ -122,7 +124,7 @@ impl CodexAdapter {
     pub fn new(codex_home: PathBuf) -> Self {
         Self {
             codex_home,
-            agent_pid: None,
+            hook_agent: HookAgent::default(),
             dir: None,
             events: None,
             rollout: None,
@@ -133,7 +135,6 @@ impl CodexAdapter {
             extra: Vec::new(),
             deferred: None,
             announced: false,
-            approval_since: 0,
             turn_open: false,
             approvals: 0,
             session_started: false,
@@ -143,7 +144,7 @@ impl CodexAdapter {
 
     /// The agent was spawned as `pid`: from now on its hooks count.
     pub fn set_agent_pid(&mut self, pid: Option<u32>) {
-        self.agent_pid = pid;
+        self.hook_agent = HookAgent::new(pid);
     }
 
     /// The session directory (`ATEM_APPROVAL_DIR`: `events/` for the hooks,
@@ -158,28 +159,19 @@ impl CodexAdapter {
         self.pinned.as_deref()
     }
 
-    /// The worker opened an approval for this session (reported it) at
-    /// `at_ms` (unix ms): the first one makes the status waiting.
-    pub fn approval_opened(&mut self, at_ms: i64) {
-        self.approvals += 1;
-        if self.approvals == 1 {
-            self.approval_since = at_ms;
+    /// The worker's approvals of this session now open: `n` (reported to
+    /// the broker and not closed). Some after none is waiting; none after
+    /// some is working again. The worker's count is authoritative: turn
+    /// ends and re-pins never change it.
+    pub fn set_open_approvals(&mut self, n: usize) {
+        if self.approvals == 0 && n > 0 {
             self.extra.push(AgentEvent::WaitingForPermission {
                 detail: APPROVAL_DETAIL.into(),
             });
-        }
-    }
-
-    /// An approval of this session closed (answered, interrupted, timed
-    /// out, released): after the last one the turn is working again.
-    pub fn approval_closed(&mut self) {
-        if self.approvals == 0 {
-            return;
-        }
-        self.approvals -= 1;
-        if self.approvals == 0 {
+        } else if self.approvals > 0 && n == 0 {
             self.extra.push(AgentEvent::ToolFinished);
         }
+        self.approvals = n;
     }
 }
 
@@ -343,15 +335,12 @@ impl AgentAdapter for CodexAdapter {
         while let Some(hook) = incoming.pop_front() {
             let start = hook.event == "SessionStart";
             let ours = self.pinned.as_deref() == Some(hook.session_id.as_str());
-            let ancestry = match self.agent_pid {
-                Some(agent) => started_by(hook.parent, agent),
-                None => Ancestry::Foreign,
-            };
+            let ancestry = self.hook_agent.ancestry(hook.parent);
             // Not started by this session's agent (a nested codex), or a
             // wrapped one naming another session than the pinned one.
             let counts = match ancestry {
                 Ancestry::Direct => true,
-                Ancestry::Wrapped => ours || self.pinned.is_none(),
+                Ancestry::Wrapped { .. } => ours || self.pinned.is_none(),
                 Ancestry::Foreign => false,
             };
             if !counts {
@@ -408,11 +397,22 @@ impl AgentAdapter for CodexAdapter {
                 String::new()
             };
             self.switch_to(hook.transcript_path.clone(), &source);
+            if self.pinned.is_none() {
+                // Pinned through a wrapper: its child (the real binary) is
+                // the agent from now on.
+                let ancestry = self.hook_agent.ancestry(hook.parent);
+                self.hook_agent.pinned_by(ancestry);
+            }
             self.pinned = Some(hook.session_id.clone());
             self.turn_open = false;
-            self.approvals = 0;
-            // A wait of the old session must not come after the reset.
+            // The chat restarts at ready: queued status changes are moot,
+            // and approvals still open (the worker's count) wait again.
             self.extra.clear();
+            if self.approvals > 0 {
+                self.extra.push(AgentEvent::WaitingForPermission {
+                    detail: APPROVAL_DETAIL.into(),
+                });
+            }
             self.deferred = None;
             self.session_started = true;
             out.push(AgentEvent::SessionStarted {
@@ -445,17 +445,9 @@ impl AgentAdapter for CodexAdapter {
                 LogItem::TurnStarted { .. } => self.turn_open = true,
                 LogItem::TurnEnded { .. } => {
                     self.turn_open = false;
-                    self.approvals = 0;
                     if let Some(deferred) = self.deferred.take() {
                         self.held.push_front(deferred);
                     }
-                }
-                // The turn went on after the approval: it was answered.
-                LogItem::AssistantPart { created_at_ms, .. }
-                    if self.approvals > 0 && *created_at_ms >= self.approval_since =>
-                {
-                    self.approvals = 0;
-                    self.extra.push(AgentEvent::ToolFinished);
                 }
                 _ => {}
             }
@@ -623,6 +615,7 @@ impl EventReader {
             }
         }
         files.sort();
+        files.truncate(EVENTS_PER_POLL);
         let mut out = Vec::new();
         for (_, _, path) in files {
             match read_event(&path) {

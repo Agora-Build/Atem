@@ -465,8 +465,8 @@ impl ChatSession {
                     );
                 }
             }
-            AgentEvent::TurnEnded if !self.started => {}
-            AgentEvent::TurnEnded => {
+            AgentEvent::TurnEnded { .. } if !self.started => {}
+            AgentEvent::TurnEnded { .. } => {
                 self.expired = None;
                 let turn = self.current_turn.as_ref().map(|(t, _)| t.clone());
                 if let Some(turn) = turn
@@ -588,7 +588,9 @@ impl ChatSession {
                 }
             }
             LogItem::TurnEnded { .. } if !self.started => {}
-            LogItem::TurnEnded { turn_id, outcome } => {
+            LogItem::TurnEnded {
+                turn_id, outcome, ..
+            } => {
                 self.expired = None;
                 if self.last_completed.as_deref() != Some(turn_id.as_str()) {
                     self.complete(turn_id, outcome, &mut out);
@@ -980,6 +982,7 @@ mod tests {
             LogItem::TurnEnded {
                 turn_id: "t1".into(),
                 outcome: Outcome::Done,
+                at_ms: 3,
             },
             3,
             1,
@@ -1035,6 +1038,7 @@ mod tests {
         LogItem::TurnEnded {
             turn_id: turn.into(),
             outcome,
+            at_ms: 6,
         }
     }
     fn completes(outs: &[Out]) -> Vec<&Out> {
@@ -1257,7 +1261,10 @@ mod tests {
         // events before a session started do not change status
         assert!(s.on_event(AgentEvent::ToolStarted, 1, 0).is_empty());
         // a turn end before the session started neither sets Ready nor the input mark
-        assert!(s.on_event(AgentEvent::TurnEnded, 1, 9).is_empty());
+        assert!(
+            s.on_event(AgentEvent::TurnEnded { at_ms: None }, 1, 9)
+                .is_empty()
+        );
         assert!(s.on_log(end("t", Outcome::Done), 1, 9).is_empty());
         assert_eq!(s.status().state, State::Unknown);
         assert!(
@@ -1282,7 +1289,10 @@ mod tests {
             })]
         );
         // repeated Ready is no change
-        assert!(s.on_event(AgentEvent::TurnEnded, 11, 0).is_empty());
+        assert!(
+            s.on_event(AgentEvent::TurnEnded { at_ms: None }, 11, 0)
+                .is_empty()
+        );
         assert_eq!(s.status().since_ms, 10);
         s.on_event(
             AgentEvent::PromptSubmitted {
@@ -1320,7 +1330,7 @@ mod tests {
             (State::Working, 31)
         );
         assert_eq!(s.status().detail, None);
-        s.on_event(AgentEvent::TurnEnded, 40, 0);
+        s.on_event(AgentEvent::TurnEnded { at_ms: None }, 40, 0);
         assert_eq!((s.status().state, s.status().since_ms), (State::Ready, 40));
         assert_eq!(s.status().detail, None);
         assert_eq!(s.heartbeat(), Out::Status(s.status().clone()));
@@ -1334,10 +1344,10 @@ mod tests {
         s.on_event(AgentEvent::ToolStarted, 3, 0);
         let o = s.on_log(end("t1", Outcome::Done), 4, 0);
         assert_eq!(completes(&o).len(), 1);
-        assert!(completes(&s.on_event(AgentEvent::TurnEnded, 4, 0)).is_empty());
+        assert!(completes(&s.on_event(AgentEvent::TurnEnded { at_ms: None }, 4, 0)).is_empty());
         // hook-first
         s.on_log(user("u2", "t2", "again"), 5, 0);
-        let o = s.on_event(AgentEvent::TurnEnded, 6, 0);
+        let o = s.on_event(AgentEvent::TurnEnded { at_ms: None }, 6, 0);
         assert_eq!(
             completes(&o),
             vec![&Out::Complete {
@@ -1407,7 +1417,7 @@ mod tests {
     #[test]
     fn turn_end_without_open_turn_emits_no_complete() {
         let mut s = ready();
-        assert!(completes(&s.on_event(AgentEvent::TurnEnded, 2, 0)).is_empty());
+        assert!(completes(&s.on_event(AgentEvent::TurnEnded { at_ms: None }, 2, 0)).is_empty());
     }
 
     #[test]
@@ -1422,7 +1432,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(completes(&s.on_event(AgentEvent::TurnEnded, 3, 0)).is_empty());
+        assert!(completes(&s.on_event(AgentEvent::TurnEnded { at_ms: None }, 3, 0)).is_empty());
     }
 
     fn submit_ok(s: &mut ChatSession, rid: &str, text: &str) {
@@ -1554,7 +1564,7 @@ mod tests {
             err_text(s.submit("r", "g1", "hi", 0, false)),
             "the agent is busy; wait for the current turn to finish"
         );
-        s.on_event(AgentEvent::TurnEnded, 3, 0);
+        s.on_event(AgentEvent::TurnEnded { at_ms: None }, 3, 0);
         assert_eq!(
             err_text(s.submit("r", "g1", "hi", 2, false)),
             "the terminal has unsent input; finish or clear it there"
@@ -1617,10 +1627,10 @@ mod tests {
             2,
             0,
         );
-        s.on_event(AgentEvent::TurnEnded, 3, 5);
+        s.on_event(AgentEvent::TurnEnded { at_ms: None }, 3, 5);
         assert!(s.submit("r1", "g1", "hi", 5, false).is_ok());
         let mut s = ready();
-        s.on_event(AgentEvent::TurnEnded, 3, 5);
+        s.on_event(AgentEvent::TurnEnded { at_ms: None }, 3, 5);
         assert!(s.submit("r1", "g1", "hi", 6, false).is_err());
         s.on_event(
             AgentEvent::PromptSubmitted {
@@ -1631,7 +1641,7 @@ mod tests {
             4,
             6,
         );
-        s.on_event(AgentEvent::TurnEnded, 5, 6);
+        s.on_event(AgentEvent::TurnEnded { at_ms: None }, 5, 6);
         assert!(s.submit("r2", "g1", "hi", 6, false).is_ok());
     }
 

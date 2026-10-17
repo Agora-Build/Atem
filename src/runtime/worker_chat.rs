@@ -83,7 +83,7 @@ fn cut_event(event: &mut AgentEvent, max: usize) {
         AgentEvent::SessionStarted { source, .. } => {
             cut(source, max);
         }
-        AgentEvent::ToolStarted | AgentEvent::ToolFinished | AgentEvent::TurnEnded => {}
+        AgentEvent::ToolStarted | AgentEvent::ToolFinished | AgentEvent::TurnEnded { .. } => {}
     }
 }
 
@@ -206,7 +206,7 @@ impl ChatBacklog {
             let (ends, others): (Vec<_>, Vec<_>) = batch
                 .events
                 .into_iter()
-                .partition(|e| matches!(e, AgentEvent::TurnEnded));
+                .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
             enum Item {
                 Event(AgentEvent),
                 Log(LogItem),
@@ -313,8 +313,13 @@ mod tests {
         log.push(LogItem::TurnEnded {
             turn_id: "t".into(),
             outcome: Outcome::Done,
+            at_ms: 1,
         });
-        backlog.push(vec![started("s"), AgentEvent::TurnEnded], log, 7);
+        backlog.push(
+            vec![started("s"), AgentEvent::TurnEnded { at_ms: None }],
+            log,
+            7,
+        );
         let chunks = backlog.take();
         assert!(chunks.len() > 5, "{}", chunks.len());
         for chunk in &chunks {
@@ -325,7 +330,10 @@ mod tests {
         }
         // Order kept: the session start first, the turn end last, every item once.
         assert_eq!(chunks[0].events, vec![started("s")]);
-        assert_eq!(chunks.last().unwrap().events, vec![AgentEvent::TurnEnded]);
+        assert_eq!(
+            chunks.last().unwrap().events,
+            vec![AgentEvent::TurnEnded { at_ms: None }]
+        );
         let log: Vec<&LogItem> = chunks.iter().flat_map(|c| &c.log).collect();
         assert_eq!(log.len(), 402);
         let LogItem::Backfill(big) = log[400] else {

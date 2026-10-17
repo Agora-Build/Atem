@@ -438,23 +438,36 @@ first a line with the hook's `$$ $PPID`, then its stdin. The rollout JSONL
 named by `transcript_path` carries every message and turn boundary.
 
 - **Ownership.** Only hooks the session's agent started count
-  (`approvals::started_by`, shared with approvals): with the hook's parent
-  the agent (or one shell under it) a hook may pin or re-pin (`/new`);
-  through a non-shell child (npm's wrapper) only the pinned session's, or
-  the first; deeper (a `codex` a tool ran) never.
+  (`approvals::HookAgent` over `started_by`, shared with approvals): with
+  the hook's parent the agent (or one shell under it) a hook may pin or
+  re-pin (`/new`); through a non-shell child (npm's wrapper: node runs the
+  real binary) only the pinned session's, or the first — which makes that
+  child the agent, so the real binary's `/new` re-pins and a `codex` it
+  starts without a shell still can't; deeper (a `codex` a tool ran) never.
+  A wrapped hook read after its parent exited counts as foreign (harmless:
+  the rollout's end record is authoritative).
 - **Status.** `unknown` until the first hook (SessionStart is lazy: it
   fires at the first prompt), with the detail "type a first prompt in the
   terminal: …"; chat opens, but `submit` is refused with that text (a
   remote prompt needs `ready`: text typed into Codex's startup dialogs could
   answer them). Then `working` from UserPromptSubmit or the rollout's
-  `task_started`, `waiting` while an approval the worker reported for this
-  session is open (Codex has no event of its own), `ready` at
-  `task_complete` / `turn_aborted`.
+  `task_started`, `waiting` while the worker has approvals of this session
+  open (its set is the only source: Codex has no event of its own; after a
+  re-pin with some open it is waiting again), `ready` at `task_complete` /
+  `turn_aborted`.
 - **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
   UserPromptSubmit and the rollout's UserMessage both name it, with the same
   `turn_id`; completed at that turn's end (interrupted at `turn_aborted`).
-  `interrupt` writes Esc and completes at the next turn end; while the
-  status is `unknown` it is written all the same.
+  `interrupt` writes Esc only while a turn is known to run (`working` or
+  `waiting`) and completes at the next turn end; in `ready` or `unknown`
+  it completes at once with nothing written (Esc on Codex's startup trust
+  dialog quits Codex). A session without chat (Codex with its hooks off)
+  has no turn state: `interrupt` is `rejected` ("no turn state; use the
+  terminal") and never writes Esc.
+- **Approvals and chat evidence.** A new prompt or a turn end (stamped with
+  its hook file's or log entry's time) answers only a permission prompt
+  opened before it, for both agents: one read in the same pass as a newer
+  request leaves it open.
 - **Pairing a remote prompt.** Only a hook (its event file's time) and a log
   entry (its timestamp) from after the paste can be the remote prompt's, and
   only the first of each whose turn isn't known to be another: a local

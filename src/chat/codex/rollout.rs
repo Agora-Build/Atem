@@ -254,6 +254,7 @@ impl RolloutReader {
                 out.push(LogItem::TurnEnded {
                     turn_id: turn_id.to_string(),
                     outcome,
+                    at_ms: created_at_ms(v, payload),
                 });
             }
             _ => self.map_item(v, payload, turn_id, out),
@@ -418,10 +419,12 @@ mod tests {
                 L::TurnEnded {
                     turn_id,
                     outcome: Outcome::Done,
+                    ..
                 } => Some((turn_id.clone(), "done")),
                 L::TurnEnded {
                     turn_id,
                     outcome: Outcome::Interrupted,
+                    ..
                 } => Some((turn_id.clone(), "interrupted")),
                 _ => None,
             })

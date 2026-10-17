@@ -47,7 +47,7 @@
 //! the broker's decision.
 
 use crate::chat::adapter::ToolResultKind;
-use crate::chat::approvals::{self, Agent, Ancestry, Request, started_by};
+use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request};
 use crate::runtime::worker_protocol::ApplyOutcome;
 use crate::session_protocol::host::ApprovalInfo;
 use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision};
@@ -104,7 +104,12 @@ pub enum Evidence {
         at_ms: i64,
     },
     /// A new prompt or the turn's end; `interrupted`: the user stopped it.
-    TurnEnded { interrupted: bool },
+    /// `at_ms`: when the agent reported it (unix ms); it answers only a
+    /// request opened by then (unknown: any).
+    TurnEnded {
+        interrupted: bool,
+        at_ms: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,7 +146,8 @@ pub struct Approvals {
     dir: PathBuf,
     agent: Agent,
     /// The session's agent process (the PTY child).
-    agent_pid: Option<u32>,
+    /// Who a Codex hook must have been started by (`HookAgent`).
+    hook_agent: HookAgent,
     timeout: Duration,
     confirm: Duration,
     waiting: BTreeMap<String, Waiting>,
@@ -207,7 +213,7 @@ impl Approvals {
         Self {
             dir: approvals::approvals_dir(session_dir),
             agent,
-            agent_pid,
+            hook_agent: HookAgent::new(agent_pid),
             timeout: Duration::from_secs(agent.timeout_secs()),
             confirm: CONFIRM,
             waiting: BTreeMap::new(),
@@ -589,14 +595,15 @@ impl Approvals {
     /// session's agent. Started directly, its Codex session becomes the
     /// pinned one (so `/new` inside Codex keeps working); through a
     /// non-shell child (ambiguous: a wrapper, or a nested `codex`) it must be
-    /// the pinned session, or the first one seen. A request without a
-    /// session id can't be matched: only a hook whose parent is the agent
-    /// itself counts.
+    /// the pinned session, or the first one seen — which makes that child
+    /// (the real binary under npm's wrapper) the agent from then on
+    /// (`HookAgent`). A request without a session id can't be matched: only
+    /// a hook whose parent is the agent itself counts.
     fn codex_owns(&mut self, parent: Option<u32>, request: Option<&Value>) -> bool {
-        let (Some(agent), Some(parent)) = (self.agent_pid, parent) else {
+        let Some(parent) = parent else {
             return false;
         };
-        let ancestry = started_by(parent, agent);
+        let ancestry = self.hook_agent.ancestry(parent);
         if ancestry == Ancestry::Foreign {
             return false;
         }
@@ -605,7 +612,7 @@ impl Approvals {
             .and_then(Value::as_str);
         match (session, ancestry) {
             // Without a session id only a hook the agent started itself.
-            (None, Ancestry::Direct) => parent == agent,
+            (None, Ancestry::Direct) => self.hook_agent.is_agent(parent),
             (None, _) => false,
             (Some(session), Ancestry::Direct) => {
                 self.codex_session = Some(session.to_string());
@@ -615,6 +622,7 @@ impl Approvals {
                 Some(pinned) => pinned == session,
                 None => {
                     self.codex_session = Some(session.to_string());
+                    self.hook_agent.pinned_by(ancestry);
                     true
                 }
             },
@@ -642,11 +650,18 @@ impl Approvals {
 
     fn weigh(&mut self, ev: Evidence, out: &mut Vec<Event>) {
         match &ev {
-            Evidence::TurnEnded { .. } => {
+            Evidence::TurnEnded { at_ms, .. } => {
+                // A request opened after it (read in the same pass) is not
+                // what the turn's end or the new prompt answered. A
+                // whole-second time (a filesystem keeping seconds) counts
+                // to the end of its second.
+                let at = at_ms.map(|at| if at % 1000 == 0 { at + 999 } else { at });
                 let ids: Vec<String> = self
                     .waiting
                     .iter()
-                    .filter(|(_, w)| w.state != State::Released)
+                    .filter(|(_, w)| {
+                        w.state != State::Released && at.is_none_or(|at| at >= w.opened_ms)
+                    })
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in ids {
@@ -679,7 +694,9 @@ impl Approvals {
         };
         let reported = w.reported;
         let reason = match ev {
-            Evidence::TurnEnded { interrupted: true } => ApprovalCloseReason::Interrupted,
+            Evidence::TurnEnded {
+                interrupted: true, ..
+            } => ApprovalCloseReason::Interrupted,
             _ => ApprovalCloseReason::AnsweredTerminal,
         };
         match w.state.clone() {
