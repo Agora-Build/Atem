@@ -6,16 +6,11 @@ use ratatui::{
 };
 use vt100::{Cell as VtCell, Color as VtColor};
 
-use crate::agent_client::{AgentProtocol, AgentStatus};
 use crate::app::{App, AppMode};
 
 pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
     frame.render_widget(Clear, size);
-    if matches!(app.mode, AppMode::CodexChat | AppMode::ClaudeChat) {
-        draw_terminal_view(frame, app);
-        return;
-    }
 
     // Create layout
     let chunks = Layout::default()
@@ -46,9 +41,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     match app.mode {
         AppMode::MainMenu => draw_main_menu(frame, chunks[1], app),
         AppMode::TokenGeneration => draw_output_view(frame, chunks[1], app),
-        AppMode::ClaudeChat => draw_claude_panel(frame, chunks[1], app),
         AppMode::CommandExecution => draw_command_input(frame, chunks[1], app),
-        AppMode::CodexChat => draw_codex_panel(frame, chunks[1], app),
         AppMode::AgentPanel => draw_agent_panel(frame, chunks[1], app),
     }
 
@@ -56,9 +49,8 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut App) {
     let base_footer = match app.mode {
         AppMode::MainMenu => "\u{2191}\u{2193}/jk: Navigate | Enter: Select | q: Quit",
         AppMode::CommandExecution => "Type command + Enter | b: Back | q: Quit",
-        AppMode::CodexChat | AppMode::ClaudeChat => "Use the Atem prefix for terminal controls",
         AppMode::AgentPanel => {
-            "\u{2191}\u{2193}/jk: Navigate | Enter: Set Active | b: Back"
+            "\u{2191}\u{2193}/jk: Navigate | Enter: Open | r: Refresh | b: Back"
         }
         AppMode::TokenGeneration if !app.cached_projects.is_empty() => {
             if app.show_certificates {
@@ -153,9 +145,9 @@ pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app
         .style(cred_style)
         .block(Block::default().borders(Borders::NONE));
 
-    // Pairing banner: show when not connected to Astation
+    // The atem runtime holds the Astation link; the menu shows its state.
     let pairing_line = if !app.astation_connected {
-        Some("Connect to Astation for remote agent control and connected features")
+        Some("Astation \u{2717} (the atem runtime holds the connection; pair to control agents remotely)")
     } else {
         None
     };
@@ -261,37 +253,9 @@ pub(crate) fn draw_command_input(frame: &mut Frame, area: ratatui::layout::Rect,
     frame.render_widget(input, chunks[1]);
 }
 
-pub(crate) fn draw_codex_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let screen = app
-        .terminal_ui
-        .browse
-        .as_ref()
-        .map_or(app.codex_terminal.screen(), |b| &b.screen);
-    draw_terminal_screen(
-        frame,
-        area,
-        screen,
-        app.terminal_ui.browse.as_ref(),
-        app.terminal_ui.help,
-    );
-}
-
-pub(crate) fn draw_claude_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let screen = app
-        .terminal_ui
-        .browse
-        .as_ref()
-        .map_or(app.claude_terminal.screen(), |b| &b.screen);
-    draw_terminal_screen(
-        frame,
-        area,
-        screen,
-        app.terminal_ui.browse.as_ref(),
-        app.terminal_ui.help,
-    );
-}
-
-fn draw_terminal_screen(
+/// `screen` in `area`, cell by cell, with the browse selection and the
+/// screen's cursor (hidden while browsing or showing help).
+pub(crate) fn draw_terminal_screen(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     screen: &vt100::Screen,
@@ -336,90 +300,6 @@ fn draw_terminal_screen(
         if row < area.height && col < area.width {
             frame.set_cursor_position((area.x + col, area.y + row));
         }
-    }
-}
-
-fn draw_terminal_view(frame: &mut Frame, app: &mut App) {
-    let size = frame.area();
-    let area = super::terminal_view::viewport(size);
-    let (provider, input) = if matches!(app.mode, AppMode::CodexChat) {
-        draw_codex_panel(frame, area, app);
-        ("Codex", &app.codex_sender)
-    } else {
-        draw_claude_panel(frame, area, app);
-        ("Claude", &app.claude_sender)
-    };
-    let prefix = app.terminal_ui.prefix.label();
-    let text = if app.terminal_ui.help {
-        "Atem | Esc: close help | Up/Down: scroll details".to_string()
-    } else if app.terminal_ui.pending {
-        format!("{prefix} | h:menu g:take x:stop r:redraw [:history c:copy ?:help")
-    } else if let Some(browse) = &app.terminal_ui.browse {
-        format!(
-            "Atem | history +{} | arrows:move Space:select Enter:copy PgUp/PgDn:scroll Esc:live",
-            browse.offset
-        )
-    } else if let Some((message, _)) = app
-        .terminal_ui
-        .feedback
-        .as_ref()
-        .filter(|(_, when)| when.elapsed().as_secs() < 4)
-    {
-        format!("Atem | {message}")
-    } else {
-        let control = if input.as_ref().is_some_and(|s| s.remote_controlled()) {
-            "Remote"
-        } else {
-            "Local"
-        };
-        let link = if app.astation_connected {
-            "✓"
-        } else {
-            "✗"
-        };
-        let notice = if app.terminal_ui.messages.is_empty() {
-            ""
-        } else {
-            " | Notice"
-        };
-        format!("Atem | {provider} | {control} | Astation {link}{notice} | {prefix} then ?:help")
-    };
-    if size.height > 0 {
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(if app.voice_active {
-                super::voice_fx::border_color(app.voice_volume)
-            } else {
-                Color::Cyan
-            })),
-            ratatui::layout::Rect {
-                y: size.y + size.height - 1,
-                height: 1,
-                ..size
-            },
-        );
-    }
-    if app.terminal_ui.help {
-        let area = centered_rect(85, 85, size);
-        frame.render_widget(Clear, area);
-        let mut text = format!(
-            "{prefix}, then:\n\nh / m  Hide terminal; keep the agent running\ng      Take control locally\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nterminal_prefix in ~/.config/atem/config.toml or ATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
-        );
-        for message in app.terminal_ui.messages.iter().rev() {
-            text.push('\n');
-            text.push_str(message);
-            text.push('\n');
-        }
-        frame.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((app.terminal_ui.help_scroll, 0))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Atem terminal controls"),
-                ),
-            area,
-        );
     }
 }
 
@@ -474,21 +354,25 @@ pub(crate) fn vt_color_to_tui(color: VtColor) -> Color {
     }
 }
 
+/// The runtime's sessions (the menu's agent panel).
 pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let agents = app.agent_registry.all();
-
-    if agents.is_empty() {
-        let msg = Paragraph::new(
-            "No agents registered.\n\n\
-             Claude Code or Codex sessions started in Atem\n\
-             (`atem agent launch`) appear here.\n\n\
-             Press 'b' to go back.",
-        )
+    let sessions = &app.runtime_sessions;
+    if sessions.is_empty() {
+        let note = app
+            .runtime_note
+            .as_deref()
+            .unwrap_or("No sessions. Launch Claude Code or Codex from the menu.");
+        let msg = Paragraph::new(format!(
+            "{note}\n\n\
+             Sessions run in the atem runtime and keep running when you\n\
+             detach; `atem agent list` shows them too.\n\n\
+             Press 'b' to go back."
+        ))
         .style(Style::default().fg(Color::DarkGray))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" \u{1f916} Agent Panel — No Agents ")
+                .title(" \u{1f916} Agent Sessions ")
                 .border_style(Style::default().fg(Color::Yellow)),
         )
         .wrap(Wrap { trim: false });
@@ -496,82 +380,37 @@ pub(crate) fn draw_agent_panel(frame: &mut Frame, area: ratatui::layout::Rect, a
         return;
     }
 
-    let items: Vec<ListItem> = agents
+    let items: Vec<ListItem> = sessions
         .iter()
         .enumerate()
-        .map(|(i, info)| {
-            let is_selected = i == app.agent_panel_selected;
-            let is_active = app.active_agent_id.as_deref() == Some(info.id.as_str());
-
-            let protocol_badge = match info.protocol {
-                AgentProtocol::Pty => "[PTY]",
-            };
-
-            let status_icon = match info.status {
-                AgentStatus::Idle => "\u{26aa}",             // grey circle
-                AgentStatus::Thinking => "\u{1f7e1}",        // yellow circle
-                AgentStatus::WaitingForInput => "\u{1f7e2}", // green circle
-                AgentStatus::Disconnected => "\u{1f534}",    // red circle
-                AgentStatus::Unknown => "\u{2754}",          // question mark: activity unknown
-            };
-
-            let active_marker = if is_active { " \u{2605}" } else { "" }; // ★
-
-            let kind_label = format!("{:?}", info.kind);
-            let sessions = info.session_ids.len();
-            let session_info = if sessions > 0 {
-                format!(
-                    " ({} session{})",
-                    sessions,
-                    if sessions == 1 { "" } else { "s" }
-                )
-            } else {
-                String::new()
-            };
-
+        .map(|(i, s)| {
             let line = format!(
-                "{} {} {} {}{}{}",
-                status_icon,
-                protocol_badge,
-                kind_label,
-                info.id,
-                active_marker,
-                session_info,
+                "{}  {:<6}  {:<17}  {:<7}  {}{}",
+                s.id,
+                s.provider,
+                s.state,
+                s.status,
+                s.cwd.display(),
+                if s.attached { "  (attached)" } else { "" },
             );
-
-            let style = if is_selected {
+            let style = if i == app.agent_panel_selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
-            } else if is_active {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-
             ListItem::new(line).style(style)
         })
         .collect();
 
-    let active_label = app.active_agent_id.as_deref().unwrap_or("none");
-    let title = format!(
-        " \u{1f916} Agent Panel — {} agents | active: {} ",
-        agents.len(),
-        active_label
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" \u{1f916} Agent Sessions \u{2014} {} ", sessions.len()))
+            .border_style(Style::default().fg(Color::Green)),
     );
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().fg(Color::Green)),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-
     frame.render_widget(list, area);
 }
 
@@ -605,6 +444,7 @@ pub(crate) fn style_from_cell(cell: &VtCell) -> Style {
 mod paired_status_tests {
     use super::paired_status_line;
     use crate::memory::trust::VerificationStatus;
+    use crate::tui::frontend::View;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -642,18 +482,39 @@ mod paired_status_tests {
         );
     }
 
+    /// A frontend view of a `provider` session with a `rows` x `cols` screen.
+    fn view(provider: &str, rows: u16, cols: u16) -> View {
+        let mut view = View::new("ses-abcdefghijkl", false, None);
+        view.apply(crate::runtime::protocol::RuntimeMsg::Attached {
+            session: crate::runtime::protocol::SessionSummary {
+                id: "ses-abcdefghijkl".into(),
+                provider: provider.into(),
+                cwd: "/tmp".into(),
+                created_at_ms: 1,
+                state: "running".into(),
+                status: "unknown".into(),
+                attached: true,
+                remote_controlled: false,
+                exited: None,
+                rows,
+                cols,
+                generation: "g".into(),
+            },
+            restore: String::new(),
+            offset: 0,
+        });
+        view.ui.viewport = (rows, cols);
+        view
+    }
+
     #[test]
     fn connected_claude_keeps_the_terminal_renderer_and_size() {
         let backend = ratatui::backend::TestBackend::new(100, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = crate::app::App::new();
-        app.mode = crate::app::AppMode::ClaudeChat;
-        app.astation_connected = true;
-        app.adjust_claude_terminal_size(39, 100);
-        terminal
-            .draw(|frame| super::draw_ui(frame, &mut app))
-            .unwrap();
-        assert_eq!(app.claude_terminal.screen().size(), (39, 100));
+        let mut view = view("claude", 39, 100);
+        view.astation = true;
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert_eq!(view.parser.screen().size(), (39, 100));
         let text: String = terminal
             .backend()
             .buffer()
@@ -661,7 +522,7 @@ mod paired_status_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Atem | Claude | Local"));
+        assert!(text.contains("Atem | Claude | Local | Astation \u{2713}"));
     }
 
     #[test]
@@ -675,23 +536,20 @@ mod paired_status_tests {
             },
         )
         .unwrap();
-        let mut app = crate::app::App::new();
-        app.mode = crate::app::AppMode::CodexChat;
-        app.adjust_codex_terminal_size(24, 80);
-        app.codex_terminal
+        let mut view = view("codex", 24, 80);
+        view.parser
             .process("\x1b[4;40H\u{28ff}\u{28fe}\u{28fc}\x1b[24;1H? for shortcuts".as_bytes());
         let mut outer = vt100::Parser::new(25, 80, 0);
         terminal
-            .draw(|frame| super::draw_ui(frame, &mut app))
+            .draw(|frame| view.draw(frame))
             .unwrap();
         outer.process(&std::mem::take(&mut *bytes.lock().unwrap()));
         assert!(outer.screen().contents().contains('\u{28ff}'));
 
-        app.codex_terminal.process("\x1b[2J\x1b[HATEM_READY \u{4e2d}\u{6587}\x1b[24;1H? for shortcuts\x1b[24;55H2 warnings\x1b[23;3H\x1b[?25h".as_bytes());
-        app.status_message = Some("A very long credential notification that belongs in details, never over the agent screen".repeat(10));
-        app.terminal_ui.observe_status(&app.status_message);
+        view.parser.process("\x1b[2J\x1b[HATEM_READY \u{4e2d}\u{6587}\x1b[24;1H? for shortcuts\x1b[24;55H2 warnings\x1b[23;3H\x1b[?25h".as_bytes());
+        view.ui.record("A very long credential notification that belongs in details, never over the agent screen".repeat(10));
         terminal
-            .draw(|frame| super::draw_ui(frame, &mut app))
+            .draw(|frame| view.draw(frame))
             .unwrap();
         outer.process(&std::mem::take(&mut *bytes.lock().unwrap()));
         let text = outer.screen().contents();
@@ -705,8 +563,8 @@ mod paired_status_tests {
         for row in 0..24 {
             for col in 0..80 {
                 let actual = outer.screen().cell(row, col).unwrap().contents();
-                let expected = app
-                    .codex_terminal
+                let expected = view
+                    .parser
                     .screen()
                     .cell(row, col)
                     .unwrap()
@@ -730,18 +588,16 @@ mod paired_status_tests {
             },
         )
         .unwrap();
-        let mut app = crate::app::App::new();
-        app.mode = crate::app::AppMode::CodexChat;
-        app.adjust_codex_terminal_size(51, 152);
+        let mut view = view("codex", 51, 152);
         let mut outer = vt100::Parser::new(52, 152, 0);
         let mut saw_animation = false;
         for (index, frame) in fixture["frames"].as_array().unwrap().iter().enumerate() {
             // Real Codex clears its animation with incremental edits, without a full clear.
             for chunk in frame.as_str().unwrap().as_bytes().chunks(37) {
-                app.codex_terminal.process(chunk);
+                view.parser.process(chunk);
             }
             terminal
-                .draw(|frame| super::draw_ui(frame, &mut app))
+                .draw(|frame| view.draw(frame))
                 .unwrap();
             outer.process(&std::mem::take(&mut *bytes.lock().unwrap()));
             let dots = outer
@@ -753,7 +609,7 @@ mod paired_status_tests {
             saw_animation |= dots > 100;
             for row in 0..51 {
                 for col in 0..152 {
-                    let expected = app.codex_terminal.screen().cell(row, col).unwrap();
+                    let expected = view.parser.screen().cell(row, col).unwrap();
                     let actual = outer.screen().cell(row, col).unwrap();
                     assert_eq!(
                         actual.contents().trim_end(),
@@ -778,11 +634,11 @@ mod paired_status_tests {
         assert_eq!(text.matches("Atem |").count(), 1);
         assert_eq!(
             outer.screen().cursor_position(),
-            app.codex_terminal.screen().cursor_position()
+            view.parser.screen().cursor_position()
         );
         assert_eq!(
             outer.screen().hide_cursor(),
-            app.codex_terminal.screen().hide_cursor()
+            view.parser.screen().hide_cursor()
         );
     }
 

@@ -29,6 +29,13 @@ pub enum Inbound {
         request_id: String,
         text: String,
     },
+    /// An approval card answered from chat (`approval` instead of `text`):
+    /// the session-v1 approval submission, payload as it is.
+    Answer {
+        generation: String,
+        request_id: String,
+        approval: Value,
+    },
     Close,
 }
 
@@ -68,10 +75,23 @@ pub fn parse_inbound(env: &ChatEnvelope) -> Result<Inbound, String> {
         "submit" => {
             let generation = str_field(env, "generation")?;
             let request_id = str_field(env, "requestId")?;
-            let text = str_field(env, "text")?;
             if !valid_id(&request_id) {
                 return Err("invalid requestId".into());
             }
+            if let Some(approval) = env.body.get("approval") {
+                if env.body.contains_key("text") {
+                    return Err("a submit carries text or approval, not both".into());
+                }
+                if !approval.is_object() {
+                    return Err("invalid approval".into());
+                }
+                return Ok(Inbound::Answer {
+                    generation,
+                    request_id,
+                    approval: approval.clone(),
+                });
+            }
+            let text = str_field(env, "text")?;
             Ok(Inbound::Submit {
                 generation,
                 request_id,
@@ -118,6 +138,14 @@ enum PartBody<'a> {
         id: &'a str,
         name: &'a str,
         summary: &'a str,
+    },
+    Approval {
+        id: &'a str,
+        approval_id: &'a str,
+        tool: &'a str,
+        summary: &'a str,
+        always_rules: &'a [crate::session_protocol::wire::AlwaysRule],
+        state: super::adapter::ApprovalCardState,
     },
 }
 
@@ -188,6 +216,14 @@ fn part_body(p: &Part) -> PartBody<'_> {
     match p {
         Part::Text { id, markdown } => PartBody::Text { id, markdown },
         Part::Tool { id, name, summary } => PartBody::Tool { id, name, summary },
+        Part::Approval(c) => PartBody::Approval {
+            id: &c.id,
+            approval_id: &c.approval_id,
+            tool: &c.tool,
+            summary: &c.summary,
+            always_rules: &c.always_rules,
+            state: c.state,
+        },
     }
 }
 
@@ -322,11 +358,6 @@ pub fn history_message(
     )
 }
 
-/// For errors raised before a session exists: no generation or sequence.
-pub fn error(conv: &str, agent: &str, text: &str, request_id: Option<&str>) -> ChatEnvelope {
-    envelope(conv, agent, "error", None, ErrorBody { text, request_id })
-}
-
 /// Atem ends a conversation: after an `error` saying why, or without one when a
 /// ninth conversation replaces the oldest.
 pub fn close(conv: &str, agent: &str) -> ChatEnvelope {
@@ -370,6 +401,58 @@ mod tests {
 
     fn body(e: &ChatEnvelope) -> Value {
         serde_json::to_value(e).unwrap()
+    }
+
+    #[test]
+    fn an_approval_answer_is_a_submit_with_approval_instead_of_text() {
+        let answer = json!({"approval_id": "a1", "decision": "allow_once", "acquire": true});
+        assert_eq!(
+            parse_inbound(&env(
+                "submit",
+                json!({"generation": "g", "requestId": "r1", "approval": answer.clone()})
+            ))
+            .unwrap(),
+            Inbound::Answer {
+                generation: "g".into(),
+                request_id: "r1".into(),
+                approval: answer.clone(),
+            }
+        );
+        for bad in [
+            json!({"generation": "g", "requestId": "r1", "approval": answer, "text": "hi"}),
+            json!({"generation": "g", "requestId": "r1", "approval": "allow"}),
+        ] {
+            assert!(parse_inbound(&env("submit", bad.clone())).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_approval_card_is_a_message_part() {
+        use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
+        use crate::session_protocol::wire::AlwaysRule;
+        let mut m = msg();
+        m.role = Role::Assistant;
+        m.origin = None;
+        m.parts = vec![Part::Approval(ApprovalCard {
+            id: "approval".into(),
+            approval_id: "a1".into(),
+            tool: "Bash".into(),
+            summary: "npm test".into(),
+            always_rules: vec![AlwaysRule {
+                rule_id: "r0-1".into(),
+                label: "Allow Bash(npm test:*)".into(),
+                scope: "this project".into(),
+            }],
+            state: ApprovalCardState::AlwaysAllowed,
+        })];
+        let e = body(&event("c1", "claude", "g", 3, &Out::Message(m)));
+        assert_eq!(
+            e["parts"][0],
+            json!({"id": "approval", "kind": "approval", "approval_id": "a1", "tool": "Bash",
+                   "summary": "npm test", "state": "always_allowed",
+                   "always_rules": [{"rule_id": "r0-1", "label": "Allow Bash(npm test:*)",
+                                     "scope": "this project"}]})
+        );
     }
 
     #[test]
@@ -582,20 +665,12 @@ mod tests {
     }
 
     #[test]
-    fn history_and_pre_session_error() {
+    fn history_message_is_marked() {
         let v = body(&history_message("c1", "claude", "g", 4, &msg()));
         assert_eq!(v["op"], "message");
         assert_eq!(v["history"], true);
         assert_eq!(v["sequence"], 4);
         assert_eq!(v["messageId"], "m1");
-        assert_eq!(
-            body(&error("c1", "claude", "no chat", Some("r1"))),
-            json!({"v":1,"op":"error","conversationId":"c1","agentId":"claude","text":"no chat","requestId":"r1"})
-        );
-        assert_eq!(
-            body(&error("c1", "claude", "no chat", None)),
-            json!({"v":1,"op":"error","conversationId":"c1","agentId":"claude","text":"no chat"})
-        );
     }
 
     #[test]

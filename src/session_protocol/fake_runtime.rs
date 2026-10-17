@@ -14,7 +14,7 @@ use super::host::{
     Attach, ChatReply, DispatchReport, Effect, HostConfig, HostContext, Origin, SessionHost,
     SessionSpec, random_ids,
 };
-use super::journal::MemJournal;
+use super::journal::{Journal, MemJournal};
 use super::wire::{
     self, Binding, ClientKind, DecodeError, Envelope, Op, Permission, ReceiptKind, SessionMessage,
     Target,
@@ -42,6 +42,12 @@ pub struct Pty {
     pub dropped_remote: u64,
     pub resizes: u64,
     pub stops: u64,
+    /// Decisions handed to the agent (`Effect::Approval`), as wire JSON.
+    pub approval_decisions: Vec<Value>,
+    /// Approvals the host released ("no decision").
+    pub approvals_released: u64,
+    /// Push requests to the relay, in order: `{op, approval_id, reason?}`.
+    pub pushes: Vec<Value>,
 }
 
 impl Default for Pty {
@@ -57,6 +63,9 @@ impl Default for Pty {
             dropped_remote: 0,
             resizes: 0,
             stops: 0,
+            approval_decisions: Vec::new(),
+            approvals_released: 0,
+            pushes: Vec::new(),
         }
     }
 }
@@ -74,8 +83,25 @@ struct Client {
     client_kind: ClientKind,
 }
 
-pub struct FakeRuntime {
-    pub host: SessionHost<MemJournal>,
+/// Fixture failure injection on a journal (`fail_next_fsync`).
+pub trait FailFsync {
+    fn fail_next_fsync(&mut self);
+}
+
+impl FailFsync for MemJournal {
+    fn fail_next_fsync(&mut self) {
+        MemJournal::fail_next_fsync(self);
+    }
+}
+
+impl FailFsync for super::file_journal::FileJournal {
+    fn fail_next_fsync(&mut self) {
+        self.inject(super::file_journal::Fault::Fsync);
+    }
+}
+
+pub struct FakeRuntime<J: Journal = MemJournal> {
+    pub host: SessionHost<J>,
     pub pty: Pty,
     /// Hold remote PTY writes in a queue instead of writing them at once
     /// (`flush_writes` writes them through the write boundary).
@@ -151,6 +177,16 @@ impl FakeRuntime {
     }
 
     pub fn with_config(setup: &Setup, config: HostConfig) -> Result<Self, String> {
+        Self::with_journal(setup, config, MemJournal::default())
+    }
+
+    pub fn from_json(setup: Value, config: HostConfig) -> Self {
+        Self::from_json_with(setup, config, MemJournal::default())
+    }
+}
+
+impl<J: Journal> FakeRuntime<J> {
+    pub fn with_journal(setup: &Setup, config: HostConfig, journal: J) -> Result<Self, String> {
         let h = &setup.host;
         let ctx = HostContext {
             account_id: h.account_id.clone(),
@@ -159,8 +195,7 @@ impl FakeRuntime {
             runtime_gen: h.runtime_gen.clone(),
             runtime_epoch: h.runtime_epoch,
         };
-        let host =
-            SessionHost::new(ctx, config, MemJournal::default(), random_ids()).map_err(|e| e.0)?;
+        let host = SessionHost::new(ctx, config, journal, random_ids()).map_err(|e| e.0)?;
         let mut rt = Self {
             host,
             pty: Pty::default(),
@@ -210,9 +245,9 @@ impl FakeRuntime {
         Ok(rt)
     }
 
-    pub fn from_json(setup: Value, config: HostConfig) -> Self {
+    pub fn from_json_with(setup: Value, config: HostConfig, journal: J) -> Self {
         let setup: Setup = serde_json::from_value(setup).expect("setup");
-        Self::with_config(&setup, config).expect("fake runtime")
+        Self::with_journal(&setup, config, journal).expect("fake runtime")
     }
 
     /// Connects `client` on a new attachment without `hello`.
@@ -374,6 +409,17 @@ impl FakeRuntime {
                 Effect::Close { attachment } => {
                     self.live.remove(&attachment);
                 }
+                // A second `hello` replaced the client's attachment on the
+                // same transport: its messages go to the new one.
+                Effect::Replaced { old, new } => {
+                    if let Some(name) = self.live.remove(&old) {
+                        if let Some(c) = self.clients.get_mut(&name) {
+                            c.attachment_gen = new.clone();
+                        }
+                        self.names.insert(new.clone(), name.clone());
+                        self.live.insert(new, name);
+                    }
+                }
                 Effect::PtyWrite { ref origin, .. } => {
                     if self.hold_writes && matches!(origin, Origin::Remote { .. }) {
                         self.queued_writes.push(effect);
@@ -412,6 +458,38 @@ impl FakeRuntime {
                         work.extend(self.host.dispatch_report(&request_id, report));
                     }
                 }
+                Effect::Approval {
+                    approval_id,
+                    decision,
+                    rule_id,
+                    message,
+                    ..
+                } => {
+                    // Handed to the agent; it reports later (`approval_applied`).
+                    self.pty.dispatch_attempts += 1;
+                    self.pty.dispatches += 1;
+                    let mut d = json!({"approval_id": approval_id, "decision": decision});
+                    if let Some(r) = rule_id {
+                        d["rule_id"] = Value::String(r);
+                    }
+                    if let Some(m) = message {
+                        d["message"] = Value::String(m);
+                    }
+                    self.pty.approval_decisions.push(d);
+                }
+                Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
+                Effect::PushApproval { request } => self
+                    .pty
+                    .pushes
+                    .push(json!({"op": "push_approval", "approval_id": request.approval_id})),
+                Effect::PushResolved {
+                    approval_id,
+                    reason,
+                } => self.pty.pushes.push(json!({
+                    "op": "push_resolved",
+                    "approval_id": approval_id,
+                    "reason": reason,
+                })),
                 Effect::Reconcile { request_id, .. } => {
                     let answer = self.reconcile_answer.clone();
                     work.extend(self.host.dispatch_report(&request_id, answer));
@@ -508,7 +586,7 @@ impl FakeRuntime {
     }
 }
 
-impl HostUnderTest for FakeRuntime {
+impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
     /// The host sees the time with the message; no timer tick is run.
     fn receive(&mut self, client: &str, msg: Result<Envelope, DecodeError>, now_ms: u64) {
         self.now = now_ms;
@@ -607,6 +685,31 @@ impl HostUnderTest for FakeRuntime {
                 self.flush_writes();
                 Vec::new()
             }
+            HostEvent::OpenApproval {
+                session_id,
+                tool,
+                summary,
+                always_rules,
+            } => {
+                let info = super::host::ApprovalInfo {
+                    tool: tool.clone(),
+                    summary: summary.clone(),
+                    always_rules: always_rules.clone(),
+                };
+                let process_gen = self.process_gen(session_id);
+                // Refused: the agent's own prompt asks; nothing is sent.
+                let (_, fx) = self
+                    .host
+                    .open_approval(session_id, &process_gen, info, now_ms);
+                fx
+            }
+            HostEvent::CloseApproval {
+                approval_id,
+                reason,
+            } => self.host.close_approval(approval_id, *reason),
+            HostEvent::ApprovalApplied { approval_id, ok } => {
+                self.host.approval_applied(approval_id, *ok)
+            }
         };
         self.apply(fx);
         Ok(())
@@ -629,6 +732,14 @@ impl HostUnderTest for FakeRuntime {
             "resizes" => p.resizes.into(),
             "stops" => p.stops.into(),
             "lease_holder" => self.lease_holder()?,
+            "approval_decisions" => Value::from(p.approval_decisions.clone()),
+            "approvals_released" => p.approvals_released.into(),
+            "pushes" => Value::from(p.pushes.clone()),
+            "approvals_pending" => self
+                .host
+                .pending_approvals(&self.only_session()?)
+                .len()
+                .into(),
             "receipts_visible" => Value::Object(
                 self.clients
                     .iter()

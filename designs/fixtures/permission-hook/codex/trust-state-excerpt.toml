@@ -1,0 +1,5 @@
+[hooks.state]
+
+[hooks.state."/home/user/home/hooks.json:permission_request:0:0"]
+trusted_hash = "sha256:e37a7fde990ccce512ead8d8de55d003231437b29f01a45326faaa8fc484f84a"
+

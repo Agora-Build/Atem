@@ -3,8 +3,6 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -62,6 +60,68 @@ pub(crate) fn is_auth_required(message: &AstationMessage) -> bool {
     matches!(message, AstationMessage::StatusUpdate { status, .. } if status == "auth_required")
 }
 
+/// The family of a message the session host decodes itself (`session`,
+/// `terminal`, `agentChat`), from its `type`.
+pub(crate) fn session_family(text: &str) -> Option<&'static str> {
+    #[derive(Deserialize)]
+    struct Peek {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    let peek: Peek = serde_json::from_str(text).ok()?;
+    match peek.kind.as_deref()? {
+        "session" => Some("session"),
+        "terminal" => Some("terminal"),
+        "agentChat" => Some("agentChat"),
+        _ => None,
+    }
+}
+
+/// Message types removed in atem-session r6 (§0): no compatibility, but
+/// still answered, so a sender learns they are gone.
+pub(crate) const REMOVED_OPS: &[&str] = &[
+    "agentInput",
+    "agentPrompt",
+    "voiceCommand",
+    "voiceToggle",
+    "voice_toggle",
+    "voiceRequest",
+    "userCommand",
+    "codexTaskRequest",
+    "agentListRequest",
+];
+
+/// `text` is one of the `REMOVED_OPS`.
+pub(crate) fn is_removed_op(text: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Peek {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    serde_json::from_str::<Peek>(text)
+        .ok()
+        .and_then(|p| p.kind)
+        .is_some_and(|kind| REMOVED_OPS.contains(&kind.as_str()))
+}
+
+/// The `data.id` of a `session` message, when it has one (no other check).
+fn session_message_id(text: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Data {
+        id: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Outer {
+        #[serde(rename = "type")]
+        kind: String,
+        data: Option<Data>,
+    }
+    let outer: Outer = serde_json::from_str(text).ok()?;
+    (outer.kind == "session")
+        .then_some(outer.data?.id?)
+        .filter(|id| crate::session_protocol::wire::is_uuid_v4(id))
+}
+
 struct OutboundMessage {
     message: AstationMessage,
     delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -70,6 +130,24 @@ struct OutboundMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AstationMessage {
+    /// A `session`, `terminal` or `agentChat` message as its raw JSON text:
+    /// the session host decodes those strictly itself. Inbound messages of
+    /// those families always arrive as this; outbound, the text is written
+    /// as is.
+    #[serde(skip)]
+    SessionWire(String),
+
+    /// A `session`, `terminal` or `agentChat` message over its size bound
+    /// (not kept): answered with an `error` (`re` = its session `id`, when
+    /// it had a readable one).
+    #[serde(skip)]
+    SessionOversize { id: Option<String> },
+
+    /// An op removed in atem-session r6 (`REMOVED_OPS`): answered with an
+    /// `error` `unsupported_version` and no effect.
+    #[serde(skip)]
+    RemovedOp,
+
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
 
@@ -102,33 +180,6 @@ pub enum AstationMessage {
         timestamp: String,
     },
 
-    #[serde(rename = "userCommand")]
-    UserCommand {
-        command: String,
-        context: std::collections::HashMap<String, String>,
-    },
-
-    #[serde(rename = "commandResponse")]
-    CommandResponse {
-        output: String,
-        success: bool,
-        timestamp: String,
-    },
-
-    #[serde(rename = "codexTaskRequest")]
-    CodexTaskRequest {
-        prompt: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context: Option<std::collections::HashMap<String, String>>,
-    },
-
-    #[serde(rename = "codexTaskResponse")]
-    CodexTaskResponse {
-        output: String,
-        success: bool,
-        timestamp: String,
-    },
-
     #[serde(rename = "statusUpdate")]
     StatusUpdate {
         status: String,
@@ -157,31 +208,11 @@ pub enum AstationMessage {
         timestamp: String,
     },
 
-    #[serde(rename = "volume_update")]
-    VolumeUpdate { level: f32 },
-
     #[serde(rename = "heartbeat")]
     Heartbeat { timestamp: String },
 
     #[serde(rename = "pong")]
     Pong { timestamp: String },
-
-    #[serde(rename = "voice_toggle")]
-    VoiceToggle { active: bool },
-
-    #[serde(rename = "video_toggle")]
-    VideoToggle { active: bool },
-
-    #[serde(rename = "atem_instance_list")]
-    AtemInstanceList { instances: Vec<AtemInstance> },
-
-    #[serde(rename = "voiceCommand")]
-    VoiceCommand {
-        text: String,
-        /// true = final chunk (trigger word detected by sender), false = partial
-        #[serde(default)]
-        is_final: bool,
-    },
 
     #[serde(rename = "markTaskAssignment")]
     MarkTaskAssignment {
@@ -201,29 +232,11 @@ pub enum AstationMessage {
 
     // ── Agent hub messages ────────────────────────────────────────────────
 
-    /// Astation → Atem: request the list of connected agents.
-    #[serde(rename = "agentListRequest")]
-    AgentListRequest,
-
     #[serde(rename = "credentialProjectListRequest")]
     CredentialProjectListRequest,
 
     #[serde(rename = "credentialProjectListResponse")]
     CredentialProjectListResponse { report: crate::memory::credential_projects::ProjectReportWire },
-
-    /// Atem → Astation: snapshot of all registered agents.
-    #[serde(rename = "agentListResponse")]
-    AgentListResponse {
-        agents: Vec<crate::agent_client::AgentInfo>,
-    },
-
-    /// Astation → Atem: send a text prompt to a specific agent.
-    #[serde(rename = "agentPrompt")]
-    AgentPrompt {
-        agent_id: String,
-        session_id: String,
-        text: String,
-    },
 
     /// Atem → Astation: a streaming event from an agent.
     ///
@@ -238,43 +251,6 @@ pub enum AstationMessage {
         text: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         data: Option<serde_json::Value>,
-    },
-
-    /// Atem → Astation: an agent's status changed.
-    #[serde(rename = "agentStatusUpdate")]
-    AgentStatusUpdate {
-        agent_id: String,
-        status: crate::agent_client::AgentStatus,
-    },
-
-    /// Astation → Atem: voice coding request with accumulated transcription.
-    #[serde(rename = "voiceRequest")]
-    VoiceRequest {
-        session_id: String,
-        accumulated_text: String,
-        relay_url: String,
-    },
-
-    /// Astation → Atem (remote agent control v1): text or a control key to write
-    /// to the focused agent's PTY. `agent_id` is optional (v1 = focused/only
-    /// agent). Wire shape: `{type:"agentInput", data:{agentId?, kind, text?, key?}}`.
-    #[serde(rename = "agentInput")]
-    AgentInput {
-        #[serde(rename = "agentId", default, skip_serializing_if = "Option::is_none")]
-        agent_id: Option<String>,
-        kind: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        key: Option<String>,
-    },
-
-    /// Atem → Astation: voice coding response confirmation.
-    #[serde(rename = "voiceResponse")]
-    VoiceResponse {
-        session_id: String,
-        success: bool,
-        message: String,
     },
 
     /// Astation → Atem: request to generate a visual diagram. Diagram
@@ -439,14 +415,6 @@ pub struct SystemStatus {
     pub projects: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AtemInstance {
-    pub id: String,
-    pub hostname: String,
-    pub tag: String,
-    pub is_focused: bool,
-}
-
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<OutboundMessage>>,
     terminal_sender: Option<mpsc::Sender<OutboundMessage>>,
@@ -476,7 +444,20 @@ pub struct AstationClient {
     /// effects (auth success, credentials, encryption, keys) is applied only
     /// while it is still current (`pairing_binding::Captured::apply`).
     capture: Option<crate::pairing_binding::Captured>,
+    /// Shows the pairing code and its outcome (`authenticate_with_pairing`);
+    /// `None` prints them. The runtime sends them to the CLI that pairs.
+    pairing_notice: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// The key agent encryption messages and reports use (`with_agent`);
+    /// `None` is this user's agent.
+    agent: Option<std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>>,
+    /// A handle for one runtime operation (`op_view`): it waits for a
+    /// migration the link is finishing instead of skipping its own.
+    is_op_view: bool,
 }
+
+/// One encryption migration at a time per process: the runtime's link and
+/// an operation on it may both be asked to finish one.
+pub(crate) static MIGRATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Why a connection couldn't authenticate with the saved session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,7 +518,97 @@ impl AstationClient {
             held_encryption: Vec::new(),
             profile: None,
             capture: None,
+            pairing_notice: None,
+            agent: None,
+            is_op_view: false,
         }
+    }
+
+    /// Encryption messages and reports use `agent` (not this user's).
+    pub(crate) fn with_agent(
+        mut self,
+        agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>,
+    ) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    /// The key agent of this client (started on demand when it's the user's).
+    fn key_agent(&self) -> std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> {
+        match &self.agent {
+            Some(agent) => agent.clone(),
+            None => std::sync::Arc::from(crate::memory::key_agent::default_agent()),
+        }
+    }
+
+    /// The running key agent of this client, never started.
+    fn running_key_agent(&self) -> Option<std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>> {
+        match &self.agent {
+            Some(agent) => Some(agent.clone()),
+            None => crate::memory::key_agent::running_agent().map(std::sync::Arc::from),
+        }
+    }
+
+    /// This client's profile (`with_profile`, else this user's).
+    pub(crate) fn profile(&self) -> Result<crate::status::Sources> {
+        self.profile_sources()
+    }
+
+    /// The legacy single-session file of this client's profile.
+    pub(crate) fn saved_session_file(&self) -> Result<std::path::PathBuf> {
+        Ok(self.profile_sources()?.config_dir().join("session.json"))
+    }
+
+    /// Pairing lines go to `notice` instead of stdout.
+    pub(crate) fn with_pairing_notice(
+        mut self,
+        notice: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        self.pairing_notice = Some(notice);
+        self
+    }
+
+    fn pairing_line(&self, text: &str) {
+        match &self.pairing_notice {
+            Some(notice) => notice(text),
+            None => println!("{text}"),
+        }
+    }
+
+    /// A handle for one operation on this link (`atem runtime`'s Astation
+    /// operations): it sends through this link's writer and receives only
+    /// what the link's owner routes to it through the returned sender. It
+    /// shares the link's identity and captured pairing; dropping it leaves
+    /// the link alone.
+    pub(crate) fn op_view(&self) -> (Self, mpsc::Sender<AstationMessage>) {
+        let (tx, rx) = mpsc::channel(64);
+        let mut view = Self::new();
+        view.sender = self.sender.clone();
+        view.terminal_sender = self.terminal_sender.clone();
+        view.receiver = Some(rx);
+        view.atem_id_override = self.atem_id_override.clone();
+        view.session_path_override = self.session_path_override.clone();
+        #[cfg(test)]
+        {
+            view.relay_code_path_override = self.relay_code_path_override.clone();
+            view.local_token_path_override = self.local_token_path_override.clone();
+        }
+        view.connected_astation_id = self.connected_astation_id.clone();
+        view.profile = self.profile.clone();
+        view.capture = self.capture.clone();
+        view.agent = self.agent.clone();
+        view.is_op_view = true;
+        (view, tx)
+    }
+
+    /// This atem's relay identity (`atem_id`), the device id verification uses.
+    pub(crate) fn device_atem_id(&self) -> String {
+        self.resolved_atem_id(&crate::auth::get_hostname())
+    }
+
+    /// Records `astation_id` as the relay identity room to reconnect to.
+    pub(crate) fn remember_relay_code(&self, astation_id: &str) {
+        self.remember_astation_relay_code(astation_id);
     }
 
     /// The profile this client reads and writes (`with_profile`, else this
@@ -711,16 +782,18 @@ impl AstationClient {
     }
 
     fn load_session_manager(&self) -> Result<crate::auth::SessionManager> {
-        match self.session_path_override.as_deref() {
-            Some(path) => crate::auth::SessionManager::load_from(path),
-            None => crate::auth::SessionManager::load(),
+        match (self.session_path_override.as_deref(), &self.profile) {
+            (Some(path), _) => crate::auth::SessionManager::load_from(path),
+            (None, Some(profile)) => crate::auth::SessionManager::load_from(&profile.sessions),
+            (None, None) => crate::auth::SessionManager::load(),
         }
     }
 
     fn save_session_manager(&self, manager: &crate::auth::SessionManager) -> Result<()> {
-        match self.session_path_override.as_deref() {
-            Some(path) => manager.save_to(path),
-            None => manager.save(),
+        match (self.session_path_override.as_deref(), &self.profile) {
+            (Some(path), _) => manager.save_to(path),
+            (None, Some(profile)) => manager.save_to(&profile.sessions),
+            (None, None) => manager.save(),
         }
     }
 
@@ -733,11 +806,13 @@ impl AstationClient {
     fn remember_astation_relay_code(&self, astation_id: &str) {
         #[cfg(test)]
         if let Some(path) = self.relay_code_path_override.as_deref() {
-            let _ = fs::write(path, astation_id);
+            let _ = std::fs::write(path, astation_id);
             return;
         }
-
-        AtemConfig::store_astation_relay_code(astation_id);
+        match &self.profile {
+            Some(profile) => AtemConfig::store_astation_relay_code_in(&profile.config_dir(), astation_id),
+            None => AtemConfig::store_astation_relay_code(astation_id),
+        }
     }
 
     fn abort_transport(&mut self) {
@@ -807,7 +882,11 @@ impl AstationClient {
                     outbound = terminal_rx.recv() => outbound,
                 };
                 let Some(outbound) = outbound else { break; };
-                let result = match serde_json::to_string(&outbound.message) {
+                let encoded = match &outbound.message {
+                    AstationMessage::SessionWire(text) => Ok(text.clone()),
+                    message => serde_json::to_string(message),
+                };
+                let result = match encoded {
                     Ok(json) => write.send(Message::Text(json)).await.map_err(|_| "WebSocket write failed".to_string()),
                     Err(_) => Err("WebSocket message encoding failed".to_string()),
                 };
@@ -822,11 +901,18 @@ impl AstationClient {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
-                        if let Ok(astation_msg) = serde_json::from_str::<AstationMessage>(&text) {
-                            if matches!(&astation_msg, AstationMessage::Terminal(_)) && text.len() > 32 * 1024 { continue; }
-                            if tx.send(astation_msg).await.is_err() {
-                                break; // Receiver has been dropped
+                        let astation_msg = match session_family(&text) {
+                            Some(family) if text.len() > if family == "terminal" { 32 * 1024 } else { crate::session_protocol::wire::MAX_MESSAGE_BYTES } => {
+                                Some(AstationMessage::SessionOversize { id: session_message_id(&text) })
                             }
+                            Some(_) => Some(AstationMessage::SessionWire(text)),
+                            None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),
+                            None => serde_json::from_str::<AstationMessage>(&text).ok(),
+                        };
+                        if let Some(astation_msg) = astation_msg
+                            && tx.send(astation_msg).await.is_err()
+                        {
+                            break; // Receiver has been dropped
                         }
                     }
                     Ok(Message::Close(_)) => {
@@ -964,9 +1050,9 @@ impl AstationClient {
         let pairing_code = crate::auth::generate_otp();
         let hostname = crate::auth::get_hostname();
 
-        println!("🔐 Pairing with Astation...");
-        println!("   Code: {}", pairing_code);
-        println!("   Waiting for approval...");
+        self.pairing_line("🔐 Pairing with Astation...");
+        self.pairing_line(&format!("   Code: {}", pairing_code));
+        self.pairing_line("   Waiting for approval...");
 
         // Send pairing auth
         let mut auth_data = std::collections::HashMap::new();
@@ -990,11 +1076,11 @@ impl AstationClient {
 
         match response {
             Some(AuthResponse::Authenticated) => {
-                println!("✅ Pairing approved!");
+                self.pairing_line("✅ Pairing approved!");
                 Ok(())
             }
             Some(AuthResponse::Denied(msg)) => {
-                println!("❌ Pairing denied: {}", msg);
+                self.pairing_line(&format!("❌ Pairing denied: {}", msg));
                 Err(anyhow!("Pairing denied: {}", msg))
             }
             Some(AuthResponse::SessionExpired) => {
@@ -1240,6 +1326,20 @@ impl AstationClient {
             .map_err(|_| anyhow!("Terminal transport queue full or closed"))
     }
 
+    /// A session-family message as raw JSON: terminal-v1 ones on the bounded
+    /// terminal queue (in order with the frames), the rest on the control queue.
+    pub fn try_send_wire(&self, text: String, terminal: bool) -> Result<()> {
+        let outbound = OutboundMessage { message: AstationMessage::SessionWire(text), delivered: None };
+        if terminal {
+            return self.terminal_sender.as_ref().ok_or_else(|| anyhow!("Not connected"))?
+                .try_send(outbound)
+                .map_err(|_| anyhow!("Terminal transport queue full or closed"));
+        }
+        self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?
+            .send(outbound)
+            .map_err(|e| anyhow!("Failed to send message: {}", e))
+    }
+
     pub async fn send_message(&self, message: AstationMessage) -> Result<()> {
         if let AstationMessage::Terminal(envelope) = message {
             return self.try_send_terminal(envelope);
@@ -1269,18 +1369,42 @@ impl AstationClient {
 
     /// Best effort metadata; failure never prevents the user's command.
     pub async fn report_credential_projects(&self) -> Result<()> {
-        use crate::memory::key_agent::{blocking, running_agent, KeyAgentApi};
-        let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
-        crate::auth::pairing_session()
+        self.report_credential_projects_in(std::env::current_dir().ok()).await
+    }
+
+    /// `report_credential_projects` naming the Git project of `cwd`.
+    pub(crate) async fn report_credential_projects_in(&self, cwd: Option<std::path::PathBuf>) -> Result<()> {
+        // The binding first: nothing else is asked for a connection that has none.
+        self.capture.as_ref().ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?.bound()?;
+        crate::auth::pairing_session_in(&self.profile_sources()?)
             .map_err(|_| anyhow!("this machine isn't paired with an Astation"))?;
+        let agent = match &self.agent {
+            Some(agent) => agent.clone(),
+            None => crate::memory::key_agent::blocking(|| {
+                crate::memory::key_agent::running_agent().ok_or_else(|| anyhow!("key agent is not running"))
+            })
+            .await
+            .map(std::sync::Arc::from)?,
+        };
+        self.report_credential_projects_with(cwd, agent).await
+    }
+
+    /// The credential-project report signed by `agent` (`atem cred
+    /// projects` runs in the runtime, for the CLI's directory).
+    pub(crate) async fn report_credential_projects_with(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>,
+    ) -> Result<()> {
+        use crate::memory::key_agent::{blocking, KeyAgentApi};
+        let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
         // Signed only under the pairing this connection authenticated with.
         let capture = self.capture.clone().ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
         capture.bound()?;
         let report = blocking(move || {
-            let agent = running_agent().ok_or_else(|| anyhow!("key agent is not running"))?;
-            let agent = crate::pairing_binding::BoundAgent::new(capture, std::sync::Arc::from(agent))?;
+            let agent = crate::pairing_binding::BoundAgent::new(capture, agent)?;
             if !agent.status()?.unlocked { return Err(anyhow!("key agent is locked")); }
-            let project = std::env::current_dir().ok().and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.label);
+            let project = cwd.and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.label);
             agent.credential_projects(&astation_id, project)
         }).await?;
         self.send_message_flushed(AstationMessage::CredentialProjectListResponse { report }).await
@@ -1292,8 +1416,8 @@ impl AstationClient {
         &mut self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
-        use crate::memory::key_agent::{blocking, default_agent, running_agent, LOCKED};
-        use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied, KeyPaths};
+        use crate::memory::key_agent::{blocking, LOCKED};
+        use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied};
 
         if matches!(message, AstationMessage::CredentialProjectListRequest) {
             let _ = self.report_credential_projects().await;
@@ -1317,7 +1441,8 @@ impl AstationClient {
             self.hold_encryption(message.clone());
             return Ok(Some(HOLDING_ENCRYPTION.into()));
         };
-        let paths = KeyPaths::default_paths();
+        let paths = self.profile_sources()?.keys;
+        let agent = self.key_agent();
         let applied = match message {
             AstationMessage::EncryptionMode { account_state } => {
                 capture.apply(|| apply_account_state(&paths, &astation_id, account_state.as_ref()))?
@@ -1325,14 +1450,15 @@ impl AstationClient {
             AstationMessage::KeyGrant { grant } => {
                 // Grants are opened only inside the key agent (blocking socket I/O).
                 let (paths, astation_id, grant) = (paths.clone(), astation_id.clone(), grant.clone());
-                let capture = capture.clone();
-                blocking(move || capture.apply(|| apply_grant(&paths, default_agent().as_ref(), &astation_id, grant.as_ref()))).await?
+                let (capture, agent) = (capture.clone(), agent.clone());
+                blocking(move || capture.apply(|| apply_grant(&paths, agent.as_ref(), &astation_id, grant.as_ref()))).await?
             }
             _ => unreachable!("filtered above"),
         };
         let request_key = || async {
             // A grant can't be opened while the keys are locked: ask after `atem cred unlock`.
-            if !blocking(|| default_agent().status().map(|status| status.unlocked)).await? {
+            let status = agent.clone();
+            if !blocking(move || status.status().map(|status| status.unlocked)).await? {
                 return Ok(Some(format!("Encryption key needed, but {LOCKED}")));
             }
             // Astation answers only for the device key it pinned, so ask with exactly that one.
@@ -1347,8 +1473,8 @@ impl AstationClient {
         };
         // Asks the agent whether K for the signed kid is held (blocking socket I/O).
         let needs_key = || {
-            let (paths, astation_id) = (paths.clone(), astation_id.clone());
-            blocking(move || key_needed(&paths, default_agent().as_ref(), &astation_id))
+            let (paths, astation_id, agent) = (paths.clone(), astation_id.clone(), agent.clone());
+            blocking(move || key_needed(&paths, agent.as_ref(), &astation_id))
         };
         match applied {
             Applied::Ignored(reason) => Ok(Some(format!("Ignored {reason}"))),
@@ -1366,8 +1492,9 @@ impl AstationClient {
                     // A running, unlocked agent drops the account's keys now; a
                     // locked one does at its next unlock.
                     let astation = astation_id.clone();
+                    let running = self.running_key_agent();
                     blocking(move || {
-                        if let Some(agent) = running_agent() {
+                        if let Some(agent) = running {
                             let _ = agent.held_kid(&astation);
                         }
                         Ok(())
@@ -1429,17 +1556,40 @@ impl AstationClient {
         statuses
     }
 
+    /// Finishes this device's part of a pending migration of
+    /// `astation_id`'s account under the newest signed state (`atem cred
+    /// unlock` on an already unlocked device).
+    pub(crate) async fn finish_pending_migration(&self, astation_id: &str) -> Result<Option<String>> {
+        let trust = crate::memory::trust::TrustStore::load_from(&self.profile_sources()?.keys.trust)?;
+        let kid = crate::memory::verification::effective_state(&trust, astation_id)?
+            .and_then(|(_, state)| state).and_then(|state| state.kid);
+        self.finish_encryption_migration(astation_id, kid).await
+    }
+
+    /// Runs this device's part of a migration and reports it, one at a
+    /// time: the runtime's link skips one an operation is running (that
+    /// operation reports it); an operation waits for the link's.
     async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {
         self.check_capture()?;
-        let trust = crate::memory::trust::TrustStore::load_from(&crate::memory::verification::KeyPaths::default_paths().trust)?;
+        let _one = if self.is_op_view {
+            MIGRATION.lock().await
+        } else {
+            match MIGRATION.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return Ok(Some("An encryption migration is already running".into())),
+            }
+        };
+        let src = self.profile_sources()?;
+        let agent = self.key_agent();
+        let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust)?;
         let epoch = crate::memory::verification::effective_state(&trust, astation_id)?
             .and_then(|(_, state)| state).map(|state| state.epoch);
-        if let Some(target) = crate::memory::crypto::migrate_account(astation_id).await? {
+        if let Some(target) = crate::memory::crypto::migrate_account_in(astation_id, &src, agent.clone()).await? {
             let kid = kid.ok_or_else(|| anyhow!("encryption migration has no key id"))?;
             let (account, proof_kid) = (astation_id.to_string(), kid.clone());
             let epoch = epoch.ok_or_else(|| anyhow!("the signed migration state is missing"))?;
             let completion = crate::memory::key_agent::blocking(move ||
-                crate::memory::key_agent::default_agent().migration_completion(&account, epoch, target, &proof_kid)).await?;
+                agent.migration_completion(&account, epoch, target, &proof_kid)).await?;
             self.send_message_flushed(AstationMessage::EncryptionMigrationComplete { mode: target.to_string(), kid, completion }).await?;
             return Ok(Some(format!("Encryption migration complete; requesting {target}")));
         }
@@ -1492,20 +1642,6 @@ impl AstationClient {
         self.send_message(msg).await
     }
 
-    pub async fn send_voice_response(
-        &self,
-        session_id: &str,
-        success: bool,
-        message: &str,
-    ) -> Result<()> {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: session_id.to_string(),
-            success,
-            message: message.to_string(),
-        };
-        self.send_message(msg).await
-    }
-
     pub async fn send_visualize_result(
         &self,
         session_id: &str,
@@ -1522,31 +1658,6 @@ impl AstationClient {
         self.send_message(msg).await
     }
 
-    pub async fn send_command_response(
-        &self,
-        output: &str,
-        success: bool,
-    ) -> Result<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        let message = AstationMessage::CommandResponse {
-            output: output.to_string(),
-            success,
-            timestamp,
-        };
-        self.send_message(message).await
-    }
-
-    /// Reply to an `agentListRequest` with all currently registered agents.
-    pub async fn send_agent_list(
-        &self,
-        agents: Vec<crate::agent_client::AgentInfo>,
-    ) -> Result<()> {
-        self.send_message(AstationMessage::AgentListResponse { agents }).await
-    }
 
 
     /// Connect to Astation for pairing.
@@ -1752,12 +1863,13 @@ fn read_local_bootstrap_token() -> Option<String> {
     read_local_bootstrap_token_from(&path)
 }
 
-#[cfg(unix)]
+/// Used on macOS (the only Astation platform) and by tests.
+#[cfg(all(unix, any(target_os = "macos", test)))]
 fn read_local_bootstrap_token_from(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let mut file = fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -1859,6 +1971,7 @@ fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// A delayed success for a connection whose pairing was replaced (atem
     /// unpair, then atem pair) while the proof was out is not adopted: no
@@ -1944,7 +2057,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            socket.send(Message::Text(r#"{"type":"terminal","data":{"v":1,"op":"list"}}"#.into())).await.unwrap();
+            socket.send(Message::Text(r#"{"type":"terminal","data":{"v":1,"op":"subscribe","terminal_id":"ses-aaaaaaaaaaaa","generation":"g"}}"#.into())).await.unwrap();
             socket.close(None).await.unwrap();
         });
         let mut client = AstationClient::new();
@@ -1954,7 +2067,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
-        assert!(matches!(client.recv_message(), Some(AstationMessage::Terminal(_))));
+        assert!(matches!(client.recv_message(), Some(AstationMessage::SessionWire(text)) if text.contains("subscribe")));
         server.await.unwrap();
     }
 
@@ -1992,6 +2105,7 @@ mod tests {
 
     #[tokio::test]
     async fn encryption_messages_before_the_astation_identity_are_held_then_applied() {
+        let _profile = crate::test_profile::temp();
         // A pairing-code relay connection: no Astation identity yet.
         let mut pairing = AstationClient::new();
         let unsigned = AstationMessage::EncryptionMode { account_state: None };
@@ -2005,7 +2119,10 @@ mod tests {
         // through the same signature checks (unsigned here: ignored).
         let profile = tempfile::tempdir().unwrap();
         let capture = crate::pairing_binding::tests::bound_profile(profile.path(), "astation-1");
-        let mut authenticated = AstationClient::new();
+        let paths = capture.sources().keys.clone();
+        let mut authenticated = AstationClient::new()
+            .with_profile(capture.sources().clone())
+            .with_agent(std::sync::Arc::new(crate::memory::key_agent::test_agent(&paths)));
         authenticated.connected_astation_id = Some("astation-1".into());
         authenticated.set_capture_for_test(capture.clone());
         let held = pairing.take_held_encryption();
@@ -2859,26 +2976,6 @@ mod tests {
     }
 
     #[test]
-    fn command_response_roundtrip() {
-        let msg = AstationMessage::CommandResponse {
-            output: "hello world".into(),
-            success: true,
-            timestamp: "1000".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::CommandResponse {
-            output, success, ..
-        } = parsed
-        {
-            assert_eq!(output, "hello world");
-            assert!(success);
-        } else {
-            panic!("expected CommandResponse");
-        }
-    }
-
-    #[test]
     fn heartbeat_roundtrip() {
         let msg = AstationMessage::Heartbeat {
             timestamp: "555".into(),
@@ -2922,23 +3019,6 @@ mod tests {
             assert_eq!(status.projects, 5);
         } else {
             panic!("expected SystemStatusResponse");
-        }
-    }
-
-    #[test]
-    fn codex_task_request_without_context() {
-        let msg = AstationMessage::CodexTaskRequest {
-            prompt: "write a test".into(),
-            context: None,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(!json.contains("context"));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::CodexTaskRequest { prompt, context } = parsed {
-            assert_eq!(prompt, "write a test");
-            assert!(context.is_none());
-        } else {
-            panic!("expected CodexTaskRequest");
         }
     }
 
@@ -3006,214 +3086,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- VoiceToggle tests ---
-
     #[test]
-    fn voice_toggle_roundtrip() {
-        let msg = AstationMessage::VoiceToggle { active: true };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voice_toggle""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceToggle { active } = parsed {
-            assert!(active);
-        } else {
-            panic!("expected VoiceToggle");
-        }
-    }
-
-    #[test]
-    fn voice_toggle_false_roundtrip() {
-        let msg = AstationMessage::VoiceToggle { active: false };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceToggle { active } = parsed {
-            assert!(!active);
-        } else {
-            panic!("expected VoiceToggle");
-        }
-    }
-
-    #[test]
-    fn deserialize_voice_toggle_from_json() {
-        let json = r#"{"type":"voice_toggle","data":{"active":true}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceToggle { active } = msg {
-            assert!(active);
-        } else {
-            panic!("expected VoiceToggle");
-        }
-    }
-
-    // --- VideoToggle tests ---
-
-    #[test]
-    fn video_toggle_roundtrip() {
-        let msg = AstationMessage::VideoToggle { active: true };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"video_toggle""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VideoToggle { active } = parsed {
-            assert!(active);
-        } else {
-            panic!("expected VideoToggle");
-        }
-    }
-
-    #[test]
-    fn video_toggle_false_roundtrip() {
-        let msg = AstationMessage::VideoToggle { active: false };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VideoToggle { active } = parsed {
-            assert!(!active);
-        } else {
-            panic!("expected VideoToggle");
-        }
-    }
-
-    #[test]
-    fn deserialize_video_toggle_from_json() {
-        let json = r#"{"type":"video_toggle","data":{"active":false}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VideoToggle { active } = msg {
-            assert!(!active);
-        } else {
-            panic!("expected VideoToggle");
-        }
-    }
-
-    // --- AtemInstanceList tests ---
-
-    #[test]
-    fn atem_instance_list_roundtrip() {
-        let msg = AstationMessage::AtemInstanceList {
-            instances: vec![
-                AtemInstance {
-                    id: "inst-1".into(),
-                    hostname: "dev-laptop".into(),
-                    tag: "primary".into(),
-                    is_focused: true,
-                },
-                AtemInstance {
-                    id: "inst-2".into(),
-                    hostname: "build-server".into(),
-                    tag: "ci".into(),
-                    is_focused: false,
-                },
-            ],
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AtemInstanceList { instances } = parsed {
-            assert_eq!(instances.len(), 2);
-            assert_eq!(instances[0].id, "inst-1");
-            assert_eq!(instances[0].hostname, "dev-laptop");
-            assert_eq!(instances[0].tag, "primary");
-            assert!(instances[0].is_focused);
-            assert_eq!(instances[1].id, "inst-2");
-            assert!(!instances[1].is_focused);
-        } else {
-            panic!("expected AtemInstanceList");
-        }
-    }
-
-    #[test]
-    fn atem_instance_list_empty_roundtrip() {
-        let msg = AstationMessage::AtemInstanceList {
-            instances: vec![],
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AtemInstanceList { instances } = parsed {
-            assert!(instances.is_empty());
-        } else {
-            panic!("expected AtemInstanceList");
-        }
-    }
-
-    #[test]
-    fn deserialize_atem_instance_list_from_json() {
-        let json = "{\"type\": \"atem_instance_list\", \"data\": {\"instances\": [{\"id\": \"a1\", \"hostname\": \"host1\", \"tag\": \"dev\", \"is_focused\": true}]}}";
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::AtemInstanceList { instances } = msg {
-            assert_eq!(instances.len(), 1);
-            assert_eq!(instances[0].id, "a1");
-        } else {
-            panic!("expected AtemInstanceList");
-        }
-    }
-
-    #[test]
-    fn atem_instance_struct_serializes() {
-        let inst = AtemInstance {
-            id: "test-id".into(),
-            hostname: "my-host".into(),
-            tag: "main".into(),
-            is_focused: false,
-        };
-        let json = serde_json::to_string(&inst).unwrap();
-        assert!(json.contains("test-id"));
-        assert!(json.contains("my-host"));
-        assert!(json.contains("false"));
-    }
-
-    // --- VoiceCommand tests ---
-
-    #[test]
-    fn voice_command_roundtrip() {
-        let msg = AstationMessage::VoiceCommand {
-            text: "fix the login page".into(),
-            is_final: false,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voiceCommand""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = parsed {
-            assert_eq!(text, "fix the login page");
-            assert!(!is_final);
-        } else {
-            panic!("expected VoiceCommand");
-        }
-    }
-
-    #[test]
-    fn voice_command_final_roundtrip() {
-        let msg = AstationMessage::VoiceCommand {
-            text: "execute".into(),
-            is_final: true,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = parsed {
-            assert_eq!(text, "execute");
-            assert!(is_final);
-        } else {
-            panic!("expected VoiceCommand");
-        }
-    }
-
-    #[test]
-    fn deserialize_voice_command_from_json() {
-        let json = r#"{"type":"voiceCommand","data":{"text":"add a button","is_final":false}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = msg {
-            assert_eq!(text, "add a button");
-            assert!(!is_final);
-        } else {
-            panic!("expected VoiceCommand");
-        }
-    }
-
-    #[test]
-    fn deserialize_voice_command_without_is_final() {
-        // is_final should default to false when missing
-        let json = r#"{"type":"voiceCommand","data":{"text":"hello world"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceCommand { text, is_final } = msg {
-            assert_eq!(text, "hello world");
-            assert!(!is_final);
-        } else {
-            panic!("expected VoiceCommand");
+    fn removed_volume_video_and_instance_messages_do_not_parse() {
+        for json in [
+            r#"{"type":"volume_update","data":{"level":0.5}}"#,
+            r#"{"type":"video_toggle","data":{"active":true}}"#,
+            r#"{"type":"atem_instance_list","data":{"instances":[]}}"#,
+        ] {
+            assert!(serde_json::from_str::<AstationMessage>(json).is_err(), "{json}");
         }
     }
 
@@ -3281,194 +3161,7 @@ mod tests {
         }
     }
 
-    // --- UserCommand tests ---
-
-    #[test]
-    fn test_user_command_roundtrip() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "cli_input".to_string());
-        context.insert("source".to_string(), "voice".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "fix the bug".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "fix the bug");
-            assert_eq!(context.get("action").unwrap(), "cli_input");
-            assert_eq!(context.get("source").unwrap(), "voice");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_cli_input_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "cli_input".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "refactor the module".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "refactor the module");
-            assert_eq!(context.get("action").unwrap(), "cli_input");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_shell_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "shell".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "ls -la".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "ls -la");
-            assert_eq!(context.get("action").unwrap(), "shell");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_claude_input_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "claude_input".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "explain this code".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "explain this code");
-            assert_eq!(context.get("action").unwrap(), "claude_input");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_with_codex_input_action() {
-        let mut context = std::collections::HashMap::new();
-        context.insert("action".to_string(), "codex_input".to_string());
-        let msg = AstationMessage::UserCommand {
-            command: "write a test".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "write a test");
-            assert_eq!(context.get("action").unwrap(), "codex_input");
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
-    #[test]
-    fn test_user_command_empty_context() {
-        let context = std::collections::HashMap::new();
-        let msg = AstationMessage::UserCommand {
-            command: "hello".into(),
-            context,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::UserCommand { command, context } = parsed {
-            assert_eq!(command, "hello");
-            assert!(context.is_empty());
-        } else {
-            panic!("expected UserCommand");
-        }
-    }
-
     // ── Agent hub message tests ───────────────────────────────────────────
-
-    fn make_agent_info(id: &str) -> crate::agent_client::AgentInfo {
-        use crate::agent_client::{AgentKind, AgentOrigin, AgentProtocol, AgentStatus};
-        crate::agent_client::AgentInfo {
-            id: id.to_string(),
-            name: format!("agent-{id}"),
-            kind: AgentKind::ClaudeCode,
-            protocol: AgentProtocol::Pty,
-            origin: AgentOrigin::Launched,
-            status: AgentStatus::Idle,
-            session_ids: vec![],
-            acp_url: None,
-            pty_pid: Some(4242),
-            capabilities: vec![],
-        }
-    }
-
-    #[test]
-    fn agent_list_request_roundtrip() {
-        let msg = AstationMessage::AgentListRequest;
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"agentListRequest\""));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, AstationMessage::AgentListRequest));
-    }
-
-    #[test]
-    fn agent_list_response_roundtrip() {
-        let msg = AstationMessage::AgentListResponse {
-            agents: vec![make_agent_info("abc"), make_agent_info("def")],
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentListResponse { agents } = parsed {
-            assert_eq!(agents.len(), 2);
-            assert_eq!(agents[0].id, "abc");
-            assert_eq!(agents[1].id, "def");
-        } else {
-            panic!("expected AgentListResponse");
-        }
-    }
-
-    #[test]
-    fn agent_list_response_empty() {
-        let msg = AstationMessage::AgentListResponse { agents: vec![] };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentListResponse { agents } = parsed {
-            assert!(agents.is_empty());
-        } else {
-            panic!("expected AgentListResponse");
-        }
-    }
-
-    #[test]
-    fn agent_prompt_roundtrip() {
-        let msg = AstationMessage::AgentPrompt {
-            agent_id: "agent-1".into(),
-            session_id: "sess-1".into(),
-            text: "write a unit test".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentPrompt {
-            agent_id,
-            session_id,
-            text,
-        } = parsed
-        {
-            assert_eq!(agent_id, "agent-1");
-            assert_eq!(session_id, "sess-1");
-            assert_eq!(text, "write a unit test");
-        } else {
-            panic!("expected AgentPrompt");
-        }
-    }
 
     #[test]
     fn agent_event_text_delta_roundtrip() {
@@ -3516,42 +3209,6 @@ mod tests {
         assert!(inner["data"].is_null());
         let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, AstationMessage::AgentEventMsg { .. }));
-    }
-
-    #[test]
-    fn agent_status_update_roundtrip() {
-        use crate::agent_client::AgentStatus;
-        let msg = AstationMessage::AgentStatusUpdate {
-            agent_id: "agent-1".into(),
-            status: AgentStatus::Thinking,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentStatusUpdate { agent_id, status } = parsed {
-            assert_eq!(agent_id, "agent-1");
-            assert_eq!(status, AgentStatus::Thinking);
-        } else {
-            panic!("expected AgentStatusUpdate");
-        }
-    }
-
-    #[test]
-    fn agent_list_response_preserves_all_info_fields() {
-        let info = make_agent_info("test-id");
-        let msg = AstationMessage::AgentListResponse {
-            agents: vec![info],
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::AgentListResponse { agents } = parsed {
-            let a = &agents[0];
-            assert_eq!(a.id, "test-id");
-            assert_eq!(a.protocol, crate::agent_client::AgentProtocol::Pty);
-            assert!(a.acp_url.is_none());
-            assert_eq!(a.pty_pid, Some(4242));
-        } else {
-            panic!("expected AgentListResponse");
-        }
     }
 
     #[test]
@@ -3623,167 +3280,6 @@ mod tests {
         match msg {
             AstationMessage::CredentialSync { login_id, .. } => assert!(login_id.is_none()),
             _ => panic!("expected CredentialSync"),
-        }
-    }
-
-    // ── VoiceRequest / VoiceResponse tests ─────────────────────────────
-
-    #[test]
-    fn voice_request_deserialize() {
-        let json = r#"{"type":"voiceRequest","data":{"session_id":"sess-abc","accumulated_text":"fix the login bug","relay_url":"https://station.agora.build"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceRequest {
-            session_id,
-            accumulated_text,
-            relay_url,
-        } = msg
-        {
-            assert_eq!(session_id, "sess-abc");
-            assert_eq!(accumulated_text, "fix the login bug");
-            assert_eq!(relay_url, "https://station.agora.build");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_request_roundtrip() {
-        let msg = AstationMessage::VoiceRequest {
-            session_id: "sess-1".into(),
-            accumulated_text: "add a button".into(),
-            relay_url: "https://relay.example.com".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voiceRequest""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceRequest {
-            session_id,
-            accumulated_text,
-            relay_url,
-        } = parsed
-        {
-            assert_eq!(session_id, "sess-1");
-            assert_eq!(accumulated_text, "add a button");
-            assert_eq!(relay_url, "https://relay.example.com");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_response_serialize() {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: "sess-1".into(),
-            success: true,
-            message: "Response delivered".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"voiceResponse""#));
-        assert!(json.contains(r#""session_id":"sess-1""#));
-        assert!(json.contains(r#""success":true"#));
-        assert!(json.contains("Response delivered"));
-    }
-
-    #[test]
-    fn voice_response_roundtrip() {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: "sess-2".into(),
-            success: false,
-            message: "Claude timeout".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceResponse {
-            session_id,
-            success,
-            message,
-        } = parsed
-        {
-            assert_eq!(session_id, "sess-2");
-            assert!(!success);
-            assert_eq!(message, "Claude timeout");
-        } else {
-            panic!("expected VoiceResponse");
-        }
-    }
-
-    #[test]
-    fn voice_request_empty_text() {
-        let msg = AstationMessage::VoiceRequest {
-            session_id: "sess-empty".into(),
-            accumulated_text: "".into(),
-            relay_url: "https://relay.example.com".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceRequest { accumulated_text, .. } = parsed {
-            assert_eq!(accumulated_text, "");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_request_special_characters() {
-        let msg = AstationMessage::VoiceRequest {
-            session_id: "sess-special".into(),
-            accumulated_text: "create a fn that returns \"hello\" with 100% accuracy & <b>tags</b>".into(),
-            relay_url: "https://relay.example.com/path?key=val&other=1".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceRequest { accumulated_text, relay_url, .. } = parsed {
-            assert!(accumulated_text.contains("\"hello\""));
-            assert!(accumulated_text.contains("100%"));
-            assert!(accumulated_text.contains("<b>tags</b>"));
-            assert!(relay_url.contains("key=val&other=1"));
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_response_success_true() {
-        let msg = AstationMessage::VoiceResponse {
-            session_id: "sess-ok".into(),
-            success: true,
-            message: "Response delivered to relay".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        if let AstationMessage::VoiceResponse { success, message, .. } = parsed {
-            assert!(success);
-            assert_eq!(message, "Response delivered to relay");
-        } else {
-            panic!("expected VoiceResponse");
-        }
-    }
-
-    #[test]
-    fn voice_request_wire_format_field_names() {
-        // Verify the exact wire format field names match what Astation Swift sends
-        let json = r#"{"type":"voiceRequest","data":{"session_id":"s1","accumulated_text":"hello","relay_url":"https://r.test"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceRequest { session_id, accumulated_text, relay_url } = msg {
-            assert_eq!(session_id, "s1");
-            assert_eq!(accumulated_text, "hello");
-            assert_eq!(relay_url, "https://r.test");
-        } else {
-            panic!("expected VoiceRequest");
-        }
-    }
-
-    #[test]
-    fn voice_response_wire_format_field_names() {
-        // Verify the exact wire format field names match what Atem Rust sends
-        let json = r#"{"type":"voiceResponse","data":{"session_id":"s1","success":true,"message":"ok"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        if let AstationMessage::VoiceResponse { session_id, success, message } = msg {
-            assert_eq!(session_id, "s1");
-            assert!(success);
-            assert_eq!(message, "ok");
-        } else {
-            panic!("expected VoiceResponse");
         }
     }
 
@@ -3956,57 +3452,6 @@ mod tests {
         assert!(json.contains(r#""type":"pairSavePreference""#));
         let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
         matches!(parsed, AstationMessage::PairSavePreference { save_credentials: true });
-    }
-
-    // --- AgentInput (remote agent control) ---
-
-    #[test]
-    fn agent_input_text_deserializes_from_astation_wire() {
-        // Exact shape sent by Astation's sendAgentText (key omitted).
-        let json = r#"{"type":"agentInput","data":{"agentId":"a1","kind":"text","text":"refactor auth"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            AstationMessage::AgentInput { agent_id, kind, text, key } => {
-                assert_eq!(agent_id.as_deref(), Some("a1"));
-                assert_eq!(kind, "text");
-                assert_eq!(text.as_deref(), Some("refactor auth"));
-                assert_eq!(key, None);
-            }
-            _ => panic!("expected AgentInput"),
-        }
-    }
-
-    #[test]
-    fn agent_input_key_deserializes_without_agent_id() {
-        // sendAgentKey with agentId omitted (v1 focused-agent default).
-        let json = r#"{"type":"agentInput","data":{"kind":"key","key":"ctrl-c"}}"#;
-        let msg: AstationMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            AstationMessage::AgentInput { agent_id, kind, text, key } => {
-                assert_eq!(agent_id, None);
-                assert_eq!(kind, "key");
-                assert_eq!(text, None);
-                assert_eq!(key.as_deref(), Some("ctrl-c"));
-            }
-            _ => panic!("expected AgentInput"),
-        }
-    }
-
-    #[test]
-    fn agent_input_roundtrips() {
-        let msg = AstationMessage::AgentInput {
-            agent_id: None,
-            kind: "text".into(),
-            text: Some("hi".into()),
-            key: None,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"agentInput""#));
-        // nil fields are omitted on the wire
-        assert!(!json.contains("agentId"));
-        assert!(!json.contains("\"key\""));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        matches!(parsed, AstationMessage::AgentInput { .. });
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # Voice-Driven Coding Implementation Stages
 
+> **Status:** the Atem side (`VoiceRequest`/`VoiceResponse`, `voiceCommand`, `voice_toggle` prompts) is removed in atem-session r6; see designs/protocol/atem-session-v1.md.
+
 ## Overview
 
 Implementation of Agora ConvoAI-based voice coding system with smart buffering.
@@ -222,6 +224,8 @@ Sources/Menubar/JoinChannelWindowController.swift (modify)
 ---
 
 ## ✅ Stage 3: Atem Integration (COMPLETED)
+
+> **Status:** Removed in atem-session r6; see designs/protocol/atem-session-v1.md.
 
 **Status:** Done: `VoiceRequest` / `VoiceResponse` in `src/websocket_client.rs`, handled in `src/app.rs`
 **Duration:** ~1 day

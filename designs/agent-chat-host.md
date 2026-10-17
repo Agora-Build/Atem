@@ -27,11 +27,26 @@ no `chat-v1` capability.
 
 - **One source of content:** the agent's own session log (Claude's
   transcript). Agent events (Claude's hooks) only mark the lifecycle. Atem never scrapes the terminal screen and never infers that a
-  turn is done or waiting from silence.
+  turn is done or waiting from silence. **Hooks never decide** — with one
+  exception: the `PermissionRequest` hook hands Claude a decision that a
+  person made on a card in Astation for that exact prompt. It never allows
+  anything by itself.
 - **The original session stays.** Atem keeps using the interactive Claude CLI
   it launched; chat never starts another Claude process or session.
-- **No approvals from chat.** Tool permission requests are answered in the
-  terminal; chat only shows `waiting`.
+- **Approvals bound to the exact prompt** (since 2026-10-16, contract
+  [§6a](protocol/atem-session-v1.md)). A permission request appears as an
+  approval card in the conversations of attachments with `control` (never a
+  view-only one); answering it — allow once, always allow with one of the
+  rules Claude itself suggested, or deny with an optional message — is an
+  `approval` submission bound to that one prompt and process, under the
+  current lease or taking it with `acquire: true`. The terminal can always
+  answer instead (first answer wins), and anything else — a failure, a
+  timeout, nobody answering — is "no decision": Claude asks in its own
+  dialog. `[claude] approvals_hook = false` in Atem's config.toml (default
+  on, never asked) turns the hook off for later launches; the chat hooks
+  stay. Approvals pending before a broker restart or adoption are released
+  without `push_resolved`: a phone notification may linger until its
+  `expires_at`, and a tap gets `stale_target` ("already answered").
 - **Never merge with a local draft.** A chat prompt is refused when anyone
   typed into the terminal since Claude's last turn ended.
 - **Never resend.** A prompt whose delivery is unknown is reported, not retried.
@@ -86,7 +101,7 @@ its tests; the wire and the clients don't change.
 | `src/chat/claude/transcript.rs` | Claude: follows the transcript and turns entries into `LogItem`s (below) |
 | `src/chat/session.rs` | Shared per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records; agent-neutral |
 | `src/chat/wire.rs` | `agentChat` v1 messages to and from Astation: encoding, decoding, validation |
-| `src/agent_registry.rs` | Status from `session.rs`; `capabilities: ["chat-v1"]` only when the agent's adapter reports it (v1: Claude with active hooks) |
+| `src/runtime/` (session-v1 descriptor; `agent_registry.rs` was removed) | Status from `session.rs` as the session's `activity`; chat-v1 advertised only when the agent's adapter reports it (v1: Claude with active hooks) |
 
 All of it lives in the Atem process that owns the terminal; there is no new
 daemon. Chat state belongs to the agent session, not to a browser connection:
@@ -104,7 +119,8 @@ chat page is open.
    holding:
    - `settings.json` (0600): hooks for `SessionStart`, `UserPromptSubmit`,
      `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, each running the
-     event-file command below;
+     event-file command below, and the approval hook (`PermissionRequest`,
+     plus a `PostToolUse` note) unless `[claude] approvals_hook = false`;
    - `events/` (0700): one file per hook event;
    - `pid` (0600): the Atem process id. The first chat an Atem process prepares
      removes `chat-*` directories under the same root whose `pid` names a
@@ -203,7 +219,7 @@ them as follows:
 | Claude source | Status |
 |---|---|
 | `UserPromptSubmit`, `PreToolUse` | `working` |
-| `Notification` asking for permission | `waiting` ("approve in the terminal") |
+| `Notification` asking for permission | `waiting` (approve on the card or in the terminal) |
 | `Stop` | `ready` (and `complete`, below) |
 | `SessionStart` `startup`/`clear`, or a different transcript | `ready`; the draft mark is reset |
 | `SessionStart` `compact`/`resume` on the transcript being read (or any `SessionStart` on it while a turn is in progress) | unchanged: the turn, a prompt waiting for acceptance and the draft mark stay |
@@ -214,9 +230,9 @@ them as follows:
 Every status carries `since` (time of the event that set it). Every 15 s Atem
 re-sends the current state with its original `since`; it never invents a new
 state. A long `working` stays `working` and `since` shows how long.
-`AgentRegistry` status uses the same state (`ready`→`Idle`,
-`working`→`Thinking`, `waiting`→`WaitingForInput`, plus `Unknown`), replacing
-today's hard-coded `Idle`.
+The session-v1 descriptor's `activity` (and `STATUS` in `atem agent list`)
+uses the same state (`ready`, `working`, `waiting`, `unknown`); the former
+`AgentRegistry` and its hard-coded `Idle` are removed.
 
 `complete` means **Claude's execution turn has ended** (by `Stop`,
 `end_turn` or an interrupt). It does not promise that no more transcript
@@ -266,7 +282,10 @@ message {
   requestId?,         // on user messages with origin "remote", and on the
                       // assistant messages and `complete` of that turn
   createdAt,          // RFC 3339 / unix ms, from the transcript
-  parts: [ { id, kind: "text", markdown } | { id, kind: "tool", name, summary } ],
+  parts: [ { id, kind: "text", markdown } | { id, kind: "tool", name, summary }
+         | { id: "approval", kind: "approval", approval_id, tool, summary,
+             always_rules: [{rule_id, label, scope}],
+             state: pending|allowed|always_allowed|denied|answered_terminal|expired|closed } ],
   history?: true      // backfill on open / page
 }
 delta { messageId, part: { id, kind, … } }   // append one part; a part id
@@ -278,6 +297,10 @@ delta { messageId, part: { id, kind, … } }   // append one part; a part id
 - IDs never change, so clients can cache messages and merge updates.
 - History never replays deltas: each message is sent whole with all its parts
   so far; clients replace what they had.
+- An approval card is an assistant message `approval-<approval_id>`; when its
+  state changes the whole message is sent again with the same `messageId`
+  (replace it). A chat `submit` with `approval` (the §6a payload) instead of
+  `text` answers it; its binding has no `lease_epoch` when `acquire` is true.
 - `waiting` and `complete` are the events a mobile app can turn into push
   notifications (delivery is Astation's/the app's concern).
 
@@ -324,6 +347,11 @@ on the existing authenticated Astation connection.
   boundary is that account: a process running as the user could forge an event
   file; that can mislabel status but cannot approve a tool, type input or read
   anything, and acceptance additionally needs the transcript's own user entry.
+  Approval decisions go the other way (Atem writes them for the hook in the
+  session's `approvals/` directory, 0700) and only for a prompt the hook
+  reported. A same-user process that can see `ATEM_APPROVAL_DIR` can forge
+  a request file: the result is a fake card, never an agent action
+  (same-user attackers are out of scope).
   Event files can hold tool input (file contents); they stay in the private
   directory and are deleted as soon as they are read.
 - Outgoing text and tool summaries pass Atem's credential detector
@@ -387,6 +415,8 @@ Additive to `mem_b3ccce1f`:
 
 ## Out of scope (v1)
 
-Adapters other than Claude Code (Codex next, as its own design); approvals from chat; streaming token-by-token (the transcript
-holds whole content blocks); end-to-end encryption of chat; push delivery;
-attachments/images.
+Adapters other than Claude Code (Codex next, as its own design; Codex
+approvals already work through its hook, without chat); streaming
+token-by-token (the transcript holds whole content blocks); end-to-end
+encryption of chat; push delivery of chat messages (approvals ask the relay
+to push, §6a); attachments/images.

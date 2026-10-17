@@ -1,6 +1,9 @@
+#[cfg(test)]
 use crate::pty_session;
+#[cfg(test)]
 use anyhow::Result;
-pub type CodexResizeHandle = pty_session::PtyHandle;
+use std::ffi::OsString;
+#[cfg(test)]
 pub type CodexSession = pty_session::PtySession;
 
 #[derive(Clone, Debug)]
@@ -10,31 +13,41 @@ pub struct CodexClient {
 }
 
 impl CodexClient {
+    /// From Atem's own environment (`CODEX_CLI_BIN`, `CODEX_CLI_ARGS`).
     pub fn new() -> Self {
-        let binary = std::env::var("CODEX_CLI_BIN").unwrap_or_else(|_| "codex".to_string());
-        let extra_args = std::env::var("CODEX_CLI_ARGS")
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    /// From a launch environment instead of Atem's own.
+    pub fn from_env(env: &[(OsString, OsString)]) -> Self {
+        Self::from_vars(|name| {
+            env.iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .and_then(|(_, value)| value.to_str().map(str::to_string))
+        })
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let binary = var("CODEX_CLI_BIN").unwrap_or_else(|| "codex".to_string());
+        let extra_args = var("CODEX_CLI_ARGS")
             .map(|raw| raw.split_whitespace().map(|s| s.to_string()).collect())
             .unwrap_or_default();
-
         Self { binary, extra_args }
     }
 
-    pub fn append_launch_args(&mut self, args: &[String]) {
-        self.extra_args.extend_from_slice(args);
-    }
-
+    #[cfg(test)]
     pub async fn start_session(&self) -> Result<CodexSession> {
         pty_session::spawn(&self.binary, &self.extra_args)
     }
 
-    pub async fn start_session_sized(&self, rows: u16, cols: u16) -> Result<CodexSession> {
-        pty_session::spawn_sized(&self.binary, &self.extra_args, rows, cols)
+    pub fn binary(&self) -> &str {
+        &self.binary
     }
 
-    #[cfg(test)]
-    pub fn set_command_for_test(&mut self, binary: String, args: Vec<String>) {
-        self.binary = binary;
-        self.extra_args = args;
+    /// The arguments every spawn gets first (`CODEX_CLI_ARGS`, then appended ones).
+    pub fn launch_args(&self) -> &[String] {
+        &self.extra_args
     }
 }
 
@@ -50,6 +63,26 @@ mod tests {
         };
         assert_eq!(client.binary, "my-codex");
         assert_eq!(client.extra_args, vec!["-n", "hello"]);
+    }
+
+    #[test]
+    fn a_launch_environment_sets_binary_and_default_arguments() {
+        let env = [
+            (
+                OsString::from("CODEX_CLI_BIN"),
+                OsString::from("/opt/agent"),
+            ),
+            (
+                OsString::from("CODEX_CLI_ARGS"),
+                OsString::from(" --a  --b "),
+            ),
+        ];
+        let client = CodexClient::from_env(&env);
+        assert_eq!(client.binary(), "/opt/agent");
+        assert_eq!(client.launch_args(), ["--a", "--b"]);
+        let client = CodexClient::from_env(&[]);
+        assert_eq!(client.binary(), "codex");
+        assert!(client.launch_args().is_empty());
     }
 
     #[test]
@@ -92,7 +125,7 @@ mod tests {
         };
         let mut session = client.start_session().await.unwrap();
 
-        session.sender.send("codex_ping\n".to_string()).unwrap();
+        session.sender.respond(b"codex_ping\n".to_vec()).unwrap();
 
         let mut combined = String::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);

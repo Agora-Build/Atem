@@ -167,7 +167,6 @@ pub struct State {
     pub viewport: (u16, u16),
     pub feedback: Option<(String, std::time::Instant)>,
     pub messages: VecDeque<String>,
-    last_status: Option<String>,
 }
 
 impl State {
@@ -183,7 +182,6 @@ impl State {
             viewport: (0, 0),
             feedback: None,
             messages: VecDeque::new(),
-            last_status: None,
         };
         if let Some(raw) = prefix {
             if let Some(prefix) = Prefix::parse(raw) {
@@ -205,15 +203,6 @@ impl State {
             self.messages.pop_front();
         }
         self.messages.push_back(message);
-    }
-
-    pub fn observe_status(&mut self, status: &Option<String>) {
-        if self.last_status != *status {
-            self.last_status = status.clone();
-            if let Some(message) = status.as_ref().filter(|s| !s.is_empty()) {
-                self.record(message.clone());
-            }
-        }
     }
 
     pub fn reset_view(&mut self) {

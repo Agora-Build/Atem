@@ -2432,6 +2432,7 @@ mod tests {
 
     #[test]
     fn html_emits_toml_default_constants() {
+        let _profile = crate::test_profile::temp();
         // ResolvedConfig with HIPAA on + geofence + encryption set →
         // page should bake the defaults into JS constants the form
         // pre-fill code reads on DOMContentLoaded.
@@ -2467,6 +2468,7 @@ mod tests {
 
     #[test]
     fn html_attach_mode_flag_propagates() {
+        let _profile = crate::test_profile::temp();
         let resolved = ResolvedConfig {
             channel: "c".into(), rtc_user_id: "1".into(), agent_user_id: "2".into(),
             idle_timeout_secs: None, avatar_configured: false, avatar_summary: None,
@@ -2523,6 +2525,7 @@ mod tests {
 
     #[test]
     fn default_config_path_ends_with_convo_toml() {
+        let _profile = crate::test_profile::temp();
         let p = default_config_path();
         assert!(p.ends_with("convo.toml"));
     }
@@ -2564,6 +2567,7 @@ mod tests {
 
     #[test]
     fn html_has_expected_ids_and_scripts() {
+        let _profile = crate::test_profile::temp();
         let resolved = ResolvedConfig {
             channel:           "chan".into(),
             rtc_user_id:       "42".into(),
@@ -2599,6 +2603,7 @@ mod tests {
 
     #[test]
     fn html_embeds_preset_list_as_js_array() {
+        let _profile = crate::test_profile::temp();
         let resolved = ResolvedConfig {
             channel:           "c".into(),
             rtc_user_id:       "1".into(),

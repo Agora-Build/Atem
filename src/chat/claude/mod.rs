@@ -29,6 +29,8 @@ pub struct ClaudeAdapter {
     started_at: Instant,
     session_started: bool,
     withdrawn: Option<String>,
+    /// The launch registers the approval hook (`[claude] approvals_hook`).
+    approvals: bool,
 }
 
 impl ClaudeAdapter {
@@ -43,12 +45,34 @@ impl ClaudeAdapter {
             started_at: Instant::now(),
             session_started: false,
             withdrawn: None,
+            approvals: true,
         }
     }
 
-    #[cfg(test)]
+    /// The chat directory (also the approvals' session directory).
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
+    }
+}
+
+/// A new chat directory under `root` and the arguments Claude needs for it
+/// (put before the launch arguments `args`), with the approval hook when
+/// `approvals`. On failure nothing is left behind.
+pub fn prepare_chat(
+    root: &Path,
+    args: &[String],
+    approvals: bool,
+) -> anyhow::Result<(ClaudeAdapter, Vec<String>)> {
+    let dir = hooks::create_session_dir(root)?;
+    let mut adapter = ClaudeAdapter::new();
+    adapter.approvals = approvals;
+    match adapter.prepare_launch(args, &dir) {
+        Ok(plan) => Ok((adapter, plan.extra_args)),
+        Err(error) => {
+            drop(adapter);
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(error)
+        }
     }
 }
 
@@ -92,7 +116,7 @@ impl AgentAdapter for ClaudeAdapter {
         if !named || !dir.join("events").is_dir() {
             anyhow::bail!("not a chat session directory: {}", dir.display());
         }
-        let settings = hooks::write_settings(dir)?;
+        let settings = hooks::write_settings(dir, self.approvals)?;
         self.dir = Some(dir.to_path_buf());
         self.events = Some(EventReader::new(dir.to_path_buf()));
         self.started_at = Instant::now();

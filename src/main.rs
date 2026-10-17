@@ -9,6 +9,7 @@ mod claude_client;
 mod cli;
 mod codex_client;
 mod pty_session;
+mod session;
 mod terminal_share;
 mod terminal_keys;
 mod diagnostics;
@@ -18,7 +19,6 @@ mod convo_test_server;
 mod convo_wizard;
 mod credentials;
 mod repl;
-mod rtm_client;
 mod time_sync;
 mod token;
 mod tui;
@@ -28,11 +28,16 @@ mod pair_verify;
 mod pairing_binding;
 mod status;
 mod chat;
+mod daemon;
+mod runtime;
 mod session_protocol;
+#[cfg(test)]
+mod test_profile;
+// Agora RTM client: kept but unused for now (voice coding was removed in atem-session r6).
+#[allow(dead_code)]
+mod rtm_client;
 mod websocket_client;
-// Agent hub — PTY agents launched by `atem agent launch`
-mod agent_client;
-mod agent_registry;
+// Agent status on the Astation wire
 // Shared HTTPS scaffolding
 mod web_server;
 // RTC test server

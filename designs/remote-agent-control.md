@@ -1,5 +1,14 @@
 # Remote Agent Control (Astation → atem → claude/codex)
 
+> **Status note (2026-10-16):** superseded for remote control by
+> [atem-session v1 r6](protocol/atem-session-v1.md) and the runtime host
+> (`src/runtime/host_bridge.rs`, plan
+> [runtime host integration](plans/2026-10-16-runtime-host-integration.md)):
+> only `atem runtime` serves sessions remotely; terminal-v1 and chat-v1 are
+> bound to session-v1 targets and leases (`control`, `list`, `lease_id`,
+> provider ids and the agent list are removed), and sessions outlive the
+> frontend in `atem worker`s. The plain TUI refuses remote session messages.
+
 Status: legacy focused-PTY input plus initial terminal-v1 host implementation; Astation terminal UI pending
 Owner: Brent G
 Updated: 2026-10-13
@@ -127,6 +136,8 @@ user sends:
 
 Output: the user watches atem's terminal directly. No down lane.
 
+> **Status:** `agentInput`, `agentPrompt`, `voiceRequest`/`voiceCommand`/`voiceResponse` and `userCommand`/`commandResponse` described below are removed from Atem. Removed in atem-session r6; see designs/protocol/atem-session-v1.md.
+
 ### Current implementation and remaining scope (v1)
 
 | Capability | Status |
@@ -136,6 +147,8 @@ Output: the user watches atem's terminal directly. No down lane.
 | Text instruction → agent stdin | **implemented** in Atem (`agentInput{kind:text}`), focused PTY only |
 | Control keys → agent PTY | **implemented** in Atem (`agentInput{kind:key}`), focused PTY only |
 | `agent_id` (multiple agents per atem) | Field exists, but `handle_agent_input` ignores it; explicit multi-agent routing remains future work |
+
+> **Status:** Removed in atem-session r6; see designs/protocol/atem-session-v1.md (`agentInput`, `agentPrompt`, voice and `userCommand` messages).
 
 ### Message protocol
 
@@ -187,6 +200,8 @@ Existing generic/voice feedback uses `commandResponse`, `voiceResponse`, and
 `handle_agent_input` currently sets local status after enqueueing input; it
 does not provide a correlated remote accepted/written acknowledgement. The
 acknowledgement contract below is proposed.
+
+> **Status:** `handle_agent_input`/`agent_key_to_bytes` are removed. Removed in atem-session r6; see designs/protocol/atem-session-v1.md.
 
 ### Injection semantics (atem side)
 

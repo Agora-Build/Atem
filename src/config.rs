@@ -126,20 +126,19 @@ impl AtemConfig {
     /// Merge a single top-level key into `config.toml`, preserving other keys.
     /// Best-effort: silently no-ops on IO/parse failure.
     fn write_config_value(key: &str, value: toml::Value) {
-        let path = Self::config_path();
-        let mut existing = fs::read_to_string(&path)
-            .ok()
-            .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
-            .unwrap_or_else(|| toml::Value::Table(Default::default()));
-        if let Some(table) = existing.as_table_mut() {
+        Self::write_config_value_at(&Self::config_path(), key, value);
+    }
+
+    /// `write_config_value` for the `config.toml` at `path`.
+    fn write_config_value_at(path: &std::path::Path, key: &str, value: toml::Value) {
+        let _ = edit_config_file(path, |text| {
+            let mut existing = toml::from_str::<toml::Value>(text)?;
+            let table = existing
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("not a TOML table"))?;
             table.insert(key.into(), value);
-            if let Some(dir) = path.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            if let Ok(content) = toml::to_string_pretty(&existing) {
-                let _ = fs::write(&path, content);
-            }
-        }
+            Ok(toml::to_string_pretty(&existing)?)
+        });
     }
 
     /// Merge a single top-level string key into `config.toml`.
@@ -193,6 +192,15 @@ impl AtemConfig {
         Self::write_config_string("astation_relay_code", astation_id);
     }
 
+    /// `store_astation_relay_code` into the profile in `config_dir`.
+    pub fn store_astation_relay_code_in(config_dir: &std::path::Path, astation_id: &str) {
+        Self::write_config_value_at(
+            &config_dir.join("config.toml"),
+            "astation_relay_code",
+            toml::Value::String(astation_id.to_string()),
+        );
+    }
+
     /// Persist the config to disk.
     ///
     /// Non-sensitive settings → `~/.config/atem/config.toml` (plaintext)
@@ -203,59 +211,59 @@ impl AtemConfig {
             .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
 
         // Load existing config.toml so we don't clobber other keys
-        let mut existing = if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            toml::from_str::<toml::Value>(&content).unwrap_or(toml::Value::Table(Default::default()))
-        } else {
-            toml::Value::Table(Default::default())
-        };
+        edit_config_file(&path, |content| {
+            let mut existing = toml::from_str::<toml::Value>(content)
+                .unwrap_or(toml::Value::Table(Default::default()));
 
-        let table = existing.as_table_mut().expect("config is a TOML table");
+            let table = existing.as_table_mut().expect("config is a TOML table");
 
-        // Write non-sensitive settings
-        if let Some(ch) = &self.rtm_channel {
-            table.insert("rtm_channel".into(), toml::Value::String(ch.clone()));
-        }
-        if let Some(acc) = &self.rtm_account {
-            table.insert("rtm_account".into(), toml::Value::String(acc.clone()));
-        }
-        if let Some(ws) = &self.astation_ws {
-            table.insert("astation_ws".into(), toml::Value::String(ws.clone()));
-        }
-        if let Some(relay) = &self.astation_relay_url {
-            table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
-        }
-        if let Some(code) = &self.astation_relay_code {
-            table.insert("astation_relay_code".into(), toml::Value::String(code.clone()));
-        }
-        if let Some(bff) = &self.bff_url {
-            table.insert("bff_url".into(), toml::Value::String(bff.clone()));
-        }
-        if let Some(sso) = &self.sso_url {
-            table.insert("sso_url".into(), toml::Value::String(sso.clone()));
-        }
-        if let Some(id) = &self.instance_id {
-            table.insert("instance_id".into(), toml::Value::String(id.clone()));
-        }
-        if let Some(id) = &self.atem_id {
-            table.insert("atem_id".into(), toml::Value::String(id.clone()));
-        }
-        if self.bff_url.is_none() {
-            table.remove("bff_url");
-        }
-        if self.sso_url.is_none() {
-            table.remove("sso_url");
-        }
+            // Write non-sensitive settings
+            if let Some(ch) = &self.rtm_channel {
+                table.insert("rtm_channel".into(), toml::Value::String(ch.clone()));
+            }
+            if let Some(acc) = &self.rtm_account {
+                table.insert("rtm_account".into(), toml::Value::String(acc.clone()));
+            }
+            if let Some(ws) = &self.astation_ws {
+                table.insert("astation_ws".into(), toml::Value::String(ws.clone()));
+            }
+            if let Some(relay) = &self.astation_relay_url {
+                table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
+            }
+            if let Some(code) = &self.astation_relay_code {
+                table.insert("astation_relay_code".into(), toml::Value::String(code.clone()));
+            }
+            if let Some(bff) = &self.bff_url {
+                table.insert("bff_url".into(), toml::Value::String(bff.clone()));
+            }
+            if let Some(sso) = &self.sso_url {
+                table.insert("sso_url".into(), toml::Value::String(sso.clone()));
+            }
+            if let Some(id) = &self.instance_id {
+                table.insert("instance_id".into(), toml::Value::String(id.clone()));
+            }
+            if let Some(id) = &self.atem_id {
+                table.insert("atem_id".into(), toml::Value::String(id.clone()));
+            }
+            if self.bff_url.is_none() {
+                table.remove("bff_url");
+            }
+            if self.sso_url.is_none() {
+                table.remove("sso_url");
+            }
 
-        let content = toml::to_string_pretty(&existing)
-            .with_context(|| "Failed to serialize config")?;
-        fs::write(&path, content)
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+            toml::to_string_pretty(&existing).with_context(|| "Failed to serialize config")
+        })
+        .with_context(|| format!("Failed to write config file: {}", path.display()))?;
         Ok(())
     }
 
     /// Get the config directory path: ~/.config/atem/ (same on all platforms)
     pub fn config_dir() -> PathBuf {
+        // Tests never reach the real profile (src/test_profile.rs).
+        #[cfg(test)]
+        return crate::test_profile::dir();
+        #[cfg(not(test))]
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".config")
@@ -384,11 +392,13 @@ impl AtemConfig {
     }
 
     /// Get RTM channel with fallback default
+    #[allow(dead_code, reason = "RTM is kept but unused for now")]
     pub fn rtm_channel(&self) -> &str {
         self.rtm_channel.as_deref().unwrap_or("atem_channel")
     }
 
     /// Get RTM account with fallback default
+    #[allow(dead_code, reason = "RTM is kept but unused for now")]
     pub fn rtm_account(&self) -> &str {
         self.rtm_account.as_deref().unwrap_or("atem01")
     }
@@ -688,14 +698,19 @@ impl crate::auth::AuthSession {
 
     /// Load saved session from disk. Returns None if not found.
     pub fn load_saved() -> Option<Self> {
-        let path = Self::session_path();
+        Self::load_saved_from(&Self::session_path())
+    }
+
+    /// `load_saved` from `path`.
+    pub fn load_saved_from(path: &std::path::Path) -> Option<Self> {
+        let path = path.to_path_buf();
         let content = crate::auth::read_private_file(&path).ok()??;
         serde_json::from_slice(&content).ok()
     }
 
-    /// Save session to disk.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::session_path();
+    /// Save session to `path`.
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        let path = path.to_path_buf();
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir)?;
         crate::auth::set_private_directory_permissions(dir)?;
@@ -705,9 +720,192 @@ impl crate::auth::AuthSession {
     }
 }
 
+/// Read-modify-write of the `config.toml` at `path`: `edit` gets the
+/// current text (empty when there is none) and returns the new one. Under
+/// an exclusive `flock` on `config.toml.lock`, so concurrent writers (the
+/// runtime storing its identity, `atem agent launch` recording a consent)
+/// never lose each other's keys. A symlinked config.toml keeps its link:
+/// the target is replaced. The file keeps its mode (a new one gets 0600)
+/// and is replaced atomically (`write_keeping`), so a concurrent reader sees
+/// the old file or the new one, never a half-written one.
+pub fn edit_config_file(
+    path: &Path,
+    edit: impl FnOnce(&str) -> Result<String>,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    // SAFETY: flock on a descriptor this function owns; released on close.
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(anyhow::anyhow!(error).context(format!("locking {}", lock_path.display())));
+        }
+    }
+    // A symlink (e.g. into a dotfiles repo) is followed, never replaced; a
+    // dangling one is an error.
+    let target = if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    let (text, mode) = match fs::read_to_string(&target) {
+        Ok(text) => {
+            let mode = fs::metadata(&target)?.permissions().mode() & 0o7777;
+            (text, mode)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), 0o600),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", target.display())),
+    };
+    let new = edit(&text)?;
+    write_keeping(&target, new.as_bytes(), mode)
+        .with_context(|| format!("writing {}", target.display()))?;
+    drop(lock);
+    Ok(())
+}
+
+/// Replaces `path` with `bytes` (permission bits `mode`) through a temp
+/// file in the same directory (unpredictable name, never through a
+/// symlink): the file is fsynced, renamed over `path`, then the directory
+/// is fsynced.
+pub fn write_keeping(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent directory"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("no file name"))?;
+    let tmp = dir.join(format!(
+        ".{}.atem-tmp-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        fs::File::open(if dir.as_os_str().is_empty() { Path::new(".") } else { dir })?
+            .sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader never sees a half-written `config.toml` while a key is
+    /// merged in (the runtime read its identity while its own Astation
+    /// connect stored `instance_id`/`atem_id`, and fell back to unpaired).
+    #[test]
+    fn a_merged_key_is_never_seen_half_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let filler = "x".repeat(64 * 1024);
+        AtemConfig::write_config_value_at(&path, "filler", toml::Value::String(filler));
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..300 {
+                    AtemConfig::write_config_value_at(
+                        &path,
+                        "atem_id",
+                        toml::Value::String(format!("host-{i}")),
+                    );
+                }
+            })
+        };
+        let mut reads = 0;
+        while !writer.is_finished() {
+            let text = fs::read_to_string(&path).unwrap();
+            let parsed: toml::Value = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("read {reads}: a half-written file: {e}"));
+            assert!(parsed.get("filler").is_some(), "read {reads}: a truncated file");
+            reads += 1;
+        }
+        writer.join().unwrap();
+        assert!(reads > 0);
+    }
+
+    /// A symlinked config.toml keeps its link; the target is replaced and
+    /// keeps its mode. A new file is 0600.
+    #[test]
+    fn writes_follow_a_symlink_and_keep_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("new").join("config.toml");
+        AtemConfig::write_config_value_at(&fresh, "a", toml::Value::Integer(1));
+        assert_eq!(mode(&fresh), 0o600);
+        let target = dir.path().join("dotfiles").join("atem.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "# mine\nkept = true\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        AtemConfig::write_config_value_at(&link, "atem_id", toml::Value::String("h-1".into()));
+        crate::chat::codex::write_consent(&link, true).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let text = fs::read_to_string(&target).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["kept"].as_bool(), Some(true));
+        assert_eq!(parsed["atem_id"].as_str(), Some("h-1"));
+        assert_eq!(parsed["codex"]["approvals_hook"].as_bool(), Some(true));
+        assert_eq!(mode(&target), 0o640);
+        // Malformed TOML is left as it is.
+        fs::write(&target, "not = = toml").unwrap();
+        AtemConfig::write_config_value_at(&link, "a", toml::Value::Integer(1));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "not = = toml");
+    }
+
+    /// Concurrent writers (each a read-modify-write) never lose a key.
+    #[test]
+    fn concurrent_writers_all_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        AtemConfig::write_config_value_at(
+                            &path,
+                            &format!("k{w}_{i}"),
+                            toml::Value::Integer(i),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.as_table().unwrap().len(), 100);
+    }
 
     #[test]
     fn terminal_prefix_is_read_from_config_toml() {
@@ -776,6 +974,7 @@ mod tests {
 
     #[test]
     fn display_masked_shows_sso_section() {
+        let _profile = crate::test_profile::temp();
         let config = AtemConfig {
             rtm_channel: Some("test_channel".to_string()),
             ..Default::default()
@@ -831,6 +1030,7 @@ mod tests {
 
     #[test]
     fn test_display_masked_includes_astation_relay_url() {
+        let _profile = crate::test_profile::temp();
         let config = AtemConfig::default();
         let display = config.display_masked();
         assert!(display.contains("astation_relay_url"));
@@ -880,6 +1080,7 @@ mod tests {
 
     #[test]
     fn project_cache_round_trip_via_temp_path() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("project_cache.enc");
         let mut cache = ProjectCache::default();
@@ -895,6 +1096,7 @@ mod tests {
 
     #[test]
     fn set_current_and_get_current_round_trip() {
+        let _profile = crate::test_profile::temp();
         let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         let backup_path = ProjectCache::path();
         let backup = backup_path.with_extension("enc.bak");
@@ -918,6 +1120,7 @@ mod tests {
 
     #[test]
     fn save_preserves_current_if_still_present() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.enc");
 
@@ -933,6 +1136,7 @@ mod tests {
 
     #[test]
     fn save_clears_current_if_project_removed() {
+        let _profile = crate::test_profile::temp();
         // When the user runs `atem project list` and the previously-current project
         // no longer exists in the new list, current_app_id should be cleared.
         let dir = tempfile::tempdir().unwrap();
@@ -951,6 +1155,7 @@ mod tests {
 
     #[test]
     fn get_by_index_returns_projects_in_order() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.enc");
         let mut cache = ProjectCache::default();
@@ -964,6 +1169,7 @@ mod tests {
 
     #[test]
     fn load_returns_default_on_missing_file() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does_not_exist.enc");
         let cache = ProjectCache::load_from(&path);
@@ -973,6 +1179,7 @@ mod tests {
 
     #[test]
     fn cleanup_legacy_files_removes_both() {
+        let _profile = crate::test_profile::temp();
         let _lock = ACTIVE_PROJECT_LOCK.lock().unwrap();
         let dir = AtemConfig::config_dir();
         fs::create_dir_all(&dir).unwrap();
@@ -993,6 +1200,7 @@ mod tests {
 
     #[test]
     fn load_returns_default_on_corrupt_file() {
+        let _profile = crate::test_profile::temp();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("garbage.enc");
         fs::write(&path, b"this is not encrypted").unwrap();

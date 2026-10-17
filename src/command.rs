@@ -32,6 +32,14 @@ impl TaskQueue {
         Some(id)
     }
 
+    /// The task `start_next` would start (none while one is active).
+    pub fn peek_next(&self) -> Option<&str> {
+        if self.active.is_some() {
+            return None;
+        }
+        self.pending.front().map(String::as_str)
+    }
+
     /// Complete the active task and return its ID.
     pub fn complete_active(&mut self) -> Option<String> {
         self.active.take()
@@ -43,11 +51,13 @@ impl TaskQueue {
     }
 
     /// Whether there are pending tasks waiting.
+    #[cfg(test)]
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 
     /// Number of pending tasks.
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -64,65 +74,6 @@ impl TaskQueue {
         let was_set = self.needs_finalize;
         self.needs_finalize = false;
         was_set
-    }
-}
-
-/// Accumulates text chunks and detects trigger phrases at the end of the buffer.
-pub struct StreamBuffer {
-    buffer: String,
-    triggers: Vec<String>,
-}
-
-impl StreamBuffer {
-    /// Create a new buffer with the given trigger phrases (stored lowercase).
-    pub fn new(triggers: &[&str]) -> Self {
-        Self {
-            buffer: String::new(),
-            triggers: triggers.iter().map(|t| t.to_lowercase()).collect(),
-        }
-    }
-
-    /// Append text to the buffer (space-separated from previous content).
-    pub fn push(&mut self, text: &str) {
-        if !self.buffer.is_empty() {
-            self.buffer.push(' ');
-        }
-        self.buffer.push_str(text);
-    }
-
-    /// Check if the buffer ends with a trigger phrase. If found, strip it and return `true`.
-    pub fn detect_trigger(&mut self) -> bool {
-        let lower = self.buffer.to_lowercase();
-        for trigger in &self.triggers {
-            if lower.trim_end().ends_with(trigger.as_str()) {
-                let buf_len = self.buffer.trim_end().len();
-                let trigger_len = trigger.len();
-                if buf_len >= trigger_len {
-                    self.buffer.truncate(buf_len - trigger_len);
-                    let trimmed = self.buffer.trim_end().to_string();
-                    self.buffer = trimmed;
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Take the buffer contents, leaving it empty.
-    pub fn take(&mut self) -> String {
-        let val = self.buffer.trim().to_string();
-        self.buffer.clear();
-        val
-    }
-
-    /// Whether the buffer has non-whitespace content.
-    pub fn has_content(&self) -> bool {
-        !self.buffer.trim().is_empty()
-    }
-
-    /// Discard all buffered text.
-    pub fn clear(&mut self) {
-        self.buffer.clear();
     }
 }
 
@@ -215,71 +166,5 @@ mod tests {
         assert!(q.take_needs_finalize());
         // Consumed
         assert!(!q.take_needs_finalize());
-    }
-
-    // ── StreamBuffer ───────────────────────────────────────
-
-    #[test]
-    fn stream_buffer_empty() {
-        let buf = StreamBuffer::new(&["go"]);
-        assert!(!buf.has_content());
-    }
-
-    #[test]
-    fn stream_buffer_push_and_take() {
-        let mut buf = StreamBuffer::new(&["go"]);
-        buf.push("hello");
-        buf.push("world");
-        assert!(buf.has_content());
-        assert_eq!(buf.take(), "hello world");
-        assert!(!buf.has_content());
-    }
-
-    #[test]
-    fn stream_buffer_take_trims() {
-        let mut buf = StreamBuffer::new(&["go"]);
-        buf.push("  padded  ");
-        assert_eq!(buf.take(), "padded");
-    }
-
-    #[test]
-    fn stream_buffer_trigger_strips() {
-        let mut buf = StreamBuffer::new(&["execute", "run it"]);
-        buf.push("fix the bug execute");
-        assert!(buf.detect_trigger());
-        assert_eq!(buf.take(), "fix the bug");
-    }
-
-    #[test]
-    fn stream_buffer_trigger_case_insensitive() {
-        let mut buf = StreamBuffer::new(&["execute"]);
-        buf.push("fix the bug EXECUTE");
-        assert!(buf.detect_trigger());
-        assert_eq!(buf.take(), "fix the bug");
-    }
-
-    #[test]
-    fn stream_buffer_trigger_multi_word() {
-        let mut buf = StreamBuffer::new(&["run it"]);
-        buf.push("deploy the app run it");
-        assert!(buf.detect_trigger());
-        assert_eq!(buf.take(), "deploy the app");
-    }
-
-    #[test]
-    fn stream_buffer_no_match() {
-        let mut buf = StreamBuffer::new(&["execute"]);
-        buf.push("hello world");
-        assert!(!buf.detect_trigger());
-        assert_eq!(buf.take(), "hello world");
-    }
-
-    #[test]
-    fn stream_buffer_clear() {
-        let mut buf = StreamBuffer::new(&["go"]);
-        buf.push("some text");
-        buf.clear();
-        assert!(!buf.has_content());
-        assert_eq!(buf.take(), "");
     }
 }

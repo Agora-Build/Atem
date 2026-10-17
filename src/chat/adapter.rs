@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Part {
     Text {
         id: String,
@@ -11,22 +13,52 @@ pub enum Part {
         name: String,
         summary: String,
     },
+    /// An approval card (r7 §6a): the agent's permission prompt and where it
+    /// stands. Made by the broker, never by an adapter.
+    Approval(ApprovalCard),
 }
 impl Part {
     pub fn id(&self) -> &str {
         match self {
             Part::Text { id, .. } | Part::Tool { id, .. } => id,
+            Part::Approval(card) => &card.id,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a chat-v1 approval card shows: the tool, the redacted summary, the
+/// agent's own "always allow" rules and the card's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalCard {
+    pub id: String,
+    pub approval_id: String,
+    pub tool: String,
+    pub summary: String,
+    pub always_rules: Vec<crate::session_protocol::wire::AlwaysRule>,
+    pub state: ApprovalCardState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalCardState {
+    Pending,
+    Allowed,
+    AlwaysAllowed,
+    Denied,
+    AnsweredTerminal,
+    Expired,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Done,
     Interrupted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     SessionStarted {
         session_id: String,
@@ -49,7 +81,8 @@ pub enum AgentEvent {
     TurnEnded,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum LogItem {
     /// A prompt as recorded in the log. `id` is the entry uuid.
     UserMessage {
@@ -72,6 +105,26 @@ pub enum LogItem {
     Backfill(Box<LogItem>),
     /// Something could not be read; `fatal` = format changed, withdraw chat.
     Problem { detail: String, fatal: bool },
+    /// A tool call that ended in an error result (Claude's transcript): the
+    /// user refused it in the terminal (`Rejected`), or it failed or a hook
+    /// denied it (`Failed`). For the worker's approvals only (it ends a
+    /// waiting permission prompt); never forwarded or shown. `input` is the
+    /// tool input as compact JSON (keys sorted), `text` the result's text
+    /// (bounded), `at_ms` the entry's time.
+    ToolResult {
+        tool_name: String,
+        input: String,
+        kind: ToolResultKind,
+        text: String,
+        at_ms: i64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultKind {
+    Rejected,
+    Failed,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

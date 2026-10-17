@@ -1,0 +1,166 @@
+{
+ "name": "approval-late-answer-after-push-resolved-is-stale-target",
+ "setup": {
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222"
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ],
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  }
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000001"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "sessions.#": 1
+   }
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "npm test",
+   "always_rules": [
+    {
+     "rule_id": "r-npm-test",
+     "label": "Bash(npm test:*)",
+     "scope": "this project"
+    },
+    {
+     "rule_id": "r-npm",
+     "label": "Bash(npm:*)",
+     "scope": "this project"
+    }
+   ]
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "npm test",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     },
+     {
+      "rule_id": "r-npm",
+      "label": "Bash(npm:*)",
+      "scope": "this project"
+     }
+    ]
+   },
+   "capture": {
+    "aid": "approval_id"
+   }
+  },
+  {
+   "close_approval": "${aid}",
+   "reason": "answered_terminal"
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${aid}",
+    "reason": "answered_terminal"
+   }
+  },
+  {
+   "assert": {
+    "pushes": [
+     {
+      "op": "push_approval",
+      "approval_id": "${aid}"
+     },
+     {
+      "op": "push_resolved",
+      "approval_id": "${aid}",
+      "reason": "answered_terminal"
+     }
+    ]
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${aid}",
+      "decision": "allow_once",
+      "acquire": true
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "code": "stale_target"
+   }
+  },
+  {
+   "assert": {
+    "approval_decisions": [],
+    "lease_holder": null,
+    "dispatches": 0,
+    "receipts_visible": {
+     "c1": 0
+    }
+   }
+  }
+ ],
+ "note": "A late tap on a resolved notification: the approval was answered in the terminal (push_resolved went out), so the answer with acquire is stale_target — nothing recorded, nothing handed over, and no lease taken."
+}

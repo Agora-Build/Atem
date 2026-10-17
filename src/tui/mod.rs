@@ -1,7 +1,7 @@
 mod clipboard;
 pub mod draw;
+pub mod frontend;
 pub mod terminal_view;
-pub mod voice_fx;
 
 use anyhow::Result;
 use crossterm::{
@@ -14,20 +14,34 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Stdout};
+use std::time::Instant;
 use tokio::time::Duration;
 
 use crate::agora_api::format_projects;
 use crate::app::{App, AppMode, MenuAction};
+use crate::runtime::client::RuntimeClient;
+use crate::runtime::protocol::SessionSummary;
 use draw::draw_ui;
 
+/// How often the menu asks the runtime for its sessions.
+const RUNTIME_REFRESH: Duration = Duration::from_secs(3);
+
+/// Bare `atem`: the menu. Its agent entries launch and attach sessions
+/// through `atem runtime`; the menu itself opens no Astation connection.
 pub async fn run_tui() -> Result<()> {
-    run_agent_tui(None, &[]).await
+    let diagnostics = crate::diagnostics::Capture::start();
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let mut app = App::new();
+    terminal.clear()?;
+    run_tui_loop(&mut terminal, &mut app, &diagnostics).await
 }
 
-struct TerminalGuard;
+pub(crate) struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let guard = Self;
         execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
@@ -47,153 +61,118 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub async fn run_agent_tui(agent: Option<&str>, agent_args: &[String]) -> Result<()> {
-    let diagnostics = crate::diagnostics::Capture::start();
-    let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new();
-    match agent {
-        Some("codex") => {
-            app.mode = AppMode::CodexChat;
-            app.active_cli = crate::app::ActiveCli::Codex;
-            app.codex_client.append_launch_args(agent_args);
-            sync_terminal_sizes(&mut app, terminal.size()?);
-            app.ensure_codex_session().await?;
+/// How long the menu waits for the runtime's answer.
+const LOOK_WAIT: Duration = Duration::from_secs(2);
+
+/// What the menu learned from the runtime: its Astation link and sessions,
+/// `None` when none runs, or why it couldn't be asked.
+type Look = Result<Option<(bool, Vec<SessionSummary>)>, String>;
+
+/// Asks the runtime at `locator` for its sessions as a passive client (it
+/// never keeps the runtime running, and none is started), within `wait`.
+async fn look_at(locator: crate::runtime::client::Locator, wait: Duration) -> Look {
+    let looked = tokio::time::timeout(wait, async {
+        match RuntimeClient::existing_at(&locator, true).await {
+            Ok(Some(mut client)) => crate::runtime::commands::sessions(&mut client)
+                .await
+                .map(|sessions| Some((client.welcome.astation, sessions)))
+                .map_err(|e| format!("The atem runtime didn't list its sessions: {e:#}")),
+            Ok(None) => Ok(None),
+            Err(error) => Err(format!("The atem runtime can't be reached: {error:#}")),
         }
-        Some("claude") | Some("claude-code") => {
-            app.mode = AppMode::ClaudeChat;
-            app.claude_client.append_launch_args(agent_args);
-            sync_terminal_sizes(&mut app, terminal.size()?);
-            app.ensure_claude_session().await?;
-        }
-        Some(_) => anyhow::bail!("Expected claude, claude-code or codex"),
-        None => {}
-    }
-    terminal.clear()?;
-    run_tui_loop(&mut terminal, &mut app, &diagnostics).await
+    })
+    .await;
+    looked.unwrap_or_else(|_| Err("The atem runtime didn't answer".into()))
 }
 
-fn sync_terminal_sizes(app: &mut App, size: ratatui::layout::Size) {
-    let rows = size.height.saturating_sub(1).clamp(2, 200);
-    let cols = size.width.clamp(2, 400);
-    app.terminal_ui.viewport = (rows, cols);
-    if matches!(app.mode, AppMode::CodexChat) || app.codex_sender.is_none() {
-        app.adjust_codex_terminal_size(rows, cols);
+fn apply_look(app: &mut App, look: Look) {
+    match look {
+        Ok(Some((astation, sessions))) => {
+            app.astation_connected = astation;
+            app.runtime_sessions = sessions;
+            app.runtime_note = None;
+        }
+        Ok(None) => {
+            app.astation_connected = false;
+            app.runtime_sessions.clear();
+            app.runtime_note =
+                Some("No atem runtime is running; launching an agent starts one.".into());
+        }
+        Err(note) => {
+            app.astation_connected = false;
+            app.runtime_sessions.clear();
+            app.runtime_note = Some(note);
+        }
     }
-    if matches!(app.mode, AppMode::ClaudeChat) || app.claude_sender.is_none() {
-        app.adjust_claude_terminal_size(rows, cols);
+    if app.agent_panel_selected >= app.runtime_sessions.len() {
+        app.agent_panel_selected = app.runtime_sessions.len().saturating_sub(1);
+    }
+    app.rebuild_menu();
+}
+
+/// The menu's looks at the runtime, on their own task so the UI loop never
+/// waits for them: one at a time, every `RUNTIME_REFRESH` while the menu
+/// shows, and at once when asked.
+#[derive(Default)]
+struct Looks {
+    task: Option<tokio::task::JoinHandle<Look>>,
+    last: Option<Instant>,
+    due: bool,
+}
+
+impl Looks {
+    fn request(&mut self) {
+        self.due = true;
+    }
+
+    fn poll(&mut self, app: &mut App) {
+        use futures_util::FutureExt;
+        if self.task.as_ref().is_some_and(|t| t.is_finished())
+            && let Some(Ok(look)) = self.task.take().and_then(|t| t.now_or_never())
+        {
+            apply_look(app, look);
+        }
+        let shown = matches!(app.mode, AppMode::MainMenu | AppMode::AgentPanel);
+        let stale = self.last.is_none_or(|at| at.elapsed() >= RUNTIME_REFRESH);
+        if self.task.is_none() && (self.due || (shown && stale)) {
+            self.due = false;
+            self.last = Some(Instant::now());
+            let locator = crate::runtime::client::Locator::default_paths();
+            self.task = Some(tokio::spawn(look_at(locator, LOOK_WAIT)));
+        }
     }
 }
 
-fn send_agent(app: &mut App, bytes: &str) {
-    if matches!(app.mode, AppMode::CodexChat) {
-        app.send_codex_data(bytes);
-    } else {
-        app.send_claude_data(bytes);
+/// Launches `provider` (or attaches to `attach`) through the runtime and
+/// runs the frontend in the menu's terminal until it ends.
+async fn open_session(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    diagnostics: &crate::diagnostics::Capture,
+    provider: Option<&str>,
+    attach: Option<String>,
+) {
+    let opened = async {
+        let mut client = RuntimeClient::connect_or_start().await?;
+        let sid = match (provider, attach) {
+            (_, Some(sid)) => sid,
+            (Some(provider), None) => {
+                let size = frontend::viewport_size(terminal.size()?);
+                crate::runtime::commands::launch_session(&mut client, provider, Vec::new(), size)
+                    .await?
+                    .id
+            }
+            (None, None) => anyhow::bail!("Nothing to open"),
+        };
+        let exit = frontend::attach_in(terminal, client, &sid, diagnostics).await?;
+        anyhow::Ok(exit.message(&sid))
     }
-}
-
-async fn copy_terminal(app: &mut App) {
-    let text = if let Some(view) = &app.terminal_ui.browse {
-        view.text()
-    } else if matches!(app.mode, AppMode::CodexChat) {
-        terminal_view::visible_text(app.codex_terminal.screen(), app.terminal_ui.viewport)
-    } else {
-        terminal_view::visible_text(app.claude_terminal.screen(), app.terminal_ui.viewport)
-    };
-    match clipboard::copy(&text).await {
-        Ok(message) => {
-            app.terminal_ui.browse = None;
-            app.status_message = Some(message.into());
-        }
-        Err(error) => app.status_message = Some(error.to_string()),
-    }
-    if let Some(message) = &app.status_message {
-        app.terminal_ui.feedback = Some((message.clone(), std::time::Instant::now()));
-    }
-}
-
-async fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    use terminal_view::Action;
-    if app.terminal_ui.help {
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => app.terminal_ui.help = false,
-            KeyCode::Up => {
-                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_sub(1)
-            }
-            KeyCode::Down => {
-                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_add(1)
-            }
-            KeyCode::PageUp => {
-                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_sub(10)
-            }
-            KeyCode::PageDown => {
-                app.terminal_ui.help_scroll = app.terminal_ui.help_scroll.saturating_add(10)
-            }
-            _ => {}
-        }
-        return;
-    }
-    let action = app.terminal_ui.key(key);
-    match action {
-        Action::Prefix | Action::Cancel => {}
-        Action::Hide => app.leave_terminal_view(),
-        Action::Take => app.reclaim_terminal(),
-        Action::Stop => app.stop_terminal(),
-        Action::Redraw => app.force_terminal_redraw = true,
-        Action::Help => {
-            app.terminal_ui.help = true;
-            app.terminal_ui.help_scroll = 0;
-        }
-        Action::Browse => app.browse_terminal(0),
-        Action::Copy => copy_terminal(app).await,
-        Action::SendPrefix => send_agent(app, &app.terminal_ui.prefix.bytes()),
-        Action::Agent(key) if app.terminal_ui.browse.is_some() => {
-            let view = app.terminal_ui.browse.as_mut().unwrap();
-            let (rows, cols) = view.viewport;
-            let offset = view.offset;
-            match key.code {
-                KeyCode::Esc => app.terminal_ui.browse = None,
-                KeyCode::Enter => copy_terminal(app).await,
-                KeyCode::PageUp => {
-                    app.browse_terminal(offset.saturating_add(usize::from(rows.saturating_sub(1))))
-                }
-                KeyCode::PageDown => {
-                    app.browse_terminal(offset.saturating_sub(usize::from(rows.saturating_sub(1))))
-                }
-                KeyCode::Up => view.cursor.0 = view.cursor.0.saturating_sub(1),
-                KeyCode::Down => view.cursor.0 = (view.cursor.0 + 1).min(rows - 1),
-                KeyCode::Left => view.cursor.1 = view.cursor.1.saturating_sub(1),
-                KeyCode::Right => view.cursor.1 = (view.cursor.1 + 1).min(cols - 1),
-                KeyCode::Home => view.cursor.1 = 0,
-                KeyCode::End => view.cursor.1 = cols - 1,
-                KeyCode::Char(' ') => {
-                    view.anchor = if view.anchor.is_some() {
-                        None
-                    } else {
-                        Some(view.cursor)
-                    }
-                }
-                _ => {}
-            }
-        }
-        Action::Agent(key) | Action::AgentWithPrefix(key) => {
-            let screen = if matches!(app.mode, AppMode::CodexChat) {
-                app.codex_terminal.screen()
-            } else {
-                app.claude_terminal.screen()
-            };
-            if let Some(bytes) = crate::terminal_keys::encode(key, screen.application_cursor()) {
-                let bytes = if matches!(action, Action::AgentWithPrefix(_)) {
-                    app.terminal_ui.prefix.bytes() + &bytes
-                } else {
-                    bytes
-                };
-                send_agent(app, &bytes);
-            }
-        }
-    }
+    .await;
+    app.status_message = Some(match opened {
+        Ok(message) => message,
+        Err(error) => format!("\u{274c} {error:#}"),
+    });
+    let _ = terminal.clear();
 }
 
 async fn run_tui_loop(
@@ -201,88 +180,34 @@ async fn run_tui_loop(
     app: &mut App,
     diagnostics: &crate::diagnostics::Capture,
 ) -> Result<()> {
-    sync_terminal_sizes(app, terminal.size()?);
-    terminal.draw(|frame| draw_ui(frame, app))?;
-
-    // Kick off Astation connection in the background — won't block the UI.
-    app.spawn_astation_connect();
-
+    let mut looks = Looks::default();
     loop {
         terminal.autoresize()?;
         for message in diagnostics.drain() {
-            app.terminal_ui.record(message);
+            app.status_message = Some(message);
         }
-        // Check if background Astation connection has completed
-        app.poll_astation_connect();
-
-        // Check if a reconnect retry timer has elapsed (fires only while awake)
-        app.check_astation_reconnect();
-
-        // Process any pending Astation messages (also detects WS disconnect)
-        app.process_astation_messages().await;
-        app.process_codex_output();
-        app.process_claude_output();
-        app.poll_chat().await;
-        // Drain bytes from the old geometry before notifying the CLI of a resize.
-        sync_terminal_sizes(app, terminal.size()?);
-        app.pump_terminals();
-
-        // Dispatcher: drain triage verdicts and try to send next task to main
-        app.dispatcher.poll_triage_results();
-        app.try_dispatch_main().await;
-
-        // Dispatcher: collect completed background task results
-        for result in app.dispatcher.poll_background_results() {
-            let _ = app
-                .astation_client
-                .send_mark_result(&result.task_id, result.success, &result.output)
-                .await;
-            app.work_items.remove(&result.task_id);
-        }
-
-        // Dispatcher: deferred finalize flag (set when Claude session ends mid-task)
-        if app.dispatcher.take_main_needs_finalize() {
-            app.finalize_mark_task(true).await;
-        }
-        if let Err(err) = app.process_rtm_messages().await {
-            app.status_message = Some(format!("RTM processing error: {}", err));
-        }
+        looks.poll(app);
 
         if app.force_terminal_redraw {
             terminal.clear()?;
             app.force_terminal_redraw = false;
         }
 
-        app.terminal_ui.observe_status(&app.status_message);
         terminal.draw(|f| draw_ui(f, app))?;
 
         if event::poll(Duration::from_millis(16))? {
             let event = event::read()?;
             if let Event::Resize(_, _) = &event {
-                app.terminal_ui.reset_view();
                 app.force_terminal_redraw = true;
             }
-            if let Event::Paste(text) = &event {
-                if app.terminal_ui.help {
-                    app.status_message = Some("Close help before pasting into the agent".into());
-                } else {
-                    app.terminal_ui.browse = None;
-                    if app.terminal_ui.pending {
-                        app.terminal_ui.pending = false;
-                        send_agent(app, &app.terminal_ui.prefix.bytes());
-                    }
-                    app.terminal_paste(text);
-                }
+            if let Event::Paste(text) = &event
+                && matches!(app.mode, AppMode::CommandExecution)
+            {
+                app.input_text.push_str(text);
             }
             if let Event::Key(key) = event {
                 if key.kind != KeyEventKind::Release {
-                    app.register_local_activity(true).await;
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-                    if matches!(app.mode, AppMode::CodexChat | AppMode::ClaudeChat) {
-                        handle_terminal_key(app, key).await;
-                        continue;
-                    }
 
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') if !ctrl => return Ok(()),
@@ -301,14 +226,14 @@ async fn run_tui_loop(
                             match app.mode {
                                 AppMode::AgentPanel => match key.code {
                                     KeyCode::Down | KeyCode::Char('j') => {
-                                        let count = app.agent_registry.all().len();
+                                        let count = app.runtime_sessions.len();
                                         if count > 0 {
                                             app.agent_panel_selected =
                                                 (app.agent_panel_selected + 1) % count;
                                         }
                                     }
                                     KeyCode::Up | KeyCode::Char('k') => {
-                                        let count = app.agent_registry.all().len();
+                                        let count = app.runtime_sessions.len();
                                         if count > 0 {
                                             app.agent_panel_selected =
                                                 if app.agent_panel_selected == 0 {
@@ -319,13 +244,18 @@ async fn run_tui_loop(
                                         }
                                     }
                                     KeyCode::Enter => {
-                                        let agents = app.agent_registry.all();
-                                        if let Some(info) = agents.get(app.agent_panel_selected) {
-                                            let id = info.id.clone();
-                                            app.active_agent_id = Some(id.clone());
-                                            app.status_message =
-                                                Some(format!("Active agent: {}", id));
+                                        let selected = app
+                                            .runtime_sessions
+                                            .get(app.agent_panel_selected)
+                                            .map(|s| s.id.clone());
+                                        if let Some(sid) = selected {
+                                            open_session(terminal, app, diagnostics, None, Some(sid))
+                                                .await;
+                                            looks.request();
                                         }
+                                    }
+                                    KeyCode::Char('r') if !ctrl => {
+                                        looks.request();
                                     }
                                     _ => {}
                                 },
@@ -333,12 +263,24 @@ async fn run_tui_loop(
                                     KeyCode::Down | KeyCode::Char('j') => app.next_item(),
                                     KeyCode::Up | KeyCode::Char('k') => app.previous_item(),
                                     KeyCode::Enter => {
-                                        if app.menu_actions.get(app.selected_index)
-                                            == Some(&MenuAction::Exit)
-                                        {
-                                            return Ok(());
+                                        match app.menu_actions.get(app.selected_index).copied() {
+                                            Some(MenuAction::Exit) => return Ok(()),
+                                            Some(MenuAction::LaunchClaude) => {
+                                                open_session(terminal, app, diagnostics, Some("claude"), None)
+                                                    .await;
+                                                looks.request();
+                                            }
+                                            Some(MenuAction::LaunchCodex) => {
+                                                open_session(terminal, app, diagnostics, Some("codex"), None)
+                                                    .await;
+                                                looks.request();
+                                            }
+                                            Some(MenuAction::AgentPanel) => {
+                                                app.handle_selection().await?;
+                                                looks.request();
+                                            }
+                                            _ => app.handle_selection().await?,
                                         }
-                                        app.handle_selection().await?;
                                     }
                                     _ => {}
                                 },
@@ -371,12 +313,53 @@ async fn run_tui_loop(
                                     }
                                     _ => {}
                                 },
-                                _ => {}
                             }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_look_at_a_runtime_that_never_answers_ends_within_its_wait() {
+        let _profile = crate::test_profile::temp();
+        let dir = tempfile::Builder::new()
+            .prefix("atem-look")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("rt.sock");
+        // Accepts connections (the backlog) but never answers a hello.
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let locator = crate::runtime::client::Locator {
+            socket: socket.clone(),
+            record: dir.path().join("none"),
+            log: dir.path().join("log"),
+        };
+        let started = Instant::now();
+        let look = look_at(locator, Duration::from_millis(300)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(look, Err("The atem runtime didn't answer".to_string()));
+        let mut app = App::new();
+        apply_look(&mut app, look);
+        assert_eq!(app.runtime_note.as_deref(), Some("The atem runtime didn't answer"));
+        assert!(!app.astation_connected && app.runtime_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_runtime_the_menu_says_launching_starts_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let locator = crate::runtime::client::Locator {
+            socket: dir.path().join("rt.sock"),
+            record: dir.path().join("none"),
+            log: dir.path().join("log"),
+        };
+        let look = look_at(locator, Duration::from_secs(2)).await;
+        assert_eq!(look, Ok(None));
     }
 }

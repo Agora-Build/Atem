@@ -183,6 +183,9 @@ pub async fn run_repl() -> Result<()> {
     let mut rl = DefaultEditor::new()?;
 
     // Load history
+    #[cfg(test)]
+    let history_path = crate::test_profile::dir().join(HISTORY_FILE);
+    #[cfg(not(test))]
     let history_path = dirs::config_dir()
         .map(|d| d.join("atem").join(HISTORY_FILE))
         .unwrap_or_else(|| std::path::PathBuf::from(HISTORY_FILE));

@@ -596,30 +596,45 @@ fn skill_record(skill: &Skill) -> String {
     format!("{}:{}:{}", skill.scope.as_str(), skill.name, skill.version)
 }
 
-pub async fn migrate_account(astation_id: &str) -> Result<Option<&'static str>> {
-    let encryption = EncryptionContext::for_astation(astation_id)?;
+/// Migrates `astation_id`'s relay data (memory, skills, vault) to the
+/// signed state's mode for the profile `src`, with `agent`; the target mode
+/// once read back, `None` when no migration is pending.
+pub async fn migrate_account_in(
+    astation_id: &str,
+    src: &crate::status::Sources,
+    agent: Arc<dyn KeyAgentApi>,
+) -> Result<Option<&'static str>> {
+    let encryption = EncryptionContext::for_astation_with(astation_id, &src.keys, agent.clone())?;
     let target = match encryption.mode {
         EncryptionMode::Enabling => "on",
         EncryptionMode::Disabling => "off",
         _ => return Ok(None),
     };
-    let paired = crate::auth::require_pairing("Encryption migration")?;
+    let paired = crate::auth::pairing_session_in(src)
+        .map_err(|_| anyhow!(crate::auth::pairing_gate_message("Encryption migration")))?;
     if paired.astation_id != astation_id {
         bail!("the active pairing does not match the encryption account");
     }
-    let client_id = crate::config::AtemConfig::ensure_instance_id();
+    let client_id = src
+        .config
+        .instance_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(crate::config::AtemConfig::ensure_instance_id);
     let knowledge = crate::memory::api::KnowledgeClient::new(
         paired.relay_base.clone(),
         client_id.clone(),
         paired.session_id.clone(),
         paired.astation_id.clone(),
-    );
+    )
+    .with_encryption(src.keys.clone(), agent.clone());
     let vault = crate::vault_client::VaultClient::new(
         paired.relay_base,
         client_id,
         paired.session_id,
         paired.astation_id,
-    );
+    )
+    .with_encryption(src.keys.clone(), agent);
     knowledge.migrate_encryption().await
         .map_err(|error| anyhow!(error.to_string()))?;
     vault.migrate_encryption().await?;

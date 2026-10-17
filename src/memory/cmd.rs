@@ -105,6 +105,9 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn build_ctx(allow_tracked: bool) -> Result<Ctx> {
+    #[cfg(test)]
+    let home = crate::test_profile::dir().join("home");
+    #[cfg(not(test))]
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot find the home directory"))?;
     let cwd = std::env::current_dir()?;
     Ok(Ctx {

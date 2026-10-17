@@ -7,7 +7,8 @@
 //! (the log is in hand first). A hook `TurnEnded` that arrives alone is still
 //! authoritative: it emits `Complete { Done }` and marks the turn completed; a later
 //! log `TurnEnded` for that turn is ignored, so a turn never completes twice.
-use crate::chat::adapter::{AgentEvent, LogItem, Outcome, Part};
+use crate::chat::adapter::{AgentEvent, ApprovalCard, LogItem, Outcome, Part};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,8 @@ const TRUNCATED: &str = "… (truncated)";
 /// Reserved part id; adapters never produce ids with this prefix.
 const TRUNCATED_ID: &str = "atem:truncated";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Ready,
     Working,
@@ -36,19 +38,21 @@ pub struct Status {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Origin {
     Local,
     Remote,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub message_id: String,
     pub role: Role,
@@ -70,6 +74,7 @@ fn part_bytes(part: &Part) -> usize {
     match part {
         Part::Text { markdown, .. } => markdown.len(),
         Part::Tool { name, summary, .. } => name.len() + summary.len(),
+        Part::Approval(card) => card.tool.len() + card.summary.len(),
     }
 }
 
@@ -110,6 +115,24 @@ struct Pending {
     pasted_at: Option<Instant>,
     hook_seen: bool,
     log_seen: bool,
+}
+
+/// A chat session's state, for a broker that connects to a running agent's
+/// worker (the worker's session is the authoritative one): status, the
+/// input mark, the current and last completed turn, and the newest history.
+/// Prompt acceptance in flight is not carried (it belongs to the broker that
+/// submitted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSnapshot {
+    pub started: bool,
+    pub exited: bool,
+    pub state: State,
+    pub since_ms: i64,
+    pub detail: Option<String>,
+    pub input_mark: u64,
+    pub current_turn: Option<String>,
+    pub last_completed: Option<String>,
+    pub history: Vec<ChatMessage>,
 }
 
 pub struct ChatSession {
@@ -184,6 +207,8 @@ fn redact_part(part: Part) -> Part {
             name: redact(&name),
             summary: redact(&summary),
         },
+        // Redacted by the runtime before the approval opened.
+        Part::Approval(card) => Part::Approval(card),
     }
 }
 
@@ -253,6 +278,41 @@ impl ChatSession {
 
     pub fn generation(&self) -> &str {
         &self.generation
+    }
+
+    /// This session's state with at most `max_messages` / `max_bytes` of
+    /// its newest history.
+    pub fn snapshot(&self, max_messages: usize, max_bytes: usize) -> ChatSnapshot {
+        ChatSnapshot {
+            started: self.started,
+            exited: self.exited,
+            state: self.status.state,
+            since_ms: self.status.since_ms,
+            detail: self.status.detail.clone(),
+            input_mark: self.input_mark,
+            current_turn: self.current_turn.as_ref().map(|(t, _)| t.clone()),
+            last_completed: self.last_completed.clone(),
+            history: self.history(None, max_messages, max_bytes),
+        }
+    }
+
+    /// A session continuing from `snapshot` under `generation`.
+    pub fn restore(generation: String, snapshot: ChatSnapshot) -> Self {
+        let mut session = Self::new(generation, snapshot.since_ms);
+        session.started = snapshot.started;
+        session.exited = snapshot.exited;
+        session.status = Status {
+            state: snapshot.state,
+            since_ms: snapshot.since_ms,
+            detail: snapshot.detail,
+        };
+        session.input_mark = snapshot.input_mark;
+        session.current_turn = snapshot.current_turn.map(|t| (t, None));
+        session.last_completed = snapshot.last_completed;
+        for message in snapshot.history {
+            session.push_message(message);
+        }
+        session
     }
 
     pub fn status(&self) -> &Status {
@@ -469,8 +529,9 @@ impl ChatSession {
                 self.set_status(State::Ready, None, now_ms, &mut out);
             }
             LogItem::Backfill(item) => self.on_backfill(*item),
-            // The App handles problems (withdrawing chat when fatal).
-            LogItem::Problem { .. } => {}
+            // The App handles problems (withdrawing chat when fatal); tool
+            // results are the worker's (approvals).
+            LogItem::Problem { .. } | LogItem::ToolResult { .. } => {}
         }
         out
     }
@@ -524,7 +585,7 @@ impl ChatSession {
                     let cut = truncate_at(markdown, room).len();
                     markdown.truncate(cut);
                 }
-                Part::Tool { .. } => {}
+                Part::Tool { .. } | Part::Approval(_) => {}
             }
         }
         let mut new_parts = Vec::new();
@@ -565,6 +626,42 @@ impl ChatSession {
                 out.push(Out::Message(message));
             }
         }
+    }
+
+    /// An approval card (r7 §6a) for this conversation: a new assistant
+    /// message `approval-<approval_id>`, or the same message again with the
+    /// card's new state (clients replace a message they have by its id).
+    pub fn approval_card(&mut self, card: ApprovalCard, created_at_ms: i64) -> Out {
+        let message_id = format!("approval-{}", card.approval_id);
+        if let Some(m) = self.history.iter_mut().find(|m| m.message_id == message_id) {
+            let old = m.bytes();
+            m.parts = vec![Part::Approval(card)];
+            let new = m.bytes();
+            let message = m.clone();
+            self.history_bytes = self.history_bytes - old + new;
+            return Out::Message(message);
+        }
+        let turn_id = self
+            .current_turn
+            .as_ref()
+            .map_or_else(|| "approval".to_string(), |(t, _)| t.clone());
+        let message = ChatMessage {
+            message_id,
+            role: Role::Assistant,
+            origin: None,
+            turn_id,
+            request_id: None,
+            created_at_ms,
+            parts: vec![Part::Approval(card)],
+        };
+        self.push_message(message.clone());
+        Out::Message(message)
+    }
+
+    /// Terminal input (`input_count`) arrived since the last prompt was
+    /// submitted: a draft that a pasted prompt or legacy input would submit.
+    pub fn has_unsent_input(&self, input_count: u64) -> bool {
+        input_count != self.input_mark
     }
 
     /// Validate and, if allowed, return the text to paste (the caller pastes it with
@@ -622,7 +719,7 @@ impl ChatSession {
         if self.status.state != State::Ready || self.pending.is_some() {
             return err("the agent is busy; wait for the current turn to finish");
         }
-        if input_count != self.input_mark {
+        if self.has_unsent_input(input_count) {
             return err("the terminal has unsent input; finish or clear it there");
         }
         if remote_controlled {
@@ -757,7 +854,7 @@ impl ChatSession {
                 self.current_turn = current;
             }
             LogItem::Backfill(item) => self.on_backfill(*item),
-            LogItem::TurnEnded { .. } | LogItem::Problem { .. } => {}
+            LogItem::TurnEnded { .. } | LogItem::Problem { .. } | LogItem::ToolResult { .. } => {}
         }
     }
 
@@ -783,6 +880,39 @@ impl ChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restored_session_continues_with_its_status_and_history() {
+        let mut first = ChatSession::new("g1".into(), 0);
+        first.on_event(started(), 1, 0);
+        first.on_log(
+            LogItem::UserMessage {
+                id: "u1".into(),
+                turn_id: "t1".into(),
+                text: "hello".into(),
+                created_at_ms: 2,
+            },
+            2,
+            0,
+        );
+        first.on_log(
+            LogItem::TurnEnded {
+                turn_id: "t1".into(),
+                outcome: Outcome::Done,
+            },
+            3,
+            1,
+        );
+        let snapshot = first.snapshot(50, 1024 * 1024);
+        let wire: ChatSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let mut restored = ChatSession::restore("g2".into(), wire);
+        assert_eq!(restored.generation(), "g2");
+        assert_eq!(restored.status().state, State::Ready);
+        assert_eq!(restored.history(None, 50, 1024 * 1024).len(), 1);
+        // A new prompt is accepted at once (ready, no draft).
+        assert!(restored.submit("r1", "g2", "next", 1, false).is_ok());
+    }
     use std::path::PathBuf;
 
     fn started() -> AgentEvent {
@@ -836,6 +966,40 @@ mod tests {
             Out::Error { text, .. } => text,
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn an_approval_card_is_one_message_replaced_as_its_state_changes() {
+        use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
+        let mut s = ready();
+        let card = |state| ApprovalCard {
+            id: "approval".into(),
+            approval_id: "a1".into(),
+            tool: "Bash".into(),
+            summary: "npm test".into(),
+            always_rules: vec![],
+            state,
+        };
+        let Out::Message(first) = s.approval_card(card(ApprovalCardState::Pending), 5) else {
+            panic!()
+        };
+        assert_eq!(first.message_id, "approval-a1");
+        assert_eq!(first.role, Role::Assistant);
+        let Out::Message(again) = s.approval_card(card(ApprovalCardState::Denied), 9) else {
+            panic!()
+        };
+        assert_eq!(again.message_id, first.message_id);
+        assert_eq!(again.created_at_ms, 5, "the same message");
+        let history = s.history(None, 50, 1 << 20);
+        let cards: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|m| m.message_id == "approval-a1")
+            .collect();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0].parts,
+            vec![Part::Approval(card(ApprovalCardState::Denied))]
+        );
     }
 
     #[test]

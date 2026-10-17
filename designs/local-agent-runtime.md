@@ -47,11 +47,13 @@ installed version of an external agent.
 | `src/app.rs`, `src/tui/mod.rs` | Display captured terminal output and drive launched sessions from the TUI | Session ownership is tied to the TUI process; Claude/Codex menu entries require an Astation connection |
 | `src/tui/mod.rs`, `src/tui/draw.rs` | Forward local keyboard input and render the emulated CLI screen; reserve Ctrl+B for Atem | Validate keyboard, paste, Unicode, cursor, and terminal-mode fidelity against both original CLIs |
 | `atem agent launch [claude-code\|codex]` | Prints a placeholder directing the user to the TUI | The CLI command does not launch a session |
-| `src/agent_registry.rs` | In-memory agent snapshots and status | No durable session bindings or output replay across process restarts |
+| `src/agent_registry.rs` (removed; sessions are the runtime broker's, listed through session-v1 and `atem agent list`) | In-memory agent snapshots and status | No durable session bindings or output replay across process restarts |
 | `AgentPrompt` in `src/app.rs` | Routes by agent ID; ignores the supplied session ID | Cannot safely address multiple conversations without a session mapping |
 | `AgentInput` in `src/app.rs` | Writes text or keys to the focused PTY; ignores `agent_id` | Explicit session routing, controller ownership, and the full terminal key/paste contract are missing |
 | Terminal output in `src/app.rs` | Feeds a local vt100 parser and records output | No shared screen snapshots/diffs, revision recovery, or remote resize policy |
 | Existing voice path | Sends transcribed requests to Claude | Selecting the intended Codex/Claude terminal session requires addressed routing |
+
+> **Status:** the `AgentPrompt`, `AgentInput` and voice rows above are removed in atem-session r6; see designs/protocol/atem-session-v1.md.
 
 The baseline's ACP commands (`atem agent list/connect/prompt/probe/visualize`),
 the ACP client and agent detector, and ACP event forwarding to Astation have
@@ -551,8 +553,11 @@ an SSO login is not a substitute.
 
 - Move provider ownership behind the runtime instead of duplicating it in
   each CLI invocation and the TUI's `App` state.
-- Extend the agent registry/event abstraction with durable session and turn
-  identity, approvals, recovery, and provider capability reporting.
+- Extend the session registry (now the runtime broker's sessions; the old
+  `agent_registry.rs` is removed) and event abstraction with durable session
+  and turn identity, approvals, recovery, and provider capability reporting.
+> **Status:** `AgentPrompt`, `AgentInput` and the voice transcription path are removed in atem-session r6; see designs/protocol/atem-session-v1.md.
+
 - Map existing `AgentPrompt`/`AgentEvent` messages into the runtime, negotiating
   new fields and event types with Astation. Honor the supplied session ID.
 - Keep legacy `AgentInput` for the focused PTY path until explicit addressing

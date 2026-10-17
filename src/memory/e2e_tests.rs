@@ -19,7 +19,7 @@ const OLD_KID: &str = "0123abcd";
 const NEW_KID: &str = "89abcdef";
 
 #[derive(Clone)]
-struct RelayState {
+pub(crate) struct RelayState {
     memories: Vec<Memory>,
     skills: Vec<Skill>,
     vault_summary: String,
@@ -28,7 +28,7 @@ struct RelayState {
 }
 
 impl RelayState {
-    fn seeded() -> Self {
+    pub(crate) fn seeded() -> Self {
         let memory = Memory {
             id: "mem-seed".into(),
             scope: Scope::Project,
@@ -106,7 +106,7 @@ fn clients(base: &str, device: &UnlockedDevice) -> (KnowledgeClient, VaultClient
     )
 }
 
-fn assert_all_encrypted_with(state: &RelayState, kid: &str) {
+pub(crate) fn assert_all_encrypted_with(state: &RelayState, kid: &str) {
     let envelope = format!("e1.{kid}.");
     let hash = format!("h1.{kid}.");
     assert!(state.memories.iter().all(|memory| {
@@ -130,7 +130,7 @@ fn assert_all_encrypted_with(state: &RelayState, kid: &str) {
     }));
 }
 
-async fn stub_relay(state: Arc<Mutex<RelayState>>) -> String {
+pub(crate) async fn stub_relay(state: Arc<Mutex<RelayState>>) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

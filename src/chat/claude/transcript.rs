@@ -6,11 +6,23 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::chat::adapter::{LogItem, Outcome, Part};
+use crate::chat::adapter::{LogItem, Outcome, Part, ToolResultKind};
 
 const SEEN_CAP: usize = 10_000;
 /// Text of the user entry Claude writes when the user interrupts a turn.
 const INTERRUPT_MARKER: &str = "[Request interrupted by user";
+/// What Claude's tool result says when the user refused a tool call at its
+/// permission dialog.
+const REJECTED: [&str; 2] = [
+    "doesn't want to proceed with this tool use",
+    "tool use was rejected",
+];
+/// Tool calls remembered for their results (oldest dropped beyond this).
+const TOOL_USES_CAP: usize = 512;
+/// A tool input larger than this (as JSON) is not remembered.
+const TOOL_INPUT_CAP: usize = 256 * 1024;
+/// Text kept of an error result.
+const RESULT_TEXT_CAP: usize = 2048;
 
 pub struct TranscriptReader {
     path: PathBuf,
@@ -20,6 +32,8 @@ pub struct TranscriptReader {
     seen_order: VecDeque<String>,
     turn_id: String,
     seen_cap: usize,
+    /// tool_use id → (name, input as compact JSON), for error results.
+    tool_uses: VecDeque<(String, String, String)>,
 }
 
 impl TranscriptReader {
@@ -32,6 +46,7 @@ impl TranscriptReader {
             seen_order: VecDeque::new(),
             turn_id: String::new(),
             seen_cap: SEEN_CAP,
+            tool_uses: VecDeque::new(),
         }
     }
 
@@ -150,6 +165,7 @@ impl TranscriptReader {
                 if !self.remember(uuid) {
                     return;
                 }
+                self.tool_results(content, ts, out);
                 if let Some(p) = prompt_id {
                     self.turn_id = p.to_string();
                 }
@@ -161,6 +177,7 @@ impl TranscriptReader {
             if !self.remember(uuid) {
                 return;
             }
+            self.tool_results(content, ts, out);
             // Esc during a reply, or deny/Esc at a permission prompt ("… for tool
             // use"); interruptedMessageId is present only in the first case.
             if text.starts_with(INTERRUPT_MARKER) {
@@ -221,6 +238,7 @@ impl TranscriptReader {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
+                    self.remember_tool_use(b, &name);
                     let summary = summarize_tool(&name, b.get("input").unwrap_or(&Value::Null));
                     Part::Tool { id, name, summary }
                 }
@@ -237,6 +255,66 @@ impl TranscriptReader {
             out.push(LogItem::TurnEnded {
                 turn_id: self.turn_id.clone(),
                 outcome: Outcome::Done,
+            });
+        }
+    }
+}
+
+impl TranscriptReader {
+    fn remember_tool_use(&mut self, block: &Value, name: &str) {
+        let Some(id) = block.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        // serde_json's map keeps keys sorted: compact output is canonical.
+        let input = block.get("input").map(Value::to_string).unwrap_or_default();
+        if input.len() > TOOL_INPUT_CAP {
+            return;
+        }
+        if self.tool_uses.len() >= TOOL_USES_CAP {
+            self.tool_uses.pop_front();
+        }
+        self.tool_uses
+            .push_back((id.to_string(), name.to_string(), input));
+    }
+
+    /// Error `tool_result`s of remembered tool calls → `ToolResult`.
+    fn tool_results(&mut self, content: Option<&Value>, ts: i64, out: &mut Vec<LogItem>) {
+        let Some(Value::Array(blocks)) = content else {
+            return;
+        };
+        for b in blocks {
+            if b.get("type").and_then(Value::as_str) != Some("tool_result")
+                || b.get("is_error").and_then(Value::as_bool) != Some(true)
+            {
+                continue;
+            }
+            let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(pos) = self.tool_uses.iter().position(|(t, _, _)| t == id) else {
+                continue;
+            };
+            let (_, tool_name, input) = self.tool_uses.remove(pos).unwrap();
+            let text = match b.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            let kind = if REJECTED.iter().any(|r| text.contains(r)) {
+                ToolResultKind::Rejected
+            } else {
+                ToolResultKind::Failed
+            };
+            out.push(LogItem::ToolResult {
+                tool_name,
+                input,
+                kind,
+                text: truncate(&text, RESULT_TEXT_CAP),
+                at_ms: ts,
             });
         }
     }
@@ -594,6 +672,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn refused_and_failed_tool_calls_are_tool_results() {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/chat/claude/session-rejected-tool.jsonl"),
+        )
+        .unwrap();
+        let (_d, mut r) = reader_with(&text);
+        let results: Vec<LogItem> = r
+            .poll()
+            .into_iter()
+            .filter(|i| matches!(i, LogItem::ToolResult { .. }))
+            .collect();
+        let input = r#"{"command":"rm -rf build","description":"Remove the build directory"}"#;
+        assert_eq!(results.len(), 3, "{results:?}");
+        match &results[0] {
+            LogItem::ToolResult {
+                tool_name,
+                input: i,
+                kind,
+                at_ms,
+                ..
+            } => {
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(i, input, "compact, keys sorted");
+                assert_eq!(*kind, ToolResultKind::Rejected);
+                assert_eq!(
+                    *at_ms,
+                    parse_rfc3339_ms("2026-10-16T10:00:05.000Z").unwrap()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match &results[1] {
+            LogItem::ToolResult {
+                input: i,
+                kind,
+                text,
+                ..
+            } => {
+                assert_eq!(i, input, "the same input in another key order");
+                assert_eq!(*kind, ToolResultKind::Failed);
+                assert_eq!(text, "Denied from Astation", "the hook's message as it is");
+            }
+            other => panic!("{other:?}"),
+        }
+        // "No" with a typed instruction (text checked against a live Claude
+        // Code 2.1.301): still a refusal at the dialog.
+        match &results[2] {
+            LogItem::ToolResult { kind, text, .. } => {
+                assert_eq!(*kind, ToolResultKind::Rejected);
+                assert!(text.ends_with("the user said:\nuse echo instead"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

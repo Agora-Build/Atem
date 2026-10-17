@@ -1,134 +1,68 @@
-//! Exercise CLI parsing and TUI launch through the real binary without provider requests.
-#![cfg(unix)]
+//! `atem agent launch|attach|list|stop` through the real binary: the
+//! frontend starts the runtime, the agent runs in a worker, and detaching
+//! leaves the session running. No provider requests: fixture agents only.
+#![cfg(target_os = "linux")]
 
-use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+mod support;
 
-struct Atem(Box<dyn Child + Send + Sync>);
+use support::{Sandbox, within};
 
-impl Drop for Atem {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
-    }
+/// A fixture agent that records its arguments, then echoes input lines.
+fn recording_agent(sandbox: &Sandbox) -> (std::path::PathBuf, std::path::PathBuf) {
+    let argv = sandbox.dir.path().join("argv");
+    let agent = sandbox.script(
+        "agent fixture",
+        "printf '%s\\0' \"$@\" > \"$ATEM_TEST_ARGV.partial\"\nmv \"$ATEM_TEST_ARGV.partial\" \"$ATEM_TEST_ARGV\"\necho AGENT_READY\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    (agent, argv)
 }
 
-fn launch_and_capture(agent: &str, defaults: &str, arguments: &[&str]) -> Vec<String> {
-    let dir = tempfile::tempdir().unwrap();
-    launch_in(&dir, agent, defaults, arguments, &[], |_| {})
-}
-
-/// Launch Atem with the fixture agent, call `running` with the agent's
-/// arguments while both still run, then quit Atem and return them.
-fn launch_in(
-    dir: &tempfile::TempDir,
-    agent: &str,
-    defaults: &str,
-    arguments: &[&str],
-    env: &[(&str, &std::path::Path)],
-    running: impl FnOnce(&[String]),
-) -> Vec<String> {
-    let fixture = dir.path().join("agent fixture");
-    let argv = dir.path().join("argv");
-    std::fs::write(
-        &fixture,
-        "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$ATEM_TEST_ARGV.partial\"\nmv \"$ATEM_TEST_ARGV.partial\" \"$ATEM_TEST_ARGV\"\nIFS= read -r line\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_atem"));
-    command.args(["agent", "launch", agent]);
-    command.args(arguments);
-    // Isolate settings, credentials and Astation connections from the user's sessions.
-    command.env_clear();
-    command.env("HOME", dir.path());
-    command.env("PATH", "/usr/bin:/bin");
-    command.env("TERM", "xterm-256color");
-    command.env("ASTATION_WS", "ws://127.0.0.1:1/ws");
-    command.env("ASTATION_RELAY_URL", "http://127.0.0.1:1");
-    command.env("ATEM_TEST_ARGV", &argv);
-    for (name, value) in env {
-        command.env(name, value);
-    }
-    let prefix = if agent == "codex" { "CODEX" } else { "CLAUDE" };
-    command.env(format!("{prefix}_CLI_BIN"), &fixture);
-    command.env(format!("{prefix}_CLI_ARGS"), defaults);
-    command.cwd(dir.path());
-    let mut atem = Atem(pair.slave.spawn_command(command).unwrap());
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let mut writer = pair.master.take_writer().unwrap();
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let output = std::thread::spawn(move || {
-        let mut startup = Vec::new();
-        let mut ready = false;
-        let mut buf = [0; 4096];
-        // Drain continuously so screen redraws never block Atem's PTY.
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            if !ready {
-                startup.extend_from_slice(&buf[..n]);
-                if startup.windows(8).any(|w| w == b"\x1b[?2004h") {
-                    let _ = ready_tx.send(());
-                    ready = true;
-                }
-            }
-        }
-    });
-    ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("TUI did not start");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !argv.exists() {
-        assert!(
-            atem.0.try_wait().unwrap().is_none(),
-            "Atem exited before launching the agent"
-        );
-        assert!(
-            Instant::now() < deadline,
-            "Agent did not record its arguments"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let bytes = std::fs::read(&argv).unwrap();
-    let values: Vec<String> = bytes
+fn read_argv(path: &std::path::Path) -> Vec<String> {
+    let bytes = std::fs::read(path).unwrap();
+    bytes
         .strip_suffix(&[0])
         .expect("Missing final argument delimiter")
         .split(|byte| *byte == 0)
         .map(|value| String::from_utf8(value.to_vec()).unwrap())
-        .collect();
-    running(&values);
+        .collect()
+}
 
-    writer.write_all(b"\x1dhq").unwrap(); // Atem prefix, hide, then quit.
-    writer.flush().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = atem.0.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "Atem did not quit");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(status.success(), "Atem exited with {status}");
-    output.join().unwrap();
+/// Launches `agent` with `arguments` in a fresh sandbox, calls `running`
+/// with the agent's arguments while it runs, detaches, then stops the session.
+fn launch_in(
+    sandbox: &Sandbox,
+    agent: &str,
+    defaults: &str,
+    arguments: &[&str],
+    running: impl FnOnce(&[String]),
+) -> Vec<String> {
+    let (fixture, argv) = recording_agent(sandbox);
+    let prefix = if agent == "codex" { "CODEX" } else { "CLAUDE" };
+    let (bin, args) = (format!("{prefix}_CLI_BIN"), format!("{prefix}_CLI_ARGS"));
+    let mut command = vec!["agent", "launch", agent];
+    command.extend_from_slice(arguments);
+    let mut frontend = sandbox.spawn(
+        &command,
+        &sandbox.home,
+        &[
+            (&bin, fixture.to_str().unwrap()),
+            (&args, defaults),
+            ("ATEM_TEST_ARGV", argv.to_str().unwrap()),
+        ],
+    );
+    frontend.shows("AGENT_READY");
+    within("the agent's arguments", || argv.exists());
+    let values = read_argv(&argv);
+    running(&values);
+    let sid = frontend.detach();
+    sandbox.track();
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "stop failed: {err}");
     values
+}
+
+fn launch_and_capture(agent: &str, defaults: &str, arguments: &[&str]) -> Vec<String> {
+    launch_in(&Sandbox::new(), agent, defaults, arguments, |_| {})
 }
 
 #[test]
@@ -174,46 +108,373 @@ fn claude_launch_forwards_options_preserving_values_and_env_defaults() {
 }
 
 #[test]
-fn claude_launch_adds_chat_hooks_and_removes_their_directory_on_quit() {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = dir.path().join("runtime");
-    std::fs::create_dir(&runtime).unwrap();
-    let mut chat_dir = None;
-    let args = launch_in(
-        &dir,
-        "claude",
-        "",
-        &["--model", "haiku"],
-        &[("XDG_RUNTIME_DIR", runtime.as_path())],
-        |args| {
-            assert_eq!(args[0], "--settings");
-            let settings = std::path::PathBuf::from(&args[1]);
-            assert!(settings.is_file(), "settings.json exists while Claude runs");
-            let parent = settings.parent().unwrap();
-            assert_eq!(parent.parent().unwrap(), runtime.join("atem"));
-            assert!(
-                parent
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("chat-")
-            );
-            assert_eq!(settings.file_name().unwrap(), "settings.json");
-            chat_dir = Some(parent.to_path_buf());
-        },
+fn claude_launch_adds_chat_hooks_that_outlive_detach_and_go_at_stop() {
+    let sandbox = Sandbox::new();
+    let (fixture, argv) = recording_agent(&sandbox);
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "claude", "--model", "haiku"],
+        &sandbox.home,
+        &[
+            ("CLAUDE_CLI_BIN", fixture.to_str().unwrap()),
+            ("ATEM_TEST_ARGV", argv.to_str().unwrap()),
+        ],
+    );
+    frontend.shows("AGENT_READY");
+    within("the agent's arguments", || argv.exists());
+    let args = read_argv(&argv);
+    assert_eq!(args[0], "--settings");
+    let settings = std::path::PathBuf::from(&args[1]);
+    assert!(settings.is_file(), "settings.json exists while Claude runs");
+    let chat_dir = settings.parent().unwrap().to_path_buf();
+    assert_eq!(chat_dir.parent().unwrap(), sandbox.run.join("atem"));
+    assert!(
+        chat_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("chat-")
     );
     assert_eq!(args[2], "--session-id");
     assert!(uuid_like(&args[3]), "{}", args[3]);
     assert_eq!(args[4..], ["--model", "haiku"]);
-    let chat_dir = chat_dir.unwrap();
+
+    let sid = frontend.detach();
     assert!(
-        !chat_dir.exists(),
-        "the chat directory is removed when Atem quits"
+        chat_dir.exists(),
+        "detaching keeps the session and its chat"
     );
+    let rows = sandbox.list();
+    assert!(
+        rows.iter()
+            .any(|r| r[0] == sid && r[1] == "claude" && r[2] == "running"),
+        "{rows:?}"
+    );
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "stop failed: {err}");
+    within("the chat directory to go", || !chat_dir.exists());
+}
+
+#[test]
+fn detach_attach_restores_two_sessions_and_stop_ends_them() {
+    let sandbox = Sandbox::new();
+    let agent = sandbox.script(
+        "echo-agent",
+        "echo \"READY $FAKE_NAME\"\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let agent = agent.to_str().unwrap();
+
+    // The first launch starts the runtime; the session runs in a worker.
+    let mut first = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent), ("FAKE_NAME", "one")],
+    );
+    first.shows("READY one");
+    first.shows("Atem | Codex | Local | Astation \u{2717}");
+    first.send(b"hello\r");
+    first.shows("got:hello");
+    let one = first.detach();
+    assert!(
+        first.written().contains(&format!(
+            "Session {one} is still running. Reattach: atem agent attach {one} \u{b7} Stop: atem agent stop {one}"
+        )),
+        "{}",
+        first.written()
+    );
+    let runtime = sandbox.runtime_pid().expect("the launch started a runtime");
+
+    // A second launch uses the same runtime.
+    let mut second = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent), ("FAKE_NAME", "two")],
+    );
+    second.shows("READY two");
+    let two = second.detach();
+    assert_ne!(one, two);
+    assert_eq!(sandbox.runtime_pid(), Some(runtime));
+
+    let (out, err, ok) = sandbox.atem(&["agent", "list"]);
+    assert!(ok, "{err}");
+    let header = out.lines().find(|l| l.starts_with("ID")).expect("a header");
+    for column in ["ID", "PROVIDER", "STATE", "STATUS", "ATTACHED", "CWD"] {
+        assert!(header.contains(column), "{header}");
+    }
+    assert!(out.contains("protocol 1"), "{out}");
+    assert!(out.contains(&format!("pid {runtime}")), "{out}");
+    let rows = sandbox.list();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (row, sid) in rows.iter().zip([&one, &two]) {
+        assert_eq!(&row[0], sid);
+        assert_eq!(row[1], "codex");
+        assert_eq!(row[2], "running");
+        assert_eq!(row[4], "no");
+        assert_eq!(row[5], sandbox.home.display().to_string());
+    }
+
+    // Attach restores the screen; input goes on.
+    let mut again = sandbox.spawn(&["agent", "attach", &one], &sandbox.home, &[]);
+    again.shows("got:hello");
+    assert!(sandbox.list().iter().any(|r| r[0] == one && r[4] == "yes"));
+    again.send(b"again\r");
+    again.shows("got:again");
+    assert_eq!(again.detach(), one);
+
+    // Unknown ids are refused.
+    let (_, err, ok) = sandbox.atem(&["agent", "attach", "ses-aaaaaaaaaaaa"]);
+    assert!(!ok && err.contains("Unknown session"), "{err}");
+
+    // Stop ends each session: its worker exits and removes its record.
+    for sid in [&one, &two] {
+        let (_, err, ok) = sandbox.atem(&["agent", "stop", sid]);
+        assert!(ok, "{err}");
+    }
+    within("the workers to end", || sandbox.records().is_empty());
+    within("both sessions to be exited", || {
+        sandbox.list().iter().all(|r| r[2] == "exited")
+    });
+}
+
+#[test]
+fn prefix_x_stops_the_session_and_shows_its_end() {
+    let sandbox = Sandbox::new();
+    let agent = sandbox.script(
+        "echo-agent",
+        "echo READY\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent.to_str().unwrap())],
+    );
+    frontend.shows("READY");
+    sandbox.track();
+    frontend.send(b"\x1dx");
+    // The final screen stays with the exit; any key closes it.
+    frontend.shows("Exited");
+    assert!(frontend.text().contains("READY"));
+    frontend.send(b"\r");
+    assert!(frontend.exits());
+    within("the worker to end", || sandbox.records().is_empty());
+    // The worker left its log and summary under this sandbox's config dir.
+    let written = frontend.written();
+    let at = written.find("Session ses-").expect("the exit line") + "Session ".len();
+    let sid = &written[at..at + 16];
+    let dir = sandbox.config().join("logs").join(sid);
+    let log = std::fs::read_to_string(dir.join("session.ansi")).unwrap();
+    assert!(log.contains("READY"), "{log:?}");
+    assert!(dir.join("summary.md").is_file());
+}
+
+#[test]
+fn a_killed_runtime_is_restarted_by_the_next_command_and_adopts_the_session() {
+    let sandbox = Sandbox::new();
+    let agent = sandbox.script(
+        "echo-agent",
+        "echo READY\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent.to_str().unwrap())],
+    );
+    frontend.shows("READY");
+    frontend.send(b"before\r");
+    frontend.shows("got:before");
+    let sid = frontend.detach();
+    sandbox.track();
+
+    let old = sandbox.kill_runtime();
+    // The worker survived; the next command starts a runtime that adopts it.
+    let rows = sandbox.list();
+    assert!(
+        rows.iter().any(|r| r[0] == sid && r[2] == "running"),
+        "{rows:?}"
+    );
+    let new = sandbox.runtime_pid().expect("a new runtime");
+    assert_ne!(new, old);
+    let mut again = sandbox.spawn(&["agent", "attach", &sid], &sandbox.home, &[]);
+    again.shows("got:before");
+    again.send(b"after\r");
+    again.shows("got:after");
+    again.detach();
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "{err}");
+    within("the worker to end", || sandbox.records().is_empty());
 }
 
 fn uuid_like(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     parts.iter().map(|p| p.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
         && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+}
+
+#[test]
+fn the_menu_launches_and_attaches_through_the_runtime() {
+    let sandbox = Sandbox::new();
+    let agent = sandbox.script(
+        "echo-agent",
+        "echo MENU_READY\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let mut menu = sandbox.spawn(
+        &[],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent.to_str().unwrap())],
+    );
+    menu.shows("Launch Codex");
+    // Projects, Claude, Codex: the third entry launches Codex in the runtime.
+    menu.send(b"\x1b[B\x1b[B\r");
+    menu.shows("MENU_READY");
+    menu.shows("Atem | Codex | Local");
+    menu.send(b"hi\r");
+    menu.shows("got:hi");
+    // Detaching returns to the menu; the session keeps running.
+    menu.send(b"\x1dh");
+    menu.shows("is still running");
+    let rows = sandbox.list();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0][2], "running");
+    let sid = rows[0][0].clone();
+    menu.shows("Agent Sessions (1 running)");
+    // The agent panel lists it; Enter attaches and restores the screen.
+    menu.send(b"\x1b[B\r");
+    menu.shows(&sid);
+    menu.send(b"\r");
+    menu.shows("got:hi");
+    menu.send(b"\x1dh");
+    menu.shows("is still running");
+    menu.send(b"bq");
+    assert!(menu.exits(), "the menu failed:\n{}", menu.written());
+    sandbox.track();
+    // Quitting the menu leaves the session.
+    assert!(
+        sandbox
+            .list()
+            .iter()
+            .any(|r| r[0] == sid && r[2] == "running")
+    );
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "{err}");
+    within("the worker to end", || sandbox.records().is_empty());
+}
+
+#[test]
+fn launch_runs_the_agent_in_the_launching_directory_and_never_logs_its_environment() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.dir.path().join("elsewhere project");
+    std::fs::create_dir_all(&project).unwrap();
+    let agent = sandbox.script(
+        "pwd-agent",
+        "echo \"CWD=[$(pwd)]\"\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let secret = "sk-launch-env-7f3a9c2e";
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &project,
+        &[
+            ("CODEX_CLI_BIN", agent.to_str().unwrap()),
+            ("ATEM_TEST_PROVIDER_KEY", secret),
+            ("PROVIDER_API_KEY", secret),
+        ],
+    );
+    frontend.shows(&format!("CWD=[{}]", project.display()));
+    let sid = frontend.detach();
+    let rows = sandbox.list();
+    assert!(
+        rows.iter()
+            .any(|r| r[0] == sid && r[5..].join(" ") == project.display().to_string()),
+        "{rows:?}"
+    );
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "{err}");
+    within("the worker to end", || sandbox.records().is_empty());
+    // No log or state file of the runtime or its workers holds the environment.
+    let mut checked = 0;
+    let mut stack = vec![sandbox.config()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                checked += 1;
+                assert!(
+                    !String::from_utf8_lossy(&bytes).contains(secret),
+                    "{} holds the launch environment",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(sandbox.config().join("runtime.log").exists());
+    assert!(checked > 0);
+}
+
+#[test]
+fn codex_launch_asks_once_and_merges_the_approval_hook() {
+    let sandbox = Sandbox::new();
+    std::fs::remove_file(sandbox.config().join("config.toml")).unwrap();
+    let codex_home = sandbox.home.join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let mine = r#"{"hooks": {"PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/mine.sh"}]}]}}"#;
+    std::fs::write(codex_home.join("hooks.json"), mine).unwrap();
+    let agent = sandbox.script(
+        "approval agent",
+        "echo \"DIR=${ATEM_APPROVAL_DIR:-none}\"\necho AGENT_READY\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent.to_str().unwrap())],
+    );
+    frontend.shows("Allow approvals from Astation for Codex?");
+    frontend.send(b"y\r");
+    frontend.shows("AGENT_READY");
+    let written = frontend.written();
+    assert!(written.contains("Added Atem's approval hook"), "{written}");
+    assert!(written.contains("/hooks"), "{written}");
+    // The session's own directory, under the sandbox's runtime dir.
+    let dir_line = frontend
+        .text()
+        .lines()
+        .find(|l| l.contains("DIR="))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(
+        dir_line.contains(&format!("DIR={}/atem/chat-", sandbox.run.display())),
+        "{dir_line}"
+    );
+    // Merged: theirs first, ours appended; the original backed up.
+    let hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_home.join("hooks.json")).unwrap())
+            .unwrap();
+    let groups = hooks["hooks"]["PermissionRequest"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["hooks"][0]["command"], "/mine.sh");
+    let ours = groups[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(ours.starts_with(": atem-approval-hook;"), "{ours}");
+    assert_eq!(groups[1]["hooks"][0]["timeout"], 300);
+    assert_eq!(
+        std::fs::read_to_string(codex_home.join("hooks.json.atem-bak")).unwrap(),
+        mine
+    );
+    let script = sandbox.config().join("hooks").join("approval-hook.sh");
+    assert!(ours.contains(script.to_str().unwrap()), "{ours}");
+    assert!(script.exists());
+    let config = std::fs::read_to_string(sandbox.config().join("config.toml")).unwrap();
+    assert!(config.contains("approvals_hook = true"), "{config}");
+    let sid = frontend.detach();
+    sandbox.track();
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "stop failed: {err}");
+    // Outside Atem the hook does nothing: no output, at once.
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(ours)
+        .env_remove("ATEM_APPROVAL_DIR")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
 }

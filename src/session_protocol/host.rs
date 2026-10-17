@@ -1,4 +1,4 @@
-//! The host authority for atem-session v1 (contract r6, compatibility mode):
+//! The host authority for atem-session v1 (contract r7, compatibility mode):
 //! attachments and hello/welcome (§3), the session registry with a
 //! per-attachment `seq` (§4), control leases with input-epoch fencing (§5),
 //! submissions with durable receipts (§6) and errors without disclosure (§7).
@@ -24,16 +24,33 @@
 //! Refused terminal-v1 requests are answered with terminal-v1 `error`, and a
 //! chat-v1 `submit` hears about its request through chat-v1 ops
 //! (`Effect::Chat`); removed forms get a session `error` without `re`.
+//!
+//! Approvals (r7): the runtime opens an agent permission prompt with
+//! `open_approval`, whoever holds the lease (delivery is independent of
+//! control): subscribed attachments with `control` get `approval_request`
+//! (again after every `list`) and `Effect::PushApproval` asks the relay to
+//! push it to the account's devices. The lease holder answers with a
+//! `kind:"approval"` submission, or any attachment with `control` answers
+//! with `acquire: true`, which takes the lease (takeover allowed) together
+//! with the answer. Once the answer is `executing` the approval closes
+//! (`answered_remote`) and `Effect::Approval` hands the decision to the
+//! agent, whose report (`approval_applied`, `close_approval`,
+//! `dispatch_report`) finishes the receipt. Every close also resolves the
+//! push (`Effect::PushResolved`). The process ending closes a pending
+//! approval and tells the runtime to answer "no decision"
+//! (`Effect::ApprovalReleased`); the terminal can always answer instead
+//! (`close_approval(answered_terminal)`), and lease changes never close one.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 use super::journal::{self, Journal, JournalError, Record, Stored};
 use super::wire::{
-    self, Activity, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
+    self, Activity, AlwaysRule, ApprovalAnswer, ApprovalCloseReason, ApprovalDecision,
+    ApprovalRequest, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
     FamilyMessage, LeaseChangeReason, MAX_IN_FLIGHT, MAX_PROMPT_BYTES, Op, Permission, Receipt,
     ReceiptKind, ReceiptState, SessionMessage, SessionState, Target, TerminalRequest,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// A lease lasts this long from its grant or renewal (§5).
 pub const LEASE_MS: u64 = 15_000;
@@ -43,13 +60,24 @@ pub const TOMBSTONE_MS: u64 = 10 * 60 * 1000;
 pub const RECEIPT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// An interrupt or stop that shows no effect within this is `outcome_unknown`.
 pub const OBSERVE_MS: u64 = 10_000;
+/// A transport's attachment is replaced by a second `hello` at most once per
+/// this interval (r7.1); more often is `busy`.
+pub const REPLACE_INTERVAL_MS: u64 = 1_000;
 /// Lease epochs are reserved durably in blocks, so an epoch is never issued
 /// twice across restarts without an fsync per grant.
-const LEASE_EPOCH_BLOCK: u64 = 64;
+pub const LEASE_EPOCH_BLOCK: u64 = 64;
 /// Default per-session receipt bound (`receipt_limit` beyond it).
 pub const DEFAULT_MAX_RECEIPTS: usize = 4096;
+/// Pending approvals per session; `open_approval` refuses beyond it.
+pub const MAX_PENDING_APPROVALS: usize = 16;
+/// A handed-off answer the agent hasn't confirmed by then (above Claude
+/// Code's 600 s hook timeout) is `outcome_unknown`.
+pub const APPROVAL_HANDOFF_MS: u64 = 630_000;
 
-pub const DETAIL_APPROVAL: &str = "approval answers are not supported in v1";
+pub const DETAIL_APPROVAL_CLOSED: &str = "the approval closed before the answer was handed over";
+pub const DETAIL_APPROVAL_CROSSED: &str = "the terminal answered too; which answer won is unknown";
+pub const DETAIL_APPROVAL_UNCONFIRMED: &str = "the agent did not confirm the decision";
+pub const DETAIL_DECISION_NOT_DELIVERED: &str = "could not hand the decision to the agent";
 pub const DETAIL_TRUST_CHANGED: &str = "host trust changed";
 pub const DETAIL_SESSION_CLOSED: &str = "session closed";
 pub const DETAIL_NOT_RECORDED: &str = "could not record the request";
@@ -141,6 +169,14 @@ pub enum Effect {
     Close {
         attachment: String,
     },
+    /// A second `hello` on the welcomed attachment `old` fenced it and
+    /// replaced it with `new` on the same transport (compatibility mode,
+    /// r7.1): route that transport's messages to `new` from now on. Comes
+    /// before anything sent to `new`.
+    Replaced {
+        old: String,
+        new: String,
+    },
     PtyWrite {
         session_id: String,
         bytes: Vec<u8>,
@@ -186,6 +222,35 @@ pub enum Effect {
         request_id: String,
         target: Target,
         kind: ReceiptKind,
+    },
+    /// Hand the lease holder's answer to the agent's waiting permission
+    /// prompt (`executing` is already durable). Report back with
+    /// `approval_applied` (or `close_approval`, or `dispatch_report` with
+    /// `FailedNoEffect` when the decision could not be delivered).
+    Approval {
+        request_id: String,
+        session_id: String,
+        approval_id: String,
+        decision: ApprovalDecision,
+        rule_id: Option<String>,
+        message: Option<String>,
+    },
+    /// The host closed a pending approval (process ended, restart): answer
+    /// the agent's waiting prompt with "no decision" so its own prompt asks.
+    ApprovalReleased {
+        session_id: String,
+        approval_id: String,
+    },
+    /// A new pending approval: ask the relay to push it to the account's
+    /// devices with `control` (best effort; never blocks the approval).
+    PushApproval {
+        request: ApprovalRequest,
+    },
+    /// The approval is no longer pending (answered, closed, released): the
+    /// relay replaces its notification.
+    PushResolved {
+        approval_id: String,
+        reason: ApprovalCloseReason,
     },
     /// A chat-v1 reply to the conversation that submitted (or was refused).
     /// The runtime's chat stream renders it with its own `generation` and
@@ -237,7 +302,30 @@ pub enum DispatchReport {
     Unknown,
 }
 
+/// What the runtime knows of an agent permission prompt (r7). The runtime
+/// redacts before opening: `summary` is the command's first line or the
+/// file path (never full inputs such as file contents) and rule labels are
+/// stripped of secrets the same way; the host only checks the bounds.
+/// `always_rules` are the agent's own suggestions, offered as they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalInfo {
+    pub tool: String,
+    pub summary: String,
+    pub always_rules: Vec<AlwaysRule>,
+}
+
 // ── State ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Approval {
+    request: ApprovalRequest,
+    /// Opening order (catch-up after `list` goes in this order).
+    order: u64,
+    /// The remote answer handed to the agent, awaiting its report.
+    handed_off: Option<String>,
+    /// Monotonic time by which the agent must confirm a handed-off answer.
+    handoff_deadline: Option<u64>,
+}
 
 #[derive(Debug, Clone)]
 struct Lease {
@@ -273,6 +361,9 @@ struct Attachment {
     registry_seq: Option<u64>,
     /// session_id → terminal-v1 stream id.
     streams: HashMap<String, String>,
+    /// When this attachment replaced an earlier one with a second `hello`
+    /// (host clock); a replacement within `REPLACE_INTERVAL_MS` is `busy`.
+    replaced_at: Option<u64>,
 }
 
 impl Attachment {
@@ -321,7 +412,14 @@ pub struct SessionHost<J: Journal> {
     ended: HashMap<String, u64>,
     attachments: BTreeMap<String, Attachment>,
     receipts: BTreeMap<String, Entry>,
+    /// session_id → its request ids (the receipts index, kept with
+    /// `receipts`): per-session scans don't walk every receipt.
+    by_session: HashMap<String, BTreeSet<String>>,
     lease_floors: HashMap<String, u64>,
+    /// approval_id → open approvals (pending, or handed off and awaiting the
+    /// agent's report). Not persisted: a restart releases them.
+    approvals: BTreeMap<String, Approval>,
+    approvals_opened: u64,
     /// Admission order of the next new request.
     next_order: u64,
     /// Final transitions whose durable write failed, retried on `advance`.
@@ -352,7 +450,10 @@ impl<J: Journal> SessionHost<J> {
             ended: HashMap::new(),
             attachments: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            by_session: HashMap::new(),
             lease_floors: HashMap::new(),
+            approvals: BTreeMap::new(),
+            approvals_opened: 0,
             next_order: 0,
             retry: Vec::new(),
             out: Vec::new(),
@@ -371,6 +472,16 @@ impl<J: Journal> SessionHost<J> {
 
     pub fn journal_mut(&mut self) -> &mut J {
         &mut self.journal
+    }
+
+    /// The journal back, to build a host with another context over it.
+    pub fn into_journal(self) -> J {
+        self.journal
+    }
+
+    /// The durable lease-epoch floor of `session_id` (0 when none was reserved).
+    pub fn lease_floor(&self, session_id: &str) -> u64 {
+        self.lease_floors.get(session_id).copied().unwrap_or(0)
     }
 
     pub fn now(&self) -> u64 {
@@ -399,11 +510,7 @@ impl<J: Journal> SessionHost<J> {
     /// were reserved for it.
     pub fn add_session(&mut self, spec: SessionSpec) -> Result<Vec<Effect>, String> {
         let sid = &spec.session_id;
-        let known = self.lease_floors.contains_key(sid)
-            || self
-                .receipts
-                .values()
-                .any(|e| &e.stored.target.session_id == sid);
+        let known = self.lease_floors.contains_key(sid) || self.by_session.contains_key(sid);
         if known {
             return Err("session_id already used".into());
         }
@@ -483,6 +590,7 @@ impl<J: Journal> SessionHost<J> {
                 authorization_deadline: deadline,
                 registry_seq: None,
                 streams: HashMap::new(),
+                replaced_at: None,
             },
         );
         Ok(self.take())
@@ -548,6 +656,20 @@ impl<J: Journal> SessionHost<J> {
             .filter(|e| e.observe_deadline.is_some_and(|d| now >= d))
             .map(|e| (e.stored.request_id.clone(), e.stored.kind))
             .collect();
+        let unconfirmed: Vec<(String, String)> = self
+            .approvals
+            .iter()
+            .filter(|(_, a)| a.handoff_deadline.is_some_and(|d| now >= d))
+            .filter_map(|(id, a)| Some((id.clone(), a.handed_off.clone()?)))
+            .collect();
+        for (approval_id, rid) in unconfirmed {
+            self.approvals.remove(&approval_id);
+            self.finish(
+                &rid,
+                ReceiptState::OutcomeUnknown,
+                Some(DETAIL_APPROVAL_UNCONFIRMED),
+            );
+        }
         for (rid, kind) in unobserved {
             let detail = match kind {
                 ReceiptKind::Stop => DETAIL_STILL_RUNNING,
@@ -569,13 +691,7 @@ impl<J: Journal> SessionHost<J> {
     }
 
     fn evict_receipts(&mut self, sid: &str) {
-        let ids: Vec<String> = self
-            .receipts
-            .values()
-            .filter(|e| e.stored.target.session_id == sid)
-            .map(|e| e.stored.request_id.clone())
-            .collect();
-        for rid in ids {
+        for rid in self.receipt_ids(sid) {
             let record = Record::Evicted {
                 request_id: rid.clone(),
             };
@@ -583,8 +699,42 @@ impl<J: Journal> SessionHost<J> {
                 return; // retried on the next advance
             }
             self.receipts.remove(&rid);
+            self.unindex(sid, &rid);
         }
         self.ended.remove(sid);
+    }
+
+    fn index(&mut self, sid: &str, rid: &str) {
+        self.by_session
+            .entry(sid.to_string())
+            .or_default()
+            .insert(rid.to_string());
+    }
+
+    fn unindex(&mut self, sid: &str, rid: &str) {
+        if let Some(ids) = self.by_session.get_mut(sid) {
+            ids.remove(rid);
+            if ids.is_empty() {
+                self.by_session.remove(sid);
+            }
+        }
+    }
+
+    /// `sid`'s request ids, in request-id order (as `receipts` iterates).
+    fn receipt_ids(&self, sid: &str) -> Vec<String> {
+        self.by_session
+            .get(sid)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// `sid`'s receipts, in request-id order.
+    fn receipts_of<'a>(&'a self, sid: &str) -> impl Iterator<Item = &'a Entry> + 'a {
+        self.by_session
+            .get(sid)
+            .into_iter()
+            .flatten()
+            .filter_map(|rid| self.receipts.get(rid))
     }
 
     /// Local terminal input on the host: it bumps the input epoch and revokes
@@ -634,7 +784,8 @@ impl<J: Journal> SessionHost<J> {
                 ReceiptState::Rejected,
                 Some(
                     match kind {
-                        ReceiptKind::Prompt | ReceiptKind::Approval => DETAIL_NO_TERMINAL_WRITE,
+                        ReceiptKind::Prompt => DETAIL_NO_TERMINAL_WRITE,
+                        ReceiptKind::Approval => DETAIL_DECISION_NOT_DELIVERED,
                         ReceiptKind::Interrupt => DETAIL_INTERRUPT_NOT_SENT,
                         ReceiptKind::Stop => DETAIL_STOP_FAILED,
                     }
@@ -645,7 +796,8 @@ impl<J: Journal> SessionHost<J> {
                 ReceiptState::OutcomeUnknown,
                 Some(
                     match kind {
-                        ReceiptKind::Prompt | ReceiptKind::Approval => DETAIL_WRITE_INTERRUPTED,
+                        ReceiptKind::Prompt => DETAIL_WRITE_INTERRUPTED,
+                        ReceiptKind::Approval => DETAIL_APPROVAL_UNCONFIRMED,
                         ReceiptKind::Interrupt => DETAIL_NO_INTERRUPT,
                         ReceiptKind::Stop => DETAIL_STILL_RUNNING,
                     }
@@ -657,7 +809,26 @@ impl<J: Journal> SessionHost<J> {
                 Some(DETAIL_UNRECONCILED.to_string()),
             ),
         };
+        let no_effect = state == ReceiptState::Rejected;
         self.finish(request_id, state, detail.as_deref());
+        if kind == ReceiptKind::Approval {
+            let ids: Vec<String> = self
+                .approvals
+                .iter()
+                .filter(|(_, a)| a.handed_off.as_deref() == Some(request_id))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for approval_id in ids {
+                let a = self.approvals.remove(&approval_id).unwrap();
+                if no_effect {
+                    // The decision never reached the prompt: stop its wait.
+                    self.out.push(Effect::ApprovalReleased {
+                        session_id: a.request.session_id,
+                        approval_id,
+                    });
+                }
+            }
+        }
         self.take()
     }
 
@@ -665,6 +836,32 @@ impl<J: Journal> SessionHost<J> {
     /// executing work is `outcome_unknown` ("agent exited") and accepted work
     /// is rejected.
     pub fn process_exited(&mut self, session_id: &str, exit_status: Option<String>) -> Vec<Effect> {
+        self.process_ended(session_id, SessionState::Exited, exit_status)
+    }
+
+    /// The agent process can no longer be reached: its worker went away
+    /// without an exit (`Interrupted`) or can't be trusted
+    /// (`RecoveryRequired`). As `process_exited`, with that state.
+    pub fn process_lost(
+        &mut self,
+        session_id: &str,
+        state: SessionState,
+        status: Option<String>,
+    ) -> Vec<Effect> {
+        match state {
+            SessionState::Interrupted | SessionState::RecoveryRequired => {
+                self.process_ended(session_id, state, status)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn process_ended(
+        &mut self,
+        session_id: &str,
+        state: SessionState,
+        exit_status: Option<String>,
+    ) -> Vec<Effect> {
         let wall = self.wall();
         let Some(s) = self.sessions.get_mut(session_id) else {
             return Vec::new();
@@ -672,10 +869,11 @@ impl<J: Journal> SessionHost<J> {
         if s.state != SessionState::Running {
             return Vec::new();
         }
-        s.state = SessionState::Exited;
+        s.state = state;
         s.activity = Activity::Unknown;
         s.exit_status = exit_status;
         s.activity_since = wall;
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
         self.process_gone(session_id);
         self.registry_changed(session_id);
@@ -688,12 +886,8 @@ impl<J: Journal> SessionHost<J> {
     fn process_gone(&mut self, session_id: &str) {
         let process_gen = self.sessions[session_id].spec.process_gen.clone();
         let work: Vec<(String, ReceiptState, ReceiptKind)> = self
-            .receipts
-            .values()
-            .filter(|e| {
-                e.stored.target.session_id == session_id
-                    && e.stored.target.process_gen == process_gen
-            })
+            .receipts_of(session_id)
+            .filter(|e| e.stored.target.process_gen == process_gen)
             .map(|e| (e.stored.request_id.clone(), e.stored.state, e.stored.kind))
             .collect();
         for (rid, state, kind) in work {
@@ -712,6 +906,7 @@ impl<J: Journal> SessionHost<J> {
                 _ => {}
             }
         }
+        self.forget_finished_approvals();
     }
 
     /// The session no longer accepts submissions; its receipts are kept for
@@ -723,6 +918,7 @@ impl<J: Journal> SessionHost<J> {
         };
         s.state = SessionState::Closed;
         self.ended.entry(session_id.to_string()).or_insert(self.now);
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         if process_gone {
@@ -768,12 +964,13 @@ impl<J: Journal> SessionHost<J> {
         if !wire::is_uuid_v4(process_gen) || s.spec.process_gen == process_gen {
             return Err("process_gen must be a new UUID v4".into());
         }
-        let used = self.receipts.values().any(|e| {
-            e.stored.target.session_id == session_id && e.stored.target.process_gen == process_gen
-        });
+        let used = self
+            .receipts_of(session_id)
+            .any(|e| e.stored.target.process_gen == process_gen);
         if used {
             return Err("process_gen already used".into());
         }
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::ProcessEnded, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         self.process_gone(session_id);
@@ -797,6 +994,7 @@ impl<J: Journal> SessionHost<J> {
         if !self.sessions.contains_key(session_id) {
             return Vec::new();
         }
+        self.close_pending(session_id, ApprovalCloseReason::ProcessEnded);
         self.end_lease(session_id, LeaseChangeReason::Revoked, None);
         self.reject_accepted(|t| t.session_id == session_id, DETAIL_SESSION_CLOSED);
         self.process_gone(session_id);
@@ -875,6 +1073,20 @@ impl<J: Journal> SessionHost<J> {
         self.attachments.clear();
         self.retry.clear();
         self.out.clear();
+        // Approvals live in memory only: the waiting prompts get "no
+        // decision" (nobody is attached to answer them any more).
+        for (approval_id, a) in std::mem::take(&mut self.approvals) {
+            if a.handed_off.is_none() {
+                self.out.push(Effect::PushResolved {
+                    approval_id: approval_id.clone(),
+                    reason: ApprovalCloseReason::Released,
+                });
+                self.out.push(Effect::ApprovalReleased {
+                    session_id: a.request.session_id,
+                    approval_id,
+                });
+            }
+        }
         self.install(replayed);
         for (sid, s) in self.sessions.iter_mut() {
             let floor = self.lease_floors.get(sid).copied().unwrap_or(0);
@@ -884,7 +1096,38 @@ impl<J: Journal> SessionHost<J> {
             s.input_epoch += 1;
             s.queued.clear();
         }
-        Ok(self.recover())
+        let mut fx = self.take();
+        fx.extend(self.recover());
+        Ok(fx)
+    }
+
+    /// The host's identity changed (a pairing verified under another
+    /// account or device while the runtime runs): as `restart` (new
+    /// `runtime_gen`, higher `runtime_epoch`), under the new identity and a
+    /// trust generation that never decreases. Nothing changes on failure.
+    pub fn rebind(
+        &mut self,
+        account_id: &str,
+        atem_device_id: &str,
+        host_trust_gen: u64,
+        runtime_gen: &str,
+        runtime_epoch: u64,
+    ) -> Result<Vec<Effect>, String> {
+        if !wire::is_opaque_id(account_id) || !wire::is_opaque_id(atem_device_id) {
+            return Err("invalid account or device id".into());
+        }
+        if host_trust_gen < self.ctx.host_trust_gen || host_trust_gen > MAX_SAFE_INTEGER {
+            return Err("host_trust_gen must not decrease".into());
+        }
+        let previous = self.ctx.clone();
+        self.ctx.account_id = account_id.to_string();
+        self.ctx.atem_device_id = atem_device_id.to_string();
+        self.ctx.host_trust_gen = host_trust_gen;
+        let restarted = self.restart(runtime_gen, runtime_epoch);
+        if restarted.is_err() {
+            self.ctx = previous;
+        }
+        restarted
     }
 
     fn reload(&mut self) -> Result<(), JournalError> {
@@ -909,6 +1152,20 @@ impl<J: Journal> SessionHost<J> {
                 (rid, entry)
             })
             .collect();
+        self.by_session.clear();
+        let ids: Vec<(String, String)> = self
+            .receipts
+            .values()
+            .map(|e| {
+                (
+                    e.stored.target.session_id.clone(),
+                    e.stored.request_id.clone(),
+                )
+            })
+            .collect();
+        for (sid, rid) in ids {
+            self.index(&sid, &rid);
+        }
         self.lease_floors = replayed.lease_epochs;
         self.next_order = self
             .receipts
@@ -916,6 +1173,19 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| e.stored.order + 1)
             .max()
             .unwrap_or(0);
+    }
+
+    /// The per-session index lists exactly the receipts there are.
+    #[cfg(test)]
+    pub fn index_matches_receipts(&self) -> bool {
+        let mut rebuilt: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for e in self.receipts.values() {
+            rebuilt
+                .entry(e.stored.target.session_id.clone())
+                .or_default()
+                .insert(e.stored.request_id.clone());
+        }
+        rebuilt == self.by_session
     }
 
     /// Final receipt writes waiting to be retried.
@@ -964,6 +1234,23 @@ impl<J: Journal> SessionHost<J> {
     /// The session's current descriptor (as `list` would send it).
     pub fn descriptor_of(&self, session_id: &str) -> Option<Descriptor> {
         self.sessions.get(session_id).map(|s| self.descriptor(s))
+    }
+
+    /// The deadline (monotonic ms) of the session's current lease, if one is
+    /// held.
+    pub fn lease_deadline(&self, session_id: &str) -> Option<u64> {
+        self.sessions
+            .get(session_id)?
+            .lease
+            .as_ref()
+            .map(|l| l.deadline)
+    }
+
+    /// The live attachment `attachment` was granted `permission`.
+    pub fn attachment_can(&self, attachment: &str, permission: Permission) -> bool {
+        self.attachments
+            .get(attachment)
+            .is_some_and(|a| a.can(permission))
     }
 
     pub fn lease_epoch(&self, session_id: &str) -> Option<u64> {
@@ -1110,19 +1397,24 @@ impl<J: Journal> SessionHost<J> {
         }
     }
 
-    /// Compatibility mode (§3): no resume; every `hello` on a fresh attachment
-    /// gets a new `controller_session` and holds no lease.
+    /// Compatibility mode (§3, r7.1): no resume; every `hello` gets a new
+    /// `controller_session` and holds no lease. A `hello` on an attachment
+    /// that was already welcomed replaces it (`replace`); each attachment is
+    /// still welcomed once.
     fn hello(&mut self, att: &str, re: Option<String>, resume: bool) -> Checked {
         if resume {
-            return Err(ErrorCode::Unauthorized);
-        }
-        if self.attachments[att].welcomed() {
-            // One welcome per attachment; a new one needs a new attachment.
             return Err(ErrorCode::Unauthorized);
         }
         if self.now >= self.attachments[att].authorization_deadline {
             return Err(ErrorCode::Paused);
         }
+        let replaced;
+        let att = if self.attachments[att].welcomed() {
+            replaced = self.replace(att)?;
+            replaced.as_str()
+        } else {
+            att
+        };
         let controller_session = self.new_id();
         let (now, wall) = (self.now, self.wall());
         let a = self.attachments.get_mut(att).unwrap();
@@ -1141,6 +1433,50 @@ impl<J: Journal> SessionHost<J> {
         };
         self.send(att, re, op);
         Ok(())
+    }
+
+    /// Fences the welcomed attachment `old` as a transport drop would, and
+    /// puts a new, unwelcomed attachment of the same client in its place:
+    /// same permissions, kind and authorization deadline (not renewed). Its
+    /// leases end now (none is carried over); its streams close and its
+    /// replies stop. Receipts and pending approvals stay. At most one
+    /// replacement per `REPLACE_INTERVAL_MS` and transport (`busy`).
+    fn replace(&mut self, old: &str) -> Checked<String> {
+        let a = self.attachments[old].clone();
+        if a.replaced_at
+            .is_some_and(|t| self.now < t.saturating_add(REPLACE_INTERVAL_MS))
+        {
+            return Err(ErrorCode::Busy);
+        }
+        let new = uuid::Uuid::new_v4().to_string();
+        self.out.push(Effect::Replaced {
+            old: old.to_string(),
+            new: new.clone(),
+        });
+        let held: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.lease.as_ref().is_some_and(|l| l.attachment == old))
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.drop_attachment(old);
+        for sid in held {
+            self.end_lease(&sid, LeaseChangeReason::Released, None);
+        }
+        self.attachments.insert(
+            new.clone(),
+            Attachment {
+                client: a.client,
+                controller_session: None,
+                permissions: a.permissions,
+                client_kind: a.client_kind,
+                authorization_deadline: a.authorization_deadline,
+                registry_seq: None,
+                streams: HashMap::new(),
+                replaced_at: Some(self.now),
+            },
+        );
+        Ok(new)
     }
 
     /// The binding names this host, this attachment and a live session the
@@ -1238,6 +1574,22 @@ impl<J: Journal> SessionHost<J> {
             sessions,
         };
         self.send(att, re, op);
+        // Catch-up: every pending approval, after the snapshot, for an
+        // attachment that may answer it.
+        if !self.attachments[att].can(Permission::Control) {
+            return Ok(());
+        }
+        let mut pending: Vec<&Approval> = self
+            .approvals
+            .values()
+            .filter(|a| a.handed_off.is_none())
+            .collect();
+        pending.sort_by_key(|a| a.order);
+        let requests: Vec<ApprovalRequest> =
+            pending.into_iter().map(|a| a.request.clone()).collect();
+        for r in requests {
+            self.send(att, None, Op::ApprovalRequest(r));
+        }
         Ok(())
     }
 
@@ -1246,13 +1598,7 @@ impl<J: Journal> SessionHost<J> {
         let Some(descriptor) = self.sessions.get(sid).map(|s| self.descriptor(s)) else {
             return;
         };
-        let subscribers: Vec<String> = self
-            .attachments
-            .iter()
-            .filter(|(_, a)| a.registry_seq.is_some() && a.can(Permission::View))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for att in subscribers {
+        for att in self.subscribers() {
             let Some(seq) = self.next_seq(&att) else {
                 continue;
             };
@@ -1318,6 +1664,8 @@ impl<J: Journal> SessionHost<J> {
         s.lease_epoch += 1;
         self.lease_changed(sid, reason, except);
         self.registry_changed(sid);
+        // Pending approvals stay: any attachment with `control` may answer
+        // them with `acquire`.
     }
 
     /// Makes sure epochs up to `need` are durably reserved.
@@ -1374,12 +1722,24 @@ impl<J: Journal> SessionHost<J> {
         if !self.reserve_epochs(&sid, need) {
             return Err(ErrorCode::Busy);
         }
+        self.grant(att, &sid, previous.is_some());
+        self.lease_reply(att, re, b);
+        self.lease_announced(&sid, previous.is_some(), Some(att));
+        // A takeover keeps pending approvals: the new holder saw them (they
+        // follow every snapshot) and answers under its own epoch.
+        Ok(())
+    }
+
+    /// Gives `att` the lease of `sid` (epochs reserved): a new epoch, and a
+    /// new input epoch when it was taken from another holder.
+    fn grant(&mut self, att: &str, sid: &str, takeover: bool) {
+        let controller = self.attachments[att].controller_session.clone().unwrap();
         let deadline = self
             .now
             .saturating_add(LEASE_MS)
             .min(self.attachments[att].authorization_deadline);
-        let s = self.sessions.get_mut(&sid).unwrap();
-        if previous.is_some() {
+        let s = self.sessions.get_mut(sid).unwrap();
+        if takeover {
             s.input_epoch += 1;
         }
         s.lease_epoch += 1;
@@ -1388,15 +1748,34 @@ impl<J: Journal> SessionHost<J> {
             controller_session: controller,
             deadline,
         });
-        self.lease_reply(att, re, b);
-        let reason = if previous.is_some() {
+    }
+
+    fn lease_announced(&mut self, sid: &str, takeover: bool, except: Option<&str>) {
+        let reason = if takeover {
             LeaseChangeReason::Takeover
         } else {
             LeaseChangeReason::Granted
         };
-        self.lease_changed(&sid, reason, Some(att));
-        self.registry_changed(&sid);
-        Ok(())
+        self.lease_changed(sid, reason, except);
+        self.registry_changed(sid);
+    }
+
+    /// An approval answer with `acquire`: `att` needs the lease unless it
+    /// holds it live already. `Some(takeover)` when it must be granted (the
+    /// epochs it needs are reserved first: `busy` if that fails).
+    fn lease_to_acquire(&mut self, att: &str, sid: &str) -> Checked<Option<bool>> {
+        let s = &self.sessions[sid];
+        let live = s.lease.as_ref().filter(|l| self.now < l.deadline);
+        match live {
+            Some(l) if l.attachment == att => return Ok(None),
+            _ => {}
+        }
+        let takeover = live.is_some();
+        let need = s.lease_epoch + 2;
+        if !self.reserve_epochs(sid, need) {
+            return Err(ErrorCode::Busy);
+        }
+        Ok(Some(takeover))
     }
 
     fn holds(&self, att: &str, b: &Binding) -> Checked<()> {
@@ -1442,11 +1821,6 @@ impl<J: Journal> SessionHost<J> {
         kind: ReceiptKind,
         payload: Value,
     ) -> Checked {
-        if kind == ReceiptKind::Approval && !self.receipts.contains_key(request_id) {
-            self.check_binding(att, b)?;
-            self.error(att, re, ErrorCode::Forbidden, Some(DETAIL_APPROVAL));
-            return Ok(());
-        }
         self.submit(att, Reply::Session(re), b, request_id, kind, payload)
     }
 
@@ -1474,12 +1848,31 @@ impl<J: Journal> SessionHost<J> {
             return Ok(());
         }
         let sid = &b.target.session_id;
-        self.check_mutation(att, &self.sessions[sid], b.lease_epoch)?;
-        let held = self
-            .receipts
-            .values()
-            .filter(|e| &e.stored.target.session_id == sid)
-            .count();
+        let answer = match kind {
+            ReceiptKind::Approval => {
+                Some(ApprovalAnswer::parse(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?)
+            }
+            _ => None,
+        };
+        let acquire = answer.as_ref().is_some_and(ApprovalAnswer::acquires);
+        if acquire {
+            // Takes the lease with the answer: `control` and a session that
+            // accepts work, but no current lease needed.
+            if !self.attachments[att].can(Permission::Control) {
+                return Err(ErrorCode::Forbidden);
+            }
+            if self.sessions[sid].state != SessionState::Running {
+                return Err(ErrorCode::SessionClosed);
+            }
+        } else {
+            self.check_mutation(att, &self.sessions[sid], b.lease_epoch)?;
+        }
+        if let Some(answer) = &answer
+            && !self.answerable(&b.target, answer)
+        {
+            return Err(ErrorCode::StaleTarget);
+        }
+        let held = self.by_session.get(sid).map_or(0, BTreeSet::len);
         if held >= self.config.max_receipts_per_session {
             return Err(ErrorCode::ReceiptLimit);
         }
@@ -1492,6 +1885,12 @@ impl<J: Journal> SessionHost<J> {
         if in_flight >= MAX_IN_FLIGHT {
             return Err(ErrorCode::Busy);
         }
+        let sid = sid.clone();
+        let grant = if acquire {
+            self.lease_to_acquire(att, &sid)?
+        } else {
+            None
+        };
         let updated_at = self.wall();
         let record = Record::Accepted {
             request_id: request_id.to_string(),
@@ -1504,6 +1903,12 @@ impl<J: Journal> SessionHost<J> {
         // `accepted` is durable before the reply; if it can't be, nothing
         // was recorded and the client may retry the same request.
         self.journal.append(record).map_err(|_| ErrorCode::Busy)?;
+        // Atomic with the answer: the lease is taken only now that the
+        // answer is recorded, and only by the attachment answering.
+        if let Some(takeover) = grant {
+            self.grant(att, &sid, takeover);
+            self.lease_announced(&sid, takeover, None);
+        }
         let order = self.next_order;
         self.next_order += 1;
         let stored = Stored {
@@ -1521,6 +1926,7 @@ impl<J: Journal> SessionHost<J> {
             Reply::Chat { conversation_id } => Some(conversation_id.clone()),
             Reply::Session(_) => None,
         };
+        self.index(&b.target.session_id, request_id);
         self.receipts.insert(
             request_id.to_string(),
             Entry {
@@ -1576,10 +1982,8 @@ impl<J: Journal> SessionHost<J> {
     }
 
     fn prompt_executing(&self, sid: &str) -> bool {
-        self.receipts.values().any(|e| {
-            e.stored.target.session_id == sid
-                && e.stored.kind == ReceiptKind::Prompt
-                && e.stored.state == ReceiptState::Executing
+        self.receipts_of(sid).any(|e| {
+            e.stored.kind == ReceiptKind::Prompt && e.stored.state == ReceiptState::Executing
         })
     }
 
@@ -1626,6 +2030,20 @@ impl<J: Journal> SessionHost<J> {
             .payload
             .clone()
             .unwrap_or(Value::Null);
+        let kind = self.receipts[rid].stored.kind;
+        let answer = if kind == ReceiptKind::Approval {
+            // Handed over only while its approval is still pending (after a
+            // restart it never is).
+            match ApprovalAnswer::parse(&payload) {
+                Ok(a) if self.answerable(&target, &a) => Some(a),
+                _ => {
+                    self.finish(rid, ReceiptState::Rejected, Some(DETAIL_APPROVAL_CLOSED));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if !self.transition(rid, ReceiptState::Executing, None) {
             self.finish(rid, ReceiptState::Rejected, Some(DETAIL_NOT_RECORDED));
             return;
@@ -1636,6 +2054,10 @@ impl<J: Journal> SessionHost<J> {
             e.observe_deadline = Some(now.saturating_add(OBSERVE_MS));
         }
         let s = &e.stored;
+        if let Some(a) = answer {
+            self.hand_off(rid, &target, a);
+            return;
+        }
         let effect = Effect::Dispatch {
             request_id: rid.to_string(),
             target: s.target.clone(),
@@ -1643,6 +2065,241 @@ impl<J: Journal> SessionHost<J> {
             payload,
         };
         self.out.push(effect);
+    }
+
+    // ── Approvals (r7) ──
+
+    /// The runtime opens an agent permission prompt for `session_id`'s
+    /// process `process_gen` at monotonic `now` (timers due by then fire
+    /// first). Refused (`Err`: the agent's own prompt asks) unless the
+    /// session runs that process, the info is within bounds and fewer than
+    /// `MAX_PENDING_APPROVALS` are pending — whoever holds the lease.
+    /// Subscribed attachments with `control` get `approval_request`, and the
+    /// relay is asked to push it (`Effect::PushApproval`). The effects are
+    /// returned either way.
+    pub fn open_approval(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+        info: ApprovalInfo,
+        now: u64,
+    ) -> (Result<String, String>, Vec<Effect>) {
+        self.tick(now);
+        let opened = self.open_checked(session_id, process_gen, info);
+        (opened, self.take())
+    }
+
+    fn open_checked(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+        info: ApprovalInfo,
+    ) -> Result<String, String> {
+        wire::validate_approval_info(&info.tool, &info.summary, &info.always_rules)?;
+        if self.halted {
+            return Err("host halted".into());
+        }
+        self.sessions
+            .get(session_id)
+            .filter(|s| s.state == SessionState::Running && s.spec.process_gen == process_gen)
+            .ok_or("no running session with that process")?;
+        let pending = self
+            .approvals
+            .values()
+            .filter(|a| a.request.session_id == session_id && a.handed_off.is_none())
+            .count();
+        if pending >= MAX_PENDING_APPROVALS {
+            return Err("too many pending approvals".into());
+        }
+        let approval_id = self.new_id();
+        let request = ApprovalRequest {
+            approval_id: approval_id.clone(),
+            session_id: session_id.to_string(),
+            process_gen: process_gen.to_string(),
+            tool: info.tool,
+            summary: info.summary,
+            created_at: self.wall(),
+            always_rules: info.always_rules,
+        };
+        self.approvals_opened += 1;
+        self.approvals.insert(
+            approval_id.clone(),
+            Approval {
+                request: request.clone(),
+                order: self.approvals_opened,
+                handed_off: None,
+                handoff_deadline: None,
+            },
+        );
+        for att in self.approval_viewers() {
+            self.send(&att, None, Op::ApprovalRequest(request.clone()));
+        }
+        self.out.push(Effect::PushApproval { request });
+        Ok(approval_id)
+    }
+
+    /// The runtime saw the approval end without the remote answer: answered
+    /// in the terminal, interrupted (Esc), timed out, or the process ended.
+    /// A pending one closes for viewers; one whose remote answer was already
+    /// handed over finishes `outcome_unknown` (the answers crossed, or the
+    /// agent never confirmed it). `answered_remote` is the host's own reason
+    /// and is ignored here, as are unknown ids.
+    pub fn close_approval(
+        &mut self,
+        approval_id: &str,
+        reason: ApprovalCloseReason,
+    ) -> Vec<Effect> {
+        // The host owns the remote hand-off.
+        if reason == ApprovalCloseReason::AnsweredRemote {
+            return Vec::new();
+        }
+        let Some(a) = self.approvals.remove(approval_id) else {
+            return Vec::new();
+        };
+        match a.handed_off {
+            Some(rid) => {
+                let detail = match reason {
+                    ApprovalCloseReason::AnsweredTerminal => DETAIL_APPROVAL_CROSSED,
+                    ApprovalCloseReason::ProcessEnded => DETAIL_AGENT_EXITED,
+                    _ => DETAIL_APPROVAL_UNCONFIRMED,
+                };
+                self.finish(&rid, ReceiptState::OutcomeUnknown, Some(detail));
+            }
+            None => self.approval_closed(approval_id, reason),
+        }
+        self.take()
+    }
+
+    /// The agent's report on a handed-over answer: applied (`completed`), or
+    /// not known to be (`outcome_unknown`: the terminal's answer may have
+    /// won). Ignored for anything not handed over.
+    pub fn approval_applied(&mut self, approval_id: &str, ok: bool) -> Vec<Effect> {
+        let rid = match self.approvals.get(approval_id) {
+            Some(Approval {
+                handed_off: Some(rid),
+                ..
+            }) => rid.clone(),
+            _ => return Vec::new(),
+        };
+        self.approvals.remove(approval_id);
+        if ok {
+            self.finish(&rid, ReceiptState::Completed, None);
+        } else {
+            self.finish(
+                &rid,
+                ReceiptState::OutcomeUnknown,
+                Some(DETAIL_APPROVAL_CROSSED),
+            );
+        }
+        self.take()
+    }
+
+    /// Pending (not yet answered) approvals of `session_id`, in opening order.
+    pub fn pending_approvals(&self, session_id: &str) -> Vec<String> {
+        let mut pending: Vec<&Approval> = self
+            .approvals
+            .values()
+            .filter(|a| a.request.session_id == session_id && a.handed_off.is_none())
+            .collect();
+        pending.sort_by_key(|a| a.order);
+        pending
+            .into_iter()
+            .map(|a| a.request.approval_id.clone())
+            .collect()
+    }
+
+    /// The answer names an approval pending for exactly this target's
+    /// session and process, and (for `allow_always`) one of its rules.
+    fn answerable(&self, t: &Target, answer: &ApprovalAnswer) -> bool {
+        self.approvals.get(&answer.approval_id).is_some_and(|a| {
+            let r = &a.request;
+            a.handed_off.is_none()
+                && r.session_id == t.session_id
+                && r.process_gen == t.process_gen
+                && answer
+                    .rule_id
+                    .as_ref()
+                    .is_none_or(|id| r.always_rules.iter().any(|x| &x.rule_id == id))
+        })
+    }
+
+    /// `executing` is durable: the approval closes for viewers
+    /// (`answered_remote`) and the decision goes to the agent.
+    fn hand_off(&mut self, rid: &str, target: &Target, a: ApprovalAnswer) {
+        let deadline = self.now.saturating_add(APPROVAL_HANDOFF_MS);
+        if let Some(entry) = self.approvals.get_mut(&a.approval_id) {
+            entry.handed_off = Some(rid.to_string());
+            entry.handoff_deadline = Some(deadline);
+        }
+        self.approval_closed(&a.approval_id, ApprovalCloseReason::AnsweredRemote);
+        self.out.push(Effect::Approval {
+            request_id: rid.to_string(),
+            session_id: target.session_id.clone(),
+            approval_id: a.approval_id,
+            decision: a.decision,
+            rule_id: a.rule_id,
+            message: a.message,
+        });
+    }
+
+    /// Tells every attachment that got the approval that it closed, and
+    /// resolves its push.
+    fn approval_closed(&mut self, approval_id: &str, reason: ApprovalCloseReason) {
+        for att in self.approval_viewers() {
+            let op = Op::ApprovalClosed {
+                approval_id: approval_id.to_string(),
+                reason,
+            };
+            self.send(&att, None, op);
+        }
+        self.out.push(Effect::PushResolved {
+            approval_id: approval_id.to_string(),
+            reason,
+        });
+    }
+
+    /// Subscribed attachments that may answer approvals (`control`).
+    fn approval_viewers(&self) -> Vec<String> {
+        self.subscribers()
+            .into_iter()
+            .filter(|id| self.attachments[id].can(Permission::Control))
+            .collect()
+    }
+
+    /// Closes `sid`'s pending approvals (the host's decision: the process
+    /// ended) and has the runtime answer them "no decision".
+    fn close_pending(&mut self, sid: &str, reason: ApprovalCloseReason) {
+        let ids = self.pending_approvals(sid);
+        for id in ids {
+            self.approvals.remove(&id);
+            self.approval_closed(&id, reason);
+            self.out.push(Effect::ApprovalReleased {
+                session_id: sid.to_string(),
+                approval_id: id,
+            });
+        }
+    }
+
+    /// Forgets handed-off approvals whose receipt is final (e.g. finished
+    /// with the process); the agent's report on them would change nothing.
+    fn forget_finished_approvals(&mut self) {
+        let receipts = &self.receipts;
+        self.approvals.retain(|_, a| {
+            a.handed_off.as_ref().is_none_or(|rid| {
+                receipts
+                    .get(rid)
+                    .is_some_and(|e| !journal::is_final(e.stored.state))
+            })
+        });
+    }
+
+    /// Welcomed attachments subscribed to the registry (`list`) with `view`.
+    fn subscribers(&self) -> Vec<String> {
+        self.attachments
+            .iter()
+            .filter(|(_, a)| a.registry_seq.is_some() && a.can(Permission::View))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Persists and applies one transition, then tells the submitter.
@@ -1963,6 +2620,21 @@ impl<J: Journal> SessionHost<J> {
         let sid = s.spec.session_id.clone();
         let data = f.data.as_ref().ok_or(ErrorCode::UnsupportedVersion)?;
         match data["op"].as_str() {
+            // An approval card answered from chat: the §6a submission.
+            Some("submit") if data.get("approval").is_some() => {
+                let request_id = data["requestId"]
+                    .as_str()
+                    .ok_or(ErrorCode::UnsupportedVersion)?
+                    .to_string();
+                let payload = data["approval"].clone();
+                let reply = Reply::Chat {
+                    conversation_id: data["conversationId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                self.submit(att, reply, b, &request_id, ReceiptKind::Approval, payload)
+            }
             Some("submit") => {
                 let text = data["text"].as_str().ok_or(ErrorCode::UnsupportedVersion)?;
                 let request_id = data["requestId"]

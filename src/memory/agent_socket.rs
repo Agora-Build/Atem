@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+use crate::daemon::{
+    self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, process_uid,
+};
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::encoding::WipingBuf;
 use crate::memory::key_agent::{
@@ -50,6 +53,9 @@ fn own_uid() -> u32 {
 /// `$XDG_RUNTIME_DIR/atem/agent.sock` when that directory is safe, else
 /// `~/.config/atem/agent.sock`.
 pub fn agent_socket_path() -> PathBuf {
+    #[cfg(test)]
+    return socket_path_in(&crate::test_profile::dir(), None);
+    #[cfg(not(test))]
     socket_path_in(
         &crate::config::AtemConfig::config_dir(),
         std::env::var_os("XDG_RUNTIME_DIR"),
@@ -73,66 +79,9 @@ fn socket_path_from(runtime_dir: Option<OsString>, config_dir: &Path) -> PathBuf
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub fn agent_log_path() -> PathBuf {
     crate::config::AtemConfig::config_dir().join("key-agent.log")
-}
-
-/// A directory the socket's directory lives in: a real directory (not a
-/// symlink) owned by `uid` that nobody else can write to.
-fn check_parent_dir(dir: &Path, uid: u32) -> Result<()> {
-    let meta = std::fs::symlink_metadata(dir)
-        .with_context(|| format!("cannot inspect {}", dir.display()))?;
-    if meta.file_type().is_symlink() {
-        bail!("{} is a symlink", dir.display());
-    }
-    if !meta.is_dir() {
-        bail!("{} is not a directory", dir.display());
-    }
-    if meta.uid() != uid {
-        bail!("{} is owned by another user", dir.display());
-    }
-    if meta.mode() & 0o022 != 0 {
-        bail!("{} can be written by other users", dir.display());
-    }
-    Ok(())
-}
-
-/// The socket's own directory: created if missing, never a symlink, owned by
-/// `uid`; then tightened to 0700.
-fn prepare_socket_dir(dir: &Path, uid: u32) -> Result<()> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                bail!(
-                    "{} is a symlink; refusing to put the key agent socket there",
-                    dir.display()
-                );
-            }
-            if !meta.is_dir() {
-                bail!("{} is not a directory", dir.display());
-            }
-            if meta.uid() != uid {
-                bail!("{} is owned by another user", dir.display());
-            }
-            if meta.mode() & 0o022 != 0 {
-                // Others could already have planted entries in it.
-                bail!(
-                    "{} can be written by other users; refusing to use it (make it private with `chmod 700` after checking its contents)",
-                    dir.display()
-                );
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = dir.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::create_dir(dir)
-                .with_context(|| format!("could not create {}", dir.display()))?;
-        }
-        Err(error) => return Err(error.into()),
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -400,23 +349,6 @@ impl std::fmt::Display for StuckAgent {
 
 impl std::error::Error for StuckAgent {}
 
-/// Whether some process holds the key directory's lock (`None` when that
-/// can't be told). A shared, non-blocking try: it never waits, and a
-/// starting agent that meets it retries for `CLAIM_WAIT`.
-fn lock_is_held(lock_path: &Path) -> Option<bool> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(lock_path)
-        .ok()?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        return Some(false);
-    }
-    (std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)).then_some(true)
-}
-
 /// The pid recorded in the (held) lock file, only when that process is
 /// confirmed to be an `atem key-agent`: the pid survives the agent (and
 /// reboots), so it may name an unrelated process. Linux: its command line
@@ -424,25 +356,13 @@ fn lock_is_held(lock_path: &Path) -> Option<bool> {
 /// is not dumpable, so usually they can't), one of them is the lock file.
 /// Elsewhere nothing can be confirmed.
 fn confirmed_holder(lock_path: &Path) -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(lock_path)
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    if pid == 0 || unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+    let pid = daemon::read_lock_pid(lock_path)?;
+    if !daemon::confirmed_atem_pid(pid, "key-agent") {
         return None;
     }
     #[cfg(target_os = "linux")]
     {
-        let proc = PathBuf::from(format!("/proc/{pid}"));
-        let cmdline = std::fs::read(proc.join("cmdline")).ok()?;
-        if !cmdline
-            .split(|byte| *byte == 0)
-            .any(|arg| arg == b"key-agent")
-        {
-            return None;
-        }
-        if let Ok(fds) = std::fs::read_dir(proc.join("fd")) {
+        if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
             let lock = std::fs::canonicalize(lock_path).ok()?;
             let holds = fds
                 .flatten()
@@ -451,12 +371,8 @@ fn confirmed_holder(lock_path: &Path) -> Option<u32> {
                 return None;
             }
         }
-        Some(pid)
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    Some(pid)
 }
 
 /// What to say when the key files' agent can't be reached (its lock is
@@ -483,29 +399,11 @@ fn stuck_message(lock_path: &Path) -> String {
 /// orphaned agent exits by itself well within that, freeing the lock).
 /// Held by the returned file until it is dropped or the process exits.
 fn lock_key_dir(paths: &KeyPaths, wait: Duration) -> Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
     let lock_path = &paths.agent_lock;
-    if let Some(dir) = lock_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(lock_path)
-        .with_context(|| {
-            format!(
-                "could not open {} (a symlink there is refused)",
-                lock_path.display()
-            )
-        })?;
     let deadline = std::time::Instant::now() + wait;
-    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(anyhow!(error).context(format!("could not lock {}", lock_path.display())));
+    loop {
+        if let Some(lock) = daemon::lock_exclusive_with_pid(lock_path)? {
+            return Ok(lock.into_file());
         }
         if recorded_socket(&paths.agent_socket)
             .is_some_and(|socket| UnixStream::connect(socket).is_ok())
@@ -521,9 +419,6 @@ fn lock_key_dir(paths: &KeyPaths, wait: Duration) -> Result<std::fs::File> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    file.set_len(0)?;
-    file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
-    Ok(file)
 }
 
 /// Takes the key directory for this agent and listens on `socket`, then
@@ -638,25 +533,13 @@ fn bind_as(socket: &Path, uid: u32) -> Result<tokio::net::UnixListener> {
         .ok_or_else(|| anyhow!("the agent socket path has no directory"))?;
     prepare_socket_dir(dir, uid)?;
     let lock = lock_agent(socket)?;
-    match std::fs::symlink_metadata(socket) {
-        Ok(meta) => {
-            if !meta.file_type().is_socket() {
-                bail!(
-                    "{} exists and is not a socket; refusing to replace it",
-                    socket.display()
-                );
-            }
-            if UnixStream::connect(socket).is_ok() {
-                return Err(AlreadyRunning::at(socket).into());
-            }
-            std::fs::remove_file(socket)?;
+    let listener = daemon::listen_replacing_dead(socket).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::Error::from(AlreadyRunning::at(socket))
+        } else {
+            error.into()
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let listener = tokio::net::UnixListener::bind(socket)
-        .with_context(|| format!("could not listen on {}", socket.display()))?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    })?;
     if let Ok(mut held) = HELD_LOCKS.lock() {
         held.push((socket.to_path_buf(), lock));
     }
@@ -894,80 +777,12 @@ pub async fn run_key_agent() -> Result<()> {
 /// Starts `exe key-agent` detached from this command and its terminal, with
 /// `envs` added to its environment. Returns the agent's pid.
 fn spawn_agent(exe: &Path, log: &Path, envs: &[(&str, &Path)]) -> Result<u32> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::CommandExt;
-    if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(log)?;
-    // `mode` only applies to a new file; tighten one that already existed.
-    log_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("key-agent")
-        .envs(envs.iter().copied())
-        .stdin(std::process::Stdio::null())
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file);
-    let detach = || -> std::io::Result<()> {
-        if unsafe { libc::setsid() } == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // Don't pin the directory the command was run from.
-        if unsafe { libc::chdir(c"/".as_ptr()) } == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    };
-    // SAFETY: setsid and chdir are async-signal-safe, as pre_exec requires.
-    unsafe {
-        command.pre_exec(detach);
-    }
-    let mut child = command.spawn().context("could not start the key agent")?;
-    let pid = child.id();
-    // Reap the agent if it exits while this process is still running.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(pid)
-}
-
-/// The user id of the process listening on the other end of `stream`.
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut cred = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        let rc = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut cred as *mut libc::ucred).cast(),
-                &mut len,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(cred.uid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
-        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(uid)
-    }
+    let envs: Vec<(OsString, OsString)> = envs
+        .iter()
+        .map(|(key, value)| (OsString::from(key), value.as_os_str().to_owned()))
+        .collect();
+    daemon::spawn_detached(exe, "key-agent", Path::new("/"), log, &envs)
+        .context("could not start the key agent")
 }
 
 /// How a client starts an agent when none answers.
@@ -1004,10 +819,10 @@ impl KeyAgentClient {
     #[cfg(test)]
     pub(crate) fn at(socket: PathBuf) -> Self {
         Self {
+            log: socket.with_file_name("key-agent.log"),
             socket,
             record: None,
             launcher: None,
-            log: agent_log_path(),
             lock: None,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
@@ -1018,6 +833,7 @@ impl KeyAgentClient {
     }
 
     /// A client for this user's agent that starts it when none answers.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn autostart() -> Self {
         let mut client = Self::finding(
             &crate::config::AtemConfig::config_dir(),
@@ -1031,6 +847,7 @@ impl KeyAgentClient {
     }
 
     /// A client for this user's running agent that never starts one.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn existing() -> Self {
         Self::finding(
             &crate::config::AtemConfig::config_dir(),
@@ -1065,10 +882,10 @@ impl KeyAgentClient {
     #[cfg(test)]
     pub(crate) fn with_launcher(socket: PathBuf, launcher: Launcher) -> Self {
         Self {
+            log: socket.with_file_name("key-agent.log"),
             socket,
             record: None,
             launcher: Some(launcher),
-            log: agent_log_path(),
             lock: None,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
@@ -1315,21 +1132,6 @@ impl KeyAgentClient {
     }
 }
 
-/// The owner of process `pid` (Linux; `None` elsewhere or when gone).
-fn process_uid(pid: u32) -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::metadata(format!("/proc/{pid}"))
-            .ok()
-            .map(|meta| meta.uid())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
 /// An agent from an older atem rejects a request it doesn't know as
 /// malformed (`unknown variant`): say what to do instead.
 fn explain_unknown_request(error: anyhow::Error) -> anyhow::Error {
@@ -1376,6 +1178,7 @@ impl KeyAgentApi for KeyAgentClient {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
 
     /// Unix socket paths are limited to ~100 bytes; keep them short.
     fn short_dir() -> tempfile::TempDir {
@@ -1528,13 +1331,11 @@ mod tests {
     fn another_user_is_refused() {
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid().wrapping_add(1));
+        let log = socket.with_file_name("key-agent.log");
         let error = format!("{:#}", KeyAgentClient::at(socket).status().err().unwrap());
         assert!(error.contains("closed the connection"), "{error}");
         // The client checked the listener's uid already: the hint is the log.
-        assert!(
-            error.contains(&format!("see {}", agent_log_path().display())),
-            "{error}"
-        );
+        assert!(error.contains(&format!("see {}", log.display())), "{error}");
         assert!(!error.contains("another user"), "{error}");
     }
 

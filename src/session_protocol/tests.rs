@@ -71,7 +71,7 @@ fn digest_must_reject_inputs_are_refused() {
 }
 
 fn submit_with_payload(payload: &[u8]) -> Vec<u8> {
-    let mut out = br#"{"type":"session","data":{"v":1,"op":"submit","id":"11111111-1111-4111-8111-000000000001","binding":{"target":{"account_id":"account-a","atem_device_id":"host-a","host_trust_gen":1,"session_id":"ses-aaaaaaaaaaaa","process_gen":"22222222-2222-4222-8222-222222222222"},"attachment_gen":"33333333-3333-4333-8333-333333333333","lease_epoch":1},"request_id":"44444444-4444-4444-8444-444444444447","kind":"approval","payload":"#.to_vec();
+    let mut out = br#"{"type":"session","data":{"v":1,"op":"submit","id":"11111111-1111-4111-8111-000000000001","binding":{"target":{"account_id":"account-a","atem_device_id":"host-a","host_trust_gen":1,"session_id":"ses-aaaaaaaaaaaa","process_gen":"22222222-2222-4222-8222-222222222222"},"attachment_gen":"33333333-3333-4333-8333-333333333333","lease_epoch":1},"request_id":"44444444-4444-4444-8444-444444444447","kind":"prompt","payload":"#.to_vec();
     out.extend_from_slice(payload);
     out.extend_from_slice(b"}}");
     out
@@ -164,9 +164,13 @@ fn strict_parser_rules() {
 
 // ── fixtures: every wire message decodes and round-trips ─────────────────
 
-/// Replaces harness placeholders (`${name}`) with a valid value.
+/// Replaces harness placeholders (`${name}`) with a valid value (a captured
+/// approval id or attachment generation is a UUID).
 fn substitute(v: &mut Value) {
     match v {
+        Value::String(s) if s == "${aid}" || s == "${gen2}" => {
+            *s = "88888888-8888-4888-8888-888888888888".to_string()
+        }
         Value::String(s) if s.contains("${") => *s = "stream-0001".to_string(),
         Value::Array(a) => a.iter_mut().for_each(substitute),
         Value::Object(m) => m.values_mut().for_each(substitute),
@@ -305,7 +309,7 @@ fn all_ops() -> Vec<Value> {
             "welcome",
             json!({"re":RE,"account_id":"account-a","atem_device_id":"host-a",
             "host_trust_gen":1,"runtime_gen":PG,"controller_session":RE,"attachment_gen":AG,
-            "client_kind":"native","permissions":["view","control","approve"],
+            "client_kind":"native","permissions":["view","control"],
             "authorization_ms_left":86400000,"server_time":1760500000000u64}),
         ),
         session("list", json!({})),
@@ -353,7 +357,8 @@ fn all_ops() -> Vec<Value> {
         ),
         session(
             "submit",
-            json!({"binding":binding(Some(7)),"request_id":RE,"kind":"approval","payload":{"x":[1,{"y":null}]}}),
+            json!({"binding":binding(Some(7)),"request_id":RE,"kind":"approval",
+            "payload":{"approval_id":ID,"decision":"allow_always","rule_id":"r-1"}}),
         ),
         session("receipt", {
             let mut r = receipt.clone();
@@ -368,7 +373,7 @@ fn all_ops() -> Vec<Value> {
         session("error", json!({"re":RE,"code":"stale_target"})),
         session(
             "error",
-            json!({"re":RE,"code":"forbidden","detail":"approval answers are not supported in v1"}),
+            json!({"re":RE,"code":"forbidden","detail":"not permitted"}),
         ),
         // terminal-v1 / chat-v1 with data.binding (§2)
         json!({"type":"terminal","data":{"v":1,"op":"subscribe","terminal_id":"ses-aaaaaaaaaaaa","generation":PG,
@@ -385,6 +390,22 @@ fn all_ops() -> Vec<Value> {
             "generation":PG,"requestId":RE,"text":"run the tests","binding":binding(Some(7))}}),
         // another family, untouched
         json!({"type":"heartbeat","data":{"ts":1}}),
+        // approvals (r7)
+        session(
+            "submit",
+            json!({"binding":binding(Some(7)),"request_id":RE,"kind":"approval",
+            "payload":{"approval_id":ID,"decision":"deny","message":"use staging"}}),
+        ),
+        session(
+            "approval_request",
+            json!({"approval_id":ID,"session_id":"ses-aaaaaaaaaaaa","process_gen":PG,"tool":"Bash",
+            "summary":"npm test","created_at":1760000000000u64,
+            "always_rules":[{"rule_id":"r-1","label":"Bash(npm test:*)","scope":"this project"}]}),
+        ),
+        session(
+            "approval_closed",
+            json!({"approval_id":ID,"reason":"answered_terminal"}),
+        ),
     ]
 }
 
@@ -695,18 +716,13 @@ fn bounds() {
         "payload.text",
         Some(json!("a".repeat(wire::MAX_PROMPT_BYTES + 1))),
     ));
-    // Canonical payload size (approval is the only kind with a free-form payload).
-    let approval = |n: usize| {
-        with(
-            with(submit(), "kind", Some(json!("approval"))),
-            "payload",
-            Some(json!({"t": "a".repeat(n)})),
-        )
-    };
-    assert!(
-        wire::decode(&serde_json::to_vec(&approval(wire::MAX_PAYLOAD_BYTES - 8)).unwrap()).is_ok()
-    );
-    rejects(&approval(wire::MAX_PAYLOAD_BYTES - 7));
+    // Canonical payload size: a control character is 6 bytes canonical
+    // (`\u0001`), so a prompt within its byte bound can still exceed 64 KiB:
+    // `{"text":"…"}` is 11 + 6n bytes.
+    let controls = |n: usize| with(submit(), "payload.text", Some(json!("\u{1}".repeat(n))));
+    let fits = (wire::MAX_PAYLOAD_BYTES - 11) / 6;
+    assert!(wire::decode(&serde_json::to_vec(&controls(fits)).unwrap()).is_ok());
+    rejects(&controls(fits + 1));
     // receipt_query.request_ids
     let ids: Vec<String> = (0..65)
         .map(|i| format!("11111111-1111-4111-8111-{i:012}"))

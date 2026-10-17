@@ -93,15 +93,12 @@ impl App {
         }
     }
 
-    /// The socket is open but no longer authenticated: offline, remote
-    /// terminals revoked, chat conversations closed, Astation-routed work
-    /// dropped. The local agent PTY and anything typed into it are left alone.
+    /// The socket is open but no longer authenticated: offline, so the
+    /// session host fences this link's attachment (its leases stop renewing
+    /// and its streams and conversations end). The local agent PTY and
+    /// anything typed into it are left alone.
     pub(super) fn suspend_astation(&mut self) {
         self.astation_connected = false;
-        self.disconnect_terminals();
-        self.close_chat_conversations();
-        self.pending_astation_command = None;
-        self.pending_voice_request = None;
         self.rebuild_menu();
     }
 
@@ -110,7 +107,6 @@ impl App {
     fn fail_astation_reauth(&mut self, reason: String) {
         self.astation_reauth = None;
         self.suspend_astation();
-        self.terminal_ui.record(reason.clone());
         self.status_message = Some(reason);
         self.on_astation_disconnect();
         // Dropping the client aborts its transport, closing the socket.
@@ -118,8 +114,8 @@ impl App {
         self.astation_reconnect_at = Some(Instant::now());
     }
 
-    /// Back online; report state as a fresh connect does. Remote viewers
-    /// subscribe again (view-only); no lease or input is resumed.
+    /// Back online, as a new link: the session host gives it a new
+    /// attachment (clients `hello` again); no lease or input is resumed.
     async fn finish_astation_reauth(&mut self) {
         // A success for a pairing or session replaced meanwhile (atem unpair,
         // atem pair) is dropped: nothing is refreshed and the link stays down.
@@ -129,10 +125,9 @@ impl App {
         }
         self.astation_reauth = None;
         self.astation_connected = true;
+        self.astation_link_gen += 1;
         self.rebuild_menu();
         self.status_message = Some("Astation reconnected".to_string());
-        let agents = self.agent_registry.all();
-        let _ = self.astation_client.send_agent_list(agents).await;
     }
 }
 
@@ -145,8 +140,7 @@ fn reauth_advice(paired: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::AppMode;
-    use crate::terminal_share::{Message, SharedTerminal};
+    use crate::terminal_share::Message;
     use crate::websocket_client::device_auth_proof;
     use futures_util::{SinkExt, StreamExt};
     use std::collections::HashMap;
@@ -163,6 +157,8 @@ mod tests {
     struct Peer {
         send: mpsc::UnboundedSender<AstationMessage>,
         recv: mpsc::UnboundedReceiver<Option<AstationMessage>>,
+        /// The temp profile stands in for the user's (src/test_profile.rs).
+        _profile: crate::test_profile::Scope,
         _state: tempfile::TempDir,
     }
 
@@ -221,7 +217,9 @@ mod tests {
                     }
                     frame = socket.next() => match frame {
                         Some(Ok(WsMessage::Text(text))) => {
-                            let _ = incoming.send(Some(serde_json::from_str(&text).unwrap()));
+                            let message = serde_json::from_str(&text)
+                                .unwrap_or(AstationMessage::SessionWire(text));
+                            let _ = incoming.send(Some(message));
                         }
                         Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => {
                             let _ = incoming.send(None);
@@ -233,6 +231,7 @@ mod tests {
             }
         });
 
+        let profile = crate::test_profile::use_dir(state.path());
         let mut app = App::new();
         // Keep process_astation_messages away from the user's sessions.json.
         app.last_session_refresh = Some(Instant::now());
@@ -249,46 +248,10 @@ mod tests {
             Peer {
                 send,
                 recv,
+                _profile: profile,
                 _state: state,
             },
         )
-    }
-
-    /// Adds a live `cat` PTY as Codex with a remote viewer that holds control.
-    fn share_codex_with_remote_controller(app: &mut App) {
-        let session = crate::pty_session::spawn("cat", &[]).unwrap();
-        app.codex_sender = Some(session.sender);
-        app.codex_receiver = Some(session.receiver);
-        app.codex_resize_handle = Some(session.resize_handle);
-        app.codex_share = Some(SharedTerminal::new("codex"));
-        app.mode = AppMode::MainMenu;
-        let generation = app.codex_share.as_ref().unwrap().generation.clone();
-        app.handle_terminal_message(
-            Message::Subscribe {
-                terminal_id: "codex".into(),
-                generation: generation.clone(),
-            }
-            .into(),
-        );
-        let stream_id = app
-            .terminal_outbox
-            .iter()
-            .find_map(|message| match message {
-                Message::Attached { stream_id, .. } => Some(stream_id.clone()),
-                _ => None,
-            })
-            .expect("viewer attached");
-        app.handle_terminal_message(
-            Message::Control {
-                terminal_id: "codex".into(),
-                generation,
-                stream_id,
-                take: true,
-            }
-            .into(),
-        );
-        assert!(app.codex_share.as_ref().unwrap().has_viewer());
-        assert!(app.codex_sender.as_ref().unwrap().remote_controlled());
     }
 
     /// Runs the TUI's Astation step until the peer receives an `auth` message
@@ -357,17 +320,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_required_goes_offline_revokes_terminals_and_answers_with_the_session_proof() {
+    async fn auth_required_goes_offline_and_answers_with_the_session_proof() {
         let (mut app, mut peer) = connected_app().await;
-        share_codex_with_remote_controller(&mut app);
+        let link = app.astation_link_gen;
         let challenge = "b".repeat(64);
         peer.send.send(auth_required(ASTATION, &challenge)).unwrap();
 
         let proof = next_auth(&mut app, &mut peer).await;
+        // Offline: the session host fences this link's attachment.
         assert!(!app.astation_connected, "status bar must show Astation ✗");
-        assert!(!app.codex_share.as_ref().unwrap().has_viewer());
-        assert!(!app.codex_sender.as_ref().unwrap().remote_controlled());
-        assert!(app.terminal_outbox.is_empty());
+        assert_eq!(app.astation_link_gen, link);
         assert_eq!(proof["session_id"], SESSION_ID);
         assert_eq!(proof["atem_id"], ATEM_ID);
         assert_eq!(proof["proof"], expected_session_proof(&challenge));
@@ -381,10 +343,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_reply_restores_online_and_resends_the_agent_list_view_only() {
+    async fn authenticated_reply_restores_online_as_a_new_link() {
         let (mut app, mut peer) = connected_app().await;
-        share_codex_with_remote_controller(&mut app);
-        let generation = app.codex_share.as_ref().unwrap().generation.clone();
+        let link = app.astation_link_gen;
         peer.send
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();
@@ -393,36 +354,13 @@ mod tests {
         peer.send
             .send(status("authenticated", &[("method", "session_proof")]))
             .unwrap();
-        let frames = pump(&mut app, &mut peer).await;
+        pump(&mut app, &mut peer).await;
         assert!(app.astation_connected);
         assert!(app.astation_reauth.is_none());
         assert_eq!(app.status_message.as_deref(), Some("Astation reconnected"));
-        assert!(
-            frames
-                .iter()
-                .any(|frame| matches!(frame, Some(AstationMessage::AgentListResponse { .. }))),
-            "agent list not re-sent: {frames:?}"
-        );
-        // Remote viewers start again from a fresh subscribe; nothing resumes.
-        assert!(!app.codex_share.as_ref().unwrap().has_viewer());
-        assert!(!app.codex_sender.as_ref().unwrap().remote_controlled());
-
-        // The local PTY is the same process, still running.
-        assert_eq!(app.codex_share.as_ref().unwrap().generation, generation);
-        app.send_codex_data("still alive\n");
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !app
-                .codex_terminal
-                .screen()
-                .contents()
-                .contains("still alive")
-            {
-                app.process_codex_output();
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("local PTY stopped answering");
+        // A new link: the session host gives it a new attachment, so clients
+        // `hello` again; no lease or input resumes.
+        assert_eq!(app.astation_link_gen, link + 1);
     }
 
     async fn assert_fails_closed(app: &mut App, peer: &mut Peer, notice: &str) {
@@ -434,9 +372,11 @@ mod tests {
             "normal reconnect not scheduled"
         );
         assert!(
-            app.terminal_ui.messages.iter().any(|m| m.contains(notice)),
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains(notice)),
             "no notice containing {notice:?}: {:?}",
-            app.terminal_ui.messages
+            app.status_message
         );
         // Nothing afterwards marks it online.
         app.process_astation_messages().await;
@@ -634,28 +574,23 @@ mod tests {
                     sessions.save_to(&sessions_path).unwrap();
                 }
                 let before = crate::status::tests::snapshot(&dir);
+                let link = app.astation_link_gen;
                 peer.send.send(reply).unwrap();
-                let frames = until_closed(&mut app, &mut peer).await;
+                until_closed(&mut app, &mut peer).await;
                 assert!(!app.astation_connected);
                 assert!(app.astation_reauth.is_none());
-                assert!(
-                    !frames
-                        .iter()
-                        .any(|frame| matches!(frame, AstationMessage::AgentListResponse { .. })),
-                    "{frames:?}"
-                );
+                assert_eq!(app.astation_link_gen, link);
                 assert_eq!(
                     crate::status::tests::snapshot(&dir),
                     before,
                     "re_pair {re_pair}"
                 );
                 assert!(
-                    app.terminal_ui
-                        .messages
-                        .iter()
-                        .any(|m| m.contains(crate::pairing_binding::CHANGED)),
+                    app.status_message
+                        .as_deref()
+                        .is_some_and(|m| m.contains(crate::pairing_binding::CHANGED)),
                     "{:?}",
-                    app.terminal_ui.messages
+                    app.status_message
                 );
             }
         }
@@ -694,10 +629,9 @@ mod tests {
         assert!(!app.astation_connected);
         assert!(app.astation_reconnect_at.is_some());
         assert!(
-            app.terminal_ui
-                .messages
-                .iter()
-                .any(|m| m.contains("astation-impostor"))
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("astation-impostor"))
         );
     }
 
@@ -728,34 +662,104 @@ mod tests {
     #[tokio::test]
     async fn requests_are_ignored_while_reauthentication_is_pending() {
         let (mut app, mut peer) = connected_app().await;
-        let (input, mut written) = crate::pty_session::PtyInput::test_channel();
-        app.claude_sender = Some(input);
+        app.hosted = Some(crate::app::hosted::Hosted::default());
+        let subscribe = Message::Subscribe {
+            terminal_id: "ses-aaaaaaaaaaaa".into(),
+            generation: uuid::Uuid::new_v4().to_string(),
+        };
         peer.send
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();
         next_auth(&mut app, &mut peer).await;
 
         peer.send
-            .send(AstationMessage::AgentInput {
-                agent_id: None,
-                kind: "text".into(),
-                text: Some("rm -rf build".into()),
-                key: None,
-            })
+            .send(AstationMessage::Terminal(subscribe.into()))
             .unwrap();
-        peer.send
-            .send(AstationMessage::Terminal(Message::List.into()))
-            .unwrap();
-        peer.send.send(AstationMessage::AgentListRequest).unwrap();
         let frames = pump(&mut app, &mut peer).await;
-        assert!(written.try_recv().is_err(), "agent input reached the PTY");
-        assert!(app.terminal_outbox.is_empty());
+        assert!(app.hosted.as_ref().unwrap().inbox.is_empty());
         assert!(
             !frames
                 .iter()
-                .any(|frame| matches!(frame, Some(AstationMessage::AgentListResponse { .. }))),
+                .any(|frame| matches!(frame, Some(AstationMessage::SessionWire(_)))),
             "answered a request while unauthenticated"
         );
         assert!(!app.astation_connected);
+    }
+
+    #[tokio::test]
+    async fn session_messages_go_to_the_runtime_host_with_their_link() {
+        let (mut app, mut peer) = connected_app().await;
+        let subscribe = Message::Subscribe {
+            terminal_id: "ses-aaaaaaaaaaaa".to_string(),
+            generation: "g".to_string(),
+        };
+        // Bare `atem` never links; were it to get one, nothing is answered.
+        app.handle_astation_message(AstationMessage::SessionWire(
+            serde_json::to_string(&AstationMessage::Terminal(subscribe.clone().into())).unwrap(),
+        ))
+        .await;
+        assert!(session_errors(&pump(&mut app, &mut peer).await).is_empty());
+
+        // Inside the runtime they go to the session host, with their link.
+        app.hosted = Some(crate::app::hosted::Hosted::default());
+        peer.send
+            .send(AstationMessage::Terminal(subscribe.into()))
+            .unwrap();
+        pump(&mut app, &mut peer).await;
+        let inbox = &app.hosted.as_ref().unwrap().inbox;
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].0, app.astation_link_gen);
+        assert!(inbox[0].1.contains("subscribe"));
+    }
+
+    fn session_errors(frames: &[Option<AstationMessage>]) -> Vec<serde_json::Value> {
+        frames
+            .iter()
+            .flatten()
+            .filter_map(|frame| match frame {
+                AstationMessage::SessionWire(text) => serde_json::from_str(text).ok(),
+                _ => None,
+            })
+            .filter(|v: &serde_json::Value| v["type"] == "session" && v["data"]["op"] == "error")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_full_session_inbox_refuses_with_busy() {
+        let (mut app, mut peer) = connected_app().await;
+        let mut hosted = crate::app::hosted::Hosted::default();
+        for _ in 0..crate::app::hosted::INBOX_LIMIT {
+            hosted
+                .inbox
+                .push_back((app.astation_link_gen, String::new()));
+        }
+        app.hosted = Some(hosted);
+        let list = r#"{"type":"session","data":{"v":1,"op":"list","id":"11111111-1111-4111-8111-111111111111"}}"#;
+        app.handle_astation_message(AstationMessage::SessionWire(list.into()))
+            .await;
+        let errors = session_errors(&pump(&mut app, &mut peer).await);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["data"]["code"], "busy");
+        assert_eq!(
+            errors[0]["data"]["re"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversize_session_message_is_answered_with_an_error() {
+        let (mut app, mut peer) = connected_app().await;
+        app.hosted = Some(crate::app::hosted::Hosted::default());
+        let subscribe = Message::Subscribe {
+            terminal_id: "ses-aaaaaaaaaaaa".into(),
+            generation: "x".repeat(40 * 1024),
+        };
+        peer.send
+            .send(AstationMessage::Terminal(subscribe.into()))
+            .unwrap();
+        let errors = session_errors(&pump(&mut app, &mut peer).await);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["data"]["code"], "unsupported_version");
+        assert!(app.hosted.as_ref().unwrap().inbox.is_empty());
     }
 }

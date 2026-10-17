@@ -1,0 +1,2156 @@
+//! The session host in the broker, in process: a real `serve` (workers in
+//! this process, fake agents) whose App holds a link to a fake Astation
+//! WebSocket peer, driven with real session-v1, terminal-v1 and chat-v1
+//! messages. The profile (pairing, verification) lives in a temp dir.
+use super::Clock;
+use crate::app::App;
+use crate::runtime::broker::{InProcess, Launcher};
+use crate::runtime::client::RuntimeClient;
+use crate::runtime::protocol::{ClientMsg, LaunchEnv, RuntimeMsg, SessionSummary};
+use crate::runtime::server::{Options, serve};
+use crate::websocket_client::AstationClient;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+const ASTATION: &str = "astation-host-test";
+const ACCOUNT: &str = "acct-1";
+const DEVICE: &str = "device-1";
+const TRUST_GEN: u64 = 3;
+const WAIT: Duration = Duration::from_secs(20);
+
+/// Unix socket paths are limited to ~100 bytes; keep them short.
+fn short_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("atem-hb")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+/// `body` on a current-thread runtime with a `LocalSet` (the App stays on one task).
+fn local<F: std::future::Future>(body: F) -> F::Output {
+    // Never the user's profile (src/test_profile.rs).
+    let profile = tempfile::tempdir().unwrap();
+    let _profile = crate::test_profile::use_dir(profile.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tokio::task::LocalSet::new().block_on(&runtime, body)
+}
+
+fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Echoes its input (the PTY echo is off; `cat` writes it back).
+fn echo_agent(dir: &Path) -> PathBuf {
+    script(
+        dir,
+        "echo-agent",
+        "stty -echo\nprintf 'READY\\r\\n'\nexec cat",
+    )
+}
+
+fn fake_claude() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/fake-claude.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    if perms.mode() & 0o111 != 0o111 {
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+/// A profile paired with `ASTATION` in trust generation 3, verified as
+/// `ACCOUNT`/`DEVICE` unless `verified` is false.
+fn profile(dir: &Path, verified: bool) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("pairing.json"),
+        json!({"version":1,"host_trust_gen":TRUST_GEN,"binding_id":"binding-1",
+               "astation_id":ASTATION,"created_at":1})
+        .to_string(),
+    )
+    .unwrap();
+    if verified {
+        let entry = json!({
+            "device_id": DEVICE, "data_account": ACCOUNT, "sign_gen": 1,
+            "astation_sign_pub": "", "astation_enc_pub": "", "recovery_sign_pub": "",
+            "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
+            "safety_code": "", "epoch_floor": 0, "account_state": null, "account_epoch": 0,
+        });
+        std::fs::write(
+            dir.join("cred_state.json"),
+            json!({"version":1,"astations":{ASTATION: entry}}).to_string(),
+        )
+        .unwrap();
+    }
+    let mut sessions = crate::auth::SessionManager::default();
+    sessions.insert_session(crate::auth::AuthSession::new(
+        "session-1".into(),
+        "token-1".into(),
+        ASTATION.into(),
+        "test-machine".into(),
+    ));
+    sessions.save_to(&dir.join("sessions.json")).unwrap();
+}
+
+/// The Astation end of the link.
+struct Peer {
+    to_atem: mpsc::UnboundedSender<String>,
+    from_atem: mpsc::UnboundedReceiver<Value>,
+    seen: Vec<Value>,
+    attachment: String,
+    /// The viewer: frames applied up to `view_at`.
+    view: vt100::Parser,
+    view_at: usize,
+}
+
+impl Peer {
+    fn send(&self, message: Value) {
+        self.to_atem.send(message.to_string()).unwrap();
+    }
+
+    /// A session-v1 request; its id.
+    fn request(&self, op: &str, fields: Value) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut data = json!({"v": 1, "op": op, "id": id});
+        for (k, v) in fields.as_object().unwrap() {
+            data[k] = v.clone();
+        }
+        self.send(json!({"type": "session", "data": data}));
+        id
+    }
+
+    /// The first message from `from` on that `pick` accepts; its index.
+    async fn wait_from(&mut self, from: usize, pick: impl Fn(&Value) -> bool) -> usize {
+        tokio::time::timeout(WAIT, async {
+            let mut at = from;
+            loop {
+                while at < self.seen.len() {
+                    if pick(&self.seen[at]) {
+                        return at;
+                    }
+                    at += 1;
+                }
+                let message = self.from_atem.recv().await.expect("the link closed");
+                self.seen.push(message);
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out; Atem sent: {:#?}", self.seen))
+    }
+
+    /// The next message (from now) `pick` accepts.
+    async fn wait(&mut self, pick: impl Fn(&Value) -> bool) -> Value {
+        let from = self.seen.len();
+        let at = self.wait_from(from, pick).await;
+        self.seen[at].clone()
+    }
+
+    /// The session-v1 reply to request `id`.
+    async fn reply(&mut self, id: &str) -> Value {
+        let at = self
+            .wait_from(0, |v| v["type"] == "session" && v["data"]["re"] == id)
+            .await;
+        self.seen[at]["data"].clone()
+    }
+
+    /// Everything received within `time`.
+    async fn drain(&mut self, time: Duration) {
+        let deadline = tokio::time::Instant::now() + time;
+        while let Ok(Some(message)) = tokio::time::timeout_at(deadline, self.from_atem.recv()).await
+        {
+            self.seen.push(message);
+        }
+    }
+
+    async fn hello(&mut self) -> Value {
+        let id = self.request("hello", json!({}));
+        let welcome = self.reply(&id).await;
+        assert_eq!(welcome["op"], "welcome", "{welcome}");
+        self.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
+        welcome
+    }
+
+    fn binding(&self, sid: &str, process_gen: &str, lease: Option<u64>) -> Value {
+        let mut binding = json!({
+            "target": {"account_id": ACCOUNT, "atem_device_id": DEVICE,
+                       "host_trust_gen": TRUST_GEN, "session_id": sid, "process_gen": process_gen},
+            "attachment_gen": self.attachment,
+        });
+        if let Some(epoch) = lease {
+            binding["lease_epoch"] = epoch.into();
+        }
+        binding
+    }
+
+    async fn acquire(&mut self, sid: &str, process_gen: &str) -> u64 {
+        let id = self.request(
+            "acquire",
+            json!({"binding": self.binding(sid, process_gen, None), "takeover": false}),
+        );
+        let lease = self.reply(&id).await;
+        assert_eq!(lease["op"], "lease", "{lease}");
+        lease["binding"]["lease_epoch"].as_u64().unwrap()
+    }
+
+    fn terminal(&self, op: &str, sid: &str, process_gen: &str, fields: Value, lease: Option<u64>) {
+        let mut data = json!({"v": 1, "op": op, "terminal_id": sid, "generation": process_gen,
+                              "binding": self.binding(sid, process_gen, lease)});
+        for (k, v) in fields.as_object().unwrap() {
+            data[k] = v.clone();
+        }
+        self.send(json!({"type": "terminal", "data": data}));
+    }
+
+    fn chat(&self, op: &str, conversation: &str, sid: &str, process_gen: &str, fields: Value) {
+        let lease = fields.get("lease_epoch").and_then(Value::as_u64);
+        let mut data = json!({"v": 1, "op": op, "conversationId": conversation, "agentId": sid,
+                              "binding": self.binding(sid, process_gen, lease)});
+        for (k, v) in fields.as_object().unwrap() {
+            if k != "lease_epoch" {
+                data[k] = v.clone();
+            }
+        }
+        self.send(json!({"type": "agentChat", "data": data}));
+    }
+}
+
+fn is_session(v: &Value, op: &str) -> bool {
+    v["type"] == "session" && v["data"]["op"] == op
+}
+
+fn is_chat(v: &Value, op: &str) -> bool {
+    v["type"] == "agentChat" && v["data"]["op"] == op
+}
+
+fn is_terminal(v: &Value, op: &str) -> bool {
+    v["type"] == "terminal" && v["data"]["op"] == op
+}
+
+struct Runtime {
+    dir: Rc<tempfile::TempDir>,
+    socket: PathBuf,
+    clock: Clock,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    peer: Peer,
+}
+
+impl Runtime {
+    /// A broker in a fresh dir, linked to a fake Astation; `verified`: the
+    /// profile is verified with it.
+    async fn start(verified: bool) -> Self {
+        let dir = Rc::new(short_dir());
+        profile(&dir.path().join("profile"), verified);
+        Self::start_in(dir, "rt.sock").await
+    }
+
+    /// Another broker of the same state dir (a restart).
+    async fn start_in(dir: Rc<tempfile::TempDir>, socket: &str) -> Self {
+        Self::start_with(dir, socket, true).await
+    }
+
+    /// `profile_at_start`: the broker reads the profile's identity at start
+    /// (else it starts unpaired and takes it from the first verified link).
+    async fn start_with(dir: Rc<tempfile::TempDir>, socket: &str, profile_at_start: bool) -> Self {
+        let root = dir.path();
+        let profile_dir = root.join("profile");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (to_atem, mut outgoing) = mpsc::unbounded_channel::<String>();
+        let (incoming, from_atem) = mpsc::unbounded_channel::<Value>();
+        tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                tokio::select! {
+                    message = outgoing.recv() => {
+                        let Some(text) = message else { break };
+                        if socket.send(WsMessage::Text(text)).await.is_err() { break; }
+                    }
+                    received = socket.next() => {
+                        let Some(Ok(received)) = received else { break };
+                        if let WsMessage::Text(text) = received
+                            && let Ok(value) = serde_json::from_str::<Value>(&text)
+                        {
+                            let _ = incoming.send(value);
+                        }
+                    }
+                }
+            }
+        });
+        let mut app = App::new();
+        // Never the user's sessions.json.
+        app.last_session_refresh = Some(Instant::now());
+        app.astation_client = AstationClient::new_with_test_state(
+            "atem-host-test",
+            profile_dir.join("sessions.json"),
+        );
+        app.astation_client
+            .connect_raw(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        // The connect-time authentication is covered by websocket_client tests.
+        app.astation_client.pin_astation_for_test(ASTATION);
+        app.astation_connected = true;
+        app.astation_link_gen = 1;
+        // Never reconnect to a real Astation from a test.
+        app.astation_reconnect = false;
+        let socket = root.join(socket);
+        let _ = std::fs::remove_file(&socket);
+        let unix = tokio::net::UnixListener::bind(&socket).unwrap();
+        let clock = Clock::default();
+        let options = Options {
+            idle: Duration::from_secs(600),
+            uid: unsafe { libc::getuid() },
+            launcher: Launcher::InProcess(InProcess {
+                state: root.join("state"),
+                socket_dir: root.join("ws"),
+                chat_root: root.join("run"),
+            }),
+            profile: profile_at_start.then(|| crate::status::Sources::in_dir(&profile_dir)),
+            clock: clock.clone(),
+            ops: crate::runtime::ops::OpEnv::unavailable(),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::task::spawn_local(serve(app, unix, options, async {
+            let _ = stopped.await;
+        }));
+        Self {
+            dir,
+            socket,
+            clock,
+            stop: Some(stop),
+            server,
+            peer: Peer {
+                to_atem,
+                from_atem,
+                seen: Vec::new(),
+                attachment: String::new(),
+                view: vt100::Parser::new(24, 80, 0),
+                view_at: 0,
+            },
+        }
+    }
+
+    async fn client(&self) -> RuntimeClient {
+        RuntimeClient::connect_at(&self.socket).await.unwrap()
+    }
+
+    async fn shutdown(mut self) -> Rc<tempfile::TempDir> {
+        let _ = self.stop.take().unwrap().send(());
+        tokio::time::timeout(Duration::from_secs(10), &mut self.server)
+            .await
+            .expect("the server stops")
+            .unwrap()
+            .unwrap();
+        self.dir
+    }
+
+    /// Launches `provider` running `binary` in `cwd` (default: the dir).
+    async fn launch(
+        &self,
+        client: &mut RuntimeClient,
+        provider: &str,
+        binary: &Path,
+        cwd: Option<&Path>,
+    ) -> SessionSummary {
+        let var = if provider == "claude" {
+            "CLAUDE_CLI_BIN"
+        } else {
+            "CODEX_CLI_BIN"
+        };
+        client
+            .send(&ClientMsg::Launch {
+                provider: provider.into(),
+                args: vec![],
+                cwd: cwd.unwrap_or(self.dir.path()).to_path_buf(),
+                env: LaunchEnv(vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (var.into(), binary.display().to_string()),
+                ]),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        expect(client, |m| match m {
+            RuntimeMsg::Launched { session } => Some(session),
+            RuntimeMsg::Error { text, .. } => panic!("launch failed: {text}"),
+            _ => None,
+        })
+        .await
+    }
+}
+
+async fn expect<T>(client: &mut RuntimeClient, mut pick: impl FnMut(RuntimeMsg) -> Option<T>) -> T {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let message = client.recv().await.unwrap().expect("the runtime closed");
+            if let Some(value) = pick(message) {
+                return value;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for a runtime message")
+}
+
+/// The session's descriptor from a fresh `list`.
+async fn listed(peer: &mut Peer, sid: &str) -> Value {
+    let id = peer.request("list", json!({}));
+    let sessions = peer.reply(&id).await;
+    assert_eq!(sessions["op"], "sessions", "{sessions}");
+    sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["session_id"] == sid)
+        .cloned()
+        .unwrap_or_else(|| panic!("{sid} not listed: {sessions}"))
+}
+
+/// Applies frames (acknowledging each) until the viewer's screen shows `text`.
+async fn screen_until(peer: &mut Peer, sid: &str, process_gen: &str, text: &str) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if peer.view.screen().contents().contains(text) {
+                return;
+            }
+            let at = peer
+                .wait_from(peer.view_at, |v| {
+                    is_terminal(v, "frame") && v["data"]["terminal_id"] == sid
+                })
+                .await;
+            let frame = peer.seen[at]["data"].clone();
+            peer.view_at = at + 1;
+            if frame["reset"] == true {
+                peer.view = vt100::Parser::new(
+                    frame["rows"].as_u64().unwrap() as u16,
+                    frame["cols"].as_u64().unwrap() as u16,
+                    0,
+                );
+            }
+            let bytes = STANDARD.decode(frame["bytes"].as_str().unwrap()).unwrap();
+            peer.view.process(&bytes);
+            let offset = frame["offset"].as_u64().unwrap() + bytes.len() as u64;
+            peer.terminal(
+                "ack",
+                sid,
+                process_gen,
+                json!({"stream_id": frame["stream_id"], "offset": offset}),
+                None,
+            );
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{text:?} never appeared"));
+}
+
+#[test]
+fn welcome_list_leases_terminal_input_and_local_input() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+
+        let welcome = peer.hello().await;
+        assert_eq!(welcome["account_id"], ACCOUNT);
+        assert_eq!(welcome["atem_device_id"], DEVICE);
+        assert_eq!(welcome["host_trust_gen"], TRUST_GEN);
+        assert_eq!(welcome["client_kind"], "native");
+        assert_eq!(welcome["permissions"], json!(["view", "control"]));
+
+        let descriptor = listed(peer, &sid).await;
+        assert_eq!(descriptor["process_gen"], pg.as_str());
+        assert_eq!(descriptor["provider"], "codex");
+        assert_eq!(descriptor["state"], "running");
+        assert_eq!(descriptor["controller"], Value::Null);
+        assert_eq!(
+            descriptor["cwd_label"],
+            rt.dir.path().file_name().unwrap().to_str().unwrap()
+        );
+
+        // A duplicate of a session message (same id) is handled once.
+        let id = uuid::Uuid::new_v4().to_string();
+        let list = json!({"type":"session","data":{"v":1,"op":"list","id":id}});
+        peer.send(list.clone());
+        peer.send(list);
+        peer.reply(&id).await;
+        peer.drain(Duration::from_millis(500)).await;
+        let replies = peer
+            .seen
+            .iter()
+            .filter(|v| v["data"]["re"] == id.as_str())
+            .count();
+        assert_eq!(replies, 1);
+        // The same id with other content is another message: it is handled.
+        peer.send(json!({"type":"session","data":{"v":1,"op":"list","id":id,"extra":1}}));
+        peer.drain(Duration::from_millis(500)).await;
+        let replies = peer
+            .seen
+            .iter()
+            .filter(|v| v["data"]["re"] == id.as_str())
+            .count();
+        assert_eq!(replies, 2);
+
+        // View, then control: input goes through the worker.
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        screen_until(peer, &sid, &pg, "READY").await;
+        // Without a lease input is refused.
+        peer.terminal(
+            "input",
+            &sid,
+            &pg,
+            json!({"stream_id": stream, "sequence": 0, "bytes": STANDARD.encode("NOLEASE\r")}),
+            Some(1),
+        );
+        let refused = peer.wait(|v| is_terminal(v, "error")).await;
+        assert_eq!(refused["data"]["code"], "stale_lease");
+        let epoch = peer.acquire(&sid, &pg).await;
+        peer.terminal(
+            "input",
+            &sid,
+            &pg,
+            json!({"stream_id": stream, "sequence": 1, "bytes": STANDARD.encode("REMOTE-1\r")}),
+            Some(epoch),
+        );
+        let written = peer.wait(|v| is_terminal(v, "written")).await;
+        assert_eq!(written["data"]["sequence"], 1);
+        assert_eq!(written["data"]["error"], Value::Null);
+        screen_until(peer, &sid, &pg, "REMOTE-1").await;
+        assert_eq!(listed(peer, &sid).await["controller"]["lease_epoch"], epoch);
+
+        // Renewal, then expiry at 15 s without one.
+        let id = peer.request(
+            "renew",
+            json!({"binding": peer.binding(&sid, &pg, Some(epoch))}),
+        );
+        assert_eq!(peer.reply(&id).await["op"], "lease");
+        rt.clock.skip(15_001);
+        let peer = &mut rt.peer;
+        let changed = peer.wait(|v| is_session(v, "lease_changed")).await;
+        assert_eq!(changed["data"]["reason"], "expired");
+        let id = peer.request(
+            "renew",
+            json!({"binding": peer.binding(&sid, &pg, Some(epoch))}),
+        );
+        let error = peer.reply(&id).await;
+        assert_eq!(error["code"], "stale_lease");
+        peer.terminal(
+            "input",
+            &sid,
+            &pg,
+            json!({"stream_id": stream, "sequence": 2, "bytes": STANDARD.encode("EXPIRED\r")}),
+            Some(epoch),
+        );
+        let refused = peer.wait(|v| is_terminal(v, "error")).await;
+        assert_eq!(refused["data"]["code"], "stale_lease");
+
+        // Local input wins: it revokes the lease before it is written.
+        let epoch = peer.acquire(&sid, &pg).await;
+        client
+            .send(&ClientMsg::Attach {
+                session_id: sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        expect(&mut client, |m| {
+            matches!(m, RuntimeMsg::Attached { .. }).then_some(())
+        })
+        .await;
+        client
+            .send(&ClientMsg::input(&sid, b"LOCAL-1\r"))
+            .await
+            .unwrap();
+        let peer = &mut rt.peer;
+        let changed = peer.wait(|v| is_session(v, "lease_changed")).await;
+        assert_eq!(changed["data"]["reason"], "local_input");
+        assert_eq!(changed["data"]["controller"], Value::Null);
+        screen_until(peer, &sid, &pg, "LOCAL-1").await;
+        peer.terminal(
+            "input",
+            &sid,
+            &pg,
+            json!({"stream_id": stream, "sequence": 3, "bytes": STANDARD.encode("STALE\r")}),
+            Some(epoch),
+        );
+        let refused = peer.wait(|v| is_terminal(v, "error")).await;
+        assert_eq!(refused["data"]["code"], "stale_lease");
+        assert!(
+            !peer
+                .seen
+                .iter()
+                .any(|v| v.to_string().contains(&STANDARD.encode("EXPIRED"))),
+        );
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn queued_remote_bytes_are_dropped_at_the_worker_when_local_input_takes_over() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        // Raw, no echo: reads nothing for two seconds, so writes queue.
+        let agent = script(
+            rt.dir.path(),
+            "sleepy",
+            "stty raw -echo\nprintf 'SLEEPING\\r\\n'\nsleep 2\nexec cat",
+        );
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        screen_until(peer, &sid, &pg, "SLEEPING").await;
+        let epoch = peer.acquire(&sid, &pg).await;
+        let chunk = STANDARD.encode([b'r'; 8 * 1024]);
+        for sequence in 0..24 {
+            peer.terminal(
+                "input",
+                &sid,
+                &pg,
+                json!({"stream_id": stream, "sequence": sequence, "bytes": chunk}),
+                Some(epoch),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client
+            .send(&ClientMsg::Attach {
+                session_id: sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        client.send(&ClientMsg::input(&sid, b"L")).await.unwrap();
+        let peer = &mut rt.peer;
+        let changed = peer.wait(|v| is_session(v, "lease_changed")).await;
+        assert_eq!(changed["data"]["reason"], "local_input");
+        // Every remote chunk is answered; those still queued were dropped.
+        let mut answered = 0;
+        let mut dropped = 0;
+        let mut at = 0;
+        while answered < 24 {
+            at = peer.wait_from(at, |v| is_terminal(v, "written")).await;
+            let error = peer.seen[at]["data"]["error"].clone();
+            if error
+                .as_str()
+                .is_some_and(|e| e.contains("control changed"))
+            {
+                dropped += 1;
+            }
+            answered += 1;
+            at += 1;
+        }
+        assert!(dropped > 0, "nothing queued was dropped: {:#?}", peer.seen);
+        rt.shutdown().await;
+    });
+}
+
+/// Opens `conversation` once chat is available; returns `opened`.
+async fn open_chat(peer: &mut Peer, conversation: &str, sid: &str, pg: &str) -> Value {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let from = peer.seen.len();
+            peer.chat("open", conversation, sid, pg, json!({}));
+            let at = peer
+                .wait_from(from, |v| {
+                    v["type"] == "agentChat"
+                        && v["data"]["conversationId"] == conversation
+                        && (v["data"]["op"] == "opened" || v["data"]["op"] == "error")
+                })
+                .await;
+            if peer.seen[at]["data"]["op"] == "opened"
+                && peer.seen[at]["data"]["status"]["state"] == "ready"
+            {
+                return peer.seen[at].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("chat never became available")
+}
+
+/// Submits `text` as `request_id` and waits for its `complete`.
+async fn submit_until_complete(
+    peer: &mut Peer,
+    conversation: &str,
+    sid: &str,
+    pg: &str,
+    lease: u64,
+    request_id: &str,
+    text: &str,
+) -> Vec<Value> {
+    let from = peer.seen.len();
+    peer.chat(
+        "submit",
+        conversation,
+        sid,
+        pg,
+        json!({"generation": pg, "requestId": request_id, "text": text, "lease_epoch": lease}),
+    );
+    let done = peer
+        .wait_from(from, |v| {
+            (is_chat(v, "complete") || is_chat(v, "error")) && v["data"]["requestId"] == request_id
+        })
+        .await;
+    peer.seen[from..=done].to_vec()
+}
+
+#[test]
+fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let session = rt.launch(&mut client, "claude", &fake_claude(), None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        let descriptor = listed(peer, &sid).await;
+        assert_eq!(
+            descriptor["capabilities"],
+            json!(["terminal-v1", "chat-v1"])
+        );
+        open_chat(peer, "conv-1", &sid, &pg).await;
+
+        // Without a lease the submit is refused, and nothing is typed.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let refused =
+            submit_until_complete(peer, "conv-1", &sid, &pg, 1, &request_id, "no lease").await;
+        let refused = refused.last().unwrap();
+        assert_eq!(refused["data"]["code"], "stale_lease", "{refused}");
+
+        let lease = peer.acquire(&sid, &pg).await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let events = submit_until_complete(
+            peer,
+            "conv-1",
+            &sid,
+            &pg,
+            lease,
+            &request_id,
+            "run the tests",
+        )
+        .await;
+        let accepted = events
+            .iter()
+            .position(|v| is_chat(v, "accepted") && v["data"]["requestId"] == request_id.as_str())
+            .expect("accepted");
+        let reply = events
+            .iter()
+            .position(|v| v["type"] == "agentChat" && v.to_string().contains("reply 1"))
+            .expect("the agent's reply");
+        let complete = events.last().unwrap();
+        assert!(is_chat(complete, "complete"), "{complete}");
+        assert_eq!(complete["data"]["outcome"], "done");
+        assert!(accepted < reply);
+        // The user's message carries the request id.
+        assert!(events.iter().any(|v| is_chat(v, "message")
+            && v["data"]["role"] == "user"
+            && v["data"]["requestId"] == request_id.as_str()));
+
+        // A duplicate is answered from its receipt, never typed again.
+        let again = submit_until_complete(
+            peer,
+            "conv-1",
+            &sid,
+            &pg,
+            lease,
+            &request_id,
+            "run the tests",
+        )
+        .await;
+        assert!(is_chat(again.last().unwrap(), "complete"));
+        assert!(!again.iter().any(|v| v.to_string().contains("reply 2")));
+        // Another text under the same id is a reused id.
+        let reused =
+            submit_until_complete(peer, "conv-1", &sid, &pg, lease, &request_id, "other").await;
+        assert_eq!(reused.last().unwrap()["data"]["code"], "request_id_reused");
+        let id = peer.request(
+            "receipt_query",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_ids": [request_id]}),
+        );
+        let receipts = peer.reply(&id).await;
+        assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
+        let old_attachment = peer.attachment.clone();
+
+        // The broker restarts; its worker survives and is adopted.
+        drop(client);
+        let dir = rt.shutdown().await;
+        let mut rt = Runtime::start_in(dir, "rt2.sock").await;
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        assert_ne!(peer.attachment, old_attachment);
+        let descriptor = listed(peer, &sid).await;
+        assert_eq!(descriptor["process_gen"], pg.as_str());
+        assert_eq!(descriptor["state"], "running");
+        // The receipt is still there, under the same target.
+        let id = peer.request(
+            "receipt_query",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_ids": [request_id]}),
+        );
+        let receipts = peer.reply(&id).await;
+        assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
+        // The old attachment is gone: requests naming it are refused.
+        let mut stale = peer.binding(&sid, &pg, None);
+        stale["attachment_gen"] = Value::String(old_attachment);
+        let id = peer.request("acquire", json!({"binding": stale, "takeover": false}));
+        assert_eq!(peer.reply(&id).await["code"], "stale_target");
+        // The duplicate submit returns the recorded receipt; nothing is typed.
+        let lease = peer.acquire(&sid, &pg).await;
+        let again = submit_until_complete(
+            peer,
+            "conv-2",
+            &sid,
+            &pg,
+            lease,
+            &request_id,
+            "run the tests",
+        )
+        .await;
+        assert!(is_chat(again.last().unwrap(), "complete"));
+        assert!(!again.iter().any(|v| v.to_string().contains("reply 2")));
+        // Chat goes on in the adopted session: its history, and a new prompt.
+        let from = peer.seen.len();
+        open_chat(peer, "conv-3", &sid, &pg).await;
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            peer.seen[from..].iter().any(|v| is_chat(v, "message")
+                && v["data"]["conversationId"] == "conv-3"
+                && v["data"]["history"] == true
+                && v.to_string().contains("run the tests")),
+            "no history after the restart"
+        );
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let events = submit_until_complete(
+            peer,
+            "conv-3",
+            &sid,
+            &pg,
+            lease,
+            &request_id,
+            "after restart",
+        )
+        .await;
+        let complete = events.last().unwrap();
+        assert!(is_chat(complete, "complete"), "{complete}");
+        assert!(events.iter().any(|v| v.to_string().contains("reply 2")));
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_link_that_is_not_a_verified_pairing_gets_no_attachment() {
+    local(async {
+        let mut rt = Runtime::start(false).await;
+        let peer = &mut rt.peer;
+        let id = peer.request("hello", json!({}));
+        let error = peer.reply(&id).await;
+        assert_eq!(error["op"], "error");
+        assert_eq!(error["code"], "unauthorized");
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn mark_tasks_wait_for_a_remote_lease_holder_and_are_written_without_one() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let project = rt.dir.path().join("project");
+        std::fs::create_dir_all(project.join(".chisel/tasks")).unwrap();
+        std::fs::write(
+            project.join(".chisel/tasks/t1.json"),
+            json!({"title": "Project B"}).to_string(),
+        )
+        .unwrap();
+        // Claude as an agent that records what it is typed.
+        let agent = script(
+            rt.dir.path(),
+            "recorder",
+            "stty -echo\nprintf 'READY\\r\\n'\nsleep 1\nexec cat >> typed.txt",
+        );
+        let typed = project.join("typed.txt");
+        let session = rt
+            .launch(&mut client, "claude", &agent, Some(&project))
+            .await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        peer.wait(|v| is_terminal(v, "attached")).await;
+        screen_until(peer, &sid, &pg, "READY").await;
+
+        // A remote lease holder exists: the task waits.
+        let epoch = peer.acquire(&sid, &pg).await;
+        // Let the broker mirror the lease to the App.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        peer.send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
+        peer.drain(Duration::from_millis(800)).await;
+        let text = std::fs::read_to_string(&typed).unwrap_or_default();
+        assert!(!text.contains("Page title"), "{text:?}");
+
+        // Released: the task is typed, as local-origin input.
+        let id = peer.request(
+            "release",
+            json!({"binding": peer.binding(&sid, &pg, Some(epoch))}),
+        );
+        assert_eq!(peer.reply(&id).await["op"], "lease_released");
+        // A local reclaim right after (no remote lease, no remote bytes)
+        // never drops the queued prompt.
+        client
+            .send(&ClientMsg::Attach {
+                session_id: sid.clone(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            client
+                .send(&ClientMsg::Reclaim {
+                    session_id: sid.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let text = std::fs::read_to_string(&typed).unwrap_or_default();
+                if text.contains("Page title: Project B") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the mark task was never typed");
+        // No lease was revoked or granted by it.
+        assert!(
+            !peer
+                .seen
+                .iter()
+                .any(|v| is_session(v, "lease_changed") && v["data"]["reason"] == "local_input")
+        );
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn re_authentication_fences_the_attachment_and_its_lease_expires() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        let hello_id = uuid::Uuid::new_v4().to_string();
+        let hello = json!({"type":"session","data":{"v":1,"op":"hello","id":hello_id}});
+        peer.send(hello.clone());
+        let welcome = peer.reply(&hello_id).await;
+        peer.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
+        let epoch = peer.acquire(&sid, &pg).await;
+        let old = peer.binding(&sid, &pg, Some(epoch));
+
+        // Astation challenges the open socket again, then accepts the proof.
+        let status = |status: &str, data: Value| json!({"type": "statusUpdate", "data": {"status": status, "data": data}});
+        peer.send(status(
+            "auth_required",
+            json!({"astation_id": ASTATION, "challenge": "b".repeat(64),
+                   "transport": "relay", "protocol": "2"}),
+        ));
+        peer.wait(|v| v["type"] == "statusUpdate" && v["data"]["status"] == "auth")
+            .await;
+        peer.send(status("authenticated", json!({"method": "session_proof"})));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // A new attachment: the same hello again is a retry there, handled.
+        let from = peer.seen.len();
+        peer.send(hello);
+        let at = peer
+            .wait_from(from, |v| {
+                v["type"] == "session" && v["data"]["re"] == hello_id.as_str()
+            })
+            .await;
+        let welcome = peer.seen[at]["data"].clone();
+        assert_eq!(welcome["op"], "welcome", "{welcome}");
+        peer.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
+        assert_ne!(welcome["attachment_gen"], old["attachment_gen"]);
+        let id = peer.request("renew", json!({"binding": old}));
+        assert_eq!(peer.reply(&id).await["code"], "stale_target");
+        // Its lease is not released; it expires (nothing renews it).
+        let descriptor = listed(peer, &sid).await;
+        assert_eq!(descriptor["controller"]["lease_epoch"], epoch);
+        rt.clock.skip(15_001);
+        let peer = &mut rt.peer;
+        let changed = peer.wait(|v| is_session(v, "lease_changed")).await;
+        assert_eq!(changed["data"]["reason"], "expired");
+        assert!(peer.acquire(&sid, &pg).await > epoch);
+        rt.shutdown().await;
+    });
+}
+
+/// Astation reset its session client (e.g. after the Mac slept) and says
+/// `hello` again on the same authenticated link: the attachment is replaced.
+#[test]
+fn a_second_hello_on_the_link_replaces_the_attachment() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        let first = peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        let epoch = peer.acquire(&sid, &pg).await;
+        let old = peer.binding(&sid, &pg, Some(epoch));
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": old, "request_id": request_id, "kind": "interrupt", "payload": {}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+
+        let welcome = peer.hello().await;
+        assert_ne!(welcome["attachment_gen"], first["attachment_gen"]);
+        assert_ne!(welcome["controller_session"], first["controller_session"]);
+        assert_eq!(welcome["permissions"], first["permissions"]);
+        assert!(
+            welcome["authorization_ms_left"].as_u64().unwrap()
+                <= first["authorization_ms_left"].as_u64().unwrap()
+        );
+        // No lease carried over; the old attachment_gen is stale.
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
+        let id = peer.request("renew", json!({"binding": old}));
+        assert_eq!(peer.reply(&id).await["code"], "stale_target");
+        let from = peer.seen.len();
+        let mut input = json!({"v": 1, "op": "input", "terminal_id": sid, "generation": pg,
+            "binding": old, "stream_id": stream, "sequence": 0,
+            "bytes": STANDARD.encode("OLD\r")});
+        input["binding"]["lease_epoch"] = epoch.into();
+        peer.send(json!({"type": "terminal", "data": input}));
+        let refused = peer.wait_from(from, |v| is_terminal(v, "error")).await;
+        assert_eq!(peer.seen[refused]["data"]["code"], "stale_target");
+        // The receipt is still there.
+        let id = peer.request(
+            "receipt_query",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_ids": [request_id]}),
+        );
+        let receipts = peer.reply(&id).await;
+        assert_eq!(receipts["receipts"][0]["request_id"], request_id.as_str());
+        // Control again without takeover.
+        assert!(peer.acquire(&sid, &pg).await > epoch);
+        // At most one replacement a second.
+        let id = peer.request("hello", json!({}));
+        assert_eq!(peer.reply(&id).await["code"], "busy");
+        rt.clock.skip(1_000);
+        let again = rt.peer.hello().await;
+        assert_ne!(again["attachment_gen"], welcome["attachment_gen"]);
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_stop_submission_completes_when_the_agent_exits() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        let epoch = peer.acquire(&sid, &pg).await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, Some(epoch)), "request_id": request_id,
+                   "kind": "stop", "payload": {}}),
+        );
+        let receipt = peer.reply(&id).await;
+        assert_eq!(receipt["op"], "receipt", "{receipt}");
+        assert_eq!(receipt["state"], "accepted");
+        let done = peer
+            .wait_from(0, |v| {
+                is_session(v, "receipt")
+                    && v["data"]["request_id"] == request_id.as_str()
+                    && v["data"]["state"] == "completed"
+            })
+            .await;
+        assert!(done > 0);
+        let exited = peer
+            .wait_from(0, |v| {
+                is_session(v, "session_changed")
+                    && v["data"]["descriptor"]["session_id"] == sid.as_str()
+                    && v["data"]["descriptor"]["state"] == "exited"
+            })
+            .await;
+        assert!(exited > 0);
+        rt.shutdown().await;
+    });
+}
+
+/// A session the broker started, in a worker in this process.
+async fn broker_session(dir: &Path) -> crate::runtime::broker::BrokerSession {
+    use crate::runtime::adopt::SpawnRequest;
+    let agent = echo_agent(dir);
+    let launcher = Launcher::InProcess(InProcess {
+        state: dir.join("state"),
+        socket_dir: dir.join("ws"),
+        chat_root: dir.join("chat"),
+    });
+    let request = SpawnRequest {
+        session_id: crate::session::SessionId::new(),
+        process_gen: uuid::Uuid::new_v4().to_string(),
+        provider: crate::session::Provider::Codex,
+        args: vec![],
+        cwd: dir.to_path_buf(),
+        rows: 24,
+        cols: 80,
+    };
+    let env = LaunchEnv(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("CODEX_CLI_BIN".into(), agent.display().to_string()),
+    ]);
+    let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
+    crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms)
+}
+
+#[tokio::test]
+async fn adoption_refuses_a_worker_epoch_beyond_the_reserved_block() {
+    use crate::runtime::broker::SessionState;
+    let dir = short_dir();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    // Within the block of an empty journal (floor 0): adopted as it is.
+    let mut fine = broker_session(dir.path()).await;
+    fine.raise_input_epoch_to(super::LEASE_EPOCH_BLOCK).unwrap();
+    bridge.check_adoption(&mut fine);
+    assert!(fine.is_live());
+    assert_eq!(fine.input_epoch(), super::LEASE_EPOCH_BLOCK);
+    // Beyond it: an epoch no broker of this journal granted.
+    let mut ahead = broker_session(dir.path()).await;
+    ahead
+        .raise_input_epoch_to(super::LEASE_EPOCH_BLOCK + 1)
+        .unwrap();
+    bridge.check_adoption(&mut ahead);
+    assert!(!ahead.is_live());
+    assert_eq!(ahead.state, SessionState::RecoveryRequired);
+    // The runtime epoch moves on with every start of the journal's broker.
+    let first = bridge.host().context().runtime_epoch;
+    drop(bridge);
+    let again =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    assert_eq!(again.host().context().runtime_epoch, first + 1);
+}
+
+#[test]
+fn classification_follows_section_6() {
+    use super::super::broker::WriteOutcome;
+    use crate::session_protocol::host::DispatchReport;
+    let outcome = |ok, dropped, no_effect| WriteOutcome {
+        seq: 0,
+        ok,
+        dropped,
+        no_effect,
+        error: None,
+    };
+    assert_eq!(super::classify(&outcome(true, false, false)), None);
+    assert_eq!(
+        super::classify(&outcome(false, true, false)),
+        Some(DispatchReport::FailedNoEffect)
+    );
+    assert_eq!(
+        super::classify(&outcome(false, false, true)),
+        Some(DispatchReport::FailedNoEffect)
+    );
+    assert_eq!(
+        super::classify(&outcome(false, false, false)),
+        Some(DispatchReport::FailedAfterPossibleEffect)
+    );
+}
+
+#[test]
+fn the_submitter_hears_the_turns_real_outcome() {
+    let env = super::complete_envelope(
+        "c1",
+        "ses-aaaaaaaaaaaa",
+        None,
+        "r1".into(),
+        Some("t1".into()),
+        crate::chat::adapter::Outcome::Interrupted,
+    );
+    assert_eq!(env.op, "complete");
+    assert_eq!(env.body["outcome"], "interrupted");
+    assert_eq!(env.body["turnId"], "t1");
+}
+
+#[test]
+fn congestion_keeps_written_acks_and_drops_only_frames() {
+    use super::Queued;
+    let mut queue = std::collections::VecDeque::from(vec![
+        Queued::Frame("f1".into()),
+        Queued::Other("written-1".into()),
+        Queued::Frame("f2".into()),
+        Queued::Other("written-2".into()),
+    ]);
+    super::drop_frames(&mut queue);
+    assert_eq!(
+        Vec::from(queue),
+        [
+            Queued::Other("written-1".into()),
+            Queued::Other("written-2".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn repeated_reclaims_never_push_the_worker_epoch_past_the_block() {
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    let session = broker_session(dir.path()).await;
+    let sid = session.id.clone();
+    let mut sessions = std::collections::BTreeMap::new();
+    sessions.insert(sid.clone(), session);
+    let mut app = App::new();
+    app.hosted = Some(Default::default());
+    app.astation_reconnect = false;
+    bridge.tick(&mut app, &mut sessions, false);
+    // Local writes in flight (a mark task's prompt, typing) are never dropped
+    // by a reclaim without a remote lease.
+    sessions.get_mut(&sid).unwrap().write(b"keep me\n").unwrap();
+    for _ in 0..(2 * super::LEASE_EPOCH_BLOCK) {
+        bridge
+            .local_input(&sid, Vec::new(), &app.astation_client, &mut sessions)
+            .unwrap();
+    }
+    assert_eq!(sessions[&sid].input_epoch(), 0);
+}
+
+#[test]
+fn a_new_identity_restarts_the_host_under_it() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        profile(&dir.path().join("profile"), true);
+        // Started unpaired; the first verified link names the identity.
+        let mut rt = Runtime::start_with(dir, "rt.sock", false).await;
+        let peer = &mut rt.peer;
+        let welcome = peer.hello().await;
+        assert_eq!(welcome["account_id"], ACCOUNT);
+        assert_eq!(welcome["atem_device_id"], DEVICE);
+        assert_eq!(welcome["host_trust_gen"], TRUST_GEN);
+        let id = peer.request("list", json!({}));
+        let sessions = peer.reply(&id).await;
+        // Epoch 1 at start, 2 for the new identity.
+        assert_eq!(sessions["runtime_epoch"], 2, "{sessions}");
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn interrupts_complete_at_once_without_a_turn_and_are_unknown_when_unobserved() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let claude = rt.launch(&mut client, "claude", &fake_claude(), None).await;
+        let codex = rt
+            .launch(&mut client, "codex", &echo_agent(rt.dir.path()), None)
+            .await;
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        open_chat(peer, "conv-1", &claude.id, &claude.generation).await;
+        let mut ids = Vec::new();
+        for session in [&claude, &codex] {
+            let epoch = peer.acquire(&session.id, &session.generation).await;
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let id = peer.request(
+                "submit",
+                json!({"binding": peer.binding(&session.id, &session.generation, Some(epoch)),
+                       "request_id": request_id, "kind": "interrupt", "payload": {}}),
+            );
+            assert_eq!(peer.reply(&id).await["state"], "accepted");
+            ids.push(request_id);
+        }
+        // Claude is ready: no turn runs, so the interrupt completes at once.
+        let done = peer
+            .wait_from(0, |v| {
+                is_session(v, "receipt")
+                    && v["data"]["request_id"] == ids[0].as_str()
+                    && v["data"]["state"] == "completed"
+            })
+            .await;
+        assert_eq!(peer.seen[done]["data"]["detail"], "no turn was running");
+        // Codex has no chat: nothing can observe it within 10 s.
+        rt.clock.skip(10_001);
+        let peer = &mut rt.peer;
+        let unknown = peer
+            .wait_from(0, |v| {
+                is_session(v, "receipt")
+                    && v["data"]["request_id"] == ids[1].as_str()
+                    && v["data"]["state"] == "outcome_unknown"
+            })
+            .await;
+        assert_eq!(
+            peer.seen[unknown]["data"]["detail"],
+            "no interrupt observed"
+        );
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn the_link_is_fenced_and_dropped_at_its_authorization_deadline() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        rt.peer.hello().await;
+        rt.clock.skip(super::LINK_AUTHORIZATION_MS + 1);
+        // The broker drops the link (a reconnect authenticates it again).
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("the link stayed open past its authorization");
+        rt.shutdown().await;
+    });
+}
+
+/// `atem unpair` took effect without telling the runtime (no `reload`
+/// delivered): the broker notices the changed pairing on its own and drops
+/// the link with its attachment.
+#[test]
+fn a_changed_pairing_drops_the_link_without_a_reload() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        rt.peer.hello().await;
+        std::fs::write(
+            rt.dir.path().join("profile").join("pairing.json"),
+            json!({"version": 1, "host_trust_gen": TRUST_GEN + 1}).to_string(),
+        )
+        .unwrap();
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("the link of a removed pairing stayed open");
+        rt.shutdown().await;
+    });
+}
+
+/// A suspended machine: the monotonic clock stood still, wall time passed
+/// the 24 h. The authorization holds in wall time too.
+#[test]
+fn the_link_is_dropped_when_wall_time_passes_its_authorization() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        rt.peer.hello().await;
+        rt.clock.skip_wall(super::LINK_AUTHORIZATION_MS + 1);
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("the link stayed open past its wall-clock authorization");
+        rt.shutdown().await;
+    });
+}
+
+/// Every message `client` gets within `time`.
+async fn collect(client: &mut RuntimeClient, time: Duration) -> Vec<RuntimeMsg> {
+    let mut messages = Vec::new();
+    let deadline = tokio::time::Instant::now() + time;
+    while let Ok(Ok(Some(message))) = tokio::time::timeout_at(deadline, client.recv()).await {
+        messages.push(message);
+    }
+    messages
+}
+
+async fn attach_client(
+    client: &mut RuntimeClient,
+    sid: &str,
+    rows: u16,
+    cols: u16,
+) -> SessionSummary {
+    client
+        .send(&ClientMsg::Attach {
+            session_id: sid.to_string(),
+            rows,
+            cols,
+        })
+        .await
+        .unwrap();
+    expect(client, |m| match m {
+        RuntimeMsg::Attached { session, .. } => Some(session),
+        _ => None,
+    })
+    .await
+}
+
+#[test]
+fn a_local_paste_is_written_whole_while_astation_types() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let typed = rt.dir.path().join("typed.bin");
+        // Raw, bracketed paste on: records every byte it is typed.
+        let agent = script(
+            rt.dir.path(),
+            "recorder",
+            &format!(
+                "stty raw -echo\nprintf '\\033[?2004hREADY\\r\\n'\nexec cat > '{}'",
+                typed.display()
+            ),
+        );
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        screen_until(peer, &sid, &pg, "READY").await;
+        attach_client(&mut client, &sid, 24, 80).await;
+
+        // Astation holds the lease and types.
+        let epoch = peer.acquire(&sid, &pg).await;
+        let remote = STANDARD.encode([b'R'; 1000]);
+        for sequence in 0..4 {
+            peer.terminal(
+                "input",
+                &sid,
+                &pg,
+                json!({"stream_id": stream, "sequence": sequence, "bytes": remote}),
+                Some(epoch),
+            );
+        }
+        // A local paste larger than one input, while Astation keeps
+        // taking the lease back and typing.
+        let text = "P".repeat(40 * 1024);
+        client
+            .send(&ClientMsg::Paste {
+                session_id: sid.clone(),
+                bytes: STANDARD.encode(&text),
+            })
+            .await
+            .unwrap();
+        let peer = &mut rt.peer;
+        for round in 0..5u64 {
+            let id = peer.request(
+                "acquire",
+                json!({"binding": peer.binding(&sid, &pg, None), "takeover": false}),
+            );
+            let lease = peer.reply(&id).await;
+            if lease["op"] == "lease" {
+                let epoch = lease["binding"]["lease_epoch"].as_u64().unwrap();
+                peer.terminal(
+                    "input",
+                    &sid,
+                    &pg,
+                    json!({"stream_id": stream, "sequence": 10 + round, "bytes": remote}),
+                    Some(epoch),
+                );
+            }
+        }
+        let changed = peer
+            .wait_from(0, |v| {
+                is_session(v, "lease_changed") && v["data"]["reason"] == "local_input"
+            })
+            .await;
+        assert!(changed > 0);
+        let expected = format!("\x1b[200~{text}\x1b[201~");
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let written = std::fs::read(&typed).unwrap_or_default();
+                if String::from_utf8_lossy(&written).contains("\x1b[201~") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the paste never arrived");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let written = String::from_utf8(std::fs::read(&typed).unwrap()).unwrap();
+        // Intact and contiguous: no remote byte inside it.
+        assert!(
+            written.contains(&expected),
+            "the paste was split or interleaved"
+        );
+        assert_eq!(written.matches('P').count(), text.len());
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_local_resize_under_a_remote_lease_waits_for_the_reclaim() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        peer.wait(|v| is_terminal(v, "attached")).await;
+        screen_until(peer, &sid, &pg, "READY").await;
+        let attached = attach_client(&mut client, &sid, 24, 80).await;
+        assert_eq!((attached.rows, attached.cols), (24, 80));
+        peer.acquire(&sid, &pg).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The remote controller owns the size: a local resize is kept for later.
+        client
+            .send(&ClientMsg::Resize {
+                session_id: sid.clone(),
+                rows: 30,
+                cols: 100,
+            })
+            .await
+            .unwrap();
+        let heard = collect(&mut client, Duration::from_millis(500)).await;
+        assert!(
+            !heard
+                .iter()
+                .any(|m| matches!(m, RuntimeMsg::Attached { session, .. } if session.rows == 30)),
+            "{heard:?}"
+        );
+        client.send(&ClientMsg::List).await.unwrap();
+        let sessions = expect(&mut client, |m| match m {
+            RuntimeMsg::Sessions { sessions } => Some(sessions),
+            _ => None,
+        })
+        .await;
+        let listed = sessions.iter().find(|s| s.id == sid).unwrap();
+        assert_eq!((listed.rows, listed.cols), (24, 80));
+
+        // Reclaim: the local size applies.
+        client
+            .send(&ClientMsg::Reclaim {
+                session_id: sid.clone(),
+            })
+            .await
+            .unwrap();
+        let session = expect(&mut client, |m| match m {
+            RuntimeMsg::Attached { session, .. } if session.rows == 30 => Some(session),
+            _ => None,
+        })
+        .await;
+        assert_eq!((session.rows, session.cols), (30, 100));
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn mark_task_notices_reach_only_the_frontend_of_their_session() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let mut other = rt.client().await;
+        let project = rt.dir.path().join("project");
+        std::fs::create_dir_all(project.join(".chisel/tasks")).unwrap();
+        std::fs::write(
+            project.join(".chisel/tasks/t1.json"),
+            json!({"title": "Project B"}).to_string(),
+        )
+        .unwrap();
+        let agent = echo_agent(rt.dir.path());
+        let claude = rt
+            .launch(&mut client, "claude", &agent, Some(&project))
+            .await;
+        let codex = rt.launch(&mut other, "codex", &agent, None).await;
+        attach_client(&mut client, &claude.id, 24, 80).await;
+        attach_client(&mut other, &codex.id, 24, 80).await;
+        rt.peer.hello().await;
+        rt.peer
+            .send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
+        let notice = expect(&mut client, |m| match m {
+            RuntimeMsg::Notice { text } if text.contains("t1") && text.contains("Claude") => {
+                Some(text)
+            }
+            _ => None,
+        })
+        .await;
+        assert!(notice.contains("t1"));
+        let heard = collect(&mut other, Duration::from_millis(800)).await;
+        assert!(
+            !heard
+                .iter()
+                .any(|m| matches!(m, RuntimeMsg::Notice { text } if text.contains("t1"))),
+            "another session's frontend got the task's notice: {heard:?}"
+        );
+        rt.shutdown().await;
+    });
+}
+
+/// Duplicate detection remembers at most `MAX_SEEN` messages; the oldest
+/// go first.
+#[test]
+fn the_duplicate_window_is_bounded() {
+    let profile = tempfile::tempdir().unwrap();
+    let _profile = crate::test_profile::use_dir(profile.path());
+    let dir = short_dir();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    for i in 0..=super::MAX_SEEN {
+        assert!(!bridge.duplicate(&format!("m{i}"), 0));
+    }
+    assert_eq!(bridge.seen.len(), super::MAX_SEEN);
+    assert_eq!(bridge.seen_order.len(), super::MAX_SEEN);
+    // The newest is still remembered; the oldest was evicted.
+    assert!(bridge.duplicate(&format!("m{}", super::MAX_SEEN), 0));
+    assert!(!bridge.duplicate("m0", 0));
+}
+
+// ── Approvals (§6a): the real hook script under a fake agent ──
+
+/// `tests/fixtures/approvals/fake-agent.py`: runs the real permission hook.
+fn approval_agent() -> PathBuf {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approvals/fake-agent.py");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    if perms.mode() & 0o111 != 0o111 {
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+/// The fake agent's next tool call `n` needing permission.
+fn ask(fake: &Path, n: u32, request: Value) {
+    let tmp = fake.join(format!("tmp-ask-{n}"));
+    std::fs::write(&tmp, request.to_string()).unwrap();
+    std::fs::rename(&tmp, fake.join(format!("ask-{n}.json"))).unwrap();
+}
+
+fn npm_test() -> Value {
+    json!({"tool_name": "Bash",
+           "tool_input": {"command": "npm test\nnpm run lint", "description": "run the tests"},
+           "permission_suggestions": [{"type": "addRules", "behavior": "allow",
+               "rules": [{"toolName": "Bash", "ruleContent": "npm test:*"}],
+               "destination": "localSettings"}]})
+}
+
+/// Waits until the fake agent's events show `line`.
+async fn agent_event(fake: &Path, line: &str) {
+    let events = fake.join("events");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let text = std::fs::read_to_string(&events).unwrap_or_default();
+            if text.lines().any(|l| l.trim_end() == line.trim_end()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the agent never showed {line:?}: {}",
+            std::fs::read_to_string(&events).unwrap_or_default()
+        )
+    });
+}
+
+fn is_relay(v: &Value, op: &str, approval_id: &str) -> bool {
+    v["type"] == "relay" && v["data"]["op"] == op && v["data"]["approval_id"] == approval_id
+}
+
+/// The chat-v1 card of `approval_id` in `state`.
+fn is_card(v: &Value, approval_id: &str, state: &str) -> bool {
+    is_chat(v, "message")
+        && v["data"]["messageId"] == format!("approval-{approval_id}")
+        && v["data"]["parts"][0]["kind"] == "approval"
+        && v["data"]["parts"][0]["state"] == state
+}
+
+impl Runtime {
+    /// Launches `provider` running the approval fake agent (control files
+    /// in `fake`).
+    async fn launch_approval_agent(
+        &self,
+        client: &mut RuntimeClient,
+        provider: &str,
+        fake: &Path,
+    ) -> SessionSummary {
+        let var = if provider == "claude" {
+            "CLAUDE_CLI_BIN"
+        } else {
+            "CODEX_CLI_BIN"
+        };
+        let hook = crate::chat::codex::hook_command(&self.dir.path().join("run/approval-hook.sh"));
+        client
+            .send(&ClientMsg::Launch {
+                provider: provider.into(),
+                args: vec![],
+                cwd: self.dir.path().to_path_buf(),
+                env: LaunchEnv(vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (var.into(), approval_agent().display().to_string()),
+                    ("FAKE_DIR".into(), fake.display().to_string()),
+                    ("FAKE_CODEX_HOOK".into(), hook),
+                ]),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        let session = expect(client, |m| match m {
+            RuntimeMsg::Launched { session } => Some(session),
+            RuntimeMsg::Error { text, .. } => panic!("launch failed: {text}"),
+            _ => None,
+        })
+        .await;
+        agent_event(fake, "started").await;
+        session
+    }
+}
+
+#[test]
+fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
+        open_chat(peer, "conv-1", &sid, &pg).await;
+
+        ask(&fake, 1, npm_test());
+        let request = peer.wait(|v| is_session(v, "approval_request")).await["data"].clone();
+        assert_eq!(request["session_id"], sid.as_str());
+        assert_eq!(request["process_gen"], pg.as_str());
+        assert_eq!(request["tool"], "Bash");
+        assert_eq!(request["summary"], "npm test", "the first line only");
+        let rules = request["always_rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["label"], "Allow Bash(npm test:*)");
+        let aid = request["approval_id"].as_str().unwrap().to_string();
+        // Pushed to the account's devices over the link: redacted only.
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_approval", &aid))
+            .await;
+        let push = peer.seen[at]["data"].clone();
+        assert_eq!(push["atem_device_id"], DEVICE);
+        assert_eq!(push["session_id"], sid.as_str());
+        assert_eq!(push["tool"], "Bash");
+        assert_eq!(push["summary"], "npm test");
+        assert_eq!(
+            push["expires_at"].as_u64().unwrap(),
+            request["created_at"].as_u64().unwrap() + 600_000
+        );
+        assert!(!push.to_string().contains("npm run lint"), "{push}");
+        // The chat card, pending.
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "pending")).await;
+        let card = peer.seen[at]["data"]["parts"][0].clone();
+        assert_eq!(card["tool"], "Bash");
+        assert_eq!(card["summary"], "npm test");
+        assert_eq!(card["always_rules"], request["always_rules"]);
+
+        // Answered from chat with acquire: the lease and the answer together.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": request_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        let granted = peer.wait(|v| is_session(v, "lease_changed")).await;
+        assert_eq!(granted["data"]["reason"], "granted");
+        let rid = request_id.clone();
+        peer.wait(move |v| is_chat(v, "accepted") && v["data"]["requestId"] == rid.as_str())
+            .await;
+        agent_event(&fake, "answer 1 allow ").await;
+        let rid = request_id.clone();
+        let done = peer
+            .wait(move |v| {
+                (is_chat(v, "complete") || is_chat(v, "error"))
+                    && v["data"]["requestId"] == rid.as_str()
+            })
+            .await;
+        assert_eq!(done["data"]["op"], "complete", "{done}");
+        peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
+            .await;
+        assert_eq!(peer.seen[at]["data"]["reason"], "answered_remote");
+        let closed = peer
+            .seen
+            .iter()
+            .find(|v| is_session(v, "approval_closed"))
+            .unwrap();
+        assert_eq!(closed["data"]["reason"], "answered_remote");
+        assert!(listed(peer, &sid).await["controller"].is_object());
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        let lease = peer.acquire(&sid, &pg).await;
+
+        // The lease holder denies with a message: a session-v1 submission.
+        ask(&fake, 1, npm_test());
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)), "request_id": request_id,
+                   "kind": "approval",
+                   "payload": {"approval_id": aid, "decision": "deny",
+                               "message": "use the staging config"}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+        agent_event(&fake, "answer 1 deny use the staging config").await;
+        let rid = request_id.clone();
+        let done = peer
+            .wait(move |v| {
+                is_session(v, "receipt")
+                    && v["data"]["request_id"] == rid.as_str()
+                    && !matches!(v["data"]["state"].as_str(), Some("accepted" | "executing"))
+            })
+            .await;
+        assert_eq!(done["data"]["state"], "completed", "{done}");
+        peer.wait_from(0, |v| is_card(v, &aid, "denied")).await;
+
+        // Answered in the agent's own dialog first: the card and the push
+        // resolve, and the hook gets no decision.
+        ask(&fake, 2, npm_test());
+        let from = peer.seen.len();
+        let at = peer
+            .wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        let aid = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
+        let a = aid.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "answered_terminal");
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
+            .await;
+        assert_eq!(peer.seen[at]["data"]["reason"], "answered_terminal");
+        peer.wait_from(0, |v| is_card(v, &aid, "answered_terminal"))
+            .await;
+        agent_event(&fake, "answer 2 none ").await;
+        // A late answer is refused and takes no lease.
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval",
+                   "payload": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        assert_eq!(peer.reply(&id).await["code"], "stale_target");
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn input_to_codex_releases_its_waiting_hooks_first() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "codex", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+
+        // Local input: Codex hides its prompt while the hook waits, so the
+        // hook is released first and the card closes `released`.
+        ask(
+            &fake,
+            1,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo build"}}),
+        );
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            request["data"]["always_rules"],
+            json!([]),
+            "Codex offers none"
+        );
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_approval", &aid))
+            .await;
+        assert_eq!(
+            peer.seen[at]["data"]["expires_at"].as_u64().unwrap(),
+            request["data"]["created_at"].as_u64().unwrap() + 300_000
+        );
+        attach_client(&mut client, &sid, 24, 80).await;
+        client.send(&ClientMsg::input(&sid, b"L")).await.unwrap();
+        let peer = &mut rt.peer;
+        let a = aid.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "released");
+        agent_event(&fake, "answer 1 none ").await;
+        let at = peer
+            .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
+            .await;
+        assert_eq!(peer.seen[at]["data"]["reason"], "released");
+
+        // The lease holder's terminal input releases it the same way.
+        ask(
+            &fake,
+            2,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo test"}}),
+        );
+        let from = peer.seen.len();
+        let at = peer
+            .wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        let aid = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let lease = peer.acquire(&sid, &pg).await;
+        peer.terminal("subscribe", &sid, &pg, json!({}), None);
+        let attached = peer.wait(|v| is_terminal(v, "attached")).await;
+        let stream = attached["data"]["stream_id"].as_str().unwrap().to_string();
+        peer.terminal(
+            "input",
+            &sid,
+            &pg,
+            json!({"stream_id": stream, "sequence": 0, "bytes": STANDARD.encode("R")}),
+            Some(lease),
+        );
+        let a = aid.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "released");
+        agent_event(&fake, "answer 2 none ").await;
+        // Both inputs reached Codex, each only after its released hook had
+        // exited (so Codex's own prompt, not its hook wait, gets the keys).
+        let input = std::fs::read(fake.join("input")).unwrap_or_default();
+        assert!(input.contains(&b'L') && input.contains(&b'R'), "{input:?}");
+        let events = std::fs::read_to_string(fake.join("events")).unwrap();
+        let lines: Vec<&str> = events.lines().collect();
+        let at = |prefix: &str| lines.iter().position(|l| l.starts_with(prefix)).unwrap();
+        let inputs: Vec<usize> = (0..lines.len())
+            .filter(|i| lines[*i].starts_with("input "))
+            .collect();
+        assert_eq!(inputs.len(), 2, "{events}");
+        assert!(at("answer 1 none") < inputs[0], "{events}");
+        assert!(at("answer 2 none") < inputs[1], "{events}");
+        rt.shutdown().await;
+    });
+}
+
+#[tokio::test]
+async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
+    use crate::runtime::adopt::SpawnRequest;
+    use crate::runtime::worker_approvals::Event;
+    let dir = short_dir();
+    let fake = dir.path().join("fake");
+    let launcher = Launcher::InProcess(InProcess {
+        state: dir.path().join("state"),
+        socket_dir: dir.path().join("ws"),
+        chat_root: dir.path().join("chat"),
+    });
+    let request = SpawnRequest {
+        session_id: crate::session::SessionId::new(),
+        process_gen: uuid::Uuid::new_v4().to_string(),
+        provider: crate::session::Provider::Codex,
+        args: vec![],
+        cwd: dir.path().to_path_buf(),
+        rows: 24,
+        cols: 80,
+    };
+    let hook = crate::chat::codex::hook_command(&dir.path().join("chat/approval-hook.sh"));
+    let env = LaunchEnv(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        (
+            "CODEX_CLI_BIN".into(),
+            approval_agent().display().to_string(),
+        ),
+        ("FAKE_DIR".into(), fake.display().to_string()),
+        ("FAKE_CODEX_HOOK".into(), hook),
+    ]);
+    let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
+    let mut session =
+        crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
+    agent_event(&fake, "started").await;
+    ask(
+        &fake,
+        1,
+        json!({"tool_name": "shell", "tool_input": {"command": "ls"}}),
+    );
+    // The worker reports it to this connection (as it did to a broker that
+    // went away without answering).
+    let worker_id = tokio::time::timeout(WAIT, async {
+        loop {
+            session.pump();
+            if let Some(Event::Request { request_id, .. }) = session.take_approvals().pop() {
+                return request_id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no approval request");
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.check_adoption(&mut session);
+    agent_event(&fake, "answer 1 none ").await;
+    // The worker closes it `released`.
+    let closed = tokio::time::timeout(WAIT, async {
+        loop {
+            session.pump();
+            if let Some(event) = session.take_approvals().pop() {
+                return event;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no close");
+    assert_eq!(
+        closed,
+        Event::Closed {
+            request_id: worker_id,
+            reason: crate::session_protocol::wire::ApprovalCloseReason::Released
+        }
+    );
+    assert!(bridge.open_approvals().is_empty());
+    let _ = session.stop();
+}
+
+#[test]
+fn a_view_only_link_gets_no_approval_requests_and_no_cards() {
+    local(async {
+        super::VIEW_ONLY_LINK.with(|v| v.set(true));
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        let welcome = peer.hello().await;
+        assert_eq!(welcome["permissions"], json!(["view"]));
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        ask(&fake, 1, npm_test());
+        // The push still goes out (the account's devices with control).
+        let push = peer.wait(|v| v["type"] == "relay").await;
+        assert_eq!(push["data"]["op"], "push_approval");
+        let aid = push["data"]["approval_id"].as_str().unwrap().to_string();
+        peer.drain(Duration::from_millis(800)).await;
+        assert!(
+            !peer.seen.iter().any(|v| is_session(v, "approval_request")),
+            "{:#?}",
+            peer.seen
+        );
+        assert!(!peer.seen.iter().any(|v| is_card(v, &aid, "pending")));
+        // Nor in the history of a conversation opened now.
+        let from = peer.seen.len();
+        open_chat(peer, "conv-2", &sid, &pg).await;
+        peer.drain(Duration::from_millis(500)).await;
+        assert!(
+            !peer.seen[from..]
+                .iter()
+                .any(|v| v.to_string().contains(&format!("approval-{aid}")))
+        );
+        super::VIEW_ONLY_LINK.with(|v| v.set(false));
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "claude", &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        ask(&fake, 1, npm_test());
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        // The hook stops: the decision is handed over but never taken.
+        std::fs::write(fake.join("stop-1"), "").unwrap();
+        agent_event(&fake, "stopped 1").await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": request_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        rt.clock
+            .skip(crate::session_protocol::host::APPROVAL_HANDOFF_MS + 1);
+        let peer = &mut rt.peer;
+        let rid = request_id.clone();
+        let done = peer
+            .wait(move |v| is_chat(v, "error") && v["data"]["requestId"] == rid.as_str())
+            .await;
+        assert_eq!(done["data"]["code"], "outcome_unknown", "{done}");
+        peer.wait_from(0, |v| is_card(v, &aid, "closed")).await;
+        rt.shutdown().await;
+    });
+}

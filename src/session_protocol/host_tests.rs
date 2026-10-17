@@ -5,9 +5,10 @@
 //! per-attachment `seq`, durable-write failures and the crash rules.
 
 use super::client::{RegistryClient, RegistryOutcome};
-use super::fake_runtime::{AUTHORIZATION_MS, FakeRuntime};
+use super::fake_runtime::{AUTHORIZATION_MS, FailFsync, FakeRuntime};
+use super::file_journal::FileJournal;
 use super::host::*;
-use super::journal::{MemJournal, Record};
+use super::journal::{Journal, MemJournal, Record};
 use super::wire::{self, Envelope, Op, Permission, ReceiptKind, ReceiptState, Target};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,9 +36,18 @@ fn rid(n: u64) -> String {
 }
 
 fn setup_with(config: HostConfig) -> FakeRuntime {
+    FakeRuntime::from_json(setup_json(), config)
+}
+
+/// The same setup with receipts in a `FileJournal` under `dir`.
+fn setup_file(dir: &std::path::Path) -> FakeRuntime<FileJournal> {
+    let journal = FileJournal::open(&dir.join("state")).unwrap();
+    FakeRuntime::from_json_with(setup_json(), HostConfig::default(), journal)
+}
+
+fn setup_json() -> Value {
     let client = |name: &str, att_gen: &str, perms: Value| json!({"name": name, "attachment_gen": att_gen, "permissions": perms, "client_kind": "native"});
-    FakeRuntime::from_json(
-        json!({
+    json!({
             "host": {"account_id": "account-a", "atem_device_id": "host-a", "host_trust_gen": 1,
                      "runtime_gen": "55555555-5555-4555-8555-555555555555", "runtime_epoch": 7},
             "sessions": [{"session_id": S1, "process_gen": P1, "chat": true},
@@ -45,9 +55,7 @@ fn setup_with(config: HostConfig) -> FakeRuntime {
             "clients": [client("c1", C1, json!(["view", "control"])),
                         client("c2", C2, json!(["view", "control"])),
                         client("v", V, json!(["view"]))]
-        }),
-        config,
-    )
+    })
 }
 
 fn setup() -> FakeRuntime {
@@ -63,7 +71,12 @@ fn target_with(session: &str, trust: u64) -> Value {
            "session_id": session, "process_gen": pg(session)})
 }
 
-fn binding(rt: &FakeRuntime, client: &str, session: &str, epoch: Option<u64>) -> Value {
+fn binding(
+    rt: &FakeRuntime<impl Journal + FailFsync>,
+    client: &str,
+    session: &str,
+    epoch: Option<u64>,
+) -> Value {
     let mut b = json!({"target": target_with(session, 1), "attachment_gen": rt.attachment(client)});
     if let Some(e) = epoch {
         b["lease_epoch"] = json!(e);
@@ -79,21 +92,33 @@ fn session(op: &str, fields: Value) -> Value {
     json!({"type": "session", "data": data})
 }
 
-fn acquire(rt: &FakeRuntime, client: &str, s: &str, takeover: bool) -> Value {
+fn acquire(
+    rt: &FakeRuntime<impl Journal + FailFsync>,
+    client: &str,
+    s: &str,
+    takeover: bool,
+) -> Value {
     session(
         "acquire",
         json!({"binding": binding(rt, client, s, None), "takeover": takeover}),
     )
 }
 
-fn renew(rt: &FakeRuntime, client: &str, s: &str, epoch: u64) -> Value {
+fn renew(rt: &FakeRuntime<impl Journal + FailFsync>, client: &str, s: &str, epoch: u64) -> Value {
     session(
         "renew",
         json!({"binding": binding(rt, client, s, Some(epoch))}),
     )
 }
 
-fn submit(rt: &FakeRuntime, client: &str, s: &str, epoch: u64, n: u64, kind: &str) -> Value {
+fn submit(
+    rt: &FakeRuntime<impl Journal + FailFsync>,
+    client: &str,
+    s: &str,
+    epoch: u64,
+    n: u64,
+    kind: &str,
+) -> Value {
     let payload = if kind == "prompt" {
         json!({"text": "run the tests"})
     } else {
@@ -106,7 +131,12 @@ fn submit(rt: &FakeRuntime, client: &str, s: &str, epoch: u64, n: u64, kind: &st
     )
 }
 
-fn query(rt: &FakeRuntime, client: &str, target: Value, ids: Vec<String>) -> Value {
+fn query(
+    rt: &FakeRuntime<impl Journal + FailFsync>,
+    client: &str,
+    target: Value,
+    ids: Vec<String>,
+) -> Value {
     session(
         "receipt_query",
         json!({"binding": {"target": target, "attachment_gen": rt.attachment(client)},
@@ -114,7 +144,13 @@ fn query(rt: &FakeRuntime, client: &str, target: Value, ids: Vec<String>) -> Val
     )
 }
 
-fn terminal(rt: &FakeRuntime, client: &str, op: &str, epoch: Option<u64>, extra: Value) -> Value {
+fn terminal(
+    rt: &FakeRuntime<impl Journal + FailFsync>,
+    client: &str,
+    op: &str,
+    epoch: Option<u64>,
+    extra: Value,
+) -> Value {
     let mut data = json!({"v": 1, "op": op, "terminal_id": S1, "generation": P1,
                           "binding": binding(rt, client, S1, epoch)});
     data.as_object_mut()
@@ -124,7 +160,7 @@ fn terminal(rt: &FakeRuntime, client: &str, op: &str, epoch: Option<u64>, extra:
 }
 
 /// Takes `client`'s queued messages and returns the `data` of each.
-fn got(rt: &mut FakeRuntime, client: &str) -> Vec<Value> {
+fn got(rt: &mut FakeRuntime<impl Journal + FailFsync>, client: &str) -> Vec<Value> {
     rt.take(client)
         .into_iter()
         .map(|m| m["data"].clone())
@@ -137,7 +173,7 @@ fn ops(msgs: &[Value]) -> Vec<String> {
         .collect()
 }
 
-fn only(rt: &mut FakeRuntime, client: &str) -> Value {
+fn only(rt: &mut FakeRuntime<impl Journal + FailFsync>, client: &str) -> Value {
     let msgs = got(rt, client);
     assert_eq!(msgs.len(), 1, "{client} got {msgs:#?}");
     msgs[0].clone()
@@ -149,7 +185,7 @@ fn assert_error(msg: &Value, code: &str) {
 }
 
 /// Acquires `s` for `client` and returns the lease epoch.
-fn hold(rt: &mut FakeRuntime, client: &str, s: &str) -> u64 {
+fn hold(rt: &mut FakeRuntime<impl Journal + FailFsync>, client: &str, s: &str) -> u64 {
     let m = acquire(rt, client, s, false);
     rt.send(client, &m);
     let reply = got(rt, client)
@@ -159,7 +195,7 @@ fn hold(rt: &mut FakeRuntime, client: &str, s: &str) -> u64 {
     reply["binding"]["lease_epoch"].as_u64().unwrap()
 }
 
-fn subscribe(rt: &mut FakeRuntime, client: &str) -> String {
+fn subscribe(rt: &mut FakeRuntime<impl Journal + FailFsync>, client: &str) -> String {
     let m = terminal(rt, client, "subscribe", None, json!({}));
     rt.send(client, &m);
     let attached = got(rt, client)
@@ -169,7 +205,12 @@ fn subscribe(rt: &mut FakeRuntime, client: &str) -> String {
     attached["stream_id"].as_str().unwrap().to_string()
 }
 
-fn input(rt: &FakeRuntime, client: &str, stream: &str, epoch: u64) -> Value {
+fn input(
+    rt: &FakeRuntime<impl Journal + FailFsync>,
+    client: &str,
+    stream: &str,
+    epoch: u64,
+) -> Value {
     terminal(
         rt,
         client,
@@ -179,7 +220,10 @@ fn input(rt: &FakeRuntime, client: &str, stream: &str, epoch: u64) -> Value {
     )
 }
 
-fn receipts_of(rt: &mut FakeRuntime, client: &str) -> Vec<(String, String)> {
+fn receipts_of(
+    rt: &mut FakeRuntime<impl Journal + FailFsync>,
+    client: &str,
+) -> Vec<(String, String)> {
     got(rt, client)
         .into_iter()
         .filter(|m| m["op"] == "receipt")
@@ -233,9 +277,16 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     assert_eq!(w["client_kind"], "native");
     assert_eq!(w["authorization_ms_left"], AUTHORIZATION_MS - 1000);
     assert!(wire::is_uuid_v4(w["controller_session"].as_str().unwrap()));
-    // One welcome per attachment.
+    // A second hello replaces the attachment (r7.1); one more within a
+    // second is busy.
     rt.send("n", &session("hello", json!({})));
-    assert_error(&only(&mut rt, "n"), "unauthorized");
+    let w2 = only(&mut rt, "n");
+    assert_eq!(w2["op"], "welcome");
+    assert_ne!(w2["attachment_gen"], fresh);
+    assert_ne!(w2["controller_session"], w["controller_session"]);
+    assert_eq!(w2["authorization_ms_left"], AUTHORIZATION_MS - 1000);
+    rt.send("n", &session("hello", json!({})));
+    assert_error(&only(&mut rt, "n"), "busy");
     // Host-only ops are not requests.
     rt.send("n", &session("lease_released", json!({})));
     assert_error(&only(&mut rt, "n"), "unsupported_version");
@@ -251,6 +302,85 @@ fn every_hello_gets_its_own_controller_and_no_lease() {
     let m = acquire(&rt, "c1", S1, false);
     rt.send("c1", &m);
     assert_error(&only(&mut rt, "c1"), "lease_held");
+}
+
+#[test]
+fn a_second_hello_replaces_the_attachment() {
+    let mut rt = setup();
+    let stream = subscribe(&mut rt, "c1");
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "interrupt");
+    rt.send("c1", &m);
+    got(&mut rt, "c1");
+    rt.set_now(2000);
+    rt.effects.clear();
+    let hello = session("hello", json!({}));
+    rt.send("c1", &hello);
+    // Only the welcome reaches the client: the old attachment's lease end
+    // and stream close are not sent to it.
+    let w = only(&mut rt, "c1");
+    assert_eq!(w["op"], "welcome");
+    assert_eq!(w["re"], hello["data"]["id"]);
+    let new = w["attachment_gen"].as_str().unwrap().to_string();
+    assert_ne!(new, C1);
+    assert_eq!(rt.attachment("c1"), new);
+    assert_eq!(w["permissions"], json!(["view", "control"]));
+    // Same authorization deadline, not renewed.
+    assert_eq!(w["authorization_ms_left"], AUTHORIZATION_MS - 2000);
+    assert!(
+        rt.effects
+            .iter()
+            .any(|e| matches!(e, Effect::Replaced { old, new: n } if old == C1 && *n == new))
+    );
+    assert!(rt.effects.iter().any(
+        |e| matches!(e, Effect::StreamClosed { attachment, stream_id, .. } if attachment == C1 && *stream_id == stream)
+    ));
+    // The lease ended (no carry-over); the old attachment is fenced.
+    assert_eq!(rt.host.lease_holder(S1), None);
+    rt.effects.clear();
+    let old_renew = renew(&rt, "c1", S1, e);
+    rt.send_on(C1, &old_renew);
+    assert!(rt.effects.iter().any(|e| matches!(e,
+        Effect::Send { attachment, message: Envelope::Session(s) }
+            if attachment == C1 && matches!(s.op, Op::Error { code: wire::ErrorCode::Unauthorized, .. }))));
+    // Naming the old attachment_gen on the new attachment is stale_target.
+    let mut stale = renew(&rt, "c1", S1, e);
+    stale["data"]["binding"]["attachment_gen"] = json!(C1);
+    rt.send("c1", &stale);
+    assert_error(&only(&mut rt, "c1"), "stale_target");
+    // The receipt is still there for the new attachment.
+    let q = query(&rt, "c1", target_with(S1, 1), vec![rid(1)]);
+    rt.send("c1", &q);
+    let r = only(&mut rt, "c1");
+    assert_eq!(r["receipts"].as_array().unwrap().len(), 1, "{r}");
+    // A new lease without takeover, at the next epoch.
+    assert_eq!(hold(&mut rt, "c1", S1), e + 2);
+    // At most one replacement a second.
+    rt.set_now(2999);
+    got(&mut rt, "c1");
+    rt.send("c1", &session("hello", json!({})));
+    assert_error(&only(&mut rt, "c1"), "busy");
+    assert_eq!(rt.attachment("c1"), new);
+    assert!(rt.host.lease_holder(S1).is_some());
+    rt.set_now(3000);
+    got(&mut rt, "c1");
+    rt.send("c1", &session("hello", json!({})));
+    assert_eq!(only(&mut rt, "c1")["op"], "welcome");
+    assert_ne!(rt.attachment("c1"), new);
+}
+
+#[test]
+fn a_second_hello_after_the_authorization_deadline_is_paused() {
+    let mut rt = setup();
+    let short = "88888888-8888-4888-8888-888888888888";
+    rt.connect_only("s", short, vec![Permission::View], 5000);
+    rt.send("s", &session("hello", json!({})));
+    got(&mut rt, "s");
+    rt.set_now(5000);
+    got(&mut rt, "s");
+    rt.send("s", &session("hello", json!({})));
+    assert_error(&only(&mut rt, "s"), "paused");
+    assert_eq!(rt.attachment("s"), short);
 }
 
 #[test]
@@ -672,19 +802,6 @@ fn prompt_runs_to_completion_and_duplicates_return_the_receipt() {
 }
 
 #[test]
-fn approval_answers_are_forbidden_in_v1() {
-    let mut rt = setup();
-    let e = hold(&mut rt, "c1", S1);
-    let mut m = submit(&rt, "c1", S1, e, 1, "interrupt");
-    m["data"]["kind"] = json!("approval");
-    rt.send("c1", &m);
-    let err = only(&mut rt, "c1");
-    assert_error(&err, "forbidden");
-    assert_eq!(err["detail"], DETAIL_APPROVAL);
-    assert!(rt.host.receipt(&rid(1)).is_none());
-}
-
-#[test]
 fn trust_change_before_dispatch_rejects_and_revokes() {
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
@@ -752,8 +869,18 @@ fn accepted_record(n: u64, trust: u64) -> Record {
 
 #[test]
 fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
+    crash_rules(MemJournal::default);
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = 0;
+    crash_rules(|| {
+        n += 1;
+        FileJournal::open(&dir.path().join(format!("state{n}"))).unwrap()
+    });
+}
+
+fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     // Accepted under an older trust generation: rejected, never dispatched.
-    let mut j = MemJournal::default();
+    let mut j = journal();
     j.append_ok(accepted_record(1, 1));
     let mut host = SessionHost::new(ctx(2), HostConfig::default(), j, random_ids()).unwrap();
     host.restore_session(spec(S1, P1)).unwrap();
@@ -765,7 +892,7 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
 
     // Same trust generation: dispatched once, and a second crash only
     // reconciles it.
-    let mut j = MemJournal::default();
+    let mut j = journal();
     j.append_ok(accepted_record(1, 1));
     let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
     host.restore_session(spec(S1, P1)).unwrap();
@@ -790,7 +917,7 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
     assert_eq!(r.detail.as_deref(), Some(DETAIL_UNRECONCILED));
 
     // Accepted for a process that is gone: rejected, session closed.
-    let mut j = MemJournal::default();
+    let mut j = journal();
     j.append_ok(accepted_record(1, 1));
     let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
     host.restore_session(spec(S1, "33333333-3333-4333-8333-000000000001"))
@@ -804,6 +931,16 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
 
 #[test]
 fn crash_after_executing_is_outcome_unknown_and_queued_work_runs_once() {
+    crash_after_executing(setup);
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = 0;
+    crash_after_executing(|| {
+        n += 1;
+        setup_file(&dir.path().join(n.to_string()))
+    });
+}
+
+fn crash_after_executing<J: Journal + FailFsync>(mut setup: impl FnMut() -> FakeRuntime<J>) {
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
     for n in [1, 2] {
@@ -842,6 +979,109 @@ fn crash_after_executing_is_outcome_unknown_and_queued_work_runs_once() {
     assert_eq!(
         rt.host.receipt(&rid(1)).unwrap().state,
         ReceiptState::Completed
+    );
+}
+
+/// A host process crash with receipts on disk: a new host over the reopened
+/// `FileJournal` reconciles the executing prompt, dispatches the accepted one
+/// once, and never issues a lease epoch at or below the reserved floor.
+#[test]
+fn a_crashed_host_reloads_receipts_and_lease_floors_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    let e = hold(&mut rt, "c1", S1);
+    for n in [1, 2] {
+        let m = submit(&rt, "c1", S1, e, n, "prompt");
+        rt.send("c1", &m);
+    }
+    assert!(rt.host.index_matches_receipts());
+    let before: Vec<_> = [1, 2].map(|n| rt.host.receipt(&rid(n)).unwrap()).into();
+    assert_eq!(before[0].state, ReceiptState::Executing);
+    assert_eq!(before[1].state, ReceiptState::Accepted);
+    drop(rt);
+
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let mut host = SessionHost::new(ctx(1), HostConfig::default(), journal, random_ids()).unwrap();
+    assert!(host.index_matches_receipts());
+    let after: Vec<_> = [1, 2].map(|n| host.receipt(&rid(n)).unwrap()).into();
+    assert_eq!(after, before);
+    // The session id stays used; the surviving worker is restored.
+    assert!(host.add_session(spec(S1, P1)).is_err());
+    host.restore_session(spec(S1, P1)).unwrap();
+    assert!(host.lease_epoch(S1).unwrap() >= e);
+    let fx = host.recover();
+    let reconciled: Vec<_> = fx
+        .iter()
+        .filter_map(|f| match f {
+            Effect::Reconcile { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reconciled, vec![rid(1)]);
+    // `B` waits for `A`'s outcome, then runs once.
+    let fx = host.dispatch_report(&rid(1), DispatchReport::Unknown);
+    let dispatched = fx
+        .iter()
+        .filter(|f| matches!(f, Effect::Dispatch { request_id, .. } if *request_id == rid(2)))
+        .count();
+    assert_eq!(dispatched, 1);
+    assert_eq!(
+        host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::OutcomeUnknown
+    );
+    assert_eq!(
+        host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+}
+
+/// After a write error the file journal admits nothing until the process
+/// restarts; the failed `accepted` is not there after the restart.
+#[test]
+fn a_failed_file_journal_refuses_submissions_until_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    let e = hold(&mut rt, "c1", S1);
+    rt.host.journal_mut().fail_next_fsync();
+    for n in [1, 2] {
+        let m = submit(&rt, "c1", S1, e, n, "prompt");
+        rt.send("c1", &m);
+        assert_error(&only(&mut rt, "c1"), "busy");
+    }
+    assert!(rt.host.journal().failed().is_some());
+    assert_eq!(rt.pty.dispatch_attempts, 0);
+    drop(rt);
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let host = SessionHost::new(ctx(1), HostConfig::default(), journal, random_ids()).unwrap();
+    assert!(host.receipt(&rid(1)).is_none());
+    assert!(host.journal().failed().is_none());
+}
+
+/// Retention eviction is durable: after a reload the evicted receipts are
+/// gone, the lease floor isn't, and compaction leaves no payload behind.
+#[test]
+fn evicted_receipts_stay_gone_after_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.close_session(S1, true);
+    rt.set_now(RECEIPT_RETENTION_MS);
+    assert!(rt.host.receipt(&rid(1)).is_none());
+    assert!(rt.host.index_matches_receipts());
+    rt.host.journal_mut().compact_all().unwrap();
+    drop(rt);
+    let log = dir.path().join("state/receipts").join(format!("{S1}.log"));
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!text.contains("run the tests"), "no payload left");
+    assert!(!text.contains(&rid(1)), "no evicted receipt left");
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let mut host = SessionHost::new(ctx(1), HostConfig::default(), journal, random_ids()).unwrap();
+    assert!(host.receipt(&rid(1)).is_none());
+    assert!(
+        host.add_session(spec(S1, P1)).is_err(),
+        "the lease floor is kept"
     );
 }
 
@@ -1519,7 +1759,7 @@ fn durable_write_retries_are_deduplicated() {
     );
 }
 
-impl FakeRuntime {
+impl<J: Journal + FailFsync> FakeRuntime<J> {
     fn event_reconnect(&mut self, client: &str, att_gen: &str) {
         self.attach(client, att_gen).unwrap();
     }
@@ -1597,9 +1837,8 @@ trait AppendOk {
     fn append_ok(&mut self, r: Record);
 }
 
-impl AppendOk for MemJournal {
+impl<J: Journal> AppendOk for J {
     fn append_ok(&mut self, r: Record) {
-        use super::journal::Journal;
         self.append(r).unwrap();
     }
 }
