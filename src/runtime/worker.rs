@@ -1,6 +1,7 @@
 //! `atem worker --state <dir> --session <id>` (hidden): owns one agent
-//! session — the agent process in its PTY, the canonical screen, the Claude
-//! chat adapter and the output stream — and outlives the broker that started
+//! session — the agent process in its PTY, the canonical screen, the chat
+//! adapter (Claude's, or Codex's when Atem's Codex hooks are on) and the
+//! output stream — and outlives the broker that started
 //! it. It serves one broker connection at a time on its socket
 //! (`<runtime dir>/atem/workers/<session_id>.sock`, 0600, directory 0700,
 //! same-user peers); when that broker goes away the agent keeps running and a
@@ -224,15 +225,55 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The session's chat adapter. Each owns its session directory (removed
+/// when it is dropped), which the approvals watch too.
+enum ChatAdapter {
+    Claude(Box<crate::chat::claude::ClaudeAdapter>),
+    Codex(Box<crate::chat::codex::adapter::CodexAdapter>),
+}
+
+impl ChatAdapter {
+    fn get(&mut self) -> &mut dyn AgentAdapter {
+        match self {
+            ChatAdapter::Claude(a) => a.as_mut(),
+            ChatAdapter::Codex(a) => a.as_mut(),
+        }
+    }
+}
+
 /// What `agent_command` starts.
 struct Launch {
     binary: String,
     args: Vec<String>,
-    adapter: Option<crate::chat::claude::ClaudeAdapter>,
+    adapter: Option<ChatAdapter>,
     /// The session directory the approval hook writes to, and for which agent.
     approvals: Option<(PathBuf, Agent)>,
-    /// A session directory the worker made (Codex) and removes at the end.
-    owned_dir: Option<PathBuf>,
+}
+
+/// The Codex home of a launch: `CODEX_HOME` in the launch environment
+/// (else the worker's own), else `$HOME/.codex`.
+fn launch_codex_home(env: Option<&[(OsString, OsString)]>) -> PathBuf {
+    let var = |name: &str| -> Option<OsString> {
+        match env {
+            Some(vars) => vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
+            #[cfg(not(test))]
+            None => std::env::var_os(name),
+            // Tests never fall back to the real profile.
+            #[cfg(test)]
+            None => None,
+        }
+        .filter(|v| !v.is_empty())
+    };
+    if let Some(home) = var("CODEX_HOME") {
+        return PathBuf::from(home);
+    }
+    match var("HOME") {
+        Some(home) => PathBuf::from(home).join(".codex"),
+        #[cfg(not(test))]
+        None => crate::chat::codex::codex_home(),
+        #[cfg(test)]
+        None => PathBuf::from("/nonexistent/codex-home"),
+    }
 }
 
 /// The binary, arguments and chat adapter for `spec`, exactly as the App
@@ -240,10 +281,10 @@ struct Launch {
 /// environment (else the worker's own), the spec's arguments after them,
 /// and for Claude its chat hooks first (approvals included unless
 /// `claude_approvals` is off). With Atem's Codex hooks on (`script`), a
-/// Codex session gets its own session directory (`approvals/` for the
-/// PermissionRequest hook, `events/` for the other events) for the hooks in
-/// `~/.codex/hooks.json` (`chat::codex`), whose stable script `script` is
-/// refreshed here.
+/// Codex session gets the Codex chat adapter and its session directory
+/// (`approvals/` for the PermissionRequest hook, `events/` for the other
+/// events) for the hooks in `~/.codex/hooks.json` (`chat::codex`), whose
+/// stable script `script` is refreshed here.
 fn agent_command(
     spec: &WorkerSpec,
     env: Option<&[(OsString, OsString)]>,
@@ -278,33 +319,40 @@ fn agent_command(
             Launch {
                 binary: client.binary().to_string(),
                 args: [chat_args, launch_args].concat(),
-                adapter,
+                adapter: adapter.map(|a| ChatAdapter::Claude(Box::new(a))),
                 approvals,
-                owned_dir: None,
             }
         }
         Provider::Codex => {
             let client = env
                 .map(crate::codex_client::CodexClient::from_env)
                 .unwrap_or_else(crate::codex_client::CodexClient::new);
-            let dir = script.and_then(|script| {
+            let launch_args = [client.launch_args(), &spec.args[..]].concat();
+            let adapter = script.and_then(|script| {
                 if let Err(error) = crate::chat::approvals::install_script(script) {
                     eprintln!("atem worker: could not write {}: {error}", script.display());
                 }
-                match crate::chat::claude::hooks::create_session_dir(chat_root) {
-                    Ok(dir) => Some(dir),
+                match crate::chat::codex::adapter::prepare_chat(
+                    chat_root,
+                    launch_codex_home(env),
+                    &launch_args,
+                ) {
+                    Ok((adapter, _)) => Some(adapter),
                     Err(error) => {
                         eprintln!("atem worker: Codex hooks are off: {error}");
                         None
                     }
                 }
             });
+            let approvals = adapter
+                .as_ref()
+                .and_then(|a| a.dir())
+                .map(|d| (d.to_path_buf(), Agent::Codex));
             Launch {
                 binary: client.binary().to_string(),
-                args: [client.launch_args(), &spec.args[..]].concat(),
-                adapter: None,
-                approvals: dir.clone().map(|d| (d, Agent::Codex)),
-                owned_dir: dir,
+                args: launch_args,
+                adapter: adapter.map(|a| ChatAdapter::Codex(Box::new(a))),
+                approvals,
             }
         }
     })
@@ -336,7 +384,7 @@ pub struct WorkerOptions {
     /// The worker's pid and OS start time (recorded, sent in `hello`).
     pub pid: u32,
     pub start_time: u64,
-    /// Root of Claude chat directories.
+    /// Root of the chat session directories (Claude's and Codex's).
     pub chat_root: PathBuf,
     /// Where session logs go (`<logs>/<session_id>/`).
     pub logs: PathBuf,
@@ -458,7 +506,11 @@ struct Worker {
     log: super::session_log::SessionLog,
     offset: u64,
     dropped: u64,
-    adapter: Option<crate::chat::claude::ClaudeAdapter>,
+    adapter: Option<ChatAdapter>,
+    /// The session has a chat adapter (from its launch; told in `hello`).
+    has_chat: bool,
+    /// Approvals reported open (Codex: the adapter's waiting status).
+    open_approvals: std::collections::HashSet<String>,
     /// The agent's waiting permission prompts (`worker_approvals`).
     approvals: Option<Approvals>,
     /// What the chat adapter saw that may end a waiting prompt.
@@ -468,8 +520,6 @@ struct Worker {
     /// prompt — not its hook wait — gets the keys.
     held_input: std::collections::VecDeque<BrokerMsg>,
     hold: Option<(Instant, Vec<String>)>,
-    /// The Codex session directory, removed when the agent exited.
-    owned_dir: Option<PathBuf>,
     chat: ChatSession,
     capabilities: Capabilities,
     /// Chat read and not yet sent (no broker connected).
@@ -547,15 +597,8 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
             rows,
             cols,
         });
-        match spawned {
-            Ok(pty) => Ok((pty, launch)),
-            Err(error) => {
-                if let Some(dir) = &launch.owned_dir {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-                Err(error)
-            }
-        }
+        // Not started: the adapter's directory goes with it.
+        spawned.map(|pty| (pty, launch))
     });
     let (pty, launch) = match launched {
         Ok(launched) => launched,
@@ -569,11 +612,13 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     };
     let agent_pid = pty.resize_handle.process_id();
     let Launch {
-        adapter,
+        mut adapter,
         approvals,
-        owned_dir,
         ..
     } = launch;
+    if let Some(ChatAdapter::Codex(codex)) = adapter.as_mut() {
+        codex.set_agent_pid(agent_pid);
+    }
     let record = WorkerRecord {
         session_id: spec.session_id.clone(),
         process_gen: spec.process_gen.clone(),
@@ -589,9 +634,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
     };
     if let Err(error) = write_record(&options.state, &record) {
         let _ = pty.resize_handle.stop();
-        if let Some(dir) = &owned_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        drop(adapter);
         conn.send(&WorkerMsg::Error {
             text: format!("could not write the worker record: {error}"),
         });
@@ -609,12 +652,13 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         parser: vt100::Parser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS),
         offset: 0,
         dropped: 0,
+        has_chat: adapter.is_some(),
+        open_approvals: Default::default(),
         adapter,
         approvals: approvals.map(|(dir, agent)| Approvals::new(&dir, agent, agent_pid)),
         approval_evidence: Vec::new(),
         held_input: std::collections::VecDeque::new(),
         hold: None,
-        owned_dir,
         chat: ChatSession::new(uuid::Uuid::new_v4().to_string(), now_ms()),
         capabilities: Capabilities::default(),
         chat_backlog: Default::default(),
@@ -650,6 +694,7 @@ impl Worker {
             input_epoch: self.input.input_epoch(),
             dropped: self.dropped,
             exited: self.exited.clone(),
+            chat: self.has_chat,
         }
     }
 
@@ -671,6 +716,7 @@ impl Worker {
                 input_count: self.input.input_count(),
                 chat_v1: self.capabilities.chat_v1,
                 reason: self.capabilities.reason.clone(),
+                unavailable: self.unavailable(),
             };
             self.send(&snapshot);
         }
@@ -861,9 +907,8 @@ impl Worker {
             let events = approvals.process_ended();
             self.send_approval_events(events);
         }
-        if let Some(dir) = self.owned_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        // The approvals are done with the session directory: the adapter
+        // removes it.
         self.chat.on_process_exit(now_ms());
         self.adapter = None;
         self.set_activity(Activity::Unknown, None);
@@ -1060,6 +1105,23 @@ impl Worker {
 
     fn send_approval_events(&mut self, events: Vec<ApprovalEvent>) {
         for event in events {
+            // Codex reports no permission wait of its own: the approvals
+            // the worker reports open are its waiting status.
+            if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+                match &event {
+                    ApprovalEvent::Request { request_id, .. } => {
+                        if self.open_approvals.insert(request_id.clone()) {
+                            codex.approval_opened(now_ms());
+                        }
+                    }
+                    ApprovalEvent::Closed { request_id, .. }
+                    | ApprovalEvent::Applied { request_id, .. } => {
+                        if self.open_approvals.remove(request_id) {
+                            codex.approval_closed();
+                        }
+                    }
+                }
+            }
             let message = match event {
                 ApprovalEvent::Request { request_id, info } => WorkerMsg::ApprovalRequest {
                     request_id,
@@ -1115,7 +1177,13 @@ impl Worker {
     /// Reads the chat adapter (in the App's order: events, the log, then turn
     /// ends), keeps the activity from it and forwards what it read.
     fn poll_chat(&mut self) {
-        let Some(adapter) = self.adapter.as_mut() else {
+        // Claude shows its own dialog while the hook waits, so the
+        // terminal may answer it: what the transcript shows is evidence.
+        // Codex holds its prompt until the hook ends (and input releases
+        // the hooks first): nothing it reports answers one.
+        let evidence =
+            self.approvals.is_some() && matches!(self.adapter, Some(ChatAdapter::Claude(_)));
+        let Some(adapter) = self.adapter.as_mut().map(ChatAdapter::get) else {
             return;
         };
         let input_count = self.input.input_count();
@@ -1126,7 +1194,7 @@ impl Worker {
         // What may end a waiting permission prompt (applied with the next
         // approvals poll): a new prompt or the turn's end, a tool refused in
         // the terminal. Tool results are the worker's only: never forwarded.
-        if self.approvals.is_some() {
+        if evidence {
             use super::worker_approvals::Evidence;
             for e in &events {
                 if matches!(
@@ -1205,6 +1273,15 @@ impl Worker {
         self.set_activity(state, detail);
     }
 
+    /// What the adapter's chat can't provide (`Capabilities::unavailable`).
+    fn unavailable(&self) -> Vec<String> {
+        self.capabilities
+            .unavailable
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     /// Sends the held chat batches (or, when `always`, at least the
     /// capability) to a connected broker.
     fn flush_chat(&mut self, always: bool) {
@@ -1217,6 +1294,7 @@ impl Worker {
                 input_count: self.input.input_count(),
                 chat_v1: self.capabilities.chat_v1,
                 reason: self.capabilities.reason.clone(),
+                unavailable: self.unavailable(),
                 gap: 0,
             });
         }
@@ -1227,6 +1305,7 @@ impl Worker {
                 input_count: chunk.input_count,
                 chat_v1: self.capabilities.chat_v1,
                 reason: self.capabilities.reason.clone(),
+                unavailable: self.unavailable(),
                 gap: chunk.gap,
             });
         }
@@ -1382,12 +1461,16 @@ mod approval_settings_tests {
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("hooks").join("approval-hook.sh");
         let off = agent_command(&spec("codex"), Some(&[]), root.path(), true, None).unwrap();
-        assert!(off.approvals.is_none() && off.owned_dir.is_none());
+        assert!(off.approvals.is_none() && off.adapter.is_none());
         assert!(!script.exists());
         let on =
             agent_command(&spec("codex"), Some(&[]), root.path(), true, Some(&script)).unwrap();
-        assert!(on.approvals.is_some());
+        assert!(matches!(on.adapter, Some(ChatAdapter::Codex(_))));
+        let dir = on.approvals.clone().unwrap().0;
+        assert!(dir.join("events").is_dir());
         assert!(script.exists());
-        let _ = std::fs::remove_dir_all(on.owned_dir.unwrap());
+        // The adapter owns the session directory.
+        drop(on);
+        assert!(!dir.exists());
     }
 }

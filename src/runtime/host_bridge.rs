@@ -1019,11 +1019,25 @@ impl HostBridge {
                         .submit(request_id, &generation, text, input_count, false)
                     {
                         Ok(text) => text,
-                        Err(_) => return Some(DispatchReport::FailedNoEffect),
+                        // Why (the agent is busy, Codex before its first
+                        // prompt, ...) goes to the submitter.
+                        Err(outs) => {
+                            let detail = outs.iter().find_map(|o| match o {
+                                Out::Error { text, .. } => Some(text.clone()),
+                                _ => None,
+                            });
+                            return Some(match detail {
+                                Some(detail) => DispatchReport::Refused { detail },
+                                None => DispatchReport::FailedNoEffect,
+                            });
+                        }
                     };
+                let sent_ms = wall_ms() as i64;
                 match session.paste(&text, not_after) {
                     Ok(seq) => {
-                        session.chat.mark_pasted(request_id, Instant::now());
+                        session
+                            .chat
+                            .mark_pasted(request_id, Instant::now(), sent_ms);
                         self.pending
                             .insert((sid.to_string(), seq), Pending::Prompt(request_id.into()));
                         self.prompts.insert(request_id.into(), sid.to_string());
@@ -1036,8 +1050,11 @@ impl HostBridge {
                 }
             }
             ReceiptKind::Interrupt => {
+                // Ready: no turn runs. Unknown (Codex before its first
+                // prompt, whose hooks may not be trusted yet): Esc all the
+                // same, and the next turn end completes it.
                 let state = session.chat.status().state;
-                if session.chat_v1 && !matches!(state, ChatState::Working | ChatState::Waiting) {
+                if session.chat_v1 && state == ChatState::Ready {
                     return Some(DispatchReport::Completed {
                         detail: Some(NO_TURN.into()),
                         turn_id: None,
@@ -1111,7 +1128,9 @@ impl HostBridge {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            chat: session.provider == Provider::Claude.as_str(),
+            // Claude (its chat adapter, or why it is off, says the rest);
+            // Codex only with a chat adapter (Atem's Codex hooks on).
+            chat: session.provider == Provider::Claude.as_str() || session.chat_offered,
             rows,
             cols,
         };
@@ -1850,6 +1869,7 @@ impl HostBridge {
             sid,
             &generation,
             session.chat.status(),
+            &session.chat_unavailable,
         )];
         let history = session
             .chat

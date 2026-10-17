@@ -1085,6 +1085,7 @@ impl FakeWorker {
             input_epoch: 0,
             dropped: 0,
             exited: None,
+            chat: false,
         });
         let (lines, mut to_send) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (heard_tx, heard) = tokio::sync::mpsc::unbounded_channel();

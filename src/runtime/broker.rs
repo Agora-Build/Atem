@@ -168,6 +168,11 @@ pub struct BrokerSession {
     pub chat: ChatSession,
     pub chat_v1: bool,
     pub chat_reason: Option<String>,
+    /// The worker runs a chat adapter (its `hello`): the session offers
+    /// chat-v1 (Claude; Codex with Atem's Codex hooks on).
+    pub chat_offered: bool,
+    /// What its chat can't provide (`Capabilities::unavailable`).
+    pub chat_unavailable: Vec<String>,
     pub activity: Activity,
     pub activity_detail: Option<String>,
     /// The worker's approval reports, not taken by the session host yet.
@@ -228,6 +233,8 @@ impl BrokerSession {
             chat,
             chat_v1: false,
             chat_reason: None,
+            chat_offered: false,
+            chat_unavailable: Vec::new(),
             activity: Activity::Unknown,
             activity_detail: None,
             approval_events: Vec::new(),
@@ -312,6 +319,7 @@ impl BrokerSession {
         self.offset = handle.info.offset;
         self.tap.restart_at(self.offset);
         self.synced = synced;
+        self.chat_offered = handle.info.chat;
         let exited = handle.info.exited.clone();
         self.worker = Some(handle);
         if !synced {
@@ -670,6 +678,7 @@ impl BrokerSession {
                 input_count,
                 chat_v1,
                 reason,
+                unavailable,
                 gap: _,
             } => {
                 // The App's order: events, the log, then turn ends.
@@ -701,6 +710,7 @@ impl BrokerSession {
                 self.input_count = input_count;
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
+                self.chat_unavailable = unavailable;
             }
             WorkerMsg::Activity { state, detail } => {
                 if self.state == SessionState::Running {
@@ -781,6 +791,7 @@ impl BrokerSession {
                 input_count,
                 chat_v1,
                 reason,
+                unavailable,
             } => {
                 // The worker's chat session goes on here; open conversations
                 // (none for a fresh broker) reload it.
@@ -792,6 +803,7 @@ impl BrokerSession {
                 self.input_count = input_count;
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
+                self.chat_unavailable = unavailable;
                 self.chat_reset = Some(CHAT_SWITCHED);
             }
         }

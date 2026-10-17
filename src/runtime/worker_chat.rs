@@ -295,6 +295,7 @@ mod tests {
             input_count: chunk.input_count,
             chat_v1: true,
             reason: None,
+            unavailable: Vec::new(),
             gap: chunk.gap,
         })
     }
@@ -357,12 +358,14 @@ mod tests {
         let event = cap_event(AgentEvent::PromptSubmitted {
             text: "a".repeat(MAX_TEXT + 1),
             turn_id: None,
+            at_ms: None,
         });
         assert_eq!(
             event,
             AgentEvent::PromptSubmitted {
                 text: format!("{}{TRUNCATED}", "a".repeat(MAX_TEXT)),
                 turn_id: None,
+                at_ms: None,
             }
         );
         let small = part("fine".into());
@@ -376,6 +379,7 @@ mod tests {
             vec![AgentEvent::PromptSubmitted {
                 text: "a".into(),
                 turn_id: None,
+                at_ms: None,
             }],
             vec![],
             1,

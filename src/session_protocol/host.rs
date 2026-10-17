@@ -296,6 +296,10 @@ pub enum DispatchReport {
     /// Failed with proof that nothing reached the agent (e.g. the PTY
     /// reservation failed, the signal could not be delivered).
     FailedNoEffect,
+    /// Refused before anything reached the agent, for a reason the
+    /// submitter should see (a prompt while the agent is busy, or before
+    /// Codex's first prompt): rejected with this detail.
+    Refused { detail: String },
     /// Failed after a possible partial effect (e.g. the writer errored).
     FailedAfterPossibleEffect,
     /// Reconciliation could not establish the outcome.
@@ -792,6 +796,9 @@ impl<J: Journal> SessionHost<J> {
                     .to_string(),
                 ),
             ),
+            DispatchReport::Refused { detail } => {
+                (ReceiptState::Rejected, Some(bounded_detail(&detail)))
+            }
             DispatchReport::FailedAfterPossibleEffect => (
                 ReceiptState::OutcomeUnknown,
                 Some(

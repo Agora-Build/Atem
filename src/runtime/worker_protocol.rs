@@ -233,6 +233,9 @@ pub enum WorkerMsg {
         dropped: u64,
         /// The exit status when the agent already exited.
         exited: Option<String>,
+        /// The session has a chat adapter (Claude's; Codex's with Atem's
+        /// Codex hooks on): it offers chat-v1.
+        chat: bool,
     },
     /// Raw PTY output (base64) starting at stream position `offset`.
     Output {
@@ -260,6 +263,10 @@ pub enum WorkerMsg {
         input_count: u64,
         chat_v1: bool,
         reason: Option<String>,
+        /// What the adapter's chat can't provide (`Capabilities::unavailable`:
+        /// `streaming`, `reasoning`, `always_allow`, `error_details`).
+        #[serde(default)]
+        unavailable: Vec<String>,
         #[serde(default)]
         gap: u64,
     },
@@ -271,6 +278,8 @@ pub enum WorkerMsg {
         input_count: u64,
         chat_v1: bool,
         reason: Option<String>,
+        #[serde(default)]
+        unavailable: Vec<String>,
     },
     Activity {
         state: Activity,
@@ -519,6 +528,7 @@ mod tests {
                 input_epoch: 2,
                 dropped: 1,
                 exited: None,
+                chat: true,
             },
             WorkerMsg::output(b"x", 9),
             WorkerMsg::Screen {
@@ -537,7 +547,8 @@ mod tests {
                     },
                     AgentEvent::PromptSubmitted {
                         text: "hi".into(),
-                        turn_id: None,
+                        turn_id: Some("turn-1".into()),
+                        at_ms: Some(17),
                     },
                     AgentEvent::TurnEnded,
                 ],
@@ -559,6 +570,7 @@ mod tests {
                 input_count: 2,
                 chat_v1: true,
                 reason: None,
+                unavailable: vec!["streaming".into(), "reasoning".into()],
                 gap: 3,
             },
             WorkerMsg::Activity {

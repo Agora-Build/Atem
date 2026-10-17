@@ -13,6 +13,13 @@
 //!   and names the rollout, which must be `rollout-*-<session_id>.jsonl`
 //!   under `$CODEX_HOME/sessions`, also once symlinks are resolved (else
 //!   the hook is ignored with a notice).
+//! - Ownership: each event file's first line is the hook's `$$ $PPID`.
+//!   Only hooks the session's agent started count (`approvals::started_by`,
+//!   the rule approvals use): directly (its parent is the agent, or one
+//!   shell under it) a hook may pin or re-pin; through a non-shell child (a
+//!   wrapper such as npm's `codex`) only the pinned session's, or the first
+//!   one; anything deeper (a `codex` a tool ran) never counts, so a nested
+//!   Codex can't take over the chat or the status.
 //! - Only the pinned session's hooks count. A SessionStart of another
 //!   session re-pins (`/new` → `startup`, a resume of another conversation
 //!   → `resume`): the old rollout is read to its end first (the switch
@@ -20,9 +27,7 @@
 //!   anything else is history (`Backfill`) up to a turn still running. A
 //!   start of another session while the pinned one's turn runs waits (with
 //!   a notice) until that turn ends (its rollout end, or its Stop/Interrupt
-//!   hook): a `codex` run by a tool inside the turn has this session's
-//!   environment too and would otherwise take the chat over (the event
-//!   files carry no process ancestry, unlike approval requests).
+//!   hook).
 //! - Status (`ChatSession`): `UserPromptSubmit` → working (and the hook
 //!   half of a prompt's acceptance, with its `turn_id`), PreToolUse /
 //!   PostToolUse → tool events, the rollout's `task_started` → working,
@@ -53,6 +58,7 @@ use crate::chat::adapter::{
     AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_ALWAYS_ALLOW,
     UNAVAILABLE_ERROR_DETAILS, UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
 };
+use crate::chat::approvals::{Ancestry, started_by};
 
 /// Why a chat prompt is refused before Codex's first hook.
 pub const FIRST_PROMPT: &str = "type a first prompt in the terminal: Codex reports nothing before it (and Atem's Codex hooks must be trusted in its /hooks)";
@@ -75,6 +81,9 @@ const LEFTOVER: Duration = Duration::from_secs(60);
 
 pub struct CodexAdapter {
     codex_home: PathBuf,
+    /// The session's agent process (the PTY child): only hooks it started
+    /// count. Unknown: none does.
+    agent_pid: Option<u32>,
     dir: Option<PathBuf>,
     events: Option<EventReader>,
     rollout: Option<RolloutReader>,
@@ -113,6 +122,7 @@ impl CodexAdapter {
     pub fn new(codex_home: PathBuf) -> Self {
         Self {
             codex_home,
+            agent_pid: None,
             dir: None,
             events: None,
             rollout: None,
@@ -131,6 +141,11 @@ impl CodexAdapter {
         }
     }
 
+    /// The agent was spawned as `pid`: from now on its hooks count.
+    pub fn set_agent_pid(&mut self, pid: Option<u32>) {
+        self.agent_pid = pid;
+    }
+
     /// The session directory (`ATEM_APPROVAL_DIR`: `events/` for the hooks,
     /// `approvals/` for PermissionRequest).
     pub fn dir(&self) -> Option<&Path> {
@@ -138,6 +153,7 @@ impl CodexAdapter {
     }
 
     /// The pinned Codex session (from its first hook).
+    #[cfg(test)]
     pub fn session_id(&self) -> Option<&str> {
         self.pinned.as_deref()
     }
@@ -271,6 +287,7 @@ impl CodexAdapter {
                     out.push(AgentEvent::PromptSubmitted {
                         text,
                         turn_id: hook.turn_id,
+                        at_ms: Some(hook.at_ms),
                     });
                 }
             }
@@ -314,8 +331,8 @@ impl AgentAdapter for CodexAdapter {
         let read = reader.poll();
         let mut incoming = std::mem::take(&mut self.held);
         let mut bad = 0;
-        for v in read {
-            match v.as_ref().and_then(Hook::parse) {
+        for raw in read {
+            match raw.as_ref().and_then(Hook::from_raw) {
                 Some(hook) => incoming.push_back(hook),
                 None => bad += 1,
             }
@@ -326,6 +343,20 @@ impl AgentAdapter for CodexAdapter {
         while let Some(hook) = incoming.pop_front() {
             let start = hook.event == "SessionStart";
             let ours = self.pinned.as_deref() == Some(hook.session_id.as_str());
+            let ancestry = match self.agent_pid {
+                Some(agent) => started_by(hook.parent, agent),
+                None => Ancestry::Foreign,
+            };
+            // Not started by this session's agent (a nested codex), or a
+            // wrapped one naming another session than the pinned one.
+            let counts = match ancestry {
+                Ancestry::Direct => true,
+                Ancestry::Wrapped => ours || self.pinned.is_none(),
+                Ancestry::Foreign => false,
+            };
+            if !counts {
+                continue;
+            }
             if ours && !start {
                 self.map(hook, &mut out);
                 if !self.turn_open
@@ -380,6 +411,8 @@ impl AgentAdapter for CodexAdapter {
             self.pinned = Some(hook.session_id.clone());
             self.turn_open = false;
             self.approvals = 0;
+            // A wait of the old session must not come after the reset.
+            self.extra.clear();
             self.deferred = None;
             self.session_started = true;
             out.push(AgentEvent::SessionStarted {
@@ -453,6 +486,10 @@ impl Drop for CodexAdapter {
 /// names its session and rollout; one that doesn't is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hook {
+    /// The hook's parent process (its event file's `$PPID`).
+    pub parent: u32,
+    /// When the hook wrote its event (the file's time, unix ms).
+    pub at_ms: i64,
     pub event: String,
     pub session_id: String,
     pub transcript_path: PathBuf,
@@ -465,9 +502,12 @@ pub struct Hook {
 }
 
 impl Hook {
-    pub fn parse(json: &Value) -> Option<Hook> {
+    pub fn from_raw(raw: &RawEvent) -> Option<Hook> {
+        let json = &raw.json;
         let s = |k: &str| json.get(k).and_then(Value::as_str);
         Some(Hook {
+            parent: raw.parent,
+            at_ms: raw.at_ms,
             event: s("hook_event_name")?.to_string(),
             session_id: s("session_id")?.to_string(),
             transcript_path: PathBuf::from(s("transcript_path")?),
@@ -476,6 +516,36 @@ impl Hook {
             turn_id: s("turn_id").map(str::to_string),
         })
     }
+}
+
+/// One event file: the hook's `$$ $PPID` line, then its stdin JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawEvent {
+    /// The hook script's own pid.
+    pub pid: u32,
+    /// Its parent (Codex, or the shell Codex ran it in).
+    pub parent: u32,
+    /// The file's time (unix ms): when the hook wrote it.
+    pub at_ms: i64,
+    pub json: Value,
+}
+
+/// `"<pid> <ppid>\n<json>"` as written by the hook script.
+fn parse_event(text: &str, at_ms: i64) -> Option<RawEvent> {
+    let (head, body) = text.split_once('\n')?;
+    let mut ids = head.split(' ');
+    let pid = ids.next()?.parse().ok()?;
+    let parent = ids.next()?.parse().ok()?;
+    if ids.next().is_some() {
+        return None;
+    }
+    let json = serde_json::from_str::<Value>(body).ok()?;
+    Some(RawEvent {
+        pid,
+        parent,
+        at_ms,
+        json,
+    })
 }
 
 /// Reads the hook script's `events/ev-<seq>-<Event>.json` files in (seq,
@@ -504,21 +574,27 @@ fn stale(meta: &std::fs::Metadata, now: SystemTime) -> bool {
         .is_some_and(|age| age > LEFTOVER)
 }
 
-/// A regular file (never through a symlink): `Ok(None)` when larger than
-/// `MAX_EVENT`.
-fn read_event(path: &Path) -> std::io::Result<Option<String>> {
+/// A regular file (never through a symlink) and its time (unix ms):
+/// `Ok(None)` when larger than `MAX_EVENT`.
+fn read_event(path: &Path) -> std::io::Result<Option<(String, i64)>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
+    let at_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64);
     let mut text = String::new();
     file.take(MAX_EVENT + 1).read_to_string(&mut text)?;
-    Ok((text.len() as u64 <= MAX_EVENT).then_some(text))
+    Ok((text.len() as u64 <= MAX_EVENT).then_some((text, at_ms)))
 }
 
 impl EventReader {
@@ -526,9 +602,9 @@ impl EventReader {
         Self { dir }
     }
 
-    /// The events in order; `None` for one that was too big or not JSON
-    /// (deleted all the same).
-    pub fn poll(&mut self) -> Vec<Option<Value>> {
+    /// The events in order; `None` for one that was too big, had no
+    /// `$$ $PPID` line or wasn't JSON (deleted all the same).
+    pub fn poll(&mut self) -> Vec<Option<RawEvent>> {
         let Ok(rd) = std::fs::read_dir(self.dir.join("events")) else {
             return Vec::new();
         };
@@ -552,7 +628,7 @@ impl EventReader {
             match read_event(&path) {
                 Ok(text) => {
                     let _ = std::fs::remove_file(&path);
-                    out.push(text.and_then(|t| serde_json::from_str::<Value>(&t).ok()));
+                    out.push(text.and_then(|(t, at_ms)| parse_event(&t, at_ms)));
                 }
                 Err(_) => {
                     // Unreadable: kept for now, dropped once stale.

@@ -125,6 +125,9 @@ struct OpenedBody<'a> {
     generation: &'a str,
     sequence: u64,
     status: StatusBody<'a>,
+    /// What this agent's chat can't provide (`streaming`, `reasoning`,
+    /// `always_allow`, `error_details`); empty for Claude.
+    unavailable: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -269,7 +272,13 @@ fn envelope(
     }
 }
 
-pub fn opened(conv: &str, agent: &str, generation: &str, status: &Status) -> ChatEnvelope {
+pub fn opened(
+    conv: &str,
+    agent: &str,
+    generation: &str,
+    status: &Status,
+    unavailable: &[String],
+) -> ChatEnvelope {
     envelope(
         conv,
         agent,
@@ -279,6 +288,7 @@ pub fn opened(conv: &str, agent: &str, generation: &str, status: &Status) -> Cha
             generation,
             sequence: 0,
             status: status_body(status),
+            unavailable,
         },
     )
 }
@@ -552,9 +562,14 @@ mod tests {
             detail: None,
         };
         assert_eq!(
-            body(&opened("c1", "claude", "g", &st)),
+            body(&opened("c1", "claude", "g", &st, &[])),
             json!({"v":1,"op":"opened","conversationId":"c1","agentId":"claude","generation":"g","sequence":0,
-                   "status":{"state":"working","since":5}})
+                   "status":{"state":"working","since":5},"unavailable":[]})
+        );
+        let codex = ["streaming".to_string(), "always_allow".to_string()];
+        assert_eq!(
+            body(&opened("c1", "codex", "g", &st, &codex))["unavailable"],
+            json!(["streaming", "always_allow"])
         );
         let st = Status {
             state: State::Waiting,
@@ -562,7 +577,7 @@ mod tests {
             detail: Some("Bash".into()),
         };
         assert_eq!(
-            body(&opened("c1", "claude", "g", &st))["status"],
+            body(&opened("c1", "claude", "g", &st, &[]))["status"],
             json!({"state":"waiting","since":6,"detail":"Bash"})
         );
     }

@@ -39,10 +39,7 @@ use serde_json::Value;
 use crate::chat::approvals::{CODEX_TIMEOUT, ENV, shell_quote};
 use crate::config::write_keeping;
 
-// Wired into the worker by the next step (Codex chat plan, Task 3).
-#[allow(dead_code)]
 pub mod adapter;
-#[allow(dead_code)]
 pub mod rollout;
 
 /// How our entries' commands start (their mark).

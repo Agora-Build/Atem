@@ -365,5 +365,52 @@ pub fn decision_output(
     })
 }
 
+const SHELLS: [&str; 8] = ["sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"];
+
+fn is_shell(name: &str) -> bool {
+    SHELLS.contains(&name)
+}
+
+/// How a hook process relates to the session's agent, from the hook's
+/// parent pid (the hook script records `$PPID`: in `pid-<id>` for a
+/// PermissionRequest, in each Codex event file's first line). Codex's hook
+/// command is the same for every session and its environment reaches a
+/// `codex` run by a tool too, so only this tells the session's own agent
+/// from a nested one (`runtime::worker_approvals`, `chat::codex::adapter`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    /// Its parent is the agent, or a shell (that didn't exec) whose parent is.
+    Direct,
+    /// Through a non-shell child of the agent: a wrapper such as npm's
+    /// `codex`, which runs the real binary as its child — or a `codex` the
+    /// agent itself started without a shell. Ambiguous.
+    Wrapped,
+    /// Not started by the agent (e.g. a `codex` started inside the session
+    /// through a shell is deeper).
+    Foreign,
+}
+
+/// How a hook whose parent is `parent` relates to the agent `agent`.
+pub fn started_by(parent: u32, agent: u32) -> Ancestry {
+    use crate::runtime::adopt::process_parent_and_name;
+    let mut q = parent;
+    if q == agent {
+        return Ancestry::Direct;
+    }
+    let Some((up, name)) = process_parent_and_name(q) else {
+        return Ancestry::Foreign;
+    };
+    if is_shell(&name) {
+        q = up;
+        if q == agent {
+            return Ancestry::Direct;
+        }
+    }
+    match process_parent_and_name(q) {
+        Some((up, name)) if !is_shell(&name) && up == agent => Ancestry::Wrapped,
+        _ => Ancestry::Foreign,
+    }
+}
+
 #[cfg(test)]
 mod tests;

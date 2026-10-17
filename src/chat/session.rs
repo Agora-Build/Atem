@@ -119,6 +119,27 @@ struct Pending {
     /// log entry: both halves must agree when both are known.
     hook_turn: Option<String>,
     log_turn: Option<String>,
+    /// When the paste was sent (unix ms). Only a hook and a log entry from
+    /// after it can be this prompt's (a local prompt with the same text
+    /// typed just before is not), and only the first of each: once one
+    /// from after the paste was another prompt, nothing later pairs.
+    pasted_ms: Option<i64>,
+    hook_closed: bool,
+    log_closed: bool,
+}
+
+impl Pending {
+    /// A record made at `at_ms` (unix ms) can be this prompt's: not before
+    /// the paste. A whole second (a filesystem or a log keeping seconds
+    /// only) counts up to its end.
+    fn after_paste(&self, at_ms: i64) -> bool {
+        let at = if at_ms % 1000 == 0 {
+            at_ms + 999
+        } else {
+            at_ms
+        };
+        self.pasted_ms.is_none_or(|pasted| at >= pasted)
+    }
 }
 
 /// A chat session's state, for a broker that connects to a running agent's
@@ -390,17 +411,27 @@ impl ChatSession {
                 self.input_mark = input_count;
                 self.set_status(State::Ready, None, now_ms, &mut out);
             }
-            AgentEvent::PromptSubmitted { text, turn_id } => {
+            AgentEvent::PromptSubmitted {
+                text,
+                turn_id,
+                at_ms,
+            } => {
+                // The first hook from after the paste whose turn isn't
+                // known to be another decides.
                 if let Some(p) = &mut self.pending
                     && !p.hook_seen
-                    && same_prompt(&p.text, &text)
+                    && !p.hook_closed
+                    && at_ms.is_none_or(|at| p.after_paste(at))
                     && match (&p.log_turn, &turn_id) {
                         (Some(log), Some(hook)) => log == hook,
                         _ => true,
                     }
                 {
-                    p.hook_seen = true;
-                    p.hook_turn = turn_id;
+                    p.hook_closed = true;
+                    if same_prompt(&p.text, &text) {
+                        p.hook_seen = true;
+                        p.hook_turn = turn_id;
+                    }
                 }
                 if self.live() {
                     self.set_status(State::Working, None, now_ms, &mut out);
@@ -507,14 +538,20 @@ impl ChatSession {
                 created_at_ms,
             } => {
                 let mut request_id = None;
+                // The first log entry from after the paste whose turn isn't
+                // known to be another decides.
                 if let Some(p) = &mut self.pending
                     && !p.log_seen
-                    && same_prompt(&p.text, &text)
+                    && !p.log_closed
+                    && p.after_paste(created_at_ms)
                     && p.hook_turn.as_ref().is_none_or(|t| *t == turn_id)
                 {
-                    p.log_seen = true;
-                    p.log_turn = Some(turn_id.clone());
-                    request_id = Some(p.request_id.clone());
+                    p.log_closed = true;
+                    if same_prompt(&p.text, &text) {
+                        p.log_seen = true;
+                        p.log_turn = Some(turn_id.clone());
+                        request_id = Some(p.request_id.clone());
+                    }
                 }
                 // The timed-out link may only match the NEXT user entry.
                 let expired = self.expired.take();
@@ -766,17 +803,24 @@ impl ChatSession {
             log_seen: false,
             hook_turn: None,
             log_turn: None,
+            pasted_ms: None,
+            hook_closed: false,
+            log_closed: false,
         });
         self.record(request_id, RequestState::Pending);
         Ok(text.to_string())
     }
 
-    /// Call right after a successful paste so the 10 s acceptance clock starts then.
-    pub fn mark_pasted(&mut self, request_id: &str, now: Instant) {
+    /// Call right after a successful paste so the 10 s acceptance clock
+    /// starts then; `sent_ms` (unix ms, taken right before the paste was
+    /// sent) is what the agent's own records of the prompt must not
+    /// predate.
+    pub fn mark_pasted(&mut self, request_id: &str, now: Instant, sent_ms: i64) {
         if let Some(p) = &mut self.pending
             && p.request_id == request_id
         {
             p.pasted_at = Some(now);
+            p.pasted_ms = Some(sent_ms);
         }
     }
 
@@ -1076,10 +1120,101 @@ mod tests {
     }
 
     #[test]
+    fn a_local_prompt_from_before_the_paste_never_satisfies_a_remote_one() {
+        let hook = |turn: &str, text: &str, at: i64| AgentEvent::PromptSubmitted {
+            text: text.into(),
+            turn_id: Some(turn.into()),
+            at_ms: Some(at),
+        };
+        let user_at = |id: &str, turn: &str, text: &str, at: i64| LogItem::UserMessage {
+            id: id.into(),
+            turn_id: turn.into(),
+            text: text.into(),
+            created_at_ms: at,
+        };
+        let accepted = |o: &[Out]| o.iter().any(|o| matches!(o, Out::Accepted { .. }));
+        // Hook first: the same text typed in the terminal just before the
+        // paste (its hook and log entry predate it) is a local turn.
+        let mut s = ready();
+        s.submit("r", "g1", "go", 0, false).unwrap();
+        s.mark_pasted("r", Instant::now(), 1000);
+        assert!(!accepted(&s.on_event(hook("L", "go", 990), 2, 0)));
+        let o = s.on_log(user_at("uL", "L", "go", 995), 3, 0);
+        assert!(!accepted(&o));
+        assert!(o.iter().any(|o| matches!(o, Out::Message(m)
+            if m.origin == Some(Origin::Local) && m.request_id.is_none())));
+        // The remote prompt's own records come after it.
+        assert!(!accepted(&s.on_event(hook("R", "go", 1010), 4, 0)));
+        let o = s.on_log(user_at("uR", "R", "go", 1020), 5, 0);
+        assert!(o.contains(&Out::Accepted {
+            request_id: "r".into()
+        }));
+        // Log first (the hook's turn not known yet): the same.
+        let mut s = ready();
+        s.submit("r", "g1", "go", 0, false).unwrap();
+        s.mark_pasted("r", Instant::now(), 1000);
+        let o = s.on_log(user_at("uL", "L", "go", 999), 2, 0);
+        assert!(!accepted(&o));
+        assert!(
+            o.iter()
+                .any(|o| matches!(o, Out::Message(m) if m.request_id.is_none()))
+        );
+        assert!(!accepted(&s.on_event(hook("L", "go", 998), 3, 0)));
+        s.on_log(user_at("uR", "R", "go", 1001), 4, 0);
+        assert!(accepted(&s.on_event(hook("R", "go", 1000), 5, 0)));
+        // Only the first turn from after the paste: another prompt there
+        // means the pasted one wasn't submitted (yet); a later turn with
+        // its text is not paired.
+        let mut s = ready();
+        s.submit("r", "g1", "go", 0, false).unwrap();
+        s.mark_pasted("r", Instant::now(), 1000);
+        s.on_event(hook("X", "other", 1005), 2, 0);
+        s.on_log(user_at("uX", "X", "other", 1006), 3, 0);
+        s.on_event(hook("Y", "go", 1010), 4, 0);
+        let o = s.on_log(user_at("uY", "Y", "go", 1011), 5, 0);
+        assert!(!accepted(&o));
+        assert!(
+            o.iter()
+                .any(|o| matches!(o, Out::Message(m) if m.request_id.is_none()))
+        );
+    }
+
+    #[test]
+    fn a_whole_second_time_counts_to_the_end_of_its_second() {
+        let mut s = ready();
+        s.submit("r", "g1", "go", 0, false).unwrap();
+        s.mark_pasted("r", Instant::now(), 2500);
+        // a filesystem keeping seconds: the hook's file says 2000
+        s.on_event(
+            AgentEvent::PromptSubmitted {
+                text: "go".into(),
+                turn_id: None,
+                at_ms: Some(2000),
+            },
+            1,
+            0,
+        );
+        let o = s.on_log(
+            LogItem::UserMessage {
+                id: "u".into(),
+                turn_id: "t".into(),
+                text: "go".into(),
+                created_at_ms: 2501,
+            },
+            2,
+            0,
+        );
+        assert!(o.contains(&Out::Accepted {
+            request_id: "r".into()
+        }));
+    }
+
+    #[test]
     fn acceptance_needs_the_hooks_turn() {
         let hook = |turn: &str| AgentEvent::PromptSubmitted {
             text: "go".into(),
             turn_id: Some(turn.into()),
+            at_ms: None,
         };
         let mut s = ChatSession::new("g".into(), 0);
         s.on_event(started(), 1, 0);
@@ -1129,7 +1264,8 @@ mod tests {
             s.on_event(
                 AgentEvent::PromptSubmitted {
                     text: "x".into(),
-                    turn_id: None
+                    turn_id: None,
+                    at_ms: None,
                 },
                 1,
                 0
@@ -1152,6 +1288,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "x".into(),
                 turn_id: None,
+                at_ms: None,
             },
             20,
             0,
@@ -1300,6 +1437,7 @@ mod tests {
             let hook = AgentEvent::PromptSubmitted {
                 text: "do it".into(), // trailing whitespace is trimmed on both sides
                 turn_id: None,
+                at_ms: None,
             };
             let log = user("u1", "t1", "do it");
             let (a, b) = if hook_first {
@@ -1374,6 +1512,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "go".into(),
                 turn_id: None,
+                at_ms: None,
             },
             3,
             0,
@@ -1442,6 +1581,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "go".into(),
                 turn_id: None,
+                at_ms: None,
             },
             2,
             0,
@@ -1472,6 +1612,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "x".into(),
                 turn_id: None,
+                at_ms: None,
             },
             2,
             0,
@@ -1485,6 +1626,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "typed".into(),
                 turn_id: None,
+                at_ms: None,
             },
             4,
             6,
@@ -1618,6 +1760,7 @@ mod tests {
                 AgentEvent::PromptSubmitted {
                     text: "go".into(),
                     turn_id: None,
+                    at_ms: None,
                 },
                 2,
                 0,
@@ -1647,6 +1790,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "x".into(),
                 turn_id: None,
+                at_ms: None,
             },
             2,
             0,
@@ -1670,6 +1814,7 @@ mod tests {
                 AgentEvent::PromptSubmitted {
                     text: "x".into(),
                     turn_id: None,
+                    at_ms: None,
                 },
                 2,
                 0,
@@ -1695,6 +1840,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "x".into(),
                 turn_id: None,
+                at_ms: None,
             },
             2,
             0,
@@ -1760,6 +1906,7 @@ mod tests {
             AgentEvent::PromptSubmitted {
                 text: "go".into(),
                 turn_id: None,
+                at_ms: None,
             },
             2,
             0,

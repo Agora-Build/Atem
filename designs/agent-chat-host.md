@@ -16,9 +16,10 @@ a mobile app later uses the same events, so the host side is client-neutral.
 The host side is **adapter-based**: everything agent-specific (how Atem hooks
 in, which events mean what, how the session log is parsed) lives in one
 adapter per agent; the chat state, message model, wire protocol, security and
-reconnect handling are shared. v1 ships one adapter, **Claude Code**. Codex is
-the next adapter (its own, smaller design: rollout JSONL plus its hooks, which
-need per-installation trust); other agents (Gemini CLI, OpenCode, Copilot CLI,
+reconnect handling are shared. Two adapters: **Claude Code**, and **Codex**
+(its rollout JSONL plus Atem's Codex hooks, which need per-installation trust;
+`src/chat/codex/adapter.rs`, spec `designs/fixtures/codex-hooks/README.md`,
+plan `designs/plans/2026-10-17-codex-chat.md`); other agents (Gemini CLI, OpenCode, Copilot CLI,
 Aider, …) get an adapter only once their logs and events are checked. An agent
 without an adapter keeps the shared terminal, reports status `unknown` and has
 no `chat-v1` capability.
@@ -312,7 +313,7 @@ on the existing authenticated Astation connection.
 | op | Direction | Fields |
 |---|---|---|
 | `open` | Astation → Atem | `conversationId`, `agentId`, optional `before` (messageId) |
-| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
+| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
 | `submit` | Astation → Atem | `generation`, `requestId` (UUID), `text` |
 | `accepted` | Atem → Astation | `requestId` |
 | `message` / `delta` | Atem → Astation | see the message model |
@@ -323,6 +324,13 @@ on the existing authenticated Astation connection.
 
 - `open` with `before` on an open conversation reopens it (`opened`,
   sequence 0) and sends that older page.
+- `opened.unavailable` names what this agent's chat can't provide, so a
+  client says so instead of waiting for it: `streaming` (no partial text:
+  messages arrive whole), `reasoning`, `always_allow` (approval cards offer
+  no persistent rule), `error_details` (no model/API error behind a failed
+  turn). Empty for Claude; all four for Codex. It comes from the adapter's
+  `Capabilities.unavailable`, carried by the worker's `chat` and
+  `chat_snapshot` messages (field `unavailable`).
 - Every Atem event in a conversation carries `generation` and the next
   `sequence` (1, 2, …; at most 2^53−1). A gap or a different generation means
   the client reopens.
@@ -415,8 +423,41 @@ Additive to `mem_b3ccce1f`:
 
 ## Out of scope (v1)
 
-Adapters other than Claude Code (Codex next, as its own design; Codex
-approvals already work through its hook, without chat); streaming
+Adapters other than Claude Code and Codex; streaming
 token-by-token (the transcript holds whole content blocks); end-to-end
 encryption of chat; push delivery of chat messages (approvals ask the relay
 to push, §6a); attachments/images.
+
+## Codex
+
+The Codex adapter (`src/chat/codex/adapter.rs`) runs in the worker when
+`[codex] hooks = true` (one consent for approvals and chat). Atem's entries
+in `$CODEX_HOME/hooks.json` run `approval-hook.sh event <Event>`, which
+writes each event to the session's `events/` as `ev-<seq>-<Event>.json`:
+first a line with the hook's `$$ $PPID`, then its stdin. The rollout JSONL
+named by `transcript_path` carries every message and turn boundary.
+
+- **Ownership.** Only hooks the session's agent started count
+  (`approvals::started_by`, shared with approvals): with the hook's parent
+  the agent (or one shell under it) a hook may pin or re-pin (`/new`);
+  through a non-shell child (npm's wrapper) only the pinned session's, or
+  the first; deeper (a `codex` a tool ran) never.
+- **Status.** `unknown` until the first hook (SessionStart is lazy: it
+  fires at the first prompt), with the detail "type a first prompt in the
+  terminal: …"; chat opens, but `submit` is refused with that text (a
+  remote prompt needs `ready`: text typed into Codex's startup dialogs could
+  answer them). Then `working` from UserPromptSubmit or the rollout's
+  `task_started`, `waiting` while an approval the worker reported for this
+  session is open (Codex has no event of its own), `ready` at
+  `task_complete` / `turn_aborted`.
+- **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
+  UserPromptSubmit and the rollout's UserMessage both name it, with the same
+  `turn_id`; completed at that turn's end (interrupted at `turn_aborted`).
+  `interrupt` writes Esc and completes at the next turn end; while the
+  status is `unknown` it is written all the same.
+- **Pairing a remote prompt.** Only a hook (its event file's time) and a log
+  entry (its timestamp) from after the paste can be the remote prompt's, and
+  only the first of each whose turn isn't known to be another: a local
+  prompt with the same text typed just before is a local turn. A
+  whole-second time counts up to the end of its second. This applies to
+  Claude as well.

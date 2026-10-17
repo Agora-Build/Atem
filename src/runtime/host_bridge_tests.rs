@@ -1311,7 +1311,8 @@ fn interrupts_complete_at_once_without_a_turn_and_are_unknown_when_unobserved() 
             })
             .await;
         assert_eq!(peer.seen[done]["data"]["detail"], "no turn was running");
-        // Codex has no chat: nothing can observe it within 10 s.
+        // Codex reported no first prompt (its status is unknown): Esc is
+        // written, and nothing observes it within 10 s.
         rt.clock.skip(10_001);
         let peer = &mut rt.peer;
         let unknown = peer
@@ -2151,6 +2152,246 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
             .await;
         assert_eq!(done["data"]["code"], "outcome_unknown", "{done}");
         peer.wait_from(0, |v| is_card(v, &aid, "closed")).await;
+        rt.shutdown().await;
+    });
+}
+
+fn fake_codex() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/fake-codex.py");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    if perms.mode() & 0o111 != 0o111 {
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+impl Runtime {
+    /// Launches Codex as the fake Codex TUI (control files in `fake`), with
+    /// Atem's hooks installed in its own `CODEX_HOME` as `atem agent launch
+    /// codex` installs them.
+    async fn launch_fake_codex(&self, client: &mut RuntimeClient, fake: &Path) -> SessionSummary {
+        let home = self.dir.path().join("codex-home");
+        crate::chat::codex::install(&home, &self.dir.path().join("run/approval-hook.sh")).unwrap();
+        client
+            .send(&ClientMsg::Launch {
+                provider: "codex".into(),
+                args: vec![],
+                cwd: self.dir.path().to_path_buf(),
+                env: LaunchEnv(vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    ("CODEX_CLI_BIN".into(), fake_codex().display().to_string()),
+                    ("CODEX_HOME".into(), home.display().to_string()),
+                    ("FAKE_DIR".into(), fake.display().to_string()),
+                ]),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        let session = expect(client, |m| match m {
+            RuntimeMsg::Launched { session } => Some(session),
+            RuntimeMsg::Error { text, .. } => panic!("launch failed: {text}"),
+            _ => None,
+        })
+        .await;
+        agent_event(fake, "started").await;
+        session
+    }
+}
+
+/// Waits until the session's descriptor shows `activity`.
+async fn activity_until(peer: &mut Peer, sid: &str, activity: &str) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if listed(peer, sid).await["activity"] == activity {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the activity never became {activity}"));
+}
+
+#[test]
+fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approval() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_fake_codex(&mut client, &fake).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        let descriptor = listed(peer, &sid).await;
+        assert_eq!(
+            descriptor["capabilities"],
+            json!(["terminal-v1", "chat-v1"])
+        );
+        assert_eq!(descriptor["activity"], "unknown");
+
+        // Before Codex's first prompt: chat opens (status unknown, with the
+        // hint) and says what it can't provide; a prompt is refused, never
+        // typed.
+        peer.chat("open", "conv-1", &sid, &pg, json!({}));
+        let opened = peer.wait(|v| is_chat(v, "opened")).await;
+        assert_eq!(opened["data"]["status"]["state"], "unknown", "{opened}");
+        let detail = opened["data"]["status"]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("type a first prompt in the terminal"),
+            "{detail}"
+        );
+        assert_eq!(
+            opened["data"]["unavailable"],
+            json!(["streaming", "reasoning", "always_allow", "error_details"])
+        );
+        let lease = peer.acquire(&sid, &pg).await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let refused =
+            submit_until_complete(peer, "conv-1", &sid, &pg, lease, &request_id, "too early").await;
+        let refused = &refused.last().unwrap()["data"];
+        assert_eq!(refused["code"], "rejected", "{refused}");
+        assert!(
+            refused["text"]
+                .as_str()
+                .unwrap()
+                .contains("type a first prompt"),
+            "{refused}"
+        );
+
+        // The first prompt, typed in the terminal (a local turn).
+        attach_client(&mut client, &sid, 24, 80).await;
+        client
+            .send(&ClientMsg::input(&sid, b"local one\r"))
+            .await
+            .unwrap();
+        agent_event(&fake, "prompt turn-1 local one").await;
+        let peer = &mut rt.peer;
+        peer.wait_from(0, |v| {
+            is_chat(v, "message")
+                && v["data"]["origin"] == "local"
+                && v.to_string().contains("local one")
+        })
+        .await;
+        activity_until(peer, &sid, "working").await;
+        std::fs::write(fake.join("complete"), "").unwrap();
+        agent_event(&fake, "completed turn-1").await;
+        peer.wait_from(0, |v| {
+            is_chat(v, "message") && v.to_string().contains("reply 1")
+        })
+        .await;
+        activity_until(peer, &sid, "ready").await;
+
+        // A remote prompt: pasted through the worker, accepted once the
+        // hook and the rollout both named it, its reply, its completion.
+        let lease = peer.acquire(&sid, &pg).await;
+        let send = |peer: &mut Peer, rid: &str, text: &str| {
+            peer.chat(
+                "submit",
+                "conv-1",
+                &sid,
+                &pg,
+                json!({"generation": pg, "requestId": rid, "text": text, "lease_epoch": lease}),
+            )
+        };
+        let accepted = |rid: String| {
+            move |v: &Value| is_chat(v, "accepted") && v["data"]["requestId"] == rid.as_str()
+        };
+        let completed = |rid: String| {
+            move |v: &Value| {
+                (is_chat(v, "complete") || is_chat(v, "error"))
+                    && v["data"]["requestId"] == rid.as_str()
+            }
+        };
+        let r2 = uuid::Uuid::new_v4().to_string();
+        let from = peer.seen.len();
+        send(peer, &r2, "remote two");
+        let at_accepted = peer.wait_from(from, accepted(r2.clone())).await;
+        agent_event(&fake, "prompt turn-2 remote two").await;
+        // The prompt's own message carries the request id (the hook and
+        // the rollout both named it).
+        let rid = r2.clone();
+        peer.wait_from(from, move |v| {
+            is_chat(v, "message")
+                && v["data"]["role"] == "user"
+                && v["data"]["requestId"] == rid.as_str()
+        })
+        .await;
+        std::fs::write(fake.join("complete"), "").unwrap();
+        let at_done = peer.wait_from(from, completed(r2.clone())).await;
+        let done = peer.seen[at_done].clone();
+        assert!(is_chat(&done, "complete"), "{done}");
+        assert_eq!(done["data"]["outcome"], "done");
+        assert_eq!(done["data"]["turnId"], "turn-2");
+        let reply = peer.seen[from..]
+            .iter()
+            .position(|v| is_chat(v, "message") && v.to_string().contains("reply 2"))
+            .expect("the agent's reply")
+            + from;
+        assert!(at_accepted < reply && reply < at_done);
+        activity_until(peer, &sid, "ready").await;
+
+        // An interrupt while a turn runs: Esc, completed at the turn's end.
+        let r3 = uuid::Uuid::new_v4().to_string();
+        let from = peer.seen.len();
+        send(peer, &r3, "remote three");
+        peer.wait_from(from, accepted(r3.clone())).await;
+        activity_until(peer, &sid, "working").await;
+        let interrupt = uuid::Uuid::new_v4().to_string();
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)),
+                   "request_id": interrupt, "kind": "interrupt", "payload": {}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+        agent_event(&fake, "interrupted turn-3").await;
+        let i = interrupt.clone();
+        peer.wait_from(from, move |v| {
+            is_session(v, "receipt")
+                && v["data"]["request_id"] == i.as_str()
+                && v["data"]["state"] == "completed"
+        })
+        .await;
+        let at_done = peer.wait_from(from, completed(r3.clone())).await;
+        assert_eq!(peer.seen[at_done]["data"]["outcome"], "interrupted");
+        activity_until(peer, &sid, "ready").await;
+
+        // An approval in a remote turn: waiting, its card, answered from
+        // chat; the turn goes on and completes.
+        let r4 = uuid::Uuid::new_v4().to_string();
+        let from = peer.seen.len();
+        send(peer, &r4, "remote four");
+        peer.wait_from(from, accepted(r4.clone())).await;
+        ask(
+            &fake,
+            1,
+            json!({"tool_name": "Bash", "tool_input": {"command": "touch made.txt"}}),
+        );
+        let request = peer.wait(|v| is_session(v, "approval_request")).await["data"].clone();
+        let aid = request["approval_id"].as_str().unwrap().to_string();
+        assert_eq!(request["summary"], "touch made.txt");
+        activity_until(peer, &sid, "waiting").await;
+        peer.wait_from(from, |v| is_card(v, &aid, "pending")).await;
+        let answer = uuid::Uuid::new_v4().to_string();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": answer,
+                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        agent_event(&fake, "answer 1 allow").await;
+        let peer = &mut rt.peer;
+        activity_until(peer, &sid, "working").await;
+        std::fs::write(fake.join("complete"), "").unwrap();
+        let at_done = peer.wait_from(from, completed(r4.clone())).await;
+        assert!(is_chat(&peer.seen[at_done], "complete"));
+        assert!(peer.seen[from..].iter().any(|v| is_chat(v, "message")
+            && v["data"]["parts"][0]["kind"] == "tool"
+            && v.to_string().contains("touch made.txt")));
+        activity_until(peer, &sid, "ready").await;
         rt.shutdown().await;
     });
 }

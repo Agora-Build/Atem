@@ -154,16 +154,25 @@ chat-v1:
   session receipt.
 - At most 8 open conversations per session: a ninth `open` closes the oldest
   (`close`).
-- Codex has no chat (`capabilities: ["terminal-v1"]`; Claude:
-  `["terminal-v1","chat-v1"]`).
+- Claude: `capabilities: ["terminal-v1","chat-v1"]`. Codex has chat-v1
+  only with Atem's Codex hooks on (`[codex] hooks = true`; else
+  `["terminal-v1"]`). Before Codex's first prompt its status is `unknown`
+  with the detail "type a first prompt in the terminal: …", and a chat
+  `submit` (or a `prompt` receipt) is `rejected` with that text as its
+  `detail`/`text`; a submit refused for the status (busy, a local draft) is
+  `rejected` with the reason too.
+- `opened` carries `unavailable`: an array of strings naming what the
+  agent's chat can't provide — `streaming`, `reasoning`, `always_allow`,
+  `error_details` (all four for Codex, none for Claude).
 
 Receipts (session-v1 `submit`), per kind:
 
-- `prompt`: pasted into Claude once its chat accepts it, completed when the
-  chat reports the turn's end (`turn_id`). On a session without chat (Codex)
-  it is `rejected` with no effect.
-- `interrupt`: writes Esc; completes when a turn ends, or at once when none
-  runs.
+- `prompt`: pasted into the agent once its chat accepts it (status
+  `ready`, no local draft), completed when the chat reports the turn's end
+  (`turn_id`). On a session without chat (Codex with its hooks off) it is
+  `rejected` with no effect.
+- `interrupt`: writes Esc; completes when a turn ends, or at once when the
+  status is `ready` (no turn runs).
 - `stop`: stops the agent; completes at its exit.
 - `approval`: handed to the agent's waiting permission hook; completes when
   the agent applied it (see [Approvals](#approvals-r7-6a-on-featapprovals)).
@@ -296,7 +305,8 @@ Astation sees that changed since r6.2.
   pushed one never) and on reconnect sends `push_approval` only for
   approvals still pending and not expired, `push_resolved` only for ones it
   pushed.
-- **chat-v1 card.** In a Claude conversation (only for attachments with
+- **chat-v1 card.** In a chat conversation (Claude, or Codex with its hooks
+  on; only for attachments with
   `control`, live and in history) each approval is an assistant `message`
   `approval-<approval_id>` with one part `{id:"approval", kind:"approval",
   approval_id, tool, summary, always_rules, state}`; `state` is `pending`,
@@ -369,7 +379,12 @@ Astation sees that changed since r6.2.
   `$FAKE_DIR/events` (`answer <n> allow|deny|none <message>`, `input <bytes>`).
 - `cargo test --bin atem host_bridge::tests` runs the in-process broker
   tests (card + push + acquire, deny with message, terminal answer, Codex
-  release before input, view-only link, the 630 s deadline);
+  release before input, view-only link, the 630 s deadline, and Codex chat:
+  `tests/fixtures/chat/fake-codex.py` runs the hooks.json Atem installed and
+  writes a rollout — first prompt local, then a remote prompt, an interrupt
+  and an approval);
+  `ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored`
+  runs the same against the real Claude Code and Codex (`codex_chat_end_to_end`);
   `cargo test --test runtime_fixtures_binary` runs the approval fixtures
   against the real runtime binary (table above).
 - The rejection text Claude writes for a terminal "No" (also with a typed

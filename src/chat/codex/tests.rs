@@ -810,6 +810,16 @@ mod script {
         )
     }
 
+    /// An event file's stdin, after its `$$ $PPID` line (checked); the
+    /// parent pid.
+    fn event_body(path: &Path) -> (String, u32) {
+        let text = fs::read_to_string(path).unwrap();
+        let (head, body) = text.split_once('\n').unwrap();
+        let ids: Vec<u32> = head.split(' ').map(|n| n.parse().unwrap()).collect();
+        assert_eq!(ids.len(), 2, "{head:?}");
+        (body.to_string(), ids[1])
+    }
+
     fn event_files(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir.join("events"))
             .unwrap()
@@ -869,11 +879,11 @@ mod script {
         use std::os::unix::fs::PermissionsExt;
         for (name, input) in &want {
             let p = s.path().join("events").join(name);
-            assert_eq!(
-                &fs::read_to_string(&p).unwrap(),
-                input,
-                "{name}: stdin verbatim"
-            );
+            let (body, parent) = event_body(&p);
+            assert_eq!(&body, input, "{name}: stdin verbatim");
+            // The command execs the script: its parent is whoever ran the
+            // command (Codex; here the test).
+            assert_eq!(parent, std::process::id(), "{name}");
             assert_eq!(
                 fs::metadata(&p).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -1090,7 +1100,7 @@ mod script {
             );
             let mut got: Vec<String> = files
                 .iter()
-                .map(|f| fs::read_to_string(s.path().join("events").join(f)).unwrap())
+                .map(|f| event_body(&s.path().join("events").join(f)).0)
                 .collect();
             got.sort();
             let mut want = vec![a, b];

@@ -19,10 +19,11 @@
 #       (post-<id>.json), so a prompt answered in the terminal closes.
 #   sh approval-hook.sh event [<Event>]
 #       Codex lifecycle hooks (SessionStart, UserPromptSubmit, Stop, ...):
-#       writes the hook's stdin to $ATEM_APPROVAL_DIR/events/
-#       ev-<seq>-<Event>.json and exits 0 with no output (output or exit 2
-#       could change what Codex does, so never), within ~2.5 s (Codex's
-#       timeout is 3 s). <Event> is the argument, else stdin's
+#       writes "$$ $PPID" (one line, so Atem can tell its own agent's hook
+#       from a nested codex's) and then the hook's stdin to
+#       $ATEM_APPROVAL_DIR/events/ev-<seq>-<Event>.json and exits 0 with no
+#       output (output or exit 2 could change what Codex does, so never),
+#       within ~2.5 s (Codex's timeout is 3 s). <Event> is the argument, else stdin's
 #       "hook_event_name" (letters only; "unknown" when neither names one).
 #       <seq> is the session's event counter, printed as 10 digits
 #       (ev-0000000001-SessionStart.json): one more than events/seq, taken
@@ -70,7 +71,7 @@ if [ "$1" = event ]; then
         held=
     }
     trap 'rm -f "$t"; release; exit 0' HUP INT TERM
-    cat > "$t" 2>/dev/null || { rm -f "$t"; exit 0; }
+    { printf '%s %s\n' "$$" "$PPID" > "$t" && cat >> "$t"; } 2>/dev/null || { rm -f "$t"; exit 0; }
     ev=${2:-}
     case $ev in '' | *[!A-Za-z]*)
         ev=$(sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' "$t" 2>/dev/null | head -n 1) ;;

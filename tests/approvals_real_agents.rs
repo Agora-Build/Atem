@@ -1,8 +1,8 @@
-//! Push-based approvals end to end with the REAL Claude Code and Codex CLIs:
-//! `atem agent launch` in a PTY (the local frontend), the real `atem
-//! runtime` and `atem worker`s, and a fake Astation on the runtime's link
-//! that answers the approvals (`kind:"approval"` submissions) and records
-//! the relay pushes.
+//! Push-based approvals, and Codex chat, end to end with the REAL Claude
+//! Code and Codex CLIs: `atem agent launch` in a PTY (the local frontend),
+//! the real `atem runtime` and `atem worker`s, and a fake Astation on the
+//! runtime's link that answers the approvals (`kind:"approval"`
+//! submissions), records the relay pushes and drives chat-v1.
 //!
 //! Costs real API calls, so it never runs in a normal `cargo test`:
 //!
@@ -319,6 +319,65 @@ impl Rig {
                           "host_trust_gen": TRUST_GEN, "session_id": sid,
                           "process_gen": generation},
                "attachment_gen": self.attachment_gen})
+    }
+
+    /// A lease on `sid` for this attachment; its epoch.
+    fn acquire(&mut self, sid: &str, generation: &str) -> u64 {
+        let id = uuid();
+        self.send(
+            json!({"type": "session", "data": {"v": 1, "op": "acquire", "id": id,
+            "binding": self.binding(sid, generation), "takeover": true}}),
+        );
+        let lease = self.wait(Duration::from_secs(10), "lease", |m| {
+            m["type"] == "session" && m["data"]["re"] == id.as_str()
+        });
+        assert_eq!(lease["data"]["op"], "lease", "{lease}");
+        lease["data"]["binding"]["lease_epoch"].as_u64().unwrap()
+    }
+
+    /// Submits `text` in chat conversation `conversation` under `lease`;
+    /// the request id.
+    fn chat_submit(
+        &mut self,
+        conversation: &str,
+        sid: &str,
+        generation: &str,
+        lease: u64,
+        text: &str,
+    ) -> String {
+        let request_id = uuid();
+        let mut binding = self.binding(sid, generation);
+        binding["lease_epoch"] = lease.into();
+        self.send(json!({"type": "agentChat", "data": {"v": 1, "op": "submit",
+            "conversationId": conversation, "agentId": sid, "binding": binding,
+            "generation": generation, "requestId": request_id, "text": text}}));
+        request_id
+    }
+
+    /// The `complete` or `error` of chat request `request_id`.
+    fn chat_done(&mut self, request_id: &str, time: Duration) -> Value {
+        let rid = request_id.to_string();
+        self.wait(time, "the chat request's end", |m| {
+            m["type"] == "agentChat"
+                && matches!(m["data"]["op"].as_str(), Some("complete" | "error"))
+                && m["data"]["requestId"] == rid.as_str()
+        })["data"]
+            .clone()
+    }
+
+    /// Waits until `sid`'s activity is `activity`.
+    fn activity(&mut self, sid: &str, activity: &str, time: Duration) {
+        let deadline = Instant::now() + time;
+        loop {
+            self.pump(Duration::from_millis(200));
+            if self
+                .descriptor(sid)
+                .is_some_and(|d| d["activity"] == activity)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{sid} never became {activity}");
+        }
     }
 
     /// The next `approval_request` for `sid` not in `known`.
@@ -832,13 +891,22 @@ fn codex_idle(text: &str) -> bool {
     !text.contains("esc to interrupt") && !text.contains("Working") && text.contains("›")
 }
 
-#[test]
-#[ignore = "real Codex; ATEM_REAL_AGENTS=1"]
-fn codex_approvals_end_to_end() {
-    if !enabled() {
-        return;
-    }
-    let mut rig = Rig::new(true);
+/// A Codex session launched through `atem agent launch codex` in the
+/// sandbox, its hooks consented to, merged and trusted, at its prompt.
+struct CodexRun {
+    fe: Frontend,
+    sid: String,
+    generation: String,
+    home: PathBuf,
+    work: PathBuf,
+    /// What the consent and hook review did (for the report).
+    setup: String,
+}
+
+/// Launches the real Codex (`--profile oss`, on-request approvals,
+/// read-only sandbox) in a temp CODEX_HOME: answers Atem's consent
+/// question, checks the hooks.json merge and trusts the hooks in Codex.
+fn launch_codex(rig: &mut Rig) -> CodexRun {
     let work = rig.sb.home.join("cproj");
     std::fs::create_dir_all(&work).unwrap();
     let home = rig.sb.dir.path().join("codex-home");
@@ -854,9 +922,8 @@ fn codex_approvals_end_to_end() {
         env.push((env_key.clone(), value));
     }
     let extra: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut report: Vec<String> = Vec::new();
 
-    // 5. Consent and the hooks.json merge.
+    // Consent and the hooks.json merge.
     let mut fe = rig.sb.spawn(
         &[
             "agent",
@@ -918,9 +985,35 @@ fn codex_approvals_end_to_end() {
     let trusted = std::fs::read_to_string(home.join("oss.config.toml")).unwrap_or_default()
         + &std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
     let trust_entries = trusted.matches("trusted_hash").count();
-    report.push(format!(
-        "5 consent: asked once, y → [codex] hooks = true; hooks.json merged (Stop hook kept, backup = original); review screen shown: {reviewed}; trusted_hash entries written: {trust_entries}"
-    ));
+    let setup = format!(
+        "consent: asked once, y → [codex] hooks = true; hooks.json merged (Stop hook kept, backup = original); review screen shown: {reviewed}; trusted_hash entries written: {trust_entries}"
+    );
+    CodexRun {
+        fe,
+        sid,
+        generation,
+        home,
+        work,
+        setup,
+    }
+}
+
+#[test]
+#[ignore = "real Codex; ATEM_REAL_AGENTS=1"]
+fn codex_approvals_end_to_end() {
+    if !enabled() {
+        return;
+    }
+    let mut rig = Rig::new(true);
+    let CodexRun {
+        mut fe,
+        sid,
+        generation,
+        home,
+        work,
+        setup,
+    } = launch_codex(&mut rig);
+    let mut report: Vec<String> = vec![format!("5 {setup}")];
 
     let mut known: Vec<String> = Vec::new();
 
@@ -1047,6 +1140,165 @@ fn codex_approvals_end_to_end() {
 
     eprintln!("CODEX REPORT:\n{}", report.join("\n"));
     assert!(created, "the local key didn't answer Codex's own prompt");
+}
+
+/// The texts of the assistant messages chat delivered for `turn`.
+fn assistant_texts(rig: &Rig, turn: &str) -> Vec<String> {
+    rig.seen
+        .iter()
+        .filter(|m| {
+            m["type"] == "agentChat"
+                && m["data"]["op"] == "message"
+                && m["data"]["role"] == "assistant"
+                && m["data"]["turnId"] == turn
+        })
+        .flat_map(|m| {
+            m["data"]["parts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p["markdown"].as_str().map(str::to_string))
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "real Codex; ATEM_REAL_AGENTS=1"]
+fn codex_chat_end_to_end() {
+    if !enabled() {
+        return;
+    }
+    let mut rig = Rig::new(true);
+    let CodexRun {
+        mut fe,
+        sid,
+        generation,
+        setup,
+        ..
+    } = launch_codex(&mut rig);
+    let mut report: Vec<String> = vec![setup];
+
+    // 1. Chat opens before Codex's first prompt: unknown, with the hint,
+    //    and what Codex chat can't provide; a prompt is refused.
+    rig.send(json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+        "conversationId": "conv-1", "agentId": sid, "binding": rig.binding(&sid, &generation)}}));
+    let opened = rig.wait(Duration::from_secs(10), "chat opened", |m| {
+        m["type"] == "agentChat" && m["data"]["op"] == "opened"
+    })["data"]
+        .clone();
+    assert_eq!(opened["status"]["state"], "unknown", "{opened}");
+    assert!(
+        opened["status"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("type a first prompt in the terminal")),
+        "{opened}"
+    );
+    assert_eq!(
+        opened["unavailable"],
+        json!(["streaming", "reasoning", "always_allow", "error_details"])
+    );
+    let lease = rig.acquire(&sid, &generation);
+    let early = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Reply with exactly the word: early",
+    );
+    let refused = rig.chat_done(&early, Duration::from_secs(10));
+    assert_eq!(refused["code"], "rejected", "{refused}");
+    report.push(format!(
+        "1 before the first prompt: opened unknown ({:?}), unavailable {}; submit refused: {:?}",
+        opened["status"]["detail"], opened["unavailable"], refused["text"]
+    ));
+
+    // 2. The first prompt, typed in the terminal (the lease goes back to
+    //    the terminal).
+    type_line(&mut fe, "Reply with exactly the word: pong");
+    let local = rig.wait(TURN, "the local prompt in chat", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["origin"] == "local"
+            && m.to_string().contains("pong")
+    })["data"]
+        .clone();
+    let turn1 = local["turnId"].as_str().unwrap().to_string();
+    rig.activity(&sid, "ready", TURN);
+    let reply1 = assistant_texts(&rig, &turn1);
+    report.push(format!(
+        "2 local first prompt: turn {turn1}; reply {:?}; activity ready",
+        reply1.iter().map(|t| redact(t)).collect::<Vec<_>>()
+    ));
+    assert!(!reply1.is_empty(), "no reply for the local prompt");
+
+    // 3. A remote chat prompt: accepted, the reply, complete.
+    let lease = rig.acquire(&sid, &generation);
+    let rid = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Reply with exactly the word: ping",
+    );
+    let user = rig.wait(TURN, "the remote prompt's message", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["role"] == "user"
+            && m["data"]["requestId"] == rid.as_str()
+    })["data"]
+        .clone();
+    let done = rig.chat_done(&rid, TURN);
+    assert_eq!(done["outcome"], "done", "{done}");
+    let turn2 = done["turnId"].as_str().unwrap_or_default().to_string();
+    assert_eq!(user["turnId"], turn2.as_str());
+    let reply2 = assistant_texts(&rig, &turn2);
+    report.push(format!(
+        "3 remote prompt: user message origin {} with requestId; complete {} turn {turn2}; reply {:?}",
+        user["origin"],
+        done["outcome"],
+        reply2.iter().map(|t| redact(t)).collect::<Vec<_>>()
+    ));
+    assert!(!reply2.is_empty(), "no reply for the remote prompt");
+    assert!(rig.has(|m| m["type"] == "agentChat"
+        && m["data"]["op"] == "accepted"
+        && m["data"]["requestId"] == rid.as_str()));
+    rig.activity(&sid, "ready", TURN);
+
+    // 4. An interrupt while a remote turn runs: Esc, completed at the
+    //    turn's end, the chat request interrupted.
+    let rid = rig.chat_submit(
+        "conv-1",
+        &sid,
+        &generation,
+        lease,
+        "Write a 600-word essay about the history of terminals. Do not run any commands.",
+    );
+    rig.wait(TURN, "the essay prompt's message", |m| {
+        m["type"] == "agentChat"
+            && m["data"]["op"] == "message"
+            && m["data"]["requestId"] == rid.as_str()
+    });
+    rig.activity(&sid, "working", Duration::from_secs(30));
+    std::thread::sleep(Duration::from_millis(1500));
+    let interrupt = uuid();
+    let id = uuid();
+    let mut binding = rig.binding(&sid, &generation);
+    binding["lease_epoch"] = lease.into();
+    rig.send(
+        json!({"type": "session", "data": {"v": 1, "op": "submit", "id": id,
+        "binding": binding, "request_id": interrupt, "kind": "interrupt", "payload": {}}}),
+    );
+    let (receipt, states) = rig.receipt_final(&interrupt, Duration::from_secs(60));
+    let done = rig.chat_done(&rid, Duration::from_secs(60));
+    report.push(format!(
+        "4 interrupt: receipt {states:?} (final {}); chat request {} outcome {}",
+        receipt["state"], done["op"], done["outcome"]
+    ));
+    rig.activity(&sid, "ready", TURN);
+    eprintln!("CODEX CHAT REPORT:\n{}", report.join("\n"));
+    assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
+    assert_eq!(done["outcome"], "interrupted", "{done}");
 }
 
 /// The next approval of `sid`; on a timeout the panic shows the screen.

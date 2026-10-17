@@ -47,7 +47,7 @@
 //! the broker's decision.
 
 use crate::chat::adapter::ToolResultKind;
-use crate::chat::approvals::{self, Agent, Request};
+use crate::chat::approvals::{self, Agent, Ancestry, Request, started_by};
 use crate::runtime::worker_protocol::ApplyOutcome;
 use crate::session_protocol::host::ApprovalInfo;
 use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision};
@@ -69,7 +69,6 @@ const CROSSED_MS: i64 = 100;
 const RESULT_SLACK_MS: i64 = 1000;
 /// Largest request or post file read.
 pub const MAX_FILE: u64 = 256 * 1024;
-const SHELLS: [&str; 8] = ["sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -194,45 +193,6 @@ fn hook_alive(pid: u32, start: Option<u64>) -> bool {
             (Some(then), Some(now)) => then == now,
             _ => true,
         }
-}
-
-fn is_shell(name: &str) -> bool {
-    SHELLS.contains(&name)
-}
-
-/// How a hook relates to the session's agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ancestry {
-    /// Its parent is the agent, or a shell (that didn't exec) whose parent is.
-    Direct,
-    /// Through a non-shell child of the agent: a wrapper such as npm's
-    /// `codex`, which runs the real binary as its child — or a `codex` the
-    /// agent itself started without a shell. Ambiguous.
-    Wrapped,
-    /// Not started by the agent (e.g. a `codex` started inside the session
-    /// through a shell is deeper).
-    Foreign,
-}
-
-fn started_by(parent: u32, agent: u32) -> Ancestry {
-    use super::adopt::process_parent_and_name;
-    let mut q = parent;
-    if q == agent {
-        return Ancestry::Direct;
-    }
-    let Some((up, name)) = process_parent_and_name(q) else {
-        return Ancestry::Foreign;
-    };
-    if is_shell(&name) {
-        q = up;
-        if q == agent {
-            return Ancestry::Direct;
-        }
-    }
-    match process_parent_and_name(q) {
-        Some((up, name)) if !is_shell(&name) && up == agent => Ancestry::Wrapped,
-        _ => Ancestry::Foreign,
-    }
 }
 
 /// Equal tool inputs (serde_json's maps compare regardless of key order).

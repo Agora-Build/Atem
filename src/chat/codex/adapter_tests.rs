@@ -37,9 +37,12 @@ fn fx() -> Fx {
 
 impl Fx {
     fn fresh(&self) -> CodexAdapter {
-        let (a, args) =
+        let (mut a, args) =
             prepare_chat(&self.root.path().join("run"), self.home.clone(), &[]).unwrap();
         assert!(args.is_empty());
+        // The hooks `fire` runs are this process's children (as Codex's are
+        // the agent's).
+        a.set_agent_pid(Some(std::process::id()));
         a
     }
 
@@ -89,14 +92,21 @@ impl Fx {
         assert!(out.status.success() && out.stdout.is_empty(), "{name}");
     }
 
-    /// Writes an event file directly (seq `n`).
+    /// Writes an event file directly (seq `n`), as a hook this process
+    /// started.
     fn put(&self, a: &CodexAdapter, n: u64, event: &str, body: &str) {
+        let me = std::process::id();
+        self.put_from(a, n, event, body, me);
+    }
+
+    /// Writes an event file whose hook's parent was `parent`.
+    fn put_from(&self, a: &CodexAdapter, n: u64, event: &str, body: &str, parent: u32) {
         let p = a
             .dir()
             .unwrap()
             .join("events")
             .join(format!("ev-{n:010}-{event}.json"));
-        fs::write(p, body).unwrap();
+        fs::write(p, format!("{parent} {parent}\n{body}")).unwrap();
     }
 }
 
@@ -112,6 +122,16 @@ fn rollout_upto(dst: &Path, src: &str, n: u64) {
         }
     }
     fs::write(dst, out).unwrap();
+}
+
+/// A hook stdin as read from an event file.
+fn raw(json: Value) -> RawEvent {
+    RawEvent {
+        pid: 2,
+        parent: 1,
+        at_ms: 0,
+        json,
+    }
 }
 
 const A: &str = "rollout-session-A.jsonl";
@@ -214,7 +234,7 @@ fn session_a_then_new_and_compact_through_the_real_hook_script() {
     let t = tick(&mut a, &mut chat);
     assert!(matches!(&t.events[..], [
         AgentEvent::SessionStarted { session_id, source, same_log: false, log_path },
-        AgentEvent::PromptSubmitted { text, turn_id: Some(turn) },
+        AgentEvent::PromptSubmitted { text, turn_id: Some(turn), at_ms: Some(_) },
     ] if session_id == "<session-A>" && source == "startup" && *log_path == f.a
         && text == "Reply with exactly the word: pong" && turn == "<turn-1>"));
     assert!(!t.log.iter().any(|i| matches!(i, LogItem::Backfill(_))));
@@ -692,7 +712,7 @@ fn events_are_read_by_seq_and_nothing_else_is_touched() {
     let f = fx();
     let mut a = f.adapter();
     let dir = a.dir().unwrap().join("events");
-    let ev = |name: &str| format!(r#"{{"hook_event_name":"{name}"}}"#);
+    let ev = |name: &str| format!("1 1\n{{\"hook_event_name\":\"{name}\"}}");
     // numeric seq order, then name for a repeated seq
     fs::write(dir.join("ev-0000000010-Stop.json"), ev("Stop")).unwrap();
     fs::write(dir.join("ev-9-PreToolUse.json"), ev("PreToolUse")).unwrap();
@@ -701,7 +721,12 @@ fn events_are_read_by_seq_and_nothing_else_is_touched() {
         ev("PostToolUse"),
     )
     .unwrap();
-    fs::write(dir.join("ev-0000000011-Bad.json"), "not json").unwrap();
+    fs::write(dir.join("ev-0000000011-Bad.json"), "1 1\nnot json").unwrap();
+    fs::write(
+        dir.join("ev-0000000011-NoPids.json"),
+        r#"{"hook_event_name":"Stop"}"#,
+    )
+    .unwrap();
     fs::write(
         dir.join("ev-0000000012-Big.json"),
         "x".repeat(MAX_EVENT as usize + 1),
@@ -734,17 +759,19 @@ fn events_are_read_by_seq_and_nothing_else_is_touched() {
         .iter()
         .map(|v| {
             v.as_ref()
-                .map(|v| v["hook_event_name"].as_str().unwrap().to_string())
+                .map(|v| v.json["hook_event_name"].as_str().unwrap().to_string())
         })
         .collect();
     let some = |s: &str| Some(s.to_string());
-    // the bad and the oversized one come as None (deleted all the same)
+    // the bad one, the one without the hook's pids and the oversized one
+    // come as None (deleted all the same)
     assert_eq!(
         names,
         [
             some("PostToolUse"),
             some("PreToolUse"),
             some("Stop"),
+            None,
             None,
             None
         ]
@@ -806,7 +833,7 @@ fn every_fixture_hook_parses() {
     for e in fs::read_dir(format!("{FX}/hooks")).unwrap() {
         let p = e.unwrap().path();
         let v: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
-        let hook = Hook::parse(&v).unwrap_or_else(|| panic!("{p:?}"));
+        let hook = Hook::from_raw(&raw(v)).unwrap_or_else(|| panic!("{p:?}"));
         assert!(hook.session_id.starts_with("<session-"), "{p:?}");
         assert_eq!(hook.prompt.is_some(), hook.event == "UserPromptSubmit");
         assert_eq!(!hook.source.is_empty(), hook.event == "SessionStart");
@@ -814,7 +841,7 @@ fn every_fixture_hook_parses() {
     }
     assert_eq!(n, 33);
     let v: Value = serde_json::from_str(r#"{"hook_event_name":"Stop","session_id":"s"}"#).unwrap();
-    assert_eq!(Hook::parse(&v), None, "no transcript_path");
+    assert_eq!(Hook::from_raw(&raw(v)), None, "no transcript_path");
 }
 
 #[test]
@@ -1011,7 +1038,7 @@ fn hook_prompts_equal_the_rollouts() {
     for e in fs::read_dir(format!("{FX}/hooks")).unwrap() {
         let v: Value =
             serde_json::from_str(&fs::read_to_string(e.unwrap().path()).unwrap()).unwrap();
-        if let Some(h) = Hook::parse(&v).filter(|h| h.prompt.is_some()) {
+        if let Some(h) = Hook::from_raw(&raw(v)).filter(|h| h.prompt.is_some()) {
             prompts.push((h.turn_id.unwrap(), h.prompt.unwrap()));
         }
     }
@@ -1060,4 +1087,170 @@ fn a_symlinked_rollout_is_never_read() {
     let t = tick(&mut a, &mut chat);
     assert!(matches!(&t.events[..], [AgentEvent::SessionStarted { .. }]));
     assert!(t.log.is_empty(), "{:?}", t.log);
+}
+
+/// A child of this process that isn't a shell: a hook whose parent it is
+/// came through a wrapper (`Ancestry::Wrapped`).
+struct Child(std::process::Child);
+
+impl Child {
+    fn sleep() -> Child {
+        Child(Command::new("sleep").arg("30").spawn().unwrap())
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn only_hooks_the_sessions_agent_started_count() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    // pid 1 isn't this agent or under it: a nested codex (a tool's) can't
+    // pin the session
+    f.put_from(
+        &a,
+        1,
+        "SessionStart",
+        &f.hook("01-SessionStart-startup.json"),
+        1,
+    );
+    f.put_from(
+        &a,
+        2,
+        "UserPromptSubmit",
+        &f.hook("02-UserPromptSubmit.json"),
+        1,
+    );
+    rollout_upto(&f.a, A, 9);
+    let t = tick(&mut a, &mut chat);
+    assert!(t.events.is_empty(), "{:?}", t.events);
+    assert_eq!(a.session_id(), None);
+    assert_eq!(chat.status().state, State::Unknown);
+    // the agent's own hooks pin it
+    f.fire(&a, "01-SessionStart-startup.json");
+    f.fire(&a, "02-UserPromptSubmit.json");
+    let t = tick(&mut a, &mut chat);
+    assert!(matches!(
+        &t.events[..],
+        [
+            AgentEvent::SessionStarted { .. },
+            AgentEvent::PromptSubmitted { .. }
+        ]
+    ));
+    assert_eq!(a.session_id(), Some("<session-A>"));
+    rollout_upto(&f.a, A, 14);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Ready);
+    // between turns: a nested /new can't re-pin, and a nested hook naming
+    // the pinned session counts neither
+    f.put_from(
+        &a,
+        10,
+        "SessionStart",
+        &f.hook("22-SessionStart-after-new.json"),
+        1,
+    );
+    f.put_from(
+        &a,
+        11,
+        "UserPromptSubmit",
+        &f.hook("04-UserPromptSubmit-approval-turn.json"),
+        1,
+    );
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+    }
+    assert_eq!(a.session_id(), Some("<session-A>"));
+    assert_eq!(chat.status().state, State::Ready);
+    // through a non-shell child (a wrapper): the pinned session's hooks
+    // count, another session's start doesn't
+    let wrapper = Child::sleep();
+    f.put_from(
+        &a,
+        12,
+        "SessionStart",
+        &f.hook("22-SessionStart-after-new.json"),
+        wrapper.pid(),
+    );
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+    }
+    assert_eq!(a.session_id(), Some("<session-A>"));
+    f.put_from(
+        &a,
+        13,
+        "UserPromptSubmit",
+        &f.hook("04-UserPromptSubmit-approval-turn.json"),
+        wrapper.pid(),
+    );
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(&t.events[..], [AgentEvent::PromptSubmitted { .. }]),
+        "{:?}",
+        t.events
+    );
+}
+
+#[test]
+fn a_wrapped_agent_pins_the_first_session() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    let wrapper = Child::sleep();
+    f.put_from(
+        &a,
+        1,
+        "SessionStart",
+        &f.hook("01-SessionStart-startup.json"),
+        wrapper.pid(),
+    );
+    rollout_upto(&f.a, A, 9);
+    let t = tick(&mut a, &mut chat);
+    assert!(matches!(&t.events[..], [AgentEvent::SessionStarted { .. }]));
+    assert_eq!(a.session_id(), Some("<session-A>"));
+    // no agent pid: nothing counts
+    let mut b = f.adapter();
+    b.set_agent_pid(None);
+    f.fire(&b, "01-SessionStart-startup.json");
+    assert!(b.poll_events().is_empty());
+    assert_eq!(b.session_id(), None);
+}
+
+#[test]
+fn a_re_pin_drops_a_wait_still_queued() {
+    let f = fx();
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "01-SessionStart-startup.json");
+    f.fire(&a, "02-UserPromptSubmit.json");
+    rollout_upto(&f.a, A, 14);
+    tick(&mut a, &mut chat);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Ready);
+    // /new: the switch waits one poll; an approval of the old session is
+    // reported in between
+    f.fire(&a, "22-SessionStart-after-new.json");
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    a.approval_opened(0);
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        matches!(&t.events[..], [AgentEvent::SessionStarted { session_id, .. }] if session_id == "<session-B>"),
+        "{:?}",
+        t.events
+    );
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert_eq!(chat.status().state, State::Ready);
+    // and its late close is harmless
+    a.approval_closed();
+    assert!(a.poll_events().is_empty());
 }

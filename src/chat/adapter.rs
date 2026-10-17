@@ -76,6 +76,10 @@ pub enum AgentEvent {
         /// acceptance then needs the log's prompt of that turn.
         #[serde(default)]
         turn_id: Option<String>,
+        /// When the hook fired (its event file's time, unix ms): a remote
+        /// prompt pairs only with a hook from after its paste.
+        #[serde(default)]
+        at_ms: Option<i64>,
     },
     /// The agent can't take a prompt yet, and why (Codex before its first
     /// prompt): the status stays unknown with this detail, and a chat
@@ -150,16 +154,12 @@ pub struct Capabilities {
 }
 
 /// Partial text while a reply is written (messages arrive whole).
-#[allow(dead_code)] // used by the Codex adapter, wired next
 pub const UNAVAILABLE_STREAMING: &str = "streaming";
 /// The model's reasoning.
-#[allow(dead_code)] // used by the Codex adapter, wired next
 pub const UNAVAILABLE_REASONING: &str = "reasoning";
 /// "Always allow" on approval cards (a persistent rule).
-#[allow(dead_code)] // used by the Codex adapter, wired next
 pub const UNAVAILABLE_ALWAYS_ALLOW: &str = "always_allow";
 /// The model or API error behind a failed turn.
-#[allow(dead_code)] // used by the Codex adapter, wired next
 pub const UNAVAILABLE_ERROR_DETAILS: &str = "error_details";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
