@@ -37,3 +37,12 @@ The worker runs the Codex adapter for Codex sessions (when `[codex] hooks` is on
 ### Task 4: Docs and handoff
 
 AGENTS.md (Agent chat: Codex adapter; config row `[codex] hooks`), README/npm README, `designs/agent-chat-host.md` (Codex section, the first-prompt ruling, unavailable capabilities), `designs/protocol/atem-host-handoff.md` (Codex now has chat and activity; first remote prompt rule; the dot should follow process state).
+
+### Task 5: Atem session rules ("Always allow this command") for agents without native always-allow (user decision, 2026-10-17)
+
+Only for an agent whose hook can't persist a rule (Codex: `updatedPermissions` fails closed); Claude keeps its own suggested rules unchanged.
+- The Codex card offers Allow once / **Always allow this command** / Deny. `always_rules` gets one Atem rule per request: `{rule_id, label: "Always allow `<command first line, redacted>` in <cwd> for this session", scope: "session"}`.
+- Answering `allow_always` with that rule allows this request and stores the rule in the worker for this session (process_gen): match = tool kind + the exact full command text (byte-equal, not the redacted summary) + the exact cwd. No prefix, glob or normalisation; anything else still asks. File-change requests: exact path + change kind.
+- A later matching request is answered allow by the worker's hook path without opening a remote approval, recorded as a chat note/card in state `auto_allowed` naming the rule, and in `runtime.log` (no command text). Never across sessions, never after the process ends (a respawn clears rules), never through adoption by a new broker unless the worker kept them (the worker owns them, so they survive a broker restart).
+- Revoke: chat-v1 `submit` with `approval_rule_revoke{rule_id}` (lease required) or local prefix-key; rules listed in `opened`. Bounded: at most 32 rules per session.
+- Docs: contract §6a (rule scope `session`, `auto_allowed`, revoke), AGENTS.md, agent-chat-host.md, handoff. Tests: exact-match only (a command with an extra `; rm` still asks), cwd differs → asks, respawn clears, revoke, bound, nested codex never matches, real-agent: always allow then the same command runs without a card.
