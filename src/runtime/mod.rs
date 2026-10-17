@@ -12,6 +12,7 @@ pub mod op_client;
 pub mod ops;
 pub mod protocol;
 pub mod push_queue;
+pub mod refusal_log;
 pub mod server;
 pub mod session_log;
 pub mod test_hooks;

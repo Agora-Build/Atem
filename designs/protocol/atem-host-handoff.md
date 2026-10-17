@@ -101,6 +101,11 @@ Attachments and identity:
   `hello` meant the client already had an attachment, never that the device
   needs verifying). runtime.log has one `HH:MM:SS` UTC line per `hello`:
   `welcome`, `replaced attachment … with …; welcome`, or `refused <code>`.
+  Every other refused request (an `error` reply, a `rejected` receipt, an
+  oversize drop) also gets one line with its family, op, code and session,
+  never its content: `refused agentChat/submit kind=approval_rule_revoke
+  unsupported_version session=ses-… (decode: agentChat: approval_rule_revoke:
+  unknown field `rule`)`; at most 20 per 10 s per link.
 - `welcome`: `account_id` = the verified `data_account` from
   `cred_state.json`; `atem_device_id` = this device's verified `device_id`;
   `host_trust_gen` = `pairing.json`'s generation (moves on every

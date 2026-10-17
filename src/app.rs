@@ -660,8 +660,8 @@ impl App {
             AstationMessage::SessionWire(text) => {
                 self.session_wire(text);
             }
-            AstationMessage::SessionOversize { id } => {
-                self.session_refusal(id, crate::session_protocol::wire::ErrorCode::UnsupportedVersion, None);
+            AstationMessage::SessionOversize { id, family } => {
+                self.session_oversize(id, &family);
             }
             AstationMessage::RemovedOp => {
                 // r6 §0: refused, with no effect.
