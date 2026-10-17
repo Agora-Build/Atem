@@ -255,6 +255,44 @@ fn an_older_atem_entry_is_replaced_in_place() {
 }
 
 #[test]
+fn extra_atem_groups_of_an_event_are_dropped() {
+    let marked = |c: &str| serde_json::json!({"hooks": [{"type": "command", "command": format!("{MARKER} {c}")}]});
+    let theirs = serde_json::json!({"hooks": [{"type": "command", "command": "/a/x.sh"}]});
+    let stop = entry_for(Path::new(SCRIPT), "Stop");
+    // None equal: the first is replaced, the others go.
+    let existing = serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {"Stop": [marked("old1"), theirs, marked("old2"), marked("old3")]}
+    }))
+    .unwrap();
+    let text = changed(merge(Some(&existing), &entries()).unwrap());
+    assert_eq!(groups_of(&text, "Stop"), vec![stop.clone(), theirs.clone()]);
+    // One equal: it stays where it is, the stale ones go.
+    let existing = serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {"Stop": [marked("old1"), theirs, stop]}
+    }))
+    .unwrap();
+    let text = changed(
+        merge(
+            Some(&existing),
+            &[("Stop", entry_for(Path::new(SCRIPT), "Stop"))],
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        groups_of(&text, "Stop"),
+        vec![theirs, entry_for(Path::new(SCRIPT), "Stop")]
+    );
+    assert_eq!(
+        merge(
+            Some(&text),
+            &[("Stop", entry_for(Path::new(SCRIPT), "Stop"))]
+        )
+        .unwrap(),
+        Merge::Unchanged
+    );
+}
+
+#[test]
 fn malformed_files_are_refused() {
     let marked = format!("{MARKER} x");
     for bad in [
@@ -316,14 +354,16 @@ fn install_backs_up_once_and_is_idempotent() {
 }
 
 #[test]
-fn install_creates_a_missing_file_without_a_backup() {
+fn install_creates_a_missing_file_and_records_there_was_none() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("codex");
     assert_eq!(
         install(&home, Path::new(SCRIPT)).unwrap(),
         Installed::Changed { backup: None }
     );
-    assert!(!home.join(BACKUP).exists());
+    // An empty backup: "no file before Atem".
+    assert_eq!(fs::read_to_string(home.join(BACKUP)).unwrap(), "");
+    assert_eq!(mode(&home.join(BACKUP)), 0o600);
     let text = fs::read_to_string(home.join("hooks.json")).unwrap();
     assert_eq!(groups(&text), vec![entry()]);
     assert_complete(&text, Path::new(SCRIPT));
@@ -524,7 +564,7 @@ fn removal_takes_out_only_our_entry_byte_for_byte() {
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("hooks.json.atem-bak.")
+            .starts_with("hooks.json.atem-removed.")
     );
     assert_eq!(fs::read_to_string(&backup).unwrap(), installed);
     assert_eq!(mode(&backup), 0o640);
@@ -555,11 +595,39 @@ fn removal_drops_only_containers_atem_added() {
         serde_json::from_str::<Value>(original).unwrap()
     );
 
-    // Atem created the file (no backup): can't tell what was the user's,
+    // Atem created the file (empty backup): removal goes back to no file,
+    // keeping its own copy of what it removed.
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    install(&home, Path::new(SCRIPT)).unwrap();
+    let installed = hooks_text(&home);
+    let Removed::Removed { backup } = uninstall(&home).unwrap() else {
+        panic!("nothing removed")
+    };
+    assert!(!home.join("hooks.json").exists());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), installed);
+    assert_eq!(fs::read_to_string(home.join(BACKUP)).unwrap(), "");
+    assert_eq!(uninstall(&home).unwrap(), Removed::Nothing);
+
+    // Atem created the file and the user added a key since: only that stays.
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    install(&home, Path::new(SCRIPT)).unwrap();
+    let mut v: Value = serde_json::from_str(&hooks_text(&home)).unwrap();
+    v["mine"] = Value::Bool(true);
+    fs::write(home.join("hooks.json"), v.to_string()).unwrap();
+    uninstall(&home).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&hooks_text(&home)).unwrap(),
+        serde_json::json!({"mine": true})
+    );
+
+    // No backup at all (it was deleted): can't tell what was the user's,
     // so the empty containers stay.
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("codex");
     install(&home, Path::new(SCRIPT)).unwrap();
+    fs::remove_file(home.join(BACKUP)).unwrap();
     uninstall(&home).unwrap();
     let empty: serde_json::Map<String, Value> = EVENTS
         .iter()
@@ -569,7 +637,10 @@ fn removal_drops_only_containers_atem_added() {
         serde_json::from_str::<Value>(&hooks_text(&home)).unwrap(),
         serde_json::json!({ "hooks": empty })
     );
-    assert!(home.join(BACKUP).exists(), "the removal's own backup");
+    assert!(
+        !home.join(BACKUP).exists(),
+        "BACKUP is never the removal's copy"
+    );
 }
 
 #[test]
@@ -691,6 +762,7 @@ mod script {
     use super::*;
     use crate::chat::approvals::{ENV, SCRIPT_NAME, install_script};
     use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     fn hook_fixture(name: &str) -> String {
         fs::read_to_string(
@@ -749,6 +821,7 @@ mod script {
         names
     }
 
+    /// What isn't an event or the counter (readers ignore these).
     fn leftovers(dir: &Path) -> Vec<String> {
         fs::read_dir(dir.join("events"))
             .unwrap()
@@ -885,21 +958,144 @@ mod script {
         assert!(leftovers(s.path()).is_empty(), "{:?}", leftovers(s.path()));
     }
 
+    /// A pid that isn't running (a reaped child's).
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        dead
+    }
+
+    fn stop(s: &Path, script: &Path) -> (bool, String, String) {
+        run(
+            &event_command(script, "Stop"),
+            Some(s),
+            &hook_fixture("03-Stop.json"),
+        )
+    }
+
     #[test]
     fn a_lock_left_by_a_killed_hook_is_taken_over() {
         let (s, script) = session();
         let lock = s.path().join("events/seq.lock");
-        fs::create_dir(&lock).unwrap();
-        // A pid that isn't running (a reaped child's).
-        let mut child = Command::new("/bin/true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
-        fs::write(lock.join("pid"), format!("{dead}\n")).unwrap();
+        std::os::unix::fs::symlink(dead_pid().to_string(), &lock).unwrap();
         fs::write(s.path().join("events/seq"), "41\n").unwrap();
-        let cmd = event_command(&script, "Stop");
-        let (ok, stdout, _) = run(&cmd, Some(s.path()), &hook_fixture("03-Stop.json"));
+        let started = Instant::now();
+        let (ok, stdout, _) = stop(s.path(), &script);
         assert!(ok && stdout.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(event_files(s.path()), vec!["ev-0000000042-Stop.json"]);
-        assert!(!lock.exists());
+        assert!(fs::symlink_metadata(&lock).is_err(), "released");
+    }
+
+    /// A lock that names no pid (no hook makes one: `ln -s` writes the pid
+    /// with the lock), or isn't a symlink at all, is taken over too.
+    #[test]
+    fn a_lock_without_a_pid_is_taken_over() {
+        for make in ["empty-target", "word", "directory"] {
+            let (s, script) = session();
+            let lock = s.path().join("events/seq.lock");
+            match make {
+                "empty-target" => std::os::unix::fs::symlink("", &lock)
+                    .or_else(|_| std::os::unix::fs::symlink("-", &lock))
+                    .unwrap(),
+                "word" => std::os::unix::fs::symlink("nobody", &lock).unwrap(),
+                _ => fs::create_dir(&lock).unwrap(),
+            }
+            let (ok, stdout, _) = stop(s.path(), &script);
+            assert!(ok && stdout.is_empty(), "{make}");
+            assert_eq!(
+                event_files(s.path()),
+                vec!["ev-0000000001-Stop.json"],
+                "{make}"
+            );
+            assert!(fs::symlink_metadata(&lock).is_err(), "{make}");
+        }
+    }
+
+    /// A live holder: the event is dropped, the hook still exits 0 with no
+    /// output within Codex's 3 s, and the holder's lock stays.
+    #[test]
+    fn a_live_holder_drops_the_event_in_time() {
+        let (s, script) = session();
+        let lock = s.path().join("events/seq.lock");
+        std::os::unix::fs::symlink(std::process::id().to_string(), &lock).unwrap();
+        let started = Instant::now();
+        let (ok, stdout, stderr) = stop(s.path(), &script);
+        let took = started.elapsed();
+        assert!(ok && stdout.is_empty() && stderr.is_empty());
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert!(took >= Duration::from_millis(1500), "it waited: {took:?}");
+        assert!(event_files(s.path()).is_empty());
+        assert_eq!(
+            fs::read_link(&lock).unwrap(),
+            PathBuf::from(std::process::id().to_string())
+        );
+        assert!(leftovers(s.path()).iter().all(|n| n == "seq.lock"));
+    }
+
+    /// A name already taken (as if another hook published that seq) is
+    /// never overwritten: the event takes the next seq.
+    #[test]
+    fn a_taken_name_is_never_overwritten() {
+        let (s, script) = session();
+        let events = s.path().join("events");
+        fs::write(events.join("seq"), "4\n").unwrap();
+        fs::write(events.join("ev-0000000005-Stop.json"), "theirs").unwrap();
+        fs::write(events.join("ev-0000000006-Stop.json"), "theirs too").unwrap();
+        let (ok, stdout, _) = stop(s.path(), &script);
+        assert!(ok && stdout.is_empty());
+        assert_eq!(
+            event_files(s.path()),
+            vec![
+                "ev-0000000005-Stop.json",
+                "ev-0000000006-Stop.json",
+                "ev-0000000007-Stop.json"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(events.join("ev-0000000005-Stop.json")).unwrap(),
+            "theirs"
+        );
+        assert_eq!(fs::read_to_string(events.join("seq")).unwrap(), "7\n");
+        assert!(leftovers(s.path()).is_empty());
+    }
+
+    /// Two SessionEnd hooks at once (Codex quitting after /new), many
+    /// times: never the same seq, never a lost event.
+    #[test]
+    fn simultaneous_session_ends_never_clobber() {
+        for _ in 0..10 {
+            let (s, script) = session();
+            let cmd = event_command(&script, "SessionEnd");
+            let a = hook_fixture("27-SessionEnd-old-session-at-exit.json");
+            let b = hook_fixture("28-SessionEnd-current-session-at-exit.json");
+            let threads: Vec<_> = [a.clone(), b.clone()]
+                .into_iter()
+                .map(|input| {
+                    let (cmd, dir) = (cmd.clone(), s.path().to_path_buf());
+                    std::thread::spawn(move || run(&cmd, Some(&dir), &input))
+                })
+                .collect();
+            for t in threads {
+                assert!(t.join().unwrap().0);
+            }
+            let files = event_files(s.path());
+            assert_eq!(
+                files,
+                vec![
+                    "ev-0000000001-SessionEnd.json",
+                    "ev-0000000002-SessionEnd.json"
+                ]
+            );
+            let mut got: Vec<String> = files
+                .iter()
+                .map(|f| fs::read_to_string(s.path().join("events").join(f)).unwrap())
+                .collect();
+            got.sort();
+            let mut want = vec![a, b];
+            want.sort();
+            assert_eq!(got, want);
+        }
     }
 }

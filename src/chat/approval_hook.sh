@@ -20,18 +20,24 @@
 #   sh approval-hook.sh event [<Event>]
 #       Codex lifecycle hooks (SessionStart, UserPromptSubmit, Stop, ...):
 #       writes the hook's stdin to $ATEM_APPROVAL_DIR/events/
-#       ev-<seq>-<Event>.json and exits 0 with no output (Codex runs these
-#       hooks async; output or exit 2 could change what it does, so never).
-#       <Event> is the argument, else stdin's "hook_event_name" (letters
-#       only; "unknown" when neither names one). <seq> is the session's
-#       event counter (events/seq), 1 for the first event and one more for
-#       each next one, printed as 10 digits (ev-0000000001-SessionStart.json),
-#       taken under the lock directory events/seq.lock. The file is written
-#       to a temp file first (mode 0600, umask 077) and renamed into place
-#       under that lock, so it appears whole and in seq order. A lock left
-#       by a killed hook is taken over after about 2 s (its pid in
-#       seq.lock/pid is gone); a live holder that long means the event is
-#       dropped. PermissionRequest is never written here (its own mode).
+#       ev-<seq>-<Event>.json and exits 0 with no output (output or exit 2
+#       could change what Codex does, so never), within ~2.5 s (Codex's
+#       timeout is 3 s). <Event> is the argument, else stdin's
+#       "hook_event_name" (letters only; "unknown" when neither names one).
+#       <seq> is the session's event counter, printed as 10 digits
+#       (ev-0000000001-SessionStart.json): one more than events/seq, taken
+#       under the lock events/seq.lock, a symlink whose target is the
+#       holder's pid (made atomically by `ln -s`, so it always names a
+#       live or dead holder, never nobody). The stdin goes to a temp file
+#       first (mode 0600, umask 077) and is published with `ln`, which never
+#       replaces an existing file: a name already taken moves to the next
+#       seq, so no event overwrites another even if two hooks ever held the
+#       lock. A lock whose pid is gone (a killed hook) is taken over after
+#       ~2 s; a live holder that long means this event is dropped. A hook
+#       releases only a lock naming its own pid. PermissionRequest is never
+#       written here (its own mode).
+#       Readers take only ev-*.json files and must ignore everything else
+#       in events/: tmp.* (being written), seq, seq.<pid> and seq.lock.
 #
 # Without ATEM_APPROVAL_DIR (an agent not started by Atem) it exits at once
 # with no output, so the agent asks as usual. It never decides anything
@@ -58,7 +64,12 @@ if [ "$1" = event ]; then
     l=$e/seq.lock
     held=
     t=$(mktemp "$e/tmp.XXXXXXXX" 2>/dev/null) || exit 0
-    trap 'rm -f "$t"; [ -n "$held" ] && rm -rf "$l"; exit 0' HUP INT TERM
+    # Releases the lock only while it still names this hook.
+    release() {
+        [ -n "$held" ] && [ "$(readlink "$l" 2>/dev/null)" = "$$" ] && rm -f "$l" 2>/dev/null
+        held=
+    }
+    trap 'rm -f "$t"; release; exit 0' HUP INT TERM
     cat > "$t" 2>/dev/null || { rm -f "$t"; exit 0; }
     ev=${2:-}
     case $ev in '' | *[!A-Za-z]*)
@@ -66,16 +77,27 @@ if [ "$1" = event ]; then
     esac
     case $ev in '' | *[!A-Za-z]*) ev=unknown ;; esac
     [ "$ev" = PermissionRequest ] && { rm -f "$t"; exit 0; }
+    # A directory there isn't a lock any hook makes (and `ln -s` would
+    # put the link inside it): out of the way.
+    if [ -d "$l" ] && [ ! -h "$l" ]; then rm -rf "$l" 2>/dev/null; fi
     n=0
-    until mkdir "$l" 2>/dev/null; do
+    until ln -s "$$" "$l" 2>/dev/null; do
         if [ "$n" -ge 20 ]; then
-            p=$(cat "$l/pid" 2>/dev/null)
-            if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-                rm -f "$t"
-                exit 0
+            if [ -h "$l" ]; then
+                p=$(readlink "$l" 2>/dev/null)
+                case $p in
+                    '' | *[!0-9]*) ;; # not a pid: no live hook made it
+                    *) if kill -0 "$p" 2>/dev/null; then
+                        rm -f "$t"
+                        exit 0
+                    fi ;;
+                esac
+                # Gone: removed only if it still names that holder.
+                [ "$(readlink "$l" 2>/dev/null)" = "$p" ] && rm -f "$l" 2>/dev/null
+            elif [ -e "$l" ]; then
+                rm -f "$l" 2>/dev/null # not a lock any hook makes
             fi
-            rm -rf "$l" 2>/dev/null
-            mkdir "$l" 2>/dev/null && break
+            ln -s "$$" "$l" 2>/dev/null && break
             rm -f "$t"
             exit 0
         fi
@@ -86,15 +108,22 @@ if [ "$1" = event ]; then
     done
     held=1
     {
-        printf '%s\n' "$$" > "$l/pid"
         s=$(cat "$e/seq" 2>/dev/null)
         case $s in '' | *[!0-9]*) s=0 ;; esac
-        s=$((s + 1))
-        printf '%s\n' "$s" > "$e/seq.tmp" && mv "$e/seq.tmp" "$e/seq" &&
-            mv "$t" "$e/$(printf 'ev-%010d-%s.json' "$s" "$ev")"
+        k=0
+        while [ "$k" -lt 100 ]; do
+            s=$((s + 1))
+            f=$e/$(printf 'ev-%010d-%s.json' "$s" "$ev")
+            if ln "$t" "$f"; then break; fi
+            # No hard links here: a rename, only onto a free name.
+            if [ ! -e "$f" ] && mv "$t" "$f"; then break; fi
+            k=$((k + 1))
+        done
+        [ "$k" -lt 100 ] && printf '%s\n' "$s" > "$e/seq.$$" && mv "$e/seq.$$" "$e/seq"
+        rm -f "$e/seq.$$"
     } 2>/dev/null
     rm -f "$t" 2>/dev/null
-    rm -rf "$l" 2>/dev/null
+    release
     exit 0
 fi
 

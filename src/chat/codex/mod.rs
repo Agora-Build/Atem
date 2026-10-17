@@ -9,7 +9,9 @@
 //!   `<event>:<group>:<handler>` plus a hash); the file is edited in place
 //!   as text and checked to parse to exactly the intended JSON. A malformed
 //!   or unexpected file is refused.
-//! - `hooks.json.atem-bak` holds the original before the first change.
+//! - `hooks.json.atem-bak` holds the original before the first change
+//!   (empty: there was no file); a removal keeps its own copy of the file
+//!   as `hooks.json.atem-removed.<seconds>`.
 //! - Idempotent: an entry already there (equal) stays where it is, an older
 //!   Atem entry of an event is replaced in place, a missing one is
 //!   appended; so a partial set is completed by appending only what's
@@ -370,6 +372,8 @@ pub enum Merge {
 
 /// What happens to one event's list.
 enum Step {
+    /// Our equal group stays (only extra Atem groups go).
+    Keep,
     Append,
     Replace(usize),
 }
@@ -430,27 +434,38 @@ pub fn merge(existing: Option<&str>, entries: &[(&str, Value)]) -> Result<Merge>
             .as_array_mut()
             .unwrap();
         let mine = ours.get(*event).map(Vec::as_slice).unwrap_or(&[]);
-        if mine.iter().any(|&i| groups[i] == *entry) {
+        // One Atem group per event: an equal one stays, else the first is
+        // replaced; any other Atem group of the event goes (never left
+        // running stale).
+        let (step, keep) = match mine.iter().find(|&&i| groups[i] == *entry) {
+            Some(&i) => (Step::Keep, Some(i)),
+            None => match mine.first() {
+                Some(&i) => {
+                    groups[i] = entry.clone();
+                    (Step::Replace(i), Some(i))
+                }
+                None => {
+                    groups.push(entry.clone());
+                    (Step::Append, None)
+                }
+            },
+        };
+        let mut extra: Vec<usize> = mine.iter().copied().filter(|&i| Some(i) != keep).collect();
+        extra.sort_unstable_by(|a, b| b.cmp(a));
+        if matches!(step, Step::Keep) && extra.is_empty() {
             continue;
         }
-        let step = match mine.first() {
-            Some(&i) => {
-                groups[i] = entry.clone();
-                Step::Replace(i)
-            }
-            None => {
-                groups.push(entry.clone());
-                Step::Append
-            }
-        };
-        steps.push((*event, entry, step));
+        for &i in &extra {
+            groups.remove(i);
+        }
+        steps.push((*event, entry, step, extra));
     }
     if steps.is_empty() {
         return Ok(Merge::Unchanged);
     }
 
     let mut out = text.to_string();
-    for (event, entry, step) in steps {
+    for (event, entry, step, extra) in steps {
         let entry_text = serde_json::to_string(entry)?;
         let key = Value::String(event.to_string());
         let tree = Scanner { text: &out, i: 0 }.value()?;
@@ -468,10 +483,19 @@ pub fn merge(existing: Option<&str>, entries: &[(&str, Value)]) -> Result<Merge>
                         &out[..items[i].start],
                         &out[items[i].end..]
                     ),
+                    (_, Step::Keep) => out.clone(),
                     _ => append(&out, list, &entry_text),
                 },
             },
         };
+        // The extra Atem groups, highest index first.
+        for i in extra {
+            let tree = Scanner { text: &out, i: 0 }.value()?;
+            let list = member(&tree, "hooks")
+                .and_then(|h| member(h, event))
+                .ok_or_else(|| anyhow!("hooks.{event} moved"))?;
+            out = remove_item(&out, list, i);
+        }
     }
     let check: Value = serde_json::from_str(&out).context("the merge went wrong")?;
     if check != want {
@@ -510,16 +534,16 @@ pub fn install(codex_home: &Path, script: &Path) -> Result<Installed> {
         return Ok(Installed::Unchanged);
     };
     let mode = file_mode(&path).unwrap_or(0o600);
-    let mut backup = None;
-    if let Some(original) = &existing {
-        let bak = codex_home.join(BACKUP);
-        if std::fs::symlink_metadata(&bak).is_err() {
-            write_keeping(&bak, original.as_bytes(), mode)
-                .with_context(|| format!("writing {}", bak.display()))?;
-        }
-        backup = Some(bak);
-    }
+    // The original before Atem's first change; an empty one records that
+    // there was no file (so removal can go back to none).
     std::fs::create_dir_all(codex_home)?;
+    let bak = codex_home.join(BACKUP);
+    if std::fs::symlink_metadata(&bak).is_err() {
+        let original = existing.as_deref().unwrap_or("");
+        write_keeping(&bak, original.as_bytes(), mode)
+            .with_context(|| format!("writing {}", bak.display()))?;
+    }
+    let backup = existing.is_some().then_some(bak);
     write_keeping(&path, text.as_bytes(), mode)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(Installed::Changed { backup })
@@ -617,8 +641,13 @@ pub fn remove_ours(text: &str, original: Option<&str>) -> Result<Option<(String,
     if ours.is_empty() {
         return Ok(None);
     }
-    // What existed before Atem: unknown → keep every container.
-    let before: Option<Value> = original.and_then(|t| serde_json::from_str(t).ok());
+    // What existed before Atem: nothing (a blank backup: no file) → drop
+    // every container left empty; unknown → keep them all.
+    let before: Option<Value> = match original {
+        Some(t) if t.trim().is_empty() => Some(Value::Object(Default::default())),
+        Some(t) => serde_json::from_str(t).ok(),
+        None => None,
+    };
     let had = |pointer: &str| before.as_ref().is_none_or(|b| b.pointer(pointer).is_some());
 
     let mut out = text.to_string();
@@ -656,12 +685,12 @@ pub fn remove_ours(text: &str, original: Option<&str>) -> Result<Option<(String,
     Ok(Some((out, want)))
 }
 
-/// A free backup name: `hooks.json.atem-bak`, else `….atem-bak.<seconds>`.
-fn backup_path(codex_home: &Path) -> PathBuf {
-    let first = codex_home.join(BACKUP);
-    if std::fs::symlink_metadata(&first).is_err() {
-        return first;
-    }
+/// Where `uninstall` keeps the file as it was before a removal:
+/// `hooks.json.atem-removed.<seconds>[-n]`, never `BACKUP` (the original
+/// from before Atem, which removal reads).
+pub const REMOVED: &str = "hooks.json.atem-removed";
+
+fn removed_path(codex_home: &Path) -> PathBuf {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -669,9 +698,9 @@ fn backup_path(codex_home: &Path) -> PathBuf {
     let mut n = 0;
     loop {
         let name = if n == 0 {
-            format!("{BACKUP}.{secs}")
+            format!("{REMOVED}.{secs}")
         } else {
-            format!("{BACKUP}.{secs}-{n}")
+            format!("{REMOVED}.{secs}-{n}")
         };
         let p = codex_home.join(name);
         if std::fs::symlink_metadata(&p).is_err() {
@@ -708,9 +737,15 @@ pub fn uninstall_with(codex_home: &Path, write: Writer, restore: Writer) -> Resu
         return Ok(Removed::Nothing);
     };
     let mode = file_mode(&path).unwrap_or(0o600);
-    let backup = backup_path(codex_home);
+    let backup = removed_path(codex_home);
     write(&backup, text.as_bytes(), mode)
         .with_context(|| format!("writing {}", backup.display()))?;
+    // There was no file before Atem and nothing else is left: none again.
+    let none_before = original.as_deref().is_some_and(|t| t.trim().is_empty());
+    if none_before && want == Value::Object(Default::default()) {
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        return Ok(Removed::Removed { backup });
+    }
     write(&path, new.as_bytes(), mode).with_context(|| format!("writing {}", path.display()))?;
     let landed = std::fs::read_to_string(&path)
         .ok()
