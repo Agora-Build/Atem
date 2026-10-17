@@ -1,0 +1,584 @@
+{
+ "name": "approval-rule-revoke-needs-control-not-the-lease",
+ "setup": {
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222"
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "holds_lease_epoch": 1,
+    "client_kind": "native"
+   },
+   {
+    "name": "c2",
+    "attachment_gen": "66666666-6666-4666-8666-666666666666",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   },
+   {
+    "name": "c3",
+    "attachment_gen": "77777777-7777-4777-8777-777777777777",
+    "permissions": [
+     "view"
+    ],
+    "client_kind": "native"
+   }
+  ],
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  }
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000001"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "sessions.#": 1
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000002"
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "sessions.#": 1
+   }
+  },
+  {
+   "send": "c3",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000003"
+    }
+   }
+  },
+  {
+   "expect": "c3",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "sessions.#": 1
+   }
+  },
+  {
+   "approval_rules": "ses-aaaaaaaaaaaa",
+   "rules": [
+    {
+     "rule_id": "s-0123456789abcdef",
+     "label": "Always allow `npm test` in /home/user/proj for this session",
+     "scope": "session"
+    },
+    {
+     "rule_id": "s-fedcba9876543210",
+     "label": "Always allow `cargo check` in /home/user/proj for this session",
+     "scope": "session"
+    }
+   ]
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_rules",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "rules": [
+     {
+      "rule_id": "s-0123456789abcdef",
+      "label": "Always allow `npm test` in /home/user/proj for this session",
+      "scope": "session"
+     },
+     {
+      "rule_id": "s-fedcba9876543210",
+      "label": "Always allow `cargo check` in /home/user/proj for this session",
+      "scope": "session"
+     }
+    ]
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "approval_rules",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "rules": [
+     {
+      "rule_id": "s-0123456789abcdef",
+      "label": "Always allow `npm test` in /home/user/proj for this session",
+      "scope": "session"
+     },
+     {
+      "rule_id": "s-fedcba9876543210",
+      "label": "Always allow `cargo check` in /home/user/proj for this session",
+      "scope": "session"
+     }
+    ]
+   }
+  },
+  {
+   "expect_none": "c3",
+   "for_ms": 0
+  },
+  {
+   "send": "c3",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "77777777-7777-4777-8777-777777777777"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-0123456789abcdef"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c3",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000004",
+    "code": "forbidden"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000005",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-not-active"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000005",
+    "code": "stale_target"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000006",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "88888888-8888-4888-8888-888888888888"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000003",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-0123456789abcdef"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000006",
+    "code": "stale_target"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000007",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000004",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-0123456789abcdef",
+      "acquire": true
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000007",
+    "code": "unsupported_version"
+   }
+  },
+  {
+   "assert": {
+    "rule_revokes": [],
+    "dispatches": 0,
+    "lease_holder": "c1"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000008",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000005",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-0123456789abcdef"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "receipt",
+    "re": "11111111-1111-4111-8111-000000000008",
+    "request_id": "44444444-4444-4444-8444-000000000005",
+    "kind": "approval_rule_revoke",
+    "state": "accepted"
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000005",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000005",
+    "state": "completed"
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_rules",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "rules.#": 1,
+    "rules.0.rule_id": "s-fedcba9876543210"
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "approval_rules",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "rules.#": 1,
+    "rules.0.rule_id": "s-fedcba9876543210"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000009",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000006",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-fedcba9876543210"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "receipt",
+    "re": "11111111-1111-4111-8111-000000000009",
+    "request_id": "44444444-4444-4444-8444-000000000006",
+    "kind": "approval_rule_revoke",
+    "state": "accepted"
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000006",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000006",
+    "state": "completed"
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "approval_rules",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "rules.#": 0
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "approval_rules",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "rules.#": 0
+   }
+  },
+  {
+   "assert": {
+    "rule_revokes": [
+     "s-0123456789abcdef",
+     "s-fedcba9876543210"
+    ],
+    "dispatches": 2,
+    "lease_holder": "c1"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000010",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000005",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-0123456789abcdef"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "receipt",
+    "re": "11111111-1111-4111-8111-000000000010",
+    "request_id": "44444444-4444-4444-8444-000000000005",
+    "state": "completed"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000011",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000007",
+     "kind": "approval_rule_revoke",
+     "payload": {
+      "rule_id": "s-0123456789abcdef"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000011",
+    "code": "stale_target"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "renew",
+     "id": "11111111-1111-4111-8111-000000000012",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000012",
+    "binding.lease_epoch": 1
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c3",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "rule_revokes": [
+     "s-0123456789abcdef",
+     "s-fedcba9876543210"
+    ],
+    "dispatches": 2,
+    "lease_holder": "c1"
+   }
+  }
+ ],
+ "note": "r7.3 Atem session rules: the runtime reports a session's active rules; attachments with control get approval_rules on every change and after each sessions snapshot (view-only ones get none). Revoking one is a kind:\"approval_rule_revoke\" submission that needs only the control permission: with or without the lease, lease_epoch optional and ignored (here c2 revokes while c1 holds the lease, once without lease_epoch and once naming c1's epoch). A view-only attachment is forbidden; an inactive rule_id or another process_gen is stale_target; acquire is refused (the payload is exactly {rule_id}); nothing is recorded or dispatched for any of these. An active rule is dispatched to the runtime, completes when the worker dropped it, and the shorter list follows. A duplicate returns the recorded receipt; revoking again under a new request_id is stale_target. The holder's lease is untouched: it renews at the same epoch."
+}

@@ -1419,7 +1419,7 @@ fn scenarios() -> Vec<Value> {
 const NOT_RUN: &[&str] = &[
     "approval-answer-with-acquire-takes-control-from-the-holder",
     "approval-needs-control-and-the-lease",
-    "approval-rule-revoke-needs-the-lease-and-an-active-rule",
+    "approval-rule-revoke-needs-control-not-the-lease",
     "approval-survives-takeover",
     "closed-session-refuses-work-before-the-lease-check",
     "receipt-query-is-scoped-to-the-exact-target",

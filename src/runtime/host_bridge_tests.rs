@@ -3053,8 +3053,9 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
         })
         .await;
 
-        // Revoked from chat (with the lease): completed, the list empties.
-        let lease = peer.acquire(&sid, &pg).await;
+        // Revoked from chat without the lease (r7.3: `control` is enough;
+        // no lease is held after the restart): completed, the list empties,
+        // and still no lease is held.
         let revoke = uuid::Uuid::new_v4().to_string();
         let from = peer.seen.len();
         peer.chat(
@@ -3062,7 +3063,7 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": revoke, "lease_epoch": lease,
+            json!({"generation": pg, "requestId": revoke,
                    "approval_rule_revoke": {"rule_id": rule_id}}),
         );
         let rv = revoke.clone();
@@ -3074,8 +3075,15 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
             is_session(v, "approval_rules") && v["data"]["rules"] == json!([])
         })
         .await;
+        assert!(
+            !peer.seen[from..]
+                .iter()
+                .any(|v| is_session(v, "lease") || is_session(v, "lease_changed")),
+            "a revoke never takes or moves the lease"
+        );
+        let lease = peer.acquire(&sid, &pg).await;
 
-        // The same command asks again; an interrupt now only hands the
+        // The worker stops allowing at once: the same command asks again; an interrupt now only hands the
         // waiting approval to Codex's dialog, and says so.
         ask(&fake, 5, touch);
         let peer = &mut rt.peer;
@@ -3211,6 +3219,18 @@ async fn adopted_rules_dropped_after(change: &str) {
         "the old rule is never listed"
     );
     rt.shutdown().await;
+}
+
+#[test]
+fn the_revoke_log_line_names_the_rule_and_session_only() {
+    assert_eq!(
+        super::rule_revoked_line("ses-aaaaaaaaaaaa", "s-0123456789abcdef", true),
+        "atem runtime: ses-aaaaaaaaaaaa: session rule s-0123456789abcdef revoked"
+    );
+    assert_eq!(
+        super::rule_revoked_line("ses-aaaaaaaaaaaa", "s-0123456789abcdef", false),
+        "atem runtime: ses-aaaaaaaaaaaa: session rule s-0123456789abcdef not revoked (no longer active)"
+    );
 }
 
 #[test]
