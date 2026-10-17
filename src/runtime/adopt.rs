@@ -307,6 +307,16 @@ impl WorkerHandle {
         })
     }
 
+    /// A copy of an approval card message for the worker's chat history.
+    pub fn chat_card(&self, message: crate::chat::session::ChatMessage) -> Result<()> {
+        self.send(&BrokerMsg::ChatCard { message })
+    }
+
+    /// Asks for the worker's whole retained chat history (`chat_history`).
+    pub fn request_chat_history(&self) -> Result<()> {
+        self.send(&BrokerMsg::RequestChatHistory)
+    }
+
     /// After adoption: the approvals this broker knows (the rest released).
     pub fn known_approvals(&self, request_ids: Vec<String>) -> Result<()> {
         self.send(&BrokerMsg::KnownApprovals { request_ids })

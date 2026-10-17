@@ -112,6 +112,34 @@ pub fn cap_event(mut event: AgentEvent) -> AgentEvent {
     event
 }
 
+/// Bytes of history messages (JSON as sent) in one `chat_history_part` or
+/// in the final `chat_snapshot`/`chat_history`: a quarter of the line bound,
+/// so the largest message (131 072 bytes of text, escaped) always fits.
+pub const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// `history` (oldest first) cut into runs of at most `max_bytes` of encoded
+/// messages each, oldest run first; a single larger message is a run of its
+/// own. Never empty: no history is one empty run.
+pub fn split_history(
+    history: Vec<crate::chat::session::ChatMessage>,
+    max_bytes: usize,
+) -> Vec<Vec<crate::chat::session::ChatMessage>> {
+    let mut runs = vec![Vec::new()];
+    let mut bytes = 0;
+    for message in history {
+        let n = size(&message);
+        let run = runs.last_mut().expect("never empty");
+        if !run.is_empty() && bytes + n > max_bytes {
+            runs.push(vec![message]);
+            bytes = n;
+        } else {
+            run.push(message);
+            bytes += n;
+        }
+    }
+    runs
+}
+
 #[derive(Debug)]
 struct Batch {
     events: Vec<AgentEvent>,

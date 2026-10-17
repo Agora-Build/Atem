@@ -144,8 +144,10 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
         ChatReply::Complete {
             request_id,
             turn_id,
+            interrupted,
         } => {
-            let mut b = json!({"op": "complete", "requestId": request_id, "outcome": "done"});
+            let outcome = if interrupted { "interrupted" } else { "done" };
+            let mut b = json!({"op": "complete", "requestId": request_id, "outcome": outcome});
             if let Some(t) = turn_id {
                 b["turnId"] = Value::String(t);
             }

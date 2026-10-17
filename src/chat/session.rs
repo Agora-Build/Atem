@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-const MAX_HISTORY_MESSAGES: usize = 500;
-const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+/// History kept per session (oldest evicted first; the newest always stays).
+pub const MAX_HISTORY_MESSAGES: usize = 500;
+pub const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REQUESTS: usize = 1000;
 const MAX_MESSAGE_BYTES: usize = 131_072;
 const MAX_PROMPT_BYTES: usize = 32_768;
@@ -157,6 +158,9 @@ pub struct ChatSnapshot {
     pub input_mark: u64,
     pub current_turn: Option<String>,
     pub last_completed: Option<String>,
+    /// How `last_completed` ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<Outcome>,
     pub history: Vec<ChatMessage>,
 }
 
@@ -177,6 +181,7 @@ pub struct ChatSession {
     input_mark: u64,
     current_turn: Option<(String, Option<String>)>,
     last_completed: Option<String>,
+    last_outcome: Option<Outcome>,
 }
 
 /// Redact credential values (names are kept). See `memory::secrets::redact_secrets`.
@@ -303,6 +308,7 @@ impl ChatSession {
             input_mark: 0,
             current_turn: None,
             last_completed: None,
+            last_outcome: None,
         }
     }
 
@@ -322,6 +328,7 @@ impl ChatSession {
             input_mark: self.input_mark,
             current_turn: self.current_turn.as_ref().map(|(t, _)| t.clone()),
             last_completed: self.last_completed.clone(),
+            last_outcome: self.last_outcome,
             history: self.history(None, max_messages, max_bytes),
         }
     }
@@ -339,6 +346,7 @@ impl ChatSession {
         session.input_mark = snapshot.input_mark;
         session.current_turn = snapshot.current_turn.map(|t| (t, None));
         session.last_completed = snapshot.last_completed;
+        session.last_outcome = snapshot.last_outcome;
         for message in snapshot.history {
             session.push_message(message);
         }
@@ -347,6 +355,107 @@ impl ChatSession {
 
     pub fn status(&self) -> &Status {
         &self.status
+    }
+
+    /// `message_id` is still in the retained history of this generation (a
+    /// valid `before`); `generation`, when the client names one, must be
+    /// this session's.
+    pub fn retains(&self, message_id: &str, generation: Option<&str>) -> bool {
+        generation.is_none_or(|g| g == self.generation)
+            && self.history.iter().any(|m| m.message_id == message_id)
+    }
+
+    /// Catches up with the worker's `snapshot` state (its history replaced
+    /// this one's after items were dropped on the way): the turn the worker
+    /// saw end completes here too (with its outcome), and status, the
+    /// current turn and the input mark follow the worker's.
+    pub fn catch_up(&mut self, snapshot: &ChatSnapshot) -> Vec<Out> {
+        let mut out = Vec::new();
+        if self.exited {
+            return out;
+        }
+        self.started |= snapshot.started;
+        if let Some(done) = &snapshot.last_completed
+            && self.last_completed.as_ref() != Some(done)
+        {
+            let outcome = snapshot.last_outcome.unwrap_or(Outcome::Done);
+            self.complete(done.clone(), outcome, &mut out);
+        }
+        match &snapshot.current_turn {
+            Some(t) if self.current_turn.as_ref().is_none_or(|(c, _)| c != t) => {
+                self.current_turn = Some((t.clone(), None));
+            }
+            _ => {}
+        }
+        self.input_mark = snapshot.input_mark;
+        self.set_status(
+            snapshot.state,
+            snapshot.detail.as_deref(),
+            snapshot.since_ms,
+            &mut out,
+        );
+        out
+    }
+
+    /// The whole retained history replaced by `history` (the worker's, after
+    /// its backlog dropped items); status, turns and requests stay.
+    pub fn replace_history(&mut self, history: Vec<ChatMessage>) {
+        self.history.clear();
+        self.history_bytes = 0;
+        for message in history {
+            self.push_message(message);
+        }
+    }
+
+    /// An approval card message the broker made (`approval_card`), kept in
+    /// this (the worker's) history so a later broker gets it with the
+    /// snapshot: replaces the message with its id, or is appended. Anything
+    /// but one assistant message with exactly one approval part is ignored.
+    pub fn put_card(&mut self, message: ChatMessage) -> bool {
+        let card = message.role == Role::Assistant
+            && message.message_id.starts_with("approval-")
+            && matches!(message.parts.as_slice(), [Part::Approval(_)]);
+        if !card {
+            return false;
+        }
+        if let Some(m) = self
+            .history
+            .iter_mut()
+            .find(|m| m.message_id == message.message_id)
+        {
+            let old = m.bytes();
+            *m = message;
+            let new = m.bytes();
+            self.history_bytes = self.history_bytes - old + new;
+            return true;
+        }
+        self.push_message(message);
+        true
+    }
+
+    /// Every card still `pending` becomes `closed` with `note` (a broker
+    /// restart released its approval): the changed messages.
+    pub fn close_pending_cards(&mut self, note: &str) -> Vec<ChatMessage> {
+        let mut changed = Vec::new();
+        for m in self.history.iter_mut() {
+            let old = m.bytes();
+            let mut touched = false;
+            for part in m.parts.iter_mut() {
+                if let Part::Approval(card) = part
+                    && card.state == crate::chat::adapter::ApprovalCardState::Pending
+                {
+                    card.state = crate::chat::adapter::ApprovalCardState::Closed;
+                    card.note = Some(note.to_string());
+                    touched = true;
+                }
+            }
+            if touched {
+                let new = m.bytes();
+                self.history_bytes = self.history_bytes - old + new;
+                changed.push(m.clone());
+            }
+        }
+        changed
     }
 
     pub fn heartbeat(&self) -> Out {
@@ -500,6 +609,7 @@ impl ChatSession {
     /// compaction) completes nothing a client asked for: no `Complete`.
     fn complete(&mut self, turn_id: String, outcome: Outcome, out: &mut Vec<Out>) {
         self.last_completed = Some(turn_id.clone());
+        self.last_outcome = Some(outcome);
         let (prompted, request_id) = match &self.current_turn {
             Some((t, r)) if *t == turn_id => (true, r.clone()),
             _ => (false, None),
@@ -875,28 +985,40 @@ impl ChatSession {
         max_messages: usize,
         max_bytes: usize,
     ) -> Vec<ChatMessage> {
+        self.page(before, max_messages, max_bytes, |_| true).0
+    }
+
+    /// `history` over the messages `keep` accepts only (the limits count
+    /// those), and whether the page reaches the oldest retained one of them
+    /// (the start: nothing older to ask for).
+    pub fn page(
+        &self,
+        before: Option<&str>,
+        max_messages: usize,
+        max_bytes: usize,
+        keep: impl Fn(&ChatMessage) -> bool,
+    ) -> (Vec<ChatMessage>, bool) {
         let end = match before {
             None => self.history.len(),
             Some(id) => match self.history.iter().position(|m| m.message_id == id) {
                 Some(i) => i,
-                None => return Vec::new(),
+                None => return (Vec::new(), true),
             },
         };
         let mut picked = Vec::new();
         let mut bytes = 0usize;
-        for m in self.history.iter().take(end).rev() {
-            if picked.len() >= max_messages {
-                break;
-            }
+        let mut start = true;
+        for m in self.history.iter().take(end).rev().filter(|m| keep(m)) {
             let size = m.bytes();
-            if !picked.is_empty() && bytes + size > max_bytes {
+            if picked.len() >= max_messages || (!picked.is_empty() && bytes + size > max_bytes) {
+                start = false;
                 break;
             }
             bytes += size;
             picked.push(m.clone());
         }
         picked.reverse();
-        picked
+        (picked, start)
     }
 
     /// Content that was already in a log the adapter switched to (a resume of
@@ -1699,6 +1821,94 @@ mod tests {
         assert!(s.history(Some("u0"), 10, 1000).is_empty());
         // the newest message is returned even if it alone exceeds max_bytes
         assert_eq!(ids(s.history(None, 10, 3)), ["u4"]);
+    }
+
+    #[test]
+    fn a_page_leaves_cards_out_before_its_limits_and_says_when_it_starts() {
+        use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
+        let mut s = ready();
+        for i in 0..3 {
+            s.on_log(user(&format!("u{i}"), &format!("t{i}"), "hi"), 2, 0);
+        }
+        for i in 0..60 {
+            s.approval_card(
+                ApprovalCard {
+                    id: "approval".into(),
+                    approval_id: format!("a{i}"),
+                    tool: "Bash".into(),
+                    summary: "ls".into(),
+                    always_rules: Vec::new(),
+                    state: ApprovalCardState::Pending,
+                    rule_id: None,
+                    note: None,
+                },
+                3,
+            );
+        }
+        let ids = |v: Vec<ChatMessage>| v.into_iter().map(|m| m.message_id).collect::<Vec<_>>();
+        let no_cards = |m: &ChatMessage| !m.message_id.starts_with("approval-");
+        // A view-only page: the newest 50 are all cards, yet it holds the
+        // older messages, and it is the start.
+        let (page, start) = s.page(None, 50, 1 << 20, no_cards);
+        assert_eq!(ids(page), ["u0", "u1", "u2"]);
+        assert!(start);
+        let (page, start) = s.page(Some("approval-a30"), 2, 1 << 20, no_cards);
+        assert_eq!(ids(page), ["u1", "u2"]);
+        assert!(!start, "u0 is older");
+        let (page, start) = s.page(Some("u0"), 50, 1 << 20, no_cards);
+        assert!(page.is_empty() && start);
+        // With control the cards count.
+        let (page, start) = s.page(None, 50, 1 << 20, |_| true);
+        assert_eq!(page.len(), 50);
+        assert!(!start);
+        // A cursor of another generation is not retained.
+        assert!(s.retains("u1", None) && s.retains("u1", Some("g1")));
+        assert!(!s.retains("u1", Some("g2")) && !s.retains("nope", None));
+    }
+
+    #[test]
+    fn catching_up_completes_a_turn_whose_end_was_dropped() {
+        let hook = |turn: &str, at: i64| AgentEvent::PromptSubmitted {
+            text: "go".into(),
+            turn_id: Some(turn.into()),
+            at_ms: Some(at),
+        };
+        let mut s = ready();
+        s.submit("r", "g1", "go", 0, false).unwrap();
+        s.mark_pasted("r", Instant::now(), 1000);
+        s.on_event(hook("t1", 1010), 2, 0);
+        s.on_log(
+            LogItem::UserMessage {
+                id: "u1".into(),
+                turn_id: "t1".into(),
+                text: "go".into(),
+                created_at_ms: 1020,
+            },
+            3,
+            0,
+        );
+        assert_eq!(s.status().state, State::Working);
+        // The worker saw the turn end interrupted; that never arrived here.
+        let mut worker = s.snapshot(0, 0);
+        worker.state = State::Ready;
+        worker.since_ms = 50;
+        worker.current_turn = Some("t1".into());
+        worker.last_completed = Some("t1".into());
+        worker.last_outcome = Some(Outcome::Interrupted);
+        worker.input_mark = 4;
+        let o = s.catch_up(&worker);
+        assert!(o.contains(&Out::Complete {
+            turn_id: "t1".into(),
+            request_id: Some("r".into()),
+            outcome: Outcome::Interrupted
+        }));
+        assert!(
+            o.iter()
+                .any(|o| matches!(o, Out::Status(st) if st.state == State::Ready))
+        );
+        assert_eq!(s.status().state, State::Ready);
+        // Once is enough.
+        assert!(s.catch_up(&worker).is_empty());
     }
 
     #[test]
