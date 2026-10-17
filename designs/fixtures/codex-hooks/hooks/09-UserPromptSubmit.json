@@ -1,0 +1,10 @@
+{
+  "session_id": "<session-A>",
+  "turn_id": "<turn-3>",
+  "transcript_path": "/home/user/.codex/sessions/2026/10/17/rollout-2026-10-17T05-32-36-<session-A>.jsonl",
+  "cwd": "/home/user/proj",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "prompt": "First say one short sentence about what you will do, then run cat notes.txt, then write a 120-word poem about its content."
+}
