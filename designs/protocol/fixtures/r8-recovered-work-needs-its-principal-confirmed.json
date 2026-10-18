@@ -39,12 +39,6 @@
  },
  "steps": [
   {
-   "crash_after_accepted": {
-    "runtime_gen": "99999999-9999-4999-8999-999999999999",
-    "runtime_epoch": 8
-   }
-  },
-  {
    "send": "c1",
    "json": {
     "type": "session",
@@ -72,12 +66,76 @@
    }
   },
   {
-   "expect_none": "c1",
-   "for_ms": 0
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "lease.lease_epoch": 1
+   }
   },
   {
-   "expect_none": "c2",
-   "for_ms": 0
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": 1
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "then deploy"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000002"
+   }
+  },
+  {
+   "restart_runtime": {
+    "runtime_gen": "99999999-9999-4999-8999-999999999999",
+    "runtime_epoch": 8
+   }
   },
   {
    "reconnect": "c2",
@@ -92,7 +150,7 @@
   },
   {
    "assert": {
-    "dispatch_attempts": 0,
+    "dispatch_attempts": 1,
     "lease_holder": null
    }
   },
@@ -105,7 +163,7 @@
   },
   {
    "assert": {
-    "dispatch_attempts": 0
+    "dispatch_attempts": 1
    }
   },
   {
@@ -119,41 +177,6 @@
     "data": {
      "v": 1,
      "op": "receipt_query",
-     "id": "11111111-1111-4111-8111-000000000002",
-     "binding": {
-      "target": {
-       "account_id": "account-a",
-       "atem_device_id": "host-a",
-       "host_trust_gen": 1,
-       "session_id": "ses-aaaaaaaaaaaa",
-       "process_gen": "22222222-2222-4222-8222-222222222222"
-      },
-      "attachment_gen": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-     },
-     "request_ids": [
-      "44444444-4444-4444-8444-000000000001"
-     ]
-    }
-   }
-  },
-  {
-   "expect": "c1",
-   "type": "session",
-   "match": {
-    "op": "receipts",
-    "re": "11111111-1111-4111-8111-000000000002",
-    "receipts.#": 1,
-    "receipts.0.state": "rejected",
-    "receipts.0.detail": "control not confirmed"
-   }
-  },
-  {
-   "send": "c1",
-   "json": {
-    "type": "session",
-    "data": {
-     "v": 1,
-     "op": "submit",
      "id": "11111111-1111-4111-8111-000000000003",
      "binding": {
       "target": {
@@ -165,10 +188,47 @@
       },
       "attachment_gen": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
      },
-     "request_id": "44444444-4444-4444-8444-000000000001",
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001",
+      "44444444-4444-4444-8444-000000000002"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipts",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "receipts.#": 2,
+    "receipts.0.state": "outcome_unknown",
+    "receipts.1.state": "rejected",
+    "receipts.1.detail": "control not confirmed"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
      "kind": "prompt",
      "payload": {
-      "text": "run the tests"
+      "text": "then deploy"
      },
      "acquire": true
     }
@@ -179,9 +239,9 @@
    "type": "session",
    "match": {
     "op": "receipt",
-    "request_id": "44444444-4444-4444-8444-000000000001",
+    "request_id": "44444444-4444-4444-8444-000000000002",
     "state": "rejected",
-    "re": "11111111-1111-4111-8111-000000000003",
+    "re": "11111111-1111-4111-8111-000000000004",
     "detail": "control not confirmed"
    }
   },
@@ -195,10 +255,10 @@
   },
   {
    "assert": {
-    "dispatch_attempts": 0,
+    "dispatch_attempts": 1,
     "lease_holder": null
    }
   }
  ],
- "note": "Appendix §H. c1's Send becomes durably accepted, then the runtime crashes before replying. After the restart the recovered prompt runs only once its principal's control is confirmed in this run; another principal (c2) reconnecting doesn't confirm it. 60 s after the host's start (now >= start + 60000) without c1 it is rejected (control not confirmed) and never runs; c1, reconnecting later, finds that receipt and its resend with the same id returns it."
+ "note": "Appendix §H, Recovery rule 3. c1 executes P1 with P2 queued; the runtime stops in order with a healthy journal (clean close). After the restart P2 runs only once its principal's control is confirmed in this run; another principal (c2) reconnecting doesn't confirm it. 60 s after the host's start (now >= start + 60000) without c1 it is rejected (control not confirmed) and never runs; c1, reconnecting later, finds that receipt (P1, executing at the stop, is outcome_unknown) and its resend with the same id returns it."
 }

@@ -432,9 +432,11 @@ Kinds and payloads (v1):
   `accepted` work has provably not started any side effect, so it may still be
   dispatched — once, under its original target, and only if the host trust
   generation is unchanged (else `rejected`, `detail:"host trust changed"`).
-  (r8 draft: and only once its submitter principal's control is confirmed
-  in the new run at the recorded `control_gen`, appendix §H; a request on
-  the refusal list is `rejected` first, §I.)
+  (r8 draft: only when the previous run ended with a clean close, and then
+  only once its submitter principal's control is confirmed in the new run
+  at the recorded `control_gen`; after any other end it is `rejected`
+  "authorization history unknown", appendix §H; a request on the refusal
+  list is `rejected` first, §I.)
   `executing` work may have started a side effect: it is never dispatched again;
   it is reconciled with the worker/provider, and if that can't establish the
   outcome it becomes `outcome_unknown`.
@@ -823,6 +825,28 @@ to the step level and the scenario now follows §I; new
 `r8-delayed-send-reply-does-not-regrant-lost-control` and the client
 scenario `r8-client-delayed-send-reply-never-restores-control`; the two
 r2 history corrections (`chat_opens` 2, `wire_bytes` 675) are applied.
+
+Revised 2026-10-18 for Astation's r4 review (a failed fence write could
+lose a revocation if control was restored before the next
+authentication): queued work whose authorization history can't be
+established never runs. A failure while writing a revocation rejects
+that principal's queued work at once in memory and nothing queued is
+dispatched after a journal halt (§H, "A failed revocation write"); the
+journal gets a **clean close** record, and after any run that didn't end
+with one every recovered accepted request not yet executing is `rejected`
+"authorization history unknown", for every principal (§H, "Recovery").
+The 60 s confirmation stays, after a clean close only. Fixtures: new
+`r8-failed-fence-write-rejects-queued-work-at-once`,
+`r8-failed-fence-write-then-control-restored-never-runs` (rollback
+succeeds, then rollback fails), `r8-crash-rejects-queued-work-whose-history-is-unknown`,
+`r8-clean-close-runs-queued-work-once-its-principal-is-confirmed`;
+`r8-recovered-work-needs-its-principal-confirmed` now starts from a clean
+close, and `r8-crash-after-durable-acceptance-grants-no-lease` and
+`r8-control-fence-holds-when-a-rejection-write-fails` now end
+`rejected` "authorization history unknown"; the second welcome of
+`r8-client-delayed-send-reply-never-restores-control` names a new
+`controller_session` (§3). Schema: `crash_runtime`, and `restart_runtime`
+is an orderly stop.
 
 ### A. Version admission
 
@@ -1335,12 +1359,37 @@ authority it was accepted under only while that principal keeps `control`.
      `detail:"control revoked"`, each persisted);
   4. only then welcome the new attachment.
 
-  Executing work isn't cancelled (§6). If step 1 fails, nothing else
-  happens: the journal halts (§I), the new link is closed without a
-  `welcome`, and nothing runs (nothing becomes `executing` without a
-  durable write). If a rejection in step 3 fails, the journal halts with
-  the fence already durable; recovery rejects that work before dispatching
-  anything (dispatch check below).
+  Executing work isn't cancelled (§6).
+- **A failed revocation write** (r4 review). If any write of that step
+  fails (the fence in step 1, or a rejection in step 3), whatever the
+  rollback did, the host goes on in memory, in the same step: it fences
+  the principal's live attachments that had `control` and revokes the
+  lease as in step 2 (the input epoch rises, so the worker drops queued
+  remote bytes at the write boundary; the epoch of that `lease_changed` is
+  not persisted, which is harmless: clients order by `runtime_epoch`
+  first, and the restart starts a new one), and marks every one of the
+  principal's `accepted` requests not yet `executing` `rejected`,
+  `detail:"control revoked"`, in memory, sent to any live attachment
+  entitled to the receipt (today none: the principal's attachments were
+  just fenced). The journal halts (§I): every later session request but
+  `hello` is `busy`, the new link is closed without a `welcome`, and
+  **nothing queued is dispatched after a journal halt**, of any principal
+  (nor any remote terminal input admitted), until the restart. These
+  in-memory rejections aren't persisted; the restart rejects the same
+  requests anyway, because a halted run never writes a clean close
+  (Recovery, below), so they can never run.
+- **Clean close.** At an orderly shutdown (SIGTERM/SIGINT, idle exit,
+  replacement) whose journal is healthy (not halted, no failed write in
+  this run), after admission has stopped and the last other journal write
+  is durable, the host writes `<journal>/clean_close`
+  (`{"runtime_epoch": n}`, the run's own epoch; temp, fsync, rename,
+  directory fsync). A crash, a kill, a halted journal or a failed write
+  (including a failed fence) means no clean close. At startup the host
+  reads it before incrementing `runtime_epoch`: the previous run ended
+  cleanly only when the file exists, parses and names the stored epoch.
+  Then it removes the file (and the incremented epoch supersedes it in any
+  case, so a removal that fails can't vouch for a later crash). An
+  unreadable or stale file counts as no clean close.
 - **Dispatch check.** Before an `accepted` request becomes `executing`
   (queued in this run, or recovered after a broker restart or worker
   adoption) the host checks its recorded principal: it must hold `control`
@@ -1355,20 +1404,54 @@ authority it was accepted under only while that principal keeps `control`.
   after a revocation has no authority over work accepted before it: that
   work carries the older `control_gen` and was rejected at the fence, or is
   at dispatch.
-- **Authority is confirmed in each run.** After a broker restart or
-  adoption, recovered `accepted` work whose `control_gen` is below its
-  principal's durable one is rejected at once (`control revoked`), before
-  anything is dispatched. The rest is dispatched only once its principal's
-  control is confirmed in this run: today when an attachment of that
-  principal is welcomed with `control` (welcomed without it, the fence is
-  written first and the work is `control revoked`); with account trust,
-  when its stored grant verifies. Not confirmed 60 s after the host's start
-  (`now >= start + 60 000`) → `rejected`, `detail:"control not
-  confirmed"`. Why: a
-  revocation whose fence write failed (the journal halted before recording
-  it) is learned again from the principal's next authentication before
-  anything of it runs, so a lost write never lets revoked work through.
-  The restart disconnected every client anyway; they reconnect and query.
+- **Recovery** (broker restart, with worker adoption). Before anything is
+  dispatched, every recovered `accepted` request not yet `executing` is
+  resolved in this order, each resolution persisted:
+  1. on the refusal list (§I.3) → `rejected`, `detail:"acceptance not
+     confirmed"`;
+  2. the previous run did **not** end with a clean close → `rejected`,
+     `detail:"authorization history unknown"`, for every principal,
+     whatever the journal holds (a fence on disk or not: a failed write
+     may have left it, so what reached the disk never changes the
+     outcome);
+  3. after a clean close: host trust changed → `host trust changed` (§6);
+     `control_gen` below its principal's durable one → `control revoked`;
+     the rest is dispatched only once its principal's control is
+     confirmed in this run: today when an attachment of that principal is
+     welcomed with `control` (welcomed without it, the fence is written
+     first and the work is `control revoked`); with account trust, when its
+     stored grant verifies. Not confirmed 60 s after the host's start
+     (`now >= start + 60 000`) → `rejected`, `detail:"control not
+     confirmed"`.
+
+  `executing` work is unaffected: reconciled, else `outcome_unknown`
+  (§6). If a resolution can't be persisted, the host starts with remote
+  sessions disabled (`welcome.host_error`) and dispatches nothing.
+  Requests already `rejected` in the journal keep their detail; the
+  in-memory rejections of a failed revocation write (above) were never
+  persisted, so the same requests come back `rejected` with step 2's
+  detail. Only the state is final; a detail is the best the journal can
+  establish.
+
+  Why rule 2: a clean close proves every revocation this host observed is
+  durably fenced, so the stored `control_gen` is a complete history of
+  them. Without one, a revocation may have been observed and lost (the
+  r4 trace: the fence write fails, the host restarts, control is restored
+  before the principal next authenticates, and a current `control` flag
+  can't show the missed revocation), so no recovered queued work runs.
+  The cost: after a crash, queued prompts that never started must be sent
+  again by the client, with a new `request_id` (the old one is final,
+  §I.5).
+
+  Why the 60 s confirmation stays (after a clean close only): rule 2
+  covers revocations the host saw; confirmation covers those that happen
+  while it is down, learned only from the principal's next
+  authentication (welcomed without `control`, the fence is written before
+  anything of it runs), and the bound keeps a prompt from running long
+  after its sender went away. A revocation and a re-grant that both happen
+  entirely while the host is down are invisible to it; the authority
+  (today Astation, which arbitrates its callers, §F) owns that case. The
+  restart disconnected every client anyway; they reconnect and query.
 - **Today.** One principal, whose control changes only when it
   re-authenticates with fewer permissions; unpair raises
   `host_trust_gen`, which already rejects accepted work (`host trust
@@ -1378,7 +1461,21 @@ authority it was accepted under only while that principal keeps `control`.
 Fixtures: `r8-revoked-control-refuses-the-send-and-its-queued-prompt`,
 `r8-revoked-control-fences-work-across-reconnect-and-restart`,
 `r8-control-fence-holds-when-a-rejection-write-fails`,
+`r8-failed-fence-write-rejects-queued-work-at-once`,
+`r8-failed-fence-write-then-control-restored-never-runs`,
+`r8-crash-rejects-queued-work-whose-history-is-unknown`,
+`r8-clean-close-runs-queued-work-once-its-principal-is-confirmed`,
 `r8-recovered-work-needs-its-principal-confirmed`.
+
+Conformance obligations (r4 review; implementation tests, not wire
+fixtures): fault the fence write with both rollback outcomes and the
+rejection writes; check that a halted journal also blocks queued raw
+terminal writes at the PTY write boundary (they don't pass through the
+`accepted` → `executing` transition); fault the refusal-list write and
+its atomic replacement, with crashes before and after its rename and
+before and after the `rejected` transition is durable: replaying or
+clearing the list is idempotent and never lets a refused request run;
+and crash before, during and after the clean-close write and its removal.
 
 ### I. Admission persistence: one rule (r8)
 
@@ -1423,9 +1520,11 @@ and every later append refused until the journal is reopened.
    reply and stays halted, and the client treats the request's delivery as
    uncertain. After the restart the journal decides: nothing (the request
    was never accepted), or, when the `accepted` record reached the disk, an
-   accepted request that runs once under §H's recovery rule. The same holds
+   accepted request that §H's recovery rejects (`authorization history
+   unknown`: a halted run never ends with a clean close). The same holds
    for a crash after the `accepted` record became durable and before the
-   lease moved or the reply was sent. Either way no lease is granted:
+   lease moved or the reply was sent. Either way it never runs and no
+   lease is granted:
    leases aren't persisted, and a lease is only ever granted in the step
    that sends the admitting reply. The client follows §F: `receipt_query`
    before any new Send or takeover.
@@ -1439,8 +1538,14 @@ and every later append refused until the journal is reopened.
    and only once the old id is known to be final; §F keeps the id through
    `lease_held`, the takeover confirmation and uncertain delivery because
    there the old id may still run. A client that doesn't know why it got
-   `busy` queries after reconnecting: `rejected` with "acceptance not
-   confirmed" → a new id; nothing recorded → the same id.
+   `busy` queries after reconnecting: `rejected` (whatever the detail:
+   "acceptance not confirmed", "authorization history unknown") → a new
+   id; nothing recorded → the same id.
+7. **Which detail wins at restart.** "acceptance not confirmed" (the
+   refusal list) is resolved first and wins over §H's "authorization
+   history unknown": the client was told `busy`, and the detail confirms
+   that refusal. Both are `rejected`, final and never executed, so the
+   choice changes no outcome (§H, Recovery, gives the full order).
 6. Unchanged from §6: a failed `executing` write rejects the request
    before any effect, and every exit from `executing` is persisted before
    it is reported; any failed write halts the journal as in 2.
@@ -1453,8 +1558,8 @@ another holds the lease: the write and its rollback fail, so the record
 may be on disk; no lease change, `rejected` after the restart, never
 executed, the same id returns the receipt),
 `r8-crash-after-durable-acceptance-grants-no-lease` (durable, then a
-crash before the grant: runs once after its principal is confirmed, no
-lease).
+crash before the grant: no lease, and after the restart `rejected`
+"authorization history unknown", never executed).
 
 ### E. Errors (r8 additions)
 
@@ -1463,7 +1568,7 @@ lease).
 | `unsupported_version` | also: `hello` without `revision: 8`; anything before such a `welcome`; `open.before`/`open.generation`; an op of an unadvertised feature; `acquire` on an approval answer (§G) |
 | `invalid_request` | new: a well-formed message of a known op whose fields break its rules (history selector count, field formats or lengths; §F's `acquire`/`takeover`/`expected_controller` rules and a prompt's static checks) |
 | `stale_target` | also: a `next` token used out of its context or stale; a `before` no longer retained |
-| `busy` | also: more than 8 history requests a second in a conversation; an acquiring Send to a session without `chat-v1` (§F); a failed admission write (`detail:"acceptance not recorded"`, a definitive refusal) and every request after it until restart (`journal halted; restart Atem`) (§I) |
-| `rejected` receipt details | new: `control revoked` (the submitter principal lost `control`, §H), `control not confirmed` (recovered work whose principal wasn't confirmed within 60 s, §H), `acceptance not confirmed` (a request refused `busy` for a failed write, resolved at restart, §I) |
+| `busy` | also: more than 8 history requests a second in a conversation; an acquiring Send to a session without `chat-v1` (§F); a failed admission write (`detail:"acceptance not recorded"`, a definitive refusal) and every request after it, or after any other failed journal write such as a revocation's (§H), until restart (`journal halted; restart Atem`) (§I) |
+| `rejected` receipt details | new: `control revoked` (the submitter principal lost `control`, §H), `control not confirmed` (recovered work whose principal wasn't confirmed within 60 s after a clean close, §H), `authorization history unknown` (recovered work not yet executing after a run that didn't end with a clean close, §H), `acceptance not confirmed` (a request refused `busy` for a failed write, resolved at restart, §I) |
 | `lease_held` | now carries `controller{controller_session, lease_epoch}` (also for §5 `acquire`); also: an acquiring Send while another holds the lease, or a takeover whose `expected_controller` is no longer the holder (§F) |
 | `forbidden` | also: a Send or approval answer from an attachment without `control`, checked before any lease state (§F, §G) |

@@ -85,8 +85,14 @@ these actions.
   `resume`, `set_permissions` and a second `hello` keep it; its
   `attachment_gen`s change. (Today's host has one principal, the paired
   Astation; the harness gives each client its own so the per-principal
-  rules can be checked.) After `restart_runtime` or `crash_after_accepted`
-  the host's start is the current clock (§H's 60 s confirmation window).
+  rules can be checked.) After `restart_runtime`, `crash_runtime` or
+  `crash_after_accepted` the host's start is the current clock (§H's 60 s
+  confirmation window).
+- In an r8 scenario `restart_runtime` is an orderly stop and start: the
+  host writes its clean-close record (§H) when its journal is healthy,
+  and none when the journal is halted. `crash_runtime` and
+  `crash_after_accepted` never write one. The clean-close write is not a
+  journal append counted by `fail_next_fsync`/`fail_fsync_of`.
 
 | step (r8 draft) | meaning |
 |---|---|
@@ -102,9 +108,10 @@ these actions.
 | `{"client_open_chat": client, "conversation": id, "session_id": s}` | client side: the client opens a chat (its `open` is consumed by the fixture) |
 | `{"drop": {"to": client, "op": op}}` | the next matching host→client message is lost in transit: never delivered and not expected (repeat the step to lose several) |
 | `{"set_permissions": client, "permissions": [p], "attachment_gen": uuid}` | the client's principal re-authenticates with these permissions on a new attachment, whether or not its old one is still live (after `disconnect` too). Losing `control` follows §H: the fence is written, live attachments are fenced, a lease held by any of its attachments is revoked (`lease_changed{revoked}` to the other viewers) and its `accepted` work not yet executing, from any of its attachments, is rejected (`control revoked`); then the harness welcomes the new attachment. The permissions stay with the principal: later `reconnect`s use them |
-| `{"fail_next_fsync": true, "undo_fails"?: true}` | r8 (§I): the next journal append fails and the journal halts until `restart_runtime` (every session request but `hello` is `busy`); its rollback succeeds (nothing of it is on disk) unless `undo_fails`, which leaves the record on disk (the worst case). The refusal list write succeeds |
+| `{"fail_next_fsync": true, "undo_fails"?: true}` | r8 (§I; for a revocation's writes §H, "A failed revocation write"): the next journal append fails and the journal halts until `restart_runtime` (every session request but `hello` is `busy`); its rollback succeeds (nothing of it is on disk) unless `undo_fails`, which leaves the record on disk (the worst case). The refusal list write succeeds |
 | `{"fail_fsync_of": n}` | as `fail_next_fsync` for the `n`-th next journal append (1 = the next one); the earlier ones succeed |
-| `{"crash_after_accepted": {"runtime_gen": uuid, "runtime_epoch": n}}` | the next `accepted` record becomes durable, then the runtime crashes before acting on it (no lease change, no reply, no other message) and restarts with these values, as `restart_runtime`; every link drops and clients `reconnect` |
+| `{"crash_after_accepted": {"runtime_gen": uuid, "runtime_epoch": n}}` | the next `accepted` record becomes durable, then the runtime crashes before acting on it (no lease change, no reply, no other message) and restarts with these values, as `crash_runtime` |
+| `{"crash_runtime": {"runtime_gen": uuid, "runtime_epoch": n}}` | the runtime is killed (no clean close) and restarts with these values; workers survive and are adopted; every link drops and clients `reconnect` |
 | `{"replace_process": session_id, "process_gen": uuid}` | the agent process is replaced (restart/resume) with a new `process_gen` (`SessionHost::replace_process`) |
 
 Send and approval scenarios (`r8-send-*`, `r8-approval-*`, and the other
@@ -154,12 +161,16 @@ The r8 draft scenarios:
 | `r8-disconnect-right-after-acceptance` | host | replies lost, work runs, lease expires; receipt query then duplicate on a new attachment |
 | `r8-failed-persistence-changes-no-lease` | host | §I: failed admission write: `busy`, no grant, nothing runs, journal halted (same-id retry `busy`); after the restart the id is `rejected` "acceptance not confirmed" and not re-admitted; a new id is admitted |
 | `r8-double-write-failure-takeover-never-runs` | host | §I: confirmed takeover while c1 holds; write and rollback fail: `busy`, c1 keeps the lease; after the restart `rejected`, never executed, same id returns it |
-| `r8-crash-after-durable-acceptance-grants-no-lease` | host | §I.4: durable accepted, crash before the grant: no lease; runs once when its principal reconnects; duplicate returns the receipt |
+| `r8-crash-after-durable-acceptance-grants-no-lease` | host | §I.4: durable accepted, crash before the grant: no lease; `rejected` "authorization history unknown" at the restart, never dispatched; duplicate returns the receipt |
 | `r8-expired-lease-is-checked-at-admission` | host | expiry at admission without a timer; old epoch stale |
 | `r8-revoked-control-refuses-the-send-and-its-queued-prompt` | host | lost `control`: lease revoked, queued prompt rejected, Send `forbidden` |
 | `r8-revoked-control-fences-work-across-reconnect-and-restart` | host | §H: same-permission reconnect keeps queued work; view-only re-authentication after disconnect rejects work of the gone attachment; regaining control or a restart doesn't revive it |
-| `r8-control-fence-holds-when-a-rejection-write-fails` | host | §H: fence durable, rejection write fails: halted; recovery rejects the work (`control revoked`) |
-| `r8-recovered-work-needs-its-principal-confirmed` | host | §H: recovered work waits for its principal; not confirmed by 60 s → `control not confirmed` |
+| `r8-control-fence-holds-when-a-rejection-write-fails` | host | §H: fence durable, rejection write fails: halted, nothing dispatched; no clean close, so recovery rejects the work (`authorization history unknown`) |
+| `r8-failed-fence-write-rejects-queued-work-at-once` | host | §H: the fence write fails: lease revoked and the principal's queued work rejected in memory at once, halted, nothing dispatched after; restart: `authorization history unknown` |
+| `r8-failed-fence-write-then-control-restored-never-runs` | host | §H (r4 trace): the fence write fails (rollback succeeds, then in a second cycle rollback fails), restart, control restored before confirmation: the queued request is `rejected` "authorization history unknown" and never dispatched |
+| `r8-crash-rejects-queued-work-whose-history-is-unknown` | host | §H rule 2: crash with queued work, principal back with control at once: `rejected` "authorization history unknown"; same id returns it, a new id is admitted |
+| `r8-clean-close-runs-queued-work-once-its-principal-is-confirmed` | host | §H rule 3: after a clean close queued work waits for its principal (not another one) and runs once, no lease |
+| `r8-recovered-work-needs-its-principal-confirmed` | host | §H rule 3: after a clean close recovered work waits for its principal; not confirmed by 60 s → `control not confirmed` |
 | `r8-delayed-send-reply-does-not-regrant-lost-control` | host | §F: the admitting receipt delayed past local input or a takeover grants nothing; its epoch is `stale_lease` |
 | `r8-client-delayed-send-reply-never-restores-control` | client | §F reply rule: a late `lease` after local input, takeover, attachment replacement or local expiry is not applied; a timely one is |
 | `r8-process-replaced-before-dispatch` | host | queued Send rejected on replacement; old `process_gen` `stale_target`; new one acquires |

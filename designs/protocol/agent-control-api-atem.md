@@ -16,7 +16,10 @@ session control" handoff) and lease-free approval answers
 `976e154` (r7.3, #76 and #77). Revised 2026-10-18 for Astation's r3
 review of that addendum: submitter principals and a durable control fence
 (contract §H), one admission persistence rule (§I), the client rule for a
-late admitting reply, and the fixture corrections (§9, end).
+late admitting reply, and the fixture corrections (§9, end). Revised again
+for Astation's r4 review: a failed fence write can't lose a revocation
+(clean-close record; recovered queued work after any other end is
+rejected, contract §H; §9, end).
 
 ## 0. Answers to the r1 review
 
@@ -398,8 +401,8 @@ Card states and push are unchanged.
   same-permission reconnect keep work; regaining control doesn't revive
   work from before the revocation. After a restart, recovered work runs
   only once its principal is confirmed in that run (60 s, else `control
-  not confirmed`), so a fence lost to a failed write is learned again
-  first.
+  not confirmed`). (Superseded by the r4 answer below: confirmation alone
+  can't recover a fence lost to a failed write.)
 - **Finding 2, persistence (§I).** Accepted means the `accepted` record is
   durable. A failed admission write is `busy` and definitive: nothing
   changes, the journal halts until restart, the refusal is recorded on a
@@ -427,3 +430,42 @@ Card states and push are unchanged.
   `r8-crash-after-durable-acceptance-grants-no-lease`. Astation owns its
   API/native arbitration and renewal tests; approval persistence, the
   terminal-answer race and catch-up are run against the r8 implementation.
+
+**r4 review answers (2026-10-18).**
+
+- **Finding 1, failed fence write (§H).** Queued work whose authorization
+  history can't be established never runs. In the run: if any write of a
+  revocation fails, the host revokes the lease and rejects the principal's
+  queued work in memory at once (`control revoked`), halts, and dispatches
+  nothing queued (of anyone) until the restart. Across a restart: the
+  journal gets a clean-close record, written only at an orderly shutdown
+  with a healthy journal and bound to that run's `runtime_epoch`; after any
+  run without one (crash, kill, halted journal, failed fence) every
+  recovered accepted request not yet executing is `rejected`
+  "authorization history unknown", for every principal, whatever reached
+  the disk, before anything is dispatched. The 60 s confirmation stays,
+  after a clean close only: it covers revocations made while the host was
+  down. Precedence at restart: "acceptance not confirmed" (refusal list)
+  first, then "authorization history unknown", then (clean close only)
+  `host trust changed`, `control revoked`, `control not confirmed`; all are
+  `rejected`, so the detail never changes an outcome. Cost: after a crash,
+  queued prompts that never started are resent with a new `request_id`;
+  executing work stays `outcome_unknown`. Fixtures:
+  `r8-failed-fence-write-rejects-queued-work-at-once`,
+  `r8-failed-fence-write-then-control-restored-never-runs` (both rollback
+  outcomes), `r8-crash-rejects-queued-work-whose-history-is-unknown`,
+  `r8-clean-close-runs-queued-work-once-its-principal-is-confirmed`;
+  `r8-recovered-work-needs-its-principal-confirmed` now starts from a clean
+  close; `r8-crash-after-durable-acceptance-grants-no-lease` and
+  `r8-control-fence-holds-when-a-rejection-write-fails` now end
+  "authorization history unknown".
+- **Finding 2, fresh controller.** The second welcome in
+  `r8-client-delayed-send-reply-never-restores-control` names a new
+  `controller_session`. No other fixture reuses one across attachments
+  (`r8-client-refuses-a-host-without-revision-8` repeats a welcome on the
+  same attachment, which is not a replacement).
+- **Implementation obligations.** Listed under §H's fixtures in the
+  contract: a halted journal blocks queued raw terminal writes at the PTY
+  write boundary; refusal-list write, rename and replay faults are
+  idempotent and never let a refused request run; clean-close write and
+  removal crash points.
