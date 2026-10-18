@@ -335,11 +335,11 @@ fn only_a_hello_naming_revision_8_is_welcomed() {
     assert_eq!(only(&mut rt, "n")["op"], "sessions");
 }
 
-/// r8 §A: `open.before`/`open.generation` are removed and `history` is not
-/// advertised: each is refused in chat-v1 with `unsupported_version`, and
-/// nothing reaches the runtime.
+/// r8 §A: `open.before`/`open.generation` are removed: each is refused in
+/// chat-v1 with `unsupported_version`, and nothing reaches the runtime. A
+/// `history` (advertised) is forwarded to the runtime, which serves it.
 #[test]
-fn removed_chat_forms_and_unadvertised_history_are_refused() {
+fn removed_chat_forms_are_refused_and_history_is_forwarded() {
     let mut rt = setup();
     let chat = |rt: &FakeRuntime, op: &str, extra: Value| {
         let mut data = json!({"v": 1, "op": op, "conversationId": "conv-1", "agentId": S1,
@@ -353,14 +353,6 @@ fn removed_chat_forms_and_unadvertised_history_are_refused() {
         ("open", json!({"before": "m-0003"})),
         ("open", json!({"generation": P1})),
         ("open", json!({"before": "m-0003", "generation": P1})),
-        (
-            "history",
-            json!({"generation": P1, "page_id": "p1", "turn_id": "turn-1"}),
-        ),
-        (
-            "history",
-            json!({"generation": P1, "page_id": "p1", "before": "m-0003"}),
-        ),
     ] {
         let forwarded = rt.effects.len();
         let m = chat(&rt, op, extra.clone());
@@ -378,14 +370,24 @@ fn removed_chat_forms_and_unadvertised_history_are_refused() {
             "{op} {extra}"
         );
     }
-    // A plain open still goes to the runtime.
-    let m = chat(&rt, "open", json!({}));
-    rt.send("c1", &m);
-    assert!(
-        rt.effects
-            .iter()
-            .any(|e| matches!(e, Effect::Forward { .. }))
-    );
+    // A plain open and a history go to the runtime.
+    for (op, extra) in [
+        ("open", json!({})),
+        (
+            "history",
+            json!({"generation": P1, "page_id": "p1", "turn_id": "turn-1"}),
+        ),
+    ] {
+        let forwarded = rt.effects.len();
+        rt.send("c1", &chat(&rt, op, extra));
+        assert!(
+            rt.effects[forwarded..]
+                .iter()
+                .any(|e| matches!(e, Effect::Forward { message, .. }
+                    if message.data.as_ref().unwrap()["op"] == op)),
+            "{op}"
+        );
+    }
 }
 
 #[test]
@@ -2100,7 +2102,10 @@ fn receipts_without_a_result() {
             turn_done("done", "t1", Some("u1")),
         ),
         (
-            HostConfig::default(),
+            HostConfig {
+                receipt_result: false,
+                ..HostConfig::default()
+            },
             "prompt",
             turn_done("done", "t1", Some("u1")),
         ),

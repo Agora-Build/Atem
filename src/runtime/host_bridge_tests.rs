@@ -937,6 +937,145 @@ fn sequences(seen: &[Value], conversation: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The page `page_id` (`None`: an open's) of `conversation` from `from`:
+/// its messages and its `history_end`.
+async fn take_page(
+    peer: &mut Peer,
+    from: usize,
+    conversation: &str,
+    page_id: Option<&str>,
+) -> (Vec<Value>, Value) {
+    let (c, p) = (conversation.to_string(), page_id.map(str::to_string));
+    let at = peer
+        .wait_from(from, move |v| {
+            is_chat(v, "history_end")
+                && v["data"]["conversationId"] == c.as_str()
+                && v["data"].get("page_id").and_then(Value::as_str) == p.as_deref()
+        })
+        .await;
+    let messages = peer.seen[from..at]
+        .iter()
+        .filter(|v| {
+            is_chat(v, "message")
+                && v["data"]["conversationId"] == conversation
+                && v["data"]["history"] == true
+                && v["data"].get("page_id").and_then(Value::as_str) == page_id
+        })
+        .map(|v| v["data"].clone())
+        .collect();
+    (messages, peer.seen[at]["data"].clone())
+}
+
+/// r8 §B over the runtime: an open ends with `history_end`; a lookup by
+/// `request_id` pages that turn from its user message; `before` pages the
+/// older history; an invalid selector and a stale `next` are errors in the
+/// stream with their `page_id`; nothing resets (sequences consecutive).
+#[test]
+fn history_pages_and_lookups_come_in_the_conversation_stream() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let session = rt.launch(&mut client, "claude", &fake_claude(), None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        let lease = peer.acquire(&sid, &pg).await;
+        let mut rids = Vec::new();
+        for text in ["first", "second"] {
+            let rid = uuid::Uuid::new_v4().to_string();
+            submit_until_complete(peer, "conv-1", &sid, &pg, lease, &rid, text).await;
+            rids.push(rid);
+        }
+        peer.drain(Duration::from_millis(300)).await;
+
+        let from = peer.seen.len();
+        open_chat_any(peer, "conv-2", &sid, &pg).await;
+        let (newest, end) = take_page(peer, from, "conv-2", None).await;
+        let page = &end["page"];
+        assert_eq!(page["selector"], "newest", "{end}");
+        assert_eq!(page["end"], true);
+        assert_eq!(page["coverage"], "complete");
+        assert_eq!(page["truncated"], false);
+        assert_eq!(page["count"], newest.len());
+        assert!(newest.len() >= 4, "two turns: {newest:#?}");
+        let user_of = |rid: &str| {
+            newest
+                .iter()
+                .find(|m| m["role"] == "user" && m["requestId"] == rid)
+                .unwrap_or_else(|| panic!("no user message for {rid}: {newest:#?}"))
+                .clone()
+        };
+        let (first, second) = (user_of(&rids[0]), user_of(&rids[1]));
+
+        // The first prompt's turn, from its user message.
+        let from = peer.seen.len();
+        peer.chat(
+            "history",
+            "conv-2",
+            &sid,
+            &pg,
+            json!({"generation": pg, "page_id": "p1", "request_id": rids[0]}),
+        );
+        let (turn, end) = take_page(peer, from, "conv-2", Some("p1")).await;
+        assert_eq!(end["page"]["selector"], "request_id");
+        assert_eq!(end["page"]["coverage"], "complete");
+        assert_eq!(end["page"]["end"], true);
+        assert_eq!(turn[0]["messageId"], first["messageId"]);
+        assert!(turn.len() >= 2 && turn.iter().all(|m| m["turnId"] == first["turnId"]));
+
+        // Older than the second prompt: the first turn's messages.
+        let from = peer.seen.len();
+        peer.chat(
+            "history",
+            "conv-2",
+            &sid,
+            &pg,
+            json!({"generation": pg, "page_id": "p2", "before": second["messageId"]}),
+        );
+        let (older, end) = take_page(peer, from, "conv-2", Some("p2")).await;
+        assert_eq!(end["page"]["selector"], "before");
+        assert_eq!(end["page"]["end"], true);
+        let position = |id: &Value| newest.iter().position(|m| &m["messageId"] == id).unwrap();
+        assert!(!older.is_empty());
+        assert!(
+            older
+                .iter()
+                .all(|m| position(&m["messageId"]) < position(&second["messageId"]))
+        );
+
+        // Errors in the stream, with their page ids.
+        for (page_id, fields, code) in [
+            (
+                "p3",
+                json!({"before": first["messageId"], "turn_id": "t"}),
+                "invalid_request",
+            ),
+            ("p4", json!({"next": "AAAA"}), "stale_target"),
+        ] {
+            let from = peer.seen.len();
+            let mut fields = fields;
+            fields["generation"] = json!(pg);
+            fields["page_id"] = json!(page_id);
+            peer.chat("history", "conv-2", &sid, &pg, fields);
+            let at = peer
+                .wait_from(from, |v| {
+                    is_chat(v, "error") && v["data"]["conversationId"] == "conv-2"
+                })
+                .await;
+            let error = &peer.seen[at]["data"];
+            assert_eq!(error["code"], code, "{error}");
+            assert_eq!(error["page_id"], page_id);
+            assert!(error["sequence"].is_u64());
+        }
+        peer.drain(Duration::from_millis(300)).await;
+        let all = sequences(&peer.seen, "conv-2");
+        assert_eq!(all, (0..all.len() as u64).collect::<Vec<_>>(), "one stream");
+        rt.shutdown().await;
+    });
+}
+
 #[test]
 fn open_with_before_is_refused_and_the_conversation_goes_on() {
     local(async {
@@ -984,7 +1123,13 @@ fn open_with_before_is_refused_and_the_conversation_goes_on() {
                 && v["data"]["op"] != "error"),
             "conv-2 never opened"
         );
-        assert!(!peer.seen.iter().any(|v| v["data"].get("page").is_some()));
+        // No page but the first open's.
+        let pages = peer
+            .seen
+            .iter()
+            .filter(|v| is_chat(v, "history_end"))
+            .count();
+        assert_eq!(pages, 1);
 
         // Live events go on at the next sequences.
         let rid = uuid::Uuid::new_v4().to_string();
@@ -3679,11 +3824,11 @@ fn turn_replies_follow_the_retained_history() {
         message("t7-a-2", Role::Assistant, "t7"),
     ];
     let chat = chat_with(history.clone());
-    let r = super::turn_replies(&chat, "t7", "t7-u");
+    let r = crate::chat::history::turn_replies(&chat, "t7", "t7-u");
     assert_eq!(r.ids, vec!["t7-a-1", "t7-a-2"]);
     assert_eq!(r.coverage, Coverage::Complete);
     assert_eq!(
-        super::turn_replies(&chat, "t9", "t9-u").coverage,
+        crate::chat::history::turn_replies(&chat, "t9", "t9-u").coverage,
         Coverage::Unavailable
     );
 
@@ -3691,7 +3836,7 @@ fn turn_replies_follow_the_retained_history() {
     let mut more = history.clone();
     more.push(message("t7-a-3", Role::Assistant, "t7"));
     more.push(message("t7 bad", Role::Assistant, "t7"));
-    let r = super::turn_replies(&chat_with(more), "t7", "t7-u");
+    let r = crate::chat::history::turn_replies(&chat_with(more), "t7", "t7-u");
     assert_eq!(r.ids, vec!["t7-a-1", "t7-a-2", "t7-a-3"]);
     assert_eq!(r.coverage, Coverage::Partial);
 
@@ -3704,7 +3849,7 @@ fn turn_replies_follow_the_retained_history() {
         long.push(message(&format!("t7-b-{i}"), Role::Assistant, "t7"));
     }
     let chat = chat_with(long);
-    let r = super::turn_replies(&chat, "t7", "t7-u");
+    let r = crate::chat::history::turn_replies(&chat, "t7", "t7-u");
     assert_eq!(r.ids.len(), MAX_HISTORY_MESSAGES);
     assert_eq!(r.ids[0], "t7-b-0");
     assert_eq!(r.coverage, Coverage::Partial);

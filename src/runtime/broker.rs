@@ -45,6 +45,7 @@ use super::worker_approvals::Event as ApprovalEvent;
 use super::worker_protocol::{Activity, WorkerMsg, WorkerRecord, unb64};
 use crate::chat::adapter::{AgentEvent, LogItem};
 use crate::chat::session::{ChatSession, Out};
+use crate::chat::wire::CloseReason;
 use crate::session::{OutputTap, SessionId};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -63,10 +64,6 @@ const UNKNOWN_SIZE: (u16, u16) = (24, 80);
 pub const CHAT_WITHDRAWN: &str = "chat is not available for this agent";
 /// chat-v1 conversations must be reopened: another conversation was resumed.
 pub const CHAT_SWITCHED: &str = "the conversation was switched; reopen the chat";
-/// chat-v1 conversations must be reopened: the worker dropped chat items
-/// before they reached the broker, which reloaded the history from it.
-pub const CHAT_INCOMPLETE: &str =
-    "the chat history was incomplete (some items were dropped) and was reloaded; reopen the chat";
 /// The note on a card still pending when a new broker took the session: it
 /// released every approval, so the agent asks in its terminal again.
 pub const CARD_RELEASED: &str = "Atem's runtime restarted; answer in the terminal";
@@ -172,7 +169,7 @@ pub struct BrokerSession {
     /// What the chat session produced since the session host last took it.
     chat_out: Vec<Out>,
     /// Open chat-v1 conversations must end (why), e.g. chat was withdrawn.
-    chat_reset: Option<&'static str>,
+    chat_reset: Option<CloseReason>,
     /// The terminal input count of the worker's last chat batch.
     pub input_count: u64,
     /// Writes the worker dropped for a stale epoch.
@@ -197,6 +194,10 @@ pub struct BrokerSession {
     history_requested: bool,
     /// The `chat_history_part`s went over their bound and were dropped.
     history_overflow: bool,
+    /// Where the worker's backlog dropped items (r8 §C), while a reload is
+    /// asked for: the retained message before the gap and the first one
+    /// after it. A reload that fails reports it as a hole.
+    pending_gap: Option<(Option<String>, Option<String>)>,
 }
 
 /// What one pass over a worker's messages changed.
@@ -261,6 +262,7 @@ impl BrokerSession {
             history_parts: Vec::new(),
             history_requested: false,
             history_overflow: false,
+            pending_gap: None,
         }
     }
 
@@ -446,7 +448,7 @@ impl BrokerSession {
     }
 
     /// Why open chat-v1 conversations must end, once.
-    pub fn take_chat_reset(&mut self) -> Option<&'static str> {
+    pub fn take_chat_reset(&mut self) -> Option<CloseReason> {
         self.chat_reset.take()
     }
 
@@ -693,11 +695,12 @@ impl BrokerSession {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.worker = None;
-                    // A reload it never answered: conversations reopen on
-                    // what is here.
+                    // A reload it never answered: what the backlog dropped
+                    // stays missing (a hole, r8 §C).
                     if std::mem::take(&mut self.history_requested) {
                         self.history_parts.clear();
-                        self.chat_reset = Some(CHAT_INCOMPLETE);
+                        self.history_overflow = false;
+                        self.gap_is_a_hole();
                     }
                     if self.state == SessionState::Running {
                         eprintln!(
@@ -759,6 +762,9 @@ impl BrokerSession {
                     .into_iter()
                     .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
                 let mut outs = Vec::new();
+                // Where a gap lies: after the newest message retained before
+                // this chunk, before the first one it adds.
+                let before_chunk = self.chat.newest_retained().map(str::to_string);
                 for event in others {
                     outs.extend(self.chat.on_event(event, now, input_count));
                 }
@@ -774,10 +780,10 @@ impl BrokerSession {
                 }
                 self.chat_out.extend(outs);
                 if self.chat_v1 && !chat_v1 {
-                    self.chat_reset = Some(CHAT_WITHDRAWN);
+                    self.chat_reset = Some(CloseReason::Withdrawn);
                 } else if backfilled {
                     // History from a log switched to (resume): clients reload it.
-                    self.chat_reset = Some(CHAT_SWITCHED);
+                    self.chat_reset = Some(CloseReason::Switched);
                 }
                 self.input_count = input_count;
                 self.chat_v1 = chat_v1;
@@ -785,12 +791,25 @@ impl BrokerSession {
                 self.chat_unavailable = unavailable;
                 if gap > 0 {
                     // The worker's history has what was dropped here: reload
-                    // it, then conversations reopen (`chat_history`). Without
-                    // a worker to ask they reopen now, on what is here.
+                    // it (`chat_history`) and send what it recovers; the
+                    // conversations go on (r8 §C). Without a worker to ask,
+                    // the gap is a hole now.
                     eprintln!(
                         "atem runtime: {}: the worker dropped {gap} chat items; reloading the history",
                         self.id
                     );
+                    if self.pending_gap.is_none() {
+                        let after_gap = match &before_chunk {
+                            Some(b) => self
+                                .chat
+                                .retained()
+                                .skip_while(|m| m.message_id != *b)
+                                .nth(1),
+                            None => self.chat.retained().next(),
+                        }
+                        .map(|m| m.message_id.clone());
+                        self.pending_gap = Some((before_chunk, after_gap));
+                    }
                     let asked = self.history_requested
                         || self
                             .worker
@@ -798,7 +817,7 @@ impl BrokerSession {
                             .is_some_and(|w| w.request_chat_history().is_ok());
                     self.history_requested = asked;
                     if !asked {
-                        self.chat_reset = Some(CHAT_INCOMPLETE);
+                        self.gap_is_a_hole();
                     }
                 }
             }
@@ -817,31 +836,26 @@ impl BrokerSession {
             }
             WorkerMsg::ChatHistory { snapshot } => {
                 self.history_requested = false;
-                self.chat_reset = Some(CHAT_INCOMPLETE);
                 let mut snapshot = snapshot;
                 let mut all = std::mem::take(&mut self.history_parts);
                 if std::mem::take(&mut self.history_overflow) {
-                    // Too large to rebuild: the history stays as it is
-                    // (conversations still reopen); the state catches up.
+                    // Too large to rebuild: the history stays as it is and
+                    // what was dropped is a hole; the state catches up.
                     eprintln!(
                         "atem runtime: {}: the worker's history was too large to reload",
                         self.id
                     );
+                    self.gap_is_a_hole();
                 } else {
                     all.append(&mut snapshot.history);
-                    // This broker's cards win over the worker's copies (an
-                    // update may have crossed the request).
-                    let cards: Vec<_> = self
-                        .chat
-                        .history(None, usize::MAX, usize::MAX)
-                        .into_iter()
-                        .filter(|m| m.message_id.starts_with("approval-"))
-                        .collect();
-                    self.chat.replace_history(all);
-                    for card in cards {
-                        if self.chat.retains(&card.message_id, None) {
-                            self.chat.put_card(card);
-                        }
+                    // What the reload recovered goes to open conversations
+                    // in timeline order (r8 §C); nothing reopens.
+                    self.pending_gap = None;
+                    if snapshot.truncated {
+                        self.chat.mark_truncated();
+                    }
+                    for (message, after) in self.chat.reload(all) {
+                        self.chat_out.push(Out::Recovered { message, after });
                     }
                 }
                 // A turn end dropped on the way completes here now (and its
@@ -968,6 +982,7 @@ impl BrokerSession {
                         self.id
                     );
                     all.clear();
+                    snapshot.truncated = true;
                 }
                 all.append(&mut snapshot.history);
                 snapshot.history = all;
@@ -987,9 +1002,21 @@ impl BrokerSession {
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
                 self.chat_unavailable = unavailable;
-                self.chat_reset = Some(CHAT_SWITCHED);
+                self.chat_reset = Some(CloseReason::Switched);
             }
         }
+    }
+
+    /// The backlog gap a reload couldn't fill stays missing: a hole after
+    /// the message before it (r8 §C; truncation when none was retained),
+    /// reported to open conversations with a `coverage` event.
+    fn gap_is_a_hole(&mut self) {
+        let Some((after, before)) = self.pending_gap.take() else {
+            return;
+        };
+        self.chat
+            .add_hole(after.as_deref(), before.as_deref(), None);
+        self.chat_out.push(Out::Coverage(self.chat.coverage()));
     }
 
     /// Output at stream position `offset`: the part past the mirror's

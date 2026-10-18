@@ -317,8 +317,9 @@ async fn the_chat_snapshot_carries_the_whole_history_and_the_cards() {
 
 /// A `chat` batch with a gap (the worker dropped items before they reached
 /// the broker): the broker reloads the whole history from the worker, which
-/// brings back what the broker missed; the broker's own card states win
-/// over the worker's copies; open conversations must reopen.
+/// brings back what the broker missed (sent as recovered messages after
+/// their retained neighbour, r8 §C); the broker's own card states win over
+/// the worker's copies; nothing reopens and nothing is a hole.
 #[tokio::test]
 async fn a_chat_gap_reloads_the_history_from_the_worker() {
     use crate::chat::adapter::{ApprovalCardState, Part};
@@ -351,13 +352,24 @@ async fn a_chat_gap_reloads_the_history_from_the_worker() {
         },
         &mut pumped,
     );
+    assert!(session.history_requested);
+    let _ = session.take_chat();
+    pump_while(&mut session, |s| !s.history_requested).await;
+    assert_eq!(session.take_chat_reset(), None, "conversations go on");
+    let outs = session.take_chat();
+    let recovered: Vec<(String, Option<String>)> = outs
+        .iter()
+        .filter_map(|o| match o {
+            Out::Recovered { message, after } => Some((message.message_id.clone(), after.clone())),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        session.take_chat_reset(),
-        None,
-        "only once the history is back"
+        recovered,
+        [("approval-a0".to_string(), Some("approval-a1".to_string()))]
     );
-    pump_while(&mut session, |s| s.chat_reset.is_some()).await;
-    assert_eq!(session.take_chat_reset(), Some(CHAT_INCOMPLETE));
+    assert!(!outs.iter().any(|o| matches!(o, Out::Coverage(_))));
+    assert!(session.chat.holes().is_empty() && session.pending_gap.is_none());
     let history = session.chat.history(None, usize::MAX, usize::MAX);
     let states: Vec<(String, ApprovalCardState)> = history
         .iter()
@@ -377,11 +389,20 @@ async fn a_chat_gap_reloads_the_history_from_the_worker() {
     session.stop().unwrap();
 }
 
-/// A worker that goes away while a reload is pending: conversations reopen
-/// on what the broker has, nothing waits for an answer.
+/// A worker that goes away while a reload is pending: what its backlog
+/// dropped stays missing, a hole after the message before the gap reported
+/// by a `coverage` event (r8 §C); conversations go on, nothing waits.
 #[tokio::test]
-async fn a_worker_lost_during_a_reload_ends_the_conversations() {
+async fn a_worker_lost_during_a_reload_leaves_a_hole() {
+    use crate::chat::session::Hole;
     let Setup { mut session, _dir } = launch("sleep 1; exit 0").await;
+    // The worker's own snapshot first (it replaces the chat).
+    settle(&mut session).await;
+    let _ = session.take_chat_reset();
+    session.chat.approval_card(
+        card("a8", crate::chat::adapter::ApprovalCardState::Expired),
+        1,
+    );
     let Out::Message(part) = ChatSession::new("x".into(), 0).approval_card(
         card("a9", crate::chat::adapter::ApprovalCardState::Expired),
         1,
@@ -389,18 +410,31 @@ async fn a_worker_lost_during_a_reload_ends_the_conversations() {
         panic!("a message");
     };
     session.history_requested = true;
+    session.pending_gap = Some((Some("approval-a8".into()), None));
     session.history_parts.push(part);
     // The agent exits, the worker is released and its connection closes.
     pump_while(&mut session, |s| s.worker.is_none()).await;
     assert!(!session.history_requested && session.history_parts.is_empty());
-    assert_eq!(session.take_chat_reset(), Some(CHAT_INCOMPLETE));
+    assert_eq!(session.take_chat_reset(), None);
+    let hole = Hole {
+        after: "approval-a8".into(),
+        before: None,
+        count: None,
+    };
+    assert_eq!(session.chat.holes(), std::slice::from_ref(&hole));
+    assert!(
+        session
+            .take_chat()
+            .iter()
+            .any(|o| matches!(o, Out::Coverage(c) if c.holes == [hole.clone()]))
+    );
 }
 
-/// Parts beyond their bound are all dropped, and the reload falls back to
-/// "incomplete" on what is here (never a history with a hole); the state
-/// still catches up.
+/// Parts beyond their bound are all dropped, and the history stays as it
+/// is: what the backlog dropped is a hole (r8 §C); the state still catches
+/// up.
 #[tokio::test]
-async fn an_oversized_reload_keeps_the_history_and_says_it_is_incomplete() {
+async fn an_oversized_reload_keeps_the_history_and_reports_a_hole() {
     use crate::chat::adapter::ApprovalCardState;
     let Setup { mut session, _dir } = launch("exec cat").await;
     settle(&mut session).await;
@@ -417,6 +451,7 @@ async fn an_oversized_reload_keeps_the_history_and_says_it_is_incomplete() {
     }
     let mut pumped = Pumped::default();
     session.history_requested = true;
+    session.pending_gap = Some((Some("approval-keep".into()), None));
     for chunk in many.chunks(100) {
         session.apply(
             WorkerMsg::ChatHistoryPart {
@@ -428,8 +463,15 @@ async fn an_oversized_reload_keeps_the_history_and_says_it_is_incomplete() {
     let mut snapshot = source.snapshot(0, 0);
     snapshot.history = Vec::new();
     session.apply(WorkerMsg::ChatHistory { snapshot }, &mut pumped);
-    assert_eq!(session.take_chat_reset(), Some(CHAT_INCOMPLETE));
+    assert_eq!(session.take_chat_reset(), None);
     assert!(session.history_parts.is_empty() && !session.history_overflow);
+    assert_eq!(session.chat.holes().len(), 1);
+    assert!(
+        session
+            .take_chat()
+            .iter()
+            .any(|o| matches!(o, Out::Coverage(_)))
+    );
     let ids: Vec<String> = session
         .chat
         .history(None, usize::MAX, usize::MAX)

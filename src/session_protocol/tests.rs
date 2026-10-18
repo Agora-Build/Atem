@@ -251,10 +251,17 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
                 substitute(&mut msg);
                 total += 1;
                 if refused_by_next(steps, i) {
-                    let e = wire::decode(&serde_json::to_vec(&msg).unwrap())
-                        .expect_err(&format!("{name}: refused message decoded: {msg}"));
-                    assert_eq!(e.code, ErrorCode::UnsupportedVersion);
                     refused += 1;
+                    match wire::decode(&serde_json::to_vec(&msg).unwrap()) {
+                        Err(e) => assert_eq!(e.code, ErrorCode::UnsupportedVersion),
+                        // r8 refusals the host makes, not the decoder: a
+                        // `hello` without `revision: 8`, anything before
+                        // its `welcome`, `open.before` (§A).
+                        Ok(_) if fixture_name.starts_with("r8-") => {
+                            round_trip(&msg);
+                        }
+                        Ok(_) => panic!("{name}: refused message decoded: {msg}"),
+                    }
                     continue;
                 }
                 match round_trip(&msg) {

@@ -744,6 +744,143 @@ pub fn required_feature(env: &Envelope) -> Option<&'static str> {
     }
 }
 
+/// One chat conversation as an r8 client keeps it (§B, §C): an ordered
+/// stream per `opened`, message ids in timeline order, whether its history
+/// loaded (`history_end`) and is truncated. Truncation, holes and
+/// `coverage` events are shown, never a reason to reopen; the client
+/// reopens only on a sequence gap, another `generation` or a `close` with a
+/// `reason`.
+#[derive(Debug, Default, Clone)]
+pub struct ChatView {
+    pub session_id: String,
+    generation: Option<String>,
+    /// The next sequence expected (`None` until `opened`).
+    next: Option<u64>,
+    pub loaded: bool,
+    pub truncated: bool,
+    /// Message ids, timeline order.
+    pub messages: Vec<String>,
+    /// The current page's messages (`history: true`, no `after_message_id`).
+    page: Vec<String>,
+    /// Opens sent after the first.
+    pub reopens: u64,
+}
+
+impl ChatView {
+    fn reset(&mut self) {
+        self.generation = None;
+        self.next = None;
+        self.loaded = false;
+        self.truncated = false;
+        self.messages.clear();
+        self.page.clear();
+    }
+
+    fn insert_after(&mut self, id: &str, after: Option<&str>) {
+        if self.messages.iter().any(|m| m == id) {
+            return;
+        }
+        let at = after
+            .and_then(|a| self.messages.iter().position(|m| m == a))
+            .map_or(0, |i| i + 1);
+        self.messages.insert(at, id.to_string());
+    }
+}
+
+/// The client's chat conversations, by `conversationId`.
+#[derive(Debug, Default)]
+pub struct ChatClient {
+    conversations: BTreeMap<String, ChatView>,
+}
+
+impl ChatClient {
+    /// The client opens `conversation` (its `open` is sent).
+    pub fn open(&mut self, conversation: &str, session_id: &str) {
+        let view = self
+            .conversations
+            .entry(conversation.to_string())
+            .or_default();
+        view.session_id = session_id.to_string();
+        view.reset();
+    }
+
+    /// The only conversation (client scenarios open one).
+    pub fn only(&self) -> Option<&ChatView> {
+        match self.conversations.len() {
+            1 => self.conversations.values().next(),
+            _ => None,
+        }
+    }
+
+    /// A chat-v1 message from the host; returns what the client sends in
+    /// answer (an `open` when it resyncs).
+    pub fn on_message(&mut self, data: &serde_json::Value) -> Option<serde_json::Value> {
+        let conversation = data["conversationId"].as_str()?.to_string();
+        let view = self.conversations.get_mut(&conversation)?;
+        let op = data["op"].as_str().unwrap_or_default();
+        let resync = |view: &mut ChatView| {
+            view.reset();
+            view.reopens += 1;
+            Some(
+                serde_json::json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+                "conversationId": conversation, "agentId": view.session_id}}),
+            )
+        };
+        match op {
+            "close" if data.get("reason").is_some() => return resync(view),
+            "opened" => {
+                view.reset();
+                view.generation = data["generation"].as_str().map(str::to_string);
+                view.next = Some(1);
+                return None;
+            }
+            _ => {}
+        }
+        let sequence = data["sequence"].as_u64()?;
+        let expected = view.next?;
+        if data["generation"].as_str() != view.generation.as_deref() {
+            return resync(view);
+        }
+        if sequence < expected {
+            return None;
+        }
+        if sequence > expected {
+            return resync(view);
+        }
+        view.next = Some(expected + 1);
+        let id = data["messageId"].as_str().unwrap_or_default();
+        match op {
+            "message" if data["history"] == true => match data["after_message_id"].as_str() {
+                Some(after) => view.insert_after(id, Some(after)),
+                None => view.page.push(id.to_string()),
+            },
+            "message" => {
+                if !view.messages.iter().any(|m| m == id) {
+                    view.messages.push(id.to_string());
+                }
+            }
+            "history_end" => {
+                view.loaded = true;
+                view.truncated = data["page"]["truncated"] == true;
+                let page = std::mem::take(&mut view.page);
+                let older = matches!(data["page"]["selector"].as_str(), Some("newest" | "before"));
+                let new: Vec<String> = page
+                    .into_iter()
+                    .filter(|p| !view.messages.contains(p))
+                    .collect();
+                if older {
+                    view.messages.splice(0..0, new);
+                } else {
+                    view.messages.extend(new);
+                }
+            }
+            "coverage" => view.truncated = data["truncated"] == true,
+            _ => {}
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

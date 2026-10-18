@@ -419,6 +419,8 @@ struct Host {
     pushes: Vec<Value>,
     /// Request ids of the receipts the client was told about.
     receipts_seen: Vec<String>,
+    /// The current link was welcomed (its one attachment).
+    welcomed: bool,
 }
 
 fn replace_strings(v: &mut Value, pairs: &[(String, String)], forward: bool) {
@@ -546,6 +548,23 @@ fn unsupported(scenario: &Value) -> Option<String> {
                 "approval_rules",
                 "session rules come from a Codex session's allow_always (the fixture agent is Claude); covered by the core harness and the real-agent Codex test",
             ),
+            (
+                "chat_history",
+                "the fake agent's transcript can't hold the fixture's messages (ids, text); history paging is covered by the core harness and host_bridge_tests",
+            ),
+            (
+                "chat_message",
+                "the fake agent's transcript can't produce the fixture's messages",
+            ),
+            (
+                "chat_evict",
+                "retention evicts only past 500 messages / 8 MiB",
+            ),
+            ("chat_turn", "the fake agent writes one reply per prompt"),
+            (
+                "worker_gap",
+                "no backlog fault in the real worker; covered by the core harness and broker_tests",
+            ),
         ] {
             if step.get(action).is_some() {
                 return Some(format!("{action}: {why}"));
@@ -655,13 +674,20 @@ impl Host {
             approvals_closed: HashMap::new(),
             pushes: Vec::new(),
             receipts_seen: Vec::new(),
+            welcomed: false,
         };
         me.wait_sessions_ready()?;
         let attachment = me.client_setup["attachment_gen"]
             .as_str()
             .unwrap()
             .to_string();
-        me.attach(&attachment)?;
+        if me.client_setup["welcome"] == false {
+            // r8: the steps send this client's `hello`.
+            me.authenticated_link()?;
+            me.attached_unwelcomed()?;
+        } else {
+            me.attach(&attachment)?;
+        }
         if let Some(epoch) = me.client_setup["holds_lease_epoch"].as_u64() {
             me.setup_lease(epoch)?;
         }
@@ -695,7 +721,9 @@ impl Host {
     /// The next authenticated link, then hello → welcome on it (retried
     /// until the runtime attached the link); maps the attachment to the
     /// fixture's `attachment_gen`.
-    fn attach(&mut self, attachment_gen: &str) -> Result<(), String> {
+    /// Waits for the runtime's next authenticated link and makes it the
+    /// client's (not welcomed yet).
+    fn authenticated_link(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + WAIT;
         while self.authenticated <= self.link {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -705,6 +733,33 @@ impl Host {
             }
         }
         self.link = self.authenticated;
+        self.welcomed = false;
+        Ok(())
+    }
+
+    /// Waits until the runtime attached the link (a session request is
+    /// then refused as before `welcome`, not `unauthorized`); sends no
+    /// `hello`.
+    fn attached_unwelcomed(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let id = uuid();
+            let probe = json!({"type": "session", "data": {"v": 1, "op": "list", "id": id}});
+            self.astation.send(self.link, probe.to_string());
+            let reply = self.raw_reply(&id)?;
+            match reply["code"].as_str() {
+                Some("unsupported_version") => return Ok(()),
+                Some("unauthorized") if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                _ => return Err(format!("probe: {reply}")),
+            }
+        }
+    }
+
+    fn attach(&mut self, attachment_gen: &str) -> Result<(), String> {
+        let deadline = Instant::now() + WAIT;
+        self.authenticated_link()?;
         loop {
             let id = uuid();
             let hello = json!({"type": "session",
@@ -752,6 +807,7 @@ impl Host {
             }
             let real_attachment = reply["attachment_gen"].as_str().unwrap().to_string();
             self.ids.push((attachment_gen.to_string(), real_attachment));
+            self.welcomed = true;
             return Ok(());
         }
     }
@@ -831,6 +887,7 @@ impl Host {
                 let reason = data["reason"].as_str().unwrap_or_default().to_string();
                 self.approvals_closed.insert(id, reason);
             }
+            ("session", "welcome") => self.welcomed = true,
             ("session", "receipt") => {
                 let rid = data["request_id"].as_str().unwrap_or_default().to_string();
                 if !self.receipts_seen.contains(&rid) {
@@ -1281,6 +1338,8 @@ impl Host {
             ),
             "pushes" => json!(self.pushes),
             "receipts_visible" => json!({self.client.clone(): self.receipts_seen.len()}),
+            // The runtime holds one link: its attachment, once welcomed.
+            "attachments" => json!(u64::from(self.welcomed)),
             "pty_bytes_written" if used.contains("fail_next_partial") => json!("unknown"),
             "pty_bytes_written" => json!(paste_bytes),
             "pty_writes" => json!(local + remote),
@@ -1531,6 +1590,16 @@ const NOT_RUN: &[&str] = &[
     "r8-send-under-the-own-lease-checks-the-epoch",
     "r8-stale-takeover-confirmation-is-refused",
     "r8-two-simultaneous-sends-acquire-once",
+    // r8 history scenarios: their chat content comes from the fixture
+    // (`chat_history`, `chat_turn`, …), which the fake agent can't produce.
+    "r8-backlog-hole-is-reported-not-reopened",
+    "r8-history-page-and-live-events-share-one-ordered-stream",
+    "r8-history-selectors-are-exclusive-and-validated",
+    "r8-long-turn-is-recovered-in-bounded-pages",
+    "r8-open-with-before-is-refused",
+    "r8-receipt-result-bounds-reply-message-ids",
+    "r8-stale-or-foreign-next-token-is-stale-target",
+    "r8-truncated-history-reopens-once-then-stays-live",
 ];
 
 /// Scenarios the real runtime fails, each with the failure it must still

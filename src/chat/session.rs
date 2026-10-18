@@ -65,8 +65,9 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    /// Approximate size: the sum of the part text lengths.
-    fn bytes(&self) -> usize {
+    /// Approximate size: the sum of the part text lengths (r8 §B counts a
+    /// page's `content_bytes` this way).
+    pub fn bytes(&self) -> usize {
         self.parts.iter().map(part_bytes).sum()
     }
 }
@@ -79,9 +80,37 @@ fn part_bytes(part: &Part) -> usize {
     }
 }
 
+/// A gap inside the retained timeline (r8 §C): items the worker's backlog
+/// dropped that a reload of its history could not restore. Named by its
+/// retained neighbours: `before` is `None` at the live edge until the next
+/// message; `count` when known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hole {
+    pub after: String,
+    pub before: Option<String>,
+    pub count: Option<u64>,
+}
+
+/// The history's coverage as a `coverage` event reports it (r8 §C).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageState {
+    pub oldest_retained: Option<String>,
+    pub truncated: bool,
+    pub holes: Vec<Hole>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Out {
     Message(ChatMessage),
+    /// A message a history reload recovered (r8 §C), sent as
+    /// `message{history: true, after_message_id}`: `after` is the retained
+    /// message it follows (`None`: it is the oldest).
+    Recovered {
+        message: ChatMessage,
+        after: Option<String>,
+    },
+    /// What stayed missing after a reload (r8 §C `coverage` event).
+    Coverage(CoverageState),
     Delta {
         message_id: String,
         part: Part,
@@ -162,6 +191,13 @@ pub struct ChatSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<Outcome>,
     pub history: Vec<ChatMessage>,
+    /// Something of this process's history was evicted (r8 §C).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// The turn of the newest evicted message (its retained rest is
+    /// partial).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_evicted_turn: Option<String>,
 }
 
 pub struct ChatSession {
@@ -172,6 +208,16 @@ pub struct ChatSession {
     history: VecDeque<ChatMessage>,
     /// Sum of `ChatMessage::bytes` over `history`.
     history_bytes: usize,
+    /// The position of `history[0]`: positions grow by one per message and
+    /// stay with it until it is evicted (a reload numbers them anew).
+    first_pos: u64,
+    /// History reloads so far: a `next` token names the snapshot it
+    /// continues (r8 §B).
+    reloads: u64,
+    /// Something was evicted (retention or an adoption cut, r8 §C).
+    truncated: bool,
+    last_evicted_turn: Option<String>,
+    holes: Vec<Hole>,
     requests: HashMap<String, RequestState>,
     request_order: VecDeque<String>,
     pending: Option<Pending>,
@@ -301,6 +347,11 @@ impl ChatSession {
             exited: false,
             history: VecDeque::new(),
             history_bytes: 0,
+            first_pos: 0,
+            reloads: 0,
+            truncated: false,
+            last_evicted_turn: None,
+            holes: Vec::new(),
             requests: HashMap::new(),
             request_order: VecDeque::new(),
             pending: None,
@@ -330,6 +381,8 @@ impl ChatSession {
             last_completed: self.last_completed.clone(),
             last_outcome: self.last_outcome,
             history: self.history(None, max_messages, max_bytes),
+            truncated: self.truncated,
+            last_evicted_turn: self.last_evicted_turn.clone(),
         }
     }
 
@@ -350,7 +403,160 @@ impl ChatSession {
         for message in snapshot.history {
             session.push_message(message);
         }
+        session.truncated |= snapshot.truncated;
+        if snapshot.last_evicted_turn.is_some() {
+            session.last_evicted_turn = snapshot.last_evicted_turn;
+        }
         session
+    }
+
+    /// History older than what is retained was cut (an adoption that
+    /// couldn't take the whole history): shown as truncation (r8 §C).
+    pub fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
+    /// The position of the oldest retained message (see `first_pos`).
+    pub fn first_pos(&self) -> u64 {
+        self.first_pos
+    }
+
+    /// How often the history was reloaded (the snapshot a `next` names).
+    pub fn reloads(&self) -> u64 {
+        self.reloads
+    }
+
+    /// Anything of this process's history was evicted.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The turn of the newest evicted message.
+    pub fn last_evicted_turn(&self) -> Option<&str> {
+        self.last_evicted_turn.as_deref()
+    }
+
+    /// The holes inside the retained timeline, oldest first.
+    pub fn holes(&self) -> &[Hole] {
+        &self.holes
+    }
+
+    pub fn newest_retained(&self) -> Option<&str> {
+        self.history.back().map(|m| m.message_id.as_str())
+    }
+
+    pub fn oldest_retained(&self) -> Option<&str> {
+        self.history.front().map(|m| m.message_id.as_str())
+    }
+
+    /// Truncation and holes as a `coverage` event reports them.
+    pub fn coverage(&self) -> CoverageState {
+        CoverageState {
+            oldest_retained: self.oldest_retained().map(str::to_string),
+            truncated: self.truncated,
+            holes: self.holes.clone(),
+        }
+    }
+
+    /// Records a hole (r8 §C) after the retained message `after`; one older
+    /// than the retained history is truncation. Returns whether a hole was
+    /// recorded.
+    pub fn add_hole(
+        &mut self,
+        after: Option<&str>,
+        before: Option<&str>,
+        count: Option<u64>,
+    ) -> bool {
+        match after {
+            Some(a) if self.history.iter().any(|m| m.message_id == a) => {
+                self.holes.push(Hole {
+                    after: a.to_string(),
+                    before: before.map(str::to_string),
+                    count,
+                });
+                true
+            }
+            _ => {
+                self.truncated = true;
+                false
+            }
+        }
+    }
+
+    /// Evicts the `n` oldest messages (retention; the newest stays).
+    #[cfg(test)]
+    pub fn evict(&mut self, n: usize) {
+        for _ in 0..n {
+            if self.history.len() <= 1 {
+                break;
+            }
+            self.evict_oldest();
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        let Some(old) = self.history.pop_front() else {
+            return;
+        };
+        self.history_bytes -= old.bytes();
+        self.first_pos += 1;
+        self.truncated = true;
+        // A hole after an evicted message is older than what is retained:
+        // truncation now.
+        self.holes.retain(|h| h.after != old.message_id);
+        self.last_evicted_turn = Some(old.turn_id);
+    }
+
+    /// A message produced as it is (new, or a whole replacement of the
+    /// retained one with its id), as the fixtures' runtime feeds it.
+    #[cfg(test)]
+    pub fn put_message(&mut self, message: ChatMessage) {
+        if let Some(m) = self
+            .history
+            .iter_mut()
+            .find(|m| m.message_id == message.message_id)
+        {
+            let old = m.bytes();
+            *m = message;
+            let new = m.bytes();
+            self.history_bytes = self.history_bytes - old + new;
+            return;
+        }
+        self.push_message(message);
+    }
+
+    /// The worker's whole history replaces this one after its backlog
+    /// dropped items (r8 §C). This history's approval cards win over the
+    /// worker's copies of them (an update may have crossed the request).
+    /// Returns what the reload recovered, in timeline order: each message
+    /// that is new or changed here, with the retained message it follows.
+    /// Positions are numbered anew, so every `next` token goes stale.
+    pub fn reload(&mut self, history: Vec<ChatMessage>) -> Vec<(ChatMessage, Option<String>)> {
+        let old: HashMap<String, ChatMessage> = self
+            .history
+            .iter()
+            .map(|m| (m.message_id.clone(), m.clone()))
+            .collect();
+        let cards: Vec<ChatMessage> = old
+            .values()
+            .filter(|m| m.message_id.starts_with("approval-"))
+            .cloned()
+            .collect();
+        self.replace_history(history);
+        for card in cards {
+            if self.retains(&card.message_id) {
+                self.put_card(card);
+            }
+        }
+        let mut recovered = Vec::new();
+        let mut prev: Option<String> = None;
+        for m in &self.history {
+            if old.get(&m.message_id) != Some(m) {
+                recovered.push((m.clone(), prev.clone()));
+            }
+            prev = Some(m.message_id.clone());
+        }
+        recovered
     }
 
     pub fn status(&self) -> &Status {
@@ -372,12 +578,9 @@ impl ChatSession {
             .map(|m| m.message_id.as_str())
     }
 
-    /// `message_id` is still in the retained history of this generation (a
-    /// valid `before`); `generation`, when the client names one, must be
-    /// this session's.
-    pub fn retains(&self, message_id: &str, generation: Option<&str>) -> bool {
-        generation.is_none_or(|g| g == self.generation)
-            && self.history.iter().any(|m| m.message_id == message_id)
+    /// `message_id` is still in the retained history.
+    pub fn retains(&self, message_id: &str) -> bool {
+        self.history.iter().any(|m| m.message_id == message_id)
     }
 
     /// Catches up with the worker's `snapshot` state (its history replaced
@@ -417,9 +620,14 @@ impl ChatSession {
     pub fn replace_history(&mut self, history: Vec<ChatMessage>) {
         self.history.clear();
         self.history_bytes = 0;
+        self.first_pos = 0;
+        self.reloads += 1;
+        let holes = std::mem::take(&mut self.holes);
         for message in history {
             self.push_message(message);
         }
+        let retained = |id: &str| self.history.iter().any(|m| m.message_id == id);
+        self.holes = holes.into_iter().filter(|h| retained(&h.after)).collect();
     }
 
     /// An approval card message the broker made (`approval_card`), kept in
@@ -733,6 +941,10 @@ impl ChatSession {
     }
 
     fn push_message(&mut self, message: ChatMessage) {
+        // A hole at the live edge is named by the next message.
+        for hole in self.holes.iter_mut().filter(|h| h.before.is_none()) {
+            hole.before = Some(message.message_id.clone());
+        }
         self.history_bytes += message.bytes();
         self.history.push_back(message);
         self.trim_history();
@@ -743,9 +955,7 @@ impl ChatSession {
         while self.history.len() > 1
             && (self.history.len() > MAX_HISTORY_MESSAGES || self.history_bytes > MAX_HISTORY_BYTES)
         {
-            if let Some(old) = self.history.pop_front() {
-                self.history_bytes -= old.bytes();
-            }
+            self.evict_oldest();
         }
     }
 
@@ -1000,40 +1210,25 @@ impl ChatSession {
         max_messages: usize,
         max_bytes: usize,
     ) -> Vec<ChatMessage> {
-        self.page(before, max_messages, max_bytes, |_| true).0
-    }
-
-    /// `history` over the messages `keep` accepts only (the limits count
-    /// those), and whether the page reaches the oldest retained one of them
-    /// (the start: nothing older to ask for).
-    pub fn page(
-        &self,
-        before: Option<&str>,
-        max_messages: usize,
-        max_bytes: usize,
-        keep: impl Fn(&ChatMessage) -> bool,
-    ) -> (Vec<ChatMessage>, bool) {
         let end = match before {
             None => self.history.len(),
             Some(id) => match self.history.iter().position(|m| m.message_id == id) {
                 Some(i) => i,
-                None => return (Vec::new(), true),
+                None => return Vec::new(),
             },
         };
         let mut picked = Vec::new();
         let mut bytes = 0usize;
-        let mut start = true;
-        for m in self.history.iter().take(end).rev().filter(|m| keep(m)) {
+        for m in self.history.iter().take(end).rev() {
             let size = m.bytes();
             if picked.len() >= max_messages || (!picked.is_empty() && bytes + size > max_bytes) {
-                start = false;
                 break;
             }
             bytes += size;
             picked.push(m.clone());
         }
         picked.reverse();
-        (picked, start)
+        picked
     }
 
     /// Content that was already in a log the adapter switched to (a resume of
@@ -1840,50 +2035,6 @@ mod tests {
     }
 
     #[test]
-    fn a_page_leaves_cards_out_before_its_limits_and_says_when_it_starts() {
-        use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
-        let mut s = ready();
-        for i in 0..3 {
-            s.on_log(user(&format!("u{i}"), &format!("t{i}"), "hi"), 2, 0);
-        }
-        for i in 0..60 {
-            s.approval_card(
-                ApprovalCard {
-                    id: "approval".into(),
-                    approval_id: format!("a{i}"),
-                    tool: "Bash".into(),
-                    summary: "ls".into(),
-                    always_rules: Vec::new(),
-                    state: ApprovalCardState::Pending,
-                    rule_id: None,
-                    note: None,
-                    reason: None,
-                },
-                3,
-            );
-        }
-        let ids = |v: Vec<ChatMessage>| v.into_iter().map(|m| m.message_id).collect::<Vec<_>>();
-        let no_cards = |m: &ChatMessage| !m.message_id.starts_with("approval-");
-        // A view-only page: the newest 50 are all cards, yet it holds the
-        // older messages, and it is the start.
-        let (page, start) = s.page(None, 50, 1 << 20, no_cards);
-        assert_eq!(ids(page), ["u0", "u1", "u2"]);
-        assert!(start);
-        let (page, start) = s.page(Some("approval-a30"), 2, 1 << 20, no_cards);
-        assert_eq!(ids(page), ["u1", "u2"]);
-        assert!(!start, "u0 is older");
-        let (page, start) = s.page(Some("u0"), 50, 1 << 20, no_cards);
-        assert!(page.is_empty() && start);
-        // With control the cards count.
-        let (page, start) = s.page(None, 50, 1 << 20, |_| true);
-        assert_eq!(page.len(), 50);
-        assert!(!start);
-        // A cursor of another generation is not retained.
-        assert!(s.retains("u1", None) && s.retains("u1", Some("g1")));
-        assert!(!s.retains("u1", Some("g2")) && !s.retains("nope", None));
-    }
-
-    #[test]
     fn catching_up_completes_a_turn_whose_end_was_dropped() {
         let hook = |turn: &str, at: i64| AgentEvent::PromptSubmitted {
             text: "go".into(),
@@ -2208,5 +2359,87 @@ mod tests {
         );
         assert!(s.on_event(started(), 60, 0).is_empty());
         assert_eq!(s.status().state, State::Unknown);
+    }
+
+    fn plain(id: &str, turn: &str) -> ChatMessage {
+        ChatMessage {
+            message_id: id.into(),
+            role: Role::Assistant,
+            origin: None,
+            turn_id: turn.into(),
+            request_id: None,
+            created_at_ms: 0,
+            parts: vec![Part::Text {
+                id: "p1".into(),
+                markdown: id.into(),
+            }],
+        }
+    }
+
+    /// r8 §C: eviction is truncation (persistent, with the turn it cut);
+    /// a hole after an evicted message becomes truncation; a hole at the
+    /// live edge is named by the next message.
+    #[test]
+    fn eviction_truncates_and_holes_follow_the_timeline() {
+        let mut s = ChatSession::new("g".into(), 0);
+        for (id, turn) in [("m1", "t1"), ("m2", "t1"), ("m3", "t2")] {
+            s.put_message(plain(id, turn));
+        }
+        assert!(!s.truncated() && s.first_pos() == 0);
+        assert!(s.add_hole(Some("m3"), None, Some(2)));
+        s.put_message(plain("m4", "t3"));
+        assert_eq!(s.holes()[0].before.as_deref(), Some("m4"));
+        assert!(s.add_hole(Some("m1"), Some("m2"), None));
+        s.evict(1);
+        assert!(s.truncated());
+        assert_eq!(s.first_pos(), 1);
+        assert_eq!(s.oldest_retained(), Some("m2"));
+        assert_eq!(s.last_evicted_turn(), Some("t1"));
+        assert_eq!(s.holes().len(), 1, "the hole after m1 is truncation now");
+        assert!(!s.add_hole(Some("m1"), Some("m2"), None));
+        // The newest message always stays.
+        s.evict(10);
+        assert_eq!(s.oldest_retained(), Some("m4"));
+        let snapshot = s.snapshot(10, 1 << 20);
+        assert!(snapshot.truncated);
+        let back = ChatSession::restore("g".into(), snapshot);
+        assert!(back.truncated() && back.last_evicted_turn() == Some("t2"));
+    }
+
+    /// r8 §C: a reload replaces the history with the worker's and names
+    /// what it recovered after its retained neighbour; positions are
+    /// numbered anew (another snapshot).
+    #[test]
+    fn a_reload_reports_what_it_recovered() {
+        let mut s = ChatSession::new("g".into(), 0);
+        s.put_message(plain("m1", "t1"));
+        s.put_message(plain("m4", "t2"));
+        assert_eq!(s.reloads(), 0);
+        let mut changed = plain("m4", "t2");
+        changed.parts.push(Part::Text {
+            id: "p2".into(),
+            markdown: "more".into(),
+        });
+        let recovered = s.reload(vec![
+            plain("m1", "t1"),
+            plain("m2", "t1"),
+            plain("m3", "t1"),
+            changed.clone(),
+        ]);
+        let got: Vec<(String, Option<String>)> = recovered
+            .into_iter()
+            .map(|(m, after)| (m.message_id, after))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("m2".to_string(), Some("m1".to_string())),
+                ("m3".to_string(), Some("m2".to_string())),
+                ("m4".to_string(), Some("m3".to_string())),
+            ]
+        );
+        assert_eq!(s.reloads(), 1);
+        assert_eq!(s.retained().count(), 4);
+        assert_eq!(s.retained().last(), Some(&changed));
     }
 }

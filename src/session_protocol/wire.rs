@@ -1313,11 +1313,17 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
     let env: crate::chat::wire::ChatEnvelope = serde_json::from_value(Value::Object(m.clone()))
         .map_err(|e| fail(None, format!("agentChat: {e}")))?;
     let use_ = match op {
+        // `close` names only its conversation (the r8 fixtures close
+        // without a binding); with one, it is checked as a read.
+        "close" if binding.is_none() => {
+            let bad = |e: String| fail(None, format!("agentChat: {e}"));
+            crate::chat::wire::parse_inbound(&env).map_err(bad)?;
+            return check(is_session_id(&env.agent_id), "agentId").map_err(bad);
+        }
         "open" | "close" => BindingUse::Read,
-        // r8 history pages (`chat.history`, `chat.lookup`) are reads. They
-        // decode so the host can refuse them as ops of features it doesn't
-        // advertise (§A) and a client can check them before sending.
-        // TODO(r8 task 5): the selector and field rules of §B.
+        // r8 history pages (`chat.history`, `chat.lookup`) are reads; the
+        // runtime checks their selector and fields (§B: `invalid_request`
+        // in the conversation, not a decoding error).
         "history" => BindingUse::Read,
         "submit" if SEND_ACQUIRE_FIELDS.iter().any(|f| m.contains_key(*f)) => {
             if m.contains_key("approval") {

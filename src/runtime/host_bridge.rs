@@ -70,18 +70,18 @@ use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome, HeldRule,
 use crate::app::App;
 use crate::app::hosted::{HostedSession, refusal};
 use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
-use crate::chat::session::{ChatSession, Out, Role, State as ChatState};
-use crate::chat::wire::{self as chat_wire, ChatEnvelope, Inbound};
+use crate::chat::history::{self, Conversations, HistoryCall, HistoryKey, Opening, is_card};
+use crate::chat::session::{Out, State as ChatState};
+use crate::chat::wire::{self as chat_wire, ChatEnvelope, CloseReason, Inbound};
 use crate::session::{Provider, SessionId};
 use crate::session_protocol::file_journal::FileJournal;
 use crate::session_protocol::host::{
     Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
-    HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, TurnReplies,
-    random_ids,
+    HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
 };
 use crate::session_protocol::wire::{
-    self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Coverage,
-    Envelope, FamilyMessage, Op, Permission, ReceiptKind, SessionState,
+    self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
+    FamilyMessage, Permission, ReceiptKind, SessionState,
 };
 use crate::terminal_share::{FrameStream, Message as TerminalMessage};
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -103,10 +103,6 @@ pub(super) const LINK_AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
 /// Terminal messages waiting for the transport before streams are dropped.
 const TERMINAL_BACKLOG: usize = 128;
 const HEARTBEAT: Duration = Duration::from_secs(15);
-const HISTORY_MESSAGES: usize = 50;
-const HISTORY_BYTES: usize = 256 * 1024;
-/// Open conversations per session; opening one more closes the oldest.
-const MAX_CONVERSATIONS: usize = 8;
 const RESTARTED: &str = "the agent was restarted; reopen the chat";
 const NOT_AVAILABLE: &str = "chat is not available for this agent";
 const NO_TURN: &str = "no turn was running";
@@ -356,20 +352,6 @@ struct OpenApproval {
     card: Option<ApprovalCard>,
 }
 
-struct Conversation {
-    attachment: String,
-    /// Sequence of the next event.
-    next: u64,
-    last_heartbeat: Instant,
-    opened: u64,
-}
-
-#[derive(Default)]
-struct Chats {
-    conversations: HashMap<String, Conversation>,
-    opens: u64,
-}
-
 struct Link {
     link_gen: u64,
     attachment: String,
@@ -397,7 +379,10 @@ pub struct HostBridge {
     /// Adopted sessions to register with `restore_session`.
     restore: HashSet<String>,
     streams: HashMap<(String, String), FrameStream>,
-    chats: HashMap<String, Chats>,
+    /// Open chat-v1 conversations per session.
+    chats: HashMap<String, Conversations>,
+    /// `next` tokens are made under this key (r8 §B): random per run.
+    history_key: HistoryKey,
     /// request id → (session, conversation) of chat submits.
     submitters: HashMap<String, (String, String)>,
     /// Prompts pasted and not reported yet: request id → session.
@@ -465,6 +450,7 @@ impl HostBridge {
             restore: HashSet::new(),
             streams: HashMap::new(),
             chats: HashMap::new(),
+            history_key: HistoryKey::random(),
             submitters: HashMap::new(),
             prompts: HashMap::new(),
             interrupts: HashMap::new(),
@@ -496,7 +482,6 @@ impl HostBridge {
         let default = HostConfig::default();
         let config = HostConfig {
             wall_offset_ms: wall_ms().saturating_sub(clock.now()),
-            receipt_result: default.receipt_result || super::test_hooks::receipt_result(),
             ..default
         };
         SessionHost::open(ctx, config, journal, random_ids(), Some(previous_epoch))
@@ -842,9 +827,7 @@ impl HostBridge {
     fn forget_attachment(&mut self, attachment: &str) {
         self.streams.retain(|(att, _), _| att != attachment);
         for chats in self.chats.values_mut() {
-            chats
-                .conversations
-                .retain(|_, c| c.attachment != attachment);
+            chats.map.retain(|_, c| c.attachment != attachment);
         }
         self.terminal_out.clear();
         for per in self.per.values_mut() {
@@ -1023,7 +1006,17 @@ impl HostBridge {
                     attachment,
                     mut message,
                 } => {
-                    fill_results(&mut message, cx);
+                    crate::session_protocol::host::fill_results(&mut message, |target, result| {
+                        session_of(cx, &target.session_id)
+                            .filter(|s| s.chat.generation() == target.process_gen)
+                            .map(|s| {
+                                history::turn_replies(
+                                    &s.chat,
+                                    &result.turn_id,
+                                    &result.user_message_id,
+                                )
+                            })
+                    });
                     self.send(&attachment, &message, cx)
                 }
                 // A fenced attachment of this link's client: already gone.
@@ -1314,7 +1307,7 @@ impl HostBridge {
                 let effects = self.host.remove_session(&sid);
                 self.exec(effects, cx);
             }
-            self.end_conversations(&sid, RESTARTED, cx);
+            self.end_conversations(&sid, CloseReason::Restarted, cx);
             self.streams.retain(|(_, s), _| s != &sid);
             self.interrupts.remove(&sid);
             self.revokes.retain(|_, (s, _)| s != &sid);
@@ -1839,7 +1832,7 @@ impl HostBridge {
             .chats
             .get(sid)
             .map(|c| {
-                c.conversations
+                c.map
                     .iter()
                     .filter(|(_, c)| self.current(&c.attachment))
                     .filter(|(_, c)| self.host.attachment_can(&c.attachment, Permission::Control))
@@ -2223,11 +2216,15 @@ impl HostBridge {
                     return;
                 };
                 let conversation = env.conversation_id.clone();
+                if env.op == "history" {
+                    self.history(attachment, sid, &env, cx);
+                    return;
+                }
                 match chat_wire::parse_inbound(&env) {
                     Ok(Inbound::Open) => self.open_conversation(attachment, sid, &conversation, cx),
                     Ok(Inbound::Close) => {
                         if let Some(chats) = self.chats.get_mut(sid) {
-                            chats.conversations.remove(&conversation);
+                            chats.close(&conversation, attachment);
                         }
                     }
                     Ok(
@@ -2253,6 +2250,14 @@ impl HostBridge {
     }
 
     fn open_conversation(&mut self, attachment: &str, sid: &str, conversation: &str, cx: &mut Cx) {
+        // Approval cards and session rules only for an attachment that may
+        // answer them.
+        let control = self.host.attachment_can(attachment, Permission::Control);
+        let rules = if control {
+            self.host.approval_rules(sid)
+        } else {
+            Vec::new()
+        };
         let Some(session) = session_of(cx, sid) else {
             return;
         };
@@ -2266,65 +2271,48 @@ impl HostBridge {
             self.send_chat(env, cx);
             return;
         }
-        let generation = session.chat.generation().to_string();
-        // Approval cards and session rules only for an attachment that may
-        // answer them.
-        let control = self.host.attachment_can(attachment, Permission::Control);
-        // Cards are left out before the limits (a view-only page of cards
-        // still pages on to older messages).
-        let keep = |m: &crate::chat::session::ChatMessage| control || !is_card(m);
-        let rules = if control {
-            self.host.approval_rules(sid)
-        } else {
-            Vec::new()
-        };
-        let mut envelopes = vec![chat_wire::opened(
+        let opening = Opening {
             conversation,
-            sid,
-            &generation,
-            session.chat.status(),
-            &session.chat_unavailable,
-            &rules,
-        )];
-        let (history, _) = session
-            .chat
-            .page(None, HISTORY_MESSAGES, HISTORY_BYTES, keep);
-        let mut sequence = 1;
-        for message in history.iter() {
-            envelopes.push(chat_wire::history_message(
-                conversation,
-                sid,
-                &generation,
-                sequence,
-                message,
-            ));
-            sequence += 1;
-        }
-        let chats = self.chats.entry(sid.to_string()).or_default();
-        let mut closes = Vec::new();
-        if !chats.conversations.contains_key(conversation)
-            && chats.conversations.len() >= MAX_CONVERSATIONS
-            && let Some(oldest) = chats
-                .conversations
-                .iter()
-                .min_by_key(|(_, c)| c.opened)
-                .map(|(id, _)| id.clone())
-        {
-            chats.conversations.remove(&oldest);
-            closes.push(chat_wire::close(&oldest, sid));
-        }
-        chats.opens += 1;
-        let opened = chats.opens;
-        chats.conversations.insert(
-            conversation.to_string(),
-            Conversation {
-                attachment: attachment.to_string(),
-                next: sequence,
-                last_heartbeat: Instant::now(),
-                opened,
-            },
+            agent: sid,
+            attachment,
+            control,
+            status: session.chat.status(),
+            unavailable: &session.chat_unavailable,
+            rules: &rules,
+        };
+        let envelopes = self.chats.entry(sid.to_string()).or_default().open(
+            &session.chat,
+            &self.history_key,
+            &opening,
         );
-        for env in closes.into_iter().chain(envelopes) {
+        for env in envelopes {
+            self.send_chat(env, cx);
+        }
+    }
+
+    /// A chat-v1 `history` (r8 §B): a page of the retained history in the
+    /// conversation's stream, or an error there.
+    fn history(&mut self, attachment: &str, sid: &str, env: &ChatEnvelope, cx: &mut Cx) {
+        let control = self.host.attachment_can(attachment, Permission::Control);
+        let now_ms = self.clock.now();
+        let Some(session) = session_of(cx, sid) else {
+            return;
+        };
+        let data = serde_json::to_value(env).unwrap_or(Value::Null);
+        let call = HistoryCall {
+            data: &data,
+            conversation: &env.conversation_id,
+            agent: sid,
+            attachment,
+            control,
+            now_ms,
+        };
+        let envelopes = self.chats.entry(sid.to_string()).or_default().history(
+            &session.chat,
+            &self.history_key,
+            &call,
+        );
+        for env in envelopes {
             self.send_chat(env, cx);
         }
     }
@@ -2332,13 +2320,7 @@ impl HostBridge {
     /// The head of the next event in a conversation (`None` when it isn't open).
     fn next_head(&mut self, sid: &str, conversation: &str, cx: &mut Cx) -> Option<(String, u64)> {
         let generation = session_of(cx, sid)?.chat.generation().to_string();
-        let c = self
-            .chats
-            .get_mut(sid)?
-            .conversations
-            .get_mut(conversation)?;
-        let sequence = c.next;
-        c.next += 1;
+        let sequence = self.chats.get_mut(sid)?.next_head(conversation)?;
         Some((generation, sequence))
     }
 
@@ -2395,6 +2377,7 @@ impl HostBridge {
                 code,
                 text,
                 controller,
+                page_id,
                 ..
             } => {
                 if let Some(r) = &request_id {
@@ -2402,6 +2385,9 @@ impl HostBridge {
                 }
                 let mut env =
                     chat_error(conversation, sid, head, request_id.as_deref(), &code, &text);
+                if let Some(p) = page_id {
+                    env.body.insert("page_id".into(), Value::String(p));
+                }
                 if let Some(c) = controller {
                     // r8 §F: `lease_held` names the holder.
                     env.body.insert("controller".into(), json!(c));
@@ -2465,6 +2451,11 @@ impl HostBridge {
                 Out::Status(status) if status.state == ChatState::Ready => {
                     self.interrupts_done(sid, cx);
                 }
+                // A recovered approval card: only where cards are shown.
+                Out::Recovered { message, .. } if is_card(message) => {
+                    self.broadcast_to(sid, &out, None, true, cx);
+                    continue;
+                }
                 _ => {}
             }
             self.broadcast(sid, &out, except.as_deref(), cx);
@@ -2501,7 +2492,7 @@ impl HostBridge {
             .chats
             .get(sid)
             .map(|c| {
-                c.conversations
+                c.map
                     .iter()
                     .filter(|(id, c)| Some(id.as_str()) != except && self.current(&c.attachment))
                     .filter(|(_, c)| {
@@ -2519,12 +2510,14 @@ impl HostBridge {
         }
     }
 
-    /// Tells every open conversation of `sid` why it ends (`error`, `close`).
-    fn end_conversations(&mut self, sid: &str, text: &str, cx: &mut Cx) {
+    /// Tells every open conversation of `sid` why it ends (`error`, then
+    /// `close` with its reason, r8 §C).
+    fn end_conversations(&mut self, sid: &str, reason: CloseReason, cx: &mut Cx) {
+        let text = close_text(reason);
         let ids: Vec<String> = self
             .chats
             .get(sid)
-            .map(|c| c.conversations.keys().cloned().collect())
+            .map(|c| c.map.keys().cloned().collect())
             .unwrap_or_default();
         let error = Out::Error {
             text: text.to_string(),
@@ -2534,7 +2527,7 @@ impl HostBridge {
             let current = self
                 .chats
                 .get(sid)
-                .and_then(|c| c.conversations.get(&id))
+                .and_then(|c| c.map.get(&id))
                 .is_some_and(|c| self.current(&c.attachment));
             if current {
                 if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
@@ -2543,7 +2536,7 @@ impl HostBridge {
                         cx,
                     );
                 }
-                self.send_chat(chat_wire::close(&id, sid), cx);
+                self.send_chat(chat_wire::close(&id, sid, reason), cx);
             }
         }
         self.chats.remove(sid);
@@ -2556,7 +2549,7 @@ impl HostBridge {
             .iter()
             .flat_map(|(sid, chats)| {
                 chats
-                    .conversations
+                    .map
                     .iter()
                     .filter(|(_, c)| c.last_heartbeat.elapsed() >= HEARTBEAT)
                     .map(|(id, _)| (sid.clone(), id.clone()))
@@ -2567,11 +2560,7 @@ impl HostBridge {
             let Some(status) = session_of(cx, &sid).map(|s| s.chat.heartbeat()) else {
                 continue;
             };
-            if let Some(c) = self
-                .chats
-                .get_mut(&sid)
-                .and_then(|c| c.conversations.get_mut(&id))
-            {
+            if let Some(c) = self.chats.get_mut(&sid).and_then(|c| c.map.get_mut(&id)) {
                 c.last_heartbeat = Instant::now();
             }
             if let Some((generation, sequence)) = self.next_head(&sid, &id, cx) {
@@ -2607,67 +2596,14 @@ thread_local! {
     pub(super) static VIEW_ONLY_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// r8 §D: every receipt `result` in `message` gets its replies from the
-/// broker's retained chat history of the receipt's target, now (late
-/// content and eviction show; after an adoption, the worker's history).
-fn fill_results(message: &mut Envelope, cx: &mut Cx) {
-    let Envelope::Session(m) = message else {
-        return;
-    };
-    let receipts = match &mut m.op {
-        Op::Receipt(r) => std::slice::from_mut(r),
-        Op::Receipts { receipts } => receipts.as_mut_slice(),
-        _ => return,
-    };
-    for receipt in receipts {
-        let Some(result) = &receipt.result else {
-            continue;
-        };
-        let target = &receipt.target;
-        let replies = session_of(cx, &target.session_id)
-            .filter(|s| s.chat.generation() == target.process_gen)
-            .map(|s| turn_replies(&s.chat, &result.turn_id, &result.user_message_id));
-        crate::session_protocol::host::fill_result(receipt, replies);
+/// The text of the `error` before a `close` with `reason`.
+fn close_text(reason: CloseReason) -> &'static str {
+    match reason {
+        CloseReason::Withdrawn => super::broker::CHAT_WITHDRAWN,
+        CloseReason::Switched => super::broker::CHAT_SWITCHED,
+        CloseReason::Restarted => RESTARTED,
+        CloseReason::Evicted => "a newer conversation replaced this one",
     }
-}
-
-/// A turn's replies in `chat`'s retained history (r8 §D, coverage as §C):
-/// its assistant messages (approval cards aside), timeline order. Complete
-/// while its user message is retained (history is evicted oldest first),
-/// partial when only later messages of it are (or an id can't be named),
-/// unavailable when nothing of it is.
-fn turn_replies(chat: &ChatSession, turn_id: &str, user_message_id: &str) -> TurnReplies {
-    let mut ids = Vec::new();
-    let mut user = false;
-    let mut any = false;
-    let mut unnamed = false;
-    for m in chat.retained().filter(|m| m.turn_id == turn_id) {
-        any = true;
-        if m.message_id == user_message_id {
-            user = true;
-        }
-        if m.role != Role::Assistant || is_card(m) {
-            continue;
-        }
-        if wire::is_opaque_id(&m.message_id) {
-            ids.push(m.message_id.clone());
-        } else {
-            unnamed = true;
-        }
-    }
-    let coverage = match (user, any) {
-        (true, _) if !unnamed => Coverage::Complete,
-        (_, true) => Coverage::Partial,
-        _ => Coverage::Unavailable,
-    };
-    TurnReplies { ids, coverage }
-}
-
-/// A chat-v1 approval card message.
-fn is_card(m: &crate::chat::session::ChatMessage) -> bool {
-    m.parts
-        .iter()
-        .any(|p| matches!(p, crate::chat::adapter::Part::Approval(_)))
 }
 
 fn app_link(app: &App) -> Option<u64> {

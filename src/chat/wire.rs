@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::adapter::{Outcome, Part};
-use super::session::{ChatMessage, Origin, Out, Role, State, Status};
+use super::session::{ChatMessage, CoverageState, Hole, Origin, Out, Role, State, Status};
 
 const MAX_ID: usize = 128;
 
@@ -199,6 +199,12 @@ struct MessageBody<'a> {
     parts: Vec<PartBody<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     history: Option<bool>,
+    /// The history page this message belongs to (r8 §B).
+    #[serde(rename = "page_id", skip_serializing_if = "Option::is_none")]
+    page_id: Option<&'a str>,
+    /// A recovered message: the retained message it follows (r8 §C).
+    #[serde(rename = "after_message_id", skip_serializing_if = "Option::is_none")]
+    after_message_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -266,7 +272,12 @@ fn part_body(p: &Part) -> PartBody<'_> {
     }
 }
 
-fn message_body(m: &ChatMessage, history: bool) -> MessageBody<'_> {
+fn message_body<'a>(
+    m: &'a ChatMessage,
+    history: bool,
+    page_id: Option<&'a str>,
+    after_message_id: Option<&'a str>,
+) -> MessageBody<'a> {
     MessageBody {
         message_id: &m.message_id,
         role: match m.role {
@@ -282,6 +293,8 @@ fn message_body(m: &ChatMessage, history: bool) -> MessageBody<'_> {
         created_at: m.created_at_ms,
         parts: m.parts.iter().map(part_body).collect(),
         history: history.then_some(true),
+        page_id,
+        after_message_id,
     }
 }
 
@@ -358,7 +371,21 @@ pub fn event(conv: &str, agent: &str, generation: &str, sequence: u64, out: &Out
         sequence,
     };
     match out {
-        Out::Message(m) => envelope(conv, agent, "message", Some(head), message_body(m, false)),
+        Out::Message(m) => envelope(
+            conv,
+            agent,
+            "message",
+            Some(head),
+            message_body(m, false, None, None),
+        ),
+        Out::Recovered { message, after } => envelope(
+            conv,
+            agent,
+            "message",
+            Some(head),
+            message_body(message, true, None, after.as_deref()),
+        ),
+        Out::Coverage(c) => envelope(conv, agent, "coverage", Some(head), coverage_body(c)),
         Out::Delta { message_id, part } => envelope(
             conv,
             agent,
@@ -408,12 +435,15 @@ pub fn event(conv: &str, agent: &str, generation: &str, sequence: u64, out: &Out
     }
 }
 
+/// A message of a history page (r8 §B: `history: true` and its `page_id`;
+/// the open's page has none).
 pub fn history_message(
     conv: &str,
     agent: &str,
     generation: &str,
     sequence: u64,
     m: &ChatMessage,
+    page_id: Option<&str>,
 ) -> ChatEnvelope {
     envelope(
         conv,
@@ -423,14 +453,238 @@ pub fn history_message(
             generation,
             sequence,
         }),
-        message_body(m, true),
+        message_body(m, true, page_id, None),
     )
+}
+
+/// At most this many holes in a `history_end` or `coverage` (r8 §C), then
+/// `holes_more`.
+pub const MAX_HOLES: usize = 16;
+
+#[derive(Serialize)]
+struct HoleBody<'a> {
+    after_message_id: &'a str,
+    before_message_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u64>,
+}
+
+fn hole_bodies(holes: &[Hole]) -> (Vec<HoleBody<'_>>, bool) {
+    let more = holes.len() > MAX_HOLES;
+    let bodies = holes
+        .iter()
+        .take(MAX_HOLES)
+        .map(|h| HoleBody {
+            after_message_id: &h.after,
+            before_message_id: h.before.as_deref(),
+            count: h.count,
+        })
+        .collect();
+    (bodies, more)
+}
+
+#[derive(Serialize)]
+struct CoverageBody<'a> {
+    oldest_retained: Option<&'a str>,
+    truncated: bool,
+    holes: Vec<HoleBody<'a>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    holes_more: bool,
+}
+
+fn coverage_body(c: &CoverageState) -> CoverageBody<'_> {
+    let (holes, holes_more) = hole_bodies(&c.holes);
+    CoverageBody {
+        oldest_retained: c.oldest_retained.as_deref(),
+        truncated: c.truncated,
+        holes,
+        holes_more,
+    }
+}
+
+/// What a `history_end` says about its page (r8 §B, §C).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageInfo {
+    /// `newest`, `before`, `turn_id` or `request_id`.
+    pub selector: &'static str,
+    pub count: usize,
+    pub content_bytes: usize,
+    pub wire_bytes: usize,
+    pub end: bool,
+    pub next: Option<String>,
+    /// `complete`, `partial` or `unavailable`.
+    pub coverage: &'static str,
+    pub oldest_retained: Option<String>,
+    pub truncated: bool,
+    pub holes: Vec<Hole>,
+}
+
+#[derive(Serialize)]
+struct PageBody<'a> {
+    selector: &'static str,
+    count: usize,
+    content_bytes: usize,
+    wire_bytes: usize,
+    end: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<&'a str>,
+    coverage: &'static str,
+    oldest_retained: Option<&'a str>,
+    truncated: bool,
+    holes: Vec<HoleBody<'a>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    holes_more: bool,
+}
+
+#[derive(Serialize)]
+struct HistoryEndBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_id: Option<&'a str>,
+    page: PageBody<'a>,
+}
+
+/// The end of a history page (r8 §B): sequenced, after its messages.
+pub fn history_end(
+    conv: &str,
+    agent: &str,
+    generation: &str,
+    sequence: u64,
+    page_id: Option<&str>,
+    page: &PageInfo,
+) -> ChatEnvelope {
+    let (holes, holes_more) = hole_bodies(&page.holes);
+    envelope(
+        conv,
+        agent,
+        "history_end",
+        Some(Head {
+            generation,
+            sequence,
+        }),
+        HistoryEndBody {
+            page_id,
+            page: PageBody {
+                selector: page.selector,
+                count: page.count,
+                content_bytes: page.content_bytes,
+                wire_bytes: page.wire_bytes,
+                end: page.end,
+                next: page.next.as_deref(),
+                coverage: page.coverage,
+                oldest_retained: page.oldest_retained.as_deref(),
+                truncated: page.truncated,
+                holes,
+                holes_more,
+            },
+        },
+    )
+}
+
+/// An error in a conversation: sequenced when it is open (`head`), with the
+/// history request's `page_id` when that was valid (r8 §B).
+pub fn error(
+    conv: &str,
+    agent: &str,
+    head: Option<(&str, u64)>,
+    code: &str,
+    text: &str,
+    page_id: Option<&str>,
+) -> ChatEnvelope {
+    let mut body = Map::new();
+    body.insert("code".into(), Value::String(code.into()));
+    body.insert("text".into(), Value::String(text.into()));
+    if let Some(p) = page_id {
+        body.insert("page_id".into(), Value::String(p.into()));
+    }
+    envelope(
+        conv,
+        agent,
+        "error",
+        head.map(|(generation, sequence)| Head {
+            generation,
+            sequence,
+        }),
+        body,
+    )
+}
+
+/// Why Atem ends a conversation (r8 §C `close.reason`); the client reopens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// `/clear`, a resume, `/new`: another conversation of the agent.
+    Switched,
+    /// Chat was withdrawn.
+    Withdrawn,
+    /// A new agent process.
+    Restarted,
+    /// A ninth conversation replaced the oldest.
+    Evicted,
+    // `fenced` and `reset` are the contract's too; Atem never sends them: a
+    // fenced attachment's conversations end with its transport.
 }
 
 /// Atem ends a conversation: after an `error` saying why, or without one when a
 /// ninth conversation replaces the oldest.
-pub fn close(conv: &str, agent: &str) -> ChatEnvelope {
-    envelope(conv, agent, "close", None, Map::new())
+pub fn close(conv: &str, agent: &str, reason: CloseReason) -> ChatEnvelope {
+    let mut body = Map::new();
+    body.insert(
+        "reason".into(),
+        serde_json::to_value(reason).expect("reasons serialize"),
+    );
+    envelope(conv, agent, "close", None, body)
+}
+
+#[cfg(test)]
+/// A chat-v1 message body as it is on the wire (`message` without its
+/// envelope fields), back into a `ChatMessage`: text and tool parts only.
+pub fn parse_message(v: &Value) -> Result<ChatMessage, String> {
+    let s = |name: &str| v.get(name).and_then(Value::as_str).map(str::to_string);
+    let role = match s("role").as_deref() {
+        Some("user") => Role::User,
+        Some("assistant") => Role::Assistant,
+        other => return Err(format!("role {other:?}")),
+    };
+    let origin = match s("origin").as_deref() {
+        None => None,
+        Some("local") => Some(Origin::Local),
+        Some("remote") => Some(Origin::Remote),
+        Some(other) => return Err(format!("origin {other:?}")),
+    };
+    let mut parts = Vec::new();
+    for p in v
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or("missing parts")?
+    {
+        let f = |name: &str| {
+            p.get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or(format!("part {name}"))
+        };
+        parts.push(match p.get("kind").and_then(Value::as_str) {
+            Some("text") => Part::Text {
+                id: f("id")?,
+                markdown: f("markdown")?,
+            },
+            Some("tool") => Part::Tool {
+                id: f("id")?,
+                name: f("name")?,
+                summary: f("summary")?,
+            },
+            other => return Err(format!("part kind {other:?}")),
+        });
+    }
+    Ok(ChatMessage {
+        message_id: s("messageId").ok_or("missing messageId")?,
+        role,
+        origin,
+        turn_id: s("turnId").ok_or("missing turnId")?,
+        request_id: s("requestId"),
+        created_at_ms: v.get("createdAt").and_then(Value::as_i64).unwrap_or(0),
+        parts,
+    })
 }
 
 #[cfg(test)]
@@ -806,7 +1060,7 @@ mod tests {
 
     #[test]
     fn history_message_is_marked() {
-        let v = body(&history_message("c1", "claude", "g", 4, &msg()));
+        let v = body(&history_message("c1", "claude", "g", 4, &msg(), None));
         assert_eq!(v["op"], "message");
         assert_eq!(v["history"], true);
         assert_eq!(v["sequence"], 4);
@@ -829,10 +1083,10 @@ mod tests {
     }
 
     #[test]
-    fn close_carries_only_the_ids() {
+    fn close_carries_the_ids_and_its_reason() {
         assert_eq!(
-            serde_json::to_value(close("c1", "claude")).unwrap(),
-            json!({"v":1,"op":"close","conversationId":"c1","agentId":"claude"})
+            serde_json::to_value(close("c1", "claude", CloseReason::Evicted)).unwrap(),
+            json!({"v":1,"op":"close","conversationId":"c1","agentId":"claude","reason":"evicted"})
         );
     }
 }

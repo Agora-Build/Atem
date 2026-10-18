@@ -1621,6 +1621,7 @@ fn a_chat_send_names_the_holder_then_takes_over_when_confirmed() {
             text: "another controller holds control".into(),
             sequenced: true,
             controller: Some(holder.clone()),
+            page_id: None,
         }]
     );
     assert!(rt.host.receipt(&rid(1)).is_none());

@@ -33,12 +33,15 @@ pub const KNOWN_FEATURES: &[&str] = &[
     APPROVAL_LEASE_FREE,
 ];
 
-/// What this host implements and advertises in `welcome.features`, in
-/// order. A feature is added here only once its fixtures pass (§A): the
-/// r8 tasks extend this one list. `receipt.result` is implemented
-/// (`HostConfig::receipt_result`) but joins only with the history
-/// features its fixture needs (`r8-receipt-result-bounds-reply-message-ids`).
+/// What this host implements and advertises in `welcome.features`, in the
+/// appendix's order. A feature is added here only once its fixtures pass
+/// (§A). Every r8 feature is implemented.
 pub const FEATURES: &[&str] = &[
+    CHAT_HISTORY_END,
+    CHAT_HISTORY,
+    CHAT_LOOKUP,
+    CHAT_COVERAGE,
+    RECEIPT_RESULT,
     APPROVAL_SESSION_RULES,
     APPROVAL_CARD_REASON,
     CHAT_SEND_ACQUIRE,
@@ -67,8 +70,8 @@ const LOOKUP: &[&str] = &[CHAT_HISTORY_END, CHAT_HISTORY, CHAT_LOOKUP];
 
 /// What each `r8-*` fixture needs, by name. Send and approval scenarios
 /// need both §F/§G features: their setup `welcome` must advertise them
-/// (fixtures/schema.md). The admission scenario's welcome names seven
-/// features, so it runs once all of them ship.
+/// (fixtures/schema.md). The admission scenario's welcome names every r8
+/// feature.
 pub const R8_FIXTURE_NEEDS: &[(&str, &[&str])] = &[
     ("r8-approval-answer-by-a-non-holder-leaves-the-lease", SEND),
     ("r8-approval-answer-keeps-the-holders-deadline", SEND),
@@ -134,6 +137,8 @@ pub const R8_FIXTURE_NEEDS: &[(&str, &[&str])] = &[
             RECEIPT_RESULT,
             APPROVAL_SESSION_RULES,
             APPROVAL_CARD_REASON,
+            CHAT_SEND_ACQUIRE,
+            APPROVAL_LEASE_FREE,
         ],
     ),
     (
@@ -220,9 +225,10 @@ mod tests {
             }
         }
         assert!(r8_fixture_runnable("r8-client-refuses-a-host-without-revision-8").is_ok());
+        assert!(r8_fixture_runnable("r8-open-with-before-is-refused").is_ok());
         assert_eq!(
-            r8_fixture_runnable("r8-open-with-before-is-refused"),
-            Err("needs chat.history_end".into())
+            FEATURES, KNOWN_FEATURES,
+            "every r8 feature, in the appendix's order"
         );
         assert!(r8_fixture_runnable("r8-unknown").is_err());
         assert!(r8_fixture_runnable("r8-failed-fence-write-rejects-queued-work-at-once").is_ok());

@@ -96,6 +96,7 @@ use super::wire::{
     Receipt, ReceiptKind, ReceiptLease, ReceiptResult, ReceiptState, RuleRevoke, SessionMessage,
     SessionState, Target, TerminalRequest,
 };
+use crate::chat::history::valid_page_id;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -367,6 +368,8 @@ pub enum ChatReply {
         sequenced: bool,
         /// The holder a `lease_held` names (r8 §F).
         controller: Option<Controller>,
+        /// A history request's `page_id` (r8 §B).
+        page_id: Option<String>,
     },
 }
 
@@ -3470,7 +3473,11 @@ impl<J: Journal> SessionHost<J> {
                 });
             }
             "agentChat" => {
-                let submit = field("op").as_deref() == Some("submit");
+                let op = field("op");
+                let submit = op.as_deref() == Some("submit");
+                // A history request's error carries its valid `page_id`.
+                let page_id = field("page_id")
+                    .filter(|p| op.as_deref() == Some("history") && valid_page_id(p));
                 self.out.push(Effect::Chat {
                     attachment: att.to_string(),
                     conversation_id: field("conversationId").unwrap_or_default(),
@@ -3481,6 +3488,7 @@ impl<J: Journal> SessionHost<J> {
                         text: detail.unwrap_or(code_text(code)).to_string(),
                         sequenced: !f.data.as_ref().is_some_and(refused_chat_form),
                         controller,
+                        page_id,
                     },
                 });
             }
@@ -3624,6 +3632,16 @@ impl<J: Journal> SessionHost<J> {
     /// runtime serves.
     fn on_chat(&mut self, att: &str, f: &FamilyMessage) -> Checked {
         let Some(b) = &f.binding else {
+            // A `close` without a binding names only its conversation: the
+            // runtime ends it if it is this attachment's.
+            if let Some(data) = f.data.as_ref().filter(|d| d["op"] == "close") {
+                self.out.push(Effect::Forward {
+                    attachment: att.to_string(),
+                    session_id: data["agentId"].as_str().unwrap_or_default().to_string(),
+                    message: f.clone(),
+                });
+                return Ok(());
+            }
             // Host-only chat ops are not requests.
             return Err(ErrorCode::UnsupportedVersion);
         };
@@ -3715,7 +3733,9 @@ impl<J: Journal> SessionHost<J> {
                     send,
                 )
             }
-            Some("open" | "close") => {
+            // Reads the runtime serves from its chat history (r8 §B: the
+            // runtime checks a `history`'s selector and fields).
+            Some("open" | "close" | "history") => {
                 self.out.push(Effect::Forward {
                     attachment: att.to_string(),
                     session_id: sid,
@@ -3764,6 +3784,7 @@ fn chat_reply(e: &Entry) -> ChatReply {
         text: s.detail.clone().unwrap_or_default(),
         sequenced: true,
         controller: None,
+        page_id: None,
     };
     match s.state {
         ReceiptState::Accepted | ReceiptState::Executing => ChatReply::Accepted {
@@ -3787,13 +3808,10 @@ fn chat_reply(e: &Entry) -> ChatReply {
 /// chat-v1 forms r8 refuses before anything else (§A), answered with an
 /// unsequenced `unsupported_version`: `open.before`/`open.generation` (the
 /// r7.2 paging form, removed: never read as an open of the newest page; an
-/// open conversation is not reset and none opens) and `history`
-/// (`chat.history`/`chat.lookup`, not advertised yet).
-// TODO(r8 task 5): serve `history` once those features ship.
+/// open conversation is not reset and none opens). Older pages come with
+/// `history`.
 fn refused_chat_form(data: &Value) -> bool {
-    let removed_open =
-        data["op"] == "open" && (data.get("before").is_some() || data.get("generation").is_some());
-    removed_open || data["op"] == "history"
+    data["op"] == "open" && (data.get("before").is_some() || data.get("generation").is_some())
 }
 
 /// The wire name of a §7 code.
@@ -3878,6 +3896,30 @@ pub fn fill_result(receipt: &mut Receipt, replies: Option<TurnReplies>) {
     ids.truncate(wire::MAX_REPLY_MESSAGE_IDS);
     result.reply_message_ids = ids;
     result.replies = coverage;
+}
+
+/// r8 §D: every receipt `result` in `message` gets its replies from
+/// `replies` (the runtime's retained history of the receipt's target, now:
+/// late content and eviction show), `None` leaving them unavailable.
+pub fn fill_results(
+    message: &mut Envelope,
+    mut replies: impl FnMut(&Target, &ReceiptResult) -> Option<TurnReplies>,
+) {
+    let Envelope::Session(m) = message else {
+        return;
+    };
+    let receipts = match &mut m.op {
+        Op::Receipt(r) => std::slice::from_mut(r),
+        Op::Receipts { receipts } => receipts.as_mut_slice(),
+        _ => return,
+    };
+    for receipt in receipts {
+        let Some(result) = &receipt.result else {
+            continue;
+        };
+        let turn = replies(&receipt.target, result);
+        fill_result(receipt, turn);
+    }
 }
 
 /// `detail` is bounded (§1); cut at a char boundary.

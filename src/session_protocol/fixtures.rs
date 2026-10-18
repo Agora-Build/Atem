@@ -13,7 +13,7 @@
 //! Unknown actions, unknown assertion keys and unknown `setup` fields fail the
 //! scenario instead of being ignored.
 
-use super::client::{AdmissionClient, LeaseClient, LeaseRequest, RegistryClient};
+use super::client::{AdmissionClient, ChatClient, LeaseClient, LeaseRequest, RegistryClient};
 use super::revision::{self, CHAT_COVERAGE, CHAT_LOOKUP};
 use super::wire::{
     self, AlwaysRule, ApprovalCloseReason, ClientKind, DecodeError, Envelope, Op, Permission,
@@ -174,6 +174,8 @@ pub enum HostEvent {
         tool: String,
         summary: String,
         always_rules: Vec<AlwaysRule>,
+        /// r8: the card's `turnId`.
+        turn_id: Option<String>,
     },
     /// The runtime saw the approval end without the remote answer.
     CloseApproval {
@@ -189,6 +191,41 @@ pub enum HostEvent {
     ApprovalRules {
         session_id: String,
         rules: Vec<AlwaysRule>,
+    },
+    /// r8: the session's retained chat history (chat-v1 message bodies,
+    /// oldest first).
+    ChatHistory {
+        session_id: String,
+        messages: Vec<Value>,
+    },
+    /// r8: the agent produced a message (new, or a whole replacement).
+    ChatMessage {
+        session_id: String,
+        message: Value,
+    },
+    /// r8: retention evicted the oldest `count` messages.
+    ChatEvict {
+        session_id: String,
+        count: usize,
+    },
+    /// r8: one turn arrives live (`fixtures/schema.md`, `chat_turn`).
+    ChatTurn {
+        session_id: String,
+        turn_id: String,
+        request_id: Option<String>,
+        origin: String,
+        assistant_messages: usize,
+        text_bytes: usize,
+        /// `escape: "control"`: the text is U+0001.
+        control: bool,
+    },
+    /// r8: the worker's backlog dropped `dropped`, then delivered
+    /// `delivered_after` with a gap; a reload finds only `recoverable`.
+    WorkerGap {
+        session_id: String,
+        dropped: Vec<String>,
+        recoverable: Vec<String>,
+        delivered_after: Vec<Value>,
     },
 }
 
@@ -384,8 +421,10 @@ struct ClientMachines {
     /// host's features) unless it sends `hello`, which starts a handshake.
     admission: AdmissionClient,
     /// Messages the client machines sent on their own (`client_try`s they
-    /// allowed) since the last `sent` check.
+    /// allowed, chat resyncs) since the last `sent` check.
     sent: Vec<Value>,
+    /// r8 chat conversations (`client_open_chat`).
+    chat: ChatClient,
 }
 
 struct Runner {
@@ -451,6 +490,23 @@ fn same(expected: &Value, got: Option<&Value>, what: &str) -> Result<(), String>
     }
 }
 
+/// A chat-v1 message's content bytes as `ChatSession` counts them (part
+/// text; a tool's name and summary; a card's tool and summary).
+fn content_bytes(message: &Value) -> u64 {
+    let len = |v: &Value| v.as_str().map_or(0, str::len) as u64;
+    message["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| match p["kind"].as_str() {
+            Some("text") => len(&p["markdown"]),
+            Some("tool") => len(&p["name"]) + len(&p["summary"]),
+            Some("approval") => len(&p["tool"]) + len(&p["summary"]),
+            _ => 0,
+        })
+        .sum()
+}
+
 impl Runner {
     fn new(s: &Scenario, host: Option<Box<dyn HostUnderTest>>) -> Self {
         let client_names: Vec<String> = s.setup.clients.iter().map(|c| c.name.clone()).collect();
@@ -467,6 +523,7 @@ impl Runner {
                         attachment_gen: c.attachment_gen.clone(),
                         admission: AdmissionClient::admitted(revision::FEATURES),
                         sent: Vec::new(),
+                        chat: ChatClient::default(),
                     };
                     (c.name.clone(), m)
                 })
@@ -549,7 +606,39 @@ impl Runner {
             ("turn_complete", &["turn_id"]),
             ("hold_pty_writes", &[]),
             ("flush_pty_writes", &[]),
-            ("open_approval", &["tool", "summary", "always_rules"]),
+            (
+                "open_approval",
+                &["tool", "summary", "always_rules", "turn_id"],
+            ),
+            ("chat_history", &["messages"]),
+            ("chat_message", &["message"]),
+            ("chat_evict", &["count"]),
+            (
+                "chat_turn",
+                &[
+                    "turn_id",
+                    "request_id",
+                    "origin",
+                    "assistant_messages",
+                    "text_bytes",
+                    "escape",
+                ],
+            ),
+            ("worker_gap", &["dropped", "recoverable", "delivered_after"]),
+            ("expect_live", &["message_ids", "sequence_from"]),
+            (
+                "recover",
+                &[
+                    "request",
+                    "message_ids",
+                    "min_pages",
+                    "max_count",
+                    "max_content_bytes",
+                    "max_wire_bytes",
+                    "end",
+                ],
+            ),
+            ("client_open_chat", &["conversation", "session_id"]),
             ("close_approval", &["reason"]),
             ("approval_applied", &["ok"]),
             ("approval_rules", &["rules"]),
@@ -669,10 +758,49 @@ impl Runner {
                 Ok(())
             }
             ("assert", Side::Host) => self.assert_host(arg),
+            ("expect_live", Side::Host) => {
+                let client = self.client(arg)?.to_string();
+                let ids: Vec<String> = serde_json::from_value(take(&step, "message_ids")?.clone())
+                    .map_err(|e| format!("message_ids: {e}"))?;
+                let from = as_u64(take(&step, "sequence_from")?, "sequence_from")?;
+                for (k, id) in ids.iter().enumerate() {
+                    let op = serde_json::json!({"op": "message"});
+                    let data = self.expect(&client, Some("agentChat"), &op)?;
+                    if data.get("history").is_some() {
+                        return Err(format!("{id}: a history message, expected a live one"));
+                    }
+                    same(
+                        &Value::from(id.as_str()),
+                        data.get("messageId"),
+                        "messageId",
+                    )?;
+                    same(
+                        &Value::from(from + k as u64),
+                        data.get("sequence"),
+                        "sequence",
+                    )?;
+                }
+                Ok(())
+            }
+            ("recover", Side::Host) => {
+                let client = self.client(arg)?.to_string();
+                self.recover(&client, &step)
+            }
+            ("client_open_chat", Side::Client) => {
+                let client = self.client(arg)?.to_string();
+                let conversation = as_str(take(&step, "conversation")?, "conversation")?;
+                let session = as_str(take(&step, "session_id")?, "session_id")?;
+                let m = self.clients.get_mut(&client).unwrap();
+                if !m.admission.enabled(revision::CHAT_HISTORY_END) {
+                    return Err("the client can't open a chat without chat.history_end".into());
+                }
+                m.chat.open(conversation, session);
+                Ok(())
+            }
             (_, Side::Host)
                 if !matches!(
                     *action,
-                    "deliver_to_client" | "assert_client" | "client_try"
+                    "deliver_to_client" | "assert_client" | "client_try" | "client_open_chat"
                 ) =>
             {
                 let event = self.event(action, arg, &step)?;
@@ -806,7 +934,58 @@ impl Runner {
                     Some(v) => serde_json::from_value(v.clone())
                         .map_err(|e| format!("always_rules: {e}"))?,
                 },
+                turn_id: step
+                    .get("turn_id")
+                    .map(|t| as_str(t, "turn_id").map(str::to_string))
+                    .transpose()?,
             },
+            "chat_history" => HostEvent::ChatHistory {
+                session_id: as_str(arg, "chat_history")?.into(),
+                messages: take(step, "messages")?
+                    .as_array()
+                    .ok_or("messages must be a list")?
+                    .clone(),
+            },
+            "chat_message" => HostEvent::ChatMessage {
+                session_id: as_str(arg, "chat_message")?.into(),
+                message: take(step, "message")?.clone(),
+            },
+            "chat_evict" => HostEvent::ChatEvict {
+                session_id: as_str(arg, "chat_evict")?.into(),
+                count: as_u64(take(step, "count")?, "count")? as usize,
+            },
+            "chat_turn" => HostEvent::ChatTurn {
+                session_id: as_str(arg, "chat_turn")?.into(),
+                turn_id: as_str(take(step, "turn_id")?, "turn_id")?.into(),
+                request_id: step
+                    .get("request_id")
+                    .map(|r| as_str(r, "request_id").map(str::to_string))
+                    .transpose()?,
+                origin: as_str(take(step, "origin")?, "origin")?.into(),
+                assistant_messages: as_u64(take(step, "assistant_messages")?, "assistant_messages")?
+                    as usize,
+                text_bytes: as_u64(take(step, "text_bytes")?, "text_bytes")? as usize,
+                control: match step.get("escape") {
+                    None => false,
+                    Some(Value::String(e)) if e == "control" => true,
+                    Some(other) => return Err(format!("escape {other}")),
+                },
+            },
+            "worker_gap" => {
+                let ids = |key: &str| -> Result<Vec<String>, String> {
+                    serde_json::from_value(take(step, key)?.clone())
+                        .map_err(|e| format!("{key}: {e}"))
+                };
+                HostEvent::WorkerGap {
+                    session_id: as_str(arg, "worker_gap")?.into(),
+                    dropped: ids("dropped")?,
+                    recoverable: ids("recoverable")?,
+                    delivered_after: take(step, "delivered_after")?
+                        .as_array()
+                        .ok_or("delivered_after must be a list")?
+                        .clone(),
+                }
+            }
             "close_approval" => HostEvent::CloseApproval {
                 approval_id: as_str(arg, "close_approval")?.into(),
                 reason: serde_json::from_value(take(step, "reason")?.clone())
@@ -925,6 +1104,112 @@ impl Runner {
         Ok(())
     }
 
+    /// r8 `recover`: sends `request` and takes its pages, following each
+    /// `history_end`'s `next` until `end`, checking every page's bounds and
+    /// sequences; the messages taken must be `message_ids` exactly.
+    fn recover(&mut self, client: &str, step: &Map<String, Value>) -> Result<(), String> {
+        let request = take(step, "request")?.clone();
+        let data = request.get("data").ok_or("request without data")?.clone();
+        let want: Vec<String> = serde_json::from_value(take(step, "message_ids")?.clone())
+            .map_err(|e| format!("message_ids: {e}"))?;
+        let min_pages = as_u64(take(step, "min_pages")?, "min_pages")?;
+        let max_count = as_u64(take(step, "max_count")?, "max_count")?;
+        let max_content = as_u64(take(step, "max_content_bytes")?, "max_content_bytes")?;
+        let max_wire = as_u64(take(step, "max_wire_bytes")?, "max_wire_bytes")?;
+        let end_match = take(step, "end")?.clone();
+        let open = data["op"] == "open";
+        let base = data["page_id"].as_str().unwrap_or("open").to_string();
+        let now = self.now;
+        let msg = decode_value(&request);
+        self.host()?.receive(client, msg, now);
+        self.pump()?;
+        let mut generation = data.get("generation").cloned();
+        if open {
+            let opened = self.expect(
+                client,
+                Some("agentChat"),
+                &serde_json::json!({"op": "opened"}),
+            )?;
+            same(&Value::from(0), opened.get("sequence"), "opened sequence")?;
+            generation = opened.get("generation").cloned();
+        }
+        let mut pages: Vec<Vec<String>> = Vec::new();
+        let mut backwards;
+        loop {
+            let mut ids = Vec::new();
+            let (mut content, mut wire) = (0u64, 0u64);
+            let mut sequence: Option<u64> = None;
+            let end = loop {
+                let queue = self.queues.get_mut(client).unwrap();
+                let i = queue
+                    .iter()
+                    .position(|m| m["type"] == "agentChat")
+                    .ok_or("the page ended early")?;
+                let msg = queue.remove(i).unwrap();
+                wire += serde_json::to_vec(&msg).map_or(0, |v| v.len()) as u64;
+                let d = &msg["data"];
+                let seq = d["sequence"].as_u64().ok_or(format!("unsequenced {msg}"))?;
+                if sequence.is_some_and(|s| seq != s + 1) {
+                    return Err(format!("sequence {seq} after {sequence:?}"));
+                }
+                sequence = Some(seq);
+                match d["op"].as_str() {
+                    Some("message") if d["history"] == true => {
+                        ids.push(d["messageId"].as_str().unwrap_or_default().to_string());
+                        content += content_bytes(d);
+                    }
+                    Some("history_end") => break d.clone(),
+                    _ => return Err(format!("not part of a page: {msg}")),
+                }
+            };
+            let page = &end["page"];
+            same(&Value::from(ids.len()), page.get("count"), "page.count")?;
+            if ids.len() as u64 > max_count || content > max_content || wire > max_wire {
+                return Err(format!(
+                    "page {} over its bounds: {} messages, {content} content bytes, {wire} wire bytes",
+                    pages.len() + 1,
+                    ids.len()
+                ));
+            }
+            backwards = matches!(page["selector"].as_str(), Some("newest" | "before"));
+            pages.push(ids);
+            if page["end"] == true {
+                for (path, expected) in end_match.as_object().ok_or("end must be an object")? {
+                    same(expected, lookup(&end, path).as_ref(), path)
+                        .map_err(|e| format!("last history_end: {e}"))?;
+                }
+                break;
+            }
+            let next = page["next"].as_str().ok_or("no next before the end")?;
+            let mut more = serde_json::json!({"v": 1, "op": "history",
+                "conversationId": data["conversationId"], "agentId": data["agentId"],
+                "generation": generation.clone().unwrap_or(Value::Null),
+                "page_id": format!("{base}-{}", pages.len() + 1),
+                "binding": data["binding"], "next": next});
+            if more["generation"].is_null() {
+                more.as_object_mut().unwrap().remove("generation");
+            }
+            let msg = decode_value(&serde_json::json!({"type": "agentChat", "data": more}));
+            let now = self.now;
+            self.host()?.receive(client, msg, now);
+            self.pump()?;
+        }
+        if (pages.len() as u64) < min_pages {
+            return Err(format!(
+                "{} pages, expected at least {min_pages}",
+                pages.len()
+            ));
+        }
+        if backwards {
+            pages.reverse();
+        }
+        let got: Vec<String> = pages.into_iter().flatten().collect();
+        if got != want {
+            return Err(format!("recovered {got:?}, expected {want:?}"));
+        }
+        Ok(())
+    }
+
     // ── client side ──
 
     fn client_send(&mut self, client: &str, json: &Value) -> Result<(), String> {
@@ -986,8 +1271,18 @@ impl Runner {
 
     fn client_deliver(&mut self, client: &str, json: &Value) -> Result<(), String> {
         let env = decode_value(json).map_err(|e| format!("host message does not decode: {e:?}"))?;
-        let Envelope::Session(msg) = env else {
-            return Err("client machines only model session messages".into());
+        let msg = match env {
+            Envelope::Session(msg) => msg,
+            Envelope::Family(f) if f.family == "agentChat" => {
+                let m = self.clients.get_mut(client).unwrap();
+                if m.admission.applies()
+                    && let Some(answer) = m.chat.on_message(f.data.as_ref().unwrap_or(&Value::Null))
+                {
+                    m.sent.push(answer);
+                }
+                return Ok(());
+            }
+            _ => return Err("client machines model session and chat messages only".into()),
         };
         let now = self.now;
         let m = self.clients.get_mut(client).unwrap();
@@ -1131,6 +1426,15 @@ impl Runner {
                 // comes from the descriptor's capabilities).
                 "chat_enabled" => Value::Bool(m.admission.is_admitted()),
                 "sent" => Value::from(m.sent.clone()),
+                "chat_loaded" => Value::Bool(m.chat.only().is_some_and(|c| c.loaded)),
+                "chat_truncated" => Value::Bool(m.chat.only().is_some_and(|c| c.truncated)),
+                "chat_reopens" => Value::from(m.chat.only().map_or(0, |c| c.reopens)),
+                "chat_messages" => Value::from(
+                    m.chat
+                        .only()
+                        .map(|c| c.messages.clone())
+                        .unwrap_or_default(),
+                ),
                 other => return Err(format!("unknown assert_client key {other:?}")),
             };
             same(expected, Some(&got), key)?;
@@ -1236,28 +1540,34 @@ mod tests {
         }
     }
 
-    /// The admission scenario's welcome names seven features, so it waits
-    /// for them (`R8_FIXTURE_NEEDS`). Everything else it checks holds now:
-    /// with the expected feature list replaced by this host's, it passes,
-    /// and it fails on a changed expectation.
+    /// The admission scenario's welcome names every r8 feature in the
+    /// appendix's order (this host's list): it passes, and fails on a
+    /// changed expectation (another feature list, revision, code, or a
+    /// leftover attachment).
     #[test]
-    fn hello_admission_holds_with_this_hosts_features() {
+    fn hello_admission_names_this_hosts_features() {
         let name = "r8-hello-without-revision-8-is-refused-before-any-attachment";
-        let mut f = fixture(name);
-        assert!(matches!(
-            run_scenario(&f, Some(&fake_runtime)),
-            Ok(Outcome::NotRun(_))
-        ));
-        f.as_object_mut().unwrap().remove("requires");
-        f["name"] = json!("hello-admission-with-this-hosts-features");
-        let step = f["steps"]
+        let f = fixture(name);
+        assert_eq!(run_scenario(&f, Some(&fake_runtime)), Ok(Outcome::Passed));
+        let welcome = |g: &mut Value| -> Value {
+            g["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["match"]["op"] == "welcome")
+                .unwrap()["match"]["features"]
+                .clone()
+        };
+        assert_eq!(welcome(&mut f.clone()), json!(revision::FEATURES));
+        let mut g = f.clone();
+        let step = g["steps"]
             .as_array_mut()
             .unwrap()
             .iter_mut()
             .find(|s| s["match"]["op"] == "welcome")
             .unwrap();
-        step["match"]["features"] = json!(revision::FEATURES);
-        assert_eq!(run_scenario(&f, Some(&fake_runtime)), Ok(Outcome::Passed));
+        step["match"]["features"].as_array_mut().unwrap().pop();
+        assert!(run_scenario(&g, Some(&fake_runtime)).is_err());
         for (path, to) in [("revision", json!(7)), ("code", json!("unauthorized"))] {
             let mut g = f.clone();
             let step = g["steps"]
@@ -1275,8 +1585,64 @@ mod tests {
         assert!(run_scenario(&g, Some(&fake_runtime)).is_err());
     }
 
+    /// `recover` and `expect_live` fail when what they check changes: the
+    /// ids, the bounds, the page count, the last page or the sequences.
+    #[test]
+    fn recover_and_expect_live_fail_on_a_changed_expectation() {
+        let name = "r8-long-turn-is-recovered-in-bounded-pages";
+        let f = fixture(name);
+        let at = |f: &Value, action: &str| {
+            f["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|s| s.get(action).is_some())
+                .unwrap()
+        };
+        let (live, recover) = (at(&f, "expect_live"), at(&f, "recover"));
+        let changes: Vec<(usize, &str, Value)> = vec![
+            (live, "sequence_from", json!(3)),
+            (recover, "min_pages", json!(4)),
+            (recover, "max_count", json!(10)),
+            (recover, "max_content_bytes", json!(100_000)),
+            (recover, "max_wire_bytes", json!(500_000)),
+            (recover, "end", json!({"page.coverage": "partial"})),
+        ];
+        for (i, key, to) in changes {
+            let mut g = f.clone();
+            g["steps"][i][key] = to;
+            assert!(run_scenario(&g, Some(&fake_runtime)).is_err(), "{key}");
+        }
+        for i in [live, recover] {
+            let mut g = f.clone();
+            g["steps"][i]["message_ids"]
+                .as_array_mut()
+                .unwrap()
+                .swap(3, 4);
+            assert!(
+                run_scenario(&g, Some(&fake_runtime)).is_err(),
+                "step {i} ids"
+            );
+        }
+    }
+
     #[test]
     fn r8_client_fixtures_fail_on_a_changed_expectation() {
+        let shows = "r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap";
+        assert_eq!(run_scenario(&fixture(shows), None), Ok(Outcome::Passed));
+        for (key, from, to) in [
+            ("chat_reopens", json!(1), json!(0)),
+            ("chat_truncated", json!(true), json!(false)),
+            (
+                "chat_messages",
+                json!(["m-0005", "m-0006", "m-0007"]),
+                json!(["m-0006", "m-0005", "m-0007"]),
+            ),
+        ] {
+            let mut f = fixture(shows);
+            mutate_assert(&mut f, key, &from, to);
+            assert!(run_scenario(&f, None).is_err(), "{key}");
+        }
         let refuses = "r8-client-refuses-a-host-without-revision-8";
         let mut f = fixture(refuses);
         mutate_assert(&mut f, "admitted", &json!(false), json!(true));
@@ -1507,6 +1873,42 @@ mod tests {
                 "r8-stale-takeover-confirmation-is-refused",
                 "controller.lease_epoch",
                 json!(1),
+            ),
+            ("r8-open-with-before-is-refused", "page.count", json!(3)),
+            (
+                "r8-history-page-and-live-events-share-one-ordered-stream",
+                "parts.#",
+                json!(1),
+            ),
+            (
+                "r8-truncated-history-reopens-once-then-stays-live",
+                "page.oldest_retained",
+                json!("m-0005"),
+            ),
+            (
+                "r8-backlog-hole-is-reported-not-reopened",
+                "page.holes.#",
+                json!(0),
+            ),
+            (
+                "r8-backlog-hole-is-reported-not-reopened",
+                "holes",
+                json!([{"after_message_id": "m-0004", "before_message_id": "m-0006"}]),
+            ),
+            (
+                "r8-receipt-result-bounds-reply-message-ids",
+                "result.more",
+                json!(false),
+            ),
+            (
+                "r8-history-selectors-are-exclusive-and-validated",
+                "code",
+                json!("stale_target"),
+            ),
+            (
+                "r8-stale-or-foreign-next-token-is-stale-target",
+                "page.coverage",
+                json!("complete"),
             ),
         ];
         for (name, key, to) in mutations {

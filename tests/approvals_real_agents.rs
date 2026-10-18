@@ -164,8 +164,6 @@ impl Rig {
             .env("XDG_RUNTIME_DIR", &sb.run)
             .env("ASTATION_WS", &astation.url)
             .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
-            // r8 §D before `receipt.result` is advertised (debug builds).
-            .env("ATEM_TEST_RECEIPT_RESULT", "1")
             .current_dir(&sb.home)
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
@@ -1444,6 +1442,7 @@ fn codex_chat_end_to_end() {
         reply2.iter().map(|t| redact(t)).collect::<Vec<_>>()
     ));
     assert!(!reply2.is_empty(), "no reply for the remote prompt");
+    let ping = rid.clone();
     // r8 §D: the receipt names the turn, the user message and its replies.
     let receipt = rig.receipt_of(&sid, &generation, &rid);
     let result = &receipt["result"];
@@ -1522,6 +1521,82 @@ fn codex_chat_end_to_end() {
         interrupted["result"]["turn_id"], done["turnId"],
         "{interrupted}"
     );
+
+    // 4b. r8 §B after these turns: a new conversation's open page ends
+    //     with `history_end`; `before` the remote prompt pages the older
+    //     history; a lookup by the remote prompt's request_id pages its
+    //     turn from its user message, coverage complete.
+    let page = |rig: &mut Rig, conversation: &str, page_id: Option<&str>, from: usize| {
+        let (c, p) = (conversation.to_string(), page_id.map(str::to_string));
+        let end = rig.wait(Duration::from_secs(10), "a history_end", |m| {
+            m["type"] == "agentChat"
+                && m["data"]["op"] == "history_end"
+                && m["data"]["conversationId"] == c.as_str()
+                && m["data"].get("page_id").and_then(Value::as_str) == p.as_deref()
+        })["data"]
+            .clone();
+        let messages: Vec<Value> = rig.seen[from..]
+            .iter()
+            .filter(|m| {
+                m["type"] == "agentChat"
+                    && m["data"]["op"] == "message"
+                    && m["data"]["conversationId"] == conversation
+                    && m["data"]["history"] == true
+                    && m["data"].get("page_id").and_then(Value::as_str) == page_id
+            })
+            .map(|m| m["data"].clone())
+            .collect();
+        (messages, end)
+    };
+    let from = rig.seen.len();
+    rig.send(json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+        "conversationId": "conv-2", "agentId": sid, "binding": rig.binding(&sid, &generation)}}));
+    let (newest, end) = page(&mut rig, "conv-2", None, from);
+    assert_eq!(end["page"]["selector"], "newest", "{end}");
+    assert_eq!(end["page"]["count"], newest.len(), "{end}");
+    assert!(newest.iter().any(|m| m["messageId"] == user["messageId"]));
+    let from = rig.seen.len();
+    rig.send(
+        json!({"type": "agentChat", "data": {"v": 1, "op": "history",
+        "conversationId": "conv-2", "agentId": sid, "generation": generation,
+        "page_id": "p1", "before": user["messageId"],
+        "binding": rig.binding(&sid, &generation)}}),
+    );
+    let (older, before_end) = page(&mut rig, "conv-2", Some("p1"), from);
+    assert_eq!(before_end["page"]["selector"], "before", "{before_end}");
+    assert!(
+        older.iter().any(|m| m["turnId"] == turn1.as_str()),
+        "the local turn is older: {older:#?}"
+    );
+    assert!(!older.iter().any(|m| m["turnId"] == turn2.as_str()));
+    let from = rig.seen.len();
+    rig.send(
+        json!({"type": "agentChat", "data": {"v": 1, "op": "history",
+        "conversationId": "conv-2", "agentId": sid, "generation": generation,
+        "page_id": "p2", "request_id": ping,
+        "binding": rig.binding(&sid, &generation)}}),
+    );
+    let (turn, lookup_end) = page(&mut rig, "conv-2", Some("p2"), from);
+    assert_eq!(lookup_end["page"]["selector"], "request_id", "{lookup_end}");
+    assert_eq!(lookup_end["page"]["coverage"], "complete", "{lookup_end}");
+    assert_eq!(lookup_end["page"]["end"], true, "{lookup_end}");
+    assert_eq!(
+        turn.first().map(|m| m["messageId"].clone()),
+        Some(user["messageId"].clone())
+    );
+    assert!(turn.iter().all(|m| m["turnId"] == turn2.as_str()));
+    report.push(format!(
+        "4b history: open page {} messages (end {}, coverage {}, truncated {}); before the remote prompt {} messages (end {}); lookup by request_id {} messages (coverage {}, end {})",
+        newest.len(),
+        end["page"]["end"],
+        end["page"]["coverage"],
+        end["page"]["truncated"],
+        older.len(),
+        before_end["page"]["end"],
+        turn.len(),
+        lookup_end["page"]["coverage"],
+        lookup_end["page"]["end"]
+    ));
 
     // 5. /new (npm's codex: the hooks come from the real binary under the
     //    node wrapper): chat follows the new session, local and remote.
