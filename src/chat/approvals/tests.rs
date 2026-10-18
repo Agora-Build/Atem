@@ -187,6 +187,83 @@ fn the_hook_gives_up_at_its_timeout_silently() {
         took >= Duration::from_millis(900) && took < Duration::from_secs(5),
         "{took:?}"
     );
+    no_decision_taken(s.path());
+}
+
+/// Nothing was decided: no decision taken or claimed.
+fn no_decision_taken(dir: &Path) {
+    for e in fs::read_dir(approvals_dir(dir)).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.starts_with("taken-") && !name.starts_with("claimed-"),
+            "{name}"
+        );
+    }
+}
+
+/// Whether `pid` still exists.
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The hook's own pid, from its `pid-<id>` file.
+fn hook_pid(dir: &Path, id: &str) -> i32 {
+    let ids = fs::read_to_string(approvals_dir(dir).join(format!("pid-{id}"))).unwrap();
+    ids.split_whitespace().next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn the_hook_exits_promptly_and_silently_on_sigterm_hup_and_int() {
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let s = session();
+        let child = spawn(&claude_command(s.path()), &[], "{}");
+        let id = wait_request(s.path());
+        assert_eq!(hook_pid(s.path(), &id), child.id() as i32);
+        unsafe {
+            libc::kill(child.id() as i32, signal);
+        }
+        let started = Instant::now();
+        let (ok, stdout, stderr) = finish(child);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{signal}: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            ok && stdout.is_empty() && stderr.is_empty(),
+            "{signal}: {stderr}"
+        );
+        no_decision_taken(s.path());
+    }
+}
+
+#[test]
+fn the_hook_exits_when_its_agent_is_gone() {
+    let s = session();
+    // The "agent": a shell that started the hook and waits for it.
+    let cmd = format!("{} <&0 & wait", claude_command(s.path()));
+    let mut agent = spawn(&cmd, &[], "{}");
+    let id = wait_request(s.path());
+    let hook = hook_pid(s.path(), &id);
+    assert_ne!(hook, agent.id() as i32);
+    agent.kill().unwrap();
+    agent.wait().unwrap();
+    let started = Instant::now();
+    while alive(hook) && started.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let took = started.elapsed();
+    if alive(hook) {
+        unsafe {
+            libc::kill(hook, libc::SIGKILL);
+        }
+    }
+    assert!(took < Duration::from_millis(1200), "{took:?}");
+    // Its stdout (shared with the agent) got nothing: EOF, empty.
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut agent.stdout.take().unwrap(), &mut out).unwrap();
+    assert!(out.is_empty(), "{out}");
+    no_decision_taken(s.path());
 }
 
 #[test]

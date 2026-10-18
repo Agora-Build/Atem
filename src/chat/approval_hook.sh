@@ -12,8 +12,11 @@
 #       (stamped with the claim time; once read it becomes claimed-<id>, the
 #       time kept); Atem withdraws one by renaming it too, so exactly one of
 #       them gets it, and never touches a claimed one while the hook runs.
-#       Prints it and exits 0. Gives up silently at the timeout or when Atem
-#       withdraws the request.
+#       Prints it and exits 0. Gives up silently (exit 0, no output: no
+#       decision) at the timeout (counted in polls), when Atem withdraws the
+#       request, when the agent that started it is gone (its parent pid no
+#       longer exists), or on HUP, INT or TERM. Its request files stay for
+#       Atem, which removes them once it is gone.
 #   sh approval-hook.sh post
 #       Claude PostToolUse: tells Atem a tool ran while a request waits
 #       (post-<id>.json), so a prompt answered in the terminal closes.
@@ -130,6 +133,11 @@ fi
 
 limit=${2:-120}
 case $limit in '' | *[!0-9]*) limit=120 ;; esac
+# The agent that started it: once that pid is gone (killed, or exited
+# without killing its hook), nobody reads the answer.
+parent=$PPID
+t=
+trap '[ -n "$t" ] && rm -f "$t" 2>/dev/null; exit 0' HUP INT TERM
 t=$(mktemp "$a/tmp.XXXXXXXX" 2>/dev/null) || exit 0
 id=${t##*/tmp.}
 req=$a/req-$id.json
@@ -138,9 +146,11 @@ dec=$a/dec-$id.json
     rm -f "$t" "$a/pid-$id" 2>/dev/null
     exit 0
 }
+t=
 
 # Polls every 100 ms: about 10 forks (sleep, and mv/cat once decided) a
-# second for as long as it waits, at most the timeout.
+# second for as long as it waits, at most the timeout. The parent check
+# (`kill -0`) is a builtin: no fork.
 n=0
 max=$((limit * 10))
 while [ "$n" -lt "$max" ]; do
@@ -153,6 +163,7 @@ while [ "$n" -lt "$max" ]; do
         exit 0
     fi
     [ -f "$req" ] || exit 0
+    kill -0 "$parent" 2>/dev/null || exit 0
     if sleep 0.1 2>/dev/null; then n=$((n + 1)); else
         sleep 1
         n=$((n + 10))
