@@ -309,6 +309,79 @@ pub fn turn_replies(chat: &ChatSession, turn_id: &str, user_message_id: &str) ->
     TurnReplies { ids, coverage }
 }
 
+/// The holes as an attachment sees them (r8 §C): with `control` as they
+/// are; for a view-only one, which never sees approval cards, named by
+/// their nearest visible neighbours (a hole with no visible message before
+/// it is older than anything it sees: left out, like truncation; holes
+/// that name the same neighbours are one, its count unknown).
+pub fn visible_holes(chat: &ChatSession, control: bool) -> Vec<Hole> {
+    if control {
+        return chat.holes().to_vec();
+    }
+    let msgs: Vec<&ChatMessage> = chat.retained().collect();
+    let index = |id: &str| msgs.iter().position(|m| m.message_id == id);
+    let mut out: Vec<Hole> = Vec::new();
+    for h in chat.holes() {
+        let Some(a) = index(&h.after) else { continue };
+        let Some(after) = (0..=a).rev().find(|i| !is_card(msgs[*i])) else {
+            continue;
+        };
+        let before = h
+            .before
+            .as_deref()
+            .and_then(index)
+            .and_then(|b| (b..msgs.len()).find(|i| !is_card(msgs[*i])))
+            .map(|i| msgs[i].message_id.clone());
+        let hole = Hole {
+            after: msgs[after].message_id.clone(),
+            before,
+            count: h.count,
+        };
+        match out
+            .iter_mut()
+            .find(|o| o.after == hole.after && o.before == hole.before)
+        {
+            Some(same) => same.count = None,
+            None => out.push(hole),
+        }
+    }
+    out
+}
+
+/// The oldest retained message an attachment sees (cards aside for a
+/// view-only one).
+pub fn visible_oldest(chat: &ChatSession, control: bool) -> Option<String> {
+    chat.retained()
+        .find(|m| control || !is_card(m))
+        .map(|m| m.message_id.clone())
+}
+
+/// Coverage as a `coverage` event tells this attachment (see
+/// `visible_holes`).
+pub fn coverage_for(chat: &ChatSession, control: bool) -> super::session::CoverageState {
+    super::session::CoverageState {
+        oldest_retained: visible_oldest(chat, control),
+        truncated: chat.truncated(),
+        holes: visible_holes(chat, control),
+    }
+}
+
+/// The 16 holes that serialize largest (any page lists at most 16).
+fn largest_holes(holes: &[Hole]) -> Vec<Hole> {
+    let size = |h: &Hole| {
+        let escaped = |s: &str| serde_json::to_string(s).map_or(0, |j| j.len());
+        escaped(&h.after) + h.before.as_deref().map_or(4, escaped)
+    };
+    let mut sorted = holes.to_vec();
+    sorted.sort_by_key(|h| std::cmp::Reverse(size(h)));
+    sorted.truncate(chat_wire::MAX_HOLES);
+    // A count is at most 20 digits.
+    for h in &mut sorted {
+        h.count = Some(u64::MAX);
+    }
+    sorted
+}
+
 /// Serialized size of an envelope as it travels (`{"type":"agentChat",
 /// "data":…}`).
 pub fn wire_size(env: &ChatEnvelope) -> usize {
@@ -450,8 +523,12 @@ pub fn page(
             .collect(),
         Plan::Empty { .. } => Vec::new(),
     };
-    // The largest `history_end` this page could have (a token, every hole,
-    // seven-digit numbers): what the serialized bound must leave room for.
+    // Holes and the oldest message as this attachment sees them.
+    let visible = visible_holes(chat, to.control);
+    let oldest = visible_oldest(chat, to.control);
+    // The largest `history_end` this page could have (a token, the 16
+    // largest holes, seven-digit numbers): what the serialized bound must
+    // leave room for.
     let reserve = {
         let probe = PageInfo {
             selector: kind.name(),
@@ -470,9 +547,9 @@ pub fn page(
                 },
             )),
             coverage: "unavailable",
-            oldest_retained: chat.oldest_retained().map(str::to_string),
+            oldest_retained: oldest.clone(),
             truncated: true,
-            holes: chat.holes().to_vec(),
+            holes: largest_holes(&visible),
         };
         wire_size(&chat_wire::history_end(
             conv,
@@ -536,7 +613,7 @@ pub fn page(
     let coverage = match &plan {
         Plan::Back { end, .. } => {
             let selected = (0..*end).any(|i| keep(msgs[i]));
-            let holed = chat.holes().iter().any(|h| match &h.before {
+            let holed = visible.iter().any(|h| match &h.before {
                 Some(b) => index_of.get(b.as_str()).is_some_and(|i| i <= end),
                 None => *end == msgs.len(),
             });
@@ -550,9 +627,8 @@ pub fn page(
         Plan::Fwd { turn, .. } => turn_coverage(chat, turn),
         Plan::Empty { .. } => Coverage::Unavailable,
     };
-    let newest = msgs.len().checked_sub(1);
-    let holes: Vec<Hole> = chat
-        .holes()
+    let newest = (0..msgs.len()).rev().find(|i| keep(msgs[*i]));
+    let holes: Vec<Hole> = visible
         .iter()
         .filter(|h| match &h.before {
             Some(b) => index_of.get(b.as_str()).is_some_and(|i| picked.contains(i)),
@@ -583,7 +659,7 @@ pub fn page(
         end: exhausted,
         next,
         coverage: coverage_name(coverage),
-        oldest_retained: chat.oldest_retained().map(str::to_string),
+        oldest_retained: oldest,
         truncated: chat.truncated(),
         holes,
     };

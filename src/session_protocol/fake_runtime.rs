@@ -824,21 +824,26 @@ impl<J: Journal> FakeRuntime<J> {
         c.conversations
             .map
             .retain(|_, v| live.contains(&v.attachment));
-        let mut ids: Vec<(String, String)> = c
+        let mut ids: Vec<(String, String, bool)> = c
             .conversations
             .map
             .iter()
             .filter(|(id, _)| Some(id.as_str()) != except)
-            .filter(|(_, v)| {
-                !control_only || self.host.attachment_can(&v.attachment, Permission::Control)
+            .map(|(id, v)| {
+                let can = self.host.attachment_can(&v.attachment, Permission::Control);
+                (id.clone(), v.attachment.clone(), can)
             })
-            .map(|(id, v)| (id.clone(), v.attachment.clone()))
+            .filter(|(_, _, can)| !control_only || *can)
             .collect();
         ids.sort();
         let generation = c.chat.generation().to_string();
         let mut sends = Vec::new();
-        for (id, attachment) in ids {
+        for (id, attachment, can) in ids {
+            // A view-only conversation's coverage names no card (r8 §C).
+            let own = matches!(out, Out::Coverage(_))
+                .then(|| Out::Coverage(history::coverage_for(&c.chat, can)));
             if let Some(sequence) = c.conversations.next_head(&id) {
+                let out = own.as_ref().unwrap_or(out);
                 sends.push((
                     attachment,
                     chat_wire::event(&id, sid, &generation, sequence, out),

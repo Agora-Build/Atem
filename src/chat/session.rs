@@ -17,6 +17,15 @@ pub const MAX_HISTORY_MESSAGES: usize = 500;
 pub const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REQUESTS: usize = 1000;
 const MAX_MESSAGE_BYTES: usize = 131_072;
+/// What every part costs besides its strings (`ChatMessage::bytes`): at
+/// least its JSON skeleton (`{"id":"","kind":"tool","name":"","summary":""}`
+/// is 47 bytes). It bounds a message's part count: at most
+/// `MAX_PARTS` = 131 072 / 64 = 2048 parts fit `MAX_MESSAGE_BYTES`.
+const PART_OVERHEAD: usize = 64;
+/// An approval card part's skeleton (its fields and up to 8 rules' keys).
+const CARD_OVERHEAD: usize = 1024;
+/// Parts per message (see `PART_OVERHEAD`); the last one is the marker.
+pub const MAX_PARTS: usize = MAX_MESSAGE_BYTES / PART_OVERHEAD;
 const MAX_PROMPT_BYTES: usize = 32_768;
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const TRUNCATED: &str = "… (truncated)";
@@ -65,19 +74,42 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    /// Approximate size: the sum of the part text lengths (r8 §B counts a
-    /// page's `content_bytes` this way).
+    /// A message's size as history counts it (retention, and r8 §B's
+    /// `content_bytes`): every string it carries (its ids, each part's id
+    /// and text) plus a fixed overhead per part. Messages stay within
+    /// `MAX_MESSAGE_BYTES` (plus the final marker part): JSON escapes a
+    /// byte to at most 6, so with ids under 1 KiB a message serializes to
+    /// under 6 × 132 KiB + its envelope, well below 1 MiB however escaped.
     pub fn bytes(&self) -> usize {
-        self.parts.iter().map(part_bytes).sum()
+        id_bytes(&self.message_id, &self.turn_id, self.request_id.as_deref())
+            + self.parts.iter().map(part_bytes).sum::<usize>()
     }
 }
 
+fn id_bytes(message_id: &str, turn_id: &str, request_id: Option<&str>) -> usize {
+    message_id.len() + turn_id.len() + request_id.map_or(0, str::len)
+}
+
 fn part_bytes(part: &Part) -> usize {
-    match part {
-        Part::Text { markdown, .. } => markdown.len(),
-        Part::Tool { name, summary, .. } => name.len() + summary.len(),
-        Part::Approval(card) => card.tool.len() + card.summary.len(),
-    }
+    part.id().len()
+        + match part {
+            Part::Text { markdown, .. } => PART_OVERHEAD + markdown.len(),
+            Part::Tool { name, summary, .. } => PART_OVERHEAD + name.len() + summary.len(),
+            Part::Approval(card) => {
+                let rules: usize = card
+                    .always_rules
+                    .iter()
+                    .map(|r| r.rule_id.len() + r.label.len() + r.scope.len())
+                    .sum();
+                CARD_OVERHEAD
+                    + card.approval_id.len()
+                    + card.tool.len()
+                    + card.summary.len()
+                    + rules
+                    + card.rule_id.as_ref().map_or(0, String::len)
+                    + card.note.as_ref().map_or(0, String::len)
+            }
+        }
 }
 
 /// A gap inside the retained timeline (r8 §C): items the worker's backlog
@@ -302,7 +334,11 @@ fn user_message(
     created_at_ms: i64,
 ) -> ChatMessage {
     let mut text = redact(text);
-    let cut = truncate_at(&text, MAX_MESSAGE_BYTES).len();
+    // The text's room: the bound less the ids and the part's own cost.
+    let room = MAX_MESSAGE_BYTES.saturating_sub(
+        id_bytes(&id, &turn_id, request_id.as_deref()) + "text".len() + PART_OVERHEAD,
+    );
+    let cut = truncate_at(&text, room).len();
     let was_cut = cut < text.len();
     text.truncate(cut);
     let mut parts = vec![Part::Text {
@@ -324,6 +360,14 @@ fn user_message(
         request_id,
         created_at_ms,
         parts,
+    }
+}
+
+/// The text a part's size counts beyond its fixed cost.
+fn text_len(part: &Part) -> usize {
+    match part {
+        Part::Text { markdown, .. } => markdown.len(),
+        _ => 0,
     }
 }
 
@@ -410,10 +454,15 @@ impl ChatSession {
         session
     }
 
-    /// History older than what is retained was cut (an adoption that
-    /// couldn't take the whole history): shown as truncation (r8 §C).
-    pub fn mark_truncated(&mut self) {
+    /// History older than what is retained was cut (the worker evicted
+    /// it): shown as truncation (r8 §C). `last_evicted_turn` is the turn of
+    /// the newest message cut, when known: what is retained of it is
+    /// partial.
+    pub fn mark_truncated(&mut self, last_evicted_turn: Option<&str>) {
         self.truncated = true;
+        if let Some(turn) = last_evicted_turn {
+            self.last_evicted_turn = Some(turn.to_string());
+        }
     }
 
     /// The position of the oldest retained message (see `first_pos`).
@@ -971,7 +1020,17 @@ impl ChatSession {
             .history
             .iter()
             .rposition(|m| m.role == Role::Assistant && m.message_id == message_id);
-        let size = existing.map_or(0, |i| self.history[i].bytes());
+        let size = existing.map_or_else(
+            || {
+                let request = match &self.current_turn {
+                    Some((t, r)) if *t == turn_id => r.as_deref(),
+                    _ => None,
+                };
+                id_bytes(&message_id, &turn_id, request)
+            },
+            |i| self.history[i].bytes(),
+        );
+        let count = existing.map_or(0, |i| self.history[i].parts.len());
         if let Some(i) = existing {
             let m = &self.history[i];
             if m.parts
@@ -981,21 +1040,25 @@ impl ChatSession {
                 return; // repeat, or the message already stopped growing
             }
         }
-        // Cap the message: keep what fits, then one final marker part.
+        // Cap the message (its bytes and its part count): keep what fits,
+        // then one final marker part.
         let mut marker = false;
-        if size + part_bytes(&part) > MAX_MESSAGE_BYTES {
+        if size + part_bytes(&part) > MAX_MESSAGE_BYTES || count + 2 > MAX_PARTS {
             marker = true;
-            let room = MAX_MESSAGE_BYTES - size;
+            let fixed = part_bytes(&part) - text_len(&part);
+            let room = MAX_MESSAGE_BYTES.saturating_sub(size + fixed);
             match &mut part {
-                Part::Text { markdown, .. } => {
+                Part::Text { markdown, .. } if count + 2 <= MAX_PARTS => {
                     let cut = truncate_at(markdown, room).len();
                     markdown.truncate(cut);
                 }
+                Part::Text { markdown, .. } => markdown.clear(),
                 Part::Tool { .. } | Part::Approval(_) => {}
             }
         }
         let mut new_parts = Vec::new();
-        let keep = !(marker && matches!(part, Part::Tool { .. }));
+        let empty = matches!(&part, Part::Text { markdown, .. } if markdown.is_empty());
+        let keep = !(marker && (empty || matches!(part, Part::Tool { .. })));
         if keep {
             new_parts.push(part);
         }
@@ -1748,9 +1811,9 @@ mod tests {
         let m = &s.history(None, 1, usize::MAX)[0];
         assert_eq!(m.parts.len(), 2);
         assert_eq!(m.parts[1].id(), TRUNCATED_ID);
-        assert!(
-            matches!(&m.parts[0], Part::Text { markdown, .. } if markdown.len() == MAX_MESSAGE_BYTES)
-        );
+        let room = MAX_MESSAGE_BYTES - ("u1".len() + "t1".len() + "text".len() + PART_OVERHEAD);
+        assert!(matches!(&m.parts[0], Part::Text { markdown, .. } if markdown.len() == room));
+        assert!(m.bytes() - part_bytes(&m.parts[1]) <= MAX_MESSAGE_BYTES);
     }
 
     #[test]
@@ -2025,7 +2088,8 @@ mod tests {
         }
         let ids = |v: Vec<ChatMessage>| v.into_iter().map(|m| m.message_id).collect::<Vec<_>>();
         assert_eq!(ids(s.history(None, 2, 1000)), ["u3", "u4"]);
-        assert_eq!(ids(s.history(None, 10, 25)), ["u3", "u4"]);
+        // Each counts 82 bytes: its ids, the part's id and cost, its text.
+        assert_eq!(ids(s.history(None, 10, 170)), ["u3", "u4"]);
         assert_eq!(ids(s.history(Some("u3"), 10, 1000)), ["u0", "u1", "u2"]);
         assert_eq!(ids(s.history(Some("u3"), 1, 1000)), ["u2"]);
         assert!(s.history(Some("nope"), 10, 1000).is_empty());
@@ -2093,7 +2157,7 @@ mod tests {
     #[test]
     fn oversized_message_stops_growing_with_a_truncated_part() {
         let mut s = ready();
-        s.on_log(asst("m", text_part("p1", &"a".repeat(131_000)), "t"), 2, 0);
+        s.on_log(asst("m", text_part("p1", &"a".repeat(130_000)), "t"), 2, 0);
         let o = s.on_log(asst("m", text_part("p2", &"b".repeat(2000)), "t"), 3, 0);
         assert_eq!(o.len(), 2, "kept part + marker");
         assert!(
@@ -2101,7 +2165,7 @@ mod tests {
                 .is_empty()
         );
         let m = &s.history(None, 1, usize::MAX)[0];
-        assert!(m.bytes() <= MAX_MESSAGE_BYTES + TRUNCATED.len());
+        assert!(m.bytes() <= MAX_MESSAGE_BYTES + part_bytes(&truncated_marker()));
         assert!(
             matches!(m.parts.last().unwrap(), Part::Text { markdown, .. } if markdown == TRUNCATED)
         );
@@ -2441,5 +2505,45 @@ mod tests {
         assert_eq!(s.reloads(), 1);
         assert_eq!(s.retained().count(), 4);
         assert_eq!(s.retained().last(), Some(&changed));
+    }
+
+    /// r8 §B: one message is always below the page's 1 MiB serialized
+    /// bound, however its text escapes, and its part count is capped.
+    #[test]
+    fn a_message_stays_far_below_a_mebibyte_however_it_escapes() {
+        let wire = |m: &ChatMessage| {
+            crate::chat::history::wire_size(&crate::chat::wire::history_message(
+                &"c".repeat(128),
+                "ses-aaaaaaaaaaaa",
+                "22222222-2222-4222-8222-222222222222",
+                u64::MAX,
+                m,
+                Some(&"p".repeat(64)),
+            ))
+        };
+        let mut s = ready();
+        // Control characters escape to 6 bytes each.
+        s.on_log(user("u1", "t1", &"\u{1}".repeat(200_000)), 2, 0);
+        s.on_log(
+            asst("m", text_part("p1", &"\u{1}".repeat(200_000)), "t1"),
+            3,
+            0,
+        );
+        // Thousands of tiny parts: capped.
+        for n in 0..5000 {
+            s.on_log(
+                asst("many", text_part(&format!("q{n}"), "\u{1}"), "t1"),
+                4,
+                0,
+            );
+        }
+        let all = s.history(None, 10, usize::MAX);
+        assert_eq!(all.len(), 3);
+        for m in &all {
+            assert!(m.bytes() <= MAX_MESSAGE_BYTES + part_bytes(&truncated_marker()));
+            assert!(m.parts.len() <= MAX_PARTS, "{}", m.parts.len());
+            assert!(wire(m) < 800 * 1024, "{}: {}", m.message_id, wire(m));
+        }
+        assert_eq!(all[2].parts.last().unwrap().id(), TRUNCATED_ID);
     }
 }

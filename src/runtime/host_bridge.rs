@@ -2488,23 +2488,32 @@ impl HostBridge {
         control: bool,
         cx: &mut Cx,
     ) {
-        let ids: Vec<String> = self
+        let ids: Vec<(String, bool)> = self
             .chats
             .get(sid)
             .map(|c| {
                 c.map
                     .iter()
                     .filter(|(id, c)| Some(id.as_str()) != except && self.current(&c.attachment))
-                    .filter(|(_, c)| {
-                        !control || self.host.attachment_can(&c.attachment, Permission::Control)
+                    .map(|(id, c)| {
+                        let can = self.host.attachment_can(&c.attachment, Permission::Control);
+                        (id.clone(), can)
                     })
-                    .map(|(id, _)| id.clone())
+                    .filter(|(_, can)| !control || *can)
                     .collect()
             })
             .unwrap_or_default();
-        for id in ids {
+        for (id, can) in ids {
+            // A view-only conversation's coverage names no card (r8 §C).
+            let own = match out {
+                Out::Coverage(_) => {
+                    session_of(cx, sid).map(|s| Out::Coverage(history::coverage_for(&s.chat, can)))
+                }
+                _ => None,
+            };
             if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
-                let env = chat_wire::event(&id, sid, &generation, sequence, out);
+                let env =
+                    chat_wire::event(&id, sid, &generation, sequence, own.as_ref().unwrap_or(out));
                 self.send_chat(env, cx);
             }
         }

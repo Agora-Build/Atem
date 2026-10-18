@@ -194,6 +194,10 @@ pub struct BrokerSession {
     history_requested: bool,
     /// The `chat_history_part`s went over their bound and were dropped.
     history_overflow: bool,
+    /// The turn of the newest message in the `chat_history_part`s so far:
+    /// when they overflow and are dropped, what is kept of that turn is
+    /// partial (r8 §C).
+    history_parts_turn: Option<String>,
     /// Where the worker's backlog dropped items (r8 §C), while a reload is
     /// asked for: the retained message before the gap and the first one
     /// after it. A reload that fails reports it as a hole.
@@ -262,6 +266,7 @@ impl BrokerSession {
             history_parts: Vec::new(),
             history_requested: false,
             history_overflow: false,
+            history_parts_turn: None,
             pending_gap: None,
         }
     }
@@ -699,6 +704,7 @@ impl BrokerSession {
                     // stays missing (a hole, r8 §C).
                     if std::mem::take(&mut self.history_requested) {
                         self.history_parts.clear();
+                        self.history_parts_turn = None;
                         self.history_overflow = false;
                         self.gap_is_a_hole();
                     }
@@ -822,6 +828,9 @@ impl BrokerSession {
                 }
             }
             WorkerMsg::ChatHistoryPart { history } => {
+                if let Some(last) = history.last() {
+                    self.history_parts_turn = Some(last.turn_id.clone());
+                }
                 // Bounded like the history it rebuilds; beyond that nothing
                 // of it is used (`history_overflow`), never a silent hole.
                 if self.history_overflow
@@ -836,6 +845,7 @@ impl BrokerSession {
             }
             WorkerMsg::ChatHistory { snapshot } => {
                 self.history_requested = false;
+                self.history_parts_turn = None;
                 let mut snapshot = snapshot;
                 let mut all = std::mem::take(&mut self.history_parts);
                 if std::mem::take(&mut self.history_overflow) {
@@ -851,8 +861,11 @@ impl BrokerSession {
                     // What the reload recovered goes to open conversations
                     // in timeline order (r8 §C); nothing reopens.
                     self.pending_gap = None;
+                    // The worker's eviction (it may have gone further than
+                    // this one's): truncation and the turn it cut.
                     if snapshot.truncated {
-                        self.chat.mark_truncated();
+                        self.chat
+                            .mark_truncated(snapshot.last_evicted_turn.as_deref());
                     }
                     for (message, after) in self.chat.reload(all) {
                         self.chat_out.push(Out::Recovered { message, after });
@@ -983,7 +996,12 @@ impl BrokerSession {
                     );
                     all.clear();
                     snapshot.truncated = true;
+                    // The newest message cut was the parts' last one.
+                    if let Some(turn) = self.history_parts_turn.take() {
+                        snapshot.last_evicted_turn = Some(turn);
+                    }
                 }
+                self.history_parts_turn = None;
                 all.append(&mut snapshot.history);
                 snapshot.history = all;
                 self.chat = ChatSession::restore(self.process_gen.clone(), snapshot);

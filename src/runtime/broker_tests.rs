@@ -481,3 +481,91 @@ async fn an_oversized_reload_keeps_the_history_and_reports_a_hole() {
     assert_eq!(ids, ["approval-keep"]);
     session.stop().unwrap();
 }
+
+fn text_message(id: &str, turn: &str) -> crate::chat::session::ChatMessage {
+    crate::chat::session::ChatMessage {
+        message_id: id.into(),
+        role: crate::chat::session::Role::Assistant,
+        origin: None,
+        turn_id: turn.into(),
+        request_id: None,
+        created_at_ms: 0,
+        parts: vec![crate::chat::adapter::Part::Text {
+            id: "p1".into(),
+            markdown: id.into(),
+        }],
+    }
+}
+
+/// r8 §C: a snapshot too large to take whole keeps its newest part; the
+/// cut is truncation and the turn of the newest message cut is partial
+/// (it goes on into what was kept).
+#[tokio::test]
+async fn an_oversized_snapshot_cut_makes_the_cut_turn_partial() {
+    use crate::chat::history::turn_coverage;
+    use crate::session_protocol::wire::Coverage;
+    let Setup { mut session, _dir } = launch("exec cat").await;
+    settle(&mut session).await;
+    let mut pumped = Pumped::default();
+    let n = 2 * crate::chat::session::MAX_HISTORY_MESSAGES + 1;
+    let older: Vec<_> = (0..n)
+        .map(|i| text_message(&format!("o{i}"), if i + 1 == n { "t-cut" } else { "t-old" }))
+        .collect();
+    for chunk in older.chunks(100) {
+        session.apply(
+            WorkerMsg::ChatHistoryPart {
+                history: chunk.to_vec(),
+            },
+            &mut pumped,
+        );
+    }
+    let mut snapshot = ChatSession::new("x".into(), 0).snapshot(0, 0);
+    snapshot.history = vec![text_message("k1", "t-cut"), text_message("k2", "t-new")];
+    session.apply(
+        WorkerMsg::ChatSnapshot {
+            snapshot,
+            input_count: 0,
+            chat_v1: true,
+            reason: None,
+            unavailable: Vec::new(),
+        },
+        &mut pumped,
+    );
+    assert!(session.chat.truncated());
+    assert_eq!(session.chat.oldest_retained(), Some("k1"));
+    assert_eq!(turn_coverage(&session.chat, "t-cut"), Coverage::Partial);
+    assert_eq!(turn_coverage(&session.chat, "t-new"), Coverage::Complete);
+    session.stop().unwrap();
+}
+
+/// r8 §C: a reload takes the worker's eviction, which may have gone
+/// further than this broker's: truncation and its cut turn, partial.
+#[tokio::test]
+async fn a_reload_takes_the_workers_cut_turn() {
+    use crate::chat::history::turn_coverage;
+    use crate::session_protocol::wire::Coverage;
+    let Setup { mut session, _dir } = launch("exec cat").await;
+    settle(&mut session).await;
+    session.chat.reload(vec![
+        text_message("a1", "t1"),
+        text_message("a2", "t1"),
+        text_message("b1", "t2"),
+    ]);
+    assert!(!session.chat.truncated());
+    let mut pumped = Pumped::default();
+    session.history_requested = true;
+    session.pending_gap = Some((Some("b1".into()), None));
+    let mut snapshot = ChatSession::new("x".into(), 0).snapshot(0, 0);
+    snapshot.history = vec![
+        text_message("a2", "t1"),
+        text_message("b1", "t2"),
+        text_message("b2", "t2"),
+    ];
+    snapshot.truncated = true;
+    snapshot.last_evicted_turn = Some("t1".into());
+    session.apply(WorkerMsg::ChatHistory { snapshot }, &mut pumped);
+    assert!(session.chat.truncated());
+    assert_eq!(turn_coverage(&session.chat, "t1"), Coverage::Partial);
+    assert_eq!(turn_coverage(&session.chat, "t2"), Coverage::Complete);
+    session.stop().unwrap();
+}

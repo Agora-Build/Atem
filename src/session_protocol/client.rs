@@ -850,8 +850,11 @@ impl ChatClient {
         view.next = Some(expected + 1);
         let id = data["messageId"].as_str().unwrap_or_default();
         match op {
-            "message" if data["history"] == true => match data["after_message_id"].as_str() {
-                Some(after) => view.insert_after(id, Some(after)),
+            // A recovered message (`after_message_id`, `null` when it is
+            // the oldest) goes after its neighbour; a page's waits for its
+            // `history_end`.
+            "message" if data["history"] == true => match data.get("after_message_id") {
+                Some(after) => view.insert_after(id, after.as_str()),
                 None => view.page.push(id.to_string()),
             },
             "message" => {

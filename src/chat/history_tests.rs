@@ -1,6 +1,6 @@
 use super::*;
 use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
-use crate::chat::session::Origin;
+use crate::chat::session::{Origin, Out};
 use serde_json::json;
 
 const GEN: &str = "22222222-2222-4222-8222-222222222222";
@@ -114,7 +114,8 @@ fn a_newest_page_and_its_next_pages_go_backwards_in_bounds() {
     let p = &end["page"];
     assert_eq!(p["selector"], "newest");
     assert_eq!(p["count"], 50);
-    assert_eq!(p["content_bytes"], 500);
+    let content: usize = chat.retained().skip(70).map(ChatMessage::bytes).sum();
+    assert_eq!(p["content_bytes"], content);
     assert_eq!(p["end"], false);
     assert_eq!(p["coverage"], "complete");
     assert_eq!(p["oldest_retained"], "m-0001");
@@ -178,7 +179,9 @@ fn pages_stop_at_the_content_and_serialized_bounds() {
     let c = cx("a1", "conv-1");
     let (got, end) = split(&page(&chat, &key, &to(c, None, true), Select::Newest, 1).unwrap());
     assert_eq!(got.len(), 2);
-    assert_eq!(end["page"]["content_bytes"], 2 * 120 * 1024);
+    let content: usize = chat.retained().skip(4).map(ChatMessage::bytes).sum();
+    assert_eq!(end["page"]["content_bytes"], content);
+    assert!(content > 2 * 120 * 1024 && content <= PAGE_CONTENT_BYTES);
     // Control characters escape to 6 bytes: the serialized bound cuts.
     let mut chat = ChatSession::new(GEN.into(), 0);
     for n in 1..=40 {
@@ -628,4 +631,108 @@ fn turn_replies_are_partial_with_a_hole_in_the_turn() {
         turn_replies(&chat, "t7", "t7-u").coverage,
         Coverage::Partial
     );
+}
+
+/// A view-only attachment never sees cards: a hole next to a card is named
+/// by the nearest visible neighbours, in pages and in `coverage`.
+#[test]
+fn a_view_only_attachment_sees_holes_by_their_visible_neighbours() {
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    chat.put_message(msg("m-0001", "turn-1", Role::User, "hi"));
+    chat.put_card(card("a1", "turn-1"));
+    chat.put_message(msg("m-0002", "turn-1", Role::Assistant, "ok"));
+    assert!(chat.add_hole(Some("m-0001"), Some("approval-a1"), Some(1)));
+    let key = HistoryKey::random();
+    let (got, end) = split(
+        &page(
+            &chat,
+            &key,
+            &to(cx("a", "c"), None, false),
+            Select::Newest,
+            1,
+        )
+        .unwrap(),
+    );
+    assert_eq!(got, ["m-0001", "m-0002"]);
+    assert_eq!(
+        end["page"]["holes"],
+        json!([{"after_message_id": "m-0001", "before_message_id": "m-0002", "count": 1}])
+    );
+    assert_eq!(end["page"]["coverage"], "partial");
+    let (_, end) = split(
+        &page(
+            &chat,
+            &key,
+            &to(cx("a", "c"), None, true),
+            Select::Newest,
+            1,
+        )
+        .unwrap(),
+    );
+    assert_eq!(end["page"]["holes"][0]["before_message_id"], "approval-a1");
+    // A hole after the card: after its visible predecessor.
+    let mut chat2 = ChatSession::new(GEN.into(), 0);
+    chat2.put_card(card("a0", "turn-0"));
+    chat2.put_message(msg("m-0001", "turn-1", Role::User, "hi"));
+    chat2.put_card(card("a1", "turn-1"));
+    chat2.add_hole(Some("approval-a1"), None, None);
+    chat2.add_hole(Some("approval-a0"), Some("m-0001"), None);
+    let seen = coverage_for(&chat2, false);
+    assert_eq!(seen.oldest_retained.as_deref(), Some("m-0001"));
+    assert_eq!(
+        seen.holes,
+        [Hole {
+            after: "m-0001".into(),
+            before: None,
+            count: None
+        }],
+        "the hole after the oldest card is older than anything seen"
+    );
+    assert_eq!(coverage_for(&chat2, true).holes.len(), 2);
+}
+
+/// The serialized reserve covers the 16 largest holes, whichever a page
+/// lists.
+#[test]
+fn the_reserve_takes_the_largest_holes() {
+    let mut holes: Vec<Hole> = (0..20)
+        .map(|n| Hole {
+            after: format!("s{n}"),
+            before: Some(format!("t{n}")),
+            count: None,
+        })
+        .collect();
+    holes[19].after = "x".repeat(128);
+    holes[18].before = Some("\u{1}".repeat(100));
+    let largest = largest_holes(&holes);
+    assert_eq!(largest.len(), 16);
+    assert_eq!(
+        largest[0].before.as_deref(),
+        Some("\u{1}".repeat(100).as_str())
+    );
+    assert_eq!(largest[1].after, "x".repeat(128));
+    assert!(largest.iter().all(|h| h.count == Some(u64::MAX)));
+}
+
+/// A recovered message always carries `after_message_id`, `null` when it is
+/// the oldest, so it never looks like an open's page message.
+#[test]
+fn a_recovered_message_names_what_it_follows_even_when_nothing() {
+    let m = msg("m-0001", "turn-1", Role::User, "hi");
+    let first = Out::Recovered {
+        message: m.clone(),
+        after: None,
+    };
+    let v = data(&chat_wire::event("c", "ses-aaaaaaaaaaaa", GEN, 3, &first));
+    assert_eq!(v["history"], true);
+    assert_eq!(v.get("after_message_id"), Some(&Value::Null));
+    let page = data(&chat_wire::history_message(
+        "c",
+        "ses-aaaaaaaaaaaa",
+        GEN,
+        3,
+        &m,
+        None,
+    ));
+    assert!(page.get("after_message_id").is_none());
 }

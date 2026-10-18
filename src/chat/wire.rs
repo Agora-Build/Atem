@@ -202,9 +202,11 @@ struct MessageBody<'a> {
     /// The history page this message belongs to (r8 §B).
     #[serde(rename = "page_id", skip_serializing_if = "Option::is_none")]
     page_id: Option<&'a str>,
-    /// A recovered message: the retained message it follows (r8 §C).
+    /// A recovered message: the retained message it follows, `null` when
+    /// it is the oldest (r8 §C; always present on a recovered message, so
+    /// it is never mistaken for an open's page message).
     #[serde(rename = "after_message_id", skip_serializing_if = "Option::is_none")]
-    after_message_id: Option<&'a str>,
+    after_message_id: Option<Option<&'a str>>,
 }
 
 #[derive(Serialize)]
@@ -276,7 +278,7 @@ fn message_body<'a>(
     m: &'a ChatMessage,
     history: bool,
     page_id: Option<&'a str>,
-    after_message_id: Option<&'a str>,
+    after_message_id: Option<Option<&'a str>>,
 ) -> MessageBody<'a> {
     MessageBody {
         message_id: &m.message_id,
@@ -383,7 +385,7 @@ pub fn event(conv: &str, agent: &str, generation: &str, sequence: u64, out: &Out
             agent,
             "message",
             Some(head),
-            message_body(message, true, None, after.as_deref()),
+            message_body(message, true, None, Some(after.as_deref())),
         ),
         Out::Coverage(c) => envelope(conv, agent, "coverage", Some(head), coverage_body(c)),
         Out::Delta { message_id, part } => envelope(
