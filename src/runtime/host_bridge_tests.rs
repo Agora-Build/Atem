@@ -176,7 +176,7 @@ impl Peer {
     }
 
     async fn hello(&mut self) -> Value {
-        let id = self.request("hello", json!({}));
+        let id = self.request("hello", json!({"revision": 8}));
         let welcome = self.reply(&id).await;
         assert_eq!(welcome["op"], "welcome", "{welcome}");
         self.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
@@ -890,7 +890,7 @@ fn sequences(seen: &[Value], conversation: &str) -> Vec<u64> {
 }
 
 #[test]
-fn paging_older_history_continues_the_live_sequence_and_unknown_cursors_are_refused() {
+fn open_with_before_is_refused_and_the_conversation_goes_on() {
     local(async {
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
@@ -908,116 +908,42 @@ fn paging_older_history_continues_the_live_sequence_and_unknown_cursors_are_refu
         }
         peer.drain(Duration::from_millis(300)).await;
         let live = sequences(&peer.seen, "conv-1");
-        let last = *live.last().unwrap();
 
-        // An older page of the open conversation: no `opened`, the page at
-        // the next sequences, nothing reset, then its end marker (a
-        // `status` naming the page).
-        let from = peer.seen.len();
-        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "u-2"}));
-        let end = peer
-            .wait_from(from, |v| {
-                is_chat(v, "status") && v["data"].get("page").is_some()
-            })
-            .await;
-        let page: Vec<&Value> = peer.seen[from..=end]
-            .iter()
-            .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1")
-            .collect();
-        assert!(!page.iter().any(|v| is_chat(v, "opened")), "{page:#?}");
-        let ids: Vec<&str> = page
-            .iter()
-            .filter(|v| is_chat(v, "message"))
-            .map(|v| v["data"]["messageId"].as_str().unwrap_or(""))
-            .collect();
-        assert_eq!(ids, ["u-1", "msg-1"], "{page:#?}");
-        assert_eq!(page.len(), 3, "the page, then its marker: {page:#?}");
-        assert!(page[..2].iter().all(|v| v["data"]["history"] == true));
-        assert_eq!(page[0]["data"]["sequence"], last + 1);
-        assert_eq!(page[1]["data"]["sequence"], last + 2);
-        let marker = &page[2]["data"];
-        assert_eq!(marker["sequence"], last + 3);
-        assert_eq!(marker["state"], "ready");
-        assert_eq!(
-            marker["page"],
-            json!({"before": "u-2", "count": 2, "start": true})
+        // r8 §A: `open.before`/`open.generation` (the r7.2 paging form) are
+        // removed: refused (unsupported, unsequenced), never a page, the
+        // open conversation not reset and no new one opened.
+        for (conversation, extra) in [
+            ("conv-1", json!({"before": "u-2"})),
+            ("conv-1", json!({"before": "u-1", "generation": pg})),
+            ("conv-2", json!({"before": "u-2"})),
+        ] {
+            let from = peer.seen.len();
+            peer.chat("open", conversation, &sid, &pg, extra.clone());
+            let at = peer
+                .wait_from(from, |v| {
+                    v["type"] == "agentChat" && v["data"]["conversationId"] == conversation
+                })
+                .await;
+            let error = peer.seen[at]["data"].clone();
+            assert_eq!(error["op"], "error", "{extra}: {error}");
+            assert_eq!(error["code"], "unsupported_version");
+            assert!(error.get("sequence").is_none(), "{error}");
+        }
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            !peer.seen.iter().any(|v| v["type"] == "agentChat"
+                && v["data"]["conversationId"] == "conv-2"
+                && v["data"]["op"] != "error"),
+            "conv-2 never opened"
         );
+        assert!(!peer.seen.iter().any(|v| v["data"].get("page").is_some()));
 
-        // Live events go on after the page.
+        // Live events go on at the next sequences.
         let rid = uuid::Uuid::new_v4().to_string();
         submit_until_complete(peer, "conv-1", &sid, &pg, lease, &rid, "third").await;
         peer.drain(Duration::from_millis(300)).await;
         let all = sequences(&peer.seen, "conv-1");
-        assert_eq!(
-            all,
-            (0..all.len() as u64).collect::<Vec<_>>(),
-            "never reset or reused"
-        );
-
-        // A cursor that isn't retained is refused, never an empty page: in
-        // the open conversation (sequenced, it stays open) ...
-        let from = peer.seen.len();
-        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "nope"}));
-        let at = peer
-            .wait_from(from, |v| {
-                is_chat(v, "error") && v["data"]["conversationId"] == "conv-1"
-            })
-            .await;
-        let error = peer.seen[at]["data"].clone();
-        assert_eq!(error["code"], "stale_target", "{error}");
-        assert_eq!(error["sequence"], all.len() as u64);
-        // ... and on a new one (not opened).
-        let from = peer.seen.len();
-        peer.chat("open", "conv-2", &sid, &pg, json!({"before": "nope"}));
-        let at = peer
-            .wait_from(from, |v| {
-                v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-2"
-            })
-            .await;
-        let error = peer.seen[at]["data"].clone();
-        assert_eq!(error["op"], "error", "{error}");
-        assert_eq!(error["code"], "stale_target");
-        assert!(error.get("sequence").is_none());
-        // A cursor named with another generation is refused too.
-        let from = peer.seen.len();
-        peer.chat(
-            "open",
-            "conv-1",
-            &sid,
-            &pg,
-            json!({"before": "u-2", "generation": "another-generation"}),
-        );
-        let at = peer
-            .wait_from(from, |v| {
-                is_chat(v, "error") && v["data"]["conversationId"] == "conv-1"
-            })
-            .await;
-        assert_eq!(peer.seen[at]["data"]["code"], "stale_target");
-        // The oldest message as the cursor: an empty page, whose marker
-        // says it is the start.
-        let from = peer.seen.len();
-        peer.chat(
-            "open",
-            "conv-1",
-            &sid,
-            &pg,
-            json!({"before": "u-1", "generation": pg}),
-        );
-        let end = peer
-            .wait_from(from, |v| {
-                is_chat(v, "status") && v["data"].get("page").is_some()
-            })
-            .await;
-        let got: Vec<&Value> = peer.seen[from..=end]
-            .iter()
-            .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1")
-            .collect();
-        assert_eq!(got.len(), 1, "only the marker: {got:#?}");
-        assert_eq!(
-            got[0]["data"]["page"],
-            json!({"before": "u-1", "count": 0, "start": true})
-        );
-        let all = sequences(&peer.seen, "conv-1");
+        assert!(all.len() > live.len());
         assert_eq!(
             all,
             (0..all.len() as u64).collect::<Vec<_>>(),
@@ -1032,7 +958,7 @@ fn a_link_that_is_not_a_verified_pairing_gets_no_attachment() {
     local(async {
         let mut rt = Runtime::start(false).await;
         let peer = &mut rt.peer;
-        let id = peer.request("hello", json!({}));
+        let id = peer.request("hello", json!({"revision": 8}));
         let error = peer.reply(&id).await;
         assert_eq!(error["op"], "error");
         assert_eq!(error["code"], "unauthorized");
@@ -1134,7 +1060,8 @@ fn re_authentication_fences_the_attachment_and_its_lease_expires() {
         let (sid, pg) = (session.id.clone(), session.generation.clone());
         let peer = &mut rt.peer;
         let hello_id = uuid::Uuid::new_v4().to_string();
-        let hello = json!({"type":"session","data":{"v":1,"op":"hello","id":hello_id}});
+        let hello =
+            json!({"type":"session","data":{"v":1,"op":"hello","id":hello_id,"revision":8}});
         peer.send(hello.clone());
         let welcome = peer.reply(&hello_id).await;
         peer.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
@@ -1233,7 +1160,7 @@ fn a_second_hello_on_the_link_replaces_the_attachment() {
         // Control again without takeover.
         assert!(peer.acquire(&sid, &pg).await > epoch);
         // At most one replacement a second.
-        let id = peer.request("hello", json!({}));
+        let id = peer.request("hello", json!({"revision": 8}));
         assert_eq!(peer.reply(&id).await["code"], "busy");
         rt.clock.skip(1_000);
         let again = rt.peer.hello().await;
@@ -1987,7 +1914,7 @@ impl Runtime {
 }
 
 #[test]
-fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire() {
+fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_from_chat() {
     local(async {
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
@@ -2030,18 +1957,32 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire
         assert_eq!(card["summary"], "npm test");
         assert_eq!(card["always_rules"], request["always_rules"]);
 
-        // Answered from chat with acquire: the lease and the answer together.
+        // r8 removed `acquire` on an answer: refused, nothing taken.
+        let refused_id = uuid::Uuid::new_v4().to_string();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": refused_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        let refused = peer
+            .wait(|v| is_session(v, "error") && v["data"]["code"] == "unsupported_version")
+            .await;
+        assert!(refused["data"].get("re").is_none(), "{refused}");
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
+        // Answered from chat under the lease.
+        let lease = peer.acquire(&sid, &pg).await;
         let request_id = uuid::Uuid::new_v4().to_string();
         peer.chat(
             "submit",
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": request_id,
-                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+            json!({"generation": pg, "requestId": request_id, "lease_epoch": lease,
+                   "approval": {"approval_id": aid, "decision": "allow_once"}}),
         );
-        let granted = peer.wait(|v| is_session(v, "lease_changed")).await;
-        assert_eq!(granted["data"]["reason"], "granted");
         let rid = request_id.clone();
         peer.wait(move |v| is_chat(v, "accepted") && v["data"]["requestId"] == rid.as_str())
             .await;
@@ -2135,12 +2076,12 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
         peer.wait_from(0, |v| is_card(v, &aid, "answered_terminal"))
             .await;
         agent_event(&fake, "answer 2 none ").await;
-        // A late answer is refused and takes no lease.
+        // A late answer is refused.
         let id = peer.request(
             "submit",
-            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)), "request_id": uuid::Uuid::new_v4().to_string(),
                    "kind": "approval",
-                   "payload": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+                   "payload": {"approval_id": aid, "decision": "allow_once"}}),
         );
         assert_eq!(peer.reply(&id).await["code"], "stale_target");
         rt.shutdown().await;
@@ -2418,13 +2359,14 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
         std::fs::write(fake.join("stop-1"), "").unwrap();
         agent_event(&fake, "stopped 1").await;
         let request_id = uuid::Uuid::new_v4().to_string();
+        let lease = peer.acquire(&sid, &pg).await;
         peer.chat(
             "submit",
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": request_id,
-                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+            json!({"generation": pg, "lease_epoch": lease, "requestId": request_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once"}}),
         );
         peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
         rt.clock
@@ -2693,8 +2635,8 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": answer,
-                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+            json!({"generation": pg, "lease_epoch": lease, "requestId": answer,
+                   "approval": {"approval_id": aid, "decision": "allow_once"}}),
         );
         agent_event(&fake, "answer 1 allow").await;
         let peer = &mut rt.peer;
@@ -2816,10 +2758,11 @@ fn codex_behind_a_wrapper_keeps_chat_and_approvals_across_new() {
         let request = peer.wait(|v| is_session(v, "approval_request")).await["data"].clone();
         let aid = request["approval_id"].as_str().unwrap().to_string();
         activity_until(peer, &sid, "waiting").await;
+        let lease = peer.acquire(&sid, &pg).await;
         let id = peer.request(
             "submit",
-            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
-                   "kind": "approval", "payload": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval", "payload": {"approval_id": aid, "decision": "allow_once"}}),
         );
         peer.reply(&id).await;
         agent_event(&fake, "answer 1 allow").await;
@@ -2961,14 +2904,15 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
         );
         let rule_id = rule["rule_id"].as_str().unwrap().to_string();
         let from = peer.seen.len();
+        let lease = peer.acquire(&sid, &pg).await;
         peer.chat(
             "submit",
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": uuid::Uuid::new_v4().to_string(),
+            json!({"generation": pg, "lease_epoch": lease, "requestId": uuid::Uuid::new_v4().to_string(),
                    "approval": {"approval_id": aid, "decision": "allow_always",
-                                "rule_id": rule_id, "acquire": true}}),
+                                "rule_id": rule_id}}),
         );
         agent_event(&fake, "answer 1 allow").await;
         let peer = &mut rt.peer;
@@ -3148,14 +3092,15 @@ async fn adopted_rules_dropped_after(change: &str) {
         .unwrap()
         .to_string();
     let from = peer.seen.len();
+    let lease = peer.acquire(&sid, &pg).await;
     peer.chat(
         "submit",
         "conv-1",
         &sid,
         &pg,
-        json!({"generation": pg, "requestId": uuid::Uuid::new_v4().to_string(),
+        json!({"generation": pg, "lease_epoch": lease, "requestId": uuid::Uuid::new_v4().to_string(),
                "approval": {"approval_id": aid, "decision": "allow_always",
-                            "rule_id": rule_id, "acquire": true}}),
+                            "rule_id": rule_id}}),
     );
     agent_event(&fake, "answer 1 allow").await;
     let peer = &mut rt.peer;

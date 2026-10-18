@@ -13,7 +13,8 @@
 //! Unknown actions, unknown assertion keys and unknown `setup` fields fail the
 //! scenario instead of being ignored.
 
-use super::client::{LeaseClient, LeaseRequest, RegistryClient};
+use super::client::{AdmissionClient, LeaseClient, LeaseRequest, RegistryClient};
+use super::revision::{self, CHAT_COVERAGE, CHAT_LOOKUP};
 use super::wire::{
     self, AlwaysRule, ApprovalCloseReason, ClientKind, DecodeError, Envelope, Op, Permission,
 };
@@ -80,8 +81,9 @@ pub struct Scenario {
     pub name: String,
     #[serde(default)]
     pub side: Side,
-    /// A contract revision this runner doesn't implement yet (`"r8"`): the
-    /// scenario is parsed and reported as not run.
+    /// The contract revision a scenario is written for (`"r8"`). An `r8-*`
+    /// scenario runs once the host work it needs is implemented
+    /// (`revision::r8_fixture_runnable`), else it is reported as not run.
     #[serde(default)]
     pub requires: Option<String>,
     pub setup: Setup,
@@ -179,19 +181,20 @@ pub trait HostUnderTest {
 
 pub type HostFactory<'a> = &'a dyn Fn(&Setup) -> Result<Box<dyn HostUnderTest>, String>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Passed,
     Skipped,
-    /// Needs a contract revision not implemented yet (`requires`).
-    NotRun,
+    /// Needs host work not implemented yet (the reason names it).
+    NotRun(String),
 }
 
 #[derive(Debug, Default)]
 pub struct Report {
     pub passed: Vec<String>,
     pub skipped: Vec<String>,
-    pub not_run: Vec<String>,
+    /// (name, reason)
+    pub not_run: Vec<(String, String)>,
     pub failed: Vec<(String, String)>,
 }
 
@@ -237,7 +240,7 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
         match result {
             Ok(Outcome::Passed) => report.passed.push(name),
             Ok(Outcome::Skipped) => report.skipped.push(name),
-            Ok(Outcome::NotRun) => report.not_run.push(name),
+            Ok(Outcome::NotRun(why)) => report.not_run.push((name, why)),
             Err(e) => report.failed.push((name, e)),
         }
     }
@@ -248,11 +251,24 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
 pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, String> {
     let scenario: Scenario =
         serde_json::from_value(file.clone()).map_err(|e| format!("scenario: {e}"))?;
-    if scenario.requires.is_some() {
-        return Ok(Outcome::NotRun);
-    }
-    if scenario.setup.clients.iter().any(|c| c.welcome.is_some()) {
-        return Err(format!("{}: welcome needs requires", scenario.name));
+    let r8 = scenario.name.starts_with("r8-");
+    match scenario.requires.as_deref() {
+        None if !r8 => {
+            if let Some(why) = revision::superseded(&scenario.name) {
+                return Ok(Outcome::NotRun(why.to_string()));
+            }
+        }
+        Some("r8") if r8 => {
+            if let Err(why) = revision::r8_fixture_runnable(&scenario.name) {
+                return Ok(Outcome::NotRun(why));
+            }
+        }
+        other => {
+            return Err(format!(
+                "{}: requires {other:?} does not fit its name",
+                scenario.name
+            ));
+        }
     }
     let mut runner = match scenario.side {
         Side::Host => match host {
@@ -338,6 +354,12 @@ struct ClientMachines {
     lists_requested: u64,
     authorization_deadline: Option<u64>,
     attachment_gen: String,
+    /// r8 revision admission. A client scenario starts welcomed (with this
+    /// host's features) unless it sends `hello`, which starts a handshake.
+    admission: AdmissionClient,
+    /// Messages the client machines sent on their own (`client_try`s they
+    /// allowed) since the last `sent` check.
+    sent: Vec<Value>,
 }
 
 struct Runner {
@@ -352,6 +374,10 @@ struct Runner {
     holds: Vec<(String, String)>,
     held: Vec<(String, Value)>,
     clients: HashMap<String, ClientMachines>,
+}
+
+fn env_of(msg: &wire::SessionMessage) -> Envelope {
+    Envelope::Session(msg.clone())
 }
 
 /// Decodes `msg` strictly, as the receiving side would.
@@ -411,6 +437,8 @@ impl Runner {
                         lists_requested: 0,
                         authorization_deadline: None,
                         attachment_gen: c.attachment_gen.clone(),
+                        admission: AdmissionClient::admitted(revision::FEATURES),
+                        sent: Vec::new(),
                     };
                     (c.name.clone(), m)
                 })
@@ -471,6 +499,7 @@ impl Runner {
             ("hold", &[]),
             ("deliver", &[]),
             ("deliver_to_client", &["json"]),
+            ("client_try", &["json", "refused"]),
             ("disconnect", &[]),
             ("resume", &["attachment_gen"]),
             ("reconnect", &["attachment_gen"]),
@@ -536,6 +565,11 @@ impl Runner {
                 self.client_deliver(&client, take(&step, "json")?)
             }
             ("assert_client", Side::Client) => self.assert_client(arg),
+            ("client_try", Side::Client) => {
+                let client = self.client(arg)?.to_string();
+                let refused = as_str(take(&step, "refused")?, "refused")?;
+                self.client_try(&client, take(&step, "json")?, refused)
+            }
             ("expect", Side::Host) => {
                 let client = self.client(arg)?.to_string();
                 let empty = Value::Object(Map::new());
@@ -594,7 +628,12 @@ impl Runner {
                 Ok(())
             }
             ("assert", Side::Host) => self.assert_host(arg),
-            (_, Side::Host) if !matches!(*action, "deliver_to_client" | "assert_client") => {
+            (_, Side::Host)
+                if !matches!(
+                    *action,
+                    "deliver_to_client" | "assert_client" | "client_try"
+                ) =>
+            {
                 let event = self.event(action, arg, &step)?;
                 let now = self.now;
                 self.host()?.event(&event, now)?;
@@ -808,6 +847,18 @@ impl Runner {
         };
         let now = self.now;
         let m = self.clients.get_mut(client).unwrap();
+        if let Op::Hello { revision, .. } = &msg.op {
+            if *revision != Some(revision::REVISION) {
+                return Err("an r8 client's hello carries revision 8".into());
+            }
+            return m
+                .admission
+                .hello_sent()
+                .map_err(|e| format!("client refused to send: {e}"));
+        }
+        m.admission
+            .check_send(&env_of(&msg))
+            .map_err(|e| format!("client refused to send: {e}"))?;
         let (kind, binding) = match &msg.op {
             Op::List {} => {
                 m.registry.note_list_sent();
@@ -846,6 +897,18 @@ impl Runner {
         };
         let now = self.now;
         let m = self.clients.get_mut(client).unwrap();
+        if let Op::Welcome {
+            revision, features, ..
+        } = &msg.op
+            && !m.admission.on_welcome(*revision, features.as_deref())
+        {
+            // An older host (or one already refused): nothing is applied.
+            return Ok(());
+        }
+        if !m.admission.applies() {
+            // Refused or not welcomed: the client applies nothing.
+            return Ok(());
+        }
         match &msg.op {
             Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. } => {
                 // Routed by `re`; a reply nobody is waiting for is dropped (rule 1).
@@ -946,11 +1009,39 @@ impl Runner {
                 "runtime_epoch" => m.registry.runtime_epoch().map_or(Value::Null, Value::from),
                 "seq" => m.registry.seq().map_or(Value::Null, Value::from),
                 "sent_list" => Value::Bool(m.lists_requested > 0),
+                "admitted" => Value::Bool(m.admission.is_admitted()),
+                "revision" => m.admission.revision().map_or(Value::Null, Value::from),
+                "features_enabled" => Value::from(m.admission.features_enabled().to_vec()),
+                "lookup_enabled" => Value::Bool(m.admission.enabled(CHAT_LOOKUP)),
+                "coverage_enabled" => Value::Bool(m.admission.enabled(CHAT_COVERAGE)),
+                // Chat needs an admitted attachment (per-session chat-v1
+                // comes from the descriptor's capabilities).
+                "chat_enabled" => Value::Bool(m.admission.is_admitted()),
+                "sent" => Value::from(m.sent.clone()),
                 other => return Err(format!("unknown assert_client key {other:?}")),
             };
             same(expected, Some(&got), key)?;
         }
+        if o.contains_key("sent") {
+            self.clients.get_mut(name).unwrap().sent.clear();
+        }
         Ok(())
+    }
+
+    /// The client is asked to send `json` and must refuse it locally with
+    /// exactly `refused` (nothing is sent).
+    fn client_try(&mut self, client: &str, json: &Value, refused: &str) -> Result<(), String> {
+        let env =
+            decode_value(json).map_err(|e| format!("client request does not decode: {e:?}"))?;
+        let m = self.clients.get_mut(client).unwrap();
+        match m.admission.check_send(&env) {
+            Err(reason) if reason == refused => Ok(()),
+            Err(reason) => Err(format!("refused with {reason:?}, expected {refused:?}")),
+            Ok(()) => {
+                m.sent.push(wire::to_value(&env));
+                Err(format!("the client sent it; expected refusal {refused:?}"))
+            }
+        }
     }
 }
 
@@ -959,8 +1050,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The scenarios this runner implements (r8-draft ones, with
-    /// `requires`, are left out; see `r8_draft_fixtures_parse_and_are_not_run`).
+    /// The scenarios this runner runs now: every r7.x one, and the `r8-*`
+    /// ones whose host work is implemented (`revision::R8_FIXTURE_NEEDS`).
     fn scenario_files() -> Vec<(String, Value)> {
         scenario_paths(&fixtures_dir())
             .into_iter()
@@ -968,25 +1059,164 @@ mod tests {
                 let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
                 (p.file_name().unwrap().to_string_lossy().into_owned(), v)
             })
-            .filter(|(_, v)| v.get("requires").is_none())
+            .filter(|(_, v)| {
+                let name = v["name"].as_str().unwrap();
+                if name.starts_with("r8-") {
+                    revision::r8_fixture_runnable(name).is_ok()
+                } else {
+                    revision::superseded(name).is_none()
+                }
+            })
             .collect()
     }
 
+    /// Every `r8-*` fixture is listed with the work it needs; the ones whose
+    /// work is implemented run (and pass, see below), the rest are reported
+    /// as not run with what they still need.
     #[test]
-    fn r8_draft_fixtures_parse_and_are_not_run() {
-        let mut draft = Vec::new();
+    fn r8_fixtures_run_once_their_work_is_implemented() {
+        let mut waiting = Vec::new();
+        let mut names = Vec::new();
         for p in scenario_paths(&fixtures_dir()) {
             let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-            if v.get("requires").is_some() {
-                let s: Scenario = serde_json::from_value(v.clone()).expect("r8 fixture parses");
-                assert_eq!(s.requires.as_deref(), Some("r8"), "{}", s.name);
-                assert_eq!(run_scenario(&v, Some(&fake_runtime)), Ok(Outcome::NotRun));
-                draft.push(s.name);
+            let s: Scenario = serde_json::from_value(v.clone()).expect("fixture parses");
+            if !s.name.starts_with("r8-") {
+                assert_eq!(s.requires, None, "{}", s.name);
+                continue;
+            }
+            assert_eq!(s.requires.as_deref(), Some("r8"), "{}", s.name);
+            names.push(s.name.clone());
+            match revision::r8_fixture_runnable(&s.name) {
+                Ok(()) => {
+                    assert_eq!(
+                        run_scenario(&v, Some(&fake_runtime)),
+                        Ok(Outcome::Passed),
+                        "{}",
+                        s.name
+                    )
+                }
+                Err(why) => {
+                    assert!(why.starts_with("needs "), "{}: {why}", s.name);
+                    assert_eq!(
+                        run_scenario(&v, Some(&fake_runtime)),
+                        Ok(Outcome::NotRun(why.clone()))
+                    );
+                    waiting.push((s.name, why));
+                }
             }
         }
-        assert!(!draft.is_empty(), "r8 draft fixtures missing");
+        let mut listed: Vec<&str> = revision::R8_FIXTURE_NEEDS.iter().map(|(n, _)| *n).collect();
+        listed.sort();
+        assert_eq!(
+            listed, names,
+            "R8_FIXTURE_NEEDS lists exactly the r8 fixtures"
+        );
         let report = run_all(&fixtures_dir(), Some(&fake_runtime));
-        assert_eq!(report.not_run, draft);
+        let r8_not_run: Vec<_> = report
+            .not_run
+            .iter()
+            .filter(|(n, _)| n.starts_with("r8-"))
+            .cloned()
+            .collect();
+        assert_eq!(r8_not_run, waiting);
+        // The superseded r7.x fixtures exist, are not run, and fail if run.
+        for (name, why) in revision::SUPERSEDED_BY_R8 {
+            assert!(
+                report
+                    .not_run
+                    .contains(&(name.to_string(), why.to_string()))
+            );
+            let mut f = fixture(name);
+            f["name"] = json!("superseded-run-anyway");
+            assert!(run_scenario(&f, Some(&fake_runtime)).is_err(), "{name}");
+        }
+        for name in [
+            "r8-client-refuses-a-host-without-revision-8",
+            "r8-client-enables-only-advertised-features",
+        ] {
+            assert!(report.passed.iter().any(|p| p == name), "{name} passes");
+        }
+    }
+
+    /// The admission scenario's welcome names seven features, so it waits
+    /// for them (`R8_FIXTURE_NEEDS`). Everything else it checks holds now:
+    /// with the expected feature list replaced by this host's, it passes,
+    /// and it fails on a changed expectation.
+    #[test]
+    fn hello_admission_holds_with_this_hosts_features() {
+        let name = "r8-hello-without-revision-8-is-refused-before-any-attachment";
+        let mut f = fixture(name);
+        assert!(matches!(
+            run_scenario(&f, Some(&fake_runtime)),
+            Ok(Outcome::NotRun(_))
+        ));
+        f.as_object_mut().unwrap().remove("requires");
+        f["name"] = json!("hello-admission-with-this-hosts-features");
+        let step = f["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["match"]["op"] == "welcome")
+            .unwrap();
+        step["match"]["features"] = json!(revision::FEATURES);
+        assert_eq!(run_scenario(&f, Some(&fake_runtime)), Ok(Outcome::Passed));
+        for (path, to) in [("revision", json!(7)), ("code", json!("unauthorized"))] {
+            let mut g = f.clone();
+            let step = g["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["match"].get(path).is_some())
+                .unwrap();
+            step["match"][path] = to;
+            assert!(run_scenario(&g, Some(&fake_runtime)).is_err(), "{path}");
+        }
+        let mut g = f.clone();
+        let last = g["steps"].as_array_mut().unwrap().last_mut().unwrap();
+        last["assert"]["attachments"] = json!(0);
+        assert!(run_scenario(&g, Some(&fake_runtime)).is_err());
+    }
+
+    #[test]
+    fn r8_client_fixtures_fail_on_a_changed_expectation() {
+        let refuses = "r8-client-refuses-a-host-without-revision-8";
+        let mut f = fixture(refuses);
+        mutate_assert(&mut f, "admitted", &json!(false), json!(true));
+        assert!(run_scenario(&f, None).is_err());
+        let mut f = fixture(refuses);
+        mutate_assert(&mut f, "registry", &json!([]), json!(["ses-aaaaaaaaaaaa"]));
+        assert!(run_scenario(&f, None).is_err());
+        // An older host's welcome followed by a correct one stays refused.
+        let mut f = fixture(refuses);
+        f["steps"][5]["json"]["data"]["revision"] = json!(8);
+        assert!(run_scenario(&f, None).is_ok());
+
+        let enables = "r8-client-enables-only-advertised-features";
+        let mut f = fixture(enables);
+        mutate_assert(&mut f, "lookup_enabled", &json!(false), json!(true));
+        assert!(run_scenario(&f, None).is_err());
+        let mut f = fixture(enables);
+        let try_step = f["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.get("client_try").is_some())
+            .unwrap();
+        try_step["refused"] = json!("feature chat.history not advertised");
+        assert!(run_scenario(&f, None).is_err());
+        // Advertised, the lookup is sent, not refused.
+        let mut f = fixture(enables);
+        f["steps"][1]["json"]["data"]["features"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("chat.lookup"));
+        f["steps"][2]["assert_client"]["features_enabled"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("chat.lookup"));
+        f["steps"][2]["assert_client"]["lookup_enabled"] = json!(true);
+        let err = run_scenario(&f, None).unwrap_err();
+        assert!(err.contains("the client sent it"), "{err}");
     }
 
     fn fake_runtime(setup: &Setup) -> Result<Box<dyn HostUnderTest>, String> {
@@ -1108,26 +1338,6 @@ mod tests {
                 json!("forbidden"),
             ),
             (
-                "approval-stays-pending-when-the-lease-ends",
-                "reason",
-                json!("timed_out"),
-            ),
-            (
-                "approval-opens-without-a-lease-holder",
-                "reason",
-                json!("takeover"),
-            ),
-            (
-                "approval-answer-with-acquire-takes-control-from-the-holder",
-                "code",
-                json!("forbidden"),
-            ),
-            (
-                "approval-late-answer-after-push-resolved-is-stale-target",
-                "code",
-                json!("stale_lease"),
-            ),
-            (
                 "approval-needs-control-and-the-lease",
                 "code",
                 json!("stale_lease"),
@@ -1180,14 +1390,15 @@ mod tests {
         step["assert"]["approval_decisions"][0]["message"] = json!("something else");
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
         // And on a changed push request.
-        let mut f = fixture("approval-late-answer-after-push-resolved-is-stale-target");
+        let mut f = fixture("approval-pending-is-sent-again-after-list");
+        assert_eq!(run_scenario(&f, Some(&fake_runtime)), Ok(Outcome::Passed));
         let step = f["steps"]
             .as_array_mut()
             .unwrap()
             .iter_mut()
             .find(|s| s["assert"].get("pushes").is_some())
             .unwrap();
-        step["assert"]["pushes"][1]["reason"] = json!("answered_remote");
+        step["assert"]["pushes"][1]["reason"] = json!("timed_out");
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
     }
 
@@ -1339,6 +1550,7 @@ mod tests {
                         op: Op::Error {
                             code: wire::ErrorCode::Busy,
                             detail: None,
+                            revision: None,
                         },
                     }),
                 ));

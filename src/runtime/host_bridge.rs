@@ -108,9 +108,6 @@ const HISTORY_BYTES: usize = 256 * 1024;
 const MAX_CONVERSATIONS: usize = 8;
 const RESTARTED: &str = "the agent was restarted; reopen the chat";
 const NOT_AVAILABLE: &str = "chat is not available for this agent";
-/// `open{before}` naming a message no longer retained (`stale_target`).
-const UNKNOWN_CURSOR: &str =
-    "that message is no longer in the history; reopen without before to get the newest page";
 const NO_TURN: &str = "no turn was running";
 /// An interrupt on a session without chat: nothing knows whether a turn runs.
 const NO_TURN_STATE: &str = "no turn state; use the terminal";
@@ -2122,14 +2119,7 @@ impl HostBridge {
                 };
                 let conversation = env.conversation_id.clone();
                 match chat_wire::parse_inbound(&env) {
-                    Ok(Inbound::Open { before, generation }) => self.open_conversation(
-                        attachment,
-                        sid,
-                        &conversation,
-                        before.as_deref(),
-                        generation.as_deref(),
-                        cx,
-                    ),
+                    Ok(Inbound::Open) => self.open_conversation(attachment, sid, &conversation, cx),
                     Ok(Inbound::Close) => {
                         if let Some(chats) = self.chats.get_mut(sid) {
                             chats.conversations.remove(&conversation);
@@ -2157,15 +2147,7 @@ impl HostBridge {
         }
     }
 
-    fn open_conversation(
-        &mut self,
-        attachment: &str,
-        sid: &str,
-        conversation: &str,
-        before: Option<&str>,
-        before_generation: Option<&str>,
-        cx: &mut Cx,
-    ) {
+    fn open_conversation(&mut self, attachment: &str, sid: &str, conversation: &str, cx: &mut Cx) {
         let Some(session) = session_of(cx, sid) else {
             return;
         };
@@ -2183,69 +2165,9 @@ impl HostBridge {
         // Approval cards and session rules only for an attachment that may
         // answer them.
         let control = self.host.attachment_can(attachment, Permission::Control);
-        // An open conversation of this attachment pages: the older page
-        // continues its live sequence (no `opened`, nothing reset).
-        let paging = before.is_some()
-            && self
-                .chats
-                .get(sid)
-                .and_then(|c| c.conversations.get(conversation))
-                .is_some_and(|c| c.attachment == attachment);
-        // A cursor no longer retained (evicted, another generation, never
-        // sent) is refused, never answered with an empty page that would
-        // look like the start of history.
-        if let Some(id) = before
-            && !session.chat.retains(id, before_generation)
-        {
-            let head = if paging {
-                self.next_head(sid, conversation, cx)
-            } else {
-                None
-            };
-            let env = chat_error(
-                conversation,
-                sid,
-                head,
-                None,
-                "stale_target",
-                UNKNOWN_CURSOR,
-            );
-            self.send_chat(env, cx);
-            return;
-        }
         // Cards are left out before the limits (a view-only page of cards
         // still pages on to older messages).
         let keep = |m: &crate::chat::session::ChatMessage| control || !is_card(m);
-        if paging {
-            let (page, start) = session
-                .chat
-                .page(before, HISTORY_MESSAGES, HISTORY_BYTES, keep);
-            let status = Out::Status(session.chat.status().clone());
-            let count = page.len();
-            for message in page {
-                if let Some((generation, sequence)) = self.next_head(sid, conversation, cx) {
-                    let env = chat_wire::history_message(
-                        conversation,
-                        sid,
-                        &generation,
-                        sequence,
-                        &message,
-                    );
-                    self.send_chat(env, cx);
-                }
-            }
-            // Every page ends with a sequenced `status` naming it, so an
-            // empty page (the start) is an answer too, never silence.
-            if let Some((generation, sequence)) = self.next_head(sid, conversation, cx) {
-                let mut env = chat_wire::event(conversation, sid, &generation, sequence, &status);
-                env.body.insert(
-                    "page".into(),
-                    json!({"before": before, "count": count, "start": start}),
-                );
-                self.send_chat(env, cx);
-            }
-            return;
-        }
         let rules = if control {
             self.host.approval_rules(sid)
         } else {
@@ -2261,7 +2183,7 @@ impl HostBridge {
         )];
         let (history, _) = session
             .chat
-            .page(before, HISTORY_MESSAGES, HISTORY_BYTES, keep);
+            .page(None, HISTORY_MESSAGES, HISTORY_BYTES, keep);
         let mut sequence = 1;
         for message in history.iter() {
             envelopes.push(chat_wire::history_message(
@@ -2327,7 +2249,13 @@ impl HostBridge {
         if !self.current(attachment) {
             return;
         }
-        let head = self.next_head(sid, conversation, cx);
+        // A refused removed form (r8 §A) takes no sequence.
+        let head = match &reply {
+            ChatReply::Error {
+                sequenced: false, ..
+            } => None,
+            _ => self.next_head(sid, conversation, cx),
+        };
         let env = match reply {
             ChatReply::Accepted { request_id } => {
                 self.submitters
@@ -2354,6 +2282,7 @@ impl HostBridge {
                 request_id,
                 code,
                 text,
+                ..
             } => {
                 if let Some(r) = &request_id {
                     self.submitters.remove(r);
@@ -2748,6 +2677,7 @@ fn unauthorized(re: Option<String>) -> String {
         op: Op::Error {
             code: ErrorCode::Unauthorized,
             detail: None,
+            revision: None,
         },
     });
     String::from_utf8(wire::encode(&message)).expect("wire JSON is UTF-8")

@@ -224,8 +224,12 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let file = read_fixture(&name);
-        // r8-draft fixtures use wire forms the r7.2 decoder doesn't know yet.
-        if file.get("requires").is_some() {
+        // r8 fixtures whose work isn't implemented use wire forms the
+        // decoder doesn't know yet; superseded r7.x ones use removed forms.
+        let fixture_name = file["name"].as_str().unwrap_or_default();
+        let r8_waiting = fixture_name.starts_with("r8-")
+            && super::revision::r8_fixture_runnable(fixture_name).is_err();
+        if r8_waiting || super::revision::superseded(fixture_name).is_some() {
             continue;
         }
         let steps = file["steps"].as_array().unwrap();
@@ -302,8 +306,11 @@ fn all_ops() -> Vec<Value> {
     let receipt = json!({"request_id":RE,"target":target(),"kind":"prompt","state":"completed",
                          "detail":"done","updated_at":1760500000000u64});
     vec![
-        session("hello", json!({})),
-        session("hello", json!({"resume":{"controller_session":RE}})),
+        session("hello", json!({"revision":8})),
+        session(
+            "hello",
+            json!({"revision":8,"resume":{"controller_session":RE}}),
+        ),
         session(
             "challenge",
             json!({"re":RE,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}),
@@ -314,7 +321,8 @@ fn all_ops() -> Vec<Value> {
             json!({"re":RE,"account_id":"account-a","atem_device_id":"host-a",
             "host_trust_gen":1,"runtime_gen":PG,"controller_session":RE,"attachment_gen":AG,
             "client_kind":"native","permissions":["view","control"],
-            "authorization_ms_left":86400000,"server_time":1760500000000u64}),
+            "authorization_ms_left":86400000,"server_time":1760500000000u64,
+            "revision":8,"features":["approval.session_rules","chat.future-thing"]}),
         ),
         session("list", json!({})),
         session(
@@ -974,6 +982,28 @@ fn enums_and_codes() {
         "permissions",
         Some(json!(["view", "root"])),
     ));
+    // r8 welcome: features are opaque names, bounded.
+    rejects(&with(
+        all_ops()[4].clone(),
+        "features",
+        Some(json!(["bad name"])),
+    ));
+    rejects(&with(
+        all_ops()[4].clone(),
+        "features",
+        Some(json!(vec!["f"; 65])),
+    ));
+    rejects(&with(all_ops()[4].clone(), "revision", Some(json!("8"))));
+    rejects(&session(
+        "error",
+        json!({"code":"invalid_request","revision":-1}),
+    ));
+    assert!(
+        wire::decode(
+            &serde_json::to_vec(&session("error", json!({"code":"invalid_request"}))).unwrap()
+        )
+        .is_ok()
+    );
     rejects(&with(all_ops()[20].clone(), "state", Some(json!("done"))));
     rejects(&with(
         all_ops()[20].clone(),

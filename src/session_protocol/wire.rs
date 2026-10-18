@@ -43,6 +43,8 @@ pub const MAX_APPROVAL_MESSAGE_BYTES: usize = 512;
 pub const MAX_SESSION_RULES: usize = 32;
 /// In-flight requests per attachment (enforced by the host; excess → `busy`).
 pub const MAX_IN_FLIGHT: usize = 64;
+/// Names in `welcome.features` (r8).
+pub const MAX_FEATURES: usize = 64;
 
 // ── Representation helpers (§1) ───────────────────────────────────────────
 
@@ -130,6 +132,8 @@ pub enum ErrorCode {
     SessionClosed,
     Busy,
     Paused,
+    /// r8: a well-formed message of a known op whose fields break its rules.
+    InvalidRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,9 +326,8 @@ pub struct ApprovalRequest {
 }
 
 /// The payload of a `kind:"approval"` submission. Exactly these fields:
-/// `rule_id` iff `allow_always`, `message` only with `deny`; `acquire:
-/// true` takes the session's lease for the answering attachment together
-/// with the answer (its binding then carries no `lease_epoch`).
+/// `rule_id` iff `allow_always`, `message` only with `deny`. r7's
+/// `acquire` is removed in r8 (§A, §G) and refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalAnswer {
@@ -342,22 +345,14 @@ pub struct ApprovalAnswer {
         skip_serializing_if = "Option::is_none"
     )]
     pub message: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "present",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub acquire: Option<bool>,
 }
 
 impl ApprovalAnswer {
-    /// The answer takes the lease with it.
-    pub fn acquires(&self) -> bool {
-        self.acquire == Some(true)
-    }
-
     /// The validated answer in an approval payload.
     pub fn parse(payload: &Value) -> Result<Self, String> {
+        if payload.get("acquire").is_some() {
+            return Err(format!("approval: {REMOVED_IN_R8}"));
+        }
         let a: Self =
             serde_json::from_value(payload.clone()).map_err(|e| format!("approval: {e}"))?;
         uuid(&a.approval_id, "approval_id")?;
@@ -449,6 +444,14 @@ pub struct Resume {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     Hello {
+        /// r8: required, the JSON integer 8 (`revision::REVISION`). Decoded
+        /// optional so the host can refuse a `hello` without it explicitly.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        revision: Option<u64>,
         #[serde(
             default,
             deserialize_with = "present",
@@ -473,6 +476,20 @@ pub enum Op {
         permissions: Vec<Permission>,
         authorization_ms_left: u64,
         server_time: u64,
+        /// r8: the host's revision and features. Decoded optional so a
+        /// client can refuse an older host's welcome explicitly.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        revision: Option<u64>,
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        features: Option<Vec<String>>,
     },
     List {},
     Sessions {
@@ -544,6 +561,14 @@ pub enum Op {
             skip_serializing_if = "Option::is_none"
         )]
         detail: Option<String>,
+        /// r8: the host's revision, on the refusal of a `hello` that didn't
+        /// name it.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        revision: Option<u64>,
     },
 }
 
@@ -583,6 +608,9 @@ pub struct DecodeError {
     pub reason: String,
     /// Set when the message is a form the contract removed (r6 §0).
     pub removed: Option<RemovedOp>,
+    /// The message was a session-v1 `hello` (an undecodable one is still
+    /// answered with the host's revision, r8 §A).
+    pub hello: bool,
 }
 
 /// A message type (and op) removed by contract r6 §0.
@@ -765,15 +793,34 @@ impl Receipt {
 }
 
 /// A submission's binding is a mutation's (`lease_epoch` required), except
-/// an approval answer with `acquire: true`, which takes the lease with it,
-/// and a rule revocation, which needs only `control` (r7.3: `lease_epoch`
+/// a rule revocation, which needs only `control` (r7.3: `lease_epoch`
 /// optional and ignored).
-pub fn submit_binding_use(kind: ReceiptKind, payload: &Value) -> BindingUse {
-    let acquire = payload.get("acquire") == Some(&Value::Bool(true));
+pub fn submit_binding_use(kind: ReceiptKind) -> BindingUse {
     match kind {
         ReceiptKind::ApprovalRuleRevoke => BindingUse::LeaseIgnored,
-        ReceiptKind::Approval if acquire => BindingUse::Read,
         _ => BindingUse::Mutation,
+    }
+}
+
+/// The reason (logs only) a form r8 removed was refused (§A).
+pub const REMOVED_IN_R8: &str = "removed in r8";
+/// The reason (logs only) an op of a feature this host doesn't advertise
+/// was refused (§A).
+pub const FEATURE_NOT_ADVERTISED: &str = "feature not advertised";
+
+/// Submission fields §F adds for `chat.send_acquire` (task 3). Until that
+/// feature is advertised a submit carrying one is refused: beside an
+/// approval answer it is r7's removed `acquire` (§G), on any other kind an
+/// op of an unadvertised feature.
+// TODO(r8 task 3): parse these for `prompt`/chat `text` submits when
+// `chat.send_acquire` ships; approval answers keep refusing them.
+pub const SEND_ACQUIRE_FIELDS: &[&str] = &["acquire", "takeover", "expected_controller"];
+
+fn send_acquire_refusal(kind_is_approval: bool) -> String {
+    if kind_is_approval {
+        REMOVED_IN_R8.to_string()
+    } else {
+        FEATURE_NOT_ADVERTISED.to_string()
     }
 }
 
@@ -808,7 +855,7 @@ impl Op {
     fn validate(&self) -> Result<(), String> {
         use BindingUse::{Mutation, Read};
         match self {
-            Op::Hello { resume } => resume.as_ref().map_or(Ok(()), |r| {
+            Op::Hello { resume, .. } => resume.as_ref().map_or(Ok(()), |r| {
                 uuid(&r.controller_session, "controller_session")
             }),
             Op::Challenge { nonce } => {
@@ -826,8 +873,15 @@ impl Op {
                 attachment_gen,
                 authorization_ms_left,
                 server_time,
+                revision,
+                features,
                 ..
             } => {
+                revision.map_or(Ok(()), |r| safe(r, "revision"))?;
+                if let Some(features) = features {
+                    check(features.len() <= MAX_FEATURES, "features count")?;
+                    check(features.iter().all(|f| is_opaque_id(f)), "feature")?;
+                }
                 check(is_opaque_id(account_id), "account_id")?;
                 check(is_opaque_id(atem_device_id), "atem_device_id")?;
                 safe(*host_trust_gen, "host_trust_gen")?;
@@ -884,7 +938,7 @@ impl Op {
                 kind,
                 payload,
             } => {
-                binding.validate(submit_binding_use(*kind, payload))?;
+                binding.validate(submit_binding_use(*kind))?;
                 uuid(request_id, "request_id")?;
                 validate_payload(*kind, payload)
             }
@@ -909,7 +963,14 @@ impl Op {
                 uuid(process_gen, "process_gen")?;
                 validate_session_rules(rules)
             }
-            Op::Error { detail: d, .. } => detail(d),
+            Op::Error {
+                detail: d,
+                revision,
+                ..
+            } => {
+                revision.map_or(Ok(()), |r| safe(r, "revision"))?;
+                detail(d)
+            }
         }
     }
 }
@@ -943,6 +1004,7 @@ fn fail(id: Option<String>, reason: impl Into<String>) -> DecodeError {
         id,
         reason: reason.into(),
         removed: None,
+        hello: false,
     }
 }
 
@@ -987,17 +1049,29 @@ fn decode_session(data: Map<String, Value>) -> Result<SessionMessage, DecodeErro
     if data.get("v").and_then(Value::as_u64) != Some(VERSION) {
         return Err(fail(id, "unsupported v"));
     }
+    let op_name = data.get("op").and_then(Value::as_str).map(str::to_string);
+    let with_op = |mut e: DecodeError| {
+        e.hello = op_name.as_deref() == Some("hello");
+        e
+    };
     let Some(id) = id else {
-        return Err(fail(None, "missing or invalid id"));
+        return Err(with_op(fail(None, "missing or invalid id")));
     };
     let re = match data.get("re") {
         None => None,
         Some(Value::String(s)) if is_uuid_v4(s) => Some(s.clone()),
-        Some(_) => return Err(fail(Some(id), "invalid re")),
+        Some(_) => return Err(with_op(fail(Some(id), "invalid re"))),
     };
+    if op_name.as_deref() == Some("submit")
+        && SEND_ACQUIRE_FIELDS.iter().any(|f| data.contains_key(*f))
+    {
+        let approval = data.get("kind").and_then(Value::as_str) == Some("approval");
+        return Err(with_op(fail(Some(id), send_acquire_refusal(approval))));
+    }
     let op: Op = serde_json::from_value(Value::Object(data))
-        .map_err(|e| fail(Some(id.clone()), e.to_string()))?;
-    op.validate().map_err(|e| fail(Some(id.clone()), e))?;
+        .map_err(|e| with_op(fail(Some(id.clone()), e.to_string())))?;
+    op.validate()
+        .map_err(|e| with_op(fail(Some(id.clone()), e)))?;
     Ok(SessionMessage { id, re, op })
 }
 
@@ -1102,13 +1176,23 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
         .map_err(|e| fail(None, format!("agentChat: {e}")))?;
     let use_ = match op {
         "open" | "close" => BindingUse::Read,
-        // An approval answer (r7) may take the lease with it.
+        // r8 history pages (`chat.history`, `chat.lookup`) are reads. They
+        // decode so the host can refuse them as ops of features it doesn't
+        // advertise (§A) and a client can check them before sending.
+        // TODO(r8 task 5): the selector and field rules of §B.
+        "history" => BindingUse::Read,
+        "submit" if SEND_ACQUIRE_FIELDS.iter().any(|f| m.contains_key(*f)) => {
+            let approval = m.contains_key("approval");
+            return Err(fail(
+                None,
+                format!("agentChat: {}", send_acquire_refusal(approval)),
+            ));
+        }
         // A rule revocation (r7.3) needs no lease: `lease_epoch` optional.
-        "submit" => match (m.get(RULE_REVOKE_FIELD), m.get("approval")) {
-            (Some(revoke), _) => submit_binding_use(ReceiptKind::ApprovalRuleRevoke, revoke),
-            (None, Some(answer)) => submit_binding_use(ReceiptKind::Approval, answer),
-            (None, None) => BindingUse::Mutation,
-        },
+        "submit" if m.contains_key(RULE_REVOKE_FIELD) => {
+            submit_binding_use(ReceiptKind::ApprovalRuleRevoke)
+        }
+        "submit" => BindingUse::Mutation,
         _ if binding.is_some() => {
             return Err(fail(None, format!("agentChat {op} cannot carry a binding")));
         }
@@ -1116,6 +1200,9 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
     };
     require_binding("agentChat", op, binding, use_)?;
     let bad = |e: String| fail(None, format!("agentChat: {e}"));
+    if op == "history" {
+        return check(is_session_id(&env.agent_id), "agentId").map_err(bad);
+    }
     crate::chat::wire::parse_inbound(&env).map_err(bad)?;
     check(is_session_id(&env.agent_id), "agentId").map_err(bad)?;
     if op == "submit" {

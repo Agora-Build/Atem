@@ -256,7 +256,8 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     // Compatibility mode: resume and resume_proof are refused, never trusted.
     let resume = session(
         "hello",
-        json!({"resume": {"controller_session": "12345678-1234-4234-8234-123456789012"}}),
+        json!({"revision": 8,
+               "resume": {"controller_session": "12345678-1234-4234-8234-123456789012"}}),
     );
     rt.send("n", &resume);
     assert_error(&only(&mut rt, "n"), "unauthorized");
@@ -264,7 +265,7 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     assert_error(&only(&mut rt, "n"), "unauthorized");
 
     rt.set_now(1000);
-    let hello = session("hello", json!({}));
+    let hello = session("hello", json!({"revision": 8}));
     rt.send("n", &hello);
     let w = only(&mut rt, "n");
     assert_eq!(w["op"], "welcome");
@@ -279,17 +280,112 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     assert!(wire::is_uuid_v4(w["controller_session"].as_str().unwrap()));
     // A second hello replaces the attachment (r7.1); one more within a
     // second is busy.
-    rt.send("n", &session("hello", json!({})));
+    rt.send("n", &session("hello", json!({"revision": 8})));
     let w2 = only(&mut rt, "n");
     assert_eq!(w2["op"], "welcome");
     assert_ne!(w2["attachment_gen"], fresh);
     assert_ne!(w2["controller_session"], w["controller_session"]);
     assert_eq!(w2["authorization_ms_left"], AUTHORIZATION_MS - 1000);
-    rt.send("n", &session("hello", json!({})));
+    rt.send("n", &session("hello", json!({"revision": 8})));
     assert_error(&only(&mut rt, "n"), "busy");
     // Host-only ops are not requests.
     rt.send("n", &session("lease_released", json!({})));
     assert_error(&only(&mut rt, "n"), "unsupported_version");
+}
+
+/// r8 §A: only `hello{revision: 8}` is welcomed; anything else gets
+/// `unsupported_version` naming the host's revision and changes nothing,
+/// on a fresh attachment or a welcomed one (no replacement).
+#[test]
+fn only_a_hello_naming_revision_8_is_welcomed() {
+    let mut rt = setup();
+    let fresh = "88888888-8888-4888-8888-888888888888";
+    rt.connect_only("n", fresh, vec![Permission::View], AUTHORIZATION_MS);
+    for fields in [
+        json!({}),
+        json!({"revision": 7}),
+        json!({"revision": 9}),
+        json!({"revision": "r8"}),
+        json!({"revision": 8.5}),
+        json!({"revision": null}),
+    ] {
+        let hello = session("hello", fields.clone());
+        rt.send("n", &hello);
+        let e = only(&mut rt, "n");
+        assert_error(&e, "unsupported_version");
+        assert_eq!(e["re"], hello["data"]["id"], "{fields}");
+        assert_eq!(e["revision"], 8, "{fields}");
+        assert_eq!(rt.host.welcomed_attachments(), 3, "{fields}");
+    }
+    rt.send("n", &session("list", json!({})));
+    assert_error(&only(&mut rt, "n"), "unsupported_version");
+    let hello = session("hello", json!({"revision": 8}));
+    rt.send("n", &hello);
+    let w = only(&mut rt, "n");
+    assert_eq!(w["op"], "welcome");
+    assert_eq!(w["revision"], 8);
+    assert_eq!(w["features"], json!(super::revision::FEATURES));
+    assert_eq!(rt.host.welcomed_attachments(), 4);
+    // On the welcomed attachment: refused, not replaced.
+    rt.send("n", &session("hello", json!({})));
+    let e = only(&mut rt, "n");
+    assert_error(&e, "unsupported_version");
+    assert_eq!(rt.attachment("n"), fresh);
+    rt.send("n", &session("list", json!({})));
+    assert_eq!(only(&mut rt, "n")["op"], "sessions");
+}
+
+/// r8 §A: `open.before`/`open.generation` are removed and `history` is not
+/// advertised: each is refused in chat-v1 with `unsupported_version`, and
+/// nothing reaches the runtime.
+#[test]
+fn removed_chat_forms_and_unadvertised_history_are_refused() {
+    let mut rt = setup();
+    let chat = |rt: &FakeRuntime, op: &str, extra: Value| {
+        let mut data = json!({"v": 1, "op": op, "conversationId": "conv-1", "agentId": S1,
+            "binding": binding(rt, "c1", S1, None)});
+        data.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"type": "agentChat", "data": data})
+    };
+    for (op, extra) in [
+        ("open", json!({"before": "m-0003"})),
+        ("open", json!({"generation": P1})),
+        ("open", json!({"before": "m-0003", "generation": P1})),
+        (
+            "history",
+            json!({"generation": P1, "page_id": "p1", "turn_id": "turn-1"}),
+        ),
+        (
+            "history",
+            json!({"generation": P1, "page_id": "p1", "before": "m-0003"}),
+        ),
+    ] {
+        let forwarded = rt.effects.len();
+        let m = chat(&rt, op, extra.clone());
+        rt.send("c1", &m);
+        let msgs = rt.take("c1");
+        assert_eq!(msgs.len(), 1, "{op} {extra}: {msgs:#?}");
+        assert_eq!(msgs[0]["type"], "agentChat");
+        assert_eq!(msgs[0]["data"]["op"], "error");
+        assert_eq!(msgs[0]["data"]["code"], "unsupported_version");
+        assert_eq!(msgs[0]["data"]["conversationId"], "conv-1");
+        assert!(
+            !rt.effects[forwarded..]
+                .iter()
+                .any(|e| matches!(e, Effect::Forward { .. })),
+            "{op} {extra}"
+        );
+    }
+    // A plain open still goes to the runtime.
+    let m = chat(&rt, "open", json!({}));
+    rt.send("c1", &m);
+    assert!(
+        rt.effects
+            .iter()
+            .any(|e| matches!(e, Effect::Forward { .. }))
+    );
 }
 
 #[test]
@@ -314,7 +410,7 @@ fn a_second_hello_replaces_the_attachment() {
     got(&mut rt, "c1");
     rt.set_now(2000);
     rt.effects.clear();
-    let hello = session("hello", json!({}));
+    let hello = session("hello", json!({"revision": 8}));
     rt.send("c1", &hello);
     // Only the welcome reaches the client: the old attachment's lease end
     // and stream close are not sent to it.
@@ -358,13 +454,13 @@ fn a_second_hello_replaces_the_attachment() {
     // At most one replacement a second.
     rt.set_now(2999);
     got(&mut rt, "c1");
-    rt.send("c1", &session("hello", json!({})));
+    rt.send("c1", &session("hello", json!({"revision": 8})));
     assert_error(&only(&mut rt, "c1"), "busy");
     assert_eq!(rt.attachment("c1"), new);
     assert!(rt.host.lease_holder(S1).is_some());
     rt.set_now(3000);
     got(&mut rt, "c1");
-    rt.send("c1", &session("hello", json!({})));
+    rt.send("c1", &session("hello", json!({"revision": 8})));
     assert_eq!(only(&mut rt, "c1")["op"], "welcome");
     assert_ne!(rt.attachment("c1"), new);
 }
@@ -374,11 +470,11 @@ fn a_second_hello_after_the_authorization_deadline_is_paused() {
     let mut rt = setup();
     let short = "88888888-8888-4888-8888-888888888888";
     rt.connect_only("s", short, vec![Permission::View], 5000);
-    rt.send("s", &session("hello", json!({})));
+    rt.send("s", &session("hello", json!({"revision": 8})));
     got(&mut rt, "s");
     rt.set_now(5000);
     got(&mut rt, "s");
-    rt.send("s", &session("hello", json!({})));
+    rt.send("s", &session("hello", json!({"revision": 8})));
     assert_error(&only(&mut rt, "s"), "paused");
     assert_eq!(rt.attachment("s"), short);
 }
@@ -393,7 +489,7 @@ fn authorization_bounds_leases_and_then_pauses() {
         vec![Permission::View, Permission::Control],
         5000,
     );
-    rt.send("s", &session("hello", json!({})));
+    rt.send("s", &session("hello", json!({"revision": 8})));
     got(&mut rt, "s");
     rt.set_now(1000);
     let m = acquire(&rt, "s", S1, false);
@@ -681,7 +777,7 @@ fn registry_seq_is_per_attachment_and_a_gap_recovers_with_a_new_snapshot() {
     // A viewer without `view` gets no registry.
     let blind = "88888888-8888-4888-8888-888888888888";
     rt.connect_only("b", blind, vec![Permission::Control], AUTHORIZATION_MS);
-    rt.send("b", &session("hello", json!({})));
+    rt.send("b", &session("hello", json!({"revision": 8})));
     got(&mut rt, "b");
     rt.send("b", &session("list", json!({})));
     assert_error(&only(&mut rt, "b"), "forbidden");
@@ -1258,7 +1354,7 @@ fn receipt_query_is_scoped_to_the_exact_target() {
     assert_eq!(only(&mut rt, "v")["receipts"][0]["request_id"], rid(2));
     let blind = "88888888-8888-4888-8888-888888888888";
     rt.connect_only("b", blind, vec![Permission::Control], AUTHORIZATION_MS);
-    rt.send("b", &session("hello", json!({})));
+    rt.send("b", &session("hello", json!({"revision": 8})));
     got(&mut rt, "b");
     let q = query(&rt, "b", target_with(S1, 1), vec![rid(1)]);
     rt.send("b", &q);

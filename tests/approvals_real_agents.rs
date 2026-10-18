@@ -194,7 +194,8 @@ impl Rig {
         }
         loop {
             let id = uuid();
-            self.send(json!({"type": "session", "data": {"v": 1, "op": "hello", "id": id}}));
+            self.send(json!({"type": "session",
+                "data": {"v": 1, "op": "hello", "id": id, "revision": 8}}));
             let reply = self.wait(Duration::from_secs(10), "welcome", |m| {
                 m["type"] == "session" && m["data"]["re"] == id.as_str()
             });

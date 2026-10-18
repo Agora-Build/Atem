@@ -80,7 +80,11 @@
       "view"
      ],
      "authorization_ms_left": 86400000,
-     "server_time": 1760500000000
+     "server_time": 1760500000000,
+     "revision": 8,
+     "features": [
+      "approval.session_rules"
+     ]
     }
    }
   },

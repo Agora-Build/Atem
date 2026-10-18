@@ -172,6 +172,7 @@ pub fn error_detail_text(re: Option<String>, code: ErrorCode, detail: Option<&st
         op: Op::Error {
             code,
             detail: detail.map(str::to_string),
+            revision: None,
         },
     });
     String::from_utf8(wire::encode(&message)).expect("wire JSON is UTF-8")

@@ -45,8 +45,12 @@
 //! mode), `fail_next_fsync`, `change_trust_gen`, `approval_rules` (session
 //! rules come only from a Codex session), and approval closes other
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
-//! false`. r8-draft scenarios (`requires: "r8"`) are reported as not run
-//! (`requires r8`) until r8 ships.
+//! false`. An `r8-*` scenario runs once the host work it needs is
+//! implemented (`src/session_protocol/revision.rs`, shared with the core
+//! runner), else it is reported as not run with what it still needs; r7.x
+//! scenarios r8 superseded (`SUPERSEDED_BY_R8`) are reported as not run.
+//! The harness's `hello` carries `revision: 8` and the welcome must echo it
+//! and advertise exactly this host's features.
 //!
 //! A scenario the real runtime fails would be listed in `KNOWN_DEVIATIONS`
 //! with the failure it must keep showing, and why (none today).
@@ -69,6 +73,12 @@
 #![cfg(target_os = "linux")]
 
 mod support;
+
+/// r8 revision and features, and which `r8-*` fixtures can run: the same
+/// list the core runner gates on.
+#[allow(dead_code)]
+#[path = "../src/session_protocol/revision.rs"]
+mod revision;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
@@ -663,7 +673,8 @@ impl Host {
         self.link = self.authenticated;
         loop {
             let id = uuid();
-            let hello = json!({"type": "session", "data": {"v": 1, "op": "hello", "id": id}});
+            let hello = json!({"type": "session",
+                "data": {"v": 1, "op": "hello", "id": id, "revision": 8}});
             self.astation.send(self.link, hello.to_string());
             let reply = self.raw_reply(&id)?;
             if reply["op"] == "error" && reply["code"] == "unauthorized" {
@@ -675,6 +686,14 @@ impl Host {
             }
             if reply["op"] != "welcome" {
                 return Err(format!("hello: {reply}"));
+            }
+            if reply["revision"] != revision::REVISION
+                || reply["features"] != json!(revision::FEATURES)
+            {
+                return Err(format!(
+                    "welcome revision {} features {}",
+                    reply["revision"], reply["features"]
+                ));
             }
             for key in ["account_id", "atem_device_id", "host_trust_gen"] {
                 if reply[key] != self.host[key] {
@@ -1415,10 +1434,20 @@ fn scenarios() -> Vec<Value> {
         .collect()
 }
 
+/// Why a scenario waits for host work (an `r8-*` one whose work isn't
+/// implemented) or no longer applies (an r7.x one r8 superseded).
+fn waiting(scenario: &Value) -> Option<String> {
+    let name = scenario["name"].as_str().unwrap();
+    if name.starts_with("r8-") {
+        revision::r8_fixture_runnable(name).err()
+    } else {
+        revision::superseded(name).map(str::to_string)
+    }
+}
+
 /// The host scenarios that can't be honoured against real processes (the
 /// reason is printed); every other scenario runs.
 const NOT_RUN: &[&str] = &[
-    "approval-answer-with-acquire-takes-control-from-the-holder",
     "approval-needs-control-and-the-lease",
     "approval-rule-revoke-needs-control-not-the-lease",
     "approval-survives-takeover",
@@ -1439,9 +1468,8 @@ fn run_named(scenarios: &[Value], only: Option<&str>) -> Vec<(String, Result<(),
             .filter(|s| only.is_none_or(|o| s["name"] == o))
             .map(|s| {
                 let name = s["name"].as_str().unwrap().to_string();
-                let handle = scope.spawn(move || match s.get("requires") {
-                    // r8-draft fixtures: parsed, not run until r8 ships.
-                    Some(r) => Err(format!("not run: requires {}", r.as_str().unwrap_or("?"))),
+                let handle = scope.spawn(move || match waiting(s) {
+                    Some(why) => Err(format!("not run: {why}")),
                     None => match unsupported(s) {
                         Some(why) => Err(format!("not run: {why}")),
                         None => run(s),
@@ -1465,7 +1493,7 @@ fn shared_host_fixtures_run_against_the_real_runtime() {
     let results = run_named(&scenarios, only.as_deref());
     let draft: Vec<&str> = scenarios
         .iter()
-        .filter(|s| s.get("requires").is_some())
+        .filter(|s| waiting(s).is_some())
         .map(|s| s["name"].as_str().unwrap())
         .collect();
     let mut failed = Vec::new();

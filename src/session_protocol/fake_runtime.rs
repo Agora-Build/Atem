@@ -15,6 +15,7 @@ use super::host::{
     SessionSpec, random_ids,
 };
 use super::journal::{Journal, MemJournal};
+use super::revision::{FEATURES, REVISION};
 use super::wire::{
     self, Binding, ClientKind, DecodeError, Envelope, Op, Permission, ReceiptKind, SessionMessage,
     Target,
@@ -157,6 +158,7 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
             request_id,
             code,
             text,
+            ..
         } => {
             let mut b = json!({"op": "error", "code": code, "text": text});
             if let Some(r) = request_id {
@@ -239,7 +241,12 @@ impl<J: Journal> FakeRuntime<J> {
                     client_kind: c.client_kind,
                 },
             );
-            rt.attach(&c.name, &c.attachment_gen)?;
+            if c.welcome == Some(false) {
+                // r8: the steps send this client's `hello`.
+                rt.connect_unwelcomed(&c.name, &c.attachment_gen)?;
+            } else {
+                rt.attach(&c.name, &c.attachment_gen)?;
+            }
             if let Some(epoch) = c.holds_lease_epoch {
                 rt.setup_lease(&c.name, epoch)?;
             }
@@ -294,9 +301,9 @@ impl<J: Journal> FakeRuntime<J> {
         self.clients[client].attachment_gen.clone()
     }
 
-    /// A new attachment for `client`: connect (fencing the previous one),
-    /// `hello`, and the checked `welcome` taken off the queue.
-    pub fn attach(&mut self, client: &str, attachment_gen: &str) -> Result<(), String> {
+    /// A new attachment for `client` without `hello` (fencing the previous
+    /// one).
+    fn connect_unwelcomed(&mut self, client: &str, attachment_gen: &str) -> Result<(), String> {
         let c = self.clients.get_mut(client).ok_or("unknown client")?;
         c.attachment_gen = attachment_gen.to_string();
         let attach = Attach {
@@ -312,11 +319,21 @@ impl<J: Journal> FakeRuntime<J> {
             .insert(attachment_gen.to_string(), client.to_string());
         self.live
             .insert(attachment_gen.to_string(), client.to_string());
-        let fx = self.host.receive_decoded(
-            attachment_gen,
-            Ok(message(Op::Hello { resume: None })),
-            self.now,
-        );
+        Ok(())
+    }
+
+    /// A new attachment for `client`: connect (fencing the previous one),
+    /// `hello{revision: 8}`, and the checked `welcome` (r8: it echoes the
+    /// revision and advertises `revision::FEATURES`) taken off the queue.
+    pub fn attach(&mut self, client: &str, attachment_gen: &str) -> Result<(), String> {
+        self.connect_unwelcomed(client, attachment_gen)?;
+        let hello = Op::Hello {
+            revision: Some(REVISION),
+            resume: None,
+        };
+        let fx = self
+            .host
+            .receive_decoded(attachment_gen, Ok(message(hello)), self.now);
         self.apply(fx);
         let i = self
             .out
@@ -329,11 +346,24 @@ impl<J: Journal> FakeRuntime<J> {
         let (_, welcome) = self.out.remove(i);
         match welcome {
             Envelope::Session(SessionMessage {
-                op: Op::Welcome {
-                    attachment_gen: g, ..
-                },
+                op:
+                    Op::Welcome {
+                        attachment_gen: g,
+                        revision,
+                        features,
+                        ..
+                    },
                 ..
-            }) if g == attachment_gen => Ok(()),
+            }) if g == attachment_gen => {
+                let advertised: Vec<&str> = FEATURES.to_vec();
+                let got: Option<Vec<&str>> = features
+                    .as_ref()
+                    .map(|f| f.iter().map(String::as_str).collect());
+                if revision != Some(REVISION) || got.as_ref() != Some(&advertised) {
+                    return Err(format!("welcome revision {revision:?} features {got:?}"));
+                }
+                Ok(())
+            }
             other => Err(format!("unexpected welcome {other:?}")),
         }
     }
@@ -654,11 +684,12 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 let resume = Some(wire::Resume {
                     controller_session: uuid::Uuid::new_v4().to_string(),
                 });
-                self.host.receive_decoded(
-                    attachment_gen,
-                    Ok(message(Op::Hello { resume })),
-                    self.now,
-                )
+                let hello = Op::Hello {
+                    revision: Some(REVISION),
+                    resume,
+                };
+                self.host
+                    .receive_decoded(attachment_gen, Ok(message(hello)), self.now)
             }
             HostEvent::Reconnect {
                 client,
@@ -761,6 +792,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             "resizes" => p.resizes.into(),
             "stops" => p.stops.into(),
             "lease_holder" => self.lease_holder()?,
+            "attachments" => self.host.welcomed_attachments().into(),
             "approval_decisions" => Value::from(p.approval_decisions.clone()),
             "approvals_released" => p.approvals_released.into(),
             "pushes" => Value::from(p.pushes.clone()),

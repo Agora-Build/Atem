@@ -21,11 +21,10 @@ pub struct ChatEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
-    Open {
-        before: Option<String>,
-        /// The generation the client's `before` came from (optional).
-        generation: Option<String>,
-    },
+    /// Opens a conversation at the newest page. r8 removed `open.before`/
+    /// `open.generation` (the r7.2 paging form): the session host refuses
+    /// such an open (`unsupported_version`) before it gets here.
+    Open,
     Submit {
         generation: String,
         request_id: String,
@@ -73,19 +72,7 @@ pub fn parse_inbound(env: &ChatEnvelope) -> Result<Inbound, String> {
         return Err("invalid agentId".into());
     }
     match env.op.as_str() {
-        "open" => {
-            let before = match env.body.get("before") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if s.len() <= MAX_ID => Some(s.clone()),
-                Some(_) => return Err("invalid before".into()),
-            };
-            let generation = match env.body.get("generation") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if s.len() <= MAX_ID => Some(s.clone()),
-                Some(_) => return Err("invalid generation".into()),
-            };
-            Ok(Inbound::Open { before, generation })
-        }
+        "open" => Ok(Inbound::Open),
         "submit" => {
             let generation = str_field(env, "generation")?;
             let request_id = str_field(env, "requestId")?;
@@ -588,17 +575,7 @@ mod tests {
     fn parse_each_op() {
         assert_eq!(
             parse_inbound(&env("open", json!({}))).unwrap(),
-            Inbound::Open {
-                before: None,
-                generation: None
-            }
-        );
-        assert_eq!(
-            parse_inbound(&env("open", json!({"before":"m9","generation":"g"}))).unwrap(),
-            Inbound::Open {
-                before: Some("m9".into()),
-                generation: Some("g".into())
-            }
+            Inbound::Open
         );
         assert_eq!(
             parse_inbound(&env(
@@ -662,10 +639,6 @@ mod tests {
         let mut e = env("open", json!({}));
         e.agent_id = String::new();
         assert_eq!(parse_inbound(&e).unwrap_err(), "invalid agentId");
-        assert_eq!(
-            parse_inbound(&env("open", json!({"before":long}))).unwrap_err(),
-            "invalid before"
-        );
         // text size is not checked here
         let big = "y".repeat(100_000);
         assert!(

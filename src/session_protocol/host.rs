@@ -1,4 +1,7 @@
-//! The host authority for atem-session v1 (contract r7, compatibility mode):
+//! The host authority for atem-session v1 (contract r7, compatibility mode,
+//! moving to r8): revision admission (r8 §A: only `hello{revision: 8}` is
+//! welcomed, `welcome` names the revision and `revision::FEATURES`; ops of
+//! unadvertised features and the forms r8 removed are `unsupported_version`),
 //! attachments and hello/welcome (§3), the session registry with a
 //! per-attachment `seq` (§4), control leases with input-epoch fencing (§5),
 //! submissions with durable receipts (§6) and errors without disclosure (§7).
@@ -30,9 +33,9 @@
 //! control): subscribed attachments with `control` get `approval_request`
 //! (again after every `list`) and `Effect::PushApproval` asks the relay to
 //! push it to the account's devices. The lease holder answers with a
-//! `kind:"approval"` submission, or any attachment with `control` answers
-//! with `acquire: true`, which takes the lease (takeover allowed) together
-//! with the answer. Once the answer is `executing` the approval closes
+//! `kind:"approval"` submission (r7's `acquire` on an answer is removed in
+//! r8 and refused; lease-free answers are r8 task 3). Once the answer is
+//! `executing` the approval closes
 //! (`answered_remote`) and `Effect::Approval` hands the decision to the
 //! agent, whose report (`approval_applied`, `close_approval`,
 //! `dispatch_report`) finishes the receipt. Every close also resolves the
@@ -52,6 +55,7 @@
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 use super::journal::{self, Journal, JournalError, Record, Stored};
+use super::revision::{FEATURES, REVISION};
 use super::wire::{
     self, Activity, AlwaysRule, ApprovalAnswer, ApprovalCloseReason, ApprovalDecision,
     ApprovalRequest, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
@@ -297,6 +301,11 @@ pub enum ChatReply {
         request_id: Option<String>,
         code: String,
         text: String,
+        /// `false` for a request that never enters the conversation's
+        /// sequenced stream (r8 §A: a removed form or an op of an
+        /// unadvertised feature), so an open conversation's sequence is not
+        /// advanced by it.
+        sequenced: bool,
     },
 }
 
@@ -1288,6 +1297,11 @@ impl<J: Journal> SessionHost<J> {
             .map(|l| l.deadline)
     }
 
+    /// Live attachments that were welcomed (r8 fixtures' `attachments`).
+    pub fn welcomed_attachments(&self) -> usize {
+        self.attachments.values().filter(|a| a.welcomed()).count()
+    }
+
     /// The live attachment `attachment` was granted `permission`.
     pub fn attachment_can(&self, attachment: &str, permission: Permission) -> bool {
         self.attachments
@@ -1361,6 +1375,7 @@ impl<J: Journal> SessionHost<J> {
         }
         match msg {
             // Removed ops (§0) and invalid representations: no effect.
+            Err(e) if e.hello => self.refuse_hello(attachment, e.id),
             Err(e) => self.error(attachment, e.id, e.code, None),
             Ok(Envelope::Session(m)) => self.on_session(attachment, m),
             Ok(Envelope::Family(f)) => self.on_family(attachment, f),
@@ -1388,7 +1403,24 @@ impl<J: Journal> SessionHost<J> {
         detail: Option<&str>,
     ) {
         let detail = detail.map(str::to_string);
-        self.send(attachment, re, Op::Error { code, detail });
+        let op = Op::Error {
+            code,
+            detail,
+            revision: None,
+        };
+        self.send(attachment, re, op);
+    }
+
+    /// r8 §A: a `hello` without `revision: 8` (absent, another number or not
+    /// an integer) gets `unsupported_version` naming the host's revision,
+    /// and nothing else happens: no attachment is welcomed or replaced.
+    fn refuse_hello(&mut self, attachment: &str, re: Option<String>) {
+        let op = Op::Error {
+            code: ErrorCode::UnsupportedVersion,
+            detail: Some(format!("atem-session revision {REVISION} required")),
+            revision: Some(REVISION),
+        };
+        self.send(attachment, re, op);
     }
 
     /// Checks shared by every request after `welcome`.
@@ -1410,7 +1442,11 @@ impl<J: Journal> SessionHost<J> {
     fn on_session(&mut self, att: &str, m: SessionMessage) {
         let re = Some(m.id.clone());
         let result = match m.op {
-            Op::Hello { resume } => self.hello(att, re.clone(), resume.is_some()),
+            Op::Hello { revision, .. } if revision != Some(REVISION) => {
+                self.refuse_hello(att, re);
+                return;
+            }
+            Op::Hello { resume, .. } => self.hello(att, re.clone(), resume.is_some()),
             Op::ResumeProof { .. } => Err(ErrorCode::Unauthorized),
             op => self.admit_request(att).and_then(|()| match op {
                 Op::List {} => self.list(att, re.clone()),
@@ -1472,6 +1508,8 @@ impl<J: Journal> SessionHost<J> {
             permissions: a.permissions.clone(),
             authorization_ms_left: a.authorization_deadline - now,
             server_time: wall,
+            revision: Some(REVISION),
+            features: Some(FEATURES.iter().map(|f| f.to_string()).collect()),
         };
         self.send(att, re, op);
         Ok(())
@@ -1816,24 +1854,6 @@ impl<J: Journal> SessionHost<J> {
         self.registry_changed(sid);
     }
 
-    /// An approval answer with `acquire`: `att` needs the lease unless it
-    /// holds it live already. `Some(takeover)` when it must be granted (the
-    /// epochs it needs are reserved first: `busy` if that fails).
-    fn lease_to_acquire(&mut self, att: &str, sid: &str) -> Checked<Option<bool>> {
-        let s = &self.sessions[sid];
-        let live = s.lease.as_ref().filter(|l| self.now < l.deadline);
-        match live {
-            Some(l) if l.attachment == att => return Ok(None),
-            _ => {}
-        }
-        let takeover = live.is_some();
-        let need = s.lease_epoch + 2;
-        if !self.reserve_epochs(sid, need) {
-            return Err(ErrorCode::Busy);
-        }
-        Ok(Some(takeover))
-    }
-
     fn holds(&self, att: &str, b: &Binding) -> Checked<()> {
         let s = self.check_binding(att, b)?;
         if self.lease_live(att, s, b.lease_epoch) {
@@ -1910,20 +1930,10 @@ impl<J: Journal> SessionHost<J> {
             }
             _ => None,
         };
-        let acquire = answer.as_ref().is_some_and(ApprovalAnswer::acquires);
         if kind == ReceiptKind::ApprovalRuleRevoke {
             // r7.3: `control` and a running session; the lease is neither
             // needed nor checked (a stale `lease_epoch` is ignored), and a
             // revoke never takes, renews or moves it.
-            if !self.attachments[att].can(Permission::Control) {
-                return Err(ErrorCode::Forbidden);
-            }
-            if self.sessions[sid].state != SessionState::Running {
-                return Err(ErrorCode::SessionClosed);
-            }
-        } else if acquire {
-            // Takes the lease with the answer: `control` and a session that
-            // accepts work, but no current lease needed.
             if !self.attachments[att].can(Permission::Control) {
                 return Err(ErrorCode::Forbidden);
             }
@@ -1957,12 +1967,6 @@ impl<J: Journal> SessionHost<J> {
         if in_flight >= MAX_IN_FLIGHT {
             return Err(ErrorCode::Busy);
         }
-        let sid = sid.clone();
-        let grant = if acquire {
-            self.lease_to_acquire(att, &sid)?
-        } else {
-            None
-        };
         let updated_at = self.wall();
         let record = Record::Accepted {
             request_id: request_id.to_string(),
@@ -1975,12 +1979,6 @@ impl<J: Journal> SessionHost<J> {
         // `accepted` is durable before the reply; if it can't be, nothing
         // was recorded and the client may retry the same request.
         self.journal.append(record).map_err(|_| ErrorCode::Busy)?;
-        // Atomic with the answer: the lease is taken only now that the
-        // answer is recorded, and only by the attachment answering.
-        if let Some(takeover) = grant {
-            self.grant(att, &sid, takeover);
-            self.lease_announced(&sid, takeover, None);
-        }
         let order = self.next_order;
         self.next_order += 1;
         let stored = Stored {
@@ -2607,6 +2605,7 @@ impl<J: Journal> SessionHost<J> {
                         request_id: field("requestId").filter(|_| submit),
                         code: code_name(code),
                         text: code_text(code).to_string(),
+                        sequenced: !f.data.as_ref().is_some_and(refused_chat_form),
                     },
                 });
             }
@@ -2753,6 +2752,9 @@ impl<J: Journal> SessionHost<J> {
             // Host-only chat ops are not requests.
             return Err(ErrorCode::UnsupportedVersion);
         };
+        if f.data.as_ref().is_some_and(refused_chat_form) {
+            return Err(ErrorCode::UnsupportedVersion);
+        }
         let s = self.check_binding(att, b)?;
         f.check_binding_ids()?;
         if !s.spec.chat {
@@ -2845,6 +2847,7 @@ fn chat_reply(e: &Entry) -> ChatReply {
         request_id: Some(request_id.clone()),
         code: code.to_string(),
         text: s.detail.clone().unwrap_or_default(),
+        sequenced: true,
     };
     match s.state {
         ReceiptState::Accepted | ReceiptState::Executing => ChatReply::Accepted {
@@ -2859,6 +2862,18 @@ fn chat_reply(e: &Entry) -> ChatReply {
         ReceiptState::Rejected => error("rejected"),
         ReceiptState::OutcomeUnknown => error("outcome_unknown"),
     }
+}
+
+/// chat-v1 forms r8 refuses before anything else (§A), answered with an
+/// unsequenced `unsupported_version`: `open.before`/`open.generation` (the
+/// r7.2 paging form, removed: never read as an open of the newest page; an
+/// open conversation is not reset and none opens) and `history`
+/// (`chat.history`/`chat.lookup`, not advertised yet).
+// TODO(r8 task 5): serve `history` once those features ship.
+fn refused_chat_form(data: &Value) -> bool {
+    let removed_open =
+        data["op"] == "open" && (data.get("before").is_some() || data.get("generation").is_some());
+    removed_open || data["op"] == "history"
 }
 
 /// The wire name of a §7 code.
@@ -2884,6 +2899,7 @@ pub fn code_text(code: ErrorCode) -> &'static str {
         ErrorCode::SessionClosed => "the session no longer accepts requests",
         ErrorCode::Busy => "busy; try again",
         ErrorCode::Paused => "authorization expired; control paused",
+        ErrorCode::InvalidRequest => "invalid request",
     }
 }
 

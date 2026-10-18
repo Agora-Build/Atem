@@ -1,13 +1,17 @@
 //! Client-side state machines for atem-session v1: the control-lease client
-//! (§5 reply-correlation rules 1–5) and the session registry client (§4),
-//! which also keeps the pending approvals (r7) of the processes it holds.
+//! (§5 reply-correlation rules 1–5), the session registry client (§4),
+//! which also keeps the pending approvals (r7) of the processes it holds,
+//! and r8 revision admission (`AdmissionClient`, §A).
 //!
 //! Both are pure: the caller passes a monotonic `now_ms` with every event and
 //! performs any I/O they ask for (`RegistryClient::take_list_request`).
 //! Neither relies on a timer having fired: every query and every reply checks
 //! `now >= deadline` itself.
 
-use super::wire::{ApprovalRequest, Binding, Descriptor, Op, SessionMessage, SessionState, Target};
+use super::revision::{CHAT_HISTORY, CHAT_LOOKUP, KNOWN_FEATURES, REVISION};
+use super::wire::{
+    ApprovalRequest, Binding, Descriptor, Envelope, Op, SessionMessage, SessionState, Target,
+};
 use std::collections::{BTreeMap, HashMap};
 
 // ── Control lease (§5) ────────────────────────────────────────────────────
@@ -566,6 +570,149 @@ impl RegistryClient {
     }
 }
 
+// ── Revision admission (r8 §A) ────────────────────────────────────────────
+
+/// Where the client stands with the host's `welcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// `hello` sent, no `welcome` yet: nothing is sent or applied.
+    Awaiting,
+    /// The welcome named revision 8; `features` are the advertised ones this
+    /// client knows, in the host's order.
+    Admitted { features: Vec<String> },
+    /// The welcome named no revision or another one (an older host): the
+    /// attachment is refused for good. The client sends nothing further,
+    /// applies nothing it receives and tells the user the host's Atem must
+    /// be updated.
+    Refused,
+}
+
+/// Why the client won't send something (shown to the user).
+pub const HOST_TOO_OLD: &str = "the host's Atem must be updated (atem-session revision 8)";
+pub const NOT_WELCOMED: &str = "not welcomed yet";
+
+/// The client side of r8 revision admission: checks `welcome.revision`
+/// before anything else, enables only the advertised features it knows and
+/// refuses locally to send an op of a feature the host didn't advertise.
+#[derive(Debug, Clone)]
+pub struct AdmissionClient {
+    state: Admission,
+}
+
+impl AdmissionClient {
+    /// A client that sent `hello` and waits for the welcome.
+    pub fn awaiting() -> Self {
+        Self {
+            state: Admission::Awaiting,
+        }
+    }
+
+    /// A client already admitted with these advertised features (unknown
+    /// names are dropped).
+    pub fn admitted(advertised: &[&str]) -> Self {
+        let mut c = Self::awaiting();
+        let features: Vec<String> = advertised.iter().map(|f| f.to_string()).collect();
+        c.on_welcome(Some(REVISION), Some(&features));
+        c
+    }
+
+    pub fn state(&self) -> &Admission {
+        &self.state
+    }
+
+    /// The client sends a new `hello`: a new handshake (`Err` once refused,
+    /// it sends nothing further).
+    pub fn hello_sent(&mut self) -> Result<(), &'static str> {
+        if self.state == Admission::Refused {
+            return Err(HOST_TOO_OLD);
+        }
+        self.state = Admission::Awaiting;
+        Ok(())
+    }
+
+    /// The host's `welcome`: admitted only with `revision == 8`; anything
+    /// else refuses the attachment for good. Returns whether it was
+    /// admitted (so the welcome may be applied).
+    pub fn on_welcome(&mut self, revision: Option<u64>, features: Option<&[String]>) -> bool {
+        if self.state == Admission::Refused {
+            return false;
+        }
+        if revision != Some(REVISION) {
+            self.state = Admission::Refused;
+            return false;
+        }
+        let mut enabled: Vec<String> = Vec::new();
+        for f in features.unwrap_or_default() {
+            if KNOWN_FEATURES.contains(&f.as_str()) && !enabled.contains(f) {
+                enabled.push(f.clone());
+            }
+        }
+        self.state = Admission::Admitted { features: enabled };
+        true
+    }
+
+    pub fn is_admitted(&self) -> bool {
+        matches!(self.state, Admission::Admitted { .. })
+    }
+
+    /// Host messages apply only once admitted.
+    pub fn applies(&self) -> bool {
+        self.is_admitted()
+    }
+
+    pub fn revision(&self) -> Option<u64> {
+        self.is_admitted().then_some(REVISION)
+    }
+
+    /// The advertised features this client enabled (empty unless admitted).
+    pub fn features_enabled(&self) -> &[String] {
+        match &self.state {
+            Admission::Admitted { features } => features,
+            _ => &[],
+        }
+    }
+
+    pub fn enabled(&self, feature: &str) -> bool {
+        self.features_enabled().iter().any(|f| f == feature)
+    }
+
+    /// Whether the client may send `env` now; `Err` is the reason it
+    /// refuses locally (nothing is sent).
+    pub fn check_send(&self, env: &Envelope) -> Result<(), String> {
+        match &self.state {
+            Admission::Refused => return Err(HOST_TOO_OLD.into()),
+            Admission::Awaiting => {
+                let hello = matches!(env, Envelope::Session(m) if matches!(m.op, Op::Hello { .. }));
+                if !hello {
+                    return Err(NOT_WELCOMED.into());
+                }
+            }
+            Admission::Admitted { .. } => {}
+        }
+        match required_feature(env) {
+            Some(f) if !self.enabled(f) => Err(format!("feature {f} not advertised")),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The feature an outgoing message needs (§A): chat `history` by `turn_id`
+/// or `request_id` is `chat.lookup`, by `before`/`next` `chat.history`.
+pub fn required_feature(env: &Envelope) -> Option<&'static str> {
+    let Envelope::Family(f) = env else {
+        return None;
+    };
+    let data = f.data.as_ref()?;
+    if f.family != "agentChat" || data.get("op").and_then(|o| o.as_str()) != Some("history") {
+        return None;
+    }
+    if data.get("turn_id").is_some() || data.get("request_id").is_some() {
+        Some(CHAT_LOOKUP)
+    } else {
+        Some(CHAT_HISTORY)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +959,7 @@ mod tests {
         let err = Op::Error {
             code: ErrorCode::StaleLease,
             detail: None,
+            revision: None,
         };
         assert_eq!(
             c.on_reply(&reply(&id(2), err), 5_100),
