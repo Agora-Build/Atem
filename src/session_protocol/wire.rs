@@ -846,7 +846,9 @@ impl Receipt {
 /// optional and ignored).
 pub fn submit_binding_use(kind: ReceiptKind) -> BindingUse {
     match kind {
-        ReceiptKind::ApprovalRuleRevoke => BindingUse::LeaseIgnored,
+        // r7.3 revoke and r8 §G answer: `control` only, the lease plays no
+        // part (`lease_epoch` optional and ignored).
+        ReceiptKind::ApprovalRuleRevoke | ReceiptKind::Approval => BindingUse::LeaseIgnored,
         _ => BindingUse::Mutation,
     }
 }
@@ -859,20 +861,26 @@ pub const FEATURE_NOT_ADVERTISED: &str = "feature not advertised";
 
 /// Submission fields §F adds (`chat.send_acquire`). Beside an approval
 /// answer they are r7's removed `acquire` (§G), refused at decoding. On a
-/// session-v1 submit of any other kind they decode, and the host applies
-/// §F's rules (or refuses them as an op of an unadvertised feature while
-/// `HostConfig::send_acquire` is off). On a chat-v1 submit they are refused
-/// until `chat.send_acquire` ships.
-// TODO(r8 task 3): parse these for chat `text` submits when
-// `chat.send_acquire` ships; approval answers keep refusing them.
+/// session-v1 submit of any other kind, and on a chat-v1 `text` or rule
+/// revoke submit, they decode (each with its type), and the host applies
+/// §F's field rules (`invalid_request`).
 pub const SEND_ACQUIRE_FIELDS: &[&str] = &["acquire", "takeover", "expected_controller"];
 
-fn send_acquire_refusal(kind_is_approval: bool) -> String {
-    if kind_is_approval {
-        REMOVED_IN_R8.to_string()
-    } else {
-        FEATURE_NOT_ADVERTISED.to_string()
+/// The types of §F's fields beside a chat-v1 submit: `acquire`/`takeover`
+/// booleans, `expected_controller` a descriptor `controller`. Their rules
+/// (which may appear together) are the host's (`invalid_request`).
+fn check_send_fields(m: &Map<String, Value>) -> Result<(), String> {
+    for name in ["acquire", "takeover"] {
+        if m.get(name).is_some_and(|v| !v.is_boolean()) {
+            return Err(format!("invalid {name}"));
+        }
     }
+    if let Some(v) = m.get("expected_controller") {
+        let c: Controller =
+            serde_json::from_value(v.clone()).map_err(|e| format!("expected_controller: {e}"))?;
+        c.validate()?;
+    }
+    Ok(())
 }
 
 /// The chat-v1 `submit` field carrying a rule revocation (r7.2), named
@@ -1133,7 +1141,7 @@ fn decode_session(data: Map<String, Value>) -> Result<SessionMessage, DecodeErro
         && data.get("kind").and_then(Value::as_str) == Some("approval")
         && SEND_ACQUIRE_FIELDS.iter().any(|f| data.contains_key(*f))
     {
-        return Err(with_op(fail(Some(id), send_acquire_refusal(true))));
+        return Err(with_op(fail(Some(id), REMOVED_IN_R8)));
     }
     let op: Op = serde_json::from_value(Value::Object(data))
         .map_err(|e| with_op(fail(Some(id.clone()), e.to_string())))?;
@@ -1249,16 +1257,19 @@ fn check_chat(data: Option<&Value>, binding: Option<&Binding>) -> Result<(), Dec
         // TODO(r8 task 5): the selector and field rules of §B.
         "history" => BindingUse::Read,
         "submit" if SEND_ACQUIRE_FIELDS.iter().any(|f| m.contains_key(*f)) => {
-            let approval = m.contains_key("approval");
-            return Err(fail(
-                None,
-                format!("agentChat: {}", send_acquire_refusal(approval)),
-            ));
+            if m.contains_key("approval") {
+                return Err(fail(None, format!("agentChat: {REMOVED_IN_R8}")));
+            }
+            check_send_fields(m).map_err(|e| fail(None, format!("agentChat: {e}")))?;
+            // §F: the host judges `lease_epoch` (`acquire` excludes it).
+            BindingUse::LeaseIgnored
         }
-        // A rule revocation (r7.3) needs no lease: `lease_epoch` optional.
+        // A rule revocation (r7.3) and an approval answer (r8 §G) need no
+        // lease: `lease_epoch` optional and ignored.
         "submit" if m.contains_key(RULE_REVOKE_FIELD) => {
             submit_binding_use(ReceiptKind::ApprovalRuleRevoke)
         }
+        "submit" if m.contains_key("approval") => submit_binding_use(ReceiptKind::Approval),
         "submit" => BindingUse::Mutation,
         _ if binding.is_some() => {
             return Err(fail(None, format!("agentChat {op} cannot carry a binding")));

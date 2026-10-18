@@ -8,8 +8,7 @@
 //! the `hello`/`welcome` itself (checking the welcome) and, for
 //! `holds_lease_epoch`, a real `acquire`, so every lease and attachment comes
 //! from the host's own rules. Each client name is its own principal (r8
-//! §H). The host runs with `harness_config` (r8 §F's session-v1 acquiring
-//! Send on, not advertised).
+//! §H).
 
 use super::fixtures::{HostEvent, HostUnderTest, Setup};
 use super::host::{
@@ -30,16 +29,6 @@ pub const AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The adapter's draft check refusing a prompt (`chat::session`).
 pub const DRAFT_REFUSAL: &str = "the terminal has unsent input; finish or clear it there";
-
-/// The host configuration of the fixture harness: r8 §F's acquiring Send
-/// (session-v1 form) is on although `chat.send_acquire` isn't advertised
-/// yet (`revision::HARNESS_WORK`).
-pub fn harness_config() -> HostConfig {
-    HostConfig {
-        send_acquire: true,
-        ..HostConfig::default()
-    }
-}
 
 /// The fake PTY and dispatcher.
 #[derive(Debug)]
@@ -185,7 +174,13 @@ fn message(op: Op) -> Envelope {
 fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Envelope {
     let mut data = json!({"v": 1, "conversationId": conversation_id, "agentId": session_id});
     let body = match reply {
-        ChatReply::Accepted { request_id } => json!({"op": "accepted", "requestId": request_id}),
+        ChatReply::Accepted { request_id, lease } => {
+            let mut b = json!({"op": "accepted", "requestId": request_id});
+            if let Some(l) = lease {
+                b["lease"] = json!({"lease_epoch": l.lease_epoch, "ms_left": l.ms_left});
+            }
+            b
+        }
         ChatReply::Complete {
             request_id,
             turn_id,
@@ -202,11 +197,15 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
             request_id,
             code,
             text,
+            controller,
             ..
         } => {
             let mut b = json!({"op": "error", "code": code, "text": text});
             if let Some(r) = request_id {
                 b["requestId"] = Value::String(r);
+            }
+            if let Some(c) = controller {
+                b["controller"] = json!(c);
             }
             b
         }
@@ -223,9 +222,9 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
 }
 
 impl FakeRuntime {
-    /// The fixtures' host: `harness_config` over a `MemJournal`.
+    /// The fixtures' host: the default configuration over a `MemJournal`.
     pub fn new(setup: &Setup) -> Result<Self, String> {
-        Self::with_config(setup, harness_config())
+        Self::with_config(setup, HostConfig::default())
     }
 
     pub fn with_config(setup: &Setup, config: HostConfig) -> Result<Self, String> {

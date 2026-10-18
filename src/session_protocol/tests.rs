@@ -164,12 +164,22 @@ fn strict_parser_rules() {
 
 // ── fixtures: every wire message decodes and round-trips ─────────────────
 
+/// A placeholder for a captured UUID: `${aid}`, `${a1}`…, `${gen2}`,
+/// `${…ctl}`.
+fn is_captured_id(s: &str) -> bool {
+    let numbered_approval = s
+        .strip_prefix("${a")
+        .and_then(|r| r.strip_suffix('}'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    s == "${aid}" || s == "${gen2}" || s.ends_with("ctl}") || numbered_approval
+}
+
 /// Replaces harness placeholders (`${name}`) with a valid value (a captured
 /// approval id or attachment generation is a UUID).
 fn substitute(v: &mut Value) {
     match v {
         // Captured ids (approval ids, generations, controller sessions).
-        Value::String(s) if s == "${aid}" || s == "${gen2}" || s.ends_with("ctl}") => {
+        Value::String(s) if is_captured_id(s) => {
             *s = "88888888-8888-4888-8888-888888888888".to_string()
         }
         Value::String(s) if s.contains("${") => *s = "stream-0001".to_string(),
@@ -226,11 +236,11 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let file = read_fixture(&name);
         // r8 fixtures whose work isn't implemented use wire forms the
-        // decoder doesn't know yet; superseded r7.x ones use removed forms.
+        // decoder doesn't know yet.
         let fixture_name = file["name"].as_str().unwrap_or_default();
         let r8_waiting = fixture_name.starts_with("r8-")
-            && super::revision::r8_fixture_runnable_in_harness(fixture_name).is_err();
-        if r8_waiting || super::revision::superseded(fixture_name).is_some() {
+            && super::revision::r8_fixture_runnable(fixture_name).is_err();
+        if r8_waiting {
             continue;
         }
         let steps = file["steps"].as_array().unwrap();

@@ -32,10 +32,11 @@
 //! `open_approval`, whoever holds the lease (delivery is independent of
 //! control): subscribed attachments with `control` get `approval_request`
 //! (again after every `list`) and `Effect::PushApproval` asks the relay to
-//! push it to the account's devices. The lease holder answers with a
-//! `kind:"approval"` submission (r7's `acquire` on an answer is removed in
-//! r8 and refused; lease-free answers are r8 task 3). Once the answer is
-//! `executing` the approval closes
+//! push it to the account's devices. Any attachment with `control` answers
+//! with a `kind:"approval"` submission (r8 §G): the lease is neither needed
+//! nor checked, taken or moved, r7's `acquire` on an answer is refused, and
+//! the first admitted answer wins (later ones are `stale_target`). Once the
+//! answer is `executing` the approval closes
 //! (`answered_remote`) and `Effect::Approval` hands the decision to the
 //! agent, whose report (`approval_applied`, `close_approval`,
 //! `dispatch_report`) finishes the receipt. Every close also resolves the
@@ -71,12 +72,10 @@
 //! revoked`), else it waits for its principal to be welcomed with `control`
 //! and is `control not confirmed` 60 s after the start.
 //!
-//! Chat Send (r8 §F, session-v1 form): a `prompt` submit may carry
-//! `acquire` (with `takeover` and `expected_controller`) and acquire the
-//! lease in the same step as its durable acceptance. It is off unless
-//! `HostConfig::send_acquire` (the feature isn't advertised yet; the shared
-//! fixtures' harness turns it on), and refused as an op of an unadvertised
-//! feature otherwise.
+//! Chat Send (r8 §F, `chat.send_acquire`): a session-v1 `prompt` submit or
+//! a chat-v1 `text` submit may carry `acquire` (with `takeover` and
+//! `expected_controller`) and acquire the lease in the same step as its
+//! durable acceptance; the admitting reply carries the sender's lease.
 //!
 //! Atem session rules (r7.2): the runtime reports a session's active rules
 //! (`set_approval_rules`; the worker owns them); attachments with `control`
@@ -173,12 +172,6 @@ pub struct HostConfig {
     pub max_receipts_per_session: usize,
     /// Wall clock = this + the monotonic clock (display times only).
     pub wall_offset_ms: u64,
-    /// r8 §F's acquiring `prompt` submit (session-v1 form). Off in the
-    /// runtime until `chat.send_acquire` is advertised (§A: an op of an
-    /// unadvertised feature is `unsupported_version`); the shared fixtures'
-    /// harness turns it on.
-    // TODO(r8 task 3): on (and advertised) with the chat-v1 form.
-    pub send_acquire: bool,
 }
 
 impl Default for HostConfig {
@@ -186,7 +179,6 @@ impl Default for HostConfig {
         Self {
             max_receipts_per_session: DEFAULT_MAX_RECEIPTS,
             wall_offset_ms: 0,
-            send_acquire: false,
         }
     }
 }
@@ -345,8 +337,10 @@ pub enum Effect {
 /// `accepted`/`complete` follow the receipt's `accepted`/`completed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatReply {
+    /// `lease` only on the reply that admitted an acquiring Send (r8 §F).
     Accepted {
         request_id: String,
+        lease: Option<ReceiptLease>,
     },
     /// The turn ended (`outcome: "done"`, or `"interrupted"` when
     /// `interrupted`); `turn_id` is the provider's turn.
@@ -366,6 +360,8 @@ pub enum ChatReply {
         /// unadvertised feature), so an open conversation's sequence is not
         /// advanced by it.
         sequenced: bool,
+        /// The holder a `lease_held` names (r8 §F).
+        controller: Option<Controller>,
     },
 }
 
@@ -2526,8 +2522,8 @@ impl<J: Journal> SessionHost<J> {
 
     /// r8 §F field rules of the admission parameters: `None` for the r7 form
     /// (none present), else whether a takeover was confirmed and of which
-    /// lease. Refused `invalid_request`, nothing recorded; `unsupported_version`
-    /// while the feature is off (§A).
+    /// lease. Refused `invalid_request`, nothing recorded. Beside an approval
+    /// answer they are r7's removed `acquire` (§G): `unsupported_version`.
     fn send_rules(
         &self,
         kind: ReceiptKind,
@@ -2537,7 +2533,7 @@ impl<J: Journal> SessionHost<J> {
         if !send.any() {
             return Ok(None);
         }
-        if !self.config.send_acquire {
+        if kind == ReceiptKind::Approval {
             return Err(ErrorCode::UnsupportedVersion);
         }
         let valid = send.acquire == Some(true)
@@ -2640,10 +2636,14 @@ impl<J: Journal> SessionHost<J> {
             if crate::chat::session::clean_prompt(text).is_err() {
                 return Err(ErrorCode::InvalidRequest);
             }
-        } else if kind == ReceiptKind::ApprovalRuleRevoke {
-            // r7.3: `control` and a running session; the lease is neither
-            // needed nor checked (a stale `lease_epoch` is ignored), and a
-            // revoke never takes, renews or moves it.
+        } else if matches!(
+            kind,
+            ReceiptKind::ApprovalRuleRevoke | ReceiptKind::Approval
+        ) {
+            // r7.3 revoke and r8 §G answer: `control` and a running session;
+            // the lease is neither needed nor checked (a stale or foreign
+            // `lease_epoch` is ignored), and they never take, renew or move
+            // it, nor fence the holder's queued input.
             if !self.attachments[att].can(Permission::Control) {
                 return Err(ErrorCode::Forbidden);
             }
@@ -2751,6 +2751,23 @@ impl<J: Journal> SessionHost<J> {
                     ms_left: l.deadline.saturating_sub(self.now),
                 });
                 self.send(att, re, Op::Receipt(receipt));
+            }
+            (Some(_), Reply::Chat { conversation_id }) => {
+                let s = &self.sessions[&sid];
+                let l = s.lease.as_ref().expect("an admitted Send holds the lease");
+                let lease = ReceiptLease {
+                    lease_epoch: s.lease_epoch,
+                    ms_left: l.deadline.saturating_sub(self.now),
+                };
+                self.out.push(Effect::Chat {
+                    attachment: att.to_string(),
+                    conversation_id,
+                    session_id: sid.clone(),
+                    reply: ChatReply::Accepted {
+                        request_id: request_id.to_string(),
+                        lease: Some(lease),
+                    },
+                });
             }
             (_, reply) => self.report_state(att, reply, request_id),
         }
@@ -3351,7 +3368,7 @@ impl<J: Journal> SessionHost<J> {
                     attachment: att.to_string(),
                 });
             } else {
-                self.family_error(att, &f, code, refused.detail);
+                self.family_error(att, &f, code, refused.detail, refused.controller);
             }
         }
         self.refused = Refused::default();
@@ -3366,6 +3383,7 @@ impl<J: Journal> SessionHost<J> {
         f: &FamilyMessage,
         code: ErrorCode,
         detail: Option<&'static str>,
+        controller: Option<Controller>,
     ) {
         let field = |name: &str| {
             f.data
@@ -3407,6 +3425,7 @@ impl<J: Journal> SessionHost<J> {
                         code: code_name(code),
                         text: detail.unwrap_or(code_text(code)).to_string(),
                         sequenced: !f.data.as_ref().is_some_and(refused_chat_form),
+                        controller,
                     },
                 });
             }
@@ -3577,6 +3596,7 @@ impl<J: Journal> SessionHost<J> {
                         .unwrap_or_default()
                         .to_string(),
                 };
+                let send = chat_send_params(data)?;
                 self.submit(
                     att,
                     reply,
@@ -3584,7 +3604,7 @@ impl<J: Journal> SessionHost<J> {
                     &request_id,
                     ReceiptKind::ApprovalRuleRevoke,
                     payload,
-                    SendParams::default(),
+                    send,
                 )
             }
             Some("submit") if data.get("approval").is_some() => {
@@ -3599,7 +3619,9 @@ impl<J: Journal> SessionHost<J> {
                         .unwrap_or_default()
                         .to_string(),
                 };
-                let send = SendParams::default();
+                // §G: `acquire` beside an answer is the removed r7 form
+                // (`send_rules` refuses it `unsupported_version`).
+                let send = chat_send_params(data)?;
                 self.submit(
                     att,
                     reply,
@@ -3626,7 +3648,8 @@ impl<J: Journal> SessionHost<J> {
                         .unwrap_or_default()
                         .to_string(),
                 };
-                let send = SendParams::default();
+                // §F: the same admission parameters as the session form.
+                let send = chat_send_params(data)?;
                 self.submit(
                     att,
                     reply,
@@ -3650,6 +3673,23 @@ impl<J: Journal> SessionHost<J> {
     }
 }
 
+/// The §F admission parameters beside a chat-v1 `submit` (`acquire`,
+/// `takeover`, `expected_controller`); a value of the wrong type fails
+/// decoding (`unsupported_version`), the field rules are `send_rules`'.
+fn chat_send_params(data: &Value) -> Checked<SendParams> {
+    fn field<T: serde::de::DeserializeOwned>(data: &Value, name: &str) -> Checked<Option<T>> {
+        data.get(name)
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|_| ErrorCode::UnsupportedVersion)
+    }
+    Ok(SendParams {
+        acquire: field(data, "acquire")?,
+        takeover: field(data, "takeover")?,
+        expected_controller: field(data, "expected_controller")?,
+    })
+}
+
 /// How a submitter hears about its request.
 #[derive(Debug, Clone)]
 enum Reply {
@@ -3668,10 +3708,12 @@ fn chat_reply(e: &Entry) -> ChatReply {
         code: code.to_string(),
         text: s.detail.clone().unwrap_or_default(),
         sequenced: true,
+        controller: None,
     };
     match s.state {
         ReceiptState::Accepted | ReceiptState::Executing => ChatReply::Accepted {
             request_id: request_id.clone(),
+            lease: None,
         },
         ReceiptState::Completed => ChatReply::Complete {
             request_id: request_id.clone(),

@@ -1,10 +1,19 @@
 {
- "name": "approval-answer-with-acquire-takes-control-from-the-holder",
+ "name": "r8-approval-survives-takeover",
+ "requires": "r8",
  "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
   "sessions": [
    {
     "session_id": "ses-aaaaaaaaaaaa",
-    "process_gen": "22222222-2222-4222-8222-222222222222"
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
    }
   ],
   "clients": [
@@ -15,8 +24,8 @@
      "view",
      "control"
     ],
-    "holds_lease_epoch": 1,
-    "client_kind": "native"
+    "client_kind": "native",
+    "holds_lease_epoch": 1
    },
    {
     "name": "c2",
@@ -27,14 +36,7 @@
     ],
     "client_kind": "native"
    }
-  ],
-  "host": {
-   "account_id": "account-a",
-   "atem_device_id": "host-a",
-   "host_trust_gen": 1,
-   "runtime_gen": "55555555-5555-4555-8555-555555555555",
-   "runtime_epoch": 7
-  }
+  ]
  },
  "steps": [
   {
@@ -50,6 +52,7 @@
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "sessions",
     "re": "11111111-1111-4111-8111-000000000001",
@@ -69,6 +72,7 @@
   },
   {
    "expect": "c2",
+   "type": "session",
    "match": {
     "op": "sessions",
     "re": "11111111-1111-4111-8111-000000000002",
@@ -84,16 +88,12 @@
      "rule_id": "r-npm-test",
      "label": "Bash(npm test:*)",
      "scope": "this project"
-    },
-    {
-     "rule_id": "r-npm",
-     "label": "Bash(npm:*)",
-     "scope": "this project"
     }
    ]
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "approval_request",
     "session_id": "ses-aaaaaaaaaaaa",
@@ -104,21 +104,17 @@
      {
       "rule_id": "r-npm-test",
       "label": "Bash(npm test:*)",
-      "scope": "this project"
-     },
-     {
-      "rule_id": "r-npm",
-      "label": "Bash(npm:*)",
       "scope": "this project"
      }
     ]
    },
    "capture": {
-    "aid": "approval_id"
+    "a1": "approval_id"
    }
   },
   {
    "expect": "c2",
+   "type": "session",
    "match": {
     "op": "approval_request",
     "session_id": "ses-aaaaaaaaaaaa",
@@ -130,14 +126,9 @@
       "rule_id": "r-npm-test",
       "label": "Bash(npm test:*)",
       "scope": "this project"
-     },
-     {
-      "rule_id": "r-npm",
-      "label": "Bash(npm:*)",
-      "scope": "this project"
      }
     ],
-    "approval_id": "${aid}"
+    "approval_id": "${a1}"
    }
   },
   {
@@ -146,7 +137,7 @@
     "type": "session",
     "data": {
      "v": 1,
-     "op": "submit",
+     "op": "acquire",
      "id": "11111111-1111-4111-8111-000000000003",
      "binding": {
       "target": {
@@ -158,61 +149,31 @@
       },
       "attachment_gen": "66666666-6666-4666-8666-666666666666"
      },
-     "request_id": "44444444-4444-4444-8444-000000000001",
-     "kind": "approval",
-     "payload": {
-      "approval_id": "${aid}",
-      "decision": "deny",
-      "message": "use the staging config",
-      "acquire": true
-     }
+     "takeover": true
     }
    }
   },
   {
    "expect": "c2",
+   "type": "session",
    "match": {
-    "op": "lease_changed",
-    "reason": "takeover",
-    "lease_epoch": 2
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "binding.lease_epoch": 2
    }
   },
   {
    "expect": "c2",
+   "type": "session",
    "match": {
     "op": "session_changed",
+    "seq": 2,
     "descriptor.controller.lease_epoch": 2
    }
   },
   {
-   "expect": "c2",
-   "match": {
-    "op": "receipt",
-    "request_id": "44444444-4444-4444-8444-000000000001",
-    "kind": "approval",
-    "state": "accepted",
-    "re": "11111111-1111-4111-8111-000000000003"
-   }
-  },
-  {
-   "expect": "c2",
-   "match": {
-    "op": "receipt",
-    "request_id": "44444444-4444-4444-8444-000000000001",
-    "kind": "approval",
-    "state": "executing"
-   }
-  },
-  {
-   "expect": "c2",
-   "match": {
-    "op": "approval_closed",
-    "approval_id": "${aid}",
-    "reason": "answered_remote"
-   }
-  },
-  {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "lease_changed",
     "reason": "takeover",
@@ -221,33 +182,18 @@
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "session_changed",
+    "seq": 2,
     "descriptor.controller.lease_epoch": 2
-   }
-  },
-  {
-   "expect": "c1",
-   "match": {
-    "op": "approval_closed",
-    "approval_id": "${aid}",
-    "reason": "answered_remote"
    }
   },
   {
    "assert": {
-    "approval_decisions": [
-     {
-      "approval_id": "${aid}",
-      "decision": "deny",
-      "message": "use the staging config"
-     }
-    ],
-    "lease_holder": "c2",
-    "receipts_visible": {
-     "c1": 1,
-     "c2": 1
-    }
+    "approvals_pending": 1,
+    "approvals_released": 0,
+    "lease_holder": "c2"
    }
   },
   {
@@ -256,7 +202,7 @@
     "type": "session",
     "data": {
      "v": 1,
-     "op": "renew",
+     "op": "submit",
      "id": "11111111-1111-4111-8111-000000000004",
      "binding": {
       "target": {
@@ -268,18 +214,160 @@
       },
       "attachment_gen": "33333333-3333-4333-8333-333333333333",
       "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${a1}",
+      "decision": "deny"
      }
     }
    }
   },
   {
    "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000004",
+    "kind": "approval"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a1}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a1}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000005",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666",
+      "lease_epoch": 2
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${a1}",
+      "decision": "allow_once"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
    "match": {
     "op": "error",
-    "re": "11111111-1111-4111-8111-000000000004",
-    "code": "stale_lease"
+    "re": "11111111-1111-4111-8111-000000000005",
+    "code": "stale_target"
+   }
+  },
+  {
+   "approval_applied": "${a1}",
+   "ok": true
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "completed"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "approval_decisions": [
+     {
+      "approval_id": "${a1}",
+      "decision": "deny"
+     }
+    ],
+    "approvals_pending": 0,
+    "approvals_released": 0,
+    "dispatches": 1,
+    "lease_holder": "c2",
+    "receipts_visible": {
+     "c1": 1,
+     "c2": 1
+    }
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "renew",
+     "id": "11111111-1111-4111-8111-000000000006",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666",
+      "lease_epoch": 2
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000006",
+    "binding.lease_epoch": 2
    }
   }
- ],
- "note": "A device that is not the lease holder (e.g. a phone woken by the push) answers with acquire: true: the host takes the lease for it (takeover) and hands the decision over atomically; the old holder sees the takeover and its epoch is stale."
+ ]
 }

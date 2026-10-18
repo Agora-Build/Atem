@@ -178,6 +178,10 @@ enum PartBody<'a> {
         rule_id: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<&'a str>,
+        /// r8 `approval.card_reason`: the `approval_closed` reason of a
+        /// final card.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::session_protocol::wire::ApprovalCloseReason>,
     },
 }
 
@@ -257,6 +261,7 @@ fn part_body(p: &Part) -> PartBody<'_> {
             state: c.state,
             rule_id: c.rule_id.as_deref(),
             note: c.note.as_deref(),
+            reason: c.reason,
         },
     }
 }
@@ -510,12 +515,14 @@ mod tests {
             state: ApprovalCardState::AlwaysAllowed,
             rule_id: None,
             note: None,
+            reason: Some(crate::session_protocol::wire::ApprovalCloseReason::AnsweredRemote),
         })];
         let e = body(&event("c1", "claude", "g", 3, &Out::Message(m)));
         assert_eq!(
             e["parts"][0],
             json!({"id": "approval", "kind": "approval", "approval_id": "a1", "tool": "Bash",
                    "summary": "npm test", "state": "always_allowed",
+                   "reason": "answered_remote",
                    "always_rules": [{"rule_id": "r0-1", "label": "Allow Bash(npm test:*)",
                                      "scope": "this project"}]})
         );
@@ -561,6 +568,7 @@ mod tests {
             state: ApprovalCardState::AutoAllowed,
             rule_id: Some("s-1".into()),
             note: None,
+            reason: None,
         })];
         let e = body(&event("c1", "codex", "g", 3, &Out::Message(m)));
         assert_eq!(

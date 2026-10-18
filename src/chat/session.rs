@@ -1189,6 +1189,7 @@ mod tests {
             state,
             rule_id: None,
             note: None,
+            reason: None,
         };
         let Out::Message(first) = s.approval_card(card(ApprovalCardState::Pending), 5) else {
             panic!()
@@ -1841,6 +1842,7 @@ mod tests {
                     state: ApprovalCardState::Pending,
                     rule_id: None,
                     note: None,
+                    reason: None,
                 },
                 3,
             );

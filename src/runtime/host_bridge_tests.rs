@@ -2009,6 +2009,7 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_from_chat() 
         assert_eq!(card["tool"], "Bash");
         assert_eq!(card["summary"], "npm test");
         assert_eq!(card["always_rules"], request["always_rules"]);
+        assert!(card.get("reason").is_none(), "pending: no reason {card}");
 
         // r8 removed `acquire` on an answer: refused, nothing taken.
         let refused_id = uuid::Uuid::new_v4().to_string();
@@ -2025,15 +2026,14 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_from_chat() 
             .await;
         assert!(refused["data"].get("re").is_none(), "{refused}");
         assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
-        // Answered from chat under the lease.
-        let lease = peer.acquire(&sid, &pg).await;
+        // r8 §G: answered from chat without the lease, which stays free.
         let request_id = uuid::Uuid::new_v4().to_string();
         peer.chat(
             "submit",
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": request_id, "lease_epoch": lease,
+            json!({"generation": pg, "requestId": request_id,
                    "approval": {"approval_id": aid, "decision": "allow_once"}}),
         );
         let rid = request_id.clone();
@@ -2048,7 +2048,12 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_from_chat() 
             })
             .await;
         assert_eq!(done["data"]["op"], "complete", "{done}");
-        peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        // r8 `approval.card_reason`: the final card says why it closed.
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_remote"
+        );
         let at = peer
             .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
             .await;
@@ -2059,7 +2064,7 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_from_chat() 
             .find(|v| is_session(v, "approval_closed"))
             .unwrap();
         assert_eq!(closed["data"]["reason"], "answered_remote");
-        assert!(listed(peer, &sid).await["controller"].is_object());
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
         rt.shutdown().await;
     });
 }
@@ -2101,7 +2106,11 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
             })
             .await;
         assert_eq!(done["data"]["state"], "completed", "{done}");
-        peer.wait_from(0, |v| is_card(v, &aid, "denied")).await;
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "denied")).await;
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_remote"
+        );
 
         // Answered in the agent's own dialog first: the card and the push
         // resolve, and the hook gets no decision.
@@ -2126,8 +2135,13 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
             .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
             .await;
         assert_eq!(peer.seen[at]["data"]["reason"], "answered_terminal");
-        peer.wait_from(0, |v| is_card(v, &aid, "answered_terminal"))
+        let at = peer
+            .wait_from(0, |v| is_card(v, &aid, "answered_terminal"))
             .await;
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_terminal"
+        );
         agent_event(&fake, "answer 2 none ").await;
         // A late answer is refused.
         let id = peer.request(
@@ -2430,7 +2444,12 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
             .wait(move |v| is_chat(v, "error") && v["data"]["requestId"] == rid.as_str())
             .await;
         assert_eq!(done["data"]["code"], "outcome_unknown", "{done}");
-        peer.wait_from(0, |v| is_card(v, &aid, "closed")).await;
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "closed")).await;
+        // Closed after the remote answer: the close reason stays that one.
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_remote"
+        );
         rt.shutdown().await;
     });
 }

@@ -283,13 +283,9 @@ pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, 
         serde_json::from_value(file.clone()).map_err(|e| format!("scenario: {e}"))?;
     let r8 = scenario.name.starts_with("r8-");
     match scenario.requires.as_deref() {
-        None if !r8 => {
-            if let Some(why) = revision::superseded(&scenario.name) {
-                return Ok(Outcome::NotRun(why.to_string()));
-            }
-        }
+        None if !r8 => {}
         Some("r8") if r8 => {
-            if let Err(why) = revision::r8_fixture_runnable_in_harness(&scenario.name) {
+            if let Err(why) = revision::r8_fixture_runnable(&scenario.name) {
                 return Ok(Outcome::NotRun(why));
             }
         }
@@ -959,6 +955,12 @@ impl Runner {
             Op::Acquire { binding, .. } => (LeaseRequest::Acquire, binding),
             Op::Renew { binding } => (LeaseRequest::Renew, binding),
             Op::Release { binding } => (LeaseRequest::Release, binding),
+            // r8 §F: an acquiring Send's admitting receipt carries the lease.
+            Op::Submit {
+                binding,
+                acquire: Some(true),
+                ..
+            } => (LeaseRequest::Send, binding),
             other => return Err(format!("client machines don't send {other:?}")),
         };
         if binding.attachment_gen != m.attachment_gen {
@@ -1002,7 +1004,7 @@ impl Runner {
             return Ok(());
         }
         match &msg.op {
-            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. } => {
+            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. } | Op::Receipt(_) => {
                 // Routed by `re`; a reply nobody is waiting for is dropped (rule 1).
                 let re = msg.re.as_deref().unwrap_or_default();
                 if let Some(l) = m.leases.values_mut().find(|l| l.is_outstanding(re)) {
@@ -1023,6 +1025,18 @@ impl Runner {
             | Op::SessionChanged { .. }
             | Op::ApprovalRequest(_)
             | Op::ApprovalClosed { .. } => {
+                // A controller epoch in the registry is one seen (r8 §F rule
+                // (b)): an older lease on a late reply is not applied.
+                let descriptors = match &msg.op {
+                    Op::Sessions { sessions, .. } => sessions.iter().collect(),
+                    Op::SessionChanged { descriptor, .. } => vec![descriptor],
+                    _ => Vec::new(),
+                };
+                for d in descriptors {
+                    if let (Some(c), Some(l)) = (&d.controller, m.leases.get_mut(&d.session_id)) {
+                        l.on_lease_changed(&d.session_id, &d.process_gen, c.lease_epoch);
+                    }
+                }
                 m.registry.on_message(&msg.op);
                 if m.registry.take_list_request() {
                     m.lists_requested += 1;
@@ -1031,10 +1045,17 @@ impl Runner {
             }
             Op::Welcome {
                 authorization_ms_left,
+                attachment_gen,
                 ..
             } => {
-                // A new attachment: its registry `seq` starts over.
+                // A new attachment: its registry `seq` starts over, and it
+                // holds no lease; replies to requests sent on the old one are
+                // never applied (r8 §F rule (a)).
                 m.registry.new_attachment();
+                if *attachment_gen != m.attachment_gen {
+                    m.attachment_gen = attachment_gen.clone();
+                    m.leases.clear();
+                }
                 let deadline = now.saturating_add(*authorization_ms_left);
                 m.authorization_deadline = Some(deadline);
                 m.leases
@@ -1153,11 +1174,7 @@ mod tests {
             })
             .filter(|(_, v)| {
                 let name = v["name"].as_str().unwrap();
-                if name.starts_with("r8-") {
-                    revision::r8_fixture_runnable_in_harness(name).is_ok()
-                } else {
-                    revision::superseded(name).is_none()
-                }
+                !name.starts_with("r8-") || revision::r8_fixture_runnable(name).is_ok()
             })
             .collect()
     }
@@ -1178,7 +1195,7 @@ mod tests {
             }
             assert_eq!(s.requires.as_deref(), Some("r8"), "{}", s.name);
             names.push(s.name.clone());
-            match revision::r8_fixture_runnable_in_harness(&s.name) {
+            match revision::r8_fixture_runnable(&s.name) {
                 Ok(()) => {
                     assert_eq!(
                         run_scenario(&v, Some(&fake_runtime)),
@@ -1211,17 +1228,6 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(r8_not_run, waiting);
-        // The superseded r7.x fixtures exist, are not run, and fail if run.
-        for (name, why) in revision::SUPERSEDED_BY_R8 {
-            assert!(
-                report
-                    .not_run
-                    .contains(&(name.to_string(), why.to_string()))
-            );
-            let mut f = fixture(name);
-            f["name"] = json!("superseded-run-anyway");
-            assert!(run_scenario(&f, Some(&fake_runtime)).is_err(), "{name}");
-        }
         for name in [
             "r8-client-refuses-a-host-without-revision-8",
             "r8-client-enables-only-advertised-features",
@@ -1318,8 +1324,8 @@ mod tests {
     }
 
     /// Every fixture whose work is implemented runs and passes, none is
-    /// skipped, and exactly the others (r8 ones waiting for their work,
-    /// superseded r7.x ones) are reported as not run.
+    /// skipped, and exactly the others (r8 ones waiting for their work) are
+    /// reported as not run.
     #[test]
     fn every_runnable_fixture_passes_and_only_the_gated_ones_are_not_run() {
         let files = scenario_files();
@@ -1368,8 +1374,8 @@ mod tests {
     #[test]
     fn every_fixture_passes_with_the_file_journal() {
         use super::super::fake_runtime::FakeRuntime;
-        use super::super::fake_runtime::harness_config;
         use super::super::file_journal::FileJournal;
+        use super::super::host::HostConfig;
         let dirs = std::cell::RefCell::new(Vec::new());
         let factory = |setup: &Setup| -> Result<Box<dyn HostUnderTest>, String> {
             let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -1377,7 +1383,7 @@ mod tests {
             dirs.borrow_mut().push(dir);
             Ok(Box::new(FakeRuntime::with_journal(
                 setup,
-                harness_config(),
+                HostConfig::default(),
                 journal,
             )?))
         };
@@ -1461,7 +1467,7 @@ mod tests {
                 "reason",
                 json!("answered_remote"),
             ),
-            ("approval-survives-takeover", "code", json!("forbidden")),
+            ("r8-approval-survives-takeover", "code", json!("forbidden")),
             (
                 "r8-failed-persistence-changes-no-lease",
                 "detail",

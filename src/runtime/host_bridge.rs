@@ -1769,6 +1769,7 @@ impl HostBridge {
             state: ApprovalCardState::AutoAllowed,
             rule_id: Some(rule_id),
             note: None,
+            reason: None,
         };
         let Some(session) = session_of(cx, sid) else {
             return;
@@ -1932,6 +1933,8 @@ impl HostBridge {
         message: Option<String>,
         cx: &mut Cx,
     ) {
+        // The approval closed `answered_remote` in the host's same step.
+        self.card_reason(approval_id, ApprovalCloseReason::AnsweredRemote);
         let worker_id = self.approvals.get(approval_id).map(|a| a.worker_id.clone());
         let sent = match (worker_id, session_of(cx, sid)) {
             (Some(worker_id), Some(session)) => session
@@ -1989,6 +1992,7 @@ impl HostBridge {
                 state: ApprovalCardState::Pending,
                 rule_id: None,
                 note: None,
+                reason: None,
             };
             self.card(
                 &request.approval_id,
@@ -2016,6 +2020,7 @@ impl HostBridge {
     /// No longer pending: the card says how it ended (a remote answer: its
     /// decision, set at the hand-off) and the push is resolved.
     fn approval_resolved(&mut self, approval_id: &str, reason: ApprovalCloseReason, cx: &mut Cx) {
+        self.card_reason(approval_id, reason);
         let state = match reason {
             ApprovalCloseReason::AnsweredRemote => None,
             ApprovalCloseReason::AnsweredTerminal => Some(ApprovalCardState::AnsweredTerminal),
@@ -2037,6 +2042,18 @@ impl HostBridge {
         self.pushes.flush(link_up, wall, &mut |text| {
             client.try_send_wire(text, false).is_ok()
         });
+    }
+
+    /// r8 `approval.card_reason`: the card's final states carry why its
+    /// approval closed (the first close; a later card state keeps it).
+    fn card_reason(&mut self, approval_id: &str, reason: ApprovalCloseReason) {
+        if let Some(card) = self
+            .approvals
+            .get_mut(approval_id)
+            .and_then(|a| a.card.as_mut())
+        {
+            card.reason.get_or_insert(reason);
+        }
     }
 
     /// The card of `approval_id` in a new state.
@@ -2337,11 +2354,18 @@ impl HostBridge {
             _ => self.next_head(sid, conversation, cx),
         };
         let env = match reply {
-            ChatReply::Accepted { request_id } => {
+            ChatReply::Accepted { request_id, lease } => {
                 self.submitters
                     .insert(request_id.clone(), (sid.into(), conversation.into()));
                 let mut body = Map::new();
                 body.insert("requestId".into(), Value::String(request_id));
+                if let Some(l) = lease {
+                    // r8 §F: the admitting reply of an acquiring Send.
+                    body.insert(
+                        "lease".into(),
+                        json!({"lease_epoch": l.lease_epoch, "ms_left": l.ms_left}),
+                    );
+                }
                 chat_envelope(conversation, sid, "accepted", head, body)
             }
             ChatReply::Complete {
@@ -2362,12 +2386,19 @@ impl HostBridge {
                 request_id,
                 code,
                 text,
+                controller,
                 ..
             } => {
                 if let Some(r) = &request_id {
                     self.submitters.remove(r);
                 }
-                chat_error(conversation, sid, head, request_id.as_deref(), &code, &text)
+                let mut env =
+                    chat_error(conversation, sid, head, request_id.as_deref(), &code, &text);
+                if let Some(c) = controller {
+                    // r8 §F: `lease_held` names the holder.
+                    env.body.insert("controller".into(), json!(c));
+                }
+                env
             }
         };
         self.send_chat(env, cx);

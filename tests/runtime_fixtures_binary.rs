@@ -51,8 +51,7 @@
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
 //! false`. An `r8-*` scenario runs once the host work it needs is
 //! implemented (`src/session_protocol/revision.rs`, shared with the core
-//! runner), else it is reported as not run with what it still needs; r7.x
-//! scenarios r8 superseded (`SUPERSEDED_BY_R8`) are reported as not run.
+//! runner), else it is reported as not run with what it still needs.
 //! The harness's `hello` carries `revision: 8` and the welcome must echo it
 //! and advertise exactly this host's features.
 //!
@@ -1482,13 +1481,13 @@ fn scenarios() -> Vec<Value> {
 }
 
 /// Why a scenario waits for host work (an `r8-*` one whose work isn't
-/// implemented) or no longer applies (an r7.x one r8 superseded).
+/// implemented).
 fn waiting(scenario: &Value) -> Option<String> {
     let name = scenario["name"].as_str().unwrap();
     if name.starts_with("r8-") {
         revision::r8_fixture_runnable(name).err()
     } else {
-        revision::superseded(name).map(str::to_string)
+        None
     }
 }
 
@@ -1497,11 +1496,41 @@ fn waiting(scenario: &Value) -> Option<String> {
 const NOT_RUN: &[&str] = &[
     "approval-needs-control-and-the-lease",
     "approval-rule-revoke-needs-control-not-the-lease",
-    "approval-survives-takeover",
     "closed-session-refuses-work-before-the-lease-check",
     "receipt-query-is-scoped-to-the-exact-target",
     "removed-ops-have-no-effect",
     "takeover-moves-control-and-the-old-holder-becomes-a-viewer",
+    // r8 scenarios with two or three attachments (core harness only).
+    "r8-approval-answer-by-a-non-holder-leaves-the-lease",
+    "r8-approval-answer-keeps-the-holders-deadline",
+    "r8-approval-answer-to-a-closed-request-is-stale-target",
+    "r8-approval-answer-with-acquire-is-refused",
+    "r8-approval-answers-crossing-first-wins",
+    "r8-approval-survives-takeover",
+    "r8-clean-close-runs-queued-work-once-its-principal-is-confirmed",
+    "r8-control-fence-holds-when-a-rejection-write-fails",
+    "r8-crash-after-durable-acceptance-grants-no-lease",
+    "r8-crash-rejects-queued-work-whose-history-is-unknown",
+    "r8-delayed-send-reply-does-not-regrant-lost-control",
+    "r8-disconnect-right-after-acceptance",
+    "r8-double-write-failure-takeover-never-runs",
+    "r8-duplicate-send-never-reacquires-or-replays",
+    "r8-expired-lease-is-checked-at-admission",
+    "r8-failed-fence-write-rejects-queued-work-at-once",
+    "r8-failed-fence-write-then-control-restored-never-runs",
+    "r8-failed-persistence-changes-no-lease",
+    "r8-local-input-wins-over-a-send",
+    "r8-ownership-is-checked-at-admission-not-as-displayed",
+    "r8-process-replaced-before-dispatch",
+    "r8-recovered-work-needs-its-principal-confirmed",
+    "r8-revoked-control-fences-work-across-reconnect-and-restart",
+    "r8-revoked-control-refuses-the-send-and-its-queued-prompt",
+    "r8-send-acquire-wire-rules",
+    "r8-send-acquires-an-unowned-session",
+    "r8-send-refused-while-another-holds-then-takeover",
+    "r8-send-under-the-own-lease-checks-the-epoch",
+    "r8-stale-takeover-confirmation-is-refused",
+    "r8-two-simultaneous-sends-acquire-once",
 ];
 
 /// Scenarios the real runtime fails, each with the failure it must still

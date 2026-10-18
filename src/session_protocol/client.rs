@@ -21,6 +21,9 @@ pub enum LeaseRequest {
     Acquire,
     Renew,
     Release,
+    /// An acquiring Send (r8 §F): a `prompt` submit with `acquire: true`,
+    /// whose admitting `receipt` carries the lease.
+    Send,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,8 +63,12 @@ pub enum ReplyOutcome {
     Mismatch,
     /// The granted epoch is older than one already seen in `lease_changed`.
     StaleEpoch,
-    /// Not a lease reply (`lease`, `lease_released` or `error`).
+    /// Not a lease reply (`lease`, `lease_released` or `error`, or a
+    /// `receipt` to an acquiring Send).
     NotALeaseReply,
+    /// A reply to an acquiring Send that grants nothing: a refusal (the
+    /// host changed nothing), or a receipt without `lease`.
+    NoLease,
 }
 
 /// One client's view of its control lease on one session.
@@ -165,7 +172,7 @@ impl LeaseClient {
             return Err(RequestRefused::TooManyInFlight);
         }
         match kind {
-            LeaseRequest::Acquire => {}
+            LeaseRequest::Acquire | LeaseRequest::Send => {}
             LeaseRequest::Renew | LeaseRequest::Release if self.deadline.is_none() => {
                 return Err(RequestRefused::NotControlling);
             }
@@ -184,12 +191,16 @@ impl LeaseClient {
         Ok(())
     }
 
-    /// Applies a host reply (`lease`, `lease_released` or `error`) per §5
-    /// rules 1–5.
+    /// Applies a host reply (`lease`, `lease_released` or `error`, or the
+    /// `receipt` admitting an acquiring Send) per §5 rules 1–5 and r8 §F's
+    /// client rule: a Send's `lease` applies only to a submit still
+    /// outstanding on this attachment (a new attachment starts a new
+    /// `LeaseClient`), with an epoch not lower than any seen since, and a
+    /// deadline (send time + `ms_left`) still ahead.
     pub fn on_reply(&mut self, msg: &SessionMessage, now_ms: u64) -> ReplyOutcome {
         if !matches!(
             msg.op,
-            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. }
+            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. } | Op::Receipt(_)
         ) {
             return ReplyOutcome::NotALeaseReply;
         }
@@ -202,8 +213,22 @@ impl LeaseClient {
             self.become_viewer();
             return ReplyOutcome::DeadlinePassed;
         }
+        if pending.kind == LeaseRequest::Send {
+            // A refused Send changed nothing on the host, and a receipt
+            // without `lease` (a duplicate) grants nothing.
+            return match &msg.op {
+                Op::Receipt(r) if r.target != self.target => ReplyOutcome::Mismatch,
+                Op::Receipt(r) => match &r.lease {
+                    Some(l) => self.grant(pending, l.lease_epoch, l.ms_left, now_ms),
+                    None => ReplyOutcome::NoLease,
+                },
+                Op::Error { .. } => ReplyOutcome::NoLease,
+                _ => ReplyOutcome::Mismatch,
+            };
+        }
         match &msg.op {
             Op::Lease { binding, ms_left } => self.apply_lease(pending, binding, *ms_left, now_ms),
+            Op::Receipt(_) => ReplyOutcome::Mismatch,
             Op::LeaseReleased {} if pending.kind == LeaseRequest::Release => {
                 self.become_viewer();
                 ReplyOutcome::Applied
@@ -231,6 +256,11 @@ impl LeaseClient {
         if binding.target != self.target || binding.attachment_gen != self.attachment_gen {
             return ReplyOutcome::Mismatch;
         }
+        self.grant(pending, epoch, ms_left, now_ms)
+    }
+
+    /// A granted lease (`lease` reply, or an admitting Send's `lease`).
+    fn grant(&mut self, pending: Pending, epoch: u64, ms_left: u64, now_ms: u64) -> ReplyOutcome {
         if self.highest_epoch_seen.is_some_and(|h| epoch < h) {
             return ReplyOutcome::StaleEpoch;
         }
@@ -248,9 +278,10 @@ impl LeaseClient {
                 return ReplyOutcome::Mismatch;
             }
             (LeaseRequest::Renew, Some(_)) => candidate,
-            // Rule 4: a repeat acquire never extends.
-            (LeaseRequest::Acquire, Some(prev)) => prev.min(candidate),
-            (LeaseRequest::Acquire, None) => candidate,
+            // Rule 4: a repeat acquire (or a Send under the own lease)
+            // never extends.
+            (LeaseRequest::Acquire | LeaseRequest::Send, Some(prev)) => prev.min(candidate),
+            (LeaseRequest::Acquire | LeaseRequest::Send, None) => candidate,
         };
         // Rule 5: never hold control with zero remaining lifetime.
         if now_ms >= new {

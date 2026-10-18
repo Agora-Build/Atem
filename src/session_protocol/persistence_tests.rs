@@ -1,10 +1,9 @@
 //! r8 §H/§I conformance obligations beyond the shared fixtures: the halted
 //! journal at the PTY write boundary, a refusal that can't be recorded, the
 //! refusal list replayed or damaged, the clean-close record around crashes,
-//! the fence on disk after a failed rollback, and §F's acquire while the
-//! feature is off.
+//! and the fence on disk after a failed rollback.
 
-use super::fake_runtime::{FailFsync, FakeRuntime, harness_config};
+use super::fake_runtime::{FailFsync, FakeRuntime};
 use super::file_journal::FileJournal;
 use super::fixtures::{HostEvent, HostUnderTest};
 use super::host::*;
@@ -43,12 +42,12 @@ fn setup_json() -> Value {
 }
 
 fn mem() -> FakeRuntime {
-    FakeRuntime::from_json(setup_json(), harness_config())
+    FakeRuntime::from_json(setup_json(), HostConfig::default())
 }
 
 fn file(dir: &std::path::Path) -> FakeRuntime<FileJournal> {
     let journal = FileJournal::open(&dir.join("state")).unwrap();
-    FakeRuntime::from_json_with(setup_json(), harness_config(), journal)
+    FakeRuntime::from_json_with(setup_json(), HostConfig::default(), journal)
 }
 
 fn target() -> Value {
@@ -279,7 +278,7 @@ fn a_damaged_refusal_list_disables_remote_sessions() {
     std::fs::write(state.join("refused"), b"not a framed record").unwrap();
     let journal = FileJournal::open(&state).unwrap();
     let mut host =
-        SessionHost::open(ctx(), harness_config(), journal, random_ids(), Some(7)).unwrap();
+        SessionHost::open(ctx(), HostConfig::default(), journal, random_ids(), Some(7)).unwrap();
     host.restore_session(spec()).unwrap();
     let fx = host.recover();
     assert!(fx.is_empty(), "nothing reconciled or dispatched: {fx:?}");
@@ -329,7 +328,7 @@ fn the_clean_close_record_vouches_only_for_the_run_that_wrote_it() {
         let journal = FileJournal::open(&state).unwrap();
         SessionHost::open(
             ctx(),
-            harness_config(),
+            HostConfig::default(),
             journal,
             random_ids(),
             Some(previous),
@@ -431,23 +430,6 @@ fn a_failed_fence_write_leaves_either_state_and_the_same_outcome() {
         assert_eq!(state_of(&rt, 2), rejected(DETAIL_HISTORY_UNKNOWN));
         assert_eq!(rt.pty.dispatch_attempts, 1);
     }
-}
-
-/// §F stays off until it is advertised: an acquiring submit is an op of an
-/// unadvertised feature, nothing recorded.
-#[test]
-fn an_acquiring_submit_is_refused_while_the_feature_is_off() {
-    let mut rt = FakeRuntime::from_json(setup_json(), HostConfig::default());
-    let m = session(
-        "submit",
-        json!({"binding": binding(&rt, None), "request_id": rid(1), "kind": "prompt",
-               "payload": {"text": "run the tests"}, "acquire": true}),
-    );
-    rt.send("c1", &m);
-    let r = got(&mut rt);
-    assert_eq!(r[0]["code"], "unsupported_version");
-    assert!(rt.host.receipt(&rid(1)).is_none());
-    assert_eq!(rt.host.lease_holder(S1), None);
 }
 
 /// A principal must be an opaque id; it is never taken from messages.
@@ -554,7 +536,7 @@ fn a_pending_rollback_survives_reopen_and_loses_no_records() {
     rt.host.journal_mut().set_undo_stuck(false);
     drop(rt);
     let journal = FileJournal::open(&dir.path().join("state")).unwrap();
-    let host = SessionHost::new(ctx(), harness_config(), journal, random_ids()).unwrap();
+    let host = SessionHost::new(ctx(), HostConfig::default(), journal, random_ids()).unwrap();
     assert_eq!(
         host.receipt(&rid(1)).map(|r| r.state),
         Some(ReceiptState::Executing)
@@ -612,7 +594,8 @@ fn recovered_work_is_resolved_before_a_connect_changes_control() {
         control_gen: 1,
     })
     .unwrap();
-    let mut host = SessionHost::open(ctx(), harness_config(), j, random_ids(), Some(8)).unwrap();
+    let mut host =
+        SessionHost::open(ctx(), HostConfig::default(), j, random_ids(), Some(8)).unwrap();
     host.connect(Attach {
         client: "c1".into(),
         principal: "c1".into(),

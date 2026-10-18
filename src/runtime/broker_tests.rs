@@ -216,6 +216,7 @@ fn card(
         state,
         rule_id: None,
         note: None,
+        reason: None,
     }
 }
 

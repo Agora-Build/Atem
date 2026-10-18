@@ -180,6 +180,10 @@ The r8 draft scenarios:
 | `r8-approval-answer-with-acquire-is-refused` | host | `acquire` (payload or submit) → `unsupported_version`, no effect |
 | `r8-approval-answers-crossing-first-wins` | host | holder and non-holder cross: first admitted wins, second `stale_target` |
 | `r8-approval-answer-to-a-closed-request-is-stale-target` | host | terminal-answered, timed-out and already-answered requests → `stale_target` |
+| `r8-approval-opens-without-a-lease-holder` | host | §G (replaces r7 `approval-opens-without-a-lease-holder`): opened and pushed with nobody holding the lease; answered without it, nothing granted, push resolved |
+| `r8-approval-stays-pending-when-the-lease-ends` | host | §G (replaces the r7 fixture of that name): expiry closes nothing; an answer with the expired epoch is admitted (the epoch is ignored), nothing granted |
+| `r8-approval-late-answer-after-push-resolved-is-stale-target` | host | §G (replaces the r7 fixture of that name): after `push_resolved{answered_terminal}` a late answer without the lease is `stale_target`, nothing recorded |
+| `r8-approval-survives-takeover` | host | §G (replaces r7 `approval-survives-takeover`): a takeover keeps the approval pending; the old holder's stale-epoch answer is admitted and wins, the new holder's is `stale_target`, the lease stays the new holder's |
 
 Astation's API-level merge fixture (a delayed HTTP page against newer SSE
 versions) is Astation's; the host side of it is
