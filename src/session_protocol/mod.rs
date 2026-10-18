@@ -41,4 +41,6 @@ mod fixtures;
 #[cfg(test)]
 mod host_tests;
 #[cfg(test)]
+mod persistence_tests;
+#[cfg(test)]
 mod tests;

@@ -25,6 +25,8 @@ fn accepted(id: &str, sid: &str, text: &str) -> Record {
         payload_digest: "0".repeat(64),
         payload: json!({ "text": text }),
         updated_at: 1,
+        principal: "astation:account-a:a1".into(),
+        control_gen: 1,
     }
 }
 
@@ -80,6 +82,7 @@ fn state(records: Vec<Record>) -> (BTreeMap<String, Stored>, Vec<(String, u64)>)
     let Replayed {
         receipts,
         lease_epochs,
+        ..
     } = journal::replay(records).unwrap();
     let mut by_order: Vec<Stored> = receipts.into_values().collect();
     by_order.sort_by_key(|s| s.order);
@@ -493,6 +496,8 @@ fn compaction_backs_off_as_the_live_state_grows() {
             payload_digest: "0".repeat(64),
             payload: json!({}),
             updated_at: n,
+            principal: "p1".into(),
+            control_gen: 1,
         })
         .unwrap();
     }

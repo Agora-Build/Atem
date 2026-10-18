@@ -7,7 +7,9 @@
 //! The fixtures describe clients that are already attached; the harness does
 //! the `hello`/`welcome` itself (checking the welcome) and, for
 //! `holds_lease_epoch`, a real `acquire`, so every lease and attachment comes
-//! from the host's own rules.
+//! from the host's own rules. Each client name is its own principal (r8
+//! §H). The host runs with `harness_config` (r8 §F's session-v1 acquiring
+//! Send on, not advertised).
 
 use super::fixtures::{HostEvent, HostUnderTest, Setup};
 use super::host::{
@@ -21,10 +23,23 @@ use super::wire::{
     Target,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// The authenticated link's authorization in the fixtures (24 h).
 pub const AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The adapter's draft check refusing a prompt (`chat::session`).
+pub const DRAFT_REFUSAL: &str = "the terminal has unsent input; finish or clear it there";
+
+/// The host configuration of the fixture harness: r8 §F's acquiring Send
+/// (session-v1 form) is on although `chat.send_acquire` isn't advertised
+/// yet (`revision::HARNESS_WORK`).
+pub fn harness_config() -> HostConfig {
+    HostConfig {
+        send_acquire: true,
+        ..HostConfig::default()
+    }
+}
 
 /// The fake PTY and dispatcher.
 #[derive(Debug)]
@@ -87,20 +102,43 @@ struct Client {
     client_kind: ClientKind,
 }
 
-/// Fixture failure injection on a journal (`fail_next_fsync`).
+/// Fixture failure injection on a journal (r8 schema: `fail_next_fsync`
+/// with `undo_fails`, `fail_fsync_of`, `crash_after_accepted`).
 pub trait FailFsync {
-    fn fail_next_fsync(&mut self);
+    fn fail_next_fsync(&mut self) {
+        self.fail_fsync_of(1, false);
+    }
+    /// The `n`-th next append fails; with `undo_fails` its record stays.
+    fn fail_fsync_of(&mut self, n: u64, undo_fails: bool);
+    fn crash_after_accepted(&mut self);
+    fn crashed(&self) -> bool;
 }
 
 impl FailFsync for MemJournal {
-    fn fail_next_fsync(&mut self) {
-        MemJournal::fail_next_fsync(self);
+    fn fail_fsync_of(&mut self, n: u64, undo_fails: bool) {
+        if undo_fails {
+            MemJournal::fail_fsync_and_undo_of(self, n);
+        } else {
+            MemJournal::fail_fsync_of(self, n);
+        }
+    }
+    fn crash_after_accepted(&mut self) {
+        MemJournal::crash_after_accepted(self);
+    }
+    fn crashed(&self) -> bool {
+        MemJournal::crashed(self)
     }
 }
 
 impl FailFsync for super::file_journal::FileJournal {
-    fn fail_next_fsync(&mut self) {
-        self.inject(super::file_journal::Fault::Fsync);
+    fn fail_fsync_of(&mut self, n: u64, undo_fails: bool) {
+        self.fail_append_of(n, undo_fails);
+    }
+    fn crash_after_accepted(&mut self) {
+        super::file_journal::FileJournal::crash_after_accepted(self);
+    }
+    fn crashed(&self) -> bool {
+        super::file_journal::FileJournal::crashed(self)
     }
 }
 
@@ -118,6 +156,12 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     pub reconcile_answer: DispatchReport,
     /// session_id → the prompt whose turn is running.
     turns: HashMap<String, String>,
+    /// Sessions whose terminal has unsent local input (a `local_input`
+    /// ending without CR/LF): the adapter's draft check refuses prompts.
+    drafts: HashSet<String>,
+    /// `crash_after_accepted`: the restart to perform once the next
+    /// `accepted` record is durable.
+    crash_after: Option<(String, u64)>,
     clients: BTreeMap<String, Client>,
     /// Every attachment ever used → client name.
     names: HashMap<String, String>,
@@ -179,8 +223,9 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
 }
 
 impl FakeRuntime {
+    /// The fixtures' host: `harness_config` over a `MemJournal`.
     pub fn new(setup: &Setup) -> Result<Self, String> {
-        Self::with_config(setup, HostConfig::default())
+        Self::with_config(setup, harness_config())
     }
 
     pub fn with_config(setup: &Setup, config: HostConfig) -> Result<Self, String> {
@@ -211,6 +256,8 @@ impl<J: Journal> FakeRuntime<J> {
             queued_writes: Vec::new(),
             reconcile_answer: DispatchReport::Unknown,
             turns: HashMap::new(),
+            drafts: HashSet::new(),
+            crash_after: None,
             clients: BTreeMap::new(),
             names: HashMap::new(),
             live: HashMap::new(),
@@ -280,6 +327,7 @@ impl<J: Journal> FakeRuntime<J> {
             .host
             .connect(Attach {
                 client: client.to_string(),
+                principal: client.to_string(),
                 attachment_gen: attachment_gen.to_string(),
                 permissions,
                 client_kind: ClientKind::Native,
@@ -308,6 +356,7 @@ impl<J: Journal> FakeRuntime<J> {
         c.attachment_gen = attachment_gen.to_string();
         let attach = Attach {
             client: client.to_string(),
+            principal: client.to_string(),
             attachment_gen: attachment_gen.to_string(),
             permissions: c.permissions.clone(),
             client_kind: c.client_kind,
@@ -324,7 +373,9 @@ impl<J: Journal> FakeRuntime<J> {
 
     /// A new attachment for `client`: connect (fencing the previous one),
     /// `hello{revision: 8}`, and the checked `welcome` (r8: it echoes the
-    /// revision and advertises `revision::FEATURES`) taken off the queue.
+    /// revision and advertises `revision::FEATURES`) taken off the queue. A
+    /// halted journal welcomes nobody (r8 §I): the client stays connected,
+    /// unwelcomed.
     pub fn attach(&mut self, client: &str, attachment_gen: &str) -> Result<(), String> {
         self.connect_unwelcomed(client, attachment_gen)?;
         let hello = Op::Hello {
@@ -335,14 +386,14 @@ impl<J: Journal> FakeRuntime<J> {
             .host
             .receive_decoded(attachment_gen, Ok(message(hello)), self.now);
         self.apply(fx);
-        let i = self
-            .out
-            .iter()
-            .rposition(|(n, m)| {
-                n == client
-                    && matches!(m, Envelope::Session(s) if matches!(s.op, Op::Welcome { .. }))
-            })
-            .ok_or("no welcome")?;
+        let i = self.out.iter().rposition(|(n, m)| {
+            n == client && matches!(m, Envelope::Session(s) if matches!(s.op, Op::Welcome { .. }))
+        });
+        let i = match i {
+            Some(i) => i,
+            None if self.host.journal_halted() => return Ok(()),
+            None => return Err("no welcome".into()),
+        };
         let (_, welcome) = self.out.remove(i);
         match welcome {
             Envelope::Session(SessionMessage {
@@ -471,8 +522,15 @@ impl<J: Journal> FakeRuntime<J> {
                     target,
                 } => {
                     self.pty.dispatch_attempts += 1;
+                    let draft =
+                        kind == ReceiptKind::Prompt && self.drafts.contains(&target.session_id);
                     let report = if std::mem::take(&mut self.pty.fail_next_enqueue) {
                         Some(DispatchReport::FailedNoEffect)
+                    } else if draft {
+                        // The chat adapter's draft check: nothing is pasted.
+                        Some(DispatchReport::Refused {
+                            detail: DRAFT_REFUSAL.into(),
+                        })
                     } else if std::mem::take(&mut self.pty.fail_next_partial) {
                         self.pty.bytes_written = None;
                         Some(DispatchReport::FailedAfterPossibleEffect)
@@ -505,7 +563,11 @@ impl<J: Journal> FakeRuntime<J> {
                         // Written; completion comes from the provider later.
                         None
                     };
-                    if report != Some(DispatchReport::FailedNoEffect) {
+                    let refused = matches!(
+                        report,
+                        Some(DispatchReport::FailedNoEffect | DispatchReport::Refused { .. })
+                    );
+                    if !refused {
                         self.pty.dispatches += 1;
                     }
                     if let Some(report) = report {
@@ -640,12 +702,40 @@ impl<J: Journal> FakeRuntime<J> {
     }
 }
 
+impl<J: Journal + FailFsync> FakeRuntime<J> {
+    /// The runtime stops (orderly: it writes its clean close when the
+    /// journal is healthy; a crash doesn't) and starts with these values at
+    /// the current clock; workers are adopted, every link drops.
+    fn restart_runtime(
+        &mut self,
+        runtime_gen: &str,
+        epoch: u64,
+        orderly: bool,
+    ) -> Result<(), String> {
+        self.live.clear();
+        self.queued_writes.clear();
+        let fx = self
+            .host
+            .restart_at(runtime_gen, epoch, self.now, orderly)?;
+        self.apply(fx);
+        Ok(())
+    }
+}
+
 impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
     /// The host sees the time with the message; no timer tick is run.
     fn receive(&mut self, client: &str, msg: Result<Envelope, DecodeError>, now_ms: u64) {
         self.now = now_ms;
         let att = self.attachment(client);
         let fx = self.host.receive_decoded(&att, msg, now_ms);
+        if self.crash_after.is_some() && self.host.journal().crashed() {
+            // The `accepted` record is durable; the runtime dies before
+            // acting on it: nothing it produced happens.
+            let (runtime_gen, epoch) = self.crash_after.take().unwrap();
+            self.restart_runtime(&runtime_gen, epoch, false)
+                .expect("crash restart");
+            return;
+        }
         self.apply(fx);
     }
 
@@ -672,6 +762,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 c.attachment_gen = attachment_gen.clone();
                 let attach = Attach {
                     client: client.clone(),
+                    principal: client.clone(),
                     attachment_gen: attachment_gen.clone(),
                     permissions: c.permissions.clone(),
                     client_kind: c.client_kind,
@@ -696,20 +787,51 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 attachment_gen,
             } => return self.attach(client, attachment_gen),
             HostEvent::LocalInput { session_id, bytes } => {
+                if bytes.ends_with(b"\r") || bytes.ends_with(b"\n") {
+                    self.drafts.remove(session_id);
+                } else {
+                    self.drafts.insert(session_id.clone());
+                }
                 self.host.local_input(session_id, bytes.clone())
             }
             HostEvent::CrashWorker { session_id } => self.host.process_exited(session_id, None),
             HostEvent::RestartRuntime {
                 runtime_gen,
                 runtime_epoch,
+            } => return self.restart_runtime(runtime_gen, *runtime_epoch, true),
+            HostEvent::CrashRuntime {
+                runtime_gen,
+                runtime_epoch,
+            } => return self.restart_runtime(runtime_gen, *runtime_epoch, false),
+            HostEvent::CrashAfterAccepted {
+                runtime_gen,
+                runtime_epoch,
             } => {
-                self.live.clear();
-                self.queued_writes.clear();
-                self.host.restart(runtime_gen, *runtime_epoch)?
-            }
-            HostEvent::FailNextFsync => {
-                self.host.journal_mut().fail_next_fsync();
+                self.host.journal_mut().crash_after_accepted();
+                self.crash_after = Some((runtime_gen.clone(), *runtime_epoch));
                 Vec::new()
+            }
+            HostEvent::FailFsyncOf { n, undo_fails } => {
+                self.host.journal_mut().fail_fsync_of(*n, *undo_fails);
+                Vec::new()
+            }
+            HostEvent::SetPermissions {
+                client,
+                permissions,
+                attachment_gen,
+            } => {
+                // The principal re-authenticates: a new attachment with these
+                // permissions (the host fences first when `control` is gone).
+                let c = self.clients.get_mut(client).ok_or("unknown client")?;
+                c.permissions = permissions.clone();
+                return self.attach(client, attachment_gen);
+            }
+            HostEvent::ReplaceProcess {
+                session_id,
+                process_gen,
+            } => {
+                self.turns.remove(session_id);
+                self.host.replace_process(session_id, process_gen)?
             }
             HostEvent::ChangeTrustGen(n) => self.host.change_trust_gen(*n)?,
             HostEvent::FailNextPtyEnqueue => {
@@ -726,8 +848,9 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 turn_id,
             } => {
                 let rid = self.turns.remove(session_id).ok_or("no running turn")?;
+                // A prompt's completion names its turn's outcome (§6).
                 let report = DispatchReport::Completed {
-                    detail: None,
+                    detail: Some(super::host::DETAIL_TURN_DONE.into()),
                     turn_id: Some(turn_id.clone()),
                 };
                 self.host.dispatch_report(&rid, report)
@@ -793,6 +916,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             "stops" => p.stops.into(),
             "lease_holder" => self.lease_holder()?,
             "attachments" => self.host.welcomed_attachments().into(),
+            "journal_halted" => self.host.journal_halted().into(),
             "approval_decisions" => Value::from(p.approval_decisions.clone()),
             "approvals_released" => p.approvals_released.into(),
             "pushes" => Value::from(p.pushes.clone()),

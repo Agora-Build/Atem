@@ -168,7 +168,8 @@ fn strict_parser_rules() {
 /// approval id or attachment generation is a UUID).
 fn substitute(v: &mut Value) {
     match v {
-        Value::String(s) if s == "${aid}" || s == "${gen2}" => {
+        // Captured ids (approval ids, generations, controller sessions).
+        Value::String(s) if s == "${aid}" || s == "${gen2}" || s.ends_with("ctl}") => {
             *s = "88888888-8888-4888-8888-888888888888".to_string()
         }
         Value::String(s) if s.contains("${") => *s = "stream-0001".to_string(),
@@ -228,7 +229,7 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
         // decoder doesn't know yet; superseded r7.x ones use removed forms.
         let fixture_name = file["name"].as_str().unwrap_or_default();
         let r8_waiting = fixture_name.starts_with("r8-")
-            && super::revision::r8_fixture_runnable(fixture_name).is_err();
+            && super::revision::r8_fixture_runnable_in_harness(fixture_name).is_err();
         if r8_waiting || super::revision::superseded(fixture_name).is_some() {
             continue;
         }

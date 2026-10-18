@@ -9,8 +9,8 @@ use super::fake_runtime::FakeRuntime;
 use super::host::*;
 use super::journal::{MemJournal, Record};
 use super::wire::{
-    self, AlwaysRule, ApprovalCloseReason, ApprovalDecision, ErrorCode, Op, ReceiptKind,
-    ReceiptState, Target,
+    self, AlwaysRule, ApprovalCloseReason, ApprovalDecision, ClientKind, ErrorCode, Op, Permission,
+    ReceiptKind, ReceiptState, Target,
 };
 use serde_json::{Value, json};
 
@@ -800,8 +800,16 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
     assert!(rt.host.pending_approvals(S1).is_empty());
 
     // An approval answer recorded as accepted but never started (a crash
-    // between the two writes): after a restart its approval is gone, so it
-    // is rejected, never handed to the agent.
+    // between the two writes): no clean close, so it is rejected
+    // ("authorization history unknown", r8 §H) and never handed to the agent.
+    // After a clean close it waits for its principal, whose welcome finds
+    // the approval gone: rejected, never handed over either.
+    for clean in [false, true] {
+        unstarted_answer_after_restart(clean);
+    }
+}
+
+fn unstarted_answer_after_restart(clean: bool) {
     let mut journal = MemJournal::default();
     let t = Target {
         account_id: "account-a".into(),
@@ -820,6 +828,8 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
             payload_digest: super::canonical::payload_digest(&payload).unwrap(),
             payload,
             updated_at: 1,
+            principal: "c1".into(),
+            control_gen: 1,
         })
         .unwrap();
     let ctx = HostContext {
@@ -829,7 +839,11 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
         runtime_gen: "55555555-5555-4555-8555-555555555555".into(),
         runtime_epoch: 7,
     };
-    let mut host = SessionHost::new(ctx, HostConfig::default(), journal, random_ids()).unwrap();
+    if clean {
+        journal.write_clean_close(6).unwrap();
+    }
+    let mut host =
+        SessionHost::open(ctx, HostConfig::default(), journal, random_ids(), Some(6)).unwrap();
     host.restore_session(SessionSpec {
         session_id: S1.into(),
         process_gen: P1.into(),
@@ -840,11 +854,33 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
         cols: 80,
     })
     .unwrap();
-    let fx = host.recover();
+    let mut fx = host.recover();
+    if clean {
+        assert_eq!(host.receipt(&rid(1)).unwrap().state, ReceiptState::Accepted);
+        fx.extend(
+            host.connect(Attach {
+                client: "c1".into(),
+                principal: "c1".into(),
+                attachment_gen: C1.into(),
+                permissions: vec![Permission::View, Permission::Control],
+                client_kind: ClientKind::Native,
+                authorization_ms: 60_000,
+            })
+            .unwrap(),
+        );
+        let hello = json!({"type": "session", "data": {"v": 1, "op": "hello",
+            "id": "11111111-1111-4111-8111-000000000009", "revision": 8}});
+        fx.extend(host.receive(C1, &serde_json::to_vec(&hello).unwrap(), 0));
+    }
     assert!(!fx.iter().any(|e| matches!(e, Effect::Approval { .. })));
     let r = host.receipt(&rid(1)).unwrap();
     assert_eq!(r.state, ReceiptState::Rejected);
-    assert_eq!(r.detail.as_deref(), Some(DETAIL_APPROVAL_CLOSED));
+    let detail = if clean {
+        DETAIL_APPROVAL_CLOSED
+    } else {
+        DETAIL_HISTORY_UNKNOWN
+    };
+    assert_eq!(r.detail.as_deref(), Some(detail));
 }
 
 #[test]

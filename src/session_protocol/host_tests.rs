@@ -960,6 +960,8 @@ fn accepted_record(n: u64, trust: u64) -> Record {
         payload_digest: "0".repeat(64),
         payload: json!({"text": "hi"}),
         updated_at: 1,
+        principal: "c1".into(),
+        control_gen: 1,
     }
 }
 
@@ -974,11 +976,55 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
     });
 }
 
+/// A host over `j` at a runtime start whose previous run (epoch 8) ended
+/// cleanly or not (r8 §H).
+fn start_host<J: Journal>(mut j: J, trust: u64, clean: bool) -> SessionHost<J> {
+    if clean {
+        j.write_clean_close(8).unwrap();
+    }
+    SessionHost::open(ctx(trust), HostConfig::default(), j, random_ids(), Some(8)).unwrap()
+}
+
+/// `principal` connects with `control` on `att` and is welcomed: its
+/// recovered work may run (r8 §H confirmation).
+fn welcome_principal<J: Journal>(
+    host: &mut SessionHost<J>,
+    principal: &str,
+    att: &str,
+) -> Vec<Effect> {
+    let mut fx = host
+        .connect(Attach {
+            client: principal.into(),
+            principal: principal.into(),
+            attachment_gen: att.into(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: wire::ClientKind::Native,
+            authorization_ms: AUTHORIZATION_MS,
+        })
+        .unwrap();
+    let hello = session("hello", json!({"revision": 8}));
+    fx.extend(host.receive(att, &serde_json::to_vec(&hello).unwrap(), host.now()));
+    fx
+}
+
 fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
-    // Accepted under an older trust generation: rejected, never dispatched.
+    // No clean close: accepted work is rejected whatever the journal holds.
     let mut j = journal();
     j.append_ok(accepted_record(1, 1));
-    let mut host = SessionHost::new(ctx(2), HostConfig::default(), j, random_ids()).unwrap();
+    let mut host = start_host(j, 1, false);
+    host.restore_session(spec(S1, P1)).unwrap();
+    let mut fx = host.recover();
+    fx.extend(welcome_principal(&mut host, "c1", C1));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Dispatch { .. })));
+    let r = host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+
+    // After a clean close, accepted under an older trust generation:
+    // rejected, never dispatched.
+    let mut j = journal();
+    j.append_ok(accepted_record(1, 1));
+    let mut host = start_host(j, 2, true);
     host.restore_session(spec(S1, P1)).unwrap();
     let fx = host.recover();
     assert!(!fx.iter().any(|e| matches!(e, Effect::Dispatch { .. })));
@@ -986,13 +1032,18 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     assert_eq!(r.state, ReceiptState::Rejected);
     assert_eq!(r.detail.as_deref(), Some(DETAIL_TRUST_CHANGED));
 
-    // Same trust generation: dispatched once, and a second crash only
+    // Same trust generation: it waits for its principal (another one
+    // doesn't confirm it), is dispatched once, and a second restart only
     // reconciles it.
     let mut j = journal();
     j.append_ok(accepted_record(1, 1));
-    let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
+    let mut host = start_host(j, 1, true);
     host.restore_session(spec(S1, P1)).unwrap();
-    let fx = host.recover();
+    let mut fx = host.recover();
+    fx.extend(welcome_principal(&mut host, "c2", C2));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Dispatch { .. })));
+    assert_eq!(host.receipt(&rid(1)).unwrap().state, ReceiptState::Accepted);
+    let fx = welcome_principal(&mut host, "c1", C1);
     let dispatches = fx
         .iter()
         .filter(|e| matches!(e, Effect::Dispatch { .. }))
@@ -1012,16 +1063,34 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     assert_eq!(r.state, ReceiptState::OutcomeUnknown);
     assert_eq!(r.detail.as_deref(), Some(DETAIL_UNRECONCILED));
 
-    // Accepted for a process that is gone: rejected, session closed.
+    // Accepted for a process that is gone: rejected, session closed, once
+    // its principal is confirmed.
     let mut j = journal();
     j.append_ok(accepted_record(1, 1));
-    let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
+    let mut host = start_host(j, 1, true);
     host.restore_session(spec(S1, "33333333-3333-4333-8333-000000000001"))
         .unwrap();
     host.recover();
+    welcome_principal(&mut host, "c1", C1);
     assert_eq!(
         host.receipt(&rid(1)).unwrap().detail.as_deref(),
         Some(DETAIL_SESSION_CLOSED)
+    );
+
+    // A clean-close record naming another epoch is stale: no clean close.
+    let mut j = journal();
+    j.append_ok(accepted_record(1, 1));
+    j.write_clean_close(5).unwrap();
+    let mut host =
+        SessionHost::open(ctx(1), HostConfig::default(), j, random_ids(), Some(8)).unwrap();
+    host.restore_session(spec(S1, P1)).unwrap();
+    host.recover();
+    let r = host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+    assert_eq!(
+        host.journal_mut().take_clean_close(),
+        None,
+        "removed at start"
     );
 }
 
@@ -1045,9 +1114,16 @@ fn crash_after_executing<J: Journal + FailFsync>(mut setup: impl FnMut() -> Fake
     }
     assert_eq!(rt.pty.dispatch_attempts, 1);
     rt.restart(GEN2, 8);
-    // A is reconciled (unknown), then B — accepted, trust unchanged — runs once.
+    // An orderly restart (clean close): A is reconciled (unknown); B —
+    // accepted, trust and control unchanged — waits for its principal and
+    // runs once when it is welcomed with control (r8 §H rule 3).
     let a = rt.host.receipt(&rid(1)).unwrap();
     assert_eq!(a.state, ReceiptState::OutcomeUnknown);
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    rt.event_reconnect("c1", C1B);
     assert_eq!(
         rt.host.receipt(&rid(2)).unwrap().state,
         ReceiptState::Executing
@@ -1079,8 +1155,9 @@ fn crash_after_executing<J: Journal + FailFsync>(mut setup: impl FnMut() -> Fake
 }
 
 /// A host process crash with receipts on disk: a new host over the reopened
-/// `FileJournal` reconciles the executing prompt, dispatches the accepted one
-/// once, and never issues a lease epoch at or below the reserved floor.
+/// `FileJournal` reconciles the executing prompt, rejects the accepted one
+/// (no clean close: "authorization history unknown", r8 §H) and never
+/// issues a lease epoch at or below the reserved floor.
 #[test]
 fn a_crashed_host_reloads_receipts_and_lease_floors_from_disk() {
     let dir = tempfile::tempdir().unwrap();
@@ -1100,7 +1177,10 @@ fn a_crashed_host_reloads_receipts_and_lease_floors_from_disk() {
     let mut host = SessionHost::new(ctx(1), HostConfig::default(), journal, random_ids()).unwrap();
     assert!(host.index_matches_receipts());
     let after: Vec<_> = [1, 2].map(|n| host.receipt(&rid(n)).unwrap()).into();
-    assert_eq!(after, before);
+    assert_eq!(
+        after, before,
+        "reloaded as they were, before the start's rules"
+    );
     // The session id stays used; the surviving worker is restored.
     assert!(host.add_session(spec(S1, P1)).is_err());
     host.restore_session(spec(S1, P1)).unwrap();
@@ -1114,20 +1194,16 @@ fn a_crashed_host_reloads_receipts_and_lease_floors_from_disk() {
         })
         .collect();
     assert_eq!(reconciled, vec![rid(1)]);
-    // `B` waits for `A`'s outcome, then runs once.
-    let fx = host.dispatch_report(&rid(1), DispatchReport::Unknown);
-    let dispatched = fx
-        .iter()
-        .filter(|f| matches!(f, Effect::Dispatch { request_id, .. } if *request_id == rid(2)))
-        .count();
-    assert_eq!(dispatched, 1);
+    let b = host.receipt(&rid(2)).unwrap();
+    assert_eq!(b.state, ReceiptState::Rejected);
+    assert_eq!(b.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+    // `A`'s outcome dispatches nothing, nor does `B`'s principal returning.
+    let mut fx = host.dispatch_report(&rid(1), DispatchReport::Unknown);
+    fx.extend(welcome_principal(&mut host, "c1", C1B));
+    assert!(!fx.iter().any(|f| matches!(f, Effect::Dispatch { .. })));
     assert_eq!(
         host.receipt(&rid(1)).unwrap().state,
         ReceiptState::OutcomeUnknown
-    );
-    assert_eq!(
-        host.receipt(&rid(2)).unwrap().state,
-        ReceiptState::Executing
     );
 }
 
@@ -1181,36 +1257,40 @@ fn evicted_receipts_stay_gone_after_a_reload() {
     );
 }
 
+/// r8 §I: every failed journal write halts the journal until the restart.
 #[test]
-fn failed_durable_writes() {
-    // `accepted` can't be recorded: busy, nothing recorded, retry works.
+fn failed_durable_writes_halt_the_journal() {
+    // `accepted` can't be recorded: busy ("acceptance not recorded"),
+    // nothing recorded, the refusal listed; the retry is busy (halted).
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
     rt.host.journal_mut().fail_next_fsync();
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
     rt.send("c1", &m);
-    assert_error(&only(&mut rt, "c1"), "busy");
+    let err = only(&mut rt, "c1");
+    assert_error(&err, "busy");
+    assert_eq!(err["detail"], DETAIL_ACCEPTANCE_NOT_RECORDED);
     assert!(rt.host.receipt(&rid(1)).is_none());
-    assert_eq!(rt.pty.dispatch_attempts, 0);
+    assert!(rt.host.journal_halted());
+    assert_eq!(rt.host.journal().refusals().unwrap().len(), 1);
     rt.send("c1", &m);
-    assert_eq!(
-        rt.host.receipt(&rid(1)).unwrap().state,
-        ReceiptState::Executing
-    );
+    let err = only(&mut rt, "c1");
+    assert_eq!(err["detail"], DETAIL_JOURNAL_HALTED);
+    assert_eq!(rt.pty.dispatch_attempts, 0);
 
-    // `executing` can't be recorded: rejected before any side effect.
+    // `executing` can't be recorded: nothing reaches the agent, the request
+    // stays accepted (unreported) and the journal halts.
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
     rt.host.journal_mut().fail_fsync_of(2);
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
     rt.send("c1", &m);
-    assert_eq!(
-        receipts_of(&mut rt, "c1"),
-        vec![st("accepted", ""), st("rejected", DETAIL_NOT_RECORDED)]
-    );
+    assert_eq!(receipts_of(&mut rt, "c1"), vec![st("accepted", "")]);
     assert_eq!(rt.pty.dispatch_attempts, 0);
+    assert!(rt.host.journal_halted());
 
-    // A final state that can't be recorded isn't reported until it is.
+    // A final state that can't be recorded isn't reported; the restart
+    // reconciles it.
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
@@ -1224,10 +1304,7 @@ fn failed_durable_writes() {
         ReceiptState::Executing
     );
     rt.set_now(1);
-    assert_eq!(
-        receipts_of(&mut rt, "c1"),
-        vec![st("outcome_unknown", DETAIL_WRITE_INTERRUPTED)]
-    );
+    assert!(got(&mut rt, "c1").is_empty(), "never retried while halted");
     // The lease grant's epoch reservation is durable too.
     let mut rt = setup();
     rt.host.journal_mut().fail_next_fsync();
@@ -1235,6 +1312,7 @@ fn failed_durable_writes() {
     rt.send("c1", &m);
     assert_error(&only(&mut rt, "c1"), "busy");
     assert_eq!(rt.host.lease_holder(S1), None);
+    assert!(rt.host.journal_halted());
 }
 
 #[test]
@@ -1834,25 +1912,6 @@ fn a_restart_over_a_corrupt_journal_changes_nothing() {
     assert!(rt.host.restart(GEN2, 8).is_err());
     assert_eq!(rt.host.context(), &before);
     assert_eq!(rt.host.lease_holder(S1), Some(C1));
-}
-
-#[test]
-fn durable_write_retries_are_deduplicated() {
-    let mut rt = setup();
-    let e = hold(&mut rt, "c1", S1);
-    let m = submit(&rt, "c1", S1, e, 1, "prompt");
-    rt.send("c1", &m);
-    rt.host.journal_mut().fail_next_fsync();
-    rt.dispatch_report(&rid(1), DispatchReport::FailedAfterPossibleEffect);
-    rt.host.journal_mut().fail_next_fsync();
-    rt.process_exited(S1);
-    assert_eq!(rt.host.pending_retries(), 1);
-    rt.set_now(1);
-    assert_eq!(rt.host.pending_retries(), 0);
-    assert_eq!(
-        rt.host.receipt(&rid(1)).unwrap().state,
-        ReceiptState::OutcomeUnknown
-    );
 }
 
 impl<J: Journal + FailFsync> FakeRuntime<J> {

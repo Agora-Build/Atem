@@ -1264,6 +1264,59 @@ async fn adoption_refuses_a_worker_epoch_beyond_the_reserved_block() {
     assert_eq!(again.host().context().runtime_epoch, first + 1);
 }
 
+/// r8 §H: an orderly stop writes the journal's clean close for its runtime
+/// epoch, and the next start (reading the previous epoch before taking the
+/// next) finds it; a run that just ends (a crash) leaves none.
+#[test]
+fn an_orderly_stop_closes_the_journal_cleanly_for_the_next_start() {
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(!bridge.host().previous_run_clean());
+    let epoch = bridge.host().context().runtime_epoch;
+    bridge.close_cleanly();
+    drop(bridge);
+    let text = std::fs::read_to_string(journal.join("clean_close")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        serde_json::json!({ "runtime_epoch": epoch })
+    );
+    let bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(bridge.host().previous_run_clean());
+    assert!(!journal.join("clean_close").exists());
+    assert!(bridge.host_error().is_none());
+    drop(bridge);
+    let bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(
+        !bridge.host().previous_run_clean(),
+        "the last run didn't stop in order"
+    );
+}
+
+/// The link's principal is the paired Astation within the verified account,
+/// always an opaque id.
+#[test]
+fn the_link_principal_is_the_paired_astation_in_its_account() {
+    let identity = super::Identity {
+        account_id: "account-a".into(),
+        atem_device_id: "host-a".into(),
+        host_trust_gen: 1,
+    };
+    let p = super::link_principal(&identity, "astation-1").unwrap();
+    assert_eq!(p, "astation:account-a:astation-1");
+    let odd = super::link_principal(&identity, "a station/1").unwrap();
+    assert!(crate::session_protocol::wire::is_opaque_id(&odd), "{odd}");
+    assert_eq!(
+        super::link_principal(&identity, "a station/1").unwrap(),
+        odd
+    );
+    assert_ne!(
+        super::link_principal(&identity, "a station/2").unwrap(),
+        odd
+    );
+    assert_eq!(super::link_principal(&identity, ""), None);
+}
+
 #[test]
 fn classification_follows_section_6() {
     use super::super::broker::WriteOutcome;

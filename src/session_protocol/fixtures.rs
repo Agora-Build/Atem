@@ -115,11 +115,41 @@ pub enum HostEvent {
     CrashWorker {
         session_id: String,
     },
+    /// r8: an orderly stop and start (the clean close is written when the
+    /// journal is healthy).
     RestartRuntime {
         runtime_gen: String,
         runtime_epoch: u64,
     },
-    FailNextFsync,
+    /// r8: the runtime is killed (no clean close) and restarts.
+    CrashRuntime {
+        runtime_gen: String,
+        runtime_epoch: u64,
+    },
+    /// r8: the next `accepted` record becomes durable, then the runtime
+    /// crashes before acting on it and restarts with these values.
+    CrashAfterAccepted {
+        runtime_gen: String,
+        runtime_epoch: u64,
+    },
+    /// The `n`-th next journal append fails and the journal halts; with
+    /// `undo_fails` its record stays on disk (`fail_next_fsync` is `n` 1).
+    FailFsyncOf {
+        n: u64,
+        undo_fails: bool,
+    },
+    /// r8 §H: the client's principal re-authenticates with these
+    /// permissions on a new attachment.
+    SetPermissions {
+        client: String,
+        permissions: Vec<Permission>,
+        attachment_gen: String,
+    },
+    /// r8: the agent process is replaced with a new `process_gen`.
+    ReplaceProcess {
+        session_id: String,
+        process_gen: String,
+    },
     ChangeTrustGen(u64),
     FailNextPtyEnqueue,
     FailNextPtyWriteAfterPartial,
@@ -259,7 +289,7 @@ pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, 
             }
         }
         Some("r8") if r8 => {
-            if let Err(why) = revision::r8_fixture_runnable(&scenario.name) {
+            if let Err(why) = revision::r8_fixture_runnable_in_harness(&scenario.name) {
                 return Ok(Outcome::NotRun(why));
             }
         }
@@ -373,6 +403,8 @@ struct Runner {
     queues: HashMap<String, VecDeque<Value>>,
     holds: Vec<(String, String)>,
     held: Vec<(String, Value)>,
+    /// r8 `drop`: the next matching host message is lost in transit.
+    drops: Vec<(String, String)>,
     clients: HashMap<String, ClientMachines>,
 }
 
@@ -464,6 +496,7 @@ impl Runner {
             host,
             holds: Vec::new(),
             held: Vec::new(),
+            drops: Vec::new(),
             clients,
         }
     }
@@ -506,7 +539,13 @@ impl Runner {
             ("local_input", &["bytes"]),
             ("crash_worker", &[]),
             ("restart_runtime", &[]),
-            ("fail_next_fsync", &[]),
+            ("crash_runtime", &[]),
+            ("crash_after_accepted", &[]),
+            ("fail_next_fsync", &["undo_fails"]),
+            ("fail_fsync_of", &[]),
+            ("set_permissions", &["permissions", "attachment_gen"]),
+            ("replace_process", &["process_gen"]),
+            ("drop", &[]),
             ("change_trust_gen", &[]),
             ("fail_next_pty_enqueue", &[]),
             ("fail_next_pty_write_after_partial", &[]),
@@ -603,16 +642,22 @@ impl Runner {
                     Some(m) => Err(format!("{client} received {m}")),
                 }
             }
-            ("hold", Side::Host) => {
+            ("hold" | "drop", Side::Host) => {
                 let to = self.client(take(
-                    arg.as_object().ok_or("hold must be an object")?,
+                    arg.as_object()
+                        .ok_or(format!("{action} must be an object"))?,
                     "to",
                 )?)?;
-                let op = as_str(take(arg.as_object().unwrap(), "op")?, "hold.op")?;
+                let op = as_str(take(arg.as_object().unwrap(), "op")?, "op")?;
                 if arg.as_object().unwrap().len() != 2 {
-                    return Err("hold takes exactly to and op".into());
+                    return Err(format!("{action} takes exactly to and op"));
                 }
-                self.holds.push((to.to_string(), op.to_string()));
+                let armed = (to.to_string(), op.to_string());
+                if *action == "hold" {
+                    self.holds.push(armed);
+                } else {
+                    self.drops.push(armed);
+                }
                 Ok(())
             }
             ("deliver", Side::Host) => {
@@ -689,17 +734,59 @@ impl Runner {
             "crash_worker" => HostEvent::CrashWorker {
                 session_id: as_str(arg, "crash_worker")?.into(),
             },
-            "restart_runtime" => {
-                let o = arg.as_object().ok_or("restart_runtime must be an object")?;
+            "restart_runtime" | "crash_runtime" | "crash_after_accepted" => {
+                let o = arg
+                    .as_object()
+                    .ok_or(format!("{action} must be an object"))?;
                 if o.len() != 2 {
-                    return Err("restart_runtime takes runtime_gen and runtime_epoch".into());
+                    return Err(format!("{action} takes runtime_gen and runtime_epoch"));
                 }
-                HostEvent::RestartRuntime {
-                    runtime_gen: uuid(take(o, "runtime_gen")?, "runtime_gen")?,
-                    runtime_epoch: as_u64(take(o, "runtime_epoch")?, "runtime_epoch")?,
+                let runtime_gen = uuid(take(o, "runtime_gen")?, "runtime_gen")?;
+                let runtime_epoch = as_u64(take(o, "runtime_epoch")?, "runtime_epoch")?;
+                match action {
+                    "restart_runtime" => HostEvent::RestartRuntime {
+                        runtime_gen,
+                        runtime_epoch,
+                    },
+                    "crash_runtime" => HostEvent::CrashRuntime {
+                        runtime_gen,
+                        runtime_epoch,
+                    },
+                    _ => HostEvent::CrashAfterAccepted {
+                        runtime_gen,
+                        runtime_epoch,
+                    },
                 }
             }
-            "fail_next_fsync" => yes(arg).map(|_| HostEvent::FailNextFsync)?,
+            "fail_next_fsync" => {
+                yes(arg)?;
+                let undo_fails = match step.get("undo_fails") {
+                    None => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err("undo_fails must be a boolean".into()),
+                };
+                HostEvent::FailFsyncOf { n: 1, undo_fails }
+            }
+            "fail_fsync_of" => {
+                let n = as_u64(arg, "fail_fsync_of")?;
+                if n == 0 {
+                    return Err("fail_fsync_of counts from 1".into());
+                }
+                HostEvent::FailFsyncOf {
+                    n,
+                    undo_fails: false,
+                }
+            }
+            "set_permissions" => HostEvent::SetPermissions {
+                client: self.client(arg)?.into(),
+                permissions: serde_json::from_value(take(step, "permissions")?.clone())
+                    .map_err(|e| format!("permissions: {e}"))?,
+                attachment_gen: uuid(take(step, "attachment_gen")?, "attachment_gen")?,
+            },
+            "replace_process" => HostEvent::ReplaceProcess {
+                session_id: as_str(arg, "replace_process")?.into(),
+                process_gen: uuid(take(step, "process_gen")?, "process_gen")?,
+            },
             "change_trust_gen" => HostEvent::ChangeTrustGen(as_u64(arg, "change_trust_gen")?),
             "fail_next_pty_enqueue" => yes(arg).map(|_| HostEvent::FailNextPtyEnqueue)?,
             "fail_next_pty_write_after_partial" => {
@@ -786,6 +873,11 @@ impl Runner {
                 .get_mut(&client)
                 .ok_or(format!("host sent to unknown client {client:?}"))?;
             let op = msg["data"]["op"].as_str().unwrap_or_default();
+            if let Some(i) = self.drops.iter().position(|(c, o)| *c == client && o == op) {
+                // Lost in transit: never delivered, never expected.
+                self.drops.remove(i);
+                continue;
+            }
             if let Some(i) = self.holds.iter().position(|(c, o)| *c == client && o == op) {
                 self.holds.remove(i);
                 self.held.push((client, msg));
@@ -847,18 +939,18 @@ impl Runner {
         };
         let now = self.now;
         let m = self.clients.get_mut(client).unwrap();
-        if let Op::Hello { revision, .. } = &msg.op {
-            if *revision != Some(revision::REVISION) {
-                return Err("an r8 client's hello carries revision 8".into());
-            }
-            return m
-                .admission
-                .hello_sent()
-                .map_err(|e| format!("client refused to send: {e}"));
+        if let Op::Hello { revision, .. } = &msg.op
+            && *revision != Some(revision::REVISION)
+        {
+            return Err("an r8 client's hello carries revision 8".into());
         }
+        // A `hello` starts a new handshake inside `check_send`.
         m.admission
             .check_send(&env_of(&msg))
             .map_err(|e| format!("client refused to send: {e}"))?;
+        if matches!(msg.op, Op::Hello { .. }) {
+            return Ok(());
+        }
         let (kind, binding) = match &msg.op {
             Op::List {} => {
                 m.registry.note_list_sent();
@@ -1062,7 +1154,7 @@ mod tests {
             .filter(|(_, v)| {
                 let name = v["name"].as_str().unwrap();
                 if name.starts_with("r8-") {
-                    revision::r8_fixture_runnable(name).is_ok()
+                    revision::r8_fixture_runnable_in_harness(name).is_ok()
                 } else {
                     revision::superseded(name).is_none()
                 }
@@ -1086,7 +1178,7 @@ mod tests {
             }
             assert_eq!(s.requires.as_deref(), Some("r8"), "{}", s.name);
             names.push(s.name.clone());
-            match revision::r8_fixture_runnable(&s.name) {
+            match revision::r8_fixture_runnable_in_harness(&s.name) {
                 Ok(()) => {
                     assert_eq!(
                         run_scenario(&v, Some(&fake_runtime)),
@@ -1225,8 +1317,11 @@ mod tests {
         )?))
     }
 
+    /// Every fixture whose work is implemented runs and passes, none is
+    /// skipped, and exactly the others (r8 ones waiting for their work,
+    /// superseded r7.x ones) are reported as not run.
     #[test]
-    fn every_fixture_runs_and_passes_with_none_skipped() {
+    fn every_runnable_fixture_passes_and_only_the_gated_ones_are_not_run() {
         let files = scenario_files();
         let host: Vec<String> = files
             .iter()
@@ -1248,6 +1343,20 @@ mod tests {
         for name in &host {
             assert!(report.passed.contains(name), "host scenario {name} ran");
         }
+        let mut gated: Vec<String> = scenario_paths(&fixtures_dir())
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .filter(|n| !files.iter().any(|(_, v)| v["name"] == n.as_str()))
+            .collect();
+        gated.sort();
+        let mut not_run: Vec<String> = report.not_run.iter().map(|(n, _)| n.clone()).collect();
+        not_run.sort();
+        assert_eq!(not_run, gated, "not run: exactly the gated fixtures");
+        eprintln!(
+            "fixtures not run ({}): {:?}",
+            report.not_run.len(),
+            report.not_run
+        );
 
         // Without a host, exactly the host scenarios are reported as skipped.
         let hostless = run_all(&fixtures_dir(), None);
@@ -1259,8 +1368,8 @@ mod tests {
     #[test]
     fn every_fixture_passes_with_the_file_journal() {
         use super::super::fake_runtime::FakeRuntime;
+        use super::super::fake_runtime::harness_config;
         use super::super::file_journal::FileJournal;
-        use super::super::host::HostConfig;
         let dirs = std::cell::RefCell::new(Vec::new());
         let factory = |setup: &Setup| -> Result<Box<dyn HostUnderTest>, String> {
             let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -1268,7 +1377,7 @@ mod tests {
             dirs.borrow_mut().push(dir);
             Ok(Box::new(FakeRuntime::with_journal(
                 setup,
-                HostConfig::default(),
+                harness_config(),
                 journal,
             )?))
         };
@@ -1353,6 +1462,46 @@ mod tests {
                 json!("answered_remote"),
             ),
             ("approval-survives-takeover", "code", json!("forbidden")),
+            (
+                "r8-failed-persistence-changes-no-lease",
+                "detail",
+                json!("authorization history unknown"),
+            ),
+            (
+                "r8-double-write-failure-takeover-never-runs",
+                "detail",
+                json!("authorization history unknown"),
+            ),
+            (
+                "r8-crash-rejects-queued-work-whose-history-is-unknown",
+                "detail",
+                json!("acceptance not confirmed"),
+            ),
+            (
+                "r8-recovered-work-needs-its-principal-confirmed",
+                "detail",
+                json!("control revoked"),
+            ),
+            (
+                "r8-revoked-control-fences-work-across-reconnect-and-restart",
+                "detail",
+                json!("authorization history unknown"),
+            ),
+            (
+                "r8-control-fence-holds-when-a-rejection-write-fails",
+                "receipts.0.detail",
+                json!("control revoked"),
+            ),
+            (
+                "r8-send-refused-while-another-holds-then-takeover",
+                "lease.ms_left",
+                json!(14999),
+            ),
+            (
+                "r8-stale-takeover-confirmation-is-refused",
+                "controller.lease_epoch",
+                json!(1),
+            ),
         ];
         for (name, key, to) in mutations {
             let mut f = fixture(name);
@@ -1379,6 +1528,33 @@ mod tests {
         let last = f["steps"].as_array_mut().unwrap().last_mut().unwrap();
         last["assert"]["dispatch_attempts"] = json!(2);
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
+        // And on a changed journal state or dispatch count (r8).
+        for (name, key, to) in [
+            (
+                "r8-failed-fence-write-rejects-queued-work-at-once",
+                "journal_halted",
+                json!(true),
+            ),
+            (
+                "r8-clean-close-runs-queued-work-once-its-principal-is-confirmed",
+                "dispatch_attempts",
+                json!(1),
+            ),
+        ] {
+            let mut f = fixture(name);
+            let step = f["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .rev()
+                .find(|s| s["assert"].get(key).is_some())
+                .unwrap();
+            step["assert"][key] = to;
+            assert!(
+                run_scenario(&f, Some(&fake_runtime)).is_err(),
+                "{name} {key}"
+            );
+        }
         // And on a changed decision handed to the agent.
         let mut f = fixture("approval-deny-carries-the-message-to-the-agent");
         let step = f["steps"]
@@ -1551,6 +1727,7 @@ mod tests {
                             code: wire::ErrorCode::Busy,
                             detail: None,
                             revision: None,
+                            controller: None,
                         },
                     }),
                 ));

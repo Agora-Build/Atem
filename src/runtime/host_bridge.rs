@@ -239,21 +239,47 @@ fn link_identity(client: &AstationClient) -> Option<Identity> {
     verified_identity(capture.sources(), astation_id, capture.state.host_trust_gen)
 }
 
-/// The next runtime epoch, durably (a counter in `dir`, incremented each start).
-fn next_runtime_epoch(dir: &Path) -> anyhow::Result<u64> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+/// The principal a verified link speaks for (r8 §H, compatibility mode):
+/// the paired Astation, within the verified account. One per link today;
+/// with account trust each device with a grant becomes its own. Ids that
+/// can't form an opaque id are named by their digest instead (the same
+/// pair always gives the same principal); no Astation id, no principal.
+fn link_principal(identity: &Identity, astation_id: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if astation_id.is_empty() {
+        return None;
+    }
+    let principal = format!("astation:{}:{astation_id}", identity.account_id);
+    if wire::is_opaque_id(&principal) {
+        return Some(principal);
+    }
+    let digest = Sha256::digest(format!("{}\n{astation_id}", identity.account_id));
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    Some(format!("astation:{hex}"))
+}
+
+/// The runtime epoch the counter in `dir` holds (0 when there is none):
+/// the previous run's, before this run takes the next one.
+fn current_runtime_epoch(dir: &Path) -> anyhow::Result<u64> {
     let path = dir.join(RUNTIME_EPOCH_FILE);
-    let previous = match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(&path) {
         Ok(text) => text.trim().parse::<u64>().map_err(|_| {
             anyhow::anyhow!(
                 "{} is damaged; move it aside to reset the runtime epoch",
                 path.display()
             )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e.into()),
-    };
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The next runtime epoch, durably (a counter in `dir`, incremented each start).
+fn next_runtime_epoch(dir: &Path) -> anyhow::Result<u64> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(RUNTIME_EPOCH_FILE);
+    let previous = current_runtime_epoch(dir)?;
     let next = previous
         .checked_add(1)
         .filter(|n| *n <= crate::session_protocol::canonical::MAX_SAFE_INTEGER)
@@ -392,6 +418,8 @@ pub struct HostBridge {
     /// The request being handled (its link and what a refusal line says
     /// about it): error replies while it is set are logged.
     refusing: Option<(u64, Request, Option<String>)>,
+    /// The host closed the link's attachment: drop the link after this pass.
+    close_link: bool,
 }
 
 /// Where effects go: the link's client and the broker's sessions.
@@ -410,13 +438,17 @@ impl HostBridge {
         clock: Clock,
     ) -> anyhow::Result<Self> {
         let journal = FileJournal::open(dir).map_err(|e| anyhow::anyhow!(e.0))?;
+        // r8 §H: the previous run ended cleanly only if the journal's
+        // clean-close record names its epoch, read before this run takes
+        // the next one (which supersedes the record in any case).
+        let previous = current_runtime_epoch(dir)?;
         let epoch = next_runtime_epoch(dir)?;
         let identity = profile.map(start_identity).unwrap_or(Identity {
             account_id: UNPAIRED.into(),
             atem_device_id: UNPAIRED.into(),
             host_trust_gen: 0,
         });
-        let host = Self::build(journal, &identity, epoch, &clock)?;
+        let host = Self::build(journal, &identity, epoch, previous, &clock)?;
         Ok(Self {
             host,
             dir: dir.to_path_buf(),
@@ -442,6 +474,7 @@ impl HostBridge {
             pushes: Default::default(),
             refusal_log: RefusalLog::default(),
             refusing: None,
+            close_link: false,
         })
     }
 
@@ -449,6 +482,7 @@ impl HostBridge {
         journal: FileJournal,
         identity: &Identity,
         runtime_epoch: u64,
+        previous_epoch: u64,
         clock: &Clock,
     ) -> anyhow::Result<SessionHost<FileJournal>> {
         let ctx = HostContext {
@@ -462,7 +496,28 @@ impl HostBridge {
             wall_offset_ms: wall_ms().saturating_sub(clock.now()),
             ..HostConfig::default()
         };
-        SessionHost::new(ctx, config, journal, random_ids()).map_err(|e| anyhow::anyhow!(e.0))
+        SessionHost::open(ctx, config, journal, random_ids(), Some(previous_epoch))
+            .map_err(|e| anyhow::anyhow!(e.0))
+    }
+
+    /// At an orderly stop (signal, idle exit, replacement), after the last
+    /// pass: the journal's clean-close record, if it is healthy (r8 §H).
+    pub fn close_cleanly(&mut self) {
+        if self.host.close_cleanly() {
+            eprintln!("atem runtime: session journal closed cleanly");
+        } else {
+            eprintln!(
+                "atem runtime: session journal not closed cleanly (a write failed in this run)"
+            );
+        }
+    }
+
+    /// Why remote sessions are disabled since the start, if they are (the
+    /// recovered requests couldn't be resolved durably).
+    pub fn host_error(&self) -> Option<String> {
+        self.host
+            .start_error()
+            .map(|e| format!("remote sessions disabled: {e}; restart Atem"))
     }
 
     /// The link may attach now (its pairing was just verified): it is
@@ -590,6 +645,9 @@ impl HostBridge {
             self.recovered = true;
             let effects = self.host.recover();
             self.exec(effects, &mut cx);
+            if let Some(error) = self.host_error() {
+                eprintln!("atem runtime: {error}");
+            }
         }
         if !adopting && let Some(hosted) = app.hosted.as_mut() {
             let inbox: Vec<(u64, String)> = hosted.inbox.drain(..).collect();
@@ -627,6 +685,11 @@ impl HostBridge {
                 })
                 .collect();
         }
+        if std::mem::take(&mut self.close_link) {
+            app.drop_astation_link(
+                "The session journal couldn't record a refusal; the link was dropped".into(),
+            );
+        }
     }
 
     // ── The link ──
@@ -651,13 +714,21 @@ impl HostBridge {
         if !self.adopt_identity(&identity, cx) {
             return;
         }
+        let astation_id = cx
+            .client
+            .connected_astation_id()
+            .unwrap_or_default()
+            .to_string();
+        let Some(principal) = link_principal(&identity, &astation_id) else {
+            eprintln!(
+                "atem runtime: the Astation id can't name a principal; no session attachment"
+            );
+            return;
+        };
         let attachment = uuid::Uuid::new_v4().to_string();
         let attach = Attach {
-            client: cx
-                .client
-                .connected_astation_id()
-                .unwrap_or_default()
-                .to_string(),
+            client: astation_id,
+            principal,
             attachment_gen: attachment.clone(),
             permissions: link_permissions(),
             client_kind: ClientKind::Native,
@@ -950,7 +1021,16 @@ impl HostBridge {
                     message,
                 } => self.send(&attachment, &message, cx),
                 // A fenced attachment of this link's client: already gone.
-                Effect::Close { .. } => {}
+                // The host closed the link's own attachment without a reply
+                // (r8 §I.4: a refusal it couldn't record): the link drops at
+                // the end of the pass, so the client treats the request's
+                // delivery as uncertain. Other attachments it closes are
+                // already gone from the link.
+                Effect::Close { attachment } => {
+                    if self.current(&attachment) {
+                        self.close_link = true;
+                    }
+                }
                 // A second `hello` on the link: the link's attachment is now
                 // `new`; what belonged to `old` goes (the host fenced it).
                 Effect::Replaced { old, new } => {
@@ -2678,6 +2758,7 @@ fn unauthorized(re: Option<String>) -> String {
             code: ErrorCode::Unauthorized,
             detail: None,
             revision: None,
+            controller: None,
         },
     });
     String::from_utf8(wire::encode(&message)).expect("wire JSON is UTF-8")

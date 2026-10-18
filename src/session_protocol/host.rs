@@ -44,6 +44,40 @@
 //! (`Effect::ApprovalReleased`); the terminal can always answer instead
 //! (`close_approval(answered_terminal)`), and lease changes never close one.
 //!
+//! Principals and the control fence (r8 §H): every attachment speaks for
+//! the principal its link authenticated (`Attach::principal`; today one per
+//! link, the paired, verified Astation, while the fixture harness gives each
+//! client its own). Per principal the journal keeps whether it holds
+//! `control` and a `control_gen` that only rises; accepted work records its
+//! submitter's principal and generation and runs only while that principal
+//! holds `control` at that generation. A connect that takes `control` away
+//! writes the fence first (`Record::Control`), then fences the principal's
+//! attachments with `control`, revokes its leases and rejects its queued
+//! work (`control revoked`); if a write of that step fails it does the same
+//! in memory and the journal halts.
+//!
+//! Persistence (r8 §I): a request is accepted only once its `accepted`
+//! record is durable. Any failed journal write halts the journal: every
+//! session request but `hello` is `busy` (`journal halted; restart Atem`), a
+//! `hello` is not welcomed, nothing queued is dispatched and no remote byte
+//! passes `admit_write`, until the runtime restarts (`restart_at`, or a new
+//! process over the reopened journal). A failed admission write is put on
+//! the refusal list before its `busy` (`acceptance not recorded`); if even
+//! that fails the link is closed without a reply. An orderly stop with a
+//! healthy journal writes the clean-close record (`close_cleanly`). At start
+//! (`recover`) recovered queued work is resolved in the appendix's order:
+//! refused (`acceptance not confirmed`), no clean close (`authorization
+//! history unknown`), trust changed, an older `control_gen` (`control
+//! revoked`), else it waits for its principal to be welcomed with `control`
+//! and is `control not confirmed` 60 s after the start.
+//!
+//! Chat Send (r8 §F, session-v1 form): a `prompt` submit may carry
+//! `acquire` (with `takeover` and `expected_controller`) and acquire the
+//! lease in the same step as its durable acceptance. It is off unless
+//! `HostConfig::send_acquire` (the feature isn't advertised yet; the shared
+//! fixtures' harness turns it on), and refused as an op of an unadvertised
+//! feature otherwise.
+//!
 //! Atem session rules (r7.2): the runtime reports a session's active rules
 //! (`set_approval_rules`; the worker owns them); attachments with `control`
 //! get `approval_rules` on every change and after each `sessions` snapshot.
@@ -54,16 +88,17 @@
 //! like other work.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
-use super::journal::{self, Journal, JournalError, Record, Stored};
+use super::journal::{self, ControlState, Journal, JournalError, Record, Refusal, Stored};
 use super::revision::{FEATURES, REVISION};
 use super::wire::{
     self, Activity, AlwaysRule, ApprovalAnswer, ApprovalCloseReason, ApprovalDecision,
     ApprovalRequest, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
     FamilyMessage, LeaseChangeReason, MAX_IN_FLIGHT, MAX_PROMPT_BYTES, Op, Permission, Receipt,
-    ReceiptKind, ReceiptState, RuleRevoke, SessionMessage, SessionState, Target, TerminalRequest,
+    ReceiptKind, ReceiptLease, ReceiptState, RuleRevoke, SessionMessage, SessionState, Target,
+    TerminalRequest,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// A lease lasts this long from its grant or renewal (§5).
 pub const LEASE_MS: u64 = 15_000;
@@ -86,6 +121,9 @@ pub const MAX_PENDING_APPROVALS: usize = 16;
 /// A handed-off answer the agent hasn't confirmed by then (above Claude
 /// Code's 600 s hook timeout) is `outcome_unknown`.
 pub const APPROVAL_HANDOFF_MS: u64 = 630_000;
+/// Recovered queued work whose principal isn't welcomed with `control` by
+/// then (after the host's start) is `control not confirmed` (r8 §H).
+pub const CONFIRM_MS: u64 = 60_000;
 
 pub const DETAIL_APPROVAL_CLOSED: &str = "the approval closed before the answer was handed over";
 pub const DETAIL_APPROVAL_CROSSED: &str = "the terminal answered too; which answer won is unknown";
@@ -94,7 +132,16 @@ pub const DETAIL_DECISION_NOT_DELIVERED: &str = "could not hand the decision to 
 pub const DETAIL_RULE_NOT_REVOKED: &str = "could not revoke the rule";
 pub const DETAIL_TRUST_CHANGED: &str = "host trust changed";
 pub const DETAIL_SESSION_CLOSED: &str = "session closed";
-pub const DETAIL_NOT_RECORDED: &str = "could not record the request";
+pub const DETAIL_CONTROL_REVOKED: &str = "control revoked";
+pub const DETAIL_CONTROL_NOT_CONFIRMED: &str = "control not confirmed";
+pub const DETAIL_HISTORY_UNKNOWN: &str = "authorization history unknown";
+pub const DETAIL_ACCEPTANCE_NOT_CONFIRMED: &str = "acceptance not confirmed";
+/// `busy` for a failed admission write, a definitive refusal (r8 §I.2).
+pub const DETAIL_ACCEPTANCE_NOT_RECORDED: &str = "acceptance not recorded";
+/// `busy` for every request after a failed journal write (r8 §I).
+pub const DETAIL_JOURNAL_HALTED: &str = "journal halted; restart Atem";
+/// `busy` for an acquiring Send to a session without chat-v1 (r8 §F).
+pub const DETAIL_NO_CHAT: &str = "chat is not available for this agent";
 pub const DETAIL_NO_TERMINAL_WRITE: &str = "could not write to the terminal";
 pub const DETAIL_WRITE_INTERRUPTED: &str = "write interrupted";
 pub const DETAIL_AGENT_EXITED: &str = "agent exited";
@@ -126,6 +173,12 @@ pub struct HostConfig {
     pub max_receipts_per_session: usize,
     /// Wall clock = this + the monotonic clock (display times only).
     pub wall_offset_ms: u64,
+    /// r8 §F's acquiring `prompt` submit (session-v1 form). Off in the
+    /// runtime until `chat.send_acquire` is advertised (§A: an op of an
+    /// unadvertised feature is `unsupported_version`); the shared fixtures'
+    /// harness turns it on.
+    // TODO(r8 task 3): on (and advertised) with the chat-v1 form.
+    pub send_acquire: bool,
 }
 
 impl Default for HostConfig {
@@ -133,6 +186,7 @@ impl Default for HostConfig {
         Self {
             max_receipts_per_session: DEFAULT_MAX_RECEIPTS,
             wall_offset_ms: 0,
+            send_acquire: false,
         }
     }
 }
@@ -143,6 +197,12 @@ impl Default for HostConfig {
 pub struct Attach {
     /// The authenticated client device; a new attachment fences its previous one.
     pub client: String,
+    /// The authenticated principal the link speaks for (r8 §H): set from
+    /// the link's authentication, never from message fields or the relay.
+    /// An opaque id (`wire::is_opaque_id`). Today the runtime's one
+    /// principal is the paired, verified Astation; with account trust each
+    /// device with a grant is its own.
+    pub principal: String,
     pub attachment_gen: String,
     pub permissions: Vec<Permission>,
     pub client_kind: ClientKind,
@@ -359,8 +419,60 @@ struct Approval {
 #[derive(Debug, Clone)]
 struct Lease {
     attachment: String,
+    /// The holder attachment's principal (its leases are revoked with its
+    /// `control`, live attachment or gone).
+    principal: String,
     controller_session: String,
     deadline: u64,
+}
+
+/// A principal's control state in this run (r8 §H): the durable state, and
+/// whether an attachment of it was welcomed with `control` in this run.
+#[derive(Debug, Clone, Copy)]
+struct PrincipalState {
+    control: bool,
+    control_gen: u64,
+    confirmed: bool,
+}
+
+/// What §F's admission planned for the lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeasePlan {
+    /// Held live by the submitting attachment: no change.
+    Own,
+    Grant,
+    Takeover,
+}
+
+/// The §F admission parameters of a submit.
+#[derive(Debug, Clone, Default)]
+pub struct SendParams {
+    pub acquire: Option<bool>,
+    pub takeover: Option<bool>,
+    pub expected_controller: Option<Controller>,
+}
+
+impl SendParams {
+    fn any(&self) -> bool {
+        self.acquire.is_some() || self.takeover.is_some() || self.expected_controller.is_some()
+    }
+}
+
+/// How a refused request is answered beyond its code.
+#[derive(Debug, Default)]
+struct Refused {
+    detail: Option<&'static str>,
+    controller: Option<Controller>,
+    /// No reply: the link is closed (r8 §I.4).
+    close: bool,
+}
+
+/// Whether accepted work may be dispatched now (r8 §H dispatch check).
+enum Gate {
+    Go,
+    /// Its principal isn't confirmed in this run yet (recovered work).
+    Wait,
+    Revoked,
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +494,7 @@ struct Session {
 #[derive(Debug, Clone)]
 struct Attachment {
     client: String,
+    principal: String,
     controller_session: Option<String>,
     permissions: Vec<Permission>,
     client_kind: ClientKind,
@@ -411,8 +524,6 @@ struct Entry {
     submitted_by: Option<String>,
     /// Interrupt/stop: no effect observed by then → `outcome_unknown`.
     observe_deadline: Option<u64>,
-    /// A final state is waiting for a durable write (retried on `advance`).
-    finishing: bool,
     /// Submitted through chat-v1 in this conversation: replies use chat ops.
     chat: Option<String>,
     /// The provider turn a completed prompt ended (chat `complete`).
@@ -455,8 +566,24 @@ pub struct SessionHost<J: Journal> {
     rules: BTreeMap<String, (String, Vec<AlwaysRule>)>,
     /// Admission order of the next new request.
     next_order: u64,
-    /// Final transitions whose durable write failed, retried on `advance`.
-    retry: Vec<(String, ReceiptState, Option<String>)>,
+    /// principal → its control state (r8 §H).
+    principals: BTreeMap<String, PrincipalState>,
+    /// A journal write failed in this run (r8 §I): no more writes, no
+    /// welcome, no dispatch, no remote byte, until the restart.
+    journal_halted: bool,
+    /// The previous run ended with a clean close naming its epoch.
+    previous_clean: bool,
+    /// The start's resolution of recovered work ran (`recover`).
+    resolved: bool,
+    /// Why remote sessions are disabled: the start's resolution couldn't be
+    /// persisted (r8 §H, §I.3).
+    start_error: Option<String>,
+    /// When this run started (monotonic ms): the 60 s confirmation window.
+    started_at: u64,
+    /// Recovered accepted work waiting for its principal's confirmation.
+    waiting: BTreeSet<String>,
+    /// How the request being refused is answered beyond its code.
+    refused: Refused,
     out: Vec<Effect>,
 }
 
@@ -464,13 +591,31 @@ type Checked<T = ()> = Result<T, ErrorCode>;
 
 impl<J: Journal> SessionHost<J> {
     /// A host over `journal`, reloading what it holds (apply the crash rules
-    /// with `recover` once the surviving sessions are registered).
+    /// with `recover` once the surviving sessions are registered). The
+    /// previous run's clean-close record is discarded (as after a run that
+    /// didn't end cleanly); a runtime start uses `open`.
     pub fn new(
         ctx: HostContext,
         config: HostConfig,
         journal: J,
         ids: IdSource,
     ) -> Result<Self, JournalError> {
+        Self::open(ctx, config, journal, ids, None)
+    }
+
+    /// A host over `journal` at a runtime start. `previous_epoch` is the
+    /// runtime epoch of the previous run (read before this run's epoch was
+    /// taken): that run ended cleanly only when the journal's clean-close
+    /// record names it. The record is removed either way.
+    pub fn open(
+        ctx: HostContext,
+        config: HostConfig,
+        mut journal: J,
+        ids: IdSource,
+        previous_epoch: Option<u64>,
+    ) -> Result<Self, JournalError> {
+        let found = journal.take_clean_close();
+        let previous_clean = found.is_some() && found == previous_epoch;
         let mut host = Self {
             ctx,
             config,
@@ -489,11 +634,86 @@ impl<J: Journal> SessionHost<J> {
             approvals_opened: 0,
             rules: BTreeMap::new(),
             next_order: 0,
-            retry: Vec::new(),
+            principals: BTreeMap::new(),
+            journal_halted: false,
+            previous_clean,
+            resolved: false,
+            start_error: None,
+            started_at: 0,
+            waiting: BTreeSet::new(),
+            refused: Refused::default(),
             out: Vec::new(),
         };
         host.reload()?;
         Ok(host)
+    }
+
+    /// The journal halted after a failed write (r8 §I): until the restart.
+    pub fn journal_halted(&self) -> bool {
+        self.journal_halted
+    }
+
+    /// Whether the previous run ended with a clean close naming its epoch.
+    pub fn previous_run_clean(&self) -> bool {
+        self.previous_clean
+    }
+
+    /// Why remote sessions are disabled since the start, if they are: the
+    /// resolution of recovered work couldn't be persisted.
+    pub fn start_error(&self) -> Option<&str> {
+        self.start_error.as_deref()
+    }
+
+    /// At an orderly stop, after admission stopped: writes the clean-close
+    /// record naming this run's epoch, only if the journal is healthy (no
+    /// failed write in this run, the start's resolution persisted). True
+    /// when it was written.
+    pub fn close_cleanly(&mut self) -> bool {
+        if self.journal_halted || self.start_error.is_some() {
+            return false;
+        }
+        self.journal
+            .write_clean_close(self.ctx.runtime_epoch)
+            .is_ok()
+    }
+
+    /// Appends `record`; any failure halts the journal (r8 §I).
+    fn append(&mut self, record: Record) -> bool {
+        if self.journal_halted {
+            return false;
+        }
+        if self.journal.append(record).is_ok() {
+            return true;
+        }
+        self.halt_journal();
+        false
+    }
+
+    /// A journal write failed: nothing more is written, welcomed or
+    /// dispatched in this run. Every session's input epoch moves on, so
+    /// remote bytes already queued are dropped at the write boundary (which
+    /// also checks the halt).
+    fn halt_journal(&mut self) {
+        if self.journal_halted {
+            return;
+        }
+        self.journal_halted = true;
+        for s in self.sessions.values_mut() {
+            s.input_epoch += 1;
+        }
+    }
+
+    /// The principal's control state (a principal the journal doesn't
+    /// know holds no `control` yet, at generation 1).
+    fn principal(&self, principal: &str) -> PrincipalState {
+        self.principals
+            .get(principal)
+            .copied()
+            .unwrap_or(PrincipalState {
+                control: false,
+                control_gen: 1,
+                confirmed: false,
+            })
     }
 
     pub fn context(&self) -> &HostContext {
@@ -595,11 +815,20 @@ impl<J: Journal> SessionHost<J> {
     /// A new authenticated attachment. Any earlier attachment of the same
     /// client is fenced first (closed; anything still arriving on it is
     /// refused). It holds no lease and must `hello` before anything else.
+    ///
+    /// The link's permissions are what its principal holds now (r8 §H): a
+    /// principal that loses `control` is fenced first (`revoke_control`),
+    /// one that regains it keeps its raised `control_gen`.
     pub fn connect(&mut self, a: Attach) -> Result<Vec<Effect>, String> {
         if !wire::is_uuid_v4(&a.attachment_gen) || self.attachments.contains_key(&a.attachment_gen)
         {
             return Err("attachment_gen must be a new UUID v4".into());
         }
+        if !wire::is_opaque_id(&a.principal) {
+            return Err("principal must be an opaque id".into());
+        }
+        let has_control = a.permissions.contains(&Permission::Control);
+        self.principal_control(&a.principal, has_control);
         let old: Vec<String> = self
             .attachments
             .iter()
@@ -618,6 +847,7 @@ impl<J: Journal> SessionHost<J> {
             a.attachment_gen,
             Attachment {
                 client: a.client,
+                principal: a.principal,
                 controller_session: None,
                 permissions: a.permissions,
                 client_kind: a.client_kind,
@@ -628,6 +858,114 @@ impl<J: Journal> SessionHost<J> {
             },
         );
         Ok(self.take())
+    }
+
+    /// The principal's link authenticated with (`has`) or without `control`.
+    fn principal_control(&mut self, principal: &str, has: bool) {
+        let st = self.principal(principal);
+        if st.control && !has {
+            self.revoke_control(principal);
+        } else if !st.control && has {
+            // A grant keeps the raised generation (a failed write halts the
+            // journal: then nothing of it is welcomed or dispatched anyway).
+            self.append(Record::Control {
+                principal: principal.to_string(),
+                control: true,
+                control_gen: st.control_gen,
+            });
+            self.principals.insert(
+                principal.to_string(),
+                PrincipalState {
+                    control: true,
+                    ..st
+                },
+            );
+        }
+    }
+
+    /// r8 §H: `principal` lost `control`. In one step: the fence (its raised
+    /// `control_gen`) is written durably; its live attachments with
+    /// `control` are fenced and every lease held by one of its attachments
+    /// (live or gone) is revoked; each of its accepted requests not yet
+    /// executing is rejected (`control revoked`), persisted. If a write of
+    /// the step fails, the rest happens in memory (the rejections reported
+    /// to any live submitter, never persisted) and the journal halts; the
+    /// restart rejects the same requests (no clean close). Executing work
+    /// isn't cancelled.
+    fn revoke_control(&mut self, principal: &str) {
+        let st = self.principal(principal);
+        let raised = st.control_gen.saturating_add(1).min(MAX_SAFE_INTEGER);
+        let mut durable = self.append(Record::Control {
+            principal: principal.to_string(),
+            control: false,
+            control_gen: raised,
+        });
+        self.principals.insert(
+            principal.to_string(),
+            PrincipalState {
+                control: false,
+                control_gen: raised,
+                confirmed: false,
+            },
+        );
+        let fenced: Vec<String> = self
+            .attachments
+            .iter()
+            .filter(|(_, a)| a.principal == principal && a.can(Permission::Control))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in fenced {
+            self.drop_attachment(&id);
+            self.out.push(Effect::Close { attachment: id });
+        }
+        let held: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.lease.as_ref().is_some_and(|l| l.principal == principal))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for sid in held {
+            self.end_lease(&sid, LeaseChangeReason::Revoked, None);
+        }
+        let mut queued: Vec<(u64, String)> = self
+            .receipts
+            .values()
+            .filter(|e| e.stored.state == ReceiptState::Accepted && e.stored.principal == principal)
+            .map(|e| (e.stored.order, e.stored.request_id.clone()))
+            .collect();
+        queued.sort();
+        for (_, rid) in queued {
+            self.waiting.remove(&rid);
+            durable = durable
+                && self.transition(&rid, ReceiptState::Rejected, Some(DETAIL_CONTROL_REVOKED));
+            if !durable {
+                self.reject_in_memory(&rid, DETAIL_CONTROL_REVOKED);
+            }
+        }
+    }
+
+    /// A rejection the journal couldn't take (it halted): the request is
+    /// `rejected` in memory and its live submitter is told; the restart
+    /// rejects it durably (r8 §H, "A failed revocation write").
+    fn reject_in_memory(&mut self, rid: &str, detail: &str) {
+        let wall = self.wall();
+        let Some(e) = self.receipts.get_mut(rid) else {
+            return;
+        };
+        if e.stored.state != ReceiptState::Accepted {
+            return;
+        }
+        e.stored.state = ReceiptState::Rejected;
+        e.stored.detail = Some(detail.to_string());
+        e.stored.payload = None;
+        e.stored.updated_at = wall;
+        let reply = match e.chat.clone() {
+            Some(conversation_id) => Reply::Chat { conversation_id },
+            None => Reply::Session(None),
+        };
+        if let Some(att) = e.submitted_by.clone() {
+            self.report_state(&att, reply, rid);
+        }
     }
 
     /// The transport closed. A held lease is not released: it expires.
@@ -680,13 +1018,20 @@ impl<J: Journal> SessionHost<J> {
         for sid in expired {
             self.end_lease(&sid, LeaseChangeReason::Expired, None);
         }
-        for (rid, state, detail) in std::mem::take(&mut self.retry) {
-            self.persist_final(&rid, state, detail);
+        if !self.waiting.is_empty() && now >= self.started_at.saturating_add(CONFIRM_MS) {
+            // r8 §H: recovered work whose principal wasn't confirmed in time.
+            for rid in std::mem::take(&mut self.waiting) {
+                self.finish(
+                    &rid,
+                    ReceiptState::Rejected,
+                    Some(DETAIL_CONTROL_NOT_CONFIRMED),
+                );
+            }
         }
         let unobserved: Vec<(String, ReceiptKind)> = self
             .receipts
             .values()
-            .filter(|e| !e.finishing && e.stored.state == ReceiptState::Executing)
+            .filter(|e| e.stored.state == ReceiptState::Executing)
             .filter(|e| e.observe_deadline.is_some_and(|d| now >= d))
             .map(|e| (e.stored.request_id.clone(), e.stored.kind))
             .collect();
@@ -729,8 +1074,8 @@ impl<J: Journal> SessionHost<J> {
             let record = Record::Evicted {
                 request_id: rid.clone(),
             };
-            if self.journal.append(record).is_err() {
-                return; // retried on the next advance
+            if !self.append(record) {
+                return; // the journal halted
             }
             self.receipts.remove(&rid);
             self.unindex(sid, &rid);
@@ -791,10 +1136,12 @@ impl<J: Journal> SessionHost<J> {
     /// with the monotonic time of the write: the chunk's input epoch must
     /// still be current and its lease unexpired (`now >= deadline` is
     /// expired, whether or not `advance` ran).
+    /// Nothing passes after a journal halt (r8 §H).
     pub fn admit_write(&self, session_id: &str, input_epoch: u64, now: u64) -> bool {
-        self.sessions.get(session_id).is_some_and(|s| {
-            s.input_epoch == input_epoch && s.lease.as_ref().is_some_and(|l| now < l.deadline)
-        })
+        !self.journal_halted
+            && self.sessions.get(session_id).is_some_and(|s| {
+                s.input_epoch == input_epoch && s.lease.as_ref().is_some_and(|l| now < l.deadline)
+            })
     }
 
     /// The outcome of a `Dispatch` or `Reconcile`.
@@ -802,7 +1149,7 @@ impl<J: Journal> SessionHost<J> {
         let Some(e) = self.receipts.get(request_id) else {
             return Vec::new();
         };
-        if e.finishing || e.stored.state != ReceiptState::Executing {
+        if e.stored.state != ReceiptState::Executing {
             return Vec::new();
         }
         let kind = e.stored.kind;
@@ -1096,13 +1443,30 @@ impl<J: Journal> SessionHost<J> {
         }
     }
 
-    /// A broker restart (new `runtime_gen`, higher `runtime_epoch`): every
-    /// attachment and lease is gone, receipts are reloaded from the journal
-    /// and the §6 crash rules applied (`recover`). Sessions (workers) stay.
+    /// An orderly broker restart (new `runtime_gen`, higher `runtime_epoch`)
+    /// at the host's current time: as `restart_at` with `orderly`.
     pub fn restart(
         &mut self,
         runtime_gen: &str,
         runtime_epoch: u64,
+    ) -> Result<Vec<Effect>, String> {
+        let now = self.now;
+        self.restart_at(runtime_gen, runtime_epoch, now, true)
+    }
+
+    /// A broker restart at monotonic `now` (new `runtime_gen`, higher
+    /// `runtime_epoch`): an `orderly` one first writes the clean-close
+    /// record if the journal is healthy (r8 §H), a crash doesn't. Then the
+    /// journal is reopened, every attachment and lease is gone, receipts and
+    /// principals are reloaded, the 60 s confirmation window starts at
+    /// `now`, and the start's rules are applied (`recover`). Sessions
+    /// (workers) stay. Timers don't fire.
+    pub fn restart_at(
+        &mut self,
+        runtime_gen: &str,
+        runtime_epoch: u64,
+        now: u64,
+        orderly: bool,
     ) -> Result<Vec<Effect>, String> {
         if !wire::is_uuid_v4(runtime_gen) || runtime_gen == self.ctx.runtime_gen {
             return Err("runtime_gen must be a new UUID v4".into());
@@ -1110,17 +1474,29 @@ impl<J: Journal> SessionHost<J> {
         if runtime_epoch <= self.ctx.runtime_epoch || runtime_epoch > MAX_SAFE_INTEGER {
             return Err("runtime_epoch must increase".into());
         }
-        // Read the journal before changing anything: a failed restart leaves
-        // the host as it was.
+        let previous_epoch = self.ctx.runtime_epoch;
+        if orderly {
+            self.close_cleanly();
+        }
+        // Read the journal before changing anything else: a failed restart
+        // leaves the host as it was (its journal reopened).
+        self.journal.reopen().map_err(|e| e.0)?;
         let replayed = self
             .journal
             .load()
             .and_then(journal::replay)
             .map_err(|e| e.0)?;
+        let found = self.journal.take_clean_close();
+        self.previous_clean = found.is_some() && found == Some(previous_epoch);
+        self.now = self.now.max(now);
+        self.started_at = self.now;
+        self.journal_halted = false;
+        self.start_error = None;
+        self.resolved = false;
+        self.waiting.clear();
         self.ctx.runtime_gen = runtime_gen.to_string();
         self.ctx.runtime_epoch = runtime_epoch;
         self.attachments.clear();
-        self.retry.clear();
         self.out.clear();
         // Approvals live in memory only: the waiting prompts get "no
         // decision" (nobody is attached to answer them any more).
@@ -1196,12 +1572,32 @@ impl<J: Journal> SessionHost<J> {
                     stored,
                     submitted_by: None,
                     observe_deadline: None,
-                    finishing: false,
                     chat: None,
                     turn_id: None,
                 };
                 (rid, entry)
             })
+            .collect();
+        // Nobody is confirmed in a new run (r8 §H).
+        self.principals = replayed
+            .principals
+            .into_iter()
+            .map(
+                |(
+                    p,
+                    ControlState {
+                        control,
+                        control_gen,
+                    },
+                )| {
+                    let st = PrincipalState {
+                        control,
+                        control_gen,
+                        confirmed: false,
+                    };
+                    (p, st)
+                },
+            )
             .collect();
         self.by_session.clear();
         let ids: Vec<(String, String)> = self
@@ -1239,36 +1635,171 @@ impl<J: Journal> SessionHost<J> {
         rebuilt == self.by_session
     }
 
-    /// Final receipt writes waiting to be retried.
-    pub fn pending_retries(&self) -> usize {
-        self.retry.len()
-    }
-
-    /// §6 crash rules: `executing` work is never dispatched again, only
-    /// reconciled; `accepted` work is dispatched once under its original
-    /// target if the trust generation is unchanged, else rejected.
+    /// The start's rules (r8 §H Recovery, §I.3), once per start, before
+    /// anything is dispatched: requests on the refusal list are `rejected`
+    /// ("acceptance not confirmed"), then the list is cleared; after a run
+    /// without a clean close every other recovered `accepted` request is
+    /// `rejected` ("authorization history unknown"); after a clean close a
+    /// changed trust generation rejects it ("host trust changed"), a
+    /// `control_gen` below its principal's durable one too ("control
+    /// revoked"), and the rest waits for its principal to be welcomed with
+    /// `control` (`CONFIRM_MS`). `executing` work is never dispatched again,
+    /// only reconciled. If a resolution can't be persisted, remote sessions
+    /// stay disabled (`start_error`, the journal halted) and nothing is
+    /// dispatched or reconciled.
     pub fn recover(&mut self) -> Vec<Effect> {
-        let mut pending: Vec<&Entry> = self.receipts.values().collect();
-        pending.sort_by_key(|e| e.stored.order);
-        let pending: Vec<(String, ReceiptState, ReceiptKind, Target)> = pending
-            .into_iter()
-            .map(|e| {
-                let s = &e.stored;
-                (s.request_id.clone(), s.state, s.kind, s.target.clone())
-            })
-            .collect();
-        for (rid, state, kind, target) in pending {
-            match state {
-                ReceiptState::Executing => self.out.push(Effect::Reconcile {
-                    request_id: rid,
-                    target,
-                    kind,
-                }),
-                ReceiptState::Accepted => self.schedule(&rid),
-                _ => {}
+        if !self.resolved {
+            self.resolved = true;
+            if let Err(e) = self.resolve_start() {
+                self.halt_journal();
+                self.start_error = Some(e);
             }
         }
+        if self.start_error.is_some() {
+            return self.take();
+        }
+        let mut executing: Vec<&Entry> = self
+            .receipts
+            .values()
+            .filter(|e| e.stored.state == ReceiptState::Executing)
+            .collect();
+        executing.sort_by_key(|e| e.stored.order);
+        let reconcile: Vec<Effect> = executing
+            .into_iter()
+            .map(|e| Effect::Reconcile {
+                request_id: e.stored.request_id.clone(),
+                target: e.stored.target.clone(),
+                kind: e.stored.kind,
+            })
+            .collect();
+        self.out.extend(reconcile);
         self.take()
+    }
+
+    fn resolve_start(&mut self) -> Result<(), String> {
+        const UNPERSISTED: &str = "the recovered requests could not be resolved durably";
+        let refused = self.journal.refusals().map_err(|e| e.0)?;
+        let mut on_list = HashSet::new();
+        for r in refused {
+            on_list.insert(r.request_id.clone());
+            match self.receipts.get(&r.request_id).map(|e| e.stored.state) {
+                Some(ReceiptState::Accepted) => {
+                    let detail = Some(DETAIL_ACCEPTANCE_NOT_CONFIRMED);
+                    if !self.transition(&r.request_id, ReceiptState::Rejected, detail) {
+                        return Err(UNPERSISTED.into());
+                    }
+                }
+                // Already resolved (a restart after a crash mid-way): it
+                // keeps its state.
+                Some(_) => {}
+                None => self
+                    .record_refused(r)
+                    .map_err(|()| UNPERSISTED.to_string())?,
+            }
+        }
+        self.journal.clear_refusals().map_err(|e| e.0)?;
+        let mut queued: Vec<(u64, String)> = self
+            .receipts
+            .values()
+            .filter(|e| e.stored.state == ReceiptState::Accepted)
+            .map(|e| (e.stored.order, e.stored.request_id.clone()))
+            .collect();
+        queued.sort();
+        for (_, rid) in queued {
+            debug_assert!(!on_list.contains(&rid));
+            let (principal, control_gen, trust) = {
+                let s = &self.receipts[&rid].stored;
+                (s.principal.clone(), s.control_gen, s.target.host_trust_gen)
+            };
+            let detail = if !self.previous_clean {
+                Some(DETAIL_HISTORY_UNKNOWN)
+            } else if trust != self.ctx.host_trust_gen {
+                Some(DETAIL_TRUST_CHANGED)
+            } else if control_gen < self.principal(&principal).control_gen {
+                Some(DETAIL_CONTROL_REVOKED)
+            } else {
+                None
+            };
+            match detail {
+                Some(d) => {
+                    if !self.transition(&rid, ReceiptState::Rejected, Some(d)) {
+                        return Err(UNPERSISTED.into());
+                    }
+                }
+                None => {
+                    self.waiting.insert(rid);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A refused request whose `accepted` record never reached the disk:
+    /// recorded directly as `rejected` with its immutable values (§I.3).
+    fn record_refused(&mut self, r: Refusal) -> Result<(), ()> {
+        let updated_at = self.wall();
+        let record = Record::Rejected {
+            request_id: r.request_id.clone(),
+            target: r.target.clone(),
+            kind: r.kind,
+            payload_digest: r.payload_digest.clone(),
+            detail: DETAIL_ACCEPTANCE_NOT_CONFIRMED.into(),
+            updated_at,
+        };
+        if !self.append(record) {
+            return Err(());
+        }
+        let order = self.next_order;
+        self.next_order += 1;
+        let stored = Stored {
+            request_id: r.request_id.clone(),
+            target: r.target.clone(),
+            kind: r.kind,
+            payload_digest: r.payload_digest,
+            payload: None,
+            state: ReceiptState::Rejected,
+            detail: Some(DETAIL_ACCEPTANCE_NOT_CONFIRMED.into()),
+            updated_at,
+            order,
+            principal: String::new(),
+            control_gen: 0,
+        };
+        self.index(&r.target.session_id, &r.request_id);
+        self.receipts.insert(
+            r.request_id,
+            Entry {
+                stored,
+                submitted_by: None,
+                observe_deadline: None,
+                chat: None,
+                turn_id: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Recovered work waiting for its principal: in admission order, each
+    /// is dispatched if its `control_gen` is still current, else rejected.
+    fn confirm(&mut self, principal: &str) {
+        let Some(st) = self.principals.get_mut(principal) else {
+            return;
+        };
+        if !st.control {
+            return;
+        }
+        st.confirmed = true;
+        let mut mine: Vec<(u64, String)> = self
+            .waiting
+            .iter()
+            .filter_map(|rid| self.receipts.get(rid))
+            .filter(|e| e.stored.principal == principal)
+            .map(|e| (e.stored.order, e.stored.request_id.clone()))
+            .collect();
+        mine.sort();
+        for (_, rid) in mine {
+            self.waiting.remove(&rid);
+            self.schedule(&rid);
+        }
     }
 
     // ── Queries ──
@@ -1407,8 +1938,34 @@ impl<J: Journal> SessionHost<J> {
             code,
             detail,
             revision: None,
+            controller: None,
         };
         self.send(attachment, re, op);
+    }
+
+    /// Answers a refused request: its code, with what `self.refused` adds
+    /// (a detail, `lease_held`'s holder), or no reply and the link closed.
+    fn refuse(&mut self, att: &str, re: Option<String>, code: ErrorCode) {
+        let refused = std::mem::take(&mut self.refused);
+        if refused.close {
+            self.drop_attachment(att);
+            self.out.push(Effect::Close {
+                attachment: att.to_string(),
+            });
+            return;
+        }
+        let detail = refused.detail.or(match code {
+            ErrorCode::Busy if self.journal_halted => Some(DETAIL_JOURNAL_HALTED),
+            ErrorCode::Busy if self.halted => Some(DETAIL_REPAIR),
+            _ => None,
+        });
+        let op = Op::Error {
+            code,
+            detail: detail.map(str::to_string),
+            revision: None,
+            controller: refused.controller,
+        };
+        self.send(att, re, op);
     }
 
     /// r8 §A: a `hello` without `revision: 8` (absent, another number or not
@@ -1419,13 +1976,18 @@ impl<J: Journal> SessionHost<J> {
             code: ErrorCode::UnsupportedVersion,
             detail: Some(format!("atem-session revision {REVISION} required")),
             revision: Some(REVISION),
+            controller: None,
         };
         self.send(attachment, re, op);
     }
 
-    /// Checks shared by every request after `welcome`.
+    /// Checks shared by every request after `welcome`. After a journal halt
+    /// every request is `busy`, on a welcomed attachment or not (r8 §I).
     fn admit_request(&self, att: &str) -> Checked {
         let a = &self.attachments[att];
+        if self.journal_halted {
+            return Err(ErrorCode::Busy);
+        }
         if !a.welcomed() {
             // Any session op before welcome is a removed form (§0).
             return Err(ErrorCode::UnsupportedVersion);
@@ -1460,7 +2022,17 @@ impl<J: Journal> SessionHost<J> {
                     request_id,
                     kind,
                     payload,
-                } => self.submit_session(att, re.clone(), &binding, &request_id, kind, payload),
+                    acquire,
+                    takeover,
+                    expected_controller,
+                } => {
+                    let send = SendParams {
+                        acquire,
+                        takeover,
+                        expected_controller,
+                    };
+                    self.submit_session(att, re.clone(), &binding, &request_id, kind, payload, send)
+                }
                 Op::ReceiptQuery {
                     binding,
                     request_ids,
@@ -1470,9 +2042,9 @@ impl<J: Journal> SessionHost<J> {
             }),
         };
         if let Err(code) = result {
-            let detail = (code == ErrorCode::Busy && self.halted).then_some(DETAIL_REPAIR);
-            self.error(att, re, code, detail);
+            self.refuse(att, re, code);
         }
+        self.refused = Refused::default();
     }
 
     /// Compatibility mode (§3, r7.1): no resume; every `hello` gets a new
@@ -1482,6 +2054,11 @@ impl<J: Journal> SessionHost<J> {
     fn hello(&mut self, att: &str, re: Option<String>, resume: bool) -> Checked {
         if resume {
             return Err(ErrorCode::Unauthorized);
+        }
+        if self.journal_halted {
+            // r8 §I: not welcomed until the restart (every other request on
+            // the link is `busy`).
+            return Ok(());
         }
         if self.now >= self.attachments[att].authorization_deadline {
             return Err(ErrorCode::Paused);
@@ -1512,6 +2089,12 @@ impl<J: Journal> SessionHost<J> {
             features: Some(FEATURES.iter().map(|f| f.to_string()).collect()),
         };
         self.send(att, re, op);
+        // r8 §H: a principal welcomed with `control` is confirmed in this
+        // run; its recovered work may run.
+        if self.attachments[att].can(Permission::Control) {
+            let principal = self.attachments[att].principal.clone();
+            self.confirm(&principal);
+        }
         Ok(())
     }
 
@@ -1547,6 +2130,7 @@ impl<J: Journal> SessionHost<J> {
             new.clone(),
             Attachment {
                 client: a.client,
+                principal: a.principal,
                 controller_session: None,
                 permissions: a.permissions,
                 client_kind: a.client_kind,
@@ -1758,8 +2342,8 @@ impl<J: Journal> SessionHost<J> {
         s.lease_epoch += 1;
         self.lease_changed(sid, reason, except);
         self.registry_changed(sid);
-        // Pending approvals stay: any attachment with `control` may answer
-        // them with `acquire`.
+        // Pending approvals stay: an attachment with `control` may still
+        // answer them.
     }
 
     /// Makes sure epochs up to `need` are durably reserved.
@@ -1778,7 +2362,7 @@ impl<J: Journal> SessionHost<J> {
             session_id: sid.to_string(),
             reserved,
         };
-        if self.journal.append(record).is_err() {
+        if !self.append(record) {
             return false;
         }
         self.sessions.get_mut(sid).unwrap().epochs_reserved = reserved;
@@ -1808,7 +2392,14 @@ impl<J: Journal> SessionHost<J> {
                 return Ok(());
             }
             Some((_, c)) if c == controller => return Err(ErrorCode::StaleLease),
-            Some(_) if !takeover => return Err(ErrorCode::LeaseHeld),
+            Some((_, c)) if !takeover => {
+                // r8 §F: every `lease_held` names the holder.
+                self.refused.controller = Some(Controller {
+                    controller_session: c,
+                    lease_epoch: need - 2,
+                });
+                return Err(ErrorCode::LeaseHeld);
+            }
             Some((holder, _)) => Some(holder),
             None => None,
         };
@@ -1828,6 +2419,7 @@ impl<J: Journal> SessionHost<J> {
     /// new input epoch when it was taken from another holder.
     fn grant(&mut self, att: &str, sid: &str, takeover: bool) {
         let controller = self.attachments[att].controller_session.clone().unwrap();
+        let principal = self.attachments[att].principal.clone();
         let deadline = self
             .now
             .saturating_add(LEASE_MS)
@@ -1839,6 +2431,7 @@ impl<J: Journal> SessionHost<J> {
         s.lease_epoch += 1;
         s.lease = Some(Lease {
             attachment: att.to_string(),
+            principal,
             controller_session: controller,
             deadline,
         });
@@ -1888,6 +2481,7 @@ impl<J: Journal> SessionHost<J> {
 
     // ── Submissions and receipts (§6) ──
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_session(
         &mut self,
         att: &str,
@@ -1896,12 +2490,76 @@ impl<J: Journal> SessionHost<J> {
         request_id: &str,
         kind: ReceiptKind,
         payload: Value,
+        send: SendParams,
     ) -> Checked {
-        self.submit(att, Reply::Session(re), b, request_id, kind, payload)
+        self.submit(att, Reply::Session(re), b, request_id, kind, payload, send)
     }
 
-    /// §6 admission. `reply` is how the submitter hears about it: session
-    /// `receipt`s, or chat-v1 ops for a chat `submit`.
+    /// r8 §F field rules of the admission parameters: `None` for the r7 form
+    /// (none present), else whether a takeover was confirmed and of which
+    /// lease. Refused `invalid_request`, nothing recorded; `unsupported_version`
+    /// while the feature is off (§A).
+    fn send_rules(
+        &self,
+        kind: ReceiptKind,
+        b: &Binding,
+        send: &SendParams,
+    ) -> Checked<Option<Option<Controller>>> {
+        if !send.any() {
+            return Ok(None);
+        }
+        if !self.config.send_acquire {
+            return Err(ErrorCode::UnsupportedVersion);
+        }
+        let valid = send.acquire == Some(true)
+            && send.takeover.is_none_or(|t| t)
+            && send.takeover.is_some() == send.expected_controller.is_some()
+            && b.lease_epoch.is_none()
+            && kind == ReceiptKind::Prompt;
+        if !valid {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        Ok(Some(send.expected_controller.clone()))
+    }
+
+    /// r8 §F ownership at this instant (expiry already applied by the tick
+    /// that came with the message), never as a client last displayed it.
+    /// `expected` is `Some` for a confirmed takeover.
+    fn lease_plan(
+        &mut self,
+        att: &str,
+        sid: &str,
+        expected: Option<&Controller>,
+    ) -> Checked<LeasePlan> {
+        let controller = self.attachments[att].controller_session.clone();
+        let s = &self.sessions[sid];
+        let Some(l) = &s.lease else {
+            // Nobody's control is taken: a grant, with or without takeover.
+            return Ok(LeasePlan::Grant);
+        };
+        if l.attachment == att {
+            return Ok(LeasePlan::Own);
+        }
+        if Some(&l.controller_session) == controller.as_ref() {
+            return Err(ErrorCode::StaleLease);
+        }
+        let current = Controller {
+            controller_session: l.controller_session.clone(),
+            lease_epoch: s.lease_epoch,
+        };
+        if expected == Some(&current) {
+            return Ok(LeasePlan::Takeover);
+        }
+        // Held by another; no takeover, or one confirmed against a lease
+        // that is no longer the holder's.
+        self.refused.controller = Some(current);
+        Err(ErrorCode::LeaseHeld)
+    }
+
+    /// §6 admission, with r8's §F acquire (`send`) and §I persistence.
+    /// `reply` is how the submitter hears about it: session `receipt`s, or
+    /// chat-v1 ops for a chat `submit`.
+    #[allow(clippy::too_many_arguments)]
     fn submit(
         &mut self,
         att: &str,
@@ -1910,8 +2568,10 @@ impl<J: Journal> SessionHost<J> {
         request_id: &str,
         kind: ReceiptKind,
         payload: Value,
+        send: SendParams,
     ) -> Checked {
         self.check_binding(att, b)?;
+        let acquire = self.send_rules(kind, b, &send)?;
         let digest =
             canonical::payload_digest(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?;
         if let Some(e) = self.receipts.get(request_id) {
@@ -1919,29 +2579,50 @@ impl<J: Journal> SessionHost<J> {
             if st.target != b.target || st.kind != kind || st.payload_digest != digest {
                 return Err(ErrorCode::RequestIdReused);
             }
-            // Same request: the recorded state, no lease, no re-execution.
+            // Same request, whatever flags it carries: the recorded state,
+            // no lease, no re-execution.
             self.report_state(att, reply, request_id);
             return Ok(());
         }
-        let sid = &b.target.session_id;
+        let sid = b.target.session_id.clone();
         let answer = match kind {
             ReceiptKind::Approval => {
                 Some(ApprovalAnswer::parse(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?)
             }
             _ => None,
         };
-        if kind == ReceiptKind::ApprovalRuleRevoke {
+        let mut plan = None;
+        if let Some(expected) = &acquire {
+            // §F: `control`, a session that accepts work and runs chat, then
+            // ownership, then the prompt's static checks.
+            if !self.attachments[att].can(Permission::Control) {
+                return Err(ErrorCode::Forbidden);
+            }
+            let s = &self.sessions[&sid];
+            if s.state != SessionState::Running {
+                return Err(ErrorCode::SessionClosed);
+            }
+            if !s.spec.chat {
+                self.refused.detail = Some(DETAIL_NO_CHAT);
+                return Err(ErrorCode::Busy);
+            }
+            plan = Some(self.lease_plan(att, &sid, expected.as_ref())?);
+            let text = payload["text"].as_str().unwrap_or_default();
+            if crate::chat::session::clean_prompt(text).is_err() {
+                return Err(ErrorCode::InvalidRequest);
+            }
+        } else if kind == ReceiptKind::ApprovalRuleRevoke {
             // r7.3: `control` and a running session; the lease is neither
             // needed nor checked (a stale `lease_epoch` is ignored), and a
             // revoke never takes, renews or moves it.
             if !self.attachments[att].can(Permission::Control) {
                 return Err(ErrorCode::Forbidden);
             }
-            if self.sessions[sid].state != SessionState::Running {
+            if self.sessions[&sid].state != SessionState::Running {
                 return Err(ErrorCode::SessionClosed);
             }
         } else {
-            self.check_mutation(att, &self.sessions[sid], b.lease_epoch)?;
+            self.check_mutation(att, &self.sessions[&sid], b.lease_epoch)?;
         }
         if let Some(answer) = &answer
             && !self.answerable(&b.target, answer)
@@ -1954,7 +2635,7 @@ impl<J: Journal> SessionHost<J> {
                 return Err(ErrorCode::StaleTarget);
             }
         }
-        let held = self.by_session.get(sid).map_or(0, BTreeSet::len);
+        let held = self.by_session.get(&sid).map_or(0, BTreeSet::len);
         if held >= self.config.max_receipts_per_session {
             return Err(ErrorCode::ReceiptLimit);
         }
@@ -1968,6 +2649,19 @@ impl<J: Journal> SessionHost<J> {
             return Err(ErrorCode::Busy);
         }
         let updated_at = self.wall();
+        let moves = matches!(plan, Some(LeasePlan::Grant | LeasePlan::Takeover));
+        // §F step 9: a grant or takeover reserves its epochs durably first.
+        if moves {
+            let need = self.sessions[&sid].lease_epoch + 2;
+            if !self.reserve_epochs(&sid, need) {
+                if !self.journal_halted {
+                    return Err(ErrorCode::Busy); // counters exhausted
+                }
+                return self.admission_failed(request_id, &b.target, kind, &digest, updated_at);
+            }
+        }
+        let principal = self.attachments[att].principal.clone();
+        let control_gen = self.principal(&principal).control_gen;
         let record = Record::Accepted {
             request_id: request_id.to_string(),
             target: b.target.clone(),
@@ -1975,10 +2669,13 @@ impl<J: Journal> SessionHost<J> {
             payload_digest: digest.clone(),
             payload: payload.clone(),
             updated_at,
+            principal: principal.clone(),
+            control_gen,
         };
-        // `accepted` is durable before the reply; if it can't be, nothing
-        // was recorded and the client may retry the same request.
-        self.journal.append(record).map_err(|_| ErrorCode::Busy)?;
+        // §I.1: accepted only once durable; only then does anything act.
+        if !self.append(record) {
+            return self.admission_failed(request_id, &b.target, kind, &digest, updated_at);
+        }
         let order = self.next_order;
         self.next_order += 1;
         let stored = Stored {
@@ -1991,6 +2688,8 @@ impl<J: Journal> SessionHost<J> {
             detail: None,
             updated_at,
             order,
+            principal,
+            control_gen,
         };
         let chat = match &reply {
             Reply::Chat { conversation_id } => Some(conversation_id.clone()),
@@ -2003,14 +2702,57 @@ impl<J: Journal> SessionHost<J> {
                 stored,
                 submitted_by: Some(att.to_string()),
                 observe_deadline: None,
-                finishing: false,
                 chat,
                 turn_id: None,
             },
         );
-        self.report_state(att, reply, request_id);
+        // §F step 11: only now the lease moves, then the reply carries it.
+        if moves {
+            let takeover = plan == Some(LeasePlan::Takeover);
+            self.grant(att, &sid, takeover);
+            self.lease_announced(&sid, takeover, Some(att));
+        }
+        match (plan, reply) {
+            (Some(_), Reply::Session(re)) => {
+                let s = &self.sessions[&sid];
+                let l = s.lease.as_ref().expect("an admitted Send holds the lease");
+                let mut receipt = to_receipt(&self.receipts[request_id].stored);
+                receipt.lease = Some(ReceiptLease {
+                    lease_epoch: s.lease_epoch,
+                    ms_left: l.deadline.saturating_sub(self.now),
+                });
+                self.send(att, re, Op::Receipt(receipt));
+            }
+            (_, reply) => self.report_state(att, reply, request_id),
+        }
         self.schedule(request_id);
         Ok(())
+    }
+
+    /// §I.2: an admission write failed (the journal halted). Nothing moved,
+    /// nothing was recorded or scheduled. The refusal goes on the refusal
+    /// list before the reply (`busy`, "acceptance not recorded"); if even
+    /// that can't be written, the link is closed without a reply (§I.4).
+    fn admission_failed(
+        &mut self,
+        request_id: &str,
+        target: &Target,
+        kind: ReceiptKind,
+        digest: &str,
+        updated_at: u64,
+    ) -> Checked {
+        let refusal = Refusal {
+            request_id: request_id.to_string(),
+            target: target.clone(),
+            kind,
+            payload_digest: digest.to_string(),
+            updated_at,
+        };
+        match self.journal.record_refusal(refusal) {
+            Ok(()) => self.refused.detail = Some(DETAIL_ACCEPTANCE_NOT_RECORDED),
+            Err(_) => self.refused.close = true,
+        }
+        Err(ErrorCode::Busy)
     }
 
     /// Tells `att` the request's current state on its channel.
@@ -2058,7 +2800,8 @@ impl<J: Journal> SessionHost<J> {
     }
 
     fn pump_queue(&mut self, sid: &str) {
-        while !self.prompt_executing(sid) {
+        // r8 §H: nothing queued is dispatched after a journal halt.
+        while !self.journal_halted && !self.prompt_executing(sid) {
             let Some(rid) = self
                 .sessions
                 .get_mut(sid)
@@ -2087,12 +2830,41 @@ impl<J: Journal> SessionHost<J> {
         (!running).then_some(DETAIL_SESSION_CLOSED)
     }
 
+    /// r8 §H dispatch check: the submitter principal must hold `control`
+    /// now, confirmed in this run, at the recorded `control_gen`.
+    fn control_gate(&self, rid: &str) -> Gate {
+        let s = &self.receipts[rid].stored;
+        let p = self.principal(&s.principal);
+        if p.control_gen != s.control_gen || (p.confirmed && !p.control) {
+            Gate::Revoked
+        } else if p.confirmed {
+            Gate::Go
+        } else {
+            Gate::Wait
+        }
+    }
+
     /// accepted → executing (durable before the first side effect) → Dispatch.
     fn start(&mut self, rid: &str) {
+        if self.journal_halted {
+            // r8 §H: it stays accepted; the restart resolves it.
+            return;
+        }
         let target = self.receipts[rid].stored.target.clone();
         if let Some(detail) = self.dispatch_blocker(&target) {
             self.finish(rid, ReceiptState::Rejected, Some(detail));
             return;
+        }
+        match self.control_gate(rid) {
+            Gate::Go => {}
+            Gate::Wait => {
+                self.waiting.insert(rid.to_string());
+                return;
+            }
+            Gate::Revoked => {
+                self.finish(rid, ReceiptState::Rejected, Some(DETAIL_CONTROL_REVOKED));
+                return;
+            }
         }
         // The payload is dropped once the request leaves `accepted`.
         let payload = self.receipts[rid]
@@ -2115,7 +2887,8 @@ impl<J: Journal> SessionHost<J> {
             None
         };
         if !self.transition(rid, ReceiptState::Executing, None) {
-            self.finish(rid, ReceiptState::Rejected, Some(DETAIL_NOT_RECORDED));
+            // §I.6: no effect; the journal halted, so the rejection can't be
+            // recorded either: the restart resolves it (it stays accepted).
             return;
         }
         let now = self.now;
@@ -2166,7 +2939,8 @@ impl<J: Journal> SessionHost<J> {
         info: ApprovalInfo,
     ) -> Result<String, String> {
         wire::validate_approval_info(&info.tool, &info.summary, &info.always_rules)?;
-        if self.halted {
+        if self.halted || self.journal_halted {
+            // Nobody could answer it: the agent's own prompt asks.
             return Err("host halted".into());
         }
         self.sessions
@@ -2459,14 +3233,13 @@ impl<J: Journal> SessionHost<J> {
             detail: detail.clone(),
             updated_at,
         };
-        if self.journal.append(record).is_err() {
+        if !self.append(record) {
             return false;
         }
         let e = self.receipts.get_mut(rid).unwrap();
         e.stored.state = to;
         e.stored.detail = detail;
         e.stored.updated_at = updated_at;
-        e.finishing = false;
         e.stored.payload = None;
         let kind = e.stored.kind;
         let sid = e.stored.target.session_id.clone();
@@ -2485,28 +3258,11 @@ impl<J: Journal> SessionHost<J> {
         true
     }
 
-    /// A transition to a final state: reported once durable; if the write
-    /// fails the receipt stays where it was and the write is retried.
+    /// A transition to a final state, reported once durable. If the write
+    /// fails the journal halts (r8 §I.6) and the receipt stays where it was
+    /// until the restart resolves it.
     fn finish(&mut self, rid: &str, to: ReceiptState, detail: Option<&str>) {
-        self.persist_final(rid, to, detail.map(str::to_string));
-    }
-
-    fn persist_final(&mut self, rid: &str, to: ReceiptState, detail: Option<String>) {
-        let valid = self
-            .receipts
-            .get(rid)
-            .is_some_and(|e| journal::valid_transition(e.stored.state, to));
-        if !valid {
-            return;
-        }
-        if !self.transition(rid, to, detail.as_deref()) {
-            if let Some(e) = self.receipts.get_mut(rid) {
-                e.finishing = true;
-            }
-            // One pending final write per request: the latest wins.
-            self.retry.retain(|(r, _, _)| r != rid);
-            self.retry.push((rid.to_string(), to, detail));
-        }
+        self.transition(rid, to, detail);
     }
 
     /// Only receipts bound to exactly the binding's target; ids of other
@@ -2558,14 +3314,30 @@ impl<J: Journal> SessionHost<J> {
             _ => Ok(()),
         };
         if let Err(code) = result {
-            self.family_error(att, &f, code);
+            let refused = std::mem::take(&mut self.refused);
+            if refused.close {
+                // r8 §I.4: no durable refusal, no reply.
+                self.drop_attachment(att);
+                self.out.push(Effect::Close {
+                    attachment: att.to_string(),
+                });
+            } else {
+                self.family_error(att, &f, code, refused.detail);
+            }
         }
+        self.refused = Refused::default();
     }
 
     /// A refused terminal-v1 or chat-v1 request is answered in its own family
     /// (removed forms never get here: they fail decoding and get a session
     /// `error`). Nothing about other targets is disclosed.
-    fn family_error(&mut self, att: &str, f: &FamilyMessage, code: ErrorCode) {
+    fn family_error(
+        &mut self,
+        att: &str,
+        f: &FamilyMessage,
+        code: ErrorCode,
+        detail: Option<&'static str>,
+    ) {
         let field = |name: &str| {
             f.data
                 .as_ref()
@@ -2604,7 +3376,7 @@ impl<J: Journal> SessionHost<J> {
                     reply: ChatReply::Error {
                         request_id: field("requestId").filter(|_| submit),
                         code: code_name(code),
-                        text: code_text(code).to_string(),
+                        text: detail.unwrap_or(code_text(code)).to_string(),
                         sequenced: !f.data.as_ref().is_some_and(refused_chat_form),
                     },
                 });
@@ -2783,6 +3555,7 @@ impl<J: Journal> SessionHost<J> {
                     &request_id,
                     ReceiptKind::ApprovalRuleRevoke,
                     payload,
+                    SendParams::default(),
                 )
             }
             Some("submit") if data.get("approval").is_some() => {
@@ -2797,7 +3570,16 @@ impl<J: Journal> SessionHost<J> {
                         .unwrap_or_default()
                         .to_string(),
                 };
-                self.submit(att, reply, b, &request_id, ReceiptKind::Approval, payload)
+                let send = SendParams::default();
+                self.submit(
+                    att,
+                    reply,
+                    b,
+                    &request_id,
+                    ReceiptKind::Approval,
+                    payload,
+                    send,
+                )
             }
             Some("submit") => {
                 let text = data["text"].as_str().ok_or(ErrorCode::UnsupportedVersion)?;
@@ -2815,7 +3597,16 @@ impl<J: Journal> SessionHost<J> {
                         .unwrap_or_default()
                         .to_string(),
                 };
-                self.submit(att, reply, b, &request_id, ReceiptKind::Prompt, payload)
+                let send = SendParams::default();
+                self.submit(
+                    att,
+                    reply,
+                    b,
+                    &request_id,
+                    ReceiptKind::Prompt,
+                    payload,
+                    send,
+                )
             }
             Some("open" | "close") => {
                 self.out.push(Effect::Forward {
@@ -2911,6 +3702,7 @@ fn to_receipt(s: &Stored) -> Receipt {
         state: s.state,
         detail: s.detail.clone(),
         updated_at: s.updated_at,
+        lease: None,
     }
 }
 

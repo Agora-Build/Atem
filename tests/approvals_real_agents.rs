@@ -143,6 +143,8 @@ struct Rig {
     /// Everything the current link carried (session, terminal frames left
     /// out, agentChat, relay).
     seen: Vec<Value>,
+    /// The lease epoch the last `answer` took.
+    last_lease: u64,
 }
 
 impl Rig {
@@ -177,6 +179,7 @@ impl Rig {
             link: 0,
             attachment_gen: String::new(),
             seen: Vec::new(),
+            last_lease: 0,
         };
         rig.attach();
         rig
@@ -392,15 +395,21 @@ impl Rig {
             .clone()
     }
 
-    /// Answers `approval_id` with `acquire: true`; returns the request id.
+    /// Takes control (an explicit `acquire`: answers need the lease until
+    /// r8's lease-free answers ship; r7's `acquire` on the answer is gone),
+    /// then answers `approval_id` under that lease; returns the submit's id
+    /// and the request id. `last_lease` keeps the epoch.
+    // TODO(r8 task 3): answer without the lease (`approval.lease_free`).
     fn answer(&mut self, sid: &str, generation: &str, payload: Value) -> (String, String) {
+        let lease = self.acquire(sid, generation);
+        self.last_lease = lease;
         let id = uuid();
         let request_id = uuid();
-        let mut payload = payload;
-        payload["acquire"] = json!(true);
+        let mut binding = self.binding(sid, generation);
+        binding["lease_epoch"] = lease.into();
         self.send(
             json!({"type": "session", "data": {"v": 1, "op": "submit", "id": id,
-            "binding": self.binding(sid, generation), "request_id": request_id,
+            "binding": binding, "request_id": request_id,
             "kind": "approval", "payload": payload}}),
         );
         (id, request_id)
@@ -643,9 +652,7 @@ fn claude_approvals_end_to_end() {
     let (receipt, states) = rig.receipt_final(&rid, Duration::from_secs(30));
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
     assert_eq!(rig.closed(&aid, Duration::from_secs(10)), "answered_remote");
-    let lease = rig.wait(Duration::from_secs(5), "lease_changed", |m| {
-        m["data"]["op"] == "lease_changed"
-    });
+    let lease = rig.last_lease;
     let resolved = rig.push("push_resolved", &aid, Duration::from_secs(10));
     assert_eq!(resolved["reason"], "answered_remote");
     let card_id = format!("approval-{aid}");
@@ -665,8 +672,8 @@ fn claude_approvals_end_to_end() {
         "allow-once.txt was not created"
     );
     report.push(format!(
-        "1 allow_once: receipt {states:?}; closed answered_remote; lease {}; card pending→allowed; file created; push expires_at={}, resolved={}",
-        lease["data"]["reason"], push["expires_at"], resolved["reason"]
+        "1 allow_once: receipt {states:?}; closed answered_remote; answered under lease epoch {lease} (acquired first); card pending→allowed; file created; push expires_at={}, resolved={}",
+        push["expires_at"], resolved["reason"]
     ));
 
     // 2. deny with a message: not run, the model sees the message.

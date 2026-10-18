@@ -285,6 +285,10 @@ pub async fn serve(
     }
     acceptor.abort();
     adopting.abort();
+    // Admission has stopped: an orderly stop records it (r8 §H).
+    if let Some(bridge) = server.bridge.as_mut() {
+        bridge.close_cleanly();
+    }
     // Let writers send what's queued (a restart's error) before the
     // connections close. Workers outlive this broker: the next one adopts them.
     for client in server.clients.values_mut() {
@@ -747,6 +751,10 @@ impl Server {
         if !greeted {
             match message {
                 ClientMsg::Hello { passive, .. } => {
+                    let host_error = self
+                        .host_error
+                        .clone()
+                        .or_else(|| self.bridge.as_ref().and_then(HostBridge::host_error));
                     if let Some(client) = self.clients.get_mut(&id) {
                         client.greeted = true;
                         client.passive = passive;
@@ -755,7 +763,7 @@ impl Server {
                             build: crate::memory::key_agent::build_id().to_string(),
                             pid: std::process::id(),
                             astation: self.astation,
-                            host_error: self.host_error.clone(),
+                            host_error,
                         });
                     }
                 }

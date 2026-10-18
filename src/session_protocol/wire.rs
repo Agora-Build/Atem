@@ -301,6 +301,22 @@ pub struct Receipt {
     )]
     pub detail: Option<String>,
     pub updated_at: u64,
+    /// r8 §F: only on the reply that admits an acquiring Send, the sender's
+    /// lease (never on `executing`/final receipts, duplicates or `receipts`).
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lease: Option<ReceiptLease>,
+}
+
+/// The lease an admitting Send's reply carries (r8 §F).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptLease {
+    pub lease_epoch: u64,
+    pub ms_left: u64,
 }
 
 /// One "always allow" rule the agent itself suggested, shown before the tap.
@@ -532,6 +548,28 @@ pub enum Op {
         request_id: String,
         kind: ReceiptKind,
         payload: Value,
+        /// r8 §F admission parameters (not request identity): a `prompt`
+        /// may acquire the lease with the submission, and with `takeover`
+        /// take over exactly `expected_controller`'s lease. Their rules are
+        /// the host's (`invalid_request`), after the binding check.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        acquire: Option<bool>,
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        takeover: Option<bool>,
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        expected_controller: Option<Controller>,
     },
     Receipt(Receipt),
     ReceiptQuery {
@@ -569,6 +607,13 @@ pub enum Op {
             skip_serializing_if = "Option::is_none"
         )]
         revision: Option<u64>,
+        /// r8 §F: every `lease_held` names the current holder.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        controller: Option<Controller>,
     },
 }
 
@@ -788,6 +833,10 @@ impl Receipt {
         uuid(&self.request_id, "request_id")?;
         self.target.validate()?;
         detail(&self.detail)?;
+        if let Some(l) = &self.lease {
+            safe(l.lease_epoch, "lease.lease_epoch")?;
+            safe(l.ms_left, "lease.ms_left")?;
+        }
         safe(self.updated_at, "updated_at")
     }
 }
@@ -808,11 +857,13 @@ pub const REMOVED_IN_R8: &str = "removed in r8";
 /// was refused (§A).
 pub const FEATURE_NOT_ADVERTISED: &str = "feature not advertised";
 
-/// Submission fields §F adds for `chat.send_acquire` (task 3). Until that
-/// feature is advertised a submit carrying one is refused: beside an
-/// approval answer it is r7's removed `acquire` (§G), on any other kind an
-/// op of an unadvertised feature.
-// TODO(r8 task 3): parse these for `prompt`/chat `text` submits when
+/// Submission fields §F adds (`chat.send_acquire`). Beside an approval
+/// answer they are r7's removed `acquire` (§G), refused at decoding. On a
+/// session-v1 submit of any other kind they decode, and the host applies
+/// §F's rules (or refuses them as an op of an unadvertised feature while
+/// `HostConfig::send_acquire` is off). On a chat-v1 submit they are refused
+/// until `chat.send_acquire` ships.
+// TODO(r8 task 3): parse these for chat `text` submits when
 // `chat.send_acquire` ships; approval answers keep refusing them.
 pub const SEND_ACQUIRE_FIELDS: &[&str] = &["acquire", "takeover", "expected_controller"];
 
@@ -937,9 +988,23 @@ impl Op {
                 request_id,
                 kind,
                 payload,
+                acquire,
+                takeover,
+                expected_controller,
             } => {
-                binding.validate(submit_binding_use(*kind))?;
+                // With §F's admission parameters the binding's `lease_epoch`
+                // is the host's to judge (`acquire` excludes it).
+                let use_ =
+                    if acquire.is_some() || takeover.is_some() || expected_controller.is_some() {
+                        BindingUse::LeaseIgnored
+                    } else {
+                        submit_binding_use(*kind)
+                    };
+                binding.validate(use_)?;
                 uuid(request_id, "request_id")?;
+                expected_controller
+                    .as_ref()
+                    .map_or(Ok(()), Controller::validate)?;
                 validate_payload(*kind, payload)
             }
             Op::Receipt(r) => r.validate(),
@@ -966,9 +1031,11 @@ impl Op {
             Op::Error {
                 detail: d,
                 revision,
+                controller,
                 ..
             } => {
                 revision.map_or(Ok(()), |r| safe(r, "revision"))?;
+                controller.as_ref().map_or(Ok(()), Controller::validate)?;
                 detail(d)
             }
         }
@@ -1063,10 +1130,10 @@ fn decode_session(data: Map<String, Value>) -> Result<SessionMessage, DecodeErro
         Some(_) => return Err(with_op(fail(Some(id), "invalid re"))),
     };
     if op_name.as_deref() == Some("submit")
+        && data.get("kind").and_then(Value::as_str) == Some("approval")
         && SEND_ACQUIRE_FIELDS.iter().any(|f| data.contains_key(*f))
     {
-        let approval = data.get("kind").and_then(Value::as_str) == Some("approval");
-        return Err(with_op(fail(Some(id), send_acquire_refusal(approval))));
+        return Err(with_op(fail(Some(id), send_acquire_refusal(true))));
     }
     let op: Op = serde_json::from_value(Value::Object(data))
         .map_err(|e| with_op(fail(Some(id.clone()), e.to_string())))?;

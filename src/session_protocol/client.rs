@@ -621,7 +621,7 @@ impl AdmissionClient {
     }
 
     /// The client sends a new `hello`: a new handshake (`Err` once refused,
-    /// it sends nothing further).
+    /// it sends nothing further). `check_send` calls it for a `hello`.
     pub fn hello_sent(&mut self) -> Result<(), &'static str> {
         if self.state == Admission::Refused {
             return Err(HOST_TOO_OLD);
@@ -677,16 +677,16 @@ impl AdmissionClient {
     }
 
     /// Whether the client may send `env` now; `Err` is the reason it
-    /// refuses locally (nothing is sent).
-    pub fn check_send(&self, env: &Envelope) -> Result<(), String> {
+    /// refuses locally (nothing is sent). Every outgoing message goes
+    /// through here, a `hello` too: an allowed `hello` starts a new
+    /// handshake (`hello_sent`), so callers never call that themselves.
+    pub fn check_send(&mut self, env: &Envelope) -> Result<(), String> {
+        if matches!(env, Envelope::Session(m) if matches!(m.op, Op::Hello { .. })) {
+            return self.hello_sent().map_err(str::to_string);
+        }
         match &self.state {
             Admission::Refused => return Err(HOST_TOO_OLD.into()),
-            Admission::Awaiting => {
-                let hello = matches!(env, Envelope::Session(m) if matches!(m.op, Op::Hello { .. }));
-                if !hello {
-                    return Err(NOT_WELCOMED.into());
-                }
-            }
+            Admission::Awaiting => return Err(NOT_WELCOMED.into()),
             Admission::Admitted { .. } => {}
         }
         match required_feature(env) {
@@ -960,6 +960,7 @@ mod tests {
             code: ErrorCode::StaleLease,
             detail: None,
             revision: None,
+            controller: None,
         };
         assert_eq!(
             c.on_reply(&reply(&id(2), err), 5_100),
@@ -1338,5 +1339,32 @@ mod tests {
             r.on_message(&Op::List {}),
             RegistryOutcome::NotARegistryMessage
         );
+    }
+
+    /// Every send goes through `check_send`, a `hello` too: it starts a new
+    /// handshake, and once the attachment was refused nothing is sent.
+    #[test]
+    fn a_hello_through_check_send_starts_a_new_handshake() {
+        let hello = Envelope::Session(SessionMessage {
+            id: "11111111-1111-4111-8111-000000000001".into(),
+            re: None,
+            op: Op::Hello {
+                revision: Some(REVISION),
+                resume: None,
+            },
+        });
+        let list = Envelope::Session(SessionMessage {
+            id: "11111111-1111-4111-8111-000000000002".into(),
+            re: None,
+            op: Op::List {},
+        });
+        let mut c = AdmissionClient::admitted(&[]);
+        assert!(c.check_send(&list).is_ok());
+        assert!(c.check_send(&hello).is_ok());
+        assert_eq!(c.state(), &Admission::Awaiting);
+        assert_eq!(c.check_send(&list), Err(NOT_WELCOMED.into()));
+        assert!(!c.on_welcome(Some(7), None));
+        assert_eq!(c.check_send(&hello), Err(HOST_TOO_OLD.into()));
+        assert_eq!(c.check_send(&list), Err(HOST_TOO_OLD.into()));
     }
 }

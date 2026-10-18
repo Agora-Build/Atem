@@ -20,8 +20,9 @@
 //!   message.
 //! - `local_input`: a local frontend attached to the session sends `input`.
 //! - `crash_worker`: SIGKILL to the session's worker process.
-//! - `restart_runtime`: SIGKILL to the runtime; the next one (with the
-//!   fixture's runtime epoch) adopts the surviving workers.
+//! - `restart_runtime`: SIGTERM to the runtime (an orderly stop, r8: it
+//!   writes its journal's clean close), `crash_runtime`: SIGKILL; the next
+//!   one (with the fixture's runtime epoch) adopts the surviving workers.
 //! - `reconnect`: the fake Astation closes the link; the runtime reconnects
 //!   and authenticates again (a new attachment).
 //! - `hold_pty_writes`/`flush_pty_writes`, `fail_next_pty_enqueue`,
@@ -42,7 +43,10 @@
 //! more than one client (the runtime holds one Astation link, so one
 //! attachment at a time), `close_session` (the runtime never closes a
 //! running session), `disconnect`/`resume` (no resume in compatibility
-//! mode), `fail_next_fsync`, `change_trust_gen`, `approval_rules` (session
+//! mode), `fail_next_fsync`/`fail_fsync_of`/`crash_after_accepted` (no
+//! journal faults in the real runtime), `set_permissions` (the link's one
+//! principal always has `control`), `drop`, `replace_process`,
+//! `change_trust_gen`, `approval_rules` (session
 //! rules come only from a Codex session), and approval closes other
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
 //! false`. An `r8-*` scenario runs once the host work it needs is
@@ -303,6 +307,23 @@ impl Sandbox {
         self.runtime = Some(child);
     }
 
+    /// An orderly stop (SIGTERM): the runtime writes its journal's clean
+    /// close when the journal is healthy, then exits; its workers stay.
+    fn stop_runtime(&mut self) {
+        if let Some(mut child) = self.runtime.take() {
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = Instant::now() + WAIT;
+            while child.try_wait().ok().flatten().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the runtime didn't stop on SIGTERM");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
     fn kill_runtime(&mut self) {
         if let Some(mut child) = self.runtime.take() {
             let _ = child.kill();
@@ -504,6 +525,20 @@ fn unsupported(scenario: &Value) -> Option<String> {
             ("disconnect", "no resume in compatibility mode"),
             ("resume", "no resume in compatibility mode"),
             ("fail_next_fsync", "no fsync fault on the real journal"),
+            ("fail_fsync_of", "no fsync fault on the real journal"),
+            (
+                "crash_after_accepted",
+                "no crash hook between the runtime's journal writes",
+            ),
+            (
+                "set_permissions",
+                "the runtime's one principal (the paired Astation) always has control",
+            ),
+            ("drop", "the fake Astation link loses no message"),
+            (
+                "replace_process",
+                "the runtime replaces a process only when its agent restarts",
+            ),
             (
                 "change_trust_gen",
                 "trust generations change only by pairing",
@@ -946,8 +981,20 @@ impl Host {
                     .ok_or("no worker pid")?;
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             }
-            "restart_runtime" => {
-                self.sandbox.kill_runtime();
+            "restart_runtime" | "crash_runtime" => {
+                if action == "restart_runtime" {
+                    self.sandbox.stop_runtime();
+                    // The orderly stop recorded it in the journal (r8 §H).
+                    if !self
+                        .sandbox
+                        .logs()
+                        .contains("session journal closed cleanly")
+                    {
+                        return Err("the orderly stop didn't close the journal cleanly".into());
+                    }
+                } else {
+                    self.sandbox.kill_runtime();
+                }
                 self.sandbox
                     .next_epoch(arg["runtime_epoch"].as_u64().ok_or("runtime_epoch")?);
                 self.next_runtime_gen = arg["runtime_gen"].as_str().ok_or("runtime_gen")?.into();
