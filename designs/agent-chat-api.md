@@ -426,7 +426,9 @@ approvals pending across a broker restart are released without
 - Active rules: `opened.approvalRules`, chat `rules` on change, session-v1
   `approval_rules{session_id, process_gen, rules}` (after each `sessions`
   snapshot and on change; `[]` when the process ends). All only with `control`.
-- Revoke (lease required, no `acquire` form): chat `submit` with
+- Revoke (r7.3: needs only `control`, not the lease; `lease_epoch` optional
+  and ignored, `acquire` refused, the lease never taken or moved; view-only
+  is `forbidden`): chat `submit` with
   `"approval_rule_revoke":{"rule_id":"s-…"}` in place of `text`, or session-v1
   `submit` with `kind:"approval_rule_revoke"`, `payload:{"rule_id":"s-…"}`.
   It completes once the worker dropped the rule (chat `complete`); a rule not

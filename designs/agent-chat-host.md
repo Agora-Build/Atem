@@ -67,8 +67,12 @@ no `chat-v1` capability.
   pushed and no lease is taken. A nested `codex`, another cwd or any other
   command still asks. The active rules are listed in `opened.approvalRules`
   and re-sent with `rules` when they change; a `submit` with
-  `approval_rule_revoke: {rule_id}` instead of `text` revokes one (lease
-  required; an allow it wrote that Codex hasn't taken yet is withdrawn). A
+  `approval_rule_revoke: {rule_id}` instead of `text` revokes one (r7.3:
+  any attachment with `control`, lease or not — `lease_epoch` optional and
+  ignored, `acquire` refused, the lease never taken or moved; view-only is
+  `forbidden`, an inactive rule `stale_target`; an allow it wrote that Codex
+  hasn't taken yet is withdrawn; runtime.log gets one line naming the rule
+  and session). A
   rule the session can't keep when Codex takes the answer (32 already) is
   not kept: the card ends `allowed` with a `note`. A new account, device or
   trust generation while the host runs drops every rule. An `apply_patch`
@@ -351,7 +355,7 @@ on the existing authenticated Astation connection.
 |---|---|---|
 | `open` | Astation → Atem | `conversationId`, `agentId`, optional `before` (messageId) and `generation` (the one `before` came from) |
 | `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), `approvalRules` (the session's active Atem session rules `[{rule_id, label, scope}]`; `[]` without `control`), then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
-| `submit` | Astation → Atem | `generation`, `requestId` (UUID), and one of `text`, `approval` (§6a answer) or `approval_rule_revoke` (`{rule_id}`, r7.2) |
+| `submit` | Astation → Atem | `generation`, `requestId` (UUID), and one of `text`, `approval` (§6a answer) or `approval_rule_revoke` (`{rule_id}`, r7.2; `control` only, no lease: r7.3) |
 | `rules` | Atem → Astation | `approvalRules` (the whole list, when it changed; conversations with `control` only) |
 | `accepted` | Atem → Astation | `requestId` |
 | `message` / `delta` | Atem → Astation | see the message model |

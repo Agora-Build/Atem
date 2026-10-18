@@ -1,16 +1,31 @@
-# atem-session v1: sessions, control leases, receipts and approvals (r7.2: r7.1 plus Atem session rules — for review)
+# atem-session v1: sessions, control leases, receipts and approvals (r7.3: r7.2 with lease-free rule revocation — for review)
 
 Draft (not implemented): r8 — required `hello.revision`, `welcome.features`,
 history pages in the sequenced stream with bounded selectors and coverage,
-`receipt.result`, removal of `open.before` — is in the appendix "r8 draft"
-at the end; this r7.2 text stays authoritative until r8 ships.
-Status: r7.2 (2026-10-17) adds Atem session rules (§6a): for an agent whose
+`receipt.result`, removal of `open.before`, chat Send that acquires the lease
+with the prompt (`chat.send_acquire`) and lease-free approval answers
+(`approval.lease_free`) — is in the appendix "r8 draft" at the end; this
+r7.3 text stays authoritative until r8 ships.
+Status: r7.3 (2026-10-17) lets any attachment with `control` revoke an Atem
+session rule (§6a) with or without the lease: `approval_rule_revoke` needs
+only `control`, a running session and an active rule of that exact process
+(`stale_target` otherwise); its binding's `lease_epoch` is optional and never
+checked (a stale one is not refused), it never takes, renews or moves the
+lease, and an `acquire` field is refused (the payload is exactly
+`{rule_id}`). Found live: a user tapped Revoke in Astation without holding
+control, the revoke was refused `stale_lease` and the rule kept allowing.
+Revocation only narrows what runs unattended, so it isn't serialized with
+input. Journaling, receipts and duplicate/`request_id_reused` semantics are
+unchanged. The fixture
+`approval-rule-revoke-needs-the-lease-and-an-active-rule` is replaced by
+`approval-rule-revoke-needs-control-not-the-lease`.
+r7.2 (2026-10-17) adds Atem session rules (§6a): for an agent whose
 hook can't keep a persistent rule (Codex), its card offers "Always allow this
 command" with `scope: "session"`; Atem's worker keeps the rule for that agent
 process and answers a later byte-equal request itself (`auto_allowed`, no
 approval, no push, no lease). Attachments with `control` get the active rules
 (`approval_rules`) and revoke one with a `kind:"approval_rule_revoke"`
-submission. New fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule`.
+submission. New fixture: `approval-rule-revoke-needs-the-lease-and-an-active-rule` (replaced in r7.3).
 Clarified the same day (no new field): a `completed` `prompt` receipt's
 `detail` is its turn's outcome, `"done"` or `"interrupted"` (§6, §7).
 r7.1 (2026-10-17) lets a second `hello` on a welcomed attachment
@@ -143,7 +158,9 @@ Every request that targets a session carries one **binding** object:
   terminal-v1 has no `lease_id` field (the binding's epoch is the lease); a
   chat `submit` is the §6 `submit` with
   `kind:"prompt"`, `request_id = requestId`, `payload = {"text": text}`.
-- `lease_epoch` is required for mutations, absent for reads.
+- `lease_epoch` is required for mutations, absent for reads; an
+  `approval_rule_revoke` submission (§6a, r7.3) may carry it or not, and it
+  is ignored.
 - Any mismatch → `error{code:"stale_target"}` with **no** current values; the
   client re-lists (§4). Errors never reveal another target's ids, paths or
   receipts; an unauthorized or unknown session is `unknown_session` either way.
@@ -333,7 +350,7 @@ Kinds and payloads (v1):
 | `interrupt` | `{}` | the provider reports the turn interrupted, or the turn was already over (`detail`) |
 | `stop` | `{}` | the agent process exits |
 | `approval` | `{"approval_id", "decision", "rule_id"?, "message"?}` (§6a) | the agent reports it applied the decision |
-| `approval_rule_revoke` | `{"rule_id"}` (§6a, r7.2) | the runtime dropped the rule |
+| `approval_rule_revoke` | `{"rule_id"}` (§6a, r7.2; needs `control`, not the lease: r7.3) | the runtime dropped the rule |
 
 - **Digest**: the host computes `payload_digest = sha256(JCS(payload))`, JCS =
   RFC 8785 over the supported domain (objects, arrays, strings, booleans, null,
@@ -348,7 +365,8 @@ Kinds and payloads (v1):
   (terminal input/resize/stop) — is checked in this order: `control`
   permission (`forbidden`), then a session that accepts work
   (`session_closed`, even when the lease is also stale), then the current
-  lease (`stale_lease`). If the durable write of
+  lease (`stale_lease`; skipped for `approval_rule_revoke`, which needs no
+  lease, r7.3, and for an approval answer with `acquire`). If the durable write of
   `accepted` fails, the reply is `error{code:"busy"}`, nothing is recorded and
   the client may retry with the same `request_id`. After a double I/O failure
   (the write fails and so does undoing it) a request answered `busy` may still
@@ -437,7 +455,7 @@ takes the lease with the answer (`acquire`).
 | `push_approval` | H→relay | `approval_id`, `atem_device_id`, `session_id`, `tool`, `summary`, `expires_at` |
 | `push_resolved` | H→relay | `approval_id`, `reason` (an `approval_closed` reason) |
 | `approval_rules` | H→C | `session_id`, `process_gen`, `rules: [{rule_id, label, scope}]` (r7.2; ≤ 32) |
-| `submit` | C→H | §6 with `kind:"approval_rule_revoke"`, `payload: {rule_id}` (r7.2) |
+| `submit` | C→H | §6 with `kind:"approval_rule_revoke"`, `payload: {rule_id}` (r7.2); `control` only, `lease_epoch` optional and ignored (r7.3) |
 
 ```json
 {"type":"session","data":{"v":1,"op":"approval_request","id":"…","approval_id":"88888888-…",
@@ -591,10 +609,20 @@ takes the lease with the answer (`acquire`).
   after each `sessions` snapshot (only for sessions that have any), and
   with `rules: []` when the process ends. Revoking one is a §6 `submit`
   with `kind:"approval_rule_revoke"` and `payload: {rule_id}` (strict:
-  exactly that field, an opaque id) under the current lease (no `acquire`
-  form): admission is the §6 order (`forbidden`, `session_closed`,
-  `stale_lease`), then the rule must be active for exactly the binding's
-  process, else `stale_target` (nothing recorded or dispatched). It is
+  exactly that field, an opaque id) from any attachment with `control`,
+  with or without the lease (r7.3): admission is `forbidden` (no
+  `control`: view-only attachments can't revoke), `session_closed`, then the
+  rule must be active for exactly the binding's process, else
+  `stale_target` (nothing recorded or dispatched). The lease plays no part:
+  the binding's `lease_epoch` is optional and never checked (a stale or
+  someone else's epoch is not refused), and a revoke never takes, renews or
+  moves the lease, nor changes who holds control. `acquire` is refused, not
+  ignored: the payload is exactly `{rule_id}`, so `{rule_id, acquire}` fails
+  to decode (`unsupported_version`, nothing recorded) — a client must never
+  believe a revoke gave it control. Revoking only narrows what runs
+  unattended, so it needs no serialization with the controller's input. The
+  receipt is journaled like any other; a duplicate returns it and the same
+  `request_id` with other content is `request_id_reused`. It is
   dispatched to the runtime and completes once the runtime dropped the
   rule; the new list follows. An allow the runtime wrote for that rule and
   the agent hasn't taken yet is withdrawn ("no decision": the agent's own
@@ -615,7 +643,7 @@ takes the lease with the answer (`acquire`).
   {"type":"session","data":{"v":1,"op":"approval_rules","id":"…","session_id":"ses-aaaaaaaaaaaa",
     "process_gen":"22222222-…","rules":[{"rule_id":"s-0123456789abcdef",
     "label":"Always allow `npm test` in /home/user/proj for this session","scope":"session"}]}}
-  {"type":"session","data":{"v":1,"op":"submit","id":"…","binding":{…,"lease_epoch":7},
+  {"type":"session","data":{"v":1,"op":"submit","id":"…","binding":{"target":{…},"attachment_gen":"…"},
     "request_id":"46464646-…","kind":"approval_rule_revoke","payload":{"rule_id":"s-0123456789abcdef"}}}
   ```
 - **chat-v1 card.** A chat-v1 conversation shows each approval of its session
@@ -636,8 +664,8 @@ takes the lease with the answer (`acquire`).
   receipt as for prompts. chat-v1 `opened` carries `approvalRules` (the
   active session rules; `[]` for an attachment without `control`) and a
   `rules{approvalRules}` event follows each change; a chat-v1 `submit` with
-  `approval_rule_revoke: {rule_id}` instead of `text` revokes one (its
-  binding with `lease_epoch`).
+  `approval_rule_revoke: {rule_id}` instead of `text` revokes one (r7.3:
+  `control` is enough; its binding's `lease_epoch` is optional and ignored).
 
 ## 7. Errors
 
@@ -728,6 +756,12 @@ queryable, another replacement within a second `busy`). r7.2 adds revoking
 an Atem session rule (`approval_rules` on change and after `list`; an
 inactive rule and a stale lease refused with no dispatch; the revoke
 completes and the empty list follows; revoking again is `stale_target`).
+r7.3 replaces it with `approval-rule-revoke-needs-control-not-the-lease`: a
+control attachment without the lease revokes while another holds it (once
+without `lease_epoch`, once naming an epoch it doesn't hold), a view-only one
+is `forbidden`, an inactive rule or another process `stale_target`, `acquire`
+refused, a duplicate returns the receipt, and the holder still renews at the
+same epoch.
 
 ## 9. Gate: trust, freshness, channel and browser grants (joint)
 

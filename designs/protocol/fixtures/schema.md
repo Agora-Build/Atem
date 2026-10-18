@@ -1,4 +1,4 @@
-# Fixture format (atem-session v1, r7.2)
+# Fixture format (atem-session v1, r7.3)
 
 One scenario per `*.json` file; `digest-vectors.json` holds the canonical-digest
 known-answer vectors (`vectors`: payload → canonical string → sha256;

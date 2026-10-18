@@ -3053,8 +3053,9 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
         })
         .await;
 
-        // Revoked from chat (with the lease): completed, the list empties.
-        let lease = peer.acquire(&sid, &pg).await;
+        // Revoked from chat without the lease (r7.3: `control` is enough;
+        // no lease is held after the restart): completed, the list empties,
+        // and still no lease is held.
         let revoke = uuid::Uuid::new_v4().to_string();
         let from = peer.seen.len();
         peer.chat(
@@ -3062,7 +3063,7 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": revoke, "lease_epoch": lease,
+            json!({"generation": pg, "requestId": revoke,
                    "approval_rule_revoke": {"rule_id": rule_id}}),
         );
         let rv = revoke.clone();
@@ -3074,8 +3075,15 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
             is_session(v, "approval_rules") && v["data"]["rules"] == json!([])
         })
         .await;
+        assert!(
+            !peer.seen[from..]
+                .iter()
+                .any(|v| is_session(v, "lease") || is_session(v, "lease_changed")),
+            "a revoke never takes or moves the lease"
+        );
+        let lease = peer.acquire(&sid, &pg).await;
 
-        // The same command asks again; an interrupt now only hands the
+        // The worker stops allowing at once: the same command asks again; an interrupt now only hands the
         // waiting approval to Codex's dialog, and says so.
         ask(&fake, 5, touch);
         let peer = &mut rt.peer;
@@ -3211,6 +3219,18 @@ async fn adopted_rules_dropped_after(change: &str) {
         "the old rule is never listed"
     );
     rt.shutdown().await;
+}
+
+#[test]
+fn the_revoke_log_line_names_the_rule_and_session_only() {
+    assert_eq!(
+        super::rule_revoked_line("ses-aaaaaaaaaaaa", "s-0123456789abcdef", true),
+        "atem runtime: ses-aaaaaaaaaaaa: session rule s-0123456789abcdef revoked"
+    );
+    assert_eq!(
+        super::rule_revoked_line("ses-aaaaaaaaaaaa", "s-0123456789abcdef", false),
+        "atem runtime: ses-aaaaaaaaaaaa: session rule s-0123456789abcdef not revoked (no longer active)"
+    );
 }
 
 #[test]
@@ -3379,4 +3399,160 @@ async fn host_rebinds_drop_the_workers_session_rules() {
     for session in sessions.values() {
         let _ = session.stop();
     }
+}
+
+// ── Refusal lines in runtime.log ──
+
+const MARKER: &str = "SECRET-MARKER-7f3a";
+
+/// The refusal lines written on this thread so far.
+fn refusal_lines() -> Vec<String> {
+    super::refusal_log::WRITTEN.with(|w| w.borrow().clone())
+}
+
+/// Waits until a refusal line `pick` accepts was written; that line.
+async fn refusal_line(pick: impl Fn(&str) -> bool) -> String {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(line) = refusal_lines().into_iter().find(|l| pick(l)) {
+                return line;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no such refusal line; written: {:#?}", refusal_lines()))
+}
+
+#[test]
+fn refused_requests_are_logged_by_family_op_and_code_without_their_content() {
+    local(async {
+        super::refusal_log::WRITTEN.with(|w| w.borrow_mut().clear());
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let agent = echo_agent(rt.dir.path());
+        let session = rt.launch(&mut client, "codex", &agent, None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+
+        // A chat-v1 revoke of the wrong shape: a decode failure whose serde
+        // error names the field (and would echo values).
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": uuid::Uuid::new_v4().to_string(),
+                   "approval_rule_revoke": {"rule": MARKER}}),
+        );
+        let line = refusal_line(|l| l.contains("refused agentChat/submit")).await;
+        assert_eq!(
+            line,
+            format!(
+                "atem runtime: refused agentChat/submit kind=approval_rule_revoke \
+                 unsupported_version session={sid} \
+                 (decode: agentChat: approval_rule_revoke: unknown field `rule`)"
+            )
+        );
+
+        // A session-v1 submit whose kind is a value serde would echo.
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, None),
+                   "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": MARKER, "payload": {"text": MARKER}}),
+        );
+        assert_eq!(peer.reply(&id).await["code"], "unsupported_version");
+        let line = refusal_line(|l| l.contains("refused session/submit")).await;
+        assert_eq!(
+            line,
+            format!(
+                "atem runtime: refused session/submit unsupported_version session={sid} \
+                 (decode: unknown variant)"
+            )
+        );
+
+        // A session-v1 revoke whose payload has the wrong shape.
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, None),
+                   "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval_rule_revoke", "payload": {"rule": MARKER}}),
+        );
+        let reply = peer.reply(&id).await;
+        let code = match reply["op"].as_str() {
+            Some("error") => reply["code"].as_str().unwrap().to_string(),
+            _ => reply["state"].as_str().unwrap().to_string(),
+        };
+        let line = refusal_line(|l| {
+            l.contains("kind=approval_rule_revoke") && l.contains("session/submit")
+        })
+        .await;
+        assert!(
+            line.starts_with(&format!(
+                "atem runtime: refused session/submit kind=approval_rule_revoke {code} session={sid}"
+            )),
+            "{line}"
+        );
+
+        // A terminal-v1 subscribe to another process generation.
+        let other = uuid::Uuid::new_v4().to_string();
+        peer.terminal("subscribe", &sid, &other, json!({}), None);
+        let line = refusal_line(|l| l.contains("refused terminal/subscribe")).await;
+        assert_eq!(
+            line,
+            format!("atem runtime: refused terminal/subscribe stale_target session={sid}")
+        );
+
+        for line in refusal_lines() {
+            assert!(!line.contains(MARKER), "{line}");
+            assert!(!line.contains('{'), "{line}");
+        }
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_link_without_an_attachment_logs_its_refusals() {
+    local(async {
+        super::refusal_log::WRITTEN.with(|w| w.borrow_mut().clear());
+        let mut rt = Runtime::start(false).await;
+        let peer = &mut rt.peer;
+        let id = uuid::Uuid::new_v4().to_string();
+        peer.send(json!({"type":"session","data":{"v":1,"op":"list","id":id,"x":MARKER}}));
+        assert_eq!(peer.reply(&id).await["code"], "unauthorized");
+        let line = refusal_line(|l| l.contains("refused session/")).await;
+        assert_eq!(
+            line,
+            "atem runtime: refused session/list unauthorized (no attachment)"
+        );
+        assert!(refusal_lines().iter().all(|l| !l.contains(MARKER)));
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn a_looping_client_gets_twenty_refusal_lines_per_window_and_a_summary() {
+    local(async {
+        super::refusal_log::WRITTEN.with(|w| w.borrow_mut().clear());
+        let mut rt = Runtime::start(true).await;
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        let mut last = String::new();
+        for _ in 0..35 {
+            last = uuid::Uuid::new_v4().to_string();
+            peer.send(json!({"type":"session","data":{"v":2,"op":"list","id":last,"x":MARKER}}));
+        }
+        peer.reply(&last).await;
+        let refused = |lines: &[String]| lines.iter().filter(|l| l.contains("refused ")).count();
+        assert_eq!(refused(&refusal_lines()), 20, "{:#?}", refusal_lines());
+        assert!(!refusal_lines().iter().any(|l| l.contains("suppressed")));
+        // The window ends: one summary line for the other 15.
+        rt.clock.skip(super::refusal_log::WINDOW_MS);
+        let line = refusal_line(|l| l.contains("suppressed")).await;
+        assert_eq!(line, "atem runtime: \u{2026} 15 more refusals suppressed");
+        assert_eq!(refused(&refusal_lines()), 20);
+        rt.shutdown().await;
+    });
 }
