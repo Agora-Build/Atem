@@ -145,7 +145,7 @@
       "selector": "newest",
       "count": 1,
       "content_bytes": 9,
-      "wire_bytes": 300,
+      "wire_bytes": 675,
       "end": true,
       "coverage": "partial",
       "oldest_retained": "m-0005",

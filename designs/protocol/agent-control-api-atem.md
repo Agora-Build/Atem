@@ -13,7 +13,10 @@ Addendum 2026-10-18 (§9): two user-approved r8 features, chat Send that
 acquires the lease (`chat.send_acquire`, from Astation's "Chat Send and
 session control" handoff) and lease-free approval answers
 (`approval.lease_free`); contract appendix §F and §G, against `main` at
-`976e154` (r7.3, #76 and #77).
+`976e154` (r7.3, #76 and #77). Revised 2026-10-18 for Astation's r3
+review of that addendum: submitter principals and a durable control fence
+(contract §H), one admission persistence rule (§I), the client rule for a
+late admitting reply, and the fixture corrections (§9, end).
 
 ## 0. Answers to the r1 review
 
@@ -257,7 +260,7 @@ r8, gated by `hello.revision` (appendix A, answer 0.1). Features:
 | A4 | `receipt.result` (journal ids with `completed`; reply ids from history, ≤ 32 + `more`) | M |
 | A5 | Card `reason`; contract r8 text replaces r7.2 parts; docs | S |
 | A6 | Fixture runner actions (schema.md "r8 draft"), drop `requires`; live check with Claude 2.1.301 and Codex 0.162.1 | M |
-| A7 | `chat.send_acquire`: submit-level `acquire`/`takeover`/`expected_controller`, admission and commit after the durable write, `lease` on the admitting reply, `controller` on `lease_held`, prompt static checks at admission, lost `control` revokes the lease and rejects queued work | M |
+| A7 | `chat.send_acquire`: submit-level `acquire`/`takeover`/`expected_controller`, admission and commit after the durable write, `lease` on the admitting reply, `controller` on `lease_held`, prompt static checks at admission, submitter principal and durable control fence (§H), the admission persistence rule with its refusal list (§I) | M |
 | A8 | `approval.lease_free`: drop the lease check and `acquire` (refused), ignore `lease_epoch`; docs | S |
 
 **Joint fixtures** (in `fixtures/`, r8 draft, NOT RUN until r8 ships):
@@ -280,7 +283,8 @@ r8, gated by `hello.revision` (appendix A, answer 0.1). Features:
 `r8-disconnect-right-after-acceptance`, `r8-failed-persistence-changes-no-lease`,
 `r8-expired-lease-is-checked-at-admission`,
 `r8-revoked-control-refuses-the-send-and-its-queued-prompt`,
-`r8-process-replaced-before-dispatch`) and the four §G ones (`r8-approval-*`).
+`r8-process-replaced-before-dispatch`), the §H/§I and late-reply ones
+listed in §9, and the five §G ones (`r8-approval-*`).
 Still to write with the implementation: card `reason`, `receipt.result`
 after a broker restart and for an interrupted turn.
 
@@ -338,8 +342,8 @@ handoff's open points:
   `accepted` write, and only then the lease grant or takeover,
   `lease_changed` to the others, and the reply with
   `lease{lease_epoch, ms_left}`. Any failure before the commit means no
-  lease change and no execution (`busy` for persistence; the retry may reuse
-  the id). This is today's approval-`acquire` order
+  lease change and no execution. A failed journal write is `busy`, a
+  definitive refusal (§I below). This is today's approval-`acquire` order
   (`lease_to_acquire` → journal append → `grant`), with the takeover made
   explicit.
 - **Codes.** `lease_held` (now with `controller`) for another holder or a
@@ -363,11 +367,14 @@ handoff's open points:
   renewal happens only while the caller keeps renewing; an abandoned caller
   loses control within 15 s. The host never renews implicitly: not on chat
   reads, queries, duplicates, a Send under the own lease, or execution.
-- **New host rule.** An attachment that loses `control` (re-authenticated
-  with fewer permissions) has its lease revoked and its not-yet-executing
-  accepted work rejected (`control revoked`). Local input still revokes,
-  and the adapter's unsent-input check still refuses a queued prompt at
-  dispatch.
+- **New host rule.** A principal that loses `control` is fenced durably
+  (below): its leases are revoked and its not-yet-executing accepted work
+  rejected (`control revoked`). Local input still revokes, and the
+  adapter's unsent-input check still refuses a queued prompt at dispatch.
+- **Late admitting reply.** The client applies a receipt's `lease` only if
+  the submit is outstanding on the current attachment, no newer epoch for
+  that session arrived since it was sent, and the deadline (send time +
+  `ms_left`) is ahead; otherwise it stays a viewer (contract §F).
 
 **Lease-free approvals (`approval.lease_free`, appendix §G).** User decision
 2026-10-18, replacing r7's answer-takes-the-lease. An answer needs a verified
@@ -377,3 +384,46 @@ needs or moves the lease, and a `lease_epoch` in its binding is ignored.
 admitted answer wins and later or closed ones are `stale_target`. Rules
 still need the exact offered rule and scope (r7.2), and revoke stays r7.3.
 Card states and push are unchanged.
+
+**r3 review answers (2026-10-18).**
+
+- **Finding 1, revoked control (§H).** Accepted work records its submitter
+  *principal* (the authenticated identity: today the one paired Astation;
+  with account trust each device grant) and the principal's `control_gen`.
+  Revoking `control` writes a durable fence (`control_gen` raised) before
+  anything else; queued work of every attachment of that principal, live
+  or gone, is rejected `control revoked`, and the dispatch check (also for
+  work recovered after a restart or adoption) compares the recorded
+  `control_gen` with the current one. Disconnect, expiry and a
+  same-permission reconnect keep work; regaining control doesn't revive
+  work from before the revocation. After a restart, recovered work runs
+  only once its principal is confirmed in that run (60 s, else `control
+  not confirmed`), so a fence lost to a failed write is learned again
+  first.
+- **Finding 2, persistence (§I).** Accepted means the `accepted` record is
+  durable. A failed admission write is `busy` and definitive: nothing
+  changes, the journal halts until restart, the refusal is recorded on a
+  separate refusal list first, and at restart the request is `rejected`
+  ("acceptance not confirmed") whether or not its record reached the disk.
+  §6's double-I/O exception and the same-id retry after such a `busy` are
+  removed. If even the refusal can't be recorded, the host sends no `busy`
+  (delivery is uncertain and the journal decides at restart). A resend uses
+  a new `request_id`: the old one is final, so it can't run twice.
+- **Finding 3.** The two captures in
+  `r8-failed-persistence-changes-no-lease` are at the step level (the
+  scenario now follows §I); no other r8 fixture had one inside `match`.
+- **Other obligations.** `chat_opens` is 2 in
+  `r8-long-turn-is-recovered-in-bounded-pages`; `wire_bytes` is 675 in
+  `r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap`; the
+  schema's `open_approval` row follows control-based delivery. New
+  fixtures: `r8-approval-answer-keeps-the-holders-deadline` (non-zero
+  clock, deadline unchanged, queued input kept, no holder),
+  `r8-delayed-send-reply-does-not-regrant-lost-control` and
+  `r8-client-delayed-send-reply-never-restores-control`,
+  `r8-revoked-control-fences-work-across-reconnect-and-restart`,
+  `r8-control-fence-holds-when-a-rejection-write-fails`,
+  `r8-recovered-work-needs-its-principal-confirmed`,
+  `r8-double-write-failure-takeover-never-runs`,
+  `r8-crash-after-durable-acceptance-grants-no-lease`. Astation owns its
+  API/native arbitration and renewal tests; approval persistence, the
+  terminal-answer race and catch-up are run against the r8 implementation.

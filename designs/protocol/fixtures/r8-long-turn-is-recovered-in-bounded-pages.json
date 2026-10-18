@@ -388,7 +388,7 @@
     "dispatch_attempts": 0,
     "pty_writes": 0,
     "lease_holder": null,
-    "chat_opens": 1,
+    "chat_opens": 2,
     "chat_closes": 0
    }
   }

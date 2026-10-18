@@ -43,7 +43,7 @@ setup messages is visible to the steps.
 | `{"close_session": session_id}` | the runtime closes the session (it no longer accepts work; the process may still run) |
 | `{"turn_complete": session_id, "turn_id": t}` | the provider reports that the session's executing prompt's turn `t` ended |
 | `{"hold_pty_writes": true}` / `{"flush_pty_writes": true}` | remote terminal writes queue at the PTY writer / the writer writes them now, each re-checked at the write boundary at the current clock (dropped ones count as `pty_writes_dropped`) |
-| `{"open_approval": session_id, "tool": t, "summary": s, "always_rules"?: [{rule_id, label, scope}]}` | the agent asks a permission prompt the runtime offers remotely (r7 §6a); the host opens an approval for the session's current process, or refuses silently (no live remote lease: the agent's own prompt asks). Capture its id from the `approval_request` |
+| `{"open_approval": session_id, "tool": t, "summary": s, "always_rules"?: [{rule_id, label, scope}]}` | the agent asks a permission prompt the runtime offers remotely (r7 §6a); the host opens an approval for the session's current process whoever holds the lease, or nobody (r7 §6a; at most 16 pending), and sends `approval_request` to every attachment with `control` subscribed by `list` (view-only ones get nothing). Capture its id from the `approval_request` |
 | `{"close_approval": approval_id, "reason": r}` | the runtime saw the prompt end without the remote answer (`answered_terminal`, `interrupted`, `timed_out`, `process_ended`) |
 | `{"approval_applied": approval_id, "ok": bool}` | the agent's report on a handed-over decision: applied (`completed`) or not known to be (`outcome_unknown`) |
 | `{"approval_rules": session_id, "rules": [{rule_id, label, scope}]}` | the runtime reports the session's active Atem session rules (r7.2); a revoke the host dispatches is answered at once by the harness: the rule is dropped (the receipt completes) and the rules left are reported |
@@ -81,6 +81,12 @@ these actions.
   the `welcome` must echo `revision: 8` and carry `features`.
 - `clients[].welcome: false`: the harness sends no `hello` for that client
   (the steps do).
+- Each client `name` is one authenticated principal (§H): `reconnect`,
+  `resume`, `set_permissions` and a second `hello` keep it; its
+  `attachment_gen`s change. (Today's host has one principal, the paired
+  Astation; the harness gives each client its own so the per-principal
+  rules can be checked.) After `restart_runtime` or `crash_after_accepted`
+  the host's start is the current clock (§H's 60 s confirmation window).
 
 | step (r8 draft) | meaning |
 |---|---|
@@ -95,7 +101,10 @@ these actions.
 | `{"client_try": client, "json": msg, "refused": text}` | client side: the client is asked to send `msg` and must refuse locally with that reason (nothing is sent) |
 | `{"client_open_chat": client, "conversation": id, "session_id": s}` | client side: the client opens a chat (its `open` is consumed by the fixture) |
 | `{"drop": {"to": client, "op": op}}` | the next matching host→client message is lost in transit: never delivered and not expected (repeat the step to lose several) |
-| `{"set_permissions": client, "permissions": [p], "attachment_gen": uuid}` | the client's link re-authenticates with these permissions: the old attachment is fenced, a lease it held is revoked (`lease_changed{revoked}` to the other viewers) and its `accepted` work not yet executing is rejected (`control revoked`), then the harness welcomes the new attachment (§F) |
+| `{"set_permissions": client, "permissions": [p], "attachment_gen": uuid}` | the client's principal re-authenticates with these permissions on a new attachment, whether or not its old one is still live (after `disconnect` too). Losing `control` follows §H: the fence is written, live attachments are fenced, a lease held by any of its attachments is revoked (`lease_changed{revoked}` to the other viewers) and its `accepted` work not yet executing, from any of its attachments, is rejected (`control revoked`); then the harness welcomes the new attachment. The permissions stay with the principal: later `reconnect`s use them |
+| `{"fail_next_fsync": true, "undo_fails"?: true}` | r8 (§I): the next journal append fails and the journal halts until `restart_runtime` (every session request but `hello` is `busy`); its rollback succeeds (nothing of it is on disk) unless `undo_fails`, which leaves the record on disk (the worst case). The refusal list write succeeds |
+| `{"fail_fsync_of": n}` | as `fail_next_fsync` for the `n`-th next journal append (1 = the next one); the earlier ones succeed |
+| `{"crash_after_accepted": {"runtime_gen": uuid, "runtime_epoch": n}}` | the next `accepted` record becomes durable, then the runtime crashes before acting on it (no lease change, no reply, no other message) and restarts with these values, as `restart_runtime`; every link drops and clients `reconnect` |
 | `{"replace_process": session_id, "process_gen": uuid}` | the agent process is replaced (restart/resume) with a new `process_gen` (`SessionHost::replace_process`) |
 
 Send and approval scenarios (`r8-send-*`, `r8-approval-*`, and the other
@@ -106,7 +115,8 @@ afterwards is refused by the adapter's draft check (`rejected`, detail `the
 terminal has unsent input; finish or clear it there`). A `receipts` reply
 lists receipts in the order of `request_ids` (unrecorded ids are omitted).
 
-New `assert` keys (r8 draft): `attachments` (live attachments on the host),
+New `assert` keys (r8 draft): `journal_halted` (the journal refuses
+appends until a restart, §I), `attachments` (live attachments on the host),
 `chat_opens` / `chat_closes` (`opened` / `close` the host sent, all
 conversations), `chat_conversations` (open conversations).
 
@@ -142,12 +152,20 @@ The r8 draft scenarios:
 | `r8-stale-takeover-confirmation-is-refused` | host | `expected_controller` no longer the holder → `lease_held`, no takeover |
 | `r8-duplicate-send-never-reacquires-or-replays` | host | duplicates (any flags) return the receipt; no acquire, takeover or rerun; delayed receipt |
 | `r8-disconnect-right-after-acceptance` | host | replies lost, work runs, lease expires; receipt query then duplicate on a new attachment |
-| `r8-failed-persistence-changes-no-lease` | host | failed durable write: `busy`, no grant or takeover, nothing runs; retry is a new admission |
+| `r8-failed-persistence-changes-no-lease` | host | §I: failed admission write: `busy`, no grant, nothing runs, journal halted (same-id retry `busy`); after the restart the id is `rejected` "acceptance not confirmed" and not re-admitted; a new id is admitted |
+| `r8-double-write-failure-takeover-never-runs` | host | §I: confirmed takeover while c1 holds; write and rollback fail: `busy`, c1 keeps the lease; after the restart `rejected`, never executed, same id returns it |
+| `r8-crash-after-durable-acceptance-grants-no-lease` | host | §I.4: durable accepted, crash before the grant: no lease; runs once when its principal reconnects; duplicate returns the receipt |
 | `r8-expired-lease-is-checked-at-admission` | host | expiry at admission without a timer; old epoch stale |
 | `r8-revoked-control-refuses-the-send-and-its-queued-prompt` | host | lost `control`: lease revoked, queued prompt rejected, Send `forbidden` |
+| `r8-revoked-control-fences-work-across-reconnect-and-restart` | host | §H: same-permission reconnect keeps queued work; view-only re-authentication after disconnect rejects work of the gone attachment; regaining control or a restart doesn't revive it |
+| `r8-control-fence-holds-when-a-rejection-write-fails` | host | §H: fence durable, rejection write fails: halted; recovery rejects the work (`control revoked`) |
+| `r8-recovered-work-needs-its-principal-confirmed` | host | §H: recovered work waits for its principal; not confirmed by 60 s → `control not confirmed` |
+| `r8-delayed-send-reply-does-not-regrant-lost-control` | host | §F: the admitting receipt delayed past local input or a takeover grants nothing; its epoch is `stale_lease` |
+| `r8-client-delayed-send-reply-never-restores-control` | client | §F reply rule: a late `lease` after local input, takeover, attachment replacement or local expiry is not applied; a timely one is |
 | `r8-process-replaced-before-dispatch` | host | queued Send rejected on replacement; old `process_gen` `stale_target`; new one acquires |
 | `r8-send-acquire-wire-rules` | host | field rules → `invalid_request`; `interrupt`/`stop`/`approval_rule_revoke` can't acquire |
 | `r8-approval-answer-by-a-non-holder-leaves-the-lease` | host | §G: non-holder answers (no epoch, a foreign epoch), lease unchanged; view-only `forbidden` |
+| `r8-approval-answer-keeps-the-holders-deadline` | host | §G at t = 6000/9000: holder and non-holder answers keep the deadline (repeat acquire: `ms_left` 6000), queued input written, expiry at 15000; answer with no holder grants nothing |
 | `r8-approval-answer-with-acquire-is-refused` | host | `acquire` (payload or submit) → `unsupported_version`, no effect |
 | `r8-approval-answers-crossing-first-wins` | host | holder and non-holder cross: first admitted wins, second `stale_target` |
 | `r8-approval-answer-to-a-closed-request-is-stale-target` | host | terminal-answered, timed-out and already-answered requests → `stale_target` |
