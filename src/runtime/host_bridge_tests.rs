@@ -25,16 +25,73 @@ const DEVICE: &str = "device-1";
 const TRUST_GEN: u64 = 3;
 const WAIT: Duration = Duration::from_secs(20);
 
+thread_local! {
+    /// This thread's sandboxes, for `HookSweep`.
+    static SANDBOXES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Unix socket paths are limited to ~100 bytes; keep them short.
 fn short_dir() -> tempfile::TempDir {
-    tempfile::Builder::new()
+    let dir = tempfile::Builder::new()
         .prefix("atem-hb")
         .tempdir_in("/tmp")
-        .unwrap()
+        .unwrap();
+    SANDBOXES.with(|s| s.borrow_mut().push(dir.path().to_path_buf()));
+    dir
+}
+
+/// The approval hooks (`approval-hook.sh`) running from under `dir`: their
+/// pids and command lines. Only ever this test's own sandbox.
+fn hooks_under(dir: &Path) -> Vec<(i32, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+        .unwrap();
+    let dir = format!("{}/", dir.display());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(&dir) && l.contains("approval-hook.sh"))
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let (pid, args) = l.split_once(' ')?;
+            Some((pid.parse().ok()?, args.to_string()))
+        })
+        .collect()
+}
+
+/// Regression check (dropped last): no approval hook started under this
+/// thread's sandboxes outlives its test. Hooks still there after 5 s are
+/// killed (only those) and the test fails, unless it already failed.
+struct HookSweep;
+
+impl Drop for HookSweep {
+    fn drop(&mut self) {
+        let dirs = SANDBOXES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut left = Vec::new();
+        for dir in &dirs {
+            let mut hooks = hooks_under(dir);
+            while !hooks.is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+                hooks = hooks_under(dir);
+            }
+            for (pid, _) in &hooks {
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+            left.extend(hooks.into_iter().map(|(_, args)| args));
+        }
+        if !left.is_empty() && !std::thread::panicking() {
+            panic!("approval hooks outlived the test: {left:?}");
+        }
+    }
 }
 
 /// `body` on a current-thread runtime with a `LocalSet` (the App stays on one task).
 fn local<F: std::future::Future>(body: F) -> F::Output {
+    // Dropped after the runtime (and its workers).
+    let _sweep = HookSweep;
     // Never the user's profile (src/test_profile.rs).
     let profile = tempfile::tempdir().unwrap();
     let _profile = crate::test_profile::use_dir(profile.path());
@@ -2485,6 +2542,7 @@ fn input_to_codex_releases_its_waiting_hooks_first() {
 async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::worker_approvals::Event;
+    let _sweep = HookSweep;
     let dir = short_dir();
     let fake = dir.path().join("fake");
     let launcher = Launcher::InProcess(InProcess {
@@ -3535,6 +3593,7 @@ async fn keep_a_rule(
 #[tokio::test]
 async fn host_rebinds_drop_the_workers_session_rules() {
     use crate::runtime::adopt::SpawnRequest;
+    let _sweep = HookSweep;
     let dir = short_dir();
     let fake = dir.path().join("fake");
     let launcher = Launcher::InProcess(InProcess {

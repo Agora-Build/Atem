@@ -46,9 +46,22 @@ os.makedirs(ctl, exist_ok=True)
 log_in = open(os.path.join(ctl, "input"), "ab", buffering=0)
 events = open(os.path.join(ctl, "events"), "a", buffering=1)
 parent = os.getppid()
+asks = {}  # n -> {"proc", "request", "done"}
+def end_hooks():
+    """Hooks still running end with the agent, as Claude and Codex end
+    theirs: a stopped one (stop-<n>) is woken to take its SIGTERM, never left
+    stopped behind."""
+    for ask in asks.values():
+        if ask["proc"].poll() is None:
+            for sig in (signal.SIGTERM, signal.SIGCONT):
+                try:
+                    ask["proc"].send_signal(sig)
+                except Exception:
+                    pass
 def ended(signum, frame):
     time.sleep(0.1)
     events.write("signal %d worker_alive=%s\n" % (signum, os.getppid() == parent))
+    end_hooks()
     os._exit(0)
 signal.signal(signal.SIGHUP, ended)
 signal.signal(signal.SIGTERM, ended)
@@ -122,7 +135,6 @@ def answered(n, ask):
         # Claude Code writes the hook's message as it is (checked live).
         tool_result(n, message, True)
 
-asks = {}  # n -> {"proc", "request", "done"}
 transcribed = 0
 START, END = b"\x1b[200~", b"\x1b[201~\r"
 buf = b""
@@ -212,3 +224,4 @@ while True:
                 ask["proc"].send_signal(signal.SIGSTOP)
                 events.write("stopped %d\n" % n)
         answered(n, ask)
+end_hooks()

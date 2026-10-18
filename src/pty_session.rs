@@ -267,9 +267,12 @@ fn stop_child(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>) {
             }
             #[cfg(unix)]
             if let Some(pid) = child.process_id() {
-                // The PTY child owns a session/process group. Notify its tools too.
+                // The PTY child owns a session/process group. Notify its tools too,
+                // and wake any stopped one (as the kernel does at a hangup), which
+                // would otherwise keep its SIGHUP pending, stopped, forever.
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGHUP);
+                    libc::kill(-(pid as i32), libc::SIGCONT);
                 }
             }
         }
