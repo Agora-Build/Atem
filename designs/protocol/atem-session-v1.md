@@ -331,7 +331,8 @@ Normative rules:
   is persisted per session so it never repeats.
 - **Scope**: the lease governs terminal input/resize/stop, chat submission,
   interrupt, approval answers and future mutations. Disconnect stops renewal;
-  the lease then expires.
+  the lease then expires. (r8 draft: approval answers leave the lease's scope,
+  appendix §G; a chat Send may acquire the lease with its prompt, §F.)
 
 ## 6. Submissions and receipts
 
@@ -446,6 +447,13 @@ agent's own prompt asks. Delivery is independent of control (user decision,
 2026-10-16): every approval opens a card for all attachments with `control`
 and is pushed to the account's devices, whoever holds the lease; answering
 takes the lease with the answer (`acquire`).
+
+**r8 draft (appendix §G, `approval.lease_free`, user decision 2026-10-18):**
+an answer needs only a verified attachment with `control` and the exact
+pending request. It never takes, needs or moves the lease, its binding's
+`lease_epoch` is ignored, `acquire` is refused `unsupported_version`, and
+the first admitted answer wins (later ones `stale_target`). This r7 text
+stays authoritative until r8 ships.
 
 | op | dir | fields |
 |---|---|---|
@@ -776,7 +784,7 @@ conservative restart/clock handling), channel key establishment with
 replay/downgrade protection binding endpoint keys, account, roles, permissions
 and generations, the `resume_proof` format, and QR grant binding.
 
-## Appendix: r8 draft (not implemented; r7.2 above stays authoritative)
+## Appendix: r8 draft (not implemented; r7.3 above stays authoritative)
 
 Status: **draft**, 2026-10-17, answering Astation's review of Atem's agent
 control API response r1 (`agent-control-api-atem.md` r2). Nothing here is
@@ -824,12 +832,15 @@ the refusal is explicit at admission rather than a silent misreading later.
 | `receipt.result` | `result` on completed `prompt` receipts (§D) |
 | `approval.session_rules` | r7.2 session rules (already shipped) |
 | `approval.card_reason` | final cards carry `reason` (the `approval_closed` reason) |
+| `chat.send_acquire` | a `prompt` submit may acquire the lease with the prompt (§F) |
+| `approval.lease_free` | approval answers need `control`, never the lease (§G) |
 
 - **Removed in r8**, refused explicitly with `unsupported_version` and no
   effect (never read as another form): chat `open.before`, `open.generation`
   (the r7.2/#75 paging form; an open conversation is not reset and no new
-  one opens), the `status.page` marker (replaced by `history_end`), and a
-  `hello` without `revision`.
+  one opens), the `status.page` marker (replaced by `history_end`), a
+  `hello` without `revision`, and `acquire` on an approval answer (r7 §6a;
+  in the payload or beside it, §G).
 
 ### B. History pages in the ordered conversation stream
 
@@ -981,11 +992,260 @@ and lookups:
   `request_ids` bound), so ≤ 384 KiB, below the 1 MiB message bound without
   continuation.
 
+### F. Chat Send acquires the lease with the prompt (`chat.send_acquire`)
+
+User-approved behaviour (2026-10-18, Astation handoff "Chat Send and session
+control"). Chat and the remote terminal share one lease per session; viewing
+either needs none. Remote terminal input still needs an explicit Take
+Control (§5 `acquire`). A chat Send needs no separate step:
+
+| ownership at admission | Send |
+|---|---|
+| nobody | acquires and submits in one host operation |
+| this attachment | submits under its current lease |
+| another attachment | refused `lease_held` naming the holder; only an explicit, confirmed takeover takes it |
+
+**Wire.** A §6 `submit` of kind `prompt`, or a chat-v1 `submit` with
+`text`, may carry `acquire: true`, and with it `takeover: true` plus
+`expected_controller`, the lease the user confirmed taking over, in the
+descriptor's `controller` shape (§4). Its binding then carries no
+`lease_epoch` (as for §5 `acquire`):
+
+```json
+{"type":"session","data":{"v":1,"op":"submit","id":"…",
+ "binding":{"target":{…},"attachment_gen":"33333333-…"},
+ "request_id":"44444444-…","kind":"prompt","payload":{"text":"run the tests"},
+ "acquire":true}}
+{"type":"session","data":{"v":1,"op":"submit","id":"…",
+ "binding":{"target":{…},"attachment_gen":"66666666-…"},
+ "request_id":"44444444-…","kind":"prompt","payload":{"text":"run the tests"},
+ "acquire":true,"takeover":true,
+ "expected_controller":{"controller_session":"…","lease_epoch":7}}}
+{"type":"agentChat","data":{"v":1,"op":"submit","conversationId":"…","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-…","requestId":"44444444-…","text":"run the tests","acquire":true,
+ "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
+```
+
+- **Field rules** (each `invalid_request`, nothing recorded, no lease
+  change): `acquire` and `takeover` appear only as `true`; `takeover` needs
+  `acquire` and `expected_controller`, and `expected_controller` needs
+  `takeover`; `acquire` excludes `binding.lease_epoch`. Only `prompt` (chat:
+  `text`) may acquire. `interrupt`, `stop` and `approval_rule_revoke` with
+  `acquire` are `invalid_request`; an approval answer with `acquire` is the
+  removed r7 form, `unsupported_version` (§G). Without the advertised
+  feature, `acquire` is `unsupported_version` (§A).
+- **Why `prompt` only.** The user approved Send. `interrupt` acts on the
+  turn the current controller started: an acquiring interrupt from someone
+  else is exactly the silent ownership change Send must never make, and on
+  an unowned session an explicit Take Control first loses nothing (a raced
+  interrupt is refused `stale_lease`, never misapplied). `stop` ends the
+  process and with it every lease (`process_ended`), so acquiring for it
+  means nothing. Either can become its own feature later.
+- **Without `acquire`** a `prompt` is the r7 submit: the current lease
+  (`lease_epoch`) is checked as in §6 and a wrong one is `stale_lease`. A
+  client that holds the lease sends this form; a client that doesn't (or no
+  longer knows) sends `acquire: true`.
+
+**Request identity.** `acquire`, `takeover` and `expected_controller` are
+admission parameters, like `binding.lease_epoch` and `attachment_gen`: they
+are in neither the payload digest nor the immutable request (§6 unchanged:
+`payload` is `{"text"}`). A duplicate `request_id` returns the recorded
+receipt whatever flags it carries; it never acquires, takes over, renews or
+re-executes. Why: a retry must be safe whatever the client believed about
+ownership when it resent. The client keeps the `request_id` and text from
+the first Send through a `lease_held` refusal, the takeover confirmation
+and any uncertain delivery. If the first attempt was in fact accepted (its
+reply lost), the confirmed retry gets the original receipt instead of
+`request_id_reused`, which would tempt a new id and a second run. Flags in
+the digest would buy nothing, since a duplicate never acts on them. A
+refused Send records nothing, so the retry is a new admission. Before
+offering a new Send or a takeover after an uncertain delivery, the client
+checks the receipt (`receipt_query`). Neither a query nor a duplicate
+acquires.
+
+**Admission** (one step of the broker's single-threaded pass, so no other
+admission, local input or lease change comes between its checks and its
+commit). The order follows today's `SessionHost::submit`:
+
+1. Binding (attachment, full target, trust and process generation):
+   `unauthorized`/`stale_target`/`unknown_session` as §2.
+2. Decode and field rules: `unsupported_version`/`invalid_request`.
+3. Duplicate `request_id`: the recorded receipt (view only, no `lease`
+   field) or `request_id_reused`.
+4. `control` → `forbidden`. Control authorizes the operation; the lease
+   only coordinates writers.
+5. A session that accepts work → `session_closed`; one whose descriptor
+   lacks `chat-v1` → `busy` ("chat is not available for this agent"), so
+   nobody takes control for a prompt that can't run.
+6. Ownership, on the host's monotonic clock at this instant (a lease with
+   `now >= deadline` has expired: the host applies the expiry first, with
+   its `lease_changed{expired}`, as on any clock step). Never as Astation
+   last displayed it:
+   - held live by this attachment: **own**, no lease change;
+   - held by this `controller_session` on another attachment: `stale_lease`
+     (as §5 `acquire`);
+   - held by another, no `takeover`: `lease_held`;
+   - held by another, `takeover` with an `expected_controller` other than
+     the current (`controller_session`, `lease_epoch`): `lease_held` (a
+     stale confirmation never authorizes a different takeover);
+   - held by another, `takeover` matching: a **takeover** is planned;
+   - nobody: a **grant** is planned (also with `takeover`: nobody's control
+     is taken, so the confirmation isn't needed).
+7. The prompt's static checks: text ≤ 32 768 bytes after trimming, not
+   starting with `/` or `!` (`ChatSession`'s `clean_prompt`), now at
+   admission → `invalid_request`. Dynamic ones (status ready, no unsent
+   terminal input, the same generation) stay at dispatch (`rejected` with
+   the adapter's text), as in r7.
+8. `receipt_limit`; the attachment's in-flight bound → `busy`.
+9. A planned grant or takeover reserves its epochs durably (§5 epoch
+   blocks). Failure → `busy`.
+10. `accepted` is written durably (fsync). Failure → `busy`: nothing
+    recorded, no lease change, nothing executes; the client may retry the
+    same `request_id`. Epochs reserved in step 9 may then be skipped, which
+    §5 allows.
+11. **Commit.** Only now the lease moves: a grant or takeover gives this
+    attachment a new epoch with the full 15 s (capped by its authorization);
+    a takeover also raises the input epoch, so the previous holder's queued
+    bytes are dropped at the write boundary. Every other attachment with
+    `view` gets `lease_changed{granted|takeover}` and subscribers get
+    `session_changed`. Then the reply, then scheduling as any prompt (§6).
+
+This is today's approval `acquire` transaction (`lease_to_acquire` reserves
+before the journal append, `grant` runs only after it succeeds), with two
+differences. The takeover must be explicit and must match
+`expected_controller`. And the sender gets its lease in the reply, not in
+`lease_changed`, per §5's recipient rule.
+
+**Reply.** The reply that admits the Send carries the sender's lease:
+session `receipt{state:"accepted", …, lease:{lease_epoch, ms_left}}`, or
+chat-v1 `accepted{requestId, lease:{lease_epoch, ms_left}}`. That covers a
+grant, a takeover and own. For own the epoch is unchanged and `ms_left` is
+what remains: a Send never extends a lease (§5 rule 4). The client applies
+it as the reply to an `acquire` sent when the Send was sent (§5 rules 2–5:
+deadline = send time + `ms_left`). No other receipt carries `lease`: not
+`executing`/final ones, duplicates or `receipts`. A client whose admitting
+reply was lost doesn't control. If the registry shows it as controller, an
+explicit `acquire` (the repeat-acquire rule) returns the current lease
+unchanged.
+
+**Refusal.** `lease_held` names the holder in the descriptor's shape so the
+UI can offer "Take over and send":
+
+```json
+{"type":"session","data":{"v":1,"op":"error","re":"…","code":"lease_held",
+ "controller":{"controller_session":"…","lease_epoch":7}}}
+{"type":"agentChat","data":{"v":1,"op":"error","conversationId":"…","requestId":"44444444-…",
+ "code":"lease_held","text":"another controller holds this session",
+ "controller":{"controller_session":"…","lease_epoch":7}}}
+```
+
+r8 adds `controller` to every `lease_held`, the §5 `acquire` refusal
+included. The host names only the opaque `controller_session`. Mapping it
+to a person or device is Astation's job (its link is one attachment, and it
+arbitrates its own clients before they reach the host). Nothing in a
+refusal is recorded or executed, and no takeover happens.
+
+**Renewal and release.** The lease is the attachment's, as after §5
+`acquire`: it lasts 15 s and its holder renews it every 5 s (§5). Astation
+owns renewal. The native app renews while that session's chat or terminal
+view is in the foreground on the device whose user sent. It stops when the
+view closes, the app goes to the background or the device sleeps, and then
+sends `release` (best effort; otherwise the lease expires). For the
+protected local API, the caller holds the lease explicitly: Astation renews
+only while that caller keeps renewing through the API and releases when the
+caller's API session ends. An abandoned caller loses control within 15 s.
+The host renews nothing implicitly: not chat `open`, `history`, terminal
+`subscribe`, `receipt_query`, a duplicate submit, a Send under the own
+lease, nor execution of an accepted prompt. Expiry, release, local input or
+a takeover don't cancel accepted work (§6).
+
+**Unchanged.** Local terminal input revokes any remote lease before it is
+written (`local_input`, §5). A Send queued behind a running turn is then
+refused at dispatch by the adapter's unsent-input check. A Send's prompt is
+a §6 receipt with every r7 check and transition. Process replacement ends
+the lease (`process_ended`) and rejects accepted prompts (`session closed`);
+a trust change rejects them (`host trust changed`). New in r8: an
+attachment that loses `control` has its lease revoked
+(`lease_changed{revoked}`) and its `accepted` work not yet `executing`
+rejected (`detail:"control revoked"`); executing work isn't cancelled. In
+compatibility mode this happens when the link re-authenticates with fewer
+permissions: the old attachment is fenced, then its lease and queued work
+are handled this way before the new attachment is welcomed.
+
+Fixtures: `r8-send-acquires-an-unowned-session`,
+`r8-send-under-the-own-lease-checks-the-epoch`,
+`r8-send-refused-while-another-holds-then-takeover`,
+`r8-two-simultaneous-sends-acquire-once`,
+`r8-ownership-is-checked-at-admission-not-as-displayed`,
+`r8-local-input-wins-over-a-send`,
+`r8-stale-takeover-confirmation-is-refused`,
+`r8-duplicate-send-never-reacquires-or-replays`,
+`r8-disconnect-right-after-acceptance`,
+`r8-failed-persistence-changes-no-lease`,
+`r8-expired-lease-is-checked-at-admission`,
+`r8-revoked-control-refuses-the-send-and-its-queued-prompt`,
+`r8-process-replaced-before-dispatch`, `r8-send-acquire-wire-rules`.
+
+### G. Lease-free approval answers (`approval.lease_free`)
+
+User decision, 2026-10-18. It replaces r7's "answering takes the lease with
+the answer (`acquire`)". Answering a permission prompt is a decision about
+that prompt, not writer coordination: it doesn't need the lease and never
+moves it.
+
+- **Payload** (strict): `{approval_id, decision, rule_id?, message?}`, as
+  r7 without `acquire`. `acquire` is refused `unsupported_version` as a
+  removed form, with no effect: in the payload (the r7 form) or beside it
+  (§F's submit field). The binding's `lease_epoch` is optional and ignored,
+  as for `approval_rule_revoke` (r7.3): a stale epoch or someone else's
+  isn't refused. chat-v1 answers (`submit` with `approval`) follow the same
+  rules.
+- **Admission**, in order: a duplicate `request_id` returns its receipt
+  (view only); `control` → `forbidden` (a verified attachment with
+  `control`; view-only ones get no card and can't answer); a session that
+  accepts work → `session_closed`; the approval pending for exactly the
+  binding's `session_id` and `process_gen`, and an `allow_always`
+  `rule_id` it offered, else `stale_target`. No lease check of any kind.
+- **Never moves the lease.** No grant, takeover, renewal or release, no
+  `lease_changed`, no `session_changed`. The holder keeps its epoch and
+  deadline, and its queued input isn't fenced. A non-holder's answer is
+  handed over like the holder's.
+- **First answer wins.** The first answer the host admits while the request
+  is pending wins. In the same step it goes `executing` and the approval
+  closes (`approval_closed{answered_remote}`, push resolved). A later
+  answer, from the holder or anyone, is `stale_target` and nothing of it is
+  recorded; so is one to a request already closed (`answered_terminal`,
+  `timed_out`, `interrupted`, `released`, `process_ended`). Holding the
+  lease gives no priority. A duplicate of the winning answer returns its
+  receipt. The terminal's own prompt still races as in r7
+  (`outcome_unknown` when both crossed).
+- **Rules** are granted only with the exact rule and scope the card showed
+  (`allow_always` names an offered `rule_id`; r7.2 unchanged). Rule revoke
+  stays r7.3: `control`, no lease, `acquire` refused.
+- Unchanged from r7: delivery to every attachment with `control` whoever
+  holds the lease, push, the receipt lifecycle, the 630 s hand-off deadline,
+  release on Codex input, restart behaviour, and lease changes never
+  closing an approval.
+
+r8 text for §6a then reads: the intro's "answering takes the lease with the
+answer (`acquire`)" becomes "answering needs `control`, never the lease"; the
+`submit` row drops `acquire?`; the payload, admission and "Acquire is
+atomic" paragraphs are replaced by the rules above; §5 "Scope" drops
+approval answers; §6's admission note on approval answers with `acquire`
+becomes "approval answers skip the lease check (§G)".
+
+Fixtures: `r8-approval-answer-by-a-non-holder-leaves-the-lease`,
+`r8-approval-answer-with-acquire-is-refused`,
+`r8-approval-answers-crossing-first-wins`,
+`r8-approval-answer-to-a-closed-request-is-stale-target`.
+
 ### E. Errors (r8 additions)
 
 | code | when |
 |---|---|
-| `unsupported_version` | also: `hello` without `revision: 8`; anything before such a `welcome`; `open.before`/`open.generation`; an op of an unadvertised feature |
-| `invalid_request` | new: a well-formed message of a known op whose fields break its rules (history selector count, field formats or lengths) |
+| `unsupported_version` | also: `hello` without `revision: 8`; anything before such a `welcome`; `open.before`/`open.generation`; an op of an unadvertised feature; `acquire` on an approval answer (§G) |
+| `invalid_request` | new: a well-formed message of a known op whose fields break its rules (history selector count, field formats or lengths; §F's `acquire`/`takeover`/`expected_controller` rules and a prompt's static checks) |
 | `stale_target` | also: a `next` token used out of its context or stale; a `before` no longer retained |
-| `busy` | also: more than 8 history requests a second in a conversation |
+| `busy` | also: more than 8 history requests a second in a conversation; an acquiring Send to a session without `chat-v1` (§F) |
+| `lease_held` | now carries `controller{controller_session, lease_epoch}` (also for §5 `acquire`); also: an acquiring Send while another holds the lease, or a takeover whose `expected_controller` is no longer the holder (§F) |
+| `forbidden` | also: a Send or approval answer from an attachment without `control`, checked before any lease state (§F, §G) |

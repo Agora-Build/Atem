@@ -1,0 +1,286 @@
+{
+ "name": "r8-process-replaced-before-dispatch",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   },
+   {
+    "name": "c2",
+    "attachment_gen": "66666666-6666-4666-8666-666666666666",
+    "permissions": [
+     "view"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "lease.lease_epoch": 1
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": 1
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "then deploy"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "lease.lease_epoch": 1
+   }
+  },
+  {
+   "replace_process": "ses-aaaaaaaaaaaa",
+   "process_gen": "88888888-8888-4888-8888-888888888888"
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "process_ended",
+    "lease_epoch": 2,
+    "controller": null
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "process_ended",
+    "lease_epoch": 2,
+    "controller": null
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "rejected",
+    "detail": "session closed"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "outcome_unknown",
+    "detail": "agent exited"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000003",
+     "kind": "prompt",
+     "payload": {
+      "text": "then deploy"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "code": "stale_target"
+   }
+  },
+  {
+   "assert": {
+    "lease_holder": null,
+    "dispatch_attempts": 1,
+    "dispatches": 1
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "88888888-8888-4888-8888-888888888888"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000004",
+     "kind": "prompt",
+     "payload": {
+      "text": "then deploy"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000004",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000004",
+    "lease.lease_epoch": 3
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000004",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": 3
+   }
+  },
+  {
+   "assert": {
+    "lease_holder": "c1",
+    "dispatch_attempts": 2,
+    "dispatches": 2
+   }
+  }
+ ],
+ "note": "The agent process is replaced while a Send is accepted but not dispatched: the lease ends (process_ended), the executing prompt becomes outcome_unknown (agent exited) and the queued one rejected (session closed), never sent to the new process. A Send naming the old process_gen is stale_target with no lease change; one naming the new process acquires as usual."
+}

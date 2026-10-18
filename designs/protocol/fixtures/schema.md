@@ -94,6 +94,17 @@ these actions.
 | `{"recover": client, "request": msg, "message_ids": [id], "min_pages": n, "max_count": c, "max_content_bytes": b, "max_wire_bytes": w, "end": {path: value}}` | sends `request` (a chat `history` or `open`), takes its page (`opened` first for an `open`; `message{history:true}`s then `history_end`), and while `page.end` is false sends `history{next}` with the same binding and conversation (page id `<page_id>-2`, …) and takes the next page. Every page: consecutive sequences, ≤ `c` messages, ≤ `b` content bytes, ≤ `w` serialized bytes (the sum of its envelopes), and no `end: true` before the last. Newest-first selections are reassembled oldest first. The messages taken equal `message_ids` exactly (no gap, no duplicate); the last `history_end` matches `end`; at least `n` pages |
 | `{"client_try": client, "json": msg, "refused": text}` | client side: the client is asked to send `msg` and must refuse locally with that reason (nothing is sent) |
 | `{"client_open_chat": client, "conversation": id, "session_id": s}` | client side: the client opens a chat (its `open` is consumed by the fixture) |
+| `{"drop": {"to": client, "op": op}}` | the next matching host→client message is lost in transit: never delivered and not expected (repeat the step to lose several) |
+| `{"set_permissions": client, "permissions": [p], "attachment_gen": uuid}` | the client's link re-authenticates with these permissions: the old attachment is fenced, a lease it held is revoked (`lease_changed{revoked}` to the other viewers) and its `accepted` work not yet executing is rejected (`control revoked`), then the harness welcomes the new attachment (§F) |
+| `{"replace_process": session_id, "process_gen": uuid}` | the agent process is replaced (restart/resume) with a new `process_gen` (`SessionHost::replace_process`) |
+
+Send and approval scenarios (`r8-send-*`, `r8-approval-*`, and the other
+§F fixtures listed below): the setup `welcome` must advertise
+`chat.send_acquire` and `approval.lease_free`. A `local_input` whose bytes
+end without CR/LF leaves unsent terminal input, so every prompt dispatched
+afterwards is refused by the adapter's draft check (`rejected`, detail `the
+terminal has unsent input; finish or clear it there`). A `receipts` reply
+lists receipts in the order of `request_ids` (unrecorded ids are omitted).
 
 New `assert` keys (r8 draft): `attachments` (live attachments on the host),
 `chat_opens` / `chat_closes` (`opened` / `close` the host sent, all
@@ -122,6 +133,24 @@ The r8 draft scenarios:
 | `r8-receipt-result-bounds-reply-message-ids` | host | `reply_message_ids` ≤ 32 + `more`, rest by `history{request_id}` |
 | `r8-history-selectors-are-exclusive-and-validated` | host | exactly one selector; formats and lengths |
 | `r8-stale-or-foreign-next-token-is-stale-target` | host | `next` bound to its context; evicted turn `unavailable`, partly evicted `partial` |
+| `r8-send-acquires-an-unowned-session` | host | §F: unowned → acquire + accept in one operation; `lease` on the reply, `granted` to viewers; chat-v1 Send under the own lease |
+| `r8-send-under-the-own-lease-checks-the-epoch` | host | ordinary submit checks `lease_epoch`; acquiring Send by the holder: same epoch, deadline not extended |
+| `r8-send-refused-while-another-holds-then-takeover` | host | `lease_held{controller}`, nothing runs; confirmed `takeover` with the same `request_id` takes over atomically |
+| `r8-two-simultaneous-sends-acquire-once` | host | first admitted acquires; second `lease_held`, nothing recorded |
+| `r8-ownership-is-checked-at-admission-not-as-displayed` | host | ownership changed after display: refused; holder gone before the takeover: plain grant |
+| `r8-local-input-wins-over-a-send` | host | local input revokes the Send's lease; queued prompt refused by the draft check |
+| `r8-stale-takeover-confirmation-is-refused` | host | `expected_controller` no longer the holder → `lease_held`, no takeover |
+| `r8-duplicate-send-never-reacquires-or-replays` | host | duplicates (any flags) return the receipt; no acquire, takeover or rerun; delayed receipt |
+| `r8-disconnect-right-after-acceptance` | host | replies lost, work runs, lease expires; receipt query then duplicate on a new attachment |
+| `r8-failed-persistence-changes-no-lease` | host | failed durable write: `busy`, no grant or takeover, nothing runs; retry is a new admission |
+| `r8-expired-lease-is-checked-at-admission` | host | expiry at admission without a timer; old epoch stale |
+| `r8-revoked-control-refuses-the-send-and-its-queued-prompt` | host | lost `control`: lease revoked, queued prompt rejected, Send `forbidden` |
+| `r8-process-replaced-before-dispatch` | host | queued Send rejected on replacement; old `process_gen` `stale_target`; new one acquires |
+| `r8-send-acquire-wire-rules` | host | field rules → `invalid_request`; `interrupt`/`stop`/`approval_rule_revoke` can't acquire |
+| `r8-approval-answer-by-a-non-holder-leaves-the-lease` | host | §G: non-holder answers (no epoch, a foreign epoch), lease unchanged; view-only `forbidden` |
+| `r8-approval-answer-with-acquire-is-refused` | host | `acquire` (payload or submit) → `unsupported_version`, no effect |
+| `r8-approval-answers-crossing-first-wins` | host | holder and non-holder cross: first admitted wins, second `stale_target` |
+| `r8-approval-answer-to-a-closed-request-is-stale-target` | host | terminal-answered, timed-out and already-answered requests → `stale_target` |
 
 Astation's API-level merge fixture (a delayed HTTP page against newer SSE
 versions) is Astation's; the host side of it is

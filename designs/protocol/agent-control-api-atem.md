@@ -9,6 +9,11 @@ contract [atem-session v1 r7.2](atem-session-v1.md), [agent chat host](../agent-
 `53577a7`; **r8** means the draft in the contract's appendix "r8 draft"
 (exact wire shapes) with the `r8-*` fixtures in `fixtures/` (parsed, not run
 until r8 ships). Nothing r8 is emitted before both sides pass its fixtures.
+Addendum 2026-10-18 (§9): two user-approved r8 features, chat Send that
+acquires the lease (`chat.send_acquire`, from Astation's "Chat Send and
+session control" handoff) and lease-free approval answers
+(`approval.lease_free`); contract appendix §F and §G, against `main` at
+`976e154` (r7.3, #76 and #77).
 
 ## 0. Answers to the r1 review
 
@@ -103,6 +108,7 @@ holds in the code:
 - Approvals reach every attachment with `control` whether or not anyone holds
   the lease. An answer may take the lease with it (`acquire: true`). The
   session inbox (`approval_request`/`approval_closed`) is authoritative (§6a).
+  In r8 answers no longer touch the lease (§9).
 - Every remote mutation is a session-v1 submission with a durable receipt
   (`FileJournal`, fsync per transition). A duplicate returns the recorded
   receipt and is never run again. A prompt's text leaves the journal when its
@@ -236,7 +242,7 @@ cause. The state names above stay as they are.
 r8, gated by `hello.revision` (appendix A, answer 0.1). Features:
 `chat.history_end`, `chat.history`, `chat.lookup`, `chat.coverage`,
 `receipt.result`, `approval.session_rules` (r7.2, shipped),
-`approval.card_reason`. A side advertises or uses a feature only after its
+`approval.card_reason`, `chat.send_acquire`, `approval.lease_free` (§9). A side advertises or uses a feature only after its
 `r8-*` fixtures pass in Rust (Atem) and Swift (Astation).
 
 ## 7. Work
@@ -251,6 +257,8 @@ r8, gated by `hello.revision` (appendix A, answer 0.1). Features:
 | A4 | `receipt.result` (journal ids with `completed`; reply ids from history, ≤ 32 + `more`) | M |
 | A5 | Card `reason`; contract r8 text replaces r7.2 parts; docs | S |
 | A6 | Fixture runner actions (schema.md "r8 draft"), drop `requires`; live check with Claude 2.1.301 and Codex 0.162.1 | M |
+| A7 | `chat.send_acquire`: submit-level `acquire`/`takeover`/`expected_controller`, admission and commit after the durable write, `lease` on the admitting reply, `controller` on `lease_held`, prompt static checks at admission, lost `control` revokes the lease and rejects queued work | M |
+| A8 | `approval.lease_free`: drop the lease check and `acquire` (refused), ignore `lease_epoch`; docs | S |
 
 **Joint fixtures** (in `fixtures/`, r8 draft, NOT RUN until r8 ships):
 `r8-hello-without-revision-8-is-refused-before-any-attachment`,
@@ -264,7 +272,15 @@ r8, gated by `hello.revision` (appendix A, answer 0.1). Features:
 `r8-backlog-hole-is-reported-not-reopened`,
 `r8-receipt-result-bounds-reply-message-ids`,
 `r8-history-selectors-are-exclusive-and-validated`,
-`r8-stale-or-foreign-next-token-is-stale-target`.
+`r8-stale-or-foreign-next-token-is-stale-target`, and for §9 the fourteen
+§F fixtures (`r8-send-*`, `r8-two-simultaneous-sends-acquire-once`,
+`r8-ownership-is-checked-at-admission-not-as-displayed`,
+`r8-local-input-wins-over-a-send`, `r8-stale-takeover-confirmation-is-refused`,
+`r8-duplicate-send-never-reacquires-or-replays`,
+`r8-disconnect-right-after-acceptance`, `r8-failed-persistence-changes-no-lease`,
+`r8-expired-lease-is-checked-at-admission`,
+`r8-revoked-control-refuses-the-send-and-its-queued-prompt`,
+`r8-process-replaced-before-dispatch`) and the four §G ones (`r8-approval-*`).
 Still to write with the implementation: card `reason`, `receipt.result`
 after a broker restart and for an interrupted turn.
 
@@ -303,3 +319,61 @@ are catch-up and must not create new alerts.
 later voice-brainstorm feature (`designs/voice-context.md`, branch
 `docs/voice-context`) can cite turns and messages by these ids without new
 host state. That feature is not designed here.
+
+## 9. Chat Send and lease-free approvals (addendum, 2026-10-18)
+
+**Chat Send (`chat.send_acquire`, appendix §F).** This answers the
+handoff's open points:
+
+- **Shape.** A `prompt` submit (or chat-v1 `submit` with `text`) carries
+  `acquire: true`, and for a confirmed takeover also `takeover: true` and
+  `expected_controller: {controller_session, lease_epoch}`, the lease the
+  dialog showed. The binding then has no `lease_epoch`. Holding the lease,
+  a client may still send the r7 form with `lease_epoch`, checked as
+  today.
+- **Transaction.** One step of the broker's single-threaded pass. It checks
+  binding, fields, duplicate, `control`, a running session with `chat-v1`,
+  then ownership at that instant (expiry applied first), the prompt's
+  static checks, limits and the epoch reservation. Then the durable
+  `accepted` write, and only then the lease grant or takeover,
+  `lease_changed` to the others, and the reply with
+  `lease{lease_epoch, ms_left}`. Any failure before the commit means no
+  lease change and no execution (`busy` for persistence; the retry may reuse
+  the id). This is today's approval-`acquire` order
+  (`lease_to_acquire` → journal append → `grant`), with the takeover made
+  explicit.
+- **Codes.** `lease_held` (now with `controller`) for another holder or a
+  stale confirmation; `stale_lease` for the same controller on another
+  attachment or a wrong `lease_epoch` in the r7 form; `forbidden` without
+  `control`, before any lease state; `invalid_request` for the field rules
+  and a prompt's static checks; `busy` for a failed durable write or a
+  session without `chat-v1`; `unsupported_version` when the feature isn't
+  advertised.
+- **Identity.** The flags are admission parameters, outside the digest and
+  the immutable request, like `lease_epoch`. A duplicate returns the
+  recorded receipt and never acquires, takes over or reruns, so the client
+  keeps one `request_id` and text from the first Send through refusal,
+  confirmation and uncertain delivery. A retry can't become
+  `request_id_reused`, which would tempt a second run.
+- **Scope.** `prompt` only. `interrupt` would act on another controller's
+  turn, the silent ownership change Send must never make. `stop` ends every
+  lease anyway. Both still need an explicit Take Control.
+- **Renewal.** Astation renews: the native app while that session's chat or
+  terminal view is in the foreground, then `release`. For an API caller,
+  renewal happens only while the caller keeps renewing; an abandoned caller
+  loses control within 15 s. The host never renews implicitly: not on chat
+  reads, queries, duplicates, a Send under the own lease, or execution.
+- **New host rule.** An attachment that loses `control` (re-authenticated
+  with fewer permissions) has its lease revoked and its not-yet-executing
+  accepted work rejected (`control revoked`). Local input still revokes,
+  and the adapter's unsent-input check still refuses a queued prompt at
+  dispatch.
+
+**Lease-free approvals (`approval.lease_free`, appendix §G).** User decision
+2026-10-18, replacing r7's answer-takes-the-lease. An answer needs a verified
+attachment with `control` and the exact pending request. It never takes,
+needs or moves the lease, and a `lease_epoch` in its binding is ignored.
+`acquire` is refused `unsupported_version` (removed form). The first
+admitted answer wins and later or closed ones are `stale_target`. Rules
+still need the exact offered rule and scope (r7.2), and revoke stays r7.3.
+Card states and push are unchanged.
