@@ -70,17 +70,18 @@ use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome, HeldRule,
 use crate::app::App;
 use crate::app::hosted::{HostedSession, refusal};
 use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
-use crate::chat::session::{Out, State as ChatState};
+use crate::chat::session::{ChatSession, Out, Role, State as ChatState};
 use crate::chat::wire::{self as chat_wire, ChatEnvelope, Inbound};
 use crate::session::{Provider, SessionId};
 use crate::session_protocol::file_journal::FileJournal;
 use crate::session_protocol::host::{
     Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
-    HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
+    HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, TurnReplies,
+    random_ids,
 };
 use crate::session_protocol::wire::{
-    self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
-    FamilyMessage, Permission, ReceiptKind, SessionState,
+    self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Coverage,
+    Envelope, FamilyMessage, Op, Permission, ReceiptKind, SessionState,
 };
 use crate::terminal_share::{FrameStream, Message as TerminalMessage};
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -492,9 +493,11 @@ impl HostBridge {
             runtime_gen: uuid::Uuid::new_v4().to_string(),
             runtime_epoch,
         };
+        let default = HostConfig::default();
         let config = HostConfig {
             wall_offset_ms: wall_ms().saturating_sub(clock.now()),
-            ..HostConfig::default()
+            receipt_result: default.receipt_result || super::test_hooks::receipt_result(),
+            ..default
         };
         SessionHost::open(ctx, config, journal, random_ids(), Some(previous_epoch))
             .map_err(|e| anyhow::anyhow!(e.0))
@@ -1018,8 +1021,11 @@ impl HostBridge {
             match effect {
                 Effect::Send {
                     attachment,
-                    message,
-                } => self.send(&attachment, &message, cx),
+                    mut message,
+                } => {
+                    fill_results(&mut message, cx);
+                    self.send(&attachment, &message, cx)
+                }
                 // A fenced attachment of this link's client: already gone.
                 // The host closed the link's own attachment without a reply
                 // (r8 §I.4: a refusal it couldn't record): the link drops at
@@ -1252,6 +1258,7 @@ impl HostBridge {
                     return Some(DispatchReport::Completed {
                         detail: Some(NO_TURN.into()),
                         turn_id: None,
+                        user_message_id: None,
                     });
                 }
                 match session.write_tagged(INTERRUPT_KEY, WriteTag::Host, not_after) {
@@ -1728,6 +1735,7 @@ impl HostBridge {
                         DispatchReport::Completed {
                             detail: None,
                             turn_id: None,
+                            user_message_id: None,
                         }
                     } else {
                         DispatchReport::Refused {
@@ -2438,9 +2446,15 @@ impl HostBridge {
                                     DETAIL_TURN_INTERRUPTED
                                 }
                             };
+                            // r8 §D: the prompt's user message, journaled
+                            // with the turn (ids only).
+                            let user_message_id = session_of(cx, sid).and_then(|s| {
+                                s.chat.user_message_of(request_id).map(str::to_string)
+                            });
                             let report = DispatchReport::Completed {
                                 detail: Some(detail.to_string()),
                                 turn_id: Some(turn_id.clone()),
+                                user_message_id,
                             };
                             let effects = self.host.dispatch_report(request_id, report);
                             self.exec(effects, cx);
@@ -2462,6 +2476,7 @@ impl HostBridge {
             let report = DispatchReport::Completed {
                 detail: None,
                 turn_id: None,
+                user_message_id: None,
             };
             let effects = self.host.dispatch_report(&request_id, report);
             self.exec(effects, cx);
@@ -2590,6 +2605,62 @@ fn link_permissions() -> Vec<Permission> {
 thread_local! {
     /// Tests: the next link attaches view-only.
     pub(super) static VIEW_ONLY_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// r8 §D: every receipt `result` in `message` gets its replies from the
+/// broker's retained chat history of the receipt's target, now (late
+/// content and eviction show; after an adoption, the worker's history).
+fn fill_results(message: &mut Envelope, cx: &mut Cx) {
+    let Envelope::Session(m) = message else {
+        return;
+    };
+    let receipts = match &mut m.op {
+        Op::Receipt(r) => std::slice::from_mut(r),
+        Op::Receipts { receipts } => receipts.as_mut_slice(),
+        _ => return,
+    };
+    for receipt in receipts {
+        let Some(result) = &receipt.result else {
+            continue;
+        };
+        let target = &receipt.target;
+        let replies = session_of(cx, &target.session_id)
+            .filter(|s| s.chat.generation() == target.process_gen)
+            .map(|s| turn_replies(&s.chat, &result.turn_id, &result.user_message_id));
+        crate::session_protocol::host::fill_result(receipt, replies);
+    }
+}
+
+/// A turn's replies in `chat`'s retained history (r8 §D, coverage as §C):
+/// its assistant messages (approval cards aside), timeline order. Complete
+/// while its user message is retained (history is evicted oldest first),
+/// partial when only later messages of it are (or an id can't be named),
+/// unavailable when nothing of it is.
+fn turn_replies(chat: &ChatSession, turn_id: &str, user_message_id: &str) -> TurnReplies {
+    let mut ids = Vec::new();
+    let mut user = false;
+    let mut any = false;
+    let mut unnamed = false;
+    for m in chat.retained().filter(|m| m.turn_id == turn_id) {
+        any = true;
+        if m.message_id == user_message_id {
+            user = true;
+        }
+        if m.role != Role::Assistant || is_card(m) {
+            continue;
+        }
+        if wire::is_opaque_id(&m.message_id) {
+            ids.push(m.message_id.clone());
+        } else {
+            unnamed = true;
+        }
+    }
+    let coverage = match (user, any) {
+        (true, _) if !unnamed => Coverage::Complete,
+        (_, true) => Coverage::Partial,
+        _ => Coverage::Unavailable,
+    };
+    TurnReplies { ids, coverage }
 }
 
 /// A chat-v1 approval card message.

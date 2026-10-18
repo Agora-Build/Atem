@@ -18,6 +18,9 @@
 //!
 //!   A fault marker is removed when it is used, and its name is appended to
 //!   `<dir>/used`.
+//! - `ATEM_TEST_RECEIPT_RESULT=1`: completed prompt receipts carry `result`
+//!   (r8 §D) before `receipt.result` is advertised, for the real-agent
+//!   tests. (In-process tests always have it.)
 
 #[cfg(debug_assertions)]
 mod imp {
@@ -55,6 +58,10 @@ mod imp {
         while hold.exists() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    pub fn receipt_result() -> bool {
+        std::env::var_os("ATEM_TEST_RECEIPT_RESULT").is_some_and(|v| v == "1")
     }
 
     pub fn take_fault(name: &str) -> bool {
@@ -102,6 +109,18 @@ pub fn fail_next_enqueue() -> bool {
 pub fn fail_next_partial() -> bool {
     #[cfg(debug_assertions)]
     return imp::take_fault("fail_next_partial");
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// Completed prompt receipts carry `result` though `receipt.result` isn't
+/// advertised yet (r8 §D): in-process tests, and debug builds asked to.
+pub fn receipt_result() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    return imp::receipt_result();
     #[cfg(not(debug_assertions))]
     false
 }

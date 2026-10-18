@@ -1496,6 +1496,7 @@ fn a_duplicate_chat_prompt_after_a_restart_keeps_its_interrupted_outcome() {
         DispatchReport::Completed {
             detail: Some(DETAIL_TURN_INTERRUPTED.into()),
             turn_id: Some("t1".into()),
+            user_message_id: None,
         },
     );
     rt.apply(fx);

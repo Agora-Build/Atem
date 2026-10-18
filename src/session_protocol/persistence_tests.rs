@@ -530,6 +530,7 @@ fn a_pending_rollback_survives_reopen_and_loses_no_records() {
         state: ReceiptState::OutcomeUnknown,
         detail: None,
         updated_at: 1,
+        result: None,
     };
     assert!(rt.host.journal_mut().append(record).is_err());
     // The rollback finally works when the process goes away.

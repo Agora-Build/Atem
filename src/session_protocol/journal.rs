@@ -40,12 +40,14 @@ pub enum Record {
         principal: String,
         control_gen: u64,
     },
-    /// A later state of a recorded request.
+    /// A later state of a recorded request. `result` only on a prompt's
+    /// `completed` (r8 §D): its turn's ids (the outcome is `detail`).
     Transition {
         request_id: String,
         state: ReceiptState,
         detail: Option<String>,
         updated_at: u64,
+        result: Option<TurnIds>,
     },
     /// — → `rejected`: a request on the refusal list whose `accepted` record
     /// never reached the disk, resolved at restart with its immutable values
@@ -75,6 +77,15 @@ pub enum Record {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalError(pub String);
+
+/// A completed prompt's turn as journaled (r8 §D): ids only, never text.
+/// Its outcome is the receipt's `detail` (`done`/`interrupted`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnIds {
+    pub turn_id: String,
+    pub user_message_id: String,
+}
 
 /// A request refused `busy` because its admission write failed (§I.2): its
 /// immutable values, never its payload.
@@ -290,6 +301,8 @@ pub struct Stored {
     pub state: ReceiptState,
     pub detail: Option<String>,
     pub updated_at: u64,
+    /// A completed prompt's turn (r8 §D).
+    pub result: Option<TurnIds>,
     /// Admission order (position of its `Accepted` record).
     pub order: u64,
     /// The submitter principal and its control generation at admission
@@ -362,6 +375,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     state: ReceiptState::Accepted,
                     detail: None,
                     updated_at,
+                    result: None,
                     order: i as u64,
                     principal,
                     control_gen,
@@ -388,6 +402,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     state: ReceiptState::Rejected,
                     detail: Some(detail),
                     updated_at,
+                    result: None,
                     order: i as u64,
                     principal: String::new(),
                     control_gen: 0,
@@ -399,6 +414,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 state,
                 detail,
                 updated_at,
+                result,
             } => {
                 let s = out
                     .receipts
@@ -410,10 +426,19 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                         s.state
                     )));
                 }
+                if result.is_some()
+                    && (state != ReceiptState::Completed || s.kind != ReceiptKind::Prompt)
+                {
+                    return Err(JournalError(format!(
+                        "a turn result on {state:?} {:?} {request_id}",
+                        s.kind
+                    )));
+                }
                 s.state = state;
                 s.payload = None;
                 s.detail = detail;
                 s.updated_at = updated_at;
+                s.result = result;
             }
             Record::Evicted { request_id } => {
                 out.receipts.remove(&request_id);
@@ -480,6 +505,7 @@ mod tests {
             state,
             detail: None,
             updated_at: 2,
+            result: None,
         }
     }
 

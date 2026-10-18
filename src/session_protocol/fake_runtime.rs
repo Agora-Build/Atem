@@ -551,6 +551,7 @@ impl<J: Journal> FakeRuntime<J> {
                             let report = DispatchReport::Completed {
                                 detail: None,
                                 turn_id: None,
+                                user_message_id: None,
                             };
                             work.extend(self.host.dispatch_report(&request_id, report));
                             work.extend(
@@ -851,6 +852,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 let report = DispatchReport::Completed {
                     detail: Some(super::host::DETAIL_TURN_DONE.into()),
                     turn_id: Some(turn_id.clone()),
+                    user_message_id: None,
                 };
                 self.host.dispatch_report(&rid, report)
             }

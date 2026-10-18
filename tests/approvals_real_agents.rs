@@ -164,6 +164,8 @@ impl Rig {
             .env("XDG_RUNTIME_DIR", &sb.run)
             .env("ASTATION_WS", &astation.url)
             .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
+            // r8 §D before `receipt.result` is advertised (debug builds).
+            .env("ATEM_TEST_RECEIPT_RESULT", "1")
             .current_dir(&sb.home)
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
@@ -394,6 +396,21 @@ impl Rig {
             m["type"] == "session" && m["data"]["re"] == id.as_str()
         })["data"]
             .clone()
+    }
+
+    /// `request_id`'s receipt through `receipt_query` (r8 §D: a completed
+    /// prompt's carries `result`).
+    fn receipt_of(&mut self, sid: &str, generation: &str, request_id: &str) -> Value {
+        let id = uuid();
+        self.send(
+            json!({"type": "session", "data": {"v": 1, "op": "receipt_query",
+            "id": id, "binding": self.binding(sid, generation), "request_ids": [request_id]}}),
+        );
+        let reply = self.wait(Duration::from_secs(10), "receipts", |m| {
+            m["type"] == "session" && m["data"]["re"] == id.as_str()
+        });
+        assert_eq!(reply["data"]["op"], "receipts", "{reply}");
+        reply["data"]["receipts"][0].clone()
     }
 
     /// The `complete` or `error` of chat request `request_id`.
@@ -758,9 +775,11 @@ fn claude_approvals_end_to_end() {
     let renewed = rig.renew(&sid, &generation, holder_epoch);
     assert_eq!(renewed["op"], "lease", "{renewed}");
     assert_eq!(renewed["binding"]["lease_epoch"], holder_epoch, "{renewed}");
-    if holder.is_object() {
-        assert_eq!(rig.descriptor(&sid).unwrap()["controller"], holder);
-    }
+    assert!(
+        holder.is_object(),
+        "no lease holder after acquire: {holder}"
+    );
+    assert_eq!(rig.descriptor(&sid).unwrap()["controller"], holder);
     let (receipt, states) = rig.receipt_final(&rid, Duration::from_secs(30));
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
     assert_eq!(rig.closed(&aid, Duration::from_secs(10)), "answered_remote");
@@ -1425,6 +1444,37 @@ fn codex_chat_end_to_end() {
         reply2.iter().map(|t| redact(t)).collect::<Vec<_>>()
     ));
     assert!(!reply2.is_empty(), "no reply for the remote prompt");
+    // r8 §D: the receipt names the turn, the user message and its replies.
+    let receipt = rig.receipt_of(&sid, &generation, &rid);
+    let result = &receipt["result"];
+    let replies: Vec<Value> = rig
+        .seen
+        .iter()
+        .filter(|m| {
+            m["type"] == "agentChat"
+                && m["data"]["op"] == "message"
+                && m["data"]["role"] == "assistant"
+                && m["data"]["turnId"] == turn2.as_str()
+        })
+        .map(|m| m["data"]["messageId"].clone())
+        .collect();
+    assert_eq!(result["turn_id"], turn2.as_str(), "{receipt}");
+    assert_eq!(result["user_message_id"], user["messageId"], "{receipt}");
+    assert_eq!(result["outcome"], "done", "{receipt}");
+    let ids = result["reply_message_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!ids.is_empty(), "{receipt}");
+    assert!(ids.iter().all(|id| replies.contains(id)), "{receipt}");
+    report.push(format!(
+        "3b receipt result: turn {} user {} replies {} ({}), more {}",
+        result["turn_id"],
+        result["user_message_id"],
+        ids.len(),
+        result["replies"],
+        result["more"]
+    ));
     assert!(rig.has(|m| m["type"] == "agentChat"
         && m["data"]["op"] == "accepted"
         && m["data"]["requestId"] == rid.as_str()));
@@ -1463,6 +1513,15 @@ fn codex_chat_end_to_end() {
     rig.activity(&sid, "ready", TURN);
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
     assert_eq!(done["outcome"], "interrupted", "{done}");
+    let interrupted = rig.receipt_of(&sid, &generation, &rid);
+    assert_eq!(
+        interrupted["result"]["outcome"], "interrupted",
+        "{interrupted}"
+    );
+    assert_eq!(
+        interrupted["result"]["turn_id"], done["turnId"],
+        "{interrupted}"
+    );
 
     // 5. /new (npm's codex: the hooks come from the real binary under the
     //    node wrapper): chat follows the new session, local and remote.

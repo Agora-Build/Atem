@@ -87,14 +87,14 @@
 //! like other work.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
-use super::journal::{self, ControlState, Journal, JournalError, Record, Refusal, Stored};
-use super::revision::{FEATURES, REVISION};
+use super::journal::{self, ControlState, Journal, JournalError, Record, Refusal, Stored, TurnIds};
+use super::revision::{FEATURES, RECEIPT_RESULT, REVISION};
 use super::wire::{
     self, Activity, AlwaysRule, ApprovalAnswer, ApprovalCloseReason, ApprovalDecision,
-    ApprovalRequest, Binding, ClientKind, Controller, DecodeError, Descriptor, Envelope, ErrorCode,
-    FamilyMessage, LeaseChangeReason, MAX_IN_FLIGHT, MAX_PROMPT_BYTES, Op, Permission, Receipt,
-    ReceiptKind, ReceiptLease, ReceiptState, RuleRevoke, SessionMessage, SessionState, Target,
-    TerminalRequest,
+    ApprovalRequest, Binding, ClientKind, Controller, Coverage, DecodeError, Descriptor, Envelope,
+    ErrorCode, FamilyMessage, LeaseChangeReason, MAX_IN_FLIGHT, MAX_PROMPT_BYTES, Op, Permission,
+    Receipt, ReceiptKind, ReceiptLease, ReceiptResult, ReceiptState, RuleRevoke, SessionMessage,
+    SessionState, Target, TerminalRequest,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -172,6 +172,10 @@ pub struct HostConfig {
     pub max_receipts_per_session: usize,
     /// Wall clock = this + the monotonic clock (display times only).
     pub wall_offset_ms: u64,
+    /// Completed prompt receipts carry `result` (r8 §D). On by default
+    /// once `receipt.result` is advertised; until then only tests turn it
+    /// on (a host never sends what it doesn't advertise).
+    pub receipt_result: bool,
 }
 
 impl Default for HostConfig {
@@ -179,6 +183,7 @@ impl Default for HostConfig {
         Self {
             max_receipts_per_session: DEFAULT_MAX_RECEIPTS,
             wall_offset_ms: 0,
+            receipt_result: FEATURES.contains(&RECEIPT_RESULT),
         }
     }
 }
@@ -369,10 +374,13 @@ pub enum ChatReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchReport {
     /// The kind's completion (§6 table) was observed; for a prompt,
-    /// `turn_id` is the provider's turn that ended.
+    /// `turn_id` is the provider's turn that ended and `user_message_id`
+    /// the prompt's user message in the chat history (r8 §D: both are
+    /// journaled with the outcome, ids only).
     Completed {
         detail: Option<String>,
         turn_id: Option<String>,
+        user_message_id: Option<String>,
     },
     /// Failed with proof that nothing reached the agent (e.g. the PTY
     /// reservation failed, the signal could not be delivered).
@@ -1150,12 +1158,36 @@ impl<J: Journal> SessionHost<J> {
             return Vec::new();
         }
         let kind = e.stored.kind;
+        let mut result = None;
         let (state, detail) = match report {
-            DispatchReport::Completed { detail, turn_id } => {
+            DispatchReport::Completed {
+                detail,
+                turn_id,
+                user_message_id,
+            } => {
+                let detail = detail.map(|d| bounded_detail(&d));
+                // r8 §D: a prompt's turn, journaled with its outcome.
+                let outcome = matches!(
+                    detail.as_deref(),
+                    Some(DETAIL_TURN_DONE | DETAIL_TURN_INTERRUPTED)
+                );
+                result = match (&turn_id, user_message_id) {
+                    (Some(t), Some(u))
+                        if kind == ReceiptKind::Prompt
+                            && outcome
+                            && wire::is_opaque_id(t)
+                            && wire::is_opaque_id(&u) =>
+                    {
+                        Some(TurnIds {
+                            turn_id: t.clone(),
+                            user_message_id: u,
+                        })
+                    }
+                    _ => None,
+                };
                 if let Some(e) = self.receipts.get_mut(request_id) {
                     e.turn_id = turn_id;
                 }
-                let detail = detail.map(|d| bounded_detail(&d));
                 (ReceiptState::Completed, detail)
             }
             DispatchReport::FailedNoEffect => (
@@ -1193,7 +1225,7 @@ impl<J: Journal> SessionHost<J> {
             ),
         };
         let no_effect = state == ReceiptState::Rejected;
-        self.finish(request_id, state, detail.as_deref());
+        self.transition_with(request_id, state, detail.as_deref(), result);
         if kind == ReceiptKind::Approval {
             let ids: Vec<String> = self
                 .approvals
@@ -1785,6 +1817,7 @@ impl<J: Journal> SessionHost<J> {
             state: ReceiptState::Rejected,
             detail: Some(DETAIL_ACCEPTANCE_NOT_CONFIRMED.into()),
             updated_at,
+            result: None,
             order,
             principal: String::new(),
             control_gen: 0,
@@ -1873,8 +1906,16 @@ impl<J: Journal> SessionHost<J> {
         self.sessions.get(session_id).map(|s| s.input_epoch)
     }
 
+    /// A receipt as sent: with `result` on a completed prompt when
+    /// `receipt.result` is on (its replies unfilled, see `fill_result`).
+    fn render(&self, s: &Stored) -> Receipt {
+        to_receipt(s, self.config.receipt_result)
+    }
+
     pub fn receipt(&self, request_id: &str) -> Option<Receipt> {
-        self.receipts.get(request_id).map(|e| to_receipt(&e.stored))
+        self.receipts
+            .get(request_id)
+            .map(|e| self.render(&e.stored))
     }
 
     /// Receipts `attachment` could read with `receipt_query` (view
@@ -2716,6 +2757,7 @@ impl<J: Journal> SessionHost<J> {
             state: ReceiptState::Accepted,
             detail: None,
             updated_at,
+            result: None,
             order,
             principal,
             control_gen,
@@ -2745,7 +2787,7 @@ impl<J: Journal> SessionHost<J> {
             (Some(_), Reply::Session(re)) => {
                 let s = &self.sessions[&sid];
                 let l = s.lease.as_ref().expect("an admitted Send holds the lease");
-                let mut receipt = to_receipt(&self.receipts[request_id].stored);
+                let mut receipt = self.render(&self.receipts[request_id].stored);
                 receipt.lease = Some(ReceiptLease {
                     lease_epoch: s.lease_epoch,
                     ms_left: l.deadline.saturating_sub(self.now),
@@ -2806,7 +2848,7 @@ impl<J: Journal> SessionHost<J> {
         let e = &self.receipts[rid];
         match reply {
             Reply::Session(re) => {
-                let receipt = to_receipt(&e.stored);
+                let receipt = self.render(&e.stored);
                 self.send(att, re, Op::Receipt(receipt));
             }
             Reply::Chat { conversation_id } => {
@@ -3264,6 +3306,17 @@ impl<J: Journal> SessionHost<J> {
     /// Persists and applies one transition, then tells the submitter.
     /// `false` (nothing changed) when the durable write fails.
     fn transition(&mut self, rid: &str, to: ReceiptState, detail: Option<&str>) -> bool {
+        self.transition_with(rid, to, detail, None)
+    }
+
+    /// `transition`, with a completed prompt's turn ids (r8 §D).
+    fn transition_with(
+        &mut self,
+        rid: &str,
+        to: ReceiptState,
+        detail: Option<&str>,
+        result: Option<TurnIds>,
+    ) -> bool {
         let Some(e) = self.receipts.get(rid) else {
             return false;
         };
@@ -3278,6 +3331,7 @@ impl<J: Journal> SessionHost<J> {
             state: to,
             detail: detail.clone(),
             updated_at,
+            result: result.clone(),
         };
         if !self.append(record) {
             return false;
@@ -3285,6 +3339,7 @@ impl<J: Journal> SessionHost<J> {
         let e = self.receipts.get_mut(rid).unwrap();
         e.stored.state = to;
         e.stored.detail = detail;
+        e.stored.result = result;
         e.stored.updated_at = updated_at;
         e.stored.payload = None;
         let kind = e.stored.kind;
@@ -3339,7 +3394,7 @@ impl<J: Journal> SessionHost<J> {
             })
             .filter_map(|rid| self.receipts.get(rid))
             .filter(|e| e.stored.target == b.target)
-            .map(|e| to_receipt(&e.stored))
+            .map(|e| self.render(&e.stored))
             .collect();
         self.send(att, re, Op::Receipts { receipts });
         Ok(())
@@ -3717,7 +3772,10 @@ fn chat_reply(e: &Entry) -> ChatReply {
         },
         ReceiptState::Completed => ChatReply::Complete {
             request_id: request_id.clone(),
-            turn_id: e.turn_id.clone(),
+            turn_id: e
+                .turn_id
+                .clone()
+                .or_else(|| s.result.as_ref().map(|r| r.turn_id.clone())),
             interrupted: s.kind == ReceiptKind::Prompt
                 && s.detail.as_deref() == Some(DETAIL_TURN_INTERRUPTED),
         },
@@ -3765,7 +3823,25 @@ pub fn code_text(code: ErrorCode) -> &'static str {
     }
 }
 
-fn to_receipt(s: &Stored) -> Receipt {
+fn to_receipt(s: &Stored, with_result: bool) -> Receipt {
+    // r8 §D: the journaled ids and outcome; the replies are the runtime's
+    // to fill from its retained history when the receipt is sent
+    // (`fill_result`), unavailable until then.
+    let result = s
+        .result
+        .as_ref()
+        .filter(|_| with_result && s.kind == ReceiptKind::Prompt)
+        .filter(|_| s.state == ReceiptState::Completed)
+        .and_then(|ids| {
+            Some(ReceiptResult {
+                turn_id: ids.turn_id.clone(),
+                user_message_id: ids.user_message_id.clone(),
+                outcome: s.detail.clone()?,
+                reply_message_ids: Vec::new(),
+                more: false,
+                replies: Coverage::Unavailable,
+            })
+        });
     Receipt {
         request_id: s.request_id.clone(),
         target: s.target.clone(),
@@ -3774,7 +3850,34 @@ fn to_receipt(s: &Stored) -> Receipt {
         detail: s.detail.clone(),
         updated_at: s.updated_at,
         lease: None,
+        result,
     }
+}
+
+/// A turn's replies as the retained history holds them (r8 §D), from the
+/// runtime's chat history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnReplies {
+    /// The turn's assistant message ids, timeline order (all of them).
+    pub ids: Vec<String>,
+    pub coverage: Coverage,
+}
+
+/// Fills `receipt.result`'s replies from `replies` (at most 32 ids, `more`
+/// when more are retained); `None` (no history for the target) leaves them
+/// unavailable.
+pub fn fill_result(receipt: &mut Receipt, replies: Option<TurnReplies>) {
+    let Some(result) = receipt.result.as_mut() else {
+        return;
+    };
+    let TurnReplies { mut ids, coverage } = replies.unwrap_or(TurnReplies {
+        ids: Vec::new(),
+        coverage: Coverage::Unavailable,
+    });
+    result.more = ids.len() > wire::MAX_REPLY_MESSAGE_IDS;
+    ids.truncate(wire::MAX_REPLY_MESSAGE_IDS);
+    result.reply_message_ids = ids;
+    result.replies = coverage;
 }
 
 /// `detail` is bounded (§1); cut at a char boundary.

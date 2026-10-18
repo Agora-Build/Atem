@@ -875,6 +875,7 @@ fn prompt_runs_to_completion_and_duplicates_return_the_receipt() {
         DispatchReport::Completed {
             detail: None,
             turn_id: None,
+            user_message_id: None,
         },
     );
     assert_eq!(receipts_of(&mut rt, "c1"), vec![st("completed", "")]);
@@ -931,6 +932,7 @@ fn trust_change_before_dispatch_rejects_and_revokes() {
         DispatchReport::Completed {
             detail: None,
             turn_id: None,
+            user_message_id: None,
         },
     );
     assert_eq!(receipts_of(&mut rt, "c1"), vec![st("completed", "")]);
@@ -1146,6 +1148,7 @@ fn crash_after_executing<J: Journal + FailFsync>(mut setup: impl FnMut() -> Fake
     rt.reconcile_answer = DispatchReport::Completed {
         detail: None,
         turn_id: None,
+        user_message_id: None,
     };
     rt.restart(GEN2, 8);
     assert_eq!(
@@ -1512,6 +1515,7 @@ fn chat_submit_results_use_chat_ops() {
         DispatchReport::Completed {
             detail: None,
             turn_id: Some("turn-7".into()),
+            user_message_id: None,
         },
     );
     let msgs = rt.take("c1");
@@ -1906,6 +1910,7 @@ fn a_restart_over_a_corrupt_journal_changes_nothing() {
             state: ReceiptState::Executing,
             detail: None,
             updated_at: 0,
+            result: None,
         })
         .unwrap();
     let before = rt.host.context().clone();
@@ -1996,4 +2001,236 @@ impl<J: Journal> AppendOk for J {
     fn append_ok(&mut self, r: Record) {
         self.append(r).unwrap();
     }
+}
+
+// ── receipt result (r8 §D) ──
+
+fn with_result() -> HostConfig {
+    HostConfig {
+        receipt_result: true,
+        ..HostConfig::default()
+    }
+}
+
+fn turn_done(detail: &str, turn: &str, user: Option<&str>) -> DispatchReport {
+    DispatchReport::Completed {
+        detail: Some(detail.into()),
+        turn_id: Some(turn.into()),
+        user_message_id: user.map(str::to_string),
+    }
+}
+
+/// A completed prompt's receipt carries its turn's `result` (ids journaled
+/// with the outcome; replies unavailable without a history) on the state
+/// change, a duplicate submit, `receipt_query` and after a restart.
+#[test]
+fn a_completed_prompt_receipt_carries_its_turns_result() {
+    let mut rt = setup_with(with_result());
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    let early = got(&mut rt, "c1");
+    assert!(early.iter().all(|r| r.get("result").is_none()), "{early:?}");
+    rt.dispatch_report(&rid(1), turn_done("done", "turn-7", Some("turn-7-u")));
+    let want = json!({"turn_id": "turn-7", "user_message_id": "turn-7-u", "outcome": "done",
+                      "reply_message_ids": [], "more": false, "replies": "unavailable"});
+    let done = only(&mut rt, "c1");
+    assert_eq!(done["state"], "completed");
+    assert_eq!(done["result"], want);
+    // Journaled: the ids with the transition, never the prompt text.
+    let records = rt.host.journal().load().unwrap();
+    let journaled = format!("{records:?}");
+    assert!(journaled.contains("turn-7-u") && !journaled.contains("run the tests"));
+    // A duplicate and a query return the same result.
+    rt.send("c1", &m);
+    assert_eq!(only(&mut rt, "c1")["result"], want);
+    let q = query(&rt, "c1", target_with(S1, 1), vec![rid(1)]);
+    rt.send("c1", &q);
+    assert_eq!(only(&mut rt, "c1")["receipts"][0]["result"], want);
+    // After an orderly restart the journal gives the same ids back.
+    rt.restart(GEN2, 8);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(serde_json::to_value(r.result).unwrap(), want);
+}
+
+#[test]
+fn an_interrupted_turn_has_the_interrupted_outcome() {
+    let mut rt = setup_with(with_result());
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    got(&mut rt, "c1");
+    rt.dispatch_report(&rid(1), turn_done("interrupted", "t9", Some("u9")));
+    let r = only(&mut rt, "c1");
+    assert_eq!(r["detail"], "interrupted");
+    assert_eq!(r["result"]["outcome"], "interrupted");
+    assert_eq!(r["result"]["turn_id"], "t9");
+}
+
+/// No `result`: an `outcome_unknown` prompt, a turn without a known user
+/// message or with ids that can't be named, other kinds, and a host
+/// without `receipt.result`.
+#[test]
+fn receipts_without_a_result() {
+    let cases: Vec<(HostConfig, &str, DispatchReport)> = vec![
+        (
+            with_result(),
+            "prompt",
+            DispatchReport::FailedAfterPossibleEffect,
+        ),
+        (with_result(), "prompt", turn_done("done", "t1", None)),
+        (
+            with_result(),
+            "prompt",
+            turn_done("done", "t 1", Some("u1")),
+        ),
+        (
+            with_result(),
+            "prompt",
+            turn_done("done", "t1", Some(&"u".repeat(129))),
+        ),
+        (
+            with_result(),
+            "prompt",
+            turn_done("no turn", "t1", Some("u1")),
+        ),
+        (
+            with_result(),
+            "interrupt",
+            turn_done("done", "t1", Some("u1")),
+        ),
+        (
+            HostConfig::default(),
+            "prompt",
+            turn_done("done", "t1", Some("u1")),
+        ),
+    ];
+    for (n, (config, kind, report)) in cases.into_iter().enumerate() {
+        let mut rt = setup_with(config);
+        let e = hold(&mut rt, "c1", S1);
+        if kind == "interrupt" {
+            // An interrupt dispatches only with a turn to stop.
+            let p = submit(&rt, "c1", S1, e, 1, "prompt");
+            rt.send("c1", &p);
+        }
+        let m = submit(&rt, "c1", S1, e, 2, kind);
+        rt.send("c1", &m);
+        got(&mut rt, "c1");
+        rt.dispatch_report(&rid(2), report);
+        let r = rt.host.receipt(&rid(2)).unwrap();
+        assert!(journal_final(r.state), "case {n}: {r:?}");
+        assert_eq!(r.result, None, "case {n}");
+        rt.send("c1", &m);
+        let msgs = got(&mut rt, "c1");
+        assert!(
+            !msgs.is_empty() && msgs.iter().all(|r| r.get("result").is_none()),
+            "case {n}"
+        );
+    }
+}
+
+fn journal_final(state: ReceiptState) -> bool {
+    super::journal::is_final(state)
+}
+
+/// A crash with the result on disk: a new host over the reopened
+/// `FileJournal` returns the same ids.
+#[test]
+fn a_reloaded_file_journal_keeps_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let mut rt = FakeRuntime::from_json_with(setup_json(), with_result(), journal);
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.dispatch_report(&rid(1), turn_done("done", "turn-7", Some("turn-7-u")));
+    let before = rt.host.receipt(&rid(1)).unwrap();
+    assert!(before.result.is_some());
+    drop(rt);
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let host = SessionHost::new(ctx(1), with_result(), journal, random_ids()).unwrap();
+    assert_eq!(host.receipt(&rid(1)).unwrap(), before);
+}
+
+/// The replies: the first 32 in timeline order, `more` when more are
+/// retained, the coverage as given; no history, unavailable.
+#[test]
+fn fill_result_bounds_the_reply_ids() {
+    let mut rt = setup_with(with_result());
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.dispatch_report(&rid(1), turn_done("done", "turn-7", Some("turn-7-u")));
+    let base = rt.host.receipt(&rid(1)).unwrap();
+    let ids = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("turn-7-a-{i:04}")).collect() };
+    for (n, more) in [(0, false), (1, false), (32, false), (33, true), (40, true)] {
+        let mut r = base.clone();
+        fill_result(
+            &mut r,
+            Some(TurnReplies {
+                ids: ids(n),
+                coverage: wire::Coverage::Complete,
+            }),
+        );
+        let res = r.result.as_ref().unwrap();
+        assert_eq!(res.reply_message_ids, ids(n.min(32)), "{n}");
+        assert_eq!(res.more, more, "{n}");
+        assert_eq!(res.replies, wire::Coverage::Complete);
+    }
+    let mut r = base.clone();
+    fill_result(&mut r, None);
+    let res = r.result.unwrap();
+    assert!(res.reply_message_ids.is_empty() && !res.more);
+    assert_eq!(res.replies, wire::Coverage::Unavailable);
+}
+
+/// §D bounds on the wire: a receipt with the largest `result` stays within
+/// 6 KiB, at most 32 reply ids and 64 receipts are accepted, and `result`
+/// belongs to a completed prompt only.
+#[test]
+fn receipt_result_wire_bounds() {
+    let id128 = |i: usize| format!("{i:0>128}");
+    let result = json!({"turn_id": id128(0), "user_message_id": id128(1),
+        "outcome": "interrupted",
+        "reply_message_ids": (0..32).map(id128).collect::<Vec<_>>(),
+        "more": true, "replies": "partial"});
+    let receipt = json!({"request_id": rid(1), "target": target_with(S1, 1), "kind": "prompt",
+        "state": "completed", "detail": "interrupted", "updated_at": 9_007_199_254_740_991u64,
+        "result": result});
+    let msg = |op: &str, body: Value| {
+        let mut data = json!({"v": 1, "op": op, "id": id()});
+        data.as_object_mut()
+            .unwrap()
+            .extend(body.as_object().unwrap().clone());
+        serde_json::to_vec(&json!({"type": "session", "data": data})).unwrap()
+    };
+    let one = msg("receipt", receipt.clone());
+    assert!(wire::decode(&one).is_ok());
+    assert!(
+        one.len() <= wire::MAX_RESULT_RECEIPT_BYTES,
+        "{} bytes",
+        one.len()
+    );
+    let bad = |edit: &dyn Fn(&mut Value)| {
+        let mut r = receipt.clone();
+        edit(&mut r);
+        wire::decode(&msg("receipt", r)).is_err()
+    };
+    assert!(bad(&|r| r["result"]["reply_message_ids"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("x"))));
+    assert!(bad(
+        &|r| r["result"]["reply_message_ids"][0] = json!(id128(0) + "0")
+    ));
+    assert!(bad(&|r| r["result"]["outcome"] = json!("done")));
+    assert!(bad(&|r| r["kind"] = json!("interrupt")));
+    assert!(bad(&|r| r["state"] = json!("outcome_unknown")));
+    assert!(bad(&|r| r["result"]["replies"] = json!("some")));
+    assert!(bad(&|r| r["result"]["extra"] = json!(1)));
+    let many = |n: usize| msg("receipts", json!({"receipts": vec![receipt.clone(); n]}));
+    let full = many(64);
+    assert!(wire::decode(&full).is_ok());
+    assert!(full.len() < wire::MAX_MESSAGE_BYTES);
+    assert!(wire::decode(&many(65)).is_err());
 }

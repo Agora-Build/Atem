@@ -35,7 +35,9 @@ pub const KNOWN_FEATURES: &[&str] = &[
 
 /// What this host implements and advertises in `welcome.features`, in
 /// order. A feature is added here only once its fixtures pass (§A): the
-/// r8 tasks extend this one list.
+/// r8 tasks extend this one list. `receipt.result` is implemented
+/// (`HostConfig::receipt_result`) but joins only with the history
+/// features its fixture needs (`r8-receipt-result-bounds-reply-message-ids`).
 pub const FEATURES: &[&str] = &[
     APPROVAL_SESSION_RULES,
     APPROVAL_CARD_REASON,

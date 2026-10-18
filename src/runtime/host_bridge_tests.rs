@@ -797,6 +797,31 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         let receipts = peer.reply(&id).await;
         assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
         assert_eq!(receipts["receipts"][0]["detail"], "done", "{receipts}");
+        // r8 §D: its turn, its user message and its replies, from history.
+        let user_message = events
+            .iter()
+            .find(|v| {
+                is_chat(v, "message")
+                    && v["data"]["role"] == "user"
+                    && v["data"]["requestId"] == request_id.as_str()
+            })
+            .unwrap()["data"]["messageId"]
+            .clone();
+        let turn = complete["data"]["turnId"].clone();
+        let mut replies: Vec<Value> = Vec::new();
+        for v in &events {
+            if is_chat(v, "message")
+                && v["data"]["role"] == "assistant"
+                && v["data"]["turnId"] == turn
+                && !replies.contains(&v["data"]["messageId"])
+            {
+                replies.push(v["data"]["messageId"].clone());
+            }
+        }
+        assert!(!replies.is_empty());
+        let want = json!({"turn_id": turn, "user_message_id": user_message, "outcome": "done",
+                          "reply_message_ids": replies, "more": false, "replies": "complete"});
+        assert_eq!(receipts["receipts"][0]["result"], want, "{receipts}");
         // The journal keeps no prompt text once the request left `accepted`.
         let journal = rt.dir.path().join("state").join("journal");
         let mut files = 0;
@@ -833,13 +858,36 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         );
         let receipts = peer.reply(&id).await;
         assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
+        // The same result: ids from the journal, replies from the adopted
+        // worker's history (once its snapshot is in).
+        let mut tries = 0;
+        let mut receipts = receipts;
+        while receipts["receipts"][0]["result"] != want && tries < 50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let id = peer.request(
+                "receipt_query",
+                json!({"binding": peer.binding(&sid, &pg, None), "request_ids": [request_id]}),
+            );
+            receipts = peer.reply(&id).await;
+            tries += 1;
+        }
+        assert_eq!(receipts["receipts"][0]["result"], want, "{receipts}");
         // The old attachment is gone: requests naming it are refused.
         let mut stale = peer.binding(&sid, &pg, None);
         stale["attachment_gen"] = Value::String(old_attachment);
         let id = peer.request("acquire", json!({"binding": stale, "takeover": false}));
         assert_eq!(peer.reply(&id).await["code"], "stale_target");
-        // The duplicate submit returns the recorded receipt; nothing is typed.
+        // A duplicate session-v1 submit returns it too.
         let lease = peer.acquire(&sid, &pg).await;
+        let mut b = peer.binding(&sid, &pg, None);
+        b["lease_epoch"] = lease.into();
+        let id = peer.request(
+            "submit",
+            json!({"binding": b, "request_id": request_id, "kind": "prompt",
+                   "payload": {"text": "run the tests"}}),
+        );
+        assert_eq!(peer.reply(&id).await["result"], want);
+        // The duplicate submit returns the recorded receipt; nothing is typed.
         let again = submit_until_complete(
             peer,
             "conv-2",
@@ -3572,4 +3620,92 @@ fn a_looping_client_gets_twenty_refusal_lines_per_window_and_a_summary() {
         assert_eq!(refused(&refusal_lines()), 20);
         rt.shutdown().await;
     });
+}
+
+// ── receipt result replies (r8 §D) ──
+
+fn message(
+    id: &str,
+    role: crate::chat::session::Role,
+    turn: &str,
+) -> crate::chat::session::ChatMessage {
+    crate::chat::session::ChatMessage {
+        message_id: id.into(),
+        role,
+        origin: None,
+        turn_id: turn.into(),
+        request_id: None,
+        created_at_ms: 0,
+        parts: vec![crate::chat::adapter::Part::Text {
+            id: "text".into(),
+            markdown: "x".into(),
+        }],
+    }
+}
+
+fn chat_with(history: Vec<crate::chat::session::ChatMessage>) -> crate::chat::session::ChatSession {
+    let mut snapshot = crate::chat::session::ChatSession::new("g".into(), 0).snapshot(0, 0);
+    snapshot.history = history;
+    crate::chat::session::ChatSession::restore("g".into(), snapshot)
+}
+
+/// A turn's replies from the retained history: its assistant messages
+/// without cards, timeline order; complete while its user message is
+/// retained, partial once it was evicted (or an id can't be named),
+/// unavailable when nothing of the turn is left.
+#[test]
+fn turn_replies_follow_the_retained_history() {
+    use crate::chat::adapter::{ApprovalCard, ApprovalCardState, Part};
+    use crate::chat::session::{MAX_HISTORY_MESSAGES, Role};
+    use crate::session_protocol::wire::Coverage;
+    let mut card = message("approval-a1", Role::Assistant, "t7");
+    card.parts = vec![Part::Approval(ApprovalCard {
+        id: "approval".into(),
+        approval_id: "a1".into(),
+        tool: "Bash".into(),
+        summary: "ls".into(),
+        always_rules: Vec::new(),
+        state: ApprovalCardState::Pending,
+        rule_id: None,
+        note: None,
+        reason: None,
+    })];
+    let history = vec![
+        message("t6-u", Role::User, "t6"),
+        message("t6-a", Role::Assistant, "t6"),
+        message("t7-u", Role::User, "t7"),
+        message("t7-a-1", Role::Assistant, "t7"),
+        card,
+        message("t7-a-2", Role::Assistant, "t7"),
+    ];
+    let chat = chat_with(history.clone());
+    let r = super::turn_replies(&chat, "t7", "t7-u");
+    assert_eq!(r.ids, vec!["t7-a-1", "t7-a-2"]);
+    assert_eq!(r.coverage, Coverage::Complete);
+    assert_eq!(
+        super::turn_replies(&chat, "t9", "t9-u").coverage,
+        Coverage::Unavailable
+    );
+
+    // Late content shows; an id that can't be named makes it partial.
+    let mut more = history.clone();
+    more.push(message("t7-a-3", Role::Assistant, "t7"));
+    more.push(message("t7 bad", Role::Assistant, "t7"));
+    let r = super::turn_replies(&chat_with(more), "t7", "t7-u");
+    assert_eq!(r.ids, vec!["t7-a-1", "t7-a-2", "t7-a-3"]);
+    assert_eq!(r.coverage, Coverage::Partial);
+
+    // Eviction (oldest first): the user message and the first reply go.
+    let mut long = vec![
+        message("t7-u", Role::User, "t7"),
+        message("t7-a-1", Role::Assistant, "t7"),
+    ];
+    for i in 0..MAX_HISTORY_MESSAGES {
+        long.push(message(&format!("t7-b-{i}"), Role::Assistant, "t7"));
+    }
+    let chat = chat_with(long);
+    let r = super::turn_replies(&chat, "t7", "t7-u");
+    assert_eq!(r.ids.len(), MAX_HISTORY_MESSAGES);
+    assert_eq!(r.ids[0], "t7-b-0");
+    assert_eq!(r.coverage, Coverage::Partial);
 }

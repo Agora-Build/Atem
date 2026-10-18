@@ -357,6 +357,21 @@ impl ChatSession {
         &self.status
     }
 
+    /// The retained history, oldest first.
+    pub fn retained(&self) -> impl Iterator<Item = &ChatMessage> {
+        self.history.iter()
+    }
+
+    /// The retained user message that carried `request_id` (a remote
+    /// prompt's), newest first.
+    pub fn user_message_of(&self, request_id: &str) -> Option<&str> {
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && m.request_id.as_deref() == Some(request_id))
+            .map(|m| m.message_id.as_str())
+    }
+
     /// `message_id` is still in the retained history of this generation (a
     /// valid `before`); `generation`, when the client names one, must be
     /// this session's.

@@ -309,6 +309,44 @@ pub struct Receipt {
         skip_serializing_if = "Option::is_none"
     )]
     pub lease: Option<ReceiptLease>,
+    /// r8 §D (`receipt.result`): only on a `completed` `prompt` receipt.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub result: Option<ReceiptResult>,
+}
+
+/// At most this many reply ids in a receipt's `result` (r8 §D).
+pub const MAX_REPLY_MESSAGE_IDS: usize = 32;
+/// A receipt with `result` stays within this (r8 §D).
+pub const MAX_RESULT_RECEIPT_BYTES: usize = 6 * 1024;
+
+/// How much of a selection the retained history holds (r8 §C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+/// A completed prompt's turn (r8 §D). `turn_id`, `user_message_id` and
+/// `outcome` (equal to the receipt's `detail`) are journaled; the replies
+/// are worked out from the retained history each time it is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptResult {
+    pub turn_id: String,
+    pub user_message_id: String,
+    pub outcome: String,
+    /// The turn's assistant messages, timeline order, at most 32.
+    pub reply_message_ids: Vec<String>,
+    /// More replies are retained than listed.
+    pub more: bool,
+    /// The turn's coverage in the retained history.
+    pub replies: Coverage,
 }
 
 /// The lease an admitting Send's reply carries (r8 §F).
@@ -837,6 +875,27 @@ impl Receipt {
             safe(l.lease_epoch, "lease.lease_epoch")?;
             safe(l.ms_left, "lease.ms_left")?;
         }
+        if let Some(r) = &self.result {
+            check(
+                self.kind == ReceiptKind::Prompt && self.state == ReceiptState::Completed,
+                "result on a receipt other than a completed prompt",
+            )?;
+            check(is_opaque_id(&r.turn_id), "result.turn_id")?;
+            check(is_opaque_id(&r.user_message_id), "result.user_message_id")?;
+            check(
+                matches!(r.outcome.as_str(), "done" | "interrupted")
+                    && self.detail.as_deref() == Some(r.outcome.as_str()),
+                "result.outcome",
+            )?;
+            check(
+                r.reply_message_ids.len() <= MAX_REPLY_MESSAGE_IDS,
+                "result.reply_message_ids count",
+            )?;
+            check(
+                r.reply_message_ids.iter().all(|id| is_opaque_id(id)),
+                "result.reply_message_ids",
+            )?;
+        }
         safe(self.updated_at, "updated_at")
     }
 }
@@ -1024,7 +1083,11 @@ impl Op {
                 check(request_ids.len() <= MAX_REQUEST_IDS, "request_ids count")?;
                 request_ids.iter().try_for_each(|r| uuid(r, "request_id"))
             }
-            Op::Receipts { receipts } => receipts.iter().try_for_each(Receipt::validate),
+            Op::Receipts { receipts } => {
+                // r8 §D: as many as a `receipt_query` may name.
+                check(receipts.len() <= MAX_REQUEST_IDS, "receipts count")?;
+                receipts.iter().try_for_each(Receipt::validate)
+            }
             Op::ApprovalRequest(r) => r.validate(),
             Op::ApprovalClosed { approval_id, .. } => uuid(approval_id, "approval_id"),
             Op::ApprovalRules {

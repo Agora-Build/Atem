@@ -61,7 +61,7 @@
 //! Prompt payloads are user content: the files are private and nothing here
 //! logs a payload.
 
-use super::journal::{self, Journal, JournalError, Record, Refusal};
+use super::journal::{self, Journal, JournalError, Record, Refusal, TurnIds};
 use super::wire::{self, ReceiptKind, ReceiptState, Target};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,6 +180,9 @@ enum Disk {
         state: ReceiptState,
         detail: Option<String>,
         updated_at: u64,
+        /// r8 §D: a completed prompt's turn ids.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<TurnIds>,
     },
     Evicted {
         seq: u64,
@@ -236,12 +239,14 @@ impl Disk {
                 state,
                 detail,
                 updated_at,
+                result,
             } => Disk::Transition {
                 seq,
                 request_id,
                 state,
                 detail,
                 updated_at,
+                result,
             },
             Record::Evicted { request_id } => Disk::Evicted { seq, request_id },
             Record::LeaseEpochs {
@@ -306,6 +311,7 @@ impl Disk {
                 state,
                 detail,
                 updated_at,
+                result,
             } => (
                 seq,
                 Record::Transition {
@@ -313,6 +319,7 @@ impl Disk {
                     state,
                     detail,
                     updated_at,
+                    result,
                 },
             ),
             Disk::Evicted { seq, request_id } => (seq, Record::Evicted { request_id }),
@@ -1146,24 +1153,26 @@ impl FileJournal {
                     control_gen: s.control_gen,
                 },
             )?);
-            let mut step = |state: ReceiptState, detail: Option<String>| {
-                encode(
-                    seq,
-                    Record::Transition {
-                        request_id: s.request_id.clone(),
-                        state,
-                        detail,
-                        updated_at: s.updated_at,
-                    },
-                )
-                .map(|line| out.extend(line))
-            };
+            let mut step =
+                |state: ReceiptState, detail: Option<String>, result: Option<TurnIds>| {
+                    encode(
+                        seq,
+                        Record::Transition {
+                            request_id: s.request_id.clone(),
+                            state,
+                            detail,
+                            updated_at: s.updated_at,
+                            result,
+                        },
+                    )
+                    .map(|line| out.extend(line))
+                };
             match s.state {
                 ReceiptState::Accepted => {}
-                ReceiptState::Executing | ReceiptState::Rejected => step(s.state, s.detail)?,
+                ReceiptState::Executing | ReceiptState::Rejected => step(s.state, s.detail, None)?,
                 final_state => {
-                    step(ReceiptState::Executing, None)?;
-                    step(final_state, s.detail)?;
+                    step(ReceiptState::Executing, None, None)?;
+                    step(final_state, s.detail, s.result)?;
                 }
             }
         }

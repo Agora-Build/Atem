@@ -36,6 +36,7 @@ fn to(id: &str, state: ReceiptState, at: u64) -> Record {
         state,
         detail: Some(format!("d{at}")),
         updated_at: at,
+        result: None,
     }
 }
 
@@ -581,4 +582,56 @@ fn a_crash_during_compaction_leaves_a_valid_log() {
         );
         assert_eq!(state(j.load().unwrap()), mem_state(&records), "{fault:?}");
     }
+}
+
+/// r8 §D: a completed prompt's turn ids survive a reload and compaction,
+/// and nothing but ids and the outcome word reaches the disk.
+#[test]
+fn a_completed_prompts_turn_ids_survive_reload_and_compaction() {
+    use crate::session_protocol::journal::TurnIds;
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    let ids = TurnIds {
+        turn_id: "turn-7".into(),
+        user_message_id: "turn-7-u".into(),
+    };
+    j.append(accepted("a", S1, SECRET)).unwrap();
+    j.append(to("a", ReceiptState::Executing, 2)).unwrap();
+    j.append(Record::Transition {
+        request_id: "a".into(),
+        state: ReceiptState::Completed,
+        detail: Some("done".into()),
+        updated_at: 3,
+        result: Some(ids.clone()),
+    })
+    .unwrap();
+    let result_of = |j: &FileJournal| {
+        let r = crate::session_protocol::journal::replay(j.load().unwrap()).unwrap();
+        r.receipts["a"].result.clone()
+    };
+    assert_eq!(result_of(&j), Some(ids.clone()));
+    drop(j);
+    let mut j = open(&sd(&dir));
+    assert_eq!(result_of(&j), Some(ids.clone()));
+    j.compact_all().unwrap();
+    let s1 = text(&log(&sd(&dir), S1));
+    assert!(s1.contains("\"turn-7-u\"") && !s1.contains(SECRET), "{s1}");
+    drop(j);
+    let j = open(&sd(&dir));
+    assert_eq!(result_of(&j), Some(ids));
+}
+
+/// A turn result on anything but a completed prompt is a corrupt journal.
+#[test]
+fn a_turn_result_off_a_completed_prompt_is_not_trusted() {
+    use crate::session_protocol::journal::{TurnIds, replay};
+    let ids = Some(TurnIds {
+        turn_id: "t".into(),
+        user_message_id: "u".into(),
+    });
+    let mut executing = to("a", ReceiptState::Executing, 2);
+    if let Record::Transition { result, .. } = &mut executing {
+        *result = ids;
+    }
+    assert!(replay(vec![accepted("a", S1, "x"), executing]).is_err());
 }
