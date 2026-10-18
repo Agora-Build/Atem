@@ -82,6 +82,15 @@ pub const R8_FIXTURE_NEEDS: &[(&str, &[&str])] = &[
     ("r8-approval-answer-with-acquire-is-refused", SEND),
     ("r8-approval-answers-crossing-first-wins", SEND),
     (
+        "r8-approval-card-carries-the-close-reason",
+        &[
+            CHAT_HISTORY_END,
+            APPROVAL_CARD_REASON,
+            CHAT_SEND_ACQUIRE,
+            APPROVAL_LEASE_FREE,
+        ],
+    ),
+    (
         "r8-approval-late-answer-after-push-resolved-is-stale-target",
         SEND,
     ),

@@ -3830,7 +3830,7 @@ pub fn code_text(code: ErrorCode) -> &'static str {
         ErrorCode::Forbidden => "not permitted",
         ErrorCode::StaleTarget => "the session changed; list again",
         ErrorCode::UnknownSession => "unknown session",
-        ErrorCode::LeaseHeld => "another controller holds control",
+        ErrorCode::LeaseHeld => "another controller holds this session",
         ErrorCode::StaleLease => "control lease is not current",
         ErrorCode::RequestIdReused => "request id already used",
         ErrorCode::ReceiptLimit => "too many requests for this session",

@@ -1910,6 +1910,11 @@ mod tests {
                 "page.coverage",
                 json!("complete"),
             ),
+            (
+                "r8-approval-card-carries-the-close-reason",
+                "parts.0.reason",
+                json!("timed_out"),
+            ),
         ];
         for (name, key, to) in mutations {
             let mut f = fixture(name);

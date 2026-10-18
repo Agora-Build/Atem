@@ -1,0 +1,333 @@
+{
+ "name": "r8-approval-card-carries-the-close-reason",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000000"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000000",
+    "sessions.#": 1
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 1,
+    "page.count": 0,
+    "page.end": true
+   }
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "npm test"
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "tool": "Bash",
+    "summary": "npm test"
+   },
+   "capture": {
+    "a1": "approval_id"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 2,
+    "messageId": "approval-${a1}",
+    "parts.#": 1,
+    "parts.0.kind": "approval",
+    "parts.0.state": "pending"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${a1}",
+      "decision": "allow_once"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted",
+    "kind": "approval"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a1}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 3,
+    "messageId": "approval-${a1}",
+    "parts.#": 1,
+    "parts.0.kind": "approval",
+    "parts.0.state": "allowed",
+    "parts.0.reason": "answered_remote"
+   }
+  },
+  {
+   "approval_applied": "${a1}",
+   "ok": true
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "completed"
+   }
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "npm run lint"
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "tool": "Bash",
+    "summary": "npm run lint"
+   },
+   "capture": {
+    "a2": "approval_id"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 4,
+    "messageId": "approval-${a2}",
+    "parts.#": 1,
+    "parts.0.kind": "approval",
+    "parts.0.state": "pending"
+   }
+  },
+  {
+   "close_approval": "${a2}",
+   "reason": "answered_terminal"
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a2}",
+    "reason": "answered_terminal"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 5,
+    "messageId": "approval-${a2}",
+    "parts.#": 1,
+    "parts.0.kind": "approval",
+    "parts.0.state": "answered_terminal",
+    "parts.0.reason": "answered_terminal"
+   }
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "npm run build"
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "tool": "Bash",
+    "summary": "npm run build"
+   },
+   "capture": {
+    "a3": "approval_id"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 6,
+    "messageId": "approval-${a3}",
+    "parts.#": 1,
+    "parts.0.kind": "approval",
+    "parts.0.state": "pending"
+   }
+  },
+  {
+   "close_approval": "${a3}",
+   "reason": "interrupted"
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a3}",
+    "reason": "interrupted"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 7,
+    "messageId": "approval-${a3}",
+    "parts.#": 1,
+    "parts.0.kind": "approval",
+    "parts.0.state": "closed",
+    "parts.0.reason": "interrupted"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 1000
+  },
+  {
+   "assert": {
+    "approvals_pending": 0,
+    "lease_holder": null,
+    "approval_decisions": [
+     {
+      "approval_id": "${a1}",
+      "decision": "allow_once"
+     }
+    ]
+   }
+  }
+ ],
+ "note": "approval.card_reason: a pending card has no reason; every final card carries reason, the approval_closed reason of its approval. Answered remotely (lease-free, nobody holds the lease): the card says what was decided (allowed) with reason answered_remote. Answered in the agent's own dialog: answered_terminal with reason answered_terminal. Interrupted: closed with reason interrupted. Each version is a new message in the conversation's sequenced stream; nothing grants the lease."
+}

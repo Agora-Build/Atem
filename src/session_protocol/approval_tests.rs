@@ -1618,7 +1618,7 @@ fn a_chat_send_names_the_holder_then_takes_over_when_confirmed() {
         [ChatReply::Error {
             request_id: Some(rid(1)),
             code: "lease_held".into(),
-            text: "another controller holds control".into(),
+            text: "another controller holds this session".into(),
             sequenced: true,
             controller: Some(holder.clone()),
             page_id: None,

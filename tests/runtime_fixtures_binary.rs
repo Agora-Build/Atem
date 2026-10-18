@@ -38,6 +38,14 @@
 //!   `answered_terminal`: the user allows it in the agent's own dialog (the
 //!   tool runs); `approval_applied` with `ok: true`: nothing to do, the agent
 //!   acts on the decision its hook got by itself.
+//! - `chat_history`/`chat_message`/`chat_turn` (local origin): the fake
+//!   Claude appends the messages to its transcript as Claude Code writes
+//!   them (`transcript-<n>.jsonl`; no hook runs, so the chat status stays as
+//!   it is); after `chat_history` the harness waits until a probe
+//!   conversation's newest page holds them (the probe never reaches the
+//!   client or the counters). `expect_live` and `recover` work as in the
+//!   core runner; `chat_opens`/`chat_closes`/`chat_conversations` count the
+//!   `opened`/`close` the link carried (and the client's own `close`).
 //!
 //! Not honoured (the scenario is reported, with the reason, and not run):
 //! more than one client (the runtime holds one Astation link, so one
@@ -47,7 +55,12 @@
 //! journal faults in the real runtime), `set_permissions` (the link's one
 //! principal always has `control`), `drop`, `replace_process`,
 //! `change_trust_gen`, `approval_rules` (session
-//! rules come only from a Codex session), and approval closes other
+//! rules come only from a Codex session), `chat_evict` (retention evicts
+//! only past 500 messages / 8 MiB), `worker_gap` (no backlog fault in the
+//! worker), `chat_turn` of a remote prompt (the real adapter's status events
+//! around the turn are sequenced too), a later version of a chat message
+//! (the runtime sends the appended part as a `delta`, the fixtures the whole
+//! message), and approval closes other
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
 //! false`. An `r8-*` scenario runs once the host work it needs is
 //! implemented (`src/session_protocol/revision.rs`, shared with the core
@@ -196,6 +209,11 @@ struct Session {
     real_id: String,
     chat: bool,
     dir: PathBuf,
+    /// `transcript-<n>.jsonl` files handed to the fake agent so far.
+    transcribed: usize,
+    /// Parts written per assistant message id (a later version of the
+    /// message adds only its new parts).
+    parts: HashMap<String, usize>,
 }
 
 /// A tool call the fake agent asked for (`ask-<n>.json`).
@@ -421,6 +439,17 @@ struct Host {
     receipts_seen: Vec<String>,
     /// The current link was welcomed (its one attachment).
     welcomed: bool,
+    /// agentChat `opened`/`close` the link carried, and the conversations
+    /// open on it (the client's own `close` ends one too).
+    chat_opens: u64,
+    chat_closes: u64,
+    conversations: Vec<String>,
+    /// The harness's probe of the history: its page so far and its end.
+    probe_page: Vec<Value>,
+    probed: Option<Value>,
+    /// The scenario opens a chat: the fake Claude's tool calls write no
+    /// tool_use message (the fixture's conversation has none).
+    quiet_asks: bool,
 }
 
 fn replace_strings(v: &mut Value, pairs: &[(String, String)], forward: bool) {
@@ -517,6 +546,7 @@ fn unsupported(scenario: &Value) -> Option<String> {
             "{clients} clients: the runtime holds one Astation link, so one attachment at a time"
         ));
     }
+    let mut written: Vec<&Value> = Vec::new();
     for step in scenario["steps"].as_array().into_iter().flatten() {
         for (action, why) in [
             (
@@ -549,25 +579,43 @@ fn unsupported(scenario: &Value) -> Option<String> {
                 "session rules come from a Codex session's allow_always (the fixture agent is Claude); covered by the core harness and the real-agent Codex test",
             ),
             (
-                "chat_history",
-                "the fake agent's transcript can't hold the fixture's messages (ids, text); history paging is covered by the core harness and host_bridge_tests",
-            ),
-            (
-                "chat_message",
-                "the fake agent's transcript can't produce the fixture's messages",
-            ),
-            (
                 "chat_evict",
-                "retention evicts only past 500 messages / 8 MiB",
+                "the real chat session evicts only past 500 messages / 8 MiB, which would put hundreds of messages the fixture doesn't name into its pages; covered by the core harness and chat::history tests",
             ),
-            ("chat_turn", "the fake agent writes one reply per prompt"),
             (
                 "worker_gap",
-                "no backlog fault in the real worker; covered by the core harness and broker_tests",
+                "no backlog fault in the real worker (its backlog drops only past 4096 items / 8 MiB, and its reload then finds everything); covered by the core harness and broker_tests",
             ),
         ] {
             if step.get(action).is_some() {
                 return Some(format!("{action}: {why}"));
+            }
+        }
+        if step.get("chat_turn").is_some() && step.get("request_id").is_some() {
+            return Some("chat_turn of a remote prompt: the real Claude adapter sends status working, then ready, in the conversation around the prompt's turn (UserPromptSubmit, Stop), sequenced events the fixture's sequence numbers don't model; receipt.result is covered by the core harness, host_bridge_tests and the real-agent Codex test".into());
+        }
+        let content = step
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .chain(step.get("message"));
+        for m in content {
+            if written.contains(&&m["messageId"]) {
+                return Some(format!(
+                    "{}: a later version of a message reaches the real runtime's conversations as chat-v1 delta{{part}} (one per appended part), where the fixture expects the whole message again; covered by the core harness",
+                    m["messageId"]
+                ));
+            }
+            written.push(&m["messageId"]);
+            let text = m["parts"]
+                .as_array()
+                .is_some_and(|p| p.iter().all(|p| p["kind"] == "text"));
+            if !text || (m["role"] == "user" && m["origin"] != "local") {
+                return Some(format!(
+                    "{}: only local user messages and text parts can be written to the transcript",
+                    m["messageId"]
+                ));
             }
         }
         let reason = step["reason"].as_str().unwrap_or_default();
@@ -648,6 +696,8 @@ impl Host {
                 real_id,
                 chat,
                 dir,
+                transcribed: 0,
+                parts: HashMap::new(),
             });
         }
         let mut me = Self {
@@ -675,6 +725,16 @@ impl Host {
             pushes: Vec::new(),
             receipts_seen: Vec::new(),
             welcomed: false,
+            chat_opens: 0,
+            chat_closes: 0,
+            conversations: Vec::new(),
+            probe_page: Vec::new(),
+            probed: None,
+            quiet_asks: scenario["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|s| s["json"]["type"] == "agentChat" && s["json"]["data"]["op"] == "open"),
         };
         me.wait_sessions_ready()?;
         let attachment = me.client_setup["attachment_gen"]
@@ -878,8 +938,30 @@ impl Host {
             return;
         }
         let data = &value["data"];
+        let conversation = data["conversationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if family == "agentChat" && conversation.starts_with(PROBE) {
+            // The harness's own look at the history (`chat_history`).
+            if op == "history_end" {
+                self.probed = Some(data.clone());
+            } else if op == "message" {
+                self.probe_page.push(data.clone());
+            }
+            return;
+        }
         let id = data["approval_id"].as_str().unwrap_or_default().to_string();
         match (family.as_str(), op.as_str()) {
+            ("agentChat", "opened") => {
+                self.chat_opens += 1;
+                self.conversations.retain(|c| *c != conversation);
+                self.conversations.push(conversation);
+            }
+            ("agentChat", "close") => {
+                self.chat_closes += 1;
+                self.conversations.retain(|c| *c != conversation);
+            }
             ("session", "approval_request") if !self.approvals_opened.contains(&id) => {
                 self.approvals_opened.push(id)
             }
@@ -937,6 +1019,10 @@ impl Host {
 
     fn send(&mut self, json: &Value) {
         let mut message = json.clone();
+        if message["type"] == "agentChat" && message["data"]["op"] == "close" {
+            let conversation = &message["data"]["conversationId"];
+            self.conversations.retain(|c| conversation != c.as_str());
+        }
         if message["type"] == "terminal" && message["data"]["op"] == "input" {
             let sid = message["data"]["terminal_id"].as_str().unwrap_or_default();
             let real = self.real(sid);
@@ -1082,6 +1168,40 @@ impl Host {
                 std::fs::write(dir.join("complete"), turn).unwrap();
             }
             "open_approval" => self.open_approval(arg, step)?,
+            "chat_history" => {
+                let session = arg.as_str().unwrap_or_default().to_string();
+                let messages = step["messages"].as_array().ok_or("messages")?.clone();
+                self.transcribe(&session, &messages)?;
+                self.probe(&session, &messages)?;
+            }
+            "chat_message" => {
+                let session = arg.as_str().unwrap_or_default().to_string();
+                self.transcribe(&session, &[step["message"].clone()])?;
+            }
+            "chat_turn" => {
+                let session = arg.as_str().unwrap_or_default().to_string();
+                let turn = step["turn_id"].as_str().ok_or("turn_id")?;
+                let n = step["assistant_messages"]
+                    .as_u64()
+                    .ok_or("assistant_messages")?;
+                let bytes = step["text_bytes"].as_u64().ok_or("text_bytes")? as usize;
+                let fill = if step["escape"] == "control" {
+                    '\u{1}'
+                } else {
+                    'x'
+                };
+                let text: String = std::iter::repeat_n(fill, bytes).collect();
+                let at = 1_760_600_000_000u64;
+                let mut messages = vec![json!({"messageId": format!("{turn}-u"), "role": "user",
+                    "turnId": turn, "createdAt": at, "origin": step["origin"],
+                    "parts": [{"id": "p1", "kind": "text", "markdown": format!("prompt {turn}")}]})];
+                for k in 1..=n {
+                    messages.push(json!({"messageId": format!("{turn}-a-{k:04}"),
+                        "role": "assistant", "turnId": turn, "createdAt": at,
+                        "parts": [{"id": "p1", "kind": "text", "markdown": text}]}));
+                }
+                self.transcribe(&session, &messages)?;
+            }
             "close_approval" => {
                 let ask = self.ask(arg.as_str().unwrap_or_default())?;
                 let what = match step["reason"].as_str() {
@@ -1130,7 +1250,7 @@ impl Host {
         }
         let n = self.asks.len() + 1;
         let request = json!({"tool_name": tool, "tool_input": {"command": summary},
-                             "permission_suggestions": suggestions});
+                             "permission_suggestions": suggestions, "quiet": self.quiet_asks});
         let temp = dir.join(format!("tmp-ask-{n}"));
         std::fs::write(&temp, request.to_string()).unwrap();
         std::fs::rename(&temp, dir.join(format!("ask-{n}.json"))).unwrap();
@@ -1177,6 +1297,231 @@ impl Host {
             suggestions,
             rule_ids,
         });
+        Ok(())
+    }
+
+    /// Chat content the fixture names, written to the Claude session's
+    /// transcript by the fake agent (no hook runs, so the chat status stays
+    /// as it is), as Claude Code writes it: a user message is a user entry
+    /// (`uuid` = message id, `promptId` = turn id); an assistant message is
+    /// an entry with `message.id` = message id and one text block per part
+    /// (a later version adds an entry with its new parts).
+    fn transcribe(&mut self, fixture: &str, messages: &[Value]) -> Result<(), String> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.fixture_id == fixture)
+            .ok_or(format!("unknown session {fixture}"))?;
+        if !session.chat {
+            return Err("chat content needs the Claude session".into());
+        }
+        let mut lines = String::new();
+        for m in messages {
+            let id = m["messageId"].as_str().ok_or("messageId")?;
+            let turn = m["turnId"].as_str().ok_or("turnId")?;
+            let stamp = rfc3339(m["createdAt"].as_u64().ok_or("createdAt")?);
+            let mut texts = Vec::new();
+            for part in m["parts"].as_array().ok_or("parts")? {
+                if part["kind"] != "text" {
+                    return Err(format!("{id}: only text parts can be written"));
+                }
+                texts.push(part["markdown"].as_str().ok_or("markdown")?.to_string());
+            }
+            let entry = match m["role"].as_str() {
+                Some("user") if m["origin"] == "local" => {
+                    json!({"type": "user", "uuid": id, "promptId": turn, "timestamp": stamp,
+                           "message": {"role": "user", "content": texts.join("\n")}})
+                }
+                Some("assistant") => {
+                    let written = session.parts.entry(id.to_string()).or_insert(0);
+                    if *written >= texts.len() {
+                        continue;
+                    }
+                    let blocks: Vec<Value> = texts[*written..]
+                        .iter()
+                        .map(|t| json!({"type": "text", "text": t}))
+                        .collect();
+                    let uuid = format!("{id}.{written}");
+                    *written = texts.len();
+                    json!({"type": "assistant", "uuid": uuid, "promptId": turn, "timestamp": stamp,
+                           "message": {"id": id, "role": "assistant", "content": blocks}})
+                }
+                _ => return Err(format!("{id}: only local user and assistant messages")),
+            };
+            lines.push_str(&entry.to_string());
+            lines.push('\n');
+        }
+        session.transcribed += 1;
+        let (n, dir) = (session.transcribed, session.dir.clone());
+        let temp = dir.join(format!("tmp-transcript-{n}"));
+        std::fs::write(&temp, lines).unwrap();
+        std::fs::rename(&temp, dir.join(format!("transcript-{n}.jsonl"))).unwrap();
+        let deadline = Instant::now() + WAIT;
+        let done = format!("transcribed {n}\n");
+        while !std::fs::read_to_string(dir.join("events")).is_ok_and(|e| e.contains(&done)) {
+            if Instant::now() > deadline {
+                return Err(format!("the fake agent never wrote transcript {n}"));
+            }
+            self.pump(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
+    /// Waits until the runtime's history holds `messages` (the newest
+    /// page of a probe conversation, closed after; nothing of it reaches
+    /// the client or the counters): the worker reads the transcript on its
+    /// own schedule.
+    fn probe(&mut self, fixture: &str, messages: &[Value]) -> Result<(), String> {
+        let Some(last) = messages.last() else {
+            return Ok(());
+        };
+        let session = self.session(fixture)?;
+        let binding = self.binding(session);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let conversation = format!("{PROBE}{}", uuid());
+            self.probe_page.clear();
+            self.probed = None;
+            self.send(&json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+                "conversationId": conversation, "agentId": fixture, "binding": binding}}));
+            while self.probed.is_none() {
+                if Instant::now() > deadline {
+                    return Err("the probe's page never came".into());
+                }
+                self.pump(Duration::from_millis(50));
+            }
+            self.send(&json!({"type": "agentChat", "data": {"v": 1, "op": "close",
+                "conversationId": conversation, "agentId": fixture}}));
+            let parts = last["parts"].as_array().map_or(0, Vec::len);
+            let held = self.probe_page.iter().any(|m| {
+                m["messageId"] == last["messageId"]
+                    && m["parts"].as_array().is_some_and(|p| p.len() >= parts)
+            });
+            if held {
+                self.pump(SETTLE);
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!("the history never held {}", last["messageId"]));
+            }
+            self.pump(Duration::from_millis(200));
+        }
+    }
+
+    /// The next agentChat message (whole, fixture identifiers).
+    fn next_chat(&mut self) -> Result<Value, String> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(i) = self.queue.iter().position(|m| m["type"] == "agentChat") {
+                return Ok(self.queue.remove(i).unwrap());
+            }
+            if Instant::now() > deadline {
+                return Err("the page ended early".into());
+            }
+            self.pump(Duration::from_millis(50));
+        }
+    }
+
+    /// r8 `recover` (as the core runner does it): sends `request`, takes
+    /// its pages following each `history_end`'s `next` until `end`, checks
+    /// each page's sequences and bounds; the messages must be
+    /// `message_ids` exactly.
+    fn recover(&mut self, step: &Map<String, Value>) -> Result<(), String> {
+        let request = step["request"].clone();
+        let data = request["data"].clone();
+        let want = step["message_ids"].clone();
+        let num = |k: &str| step[k].as_u64().ok_or(format!("{k}"));
+        let (min_pages, max_count) = (num("min_pages")?, num("max_count")?);
+        let (max_content, max_wire) = (num("max_content_bytes")?, num("max_wire_bytes")?);
+        let base = data["page_id"].as_str().unwrap_or("open").to_string();
+        self.send(&request);
+        let mut generation = data.get("generation").cloned();
+        if data["op"] == "open" {
+            let opened = self.expect(
+                Some("agentChat"),
+                json!({"op": "opened"}).as_object().unwrap(),
+            )?;
+            if opened["sequence"] != 0 {
+                return Err(format!("opened at {}", opened["sequence"]));
+            }
+            generation = opened.get("generation").cloned();
+        }
+        let mut pages: Vec<Vec<Value>> = Vec::new();
+        let mut backwards;
+        loop {
+            let mut ids = Vec::new();
+            let (mut content, mut wire) = (0u64, 0u64);
+            let mut sequence: Option<u64> = None;
+            let end = loop {
+                let msg = self.next_chat()?;
+                wire += serde_json::to_vec(&msg).map_or(0, |v| v.len()) as u64;
+                let d = &msg["data"];
+                let seq = d["sequence"].as_u64().ok_or(format!("unsequenced {msg}"))?;
+                if sequence.is_some_and(|s| seq != s + 1) {
+                    return Err(format!("sequence {seq} after {sequence:?}"));
+                }
+                sequence = Some(seq);
+                match d["op"].as_str() {
+                    Some("message") if d["history"] == true => {
+                        ids.push(d["messageId"].clone());
+                        content += content_bytes(d);
+                    }
+                    Some("history_end") => break d.clone(),
+                    _ => return Err(format!("not part of a page: {msg}")),
+                }
+            };
+            let page = &end["page"];
+            if page["count"] != ids.len() {
+                return Err(format!(
+                    "page.count {} for {} messages",
+                    page["count"],
+                    ids.len()
+                ));
+            }
+            if ids.len() as u64 > max_count || content > max_content || wire > max_wire {
+                return Err(format!(
+                    "page {} over its bounds: {} messages, {content} content bytes, {wire} wire bytes",
+                    pages.len() + 1,
+                    ids.len()
+                ));
+            }
+            backwards = matches!(page["selector"].as_str(), Some("newest" | "before"));
+            pages.push(ids);
+            if page["end"] == true {
+                for (path, expected) in step["end"].as_object().ok_or("end")? {
+                    let got = lookup(&end, path);
+                    if got.as_ref() != Some(expected) {
+                        return Err(format!(
+                            "last history_end {path}: expected {expected}, got {got:?}"
+                        ));
+                    }
+                }
+                break;
+            }
+            let next = page["next"].as_str().ok_or("no next before the end")?;
+            let mut more = json!({"v": 1, "op": "history",
+                "conversationId": data["conversationId"], "agentId": data["agentId"],
+                "generation": generation.clone().unwrap_or(Value::Null),
+                "page_id": format!("{base}-{}", pages.len() + 1),
+                "binding": data["binding"], "next": next});
+            if more["generation"].is_null() {
+                more.as_object_mut().unwrap().remove("generation");
+            }
+            self.send(&json!({"type": "agentChat", "data": more}));
+        }
+        if (pages.len() as u64) < min_pages {
+            return Err(format!(
+                "{} pages, expected at least {min_pages}",
+                pages.len()
+            ));
+        }
+        if backwards {
+            pages.reverse();
+        }
+        let got = Value::from(pages.into_iter().flatten().collect::<Vec<_>>());
+        if got != want {
+            return Err(format!("recovered {got}, expected {want}"));
+        }
         Ok(())
     }
 
@@ -1340,6 +1685,9 @@ impl Host {
             "receipts_visible" => json!({self.client.clone(): self.receipts_seen.len()}),
             // The runtime holds one link: its attachment, once welcomed.
             "attachments" => json!(u64::from(self.welcomed)),
+            "chat_opens" => json!(self.chat_opens),
+            "chat_closes" => json!(self.chat_closes),
+            "chat_conversations" => json!(self.conversations.len()),
             "pty_bytes_written" if used.contains("fail_next_partial") => json!("unknown"),
             "pty_bytes_written" => json!(paste_bytes),
             "pty_writes" => json!(local + remote),
@@ -1382,6 +1730,21 @@ impl Host {
             "always_rules",
             "reason",
             "ok",
+            "messages",
+            "message",
+            "request_id",
+            "origin",
+            "assistant_messages",
+            "text_bytes",
+            "escape",
+            "message_ids",
+            "sequence_from",
+            "request",
+            "min_pages",
+            "max_count",
+            "max_content_bytes",
+            "max_wire_bytes",
+            "end",
         ];
         let actions: Vec<&String> = step
             .keys()
@@ -1454,6 +1817,32 @@ impl Host {
                 let held = std::mem::take(&mut self.held);
                 self.queue.extend(held);
             }
+            "expect_live" => {
+                client_ok(arg)?;
+                let ids = step["message_ids"].as_array().ok_or("message_ids")?;
+                let from = step["sequence_from"].as_u64().ok_or("sequence_from")?;
+                for (k, id) in ids.iter().enumerate() {
+                    let data = self.expect(
+                        Some("agentChat"),
+                        json!({"op": "message"}).as_object().unwrap(),
+                    )?;
+                    if data.get("history").is_some() {
+                        return Err(format!("{id}: a history message, expected a live one"));
+                    }
+                    if &data["messageId"] != id || data["sequence"] != from + k as u64 {
+                        return Err(format!(
+                            "expected live {id} at {}, got {} at {}",
+                            from + k as u64,
+                            data["messageId"],
+                            data["sequence"]
+                        ));
+                    }
+                }
+            }
+            "recover" => {
+                client_ok(arg)?;
+                self.recover(&step)?;
+            }
             "assert" => {
                 self.pump(SETTLE);
                 for (key, expected) in arg.as_object().ok_or("assert must be an object")? {
@@ -1495,6 +1884,47 @@ impl Host {
         }
         Ok(())
     }
+}
+
+/// Conversations the harness opens to look at the history (`probe`).
+const PROBE: &str = "probe-";
+
+/// Content bytes of a chat message as the fixtures count them.
+fn content_bytes(message: &Value) -> u64 {
+    let len = |v: &Value| v.as_str().map_or(0, str::len) as u64;
+    message["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| match p["kind"].as_str() {
+            Some("text") => len(&p["markdown"]),
+            Some("tool") => len(&p["name"]) + len(&p["summary"]),
+            Some("approval") => len(&p["tool"]) + len(&p["summary"]),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Unix milliseconds as an RFC 3339 UTC timestamp (transcript `timestamp`).
+fn rfc3339(ms: u64) -> String {
+    let (secs, millis) = (ms / 1000, ms % 1000);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1590,13 +2020,11 @@ const NOT_RUN: &[&str] = &[
     "r8-send-under-the-own-lease-checks-the-epoch",
     "r8-stale-takeover-confirmation-is-refused",
     "r8-two-simultaneous-sends-acquire-once",
-    // r8 history scenarios: their chat content comes from the fixture
-    // (`chat_history`, `chat_turn`, …), which the fake agent can't produce.
+    // r8 history scenarios the fake Claude's transcript can't express (each
+    // reason is printed: eviction, a backlog fault, a remote turn's status
+    // events, a message's later version sent as a delta).
     "r8-backlog-hole-is-reported-not-reopened",
     "r8-history-page-and-live-events-share-one-ordered-stream",
-    "r8-history-selectors-are-exclusive-and-validated",
-    "r8-long-turn-is-recovered-in-bounded-pages",
-    "r8-open-with-before-is-refused",
     "r8-receipt-result-bounds-reply-message-ids",
     "r8-stale-or-foreign-next-token-is-stale-target",
     "r8-truncated-history-reopens-once-then-stays-live",
@@ -1704,7 +2132,25 @@ fn a_changed_expectation_fails_against_the_real_runtime() {
         .find(|s| s["assert"].get("approval_decisions").is_some())
         .unwrap();
     step["assert"]["approval_decisions"][0]["message"] = json!("something else");
-    let results = run_named(&[lease, dispatch, deny], None);
+    // History written through the fake Claude's transcript: a page and a
+    // recovery are checked against what the runtime sent.
+    let mut before = named("r8-open-with-before-is-refused");
+    let step = before["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["match"]["op"] == "history_end")
+        .unwrap();
+    step["match"]["page.count"] = json!(5);
+    let mut long = named("r8-long-turn-is-recovered-in-bounded-pages");
+    let step = long["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s.get("recover").is_some())
+        .unwrap();
+    step["message_ids"].as_array_mut().unwrap().pop();
+    let results = run_named(&[lease, dispatch, deny, before, long], None);
     for (name, result) in results {
         let error = result.expect_err(&name);
         assert!(error.contains("expected"), "{name}: {error}");

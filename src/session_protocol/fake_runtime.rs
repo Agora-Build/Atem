@@ -23,8 +23,8 @@ use super::host::{
 use super::journal::{Journal, MemJournal};
 use super::revision::{FEATURES, REVISION};
 use super::wire::{
-    self, ApprovalCloseReason, Binding, ClientKind, DecodeError, Envelope, Op, Permission,
-    ReceiptKind, SessionMessage, Target,
+    self, ApprovalCloseReason, ApprovalDecision, Binding, ClientKind, DecodeError, Envelope, Op,
+    Permission, ReceiptKind, SessionMessage, Target,
 };
 use crate::chat::adapter::{ApprovalCard, ApprovalCardState, Outcome, Part};
 use crate::chat::history::{self, Conversations, HistoryCall, HistoryKey, Opening, is_card};
@@ -675,6 +675,18 @@ impl<J: Journal> FakeRuntime<J> {
                         d["message"] = Value::String(m);
                     }
                     self.pty.approval_decisions.push(d);
+                    // The card says what was decided (as the runtime's
+                    // hand-off does), with why it closed (r8 card_reason).
+                    if let Some((_, card, _)) = self.cards.get_mut(&approval_id) {
+                        card.state = match decision {
+                            ApprovalDecision::AllowOnce => ApprovalCardState::Allowed,
+                            ApprovalDecision::AllowAlways => ApprovalCardState::AlwaysAllowed,
+                            ApprovalDecision::Deny => ApprovalCardState::Denied,
+                        };
+                        card.reason
+                            .get_or_insert(ApprovalCloseReason::AnsweredRemote);
+                        self.show_card(&approval_id);
+                    }
                 }
                 Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
                 Effect::PushApproval { request } => self
