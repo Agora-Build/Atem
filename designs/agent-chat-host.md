@@ -1,6 +1,11 @@
 # Agent chat (chat-v1): Atem host side
 
-Status: design approved 2026-10-15; Atem host side built (Claude adapter).
+Status: design approved 2026-10-15; Atem host side built (Claude and Codex
+adapters). atem-session r8 (2026-10-18, implemented) replaces the #75 paging
+(`open{before}`, `status.page`) with history pages in the sequenced stream,
+adds coverage, receipt results, chat Send that acquires the lease and
+lease-free approval answers; this document describes the r8 behaviour (the
+contract is the appendix "r8" of `protocol/atem-session-v1.md`).
 Astation side (browser page, later a mobile app) is the Astation agent's; its
 proposed contract is the starting point (atem memory `mem_b3ccce1f`, project
 github.com/agora-build/atem) and this document lists the changes Atem needs
@@ -132,6 +137,7 @@ its tests; the wire and the clients don't change.
 | `src/chat/claude/transcript.rs` | Claude: follows the transcript and turns entries into `LogItem`s (below) |
 | `src/chat/session.rs` | Shared per-agent chat state: status, recent messages, the draft tracker, prompt submission and acceptance, request-id records; agent-neutral |
 | `src/chat/wire.rs` | `agentChat` v1 messages to and from Astation: encoding, decoding, validation |
+| `src/chat/history.rs` | r8 history (shared by the runtime and the fixtures' fake runtime): conversations as ordered streams (`Conversations`), bounded pages with `history_end`, lookups, `next` tokens, coverage, and a turn's reply ids for `receipt.result` |
 | `src/runtime/` (session-v1 descriptor; `agent_registry.rs` was removed) | Status from `session.rs` as the session's `activity`; chat-v1 advertised only when the agent's adapter reports it (v1: Claude with active hooks) |
 
 All of it lives in the Atem process that owns the terminal; there is no new
@@ -319,8 +325,13 @@ message {
              state: pending|allowed|always_allowed|denied|answered_terminal|expired|closed
                     |auto_allowed,
              rule_id?,       // auto_allowed: the Atem session rule that allowed it
+             reason?,        // final cards (r8 approval.card_reason): the
+                             // approval_closed reason (answered_remote, …)
              note? } ],      // e.g. an allow_always whose rule wasn't kept
-  history?: true      // backfill on open / page
+  history?: true,     // from a history page, or recovered after a gap
+  page_id?,           // the history request's page id (absent on the open's page)
+  after_message_id?   // recovered after a backlog gap: the retained message
+                      // it follows, null when none precedes it (always present)
 }
 delta { messageId, part: { id, kind, … } }   // a later part appended to a
                                              // message already sent; a part
@@ -335,11 +346,17 @@ delta { messageId, part: { id, kind, … } }   // a later part appended to a
   without a web view.
 - IDs never change, so clients can cache messages and merge updates.
 - History never replays deltas: each message is sent whole with all its parts
-  so far; clients replace what they had.
+  so far. A live `delta` at a higher sequence than a page is newer than the
+  page's copy (append it); a page never replaces a newer version.
 - An approval card is an assistant message `approval-<approval_id>`; when its
   state changes the whole message is sent again with the same `messageId`
-  (replace it). A chat `submit` with `approval` (the §6a payload) instead of
-  `text` answers it; its binding has no `lease_epoch` when `acquire` is true.
+  (replace it). Final cards carry `reason`, the `approval_closed` reason
+  (`answered_remote` with the decision's state, `answered_terminal`,
+  `interrupted`/`released`/`process_ended` as `closed`, `timed_out` as
+  `expired`); the first reason is kept. A chat `submit` with `approval` (the
+  §6a payload) instead of `text` answers it: it needs `control`, never the
+  lease (r8 §G: `lease_epoch` optional and ignored, `acquire` refused, the
+  first admitted answer wins).
 - An `auto_allowed` card (Codex, r7.2) is final when it arrives: the worker
   allowed the request by the session rule `rule_id` without asking; it
   offers nothing to answer (`always_rules: []`).
@@ -353,46 +370,57 @@ on the existing authenticated Astation connection.
 
 | op | Direction | Fields |
 |---|---|---|
-| `open` | Astation → Atem | `conversationId`, `agentId`, optional `before` (messageId) and `generation` (the one `before` came from) |
-| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), `approvalRules` (the session's active Atem session rules `[{rule_id, label, scope}]`; `[]` without `control`), then history as `message` events (latest 50 or 256 KB, older pages with `before`) |
-| `submit` | Astation → Atem | `generation`, `requestId` (UUID), and one of `text`, `approval` (§6a answer) or `approval_rule_revoke` (`{rule_id}`, r7.2; `control` only, no lease: r7.3) |
+| `open` | Astation → Atem | `conversationId`, `agentId`, `binding` (`before`/`generation` are removed in r8: `unsupported_version`, nothing reset, nothing opened) |
+| `opened` | Atem → Astation | `generation`, `sequence: 0`, `status {state, since}`, `unavailable` (array of strings, below), `approvalRules` (the session's active Atem session rules `[{rule_id, label, scope}]`; `[]` without `control`), then the newest page as `message{history:true}` events and a sequenced `history_end` (`selector: "newest"`) |
+| `history` | Astation → Atem | `generation`, `page_id` (1–64 bytes `[A-Za-z0-9._:-]`), `binding`, and exactly one of `before` (messageId), `turn_id`, `request_id` (lowercase v4 UUID) or `next` (token from the last `history_end`) |
+| `history_end` | Atem → Astation | `page_id` (absent on the open's page), `page {selector, count, content_bytes, wire_bytes, end, next?, coverage, oldest_retained, truncated, holes, holes_more?}` |
+| `coverage` | Atem → Astation | `oldest_retained`, `truncated`, `holes` (≤ 16, then `holes_more`): after a backlog reload left a hole |
+| `submit` | Astation → Atem | `generation`, `requestId` (UUID), `binding`, and one of `text` (optionally `acquire: true`, with `takeover: true` and `expected_controller`, r8 §F), `approval` (§6a answer; `control` only, no lease, r8 §G) or `approval_rule_revoke` (`{rule_id}`, r7.2; `control` only, no lease: r7.3) |
 | `rules` | Atem → Astation | `approvalRules` (the whole list, when it changed; conversations with `control` only) |
-| `accepted` | Atem → Astation | `requestId` |
+| `accepted` | Atem → Astation | `requestId`; `lease {lease_epoch, ms_left}` when the admitted submit carried `acquire` (a grant, a takeover, or the sender's own lease unchanged; r8 §F) |
 | `message` / `delta` | Atem → Astation | see the message model |
 | `status` | Atem → Astation | `state: ready|working|waiting|unknown`, `since`, optional `detail` |
 | `complete` | Atem → Astation | `turnId`, optional `requestId`, `outcome: "done"|"interrupted"` (below) |
-| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`, and `code` on every `error` the session host makes: `rejected` or `outcome_unknown` (a submit's receipt), a session-v1 code from admission (`stale_target`, `stale_lease`, `lease_held`, `forbidden`, …), `unsupported_version` (a malformed chat message) or `busy` (`open` without chat-v1, below); the chat's own errors (the agent exited or was restarted, the conversation was switched, chat withdrawn) carry no `code`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
-| `close` | either | `conversationId` |
+| `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`, and `code` on every `error` the session host makes: `rejected` or `outcome_unknown` (a submit's receipt), a session-v1 code from admission (`stale_target`, `stale_lease`, `lease_held` with `controller {controller_session, lease_epoch}`, `forbidden`, …), `invalid_request` (a `history` or Send field rule), `unsupported_version` (a malformed or removed chat message) or `busy` (`open` without chat-v1, too many `history` requests); a history request's error carries its `page_id` when that was valid; the chat's own errors (the agent exited or was restarted, the conversation was switched, chat withdrawn) carry no `code`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
+| `close` | either | `conversationId`; from Atem `reason`: `switched`, `withdrawn`, `restarted` or `evicted` (r8 §C); from Astation `binding` is optional (without it, only the sender attachment's own conversation closes) |
 
-- History pages (since 2026-10-17). `open` with `before` on a conversation
-  this attachment already has open pages it: no `opened`, nothing reset.
-  The older page (up to 50 messages / 256 KiB strictly before `before`)
-  arrives as `message{history:true}` at that conversation's next sequence
-  numbers, continuing its live sequence, so a live event never collides
-  with or overtakes a page and the client keeps applying `last + 1`. The
-  page holds older messages than ones already sent: place messages by
-  `messageId` (a whole message replaces an earlier copy) and order them by
-`createdAt`/history position, not by `sequence`. Every such page ends
-  with a sequenced `status` (the current status) carrying
-  `page: {before, count, start}`: `count` is the number of messages the
-  page held, `start: true` means it reached the oldest retained message (no
-  older page to ask for). An empty page is that marker alone
-  (`count: 0, start: true`), never silence. Approval cards are left out of
-  a view-only attachment's pages before the 50-message / 256 KiB limits,
-  so a stretch of cards never yields an empty page while older messages
-  exist (the same holds for the newest page on `opened`). `open` without
-  `before` on an open conversation is a resynchronization: a new `opened`
-  at 0 and the newest page; replace the cache. `open` with `before` on a
-  conversation that isn't open opens it (`opened` at 0) with that page.
-- `open` may carry the optional `generation` its `before` came from. A
-  `before` that isn't in the retained history (evicted, never sent), or
-  named with another `generation`, is refused with `error{code:"stale_target"}`,
-  text "that message is no longer in the history; reopen without before to
-  get the newest page", never an empty page. On an open conversation the
-  error is sequenced and the conversation stays open; on a new one it
-  carries no `generation`/`sequence` and opens nothing. `stale_target` is
-  the contract's code for a reference to something the host no longer
-  holds (§7: a closed approval, a revoked rule); no other §7 code fits.
+- **History (r8 §B, §C).** A conversation is one ordered stream: every
+  Atem event in it, pages included, takes the next `sequence`, and a page
+  is built in one step from the retained history (no live event of that
+  conversation comes between its envelopes; every later event has a higher
+  sequence). Keep per `messageId` the version with the highest sequence.
+  `history` pages carry `message{history:true, page_id}` then
+  `history_end`. Bounds per page: 50 messages, 256 KiB of content (as
+  `ChatMessage::bytes` counts it: ids, text, 64 bytes per part, 1 KiB per
+  card) and 1 MiB serialized, `history_end` included (`wire_bytes`); a
+  page stops before the message that would pass a bound and holds at least
+  one when one remains. `newest`/`before` go backwards (each page oldest
+  first); `turn_id`/`request_id` go forwards from the turn's oldest retained
+  message to its newest at the first page's snapshot (later messages of the
+  turn arrive live). `next` is an HMAC-SHA256 token under a key made for
+  each runtime run, bound to the attachment, conversation, session,
+  `process_gen`, selector, continuation point and the history's reload
+  count; out of context, altered, evicted, after a reload or a restart it
+  is `stale_target` (start a new selection). A `before` no longer retained
+  is `stale_target`; a lookup with nothing retained is an empty page
+  (`count: 0, end: true, coverage: "unavailable"`). Field errors are
+  `invalid_request` (sequenced in an open conversation, with the valid
+  `page_id`); a conversation that isn't open on this attachment, or another
+  `generation`, is `stale_target`; more than 8 valid requests a second per
+  conversation is `busy` (invalid ones aren't counted). Nothing resets.
+- **Coverage.** `coverage` is `complete`, `partial` or `unavailable`; a
+  turn is `partial` when its oldest messages were evicted or a hole touches
+  it. `truncated` turns true once anything was evicted (retention, or an
+  adoption cut) and `oldest_retained` names the oldest retained message.
+  Holes are gaps a backlog reload couldn't restore, named by their
+  neighbours (`before_message_id: null` at the live edge until the next
+  message); a `history_end` lists those whose `before_message_id` is in its
+  page plus a live-edge hole on the newest page (≤ 16, then `holes_more`).
+  A view-only attachment sees no card ids here: holes are named by visible
+  neighbours, one with no visible message before it is left out, and
+  `oldest_retained` is the oldest visible message. Truncation, holes and
+  `coverage` events never ask for a reopen; only a sequence gap, another
+  `generation`, a fenced attachment or `close` with a `reason` do.
 - `open` on a running session whose chat-v1 is off (Claude before its
   SessionStart or after chat was withdrawn, Codex without Atem's hooks) is
   answered `error{code:"busy"}` with the text "chat is not available for
@@ -426,7 +454,8 @@ on the existing authenticated Astation connection.
   history.
 - Each conversation gets the status again 15 s after it last got it (on
   `opened` or a heartbeat). At most 8 conversations are open per agent:
-  opening a ninth sends the least recently opened one `close`.
+  opening a ninth sends the least recently opened one `close{reason:
+  "evicted"}`.
 - Atem keeps the newest 500 messages, at most 8 MiB, per agent process.
 
 ## Security
@@ -459,13 +488,13 @@ on the existing authenticated Astation connection.
 |---|---|
 | Atem not running when a hook fires | the event file is written and never read; Claude is unaffected; the directory goes with the session |
 | Claude exits or crashes | `unknown`, `error` to open conversations, generation retired, prompts refused |
-| Agent restarted | open conversations get `error` "the agent was restarted; reopen the chat" and `close`; the new process has a new generation |
-| Another session resumed in the same process | its earlier turns become history (no events); open conversations get `error` "the conversation was switched; reopen the chat" and `close`; same generation |
+| Agent restarted | open conversations get `error` "the agent was restarted; reopen the chat" and `close{reason:"restarted"}`; the new process has a new generation |
+| Another session resumed in the same process | its earlier turns become history (no events); open conversations get `error` "the conversation was switched; reopen the chat" and `close{reason:"switched"}`; same generation |
 | Bad or unknown transcript line | skipped, one notice; reading continues |
-| Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason (open conversations get `error` and `close`); terminal unaffected |
+| Transcript format changed (required fields missing) | chat withdrawn for this agent, with the reason (open conversations get `error` and `close{reason:"withdrawn"}`); terminal unaffected |
 | No acceptance within 10 s of a paste | `error` "delivery unknown"; never resent |
 | Astation disconnects / re-authenticates | conversations close; Claude keeps running; a new `open` restores status and history |
-| The worker dropped chat items before they reached the broker (its backlog overflowed in one read, `chat.gap > 0`) | the broker asks the worker for its whole retained history (`request_chat_history` → `chat_history_part`s + `chat_history`), replaces its own with it (keeping its newer approval card states) and catches up with the worker's chat state carried in `chat_history` (status, current and last completed turn with its outcome, input mark: a turn end it missed completes then, and so does its prompt's receipt), then open conversations get `error` "the chat history was incomplete (some items were dropped) and was reloaded; reopen the chat" (no `code`, like the chat's other own errors) and `close`; a reopen gets the complete history. Without a worker to ask, when the worker goes away before answering, or when the reload exceeds 1000 messages (all its parts are dropped, the history stays as it was, never with a hole), they get the same `error` and `close` |
+| The worker dropped chat items before they reached the broker (its backlog overflowed in one read, `chat.gap > 0`) | r8 §C: the broker asks the worker for its whole retained history (`request_chat_history` → `chat_history_part`s + `chat_history`), replaces its own with it (keeping its newer approval card states, and the worker's truncation and cut turn) and catches up with the worker's chat state carried in `chat_history` (status, current and last completed turn with its outcome, input mark: a turn end it missed completes then, and so does its prompt's receipt). Every recovered (new or changed) message goes to open conversations as a sequenced `message{history:true, after_message_id}` (cards only to conversations with `control`); no `error`, no `close`, no reopen. Without a worker to ask, when the worker goes away before answering, or when the reload is over its bound (1000 messages), the gap stays as a hole (no `count`) and open conversations get a sequenced `coverage` event |
 | Broker restart or adoption | the worker's `chat_snapshot` carries its whole retained history (500 messages / 8 MiB), older messages first in `chat_history_part` lines of at most 1 MiB each, approval cards included (the broker copies every card to the worker, `chat_card`); a card still `pending` becomes `closed` with the note "Atem's runtime restarted; answer in the terminal" (the new broker released its approval). Prompt acceptance in flight is not carried |
 | Atem exits | the terminal and Claude end with it (as today); a new Atem has a new generation |
 
@@ -481,6 +510,13 @@ on the existing authenticated Astation connection.
   in a pseudo-terminal against a fake Astation WebSocket: open with history;
   submit → accepted → message/delta → complete; refusal after local typing;
   duplicate request; process exit → unknown; reconnect keeps state.
+- r8 history: `src/chat/history_tests.rs` (paging, bounds with escaping,
+  lookups, token binding, coverage, holes, view-only), broker tests (gap
+  reload, holes, cut turns), `host_bridge_tests` over the real runtime with
+  the fake Claude, the shared fixtures in both runners (the real runtime
+  writes the fixtures' chat content through the fake Claude's transcript),
+  and the real-agent Codex test (open page, `before`, lookup by
+  `request_id`, `receipt.result`).
 - Before building on them, confirm on the installed Claude Code 2.1.x:
   `--settings` hooks fire in interactive mode and receive the event JSON on
   stdin, `SessionStart` arrives before
@@ -501,7 +537,8 @@ Additive to `mem_b3ccce1f`:
 - `complete` gains `turnId` and `outcome`; it means the execution turn ended,
   not that no more content can arrive.
 - `status` gains `since` and is re-sent every 15 s with the original `since`.
-- `open` gains optional `before` for history pages.
+- `open` gained optional `before` for history pages (2026-10-17); r8 removed
+  it in favour of `history` and `history_end`.
 - `requestId` deduplication is per agent session (stronger than per
   conversation).
 - `submit` can be refused because of a local draft, terminal control, status

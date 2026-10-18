@@ -53,7 +53,7 @@ pub struct ClientSetup {
     pub client_kind: ClientKind,
     #[serde(default)]
     pub holds_lease_epoch: Option<u64>,
-    /// r8 draft: `false` leaves the client without the harness's `hello`.
+    /// r8: `false` leaves the client without the harness's `hello`.
     #[serde(default)]
     pub welcome: Option<bool>,
 }

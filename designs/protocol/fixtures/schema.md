@@ -68,14 +68,17 @@ from the agents' permission hooks.
 `allow_always` creates: the real-runtime runner (whose agent is Claude)
 lists it as not run.
 
-## r8 draft fixtures (not run until r8 ships)
+## r8 fixtures
 
-`r8-*.json` scenarios carry `"requires": "r8"` and exercise the **r8
-draft** in `../atem-session-v1.md` (appendix "r8 draft"). Both runners
+`r8-*.json` scenarios carry `"requires": "r8"` and exercise r8 in
+`../atem-session-v1.md` (appendix "r8"). Both runners
 (`src/session_protocol/fixtures.rs`, `tests/runtime_fixtures_binary.rs`)
-parse them and report them as NOT RUN (`requires r8`); nothing below is
-implemented yet. When r8 ships, `requires` is removed and the runners gain
-these actions.
+gate each one on the host work it needs (`R8_FIXTURE_NEEDS` in
+`src/session_protocol/revision.rs`); every r8 feature and the §H/§I work
+are implemented, so the core runner runs all of them. The real-runtime
+runner reports the ones it can't express as NOT RUN with the reason (more
+than one client, journal faults, `chat_evict`, `worker_gap`, …); see
+`../atem-host-handoff.md` for the current counts.
 
 - In an r8 scenario the harness's setup `hello` carries `"revision": 8` and
   the `welcome` must echo `revision: 8` and carry `features`.
@@ -94,7 +97,7 @@ these actions.
   `crash_after_accepted` never write one. The clean-close write is not a
   journal append counted by `fail_next_fsync`/`fail_fsync_of`.
 
-| step (r8 draft) | meaning |
+| step (r8) | meaning |
 |---|---|
 | `{"chat_history": session_id, "messages": [message]}` | the session's retained chat history before any step reads it (complete chat-v1 message bodies, oldest first) |
 | `{"chat_message": session_id, "message": message}` | the agent produced a message, new or a whole replacement of one with the same `messageId` |
@@ -103,7 +106,7 @@ these actions.
 | `{"worker_gap": session_id, "dropped": [id], "recoverable": [id], "delivered_after": [message]}` | the worker's backlog dropped `dropped`, then delivered `delivered_after` with `gap > 0`; the host's reload of the worker's history finds only `recoverable` (the rest is gone from the worker too) |
 | `{"open_approval": …, "turn_id": t}` | as before; `turn_id` is the card's `turnId` |
 | `{"expect_live": client, "message_ids": [id], "sequence_from": n}` | takes that many chat `message`s (no `history`), with those ids in order and consecutive sequences from `n` |
-| `{"recover": client, "request": msg, "message_ids": [id], "min_pages": n, "max_count": c, "max_content_bytes": b, "max_wire_bytes": w, "end": {path: value}}` | sends `request` (a chat `history` or `open`), takes its page (`opened` first for an `open`; `message{history:true}`s then `history_end`), and while `page.end` is false sends `history{next}` with the same binding and conversation (page id `<page_id>-2`, …) and takes the next page. Every page: consecutive sequences, ≤ `c` messages, ≤ `b` content bytes, ≤ `w` serialized bytes (the sum of its envelopes), and no `end: true` before the last. Newest-first selections are reassembled oldest first. The messages taken equal `message_ids` exactly (no gap, no duplicate); the last `history_end` matches `end`; at least `n` pages |
+| `{"recover": client, "request": msg, "message_ids": [id], "min_pages": n, "max_count": c, "max_content_bytes": b, "max_wire_bytes": w, "end": {path: value}}` | sends `request` (a chat `history` or `open`), takes its page (`opened` first for an `open`; `message{history:true}`s then `history_end`), and while `page.end` is false sends `history{next}` with the same binding and conversation (page id `<page_id>-2`, `<page_id>-3`, …; `open-2`, `open-3`, … after an `open`, which has no `page_id`) and takes the next page. Every page: consecutive sequences, ≤ `c` messages, ≤ `b` content bytes, ≤ `w` serialized bytes (the sum of its envelopes), and no `end: true` before the last. Newest-first selections are reassembled oldest first. The messages taken equal `message_ids` exactly (no gap, no duplicate); the last `history_end` matches `end`; at least `n` pages |
 | `{"client_try": client, "json": msg, "refused": text}` | client side: the client is asked to send `msg` and must refuse locally with that reason (nothing is sent) |
 | `{"client_open_chat": client, "conversation": id, "session_id": s}` | client side: the client opens a chat (its `open` is consumed by the fixture) |
 | `{"drop": {"to": client, "op": op}}` | the next matching host→client message is lost in transit: never delivered and not expected (repeat the step to lose several) |
@@ -122,19 +125,19 @@ afterwards is refused by the adapter's draft check (`rejected`, detail `the
 terminal has unsent input; finish or clear it there`). A `receipts` reply
 lists receipts in the order of `request_ids` (unrecorded ids are omitted).
 
-New `assert` keys (r8 draft): `journal_halted` (the journal refuses
+New `assert` keys (r8): `journal_halted` (the journal refuses
 appends until a restart, §I), `attachments` (live attachments on the host),
 `chat_opens` / `chat_closes` (`opened` / `close` the host sent, all
 conversations), `chat_conversations` (open conversations).
 
-New `assert_client` keys (r8 draft): `admitted` (the welcome passed the
+New `assert_client` keys (r8): `admitted` (the welcome passed the
 revision check), `revision`, `features_enabled` (advertised features the
 client knows and enabled), `lookup_enabled`, `coverage_enabled`,
 `chat_enabled`, `chat_loaded` (a `history_end` arrived), `chat_truncated`,
 `chat_messages` (ids in timeline order), `chat_reopens` (opens the client
 sent after the first), `sent` (messages sent since the last check).
 
-The r8 draft scenarios:
+The r8 scenarios:
 
 | fixture | side | checks |
 |---|---|---|
@@ -184,6 +187,7 @@ The r8 draft scenarios:
 | `r8-approval-stays-pending-when-the-lease-ends` | host | §G (replaces the r7 fixture of that name): expiry closes nothing; an answer with the expired epoch is admitted (the epoch is ignored), nothing granted |
 | `r8-approval-late-answer-after-push-resolved-is-stale-target` | host | §G (replaces the r7 fixture of that name): after `push_resolved{answered_terminal}` a late answer without the lease is `stale_target`, nothing recorded |
 | `r8-approval-survives-takeover` | host | §G (replaces r7 `approval-survives-takeover`): a takeover keeps the approval pending; the old holder's stale-epoch answer is admitted and wins, the new holder's is `stale_target`, the lease stays the new holder's |
+| `r8-approval-card-carries-the-close-reason` | host | `approval.card_reason`: a pending card has no `reason`; the final card carries the `approval_closed` reason: remote answer (`allowed`, `answered_remote`), the agent's own dialog (`answered_terminal`), an interrupt (`closed`, `interrupted`) |
 
 Astation's API-level merge fixture (a delayed HTTP page against newer SSE
 versions) is Astation's; the host side of it is

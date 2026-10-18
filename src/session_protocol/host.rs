@@ -1,5 +1,5 @@
-//! The host authority for atem-session v1 (contract r7, compatibility mode,
-//! moving to r8): revision admission (r8 §A: only `hello{revision: 8}` is
+//! The host authority for atem-session v1 (contract r8, compatibility
+//! mode): revision admission (r8 §A: only `hello{revision: 8}` is
 //! welcomed, `welcome` names the revision and `revision::FEATURES`; ops of
 //! unadvertised features and the forms r8 removed are `unsupported_version`),
 //! attachments and hello/welcome (§3), the session registry with a

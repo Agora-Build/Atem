@@ -1430,7 +1430,7 @@ impl Host {
         let request = step["request"].clone();
         let data = request["data"].clone();
         let want = step["message_ids"].clone();
-        let num = |k: &str| step[k].as_u64().ok_or(format!("{k}"));
+        let num = |k: &str| step[k].as_u64().ok_or(k.to_string());
         let (min_pages, max_count) = (num("min_pages")?, num("max_count")?);
         let (max_content, max_wire) = (num("max_content_bytes")?, num("max_wire_bytes")?);
         let base = data["page_id"].as_str().unwrap_or("open").to_string();

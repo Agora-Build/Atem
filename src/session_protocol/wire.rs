@@ -365,8 +365,9 @@ pub struct AlwaysRule {
     pub scope: String,
 }
 
-/// `approval_request` (r7): an agent permission prompt the lease holder may
-/// answer, bound to one session and process.
+/// `approval_request` (r7): an agent permission prompt any attachment with
+/// `control` may answer (r8 §G: no lease needed), bound to one session and
+/// process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub approval_id: String,

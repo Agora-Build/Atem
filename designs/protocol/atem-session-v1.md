@@ -1,14 +1,28 @@
-# atem-session v1: sessions, control leases, receipts and approvals (r7.3: r7.2 with lease-free rule revocation — for review)
+# atem-session v1: sessions, control leases, receipts and approvals (r8: revision admission, chat history pages, receipt results, chat Send acquire, lease-free approvals)
 
-Draft (not implemented): r8 — required `hello.revision`, `welcome.features`,
-history pages in the sequenced stream with bounded selectors and coverage,
-`receipt.result`, removal of `open.before`, chat Send that acquires the lease
-with the prompt (`chat.send_acquire`) and lease-free approval answers
-(`approval.lease_free`), with the submitter principal and its durable
-control fence (§H) and one admission persistence rule (§I) — is in the
-appendix "r8 draft" at the end; this
-r7.3 text stays authoritative until r8 ships.
-Status: r7.3 (2026-10-17) lets any attachment with `control` revoke an Atem
+Status: **r8 is implemented in Atem and authoritative** (2026-10-18). The
+appendix "r8" at the end is the contract wherever it differs from the r7.3
+text above it: required `hello.revision: 8` and `welcome.features` (§A),
+history pages in the sequenced stream with bounded selectors and coverage
+(§B, §C), `receipt.result` (§D), removal of `open.before`/`status.page`,
+chat Send that acquires the lease with the prompt (`chat.send_acquire`, §F),
+lease-free approval answers (`approval.lease_free`, §G), the submitter
+principal and its durable control fence (§H) and one admission persistence
+rule (§I, which removes §6's double-I/O exception). Atem's host speaks only
+r8: a `hello` without `revision: 8` is refused, so Astation must send it.
+The shared fixtures and where they run are in `atem-host-handoff.md`; the
+consolidated Astation note is `r8-astation-handoff.md`.
+r8 (2026-10-18) changelog: implemented in Atem (`src/session_protocol/`,
+`src/chat/history.rs`, `src/runtime/host_bridge.rs`); welcome advertises all
+nine features. The implementation corrected the appendix where it was
+wrong or silent; each change is listed in the appendix's "Implementation
+notes" and was flagged to Astation. Fixtures: the five r7 approval fixtures
+that answered with `acquire` or expected `stale_lease` on an answer are
+deleted (superseded by §G; replacements named in `atem-host-handoff.md`),
+`r8-approval-card-carries-the-close-reason` is new, and
+`r8-hello-without-revision-8-is-refused-before-any-attachment` and
+`r8-approval-answer-keeps-the-holders-deadline` were corrected.
+r7.3 (2026-10-17) lets any attachment with `control` revoke an Atem
 session rule (§6a) with or without the lease: `approval_rule_revoke` needs
 only `control`, a running session and an active rule of that exact process
 (`stale_target` otherwise); its binding's `lease_epoch` is optional and never
@@ -333,7 +347,7 @@ Normative rules:
   is persisted per session so it never repeats.
 - **Scope**: the lease governs terminal input/resize/stop, chat submission,
   interrupt, approval answers and future mutations. Disconnect stops renewal;
-  the lease then expires. (r8 draft: approval answers leave the lease's scope,
+  the lease then expires. (r8, authoritative: approval answers leave the lease's scope,
   appendix §G; a chat Send may acquire the lease with its prompt, §F.)
 
 ## 6. Submissions and receipts
@@ -374,7 +388,7 @@ Kinds and payloads (v1):
   the client may retry with the same `request_id`. After a double I/O failure
   (the write fails and so does undoing it) a request answered `busy` may still
   be dispatched once, under its original target and trust generation; a retry
-  with the same `request_id` returns its receipt. (r8 draft: this exception
+  with the same `request_id` returns its receipt. (r8, authoritative: this exception
   and the same-id retry are **removed**; a `busy` for a failed admission
   write is a definitive refusal, the journal halts, and the request is
   resolved `rejected` "acceptance not confirmed" at restart and never
@@ -432,7 +446,7 @@ Kinds and payloads (v1):
   `accepted` work has provably not started any side effect, so it may still be
   dispatched — once, under its original target, and only if the host trust
   generation is unchanged (else `rejected`, `detail:"host trust changed"`).
-  (r8 draft: only when the previous run ended with a clean close, and then
+  (r8, authoritative: only when the previous run ended with a clean close, and then
   only once its submitter principal's control is confirmed in the new run
   at the recorded `control_gen`; after any other end it is `rejected`
   "authorization history unknown", appendix §H; a request on the refusal
@@ -459,12 +473,13 @@ agent's own prompt asks. Delivery is independent of control (user decision,
 and is pushed to the account's devices, whoever holds the lease; answering
 takes the lease with the answer (`acquire`).
 
-**r8 draft (appendix §G, `approval.lease_free`, user decision 2026-10-18):**
+**r8 (appendix §G, `approval.lease_free`, user decision 2026-10-18; authoritative):**
 an answer needs only a verified attachment with `control` and the exact
 pending request. It never takes, needs or moves the lease, its binding's
 `lease_epoch` is ignored, `acquire` is refused `unsupported_version`, and
-the first admitted answer wins (later ones `stale_target`). This r7 text
-stays authoritative until r8 ships.
+the first admitted answer wins (later ones `stale_target`). It replaces the
+r7 text above wherever they differ; the r7 `acquire` on an answer is
+refused.
 
 | op | dir | fields |
 |---|---|---|
@@ -780,7 +795,14 @@ control attachment without the lease revokes while another holds it (once
 without `lease_epoch`, once naming an epoch it doesn't hold), a view-only one
 is `forbidden`, an inactive rule or another process `stale_target`, `acquire`
 refused, a duplicate returns the receipt, and the holder still renews at the
-same epoch.
+same epoch. r8 deletes the r7 approval fixtures that answered with `acquire`
+or expected `stale_lease` on an answer
+(`approval-answer-with-acquire-takes-control-from-the-holder`,
+`approval-opens-without-a-lease-holder`,
+`approval-stays-pending-when-the-lease-ends`,
+`approval-late-answer-after-push-resolved-is-stale-target`,
+`approval-survives-takeover`) and adds the `r8-*` scenarios
+(`fixtures/schema.md`, "r8 fixtures").
 
 ## 9. Gate: trust, freshness, channel and browser grants (joint)
 
@@ -795,14 +817,68 @@ conservative restart/clock handling), channel key establishment with
 replay/downgrade protection binding endpoint keys, account, roles, permissions
 and generations, the `resume_proof` format, and QR grant binding.
 
-## Appendix: r8 draft (not implemented; r7.3 above stays authoritative)
+## Appendix: r8 (implemented in Atem 2026-10-18; authoritative)
 
-Status: **draft**, 2026-10-17, answering Astation's review of Atem's agent
-control API response r1 (`agent-control-api-atem.md` r2). Nothing here is
-emitted or accepted by any build until r8 ships on both sides together and
-the `r8-*` fixtures (`fixtures/schema.md`, "r8 draft fixtures") pass in Rust
-and Swift. Then this appendix replaces the affected r7.2 text. No backward
-compatibility: an r8 host and an r8 client refuse every r7 peer.
+Status: **implemented in Atem**, 2026-10-18 (drafted 2026-10-17, answering
+Astation's review of Atem's agent control API response r1,
+`agent-control-api-atem.md` r2). This appendix replaces the affected r7.x
+text above. Every `r8-*` fixture (`fixtures/schema.md`, "r8 fixtures")
+passes in Atem's core runner, and the ones a single real link can express
+pass against the real runtime (`atem-host-handoff.md`); Swift conformance
+is Astation's. No backward compatibility: an r8 host and an r8 client
+refuse every r7 peer.
+
+**Implementation notes (2026-10-18).** What building r8 showed the text
+above had wrong or left open, now written into the sections below (each is
+listed for Astation in `r8-astation-handoff.md`):
+
+1. §H, a failed revocation write: the new link is **not closed**. As
+   `r8-control-fence-holds-when-a-rejection-write-fails` step 12 requires,
+   it gets no `welcome` (its `hello` has no reply) and every request on it
+   is `busy` "journal halted; restart Atem" until the restart.
+2. §B: the paragraph on today's code (#75 `open{before}` and `status.page`)
+   described what r8 removed; it now names the r8 page builder.
+3. §B: the 8-a-second bound counts valid `history` requests only. An
+   invalid one gets its sequenced `invalid_request` and is not counted.
+4. §B: `wire_bytes` (and the 1 MiB bound) includes the page's
+   `history_end` itself.
+5. §B: "message bytes as counted by `ChatSession`" counts each message's
+   ids, every part's text and id plus 64 bytes per part, and 1 KiB per
+   approval card; a message holds at most 2048 parts (the last a truncation
+   marker), so it serializes far below 1 MiB however it escapes.
+6. §B: a chat `close` may come without a binding; it then closes only the
+   sender attachment's own conversation of that id. With a binding it is
+   checked like a read.
+7. §B: a later version of a live message may arrive as chat-v1
+   `delta{messageId, part}` (one part appended) rather than the whole
+   message; it is a newer version by the same sequence rule. Pages always
+   carry whole messages.
+8. §C: a recovered message always carries `after_message_id`, `null` when
+   no retained message precedes it (the key's presence marks it as
+   recovered).
+9. §C: for a view-only attachment holes are named by their nearest visible
+   neighbours, a hole with no visible message before it is left out (like
+   truncation), and `oldest_retained` is the oldest message it can see, in
+   pages and in `coverage` events.
+10. §C: a `coverage` event carries the session's whole hole list (≤ 16,
+    then `holes_more`) and follows a reload only when a hole was recorded.
+    A reload that fails leaves a hole without `count` (the worker's `gap`
+    counts items, not messages).
+11. §C: for a lookup, a turn is `partial` when its oldest messages were
+    evicted (the newest evicted message belonged to it) or a hole touches
+    it (either neighbour is in the turn).
+12. §C: Atem sends `close.reason` `switched`, `withdrawn`, `restarted` and
+    `evicted`; never `fenced` or `reset` (a fenced attachment's
+    conversations end with its transport).
+13. §D: `reply_message_ids` leaves approval cards out (they aren't the
+    agent's reply, and a view-only `receipt_query` must not learn card ids;
+    `history{request_id}` pages them to attachments with `control`). A
+    reply id that can't be named (not an opaque id) is dropped and makes
+    `replies` `partial`. A completion whose user message isn't retained, or
+    whose turn or user message id is invalid, journals no result: the
+    receipt completes without `result`.
+14. §F: the chat-v1 `lease_held` text is "another controller holds this
+    session" (session-v1 `error` uses the same text).
 
 Revised 2026-10-18 for Astation's review of the §F/§G draft (r3 review):
 control is a permission of an authenticated **principal**, recorded with
@@ -904,16 +980,18 @@ the refusal is explicit at admission rather than a silent misreading later.
 single-threaded broker pass: it snapshots the retained history and enqueues
 the page's envelopes with consecutive sequences, and no live event of that
 conversation is enqueued between them. Every live event produced after the
-snapshot has a higher sequence. (Today's code already does this:
-`host_bridge.rs` `open_conversation` builds the open page and, since #75, the
-`open{before}` page plus its `status.page` marker synchronously from
-`ChatSession::page`, numbering every envelope with the conversation's
-`next_head`; r8 makes it a contract.)
+snapshot has a higher sequence. (Atem: `src/chat/history.rs` builds every
+page, the open's included, in one step from `ChatSession`'s retained
+history and numbers its envelopes with the conversation's next sequences;
+the runtime and the fixtures' fake runtime share it.)
 
 Each message envelope's `sequence` is its position: a message version
 carried at a higher sequence is newer. A client keeps, per `messageId`, the
 version with the highest sequence and never lets a page replace a newer
-version. No per-message revision is needed because the stream is the order.
+version. A live update may be a whole `message` or a chat-v1
+`delta{messageId, part}` that appends one part; either is the newer version
+at its sequence, and pages always carry whole messages. No per-message
+revision is needed because the stream is the order.
 Astation, which returns pages over HTTP and changes over SSE, attaches its
 own replay cursor (the conversation sequence) to each page and applies the
 same rule. A reopen starts a new stream (`opened` at 0), so positions are
@@ -937,8 +1015,11 @@ and lookups:
   `request_id`: lowercase v4 UUID; `next`: 1–512 bytes of base64url;
   `page_id`: 1–64 bytes of `[A-Za-z0-9._:-]`, chosen by the client;
   `generation` must equal `binding.target.process_gen` and the conversation
-  must be open on this attachment (`stale_target`). At most 8 history
-  requests a second per conversation (`busy`).
+  must be open on this attachment (`stale_target`). At most 8 valid history
+  requests a second per conversation (`busy`); invalid ones aren't counted.
+- **`close`** may omit `binding`: it then closes only the sender
+  attachment's own conversation of that id. With a binding it is checked
+  like a read.
 - **Reply**: `message{history: true, page_id}` envelopes, then
   `history_end`, all sequenced:
 
@@ -957,12 +1038,14 @@ and lookups:
   its newest message at the first page's snapshot; later messages of the
   turn arrive live.
 - **Bounds** (every page, lookups included): ≤ 50 messages, ≤ 256 KiB of
-  content (message bytes as counted by `ChatSession`), and ≤ 1 MiB
-  serialized (the sum of the page's envelopes, so Astation can return it as
-  one body); a page stops before the message that would pass any bound and
+  content (message bytes as counted by `ChatSession`: the message's ids,
+  each part's text and id plus 64 bytes per part, 1 KiB per approval card),
+  and ≤ 1 MiB serialized (the sum of the page's envelopes, its
+  `history_end` included, so Astation can return it as one body;
+  `wire_bytes` reports that sum); a page stops before the message that would pass any bound and
   holds at least one message when one remains (a message is ≤ 128 KiB of
-  content, < 1 MiB however escaped). Cards filtered out for a view-only
-  attachment don't count.
+  content and ≤ 2048 parts, < 1 MiB however escaped). Cards filtered out
+  for a view-only attachment don't count.
 - **`end`**: `true` when the selected result is exhausted (no older retained
   message, or the turn's last message at the snapshot was sent); then there
   is no `next`.
@@ -984,7 +1067,9 @@ and lookups:
 - **`coverage`** of the selected result: `complete` (every message of it is
   retained), `partial` (some were evicted or fall in a hole; for a lookup,
   the turn's oldest messages were evicted or a hole lies inside the turn),
-  `unavailable` (none is retained).
+  `unavailable` (none is retained). A turn is `partial` when its oldest
+  messages were evicted (the newest evicted message belonged to it) or a
+  hole touches it (either neighbour is in the turn).
 - **Truncation** is persistent: `oldest_retained` (the oldest retained
   `messageId`, `null` when empty) and `truncated: true` once anything of this
   process's history was evicted (retention 500 messages / 8 MiB, or an
@@ -997,14 +1082,18 @@ and lookups:
   next message); `count` when known. A `history_end` lists the holes whose
   `before_message_id` is in its page (≤ 16, then `holes_more: true`); holes
   older than `oldest_retained` become truncation. Holes are persistent and
-  no reopen repairs them.
+  no reopen repairs them. A view-only attachment never sees card ids in
+  this metadata: its holes are named by their nearest visible neighbours (a
+  hole with no visible message before it is left out, like truncation) and
+  its `oldest_retained` is the oldest message it can see.
 - **Backlog gap handling (r8 implementation change from #75).** Today a
   worker chunk with `gap > 0` makes the broker reload the worker's history
   and then send every open conversation `error` "the chat history was
   incomplete…" and `close`, forcing a reopen. In r8 the broker reloads, sends
   each recovered message to open conversations as a sequenced
   `message{history: true, after_message_id}` (timeline order; `after_message_id`
-  is the retained message it follows), and reports what stayed missing in a
+  is the retained message it follows, `null` when none precedes it; the
+  key is always present), and reports what stayed missing in a
   sequenced event, with no `error` or `close`:
 
 ```json
@@ -1014,14 +1103,18 @@ and lookups:
 ```
 
   A reload that fails (worker gone, over the reload bound) reports the gap as
-  a hole with `count` when known.
+  a hole with `count` when known (Atem: never, since the worker's `gap`
+  counts items, not messages). The `coverage` event carries the session's
+  whole hole list (≤ 16, then `holes_more`) and follows a reload only when
+  a hole was recorded; a reload that restores everything sends none.
 - **Resync** (reopen) only on: a sequence gap in the conversation, a fenced
   conversation (`stale_target` for its attachment, a new attachment), another
   `generation`, or `close` with a `reason`. r8 `close` carries `reason`:
   `switched` (`/clear`, resume, `/new`), `withdrawn` (chat withdrawn),
   `restarted` (new process), `evicted` (a ninth conversation), `fenced`,
-  `reset` (any other host reset). Truncation, holes and `coverage` events
-  never ask for one.
+  `reset` (any other host reset); Atem sends the first four (a fenced
+  attachment's conversations end with its transport). Truncation, holes and
+  `coverage` events never ask for one.
 
 ### D. `receipt.result`
 
@@ -1034,8 +1127,11 @@ and lookups:
 
 - On `completed` `prompt` receipts only. `turn_id`, `user_message_id` and
   `outcome` (`done`|`interrupted`, equal to `detail`) are journaled with the
-  `completed` transition (ids only, never text). `reply_message_ids` (the
-  turn's assistant messages, timeline order, **at most 32**), `more` (true
+  `completed` transition (ids only, never text); a completion whose user
+  message isn't retained, or whose ids aren't opaque ids, journals none and
+  its receipt has no `result`. `reply_message_ids` (the turn's assistant
+  messages, timeline order, approval cards left out, **at most 32**; an id
+  that can't be named is dropped and makes `replies` `partial`), `more` (true
   when more replies are retained) and `replies` (`complete`|`partial`|
   `unavailable`, the turn's coverage as in §C) are computed from retained
   history each time the receipt is sent, so they may change with late
@@ -1372,7 +1468,9 @@ authority it was accepted under only while that principal keeps `control`.
   `detail:"control revoked"`, in memory, sent to any live attachment
   entitled to the receipt (today none: the principal's attachments were
   just fenced). The journal halts (§I): every later session request but
-  `hello` is `busy`, the new link is closed without a `welcome`, and
+  `hello` is `busy`, a new link gets no `welcome` (its `hello` has no
+  reply and every request on it is `busy` "journal halted; restart Atem";
+  the link isn't closed), and
   **nothing queued is dispatched after a journal halt**, of any principal
   (nor any remote terminal input admitted), until the restart. These
   in-memory rejections aren't persisted; the restart rejects the same
@@ -1541,14 +1639,14 @@ and every later append refused until the journal is reopened.
    `busy` queries after reconnecting: `rejected` (whatever the detail:
    "acceptance not confirmed", "authorization history unknown") → a new
    id; nothing recorded → the same id.
+6. Unchanged from §6: a failed `executing` write rejects the request
+   before any effect, and every exit from `executing` is persisted before
+   it is reported; any failed write halts the journal as in 2.
 7. **Which detail wins at restart.** "acceptance not confirmed" (the
    refusal list) is resolved first and wins over §H's "authorization
    history unknown": the client was told `busy`, and the detail confirms
    that refusal. Both are `rejected`, final and never executed, so the
    choice changes no outcome (§H, Recovery, gives the full order).
-6. Unchanged from §6: a failed `executing` write rejects the request
-   before any effect, and every exit from `executing` is persisted before
-   it is reported; any failed write halts the journal as in 2.
 
 Fixtures: `r8-failed-persistence-changes-no-lease` (single failure, the
 retry with the same id while halted, then the restart: `rejected`, the

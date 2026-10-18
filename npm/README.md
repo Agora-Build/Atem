@@ -299,8 +299,12 @@ printed something ends, its last output and a short summary are saved under
 
 If you are paired and verified, Astation can view each session, take control
 of it (one controller at a time, on a lease Astation keeps renewing; typing
-locally takes control back at once), and send prompts to Claude from its chat view.
-Every remote request names the exact session; old `agentInput`,
+locally takes control back at once), and chat with the agent: sending a
+prompt takes control when nobody holds it (if another device does, Astation
+asks before taking over), the whole retained conversation can be scrolled
+back page by page, and each finished prompt names its reply messages.
+Every remote request names the exact session and speaks atem-session r8
+(Astation must be current: older clients are refused); old `agentInput`,
 `agentPrompt`, voice and `userCommand` messages were removed.
 
 Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
@@ -363,7 +367,9 @@ by Atem; later runs of
 the very same command are allowed without asking and show as "auto allowed",
 and the rule can be revoked from Astation) or **Deny** (with an optional
 note for the agent).
-Answering takes control of the session for that device. The terminal can
+Answering needs no control of the session: any of your devices that can
+control it answers, whoever is typing, and the first answer wins. The
+finished card shows how it ended. The terminal can
 always answer instead: Claude keeps its own dialog on screen (the first
 answer wins), and for Codex any key you type in the terminal hands the
 prompt back to Codex's own dialog. If nobody answers, nothing is allowed:
@@ -376,7 +382,7 @@ The first `atem agent launch codex` asks once whether to add Atem's hooks
 (one per Codex event, for approvals and chat) to `~/.codex/hooks.json`, after
 your own (a backup is kept as `hooks.json.atem-bak`); to turn them off later,
 set `hooks = false` under `[codex]` in `~/.config/atem/config.toml` — the next
-`atem agent launch codex` removes them. See [§6a of the session protocol](https://github.com/Agora-Build/Atem/blob/main/designs/protocol/atem-session-v1.md).
+`atem agent launch codex` removes them. See §6a and the r8 appendix of the [session protocol](https://github.com/Agora-Build/Atem/blob/main/designs/protocol/atem-session-v1.md).
 
 ## TUI Modes
 
