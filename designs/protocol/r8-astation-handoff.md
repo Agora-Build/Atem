@@ -12,7 +12,7 @@ must build. Test results and the per-fixture table are in
 Pin the shared fixtures and the contract to **the merge commit of the r8 PR
 into `main`**. Until it merges, pin `feat/r8` at the commit named here:
 
-- `feat/r8` pin: **`974a6e7`** (`974a6e7` completes r8: code, fixtures and
+- `feat/r8` pin: **`10e089a`** (`10e089a` completes r8 with the final-review fixes: code, fixtures and
   docs; later commits on `feat/r8` that touch only this note keep the same
   fixtures).
 
@@ -214,5 +214,5 @@ but your implementation and Swift runner must read them the same way.
 
 ## Pin commit
 
-`feat/r8` at `974a6e7` until the r8 PR merges; then the PR's merge commit
+`feat/r8` at `10e089a` until the r8 PR merges; then the PR's merge commit
 on `main`.

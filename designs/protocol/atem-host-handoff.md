@@ -43,7 +43,7 @@ must do, is [r8-astation-handoff.md](r8-astation-handoff.md).
 - Results: all 72 fixtures pass in the core runner; 25 pass against the real
   runtime and 40 can't be expressed there (see "Shared fixtures (r8)").
 - **Pin**: the merge commit of the r8 PR into `main`. Until it merges, pin
-  `feat/r8` at `974a6e7`.
+  `feat/r8` at `10e089a`.
 
 The sections below describe the runtime (r6) and approvals (r7) as they
 were handed over; where they say an answer carries `acquire` or needs the
