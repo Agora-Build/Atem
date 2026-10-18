@@ -142,32 +142,38 @@ pub struct MemJournal {
 
 impl MemJournal {
     /// The next `append` fails its fsync; the record is lost.
+    #[cfg(test)]
     pub fn fail_next_fsync(&mut self) {
         self.fail_fsync_of(1);
     }
 
     /// The `n`-th next `append` (1-based) fails its fsync.
+    #[cfg(test)]
     pub fn fail_fsync_of(&mut self, n: u64) {
         self.fail_in = Some((n.saturating_sub(1), false));
     }
 
     /// The `n`-th next `append` fails, and so does its rollback: the record
     /// is durable although the append reported a failure.
+    #[cfg(test)]
     pub fn fail_fsync_and_undo_of(&mut self, n: u64) {
         self.fail_in = Some((n.saturating_sub(1), true));
     }
 
     /// The next `Accepted` becomes durable, then the journal stops (a crash).
+    #[cfg(test)]
     pub fn crash_after_accepted(&mut self) {
         self.crash_after_accepted = true;
     }
 
     /// Whether `crash_after_accepted` fired.
+    #[cfg(test)]
     pub fn crashed(&self) -> bool {
         self.crashed
     }
 
     /// The next refusal-list write fails.
+    #[cfg(test)]
     pub fn fail_next_refusal(&mut self) {
         self.fail_refusal = true;
     }

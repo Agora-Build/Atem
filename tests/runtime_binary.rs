@@ -59,7 +59,9 @@ fn within(secs: u64, mut done: impl FnMut() -> bool) -> bool {
 /// Sends hello and returns the welcome.
 fn hello(socket: &Path) -> Option<serde_json::Value> {
     let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
     stream
         .write_all(b"{\"v\":1,\"op\":\"hello\",\"protocol\":1,\"build\":\"test\"}\n")
         .ok()?;
@@ -88,7 +90,11 @@ fn one_runtime_per_config_dir_with_its_pid_and_a_private_socket() {
         within(10, || hello(&socket).is_some()),
         "the runtime didn't start listening"
     );
-    let pid: u32 = std::fs::read_to_string(&lock).unwrap().trim().parse().unwrap();
+    let pid: u32 = std::fs::read_to_string(&lock)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     started.0 = Some(pid);
     assert_eq!(pid, first.id());
     let welcome = hello(&socket).unwrap();
@@ -97,7 +103,11 @@ fn one_runtime_per_config_dir_with_its_pid_and_a_private_socket() {
     assert_eq!(welcome["pid"], pid);
     let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    let dir_mode = std::fs::metadata(socket.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(socket.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(dir_mode, 0o700);
     assert_eq!(
         std::fs::read_to_string(config.join("runtime.socket")).unwrap(),
@@ -154,6 +164,16 @@ fn an_idle_runtime_exits_by_itself() {
         "the idle runtime kept running"
     );
     assert!(child.0.wait().unwrap().success());
+    // The idle exit is an orderly stop: its journal is closed cleanly for
+    // the run's epoch (r8 §H).
+    let journal = home.join(".config/atem/runtime/journal");
+    let epoch = std::fs::read_to_string(journal.join("runtime_epoch")).unwrap();
+    let clean: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal.join("clean_close")).unwrap()).unwrap();
+    assert_eq!(
+        clean,
+        serde_json::json!({"runtime_epoch": epoch.trim().parse::<u64>().unwrap()})
+    );
 }
 
 /// `/proc/<pid>/stat` field 22, or `None` when the process is gone.
@@ -211,7 +231,9 @@ impl Frontend {
             "the runtime didn't listen"
         );
         let stream = stream.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut frontend = Self {
             reader: BufReader::new(stream.try_clone().unwrap()),
             stream,
@@ -224,7 +246,9 @@ impl Frontend {
 
     fn send(&mut self, mut message: serde_json::Value) {
         message["v"] = serde_json::json!(1);
-        self.stream.write_all(format!("{message}\n").as_bytes()).unwrap();
+        self.stream
+            .write_all(format!("{message}\n").as_bytes())
+            .unwrap();
     }
 
     fn recv(&mut self) -> serde_json::Value {
@@ -248,7 +272,10 @@ impl Frontend {
     }
 
     /// Messages until `done` holds for one (or the screen); returns it.
-    fn until(&mut self, mut done: impl FnMut(&serde_json::Value, &str) -> bool) -> serde_json::Value {
+    fn until(
+        &mut self,
+        mut done: impl FnMut(&serde_json::Value, &str) -> bool,
+    ) -> serde_json::Value {
         loop {
             let message = self.recv();
             assert_ne!(message["op"], "error", "{message}");
@@ -306,10 +333,18 @@ fn sessions_run_in_workers_that_a_restarted_runtime_adopts() {
     std::fs::create_dir_all(&run).unwrap();
     std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
     let agent = dir.path().join("agent.sh");
-    std::fs::write(&agent, "#!/bin/sh\necho ready\nwhile read l; do echo \"got:$l\"; done\n").unwrap();
+    std::fs::write(
+        &agent,
+        "#!/bin/sh\necho ready\nwhile read l; do echo \"got:$l\"; done\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
     let socket = run.join("atem").join("runtime.sock");
-    let workers = home.join(".config").join("atem").join("runtime").join("workers");
+    let workers = home
+        .join(".config")
+        .join("atem")
+        .join("runtime")
+        .join("workers");
     let record = |sid: &str| -> serde_json::Value {
         let text = std::fs::read_to_string(workers.join(format!("{sid}.json"))).unwrap();
         serde_json::from_str(&text).unwrap()
@@ -348,9 +383,16 @@ fn sessions_run_in_workers_that_a_restarted_runtime_adopts() {
     // `list` waits until the runtime adopted what it found at start.
     let sessions = frontend.list();
     assert_eq!(sessions.len(), 2, "{sessions:?}");
-    assert!(sessions.iter().all(|s| s["state"] == "running"), "{sessions:?}");
+    assert!(
+        sessions.iter().all(|s| s["state"] == "running"),
+        "{sessions:?}"
+    );
     frontend.attach(&one);
-    assert!(frontend.screen.contains("got:hello"), "{:?}", frontend.screen);
+    assert!(
+        frontend.screen.contains("got:hello"),
+        "{:?}",
+        frontend.screen
+    );
     frontend.input(&one, "again\r");
     frontend.shows("got:again");
 
@@ -361,7 +403,10 @@ fn sessions_run_in_workers_that_a_restarted_runtime_adopts() {
             within(10, || !workers.join(format!("{sid}.json")).exists()),
             "the record of {sid} stayed"
         );
-        assert!(within(10, || start_time(worker).is_none()), "worker {worker} kept running");
+        assert!(
+            within(10, || start_time(worker).is_none()),
+            "worker {worker} kept running"
+        );
         // Its lock and log go with the record.
         for leftover in [format!("{sid}.lock"), format!("{sid}.log")] {
             assert!(
@@ -371,5 +416,8 @@ fn sessions_run_in_workers_that_a_restarted_runtime_adopts() {
         }
     }
     let sessions = frontend.list();
-    assert!(sessions.iter().all(|s| s["state"] == "exited"), "{sessions:?}");
+    assert!(
+        sessions.iter().all(|s| s["state"] == "exited"),
+        "{sessions:?}"
+    );
 }

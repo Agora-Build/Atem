@@ -512,3 +512,119 @@ impl<J: Journal + FailFsync> FakeRuntime<J> {
             .unwrap();
     }
 }
+
+/// A rollback that keeps failing survives `reopen`: the restart is refused
+/// and the host stays halted, so nothing is written that the pending
+/// rollback could later cut away. The records written before the failure
+/// are all there when a new process opens the journal.
+#[test]
+fn a_pending_rollback_survives_reopen_and_loses_no_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let e = hold(&mut rt);
+    let m = prompt(&rt, e, 1);
+    rt.send("c1", &m);
+    assert_eq!(state_of(&rt, 1).unwrap().0, ReceiptState::Executing);
+    rt.host.journal_mut().set_undo_stuck(true);
+    rt.host
+        .journal_mut()
+        .inject(super::file_journal::Fault::FsyncAndUndo);
+    let m = prompt(&rt, e, 2);
+    rt.send("c1", &m);
+    assert_eq!(
+        got(&mut rt).last().unwrap()["detail"],
+        DETAIL_ACCEPTANCE_NOT_RECORDED
+    );
+    let now = rt.now();
+    assert!(rt.host.restart_at(GEN2, 8, now, true).is_err());
+    assert!(rt.host.journal_halted());
+    assert!(rt.host.journal().failed().is_some());
+    assert!(!rt.host.close_cleanly());
+    let m = prompt(&rt, e, 3);
+    rt.send("c1", &m);
+    assert!(rt.host.receipt(&rid(3)).is_none());
+    let record = journal::Record::Transition {
+        request_id: rid(1),
+        state: ReceiptState::OutcomeUnknown,
+        detail: None,
+        updated_at: 1,
+    };
+    assert!(rt.host.journal_mut().append(record).is_err());
+    // The rollback finally works when the process goes away.
+    rt.host.journal_mut().set_undo_stuck(false);
+    drop(rt);
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let host = SessionHost::new(ctx(), harness_config(), journal, random_ids()).unwrap();
+    assert_eq!(
+        host.receipt(&rid(1)).map(|r| r.state),
+        Some(ReceiptState::Executing)
+    );
+    assert!(host.receipt(&rid(2)).is_none(), "rolled back");
+    assert_eq!(host.journal().refusals().unwrap().len(), 1);
+}
+
+/// A reload that fails leaves the journal failed and the host halted,
+/// never a wiped journal that takes writes.
+#[test]
+fn a_failed_reload_leaves_the_journal_failed_and_the_host_halted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let e = hold(&mut rt);
+    let m = prompt(&rt, e, 1);
+    rt.send("c1", &m);
+    std::fs::write(dir.path().join("state/floors"), b"damaged").unwrap();
+    let now = rt.now();
+    assert!(rt.host.restart_at(GEN2, 8, now, true).is_err());
+    assert!(rt.host.journal_halted());
+    assert!(rt.host.journal().failed().is_some());
+    let record = journal::Record::LeaseEpochs {
+        session_id: S1.into(),
+        reserved: 1000,
+    };
+    assert!(rt.host.journal_mut().append(record).is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("state/floors")).unwrap(),
+        b"damaged",
+        "never rewritten from a wiped state"
+    );
+}
+
+/// A link that connects without `control` before the start's resolution
+/// (workers still being adopted) doesn't change what recovered work is
+/// resolved as: rule 2's detail, not "control revoked".
+#[test]
+fn recovered_work_is_resolved_before_a_connect_changes_control() {
+    let mut j = MemJournal::default();
+    j.append(journal::Record::Control {
+        principal: "c1".into(),
+        control: true,
+        control_gen: 1,
+    })
+    .unwrap();
+    j.append(journal::Record::Accepted {
+        request_id: rid(1),
+        target: serde_json::from_value(target()).unwrap(),
+        kind: ReceiptKind::Prompt,
+        payload_digest: "0".repeat(64),
+        payload: json!({"text": "run the tests"}),
+        updated_at: 1,
+        principal: "c1".into(),
+        control_gen: 1,
+    })
+    .unwrap();
+    let mut host = SessionHost::open(ctx(), harness_config(), j, random_ids(), Some(8)).unwrap();
+    host.connect(Attach {
+        client: "c1".into(),
+        principal: "c1".into(),
+        attachment_gen: C1.into(),
+        permissions: vec![Permission::View],
+        client_kind: ClientKind::Native,
+        authorization_ms: 1000,
+    })
+    .unwrap();
+    host.restore_session(spec()).unwrap();
+    host.recover();
+    let r = host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+}

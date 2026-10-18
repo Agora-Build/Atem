@@ -565,6 +565,8 @@ struct Plan {
     crash_after_accepted: bool,
     crashed: bool,
     fail_refusal: bool,
+    /// Every rollback attempt fails (a log that can't be cut back).
+    undo_stuck: bool,
 }
 
 struct SessionLog {
@@ -728,6 +730,13 @@ impl FileJournal {
     #[cfg(test)]
     pub fn crashed(&self) -> bool {
         self.plan.crashed
+    }
+
+    /// Rollbacks fail until `false` (survives `reopen`, which is refused
+    /// while one is pending).
+    #[cfg(test)]
+    pub fn set_undo_stuck(&mut self, stuck: bool) {
+        self.plan.undo_stuck = stuck;
     }
 
     /// The next refusal-list write fails.
@@ -974,8 +983,13 @@ impl FileJournal {
     }
 
     /// Cuts logs back to their length before a failed append, where the
-    /// first attempt failed.
+    /// first attempt failed. Safe only because nothing is appended while a
+    /// rollback is pending (the journal stays failed, `reopen` included).
     fn retry_undo(&mut self) {
+        #[cfg(test)]
+        if self.plan.undo_stuck {
+            return;
+        }
         self.undo.retain(|_, log| {
             log.file
                 .set_len(log.len)
@@ -1393,8 +1407,18 @@ impl Journal for FileJournal {
         epoch
     }
 
+    /// Refused while a failed append's rollback is still pending: the log
+    /// may hold a record the host was told isn't written, and the rollback
+    /// cuts it back to its old length, which would destroy anything durable
+    /// written after it. The journal stays failed until a real process
+    /// restart opens it from disk. A reload that fails leaves it failed too
+    /// (its in-memory state is gone).
     fn reopen(&mut self) -> Result<(), JournalError> {
         self.retry_undo();
+        if !self.undo.is_empty() {
+            let why = "a failed write could not be rolled back; restart Atem".to_string();
+            return Err(self.fail(why));
+        }
         self.open.clear();
         self.owner.clear();
         self.live.clear();
@@ -1409,6 +1433,7 @@ impl Journal for FileJournal {
             self.plan = Plan::default();
         }
         self.load_state()
+            .map_err(|e| self.fail(format!("cannot reload: {}", e.0)))
     }
 
     fn load(&self) -> Result<Vec<Record>, JournalError> {

@@ -828,6 +828,7 @@ impl<J: Journal> SessionHost<J> {
             return Err("principal must be an opaque id".into());
         }
         let has_control = a.permissions.contains(&Permission::Control);
+        self.resolve_once();
         self.principal_control(&a.principal, has_control);
         let old: Vec<String> = self
             .attachments
@@ -1478,14 +1479,22 @@ impl<J: Journal> SessionHost<J> {
         if orderly {
             self.close_cleanly();
         }
-        // Read the journal before changing anything else: a failed restart
-        // leaves the host as it was (its journal reopened).
-        self.journal.reopen().map_err(|e| e.0)?;
+        // Read the journal before changing anything else. A failed restart
+        // leaves the host as it was, halted: the journal couldn't be
+        // reopened (a rollback still pending, a reload that failed) and
+        // must not take writes until a real process restart.
         let replayed = self
             .journal
-            .load()
-            .and_then(journal::replay)
-            .map_err(|e| e.0)?;
+            .reopen()
+            .and_then(|()| self.journal.load())
+            .and_then(journal::replay);
+        let replayed = match replayed {
+            Ok(r) => r,
+            Err(e) => {
+                self.halt_journal();
+                return Err(e.0);
+            }
+        };
         let found = self.journal.take_clean_close();
         self.previous_clean = found.is_some() && found == Some(previous_epoch);
         self.now = self.now.max(now);
@@ -1648,13 +1657,7 @@ impl<J: Journal> SessionHost<J> {
     /// stay disabled (`start_error`, the journal halted) and nothing is
     /// dispatched or reconciled.
     pub fn recover(&mut self) -> Vec<Effect> {
-        if !self.resolved {
-            self.resolved = true;
-            if let Err(e) = self.resolve_start() {
-                self.halt_journal();
-                self.start_error = Some(e);
-            }
-        }
+        self.resolve_once();
         if self.start_error.is_some() {
             return self.take();
         }
@@ -1674,6 +1677,32 @@ impl<J: Journal> SessionHost<J> {
             .collect();
         self.out.extend(reconcile);
         self.take()
+    }
+
+    /// The start's resolution, once per start: before `recover`'s
+    /// reconciliation, and before the first connect (a link may connect
+    /// while workers are still being adopted; its control changes then
+    /// apply to resolved work, so recovered work gets the start's detail).
+    /// Principals already confirmed get their waiting work at once.
+    fn resolve_once(&mut self) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        if let Err(e) = self.resolve_start() {
+            self.halt_journal();
+            self.start_error = Some(e);
+            return;
+        }
+        let confirmed: Vec<String> = self
+            .principals
+            .iter()
+            .filter(|(_, p)| p.confirmed && p.control)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for p in confirmed {
+            self.confirm(&p);
+        }
     }
 
     fn resolve_start(&mut self) -> Result<(), String> {
