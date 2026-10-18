@@ -211,13 +211,6 @@ struct MessageBody<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DeltaBody<'a> {
-    message_id: &'a str,
-    part: PartBody<'a>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AcceptedBody<'a> {
     request_id: &'a str,
 }
@@ -388,16 +381,6 @@ pub fn event(conv: &str, agent: &str, generation: &str, sequence: u64, out: &Out
             message_body(message, true, None, Some(after.as_deref())),
         ),
         Out::Coverage(c) => envelope(conv, agent, "coverage", Some(head), coverage_body(c)),
-        Out::Delta { message_id, part } => envelope(
-            conv,
-            agent,
-            "delta",
-            Some(head),
-            DeltaBody {
-                message_id,
-                part: part_body(part),
-            },
-        ),
         Out::Status(s) => envelope(conv, agent, "status", Some(head), status_body(s)),
         Out::Accepted { request_id } => envelope(
             conv,
@@ -990,19 +973,6 @@ mod tests {
         let v = b(&Out::Message(a));
         assert_eq!(v["role"], "assistant");
         assert!(v.get("origin").is_none() && v.get("requestId").is_none());
-        assert_eq!(
-            b(&Out::Delta {
-                message_id: "m1".into(),
-                part: Part::Text {
-                    id: "p3".into(),
-                    markdown: "x".into()
-                }
-            }),
-            merged(
-                "delta",
-                json!({"messageId":"m1","part":{"id":"p3","kind":"text","markdown":"x"}})
-            )
-        );
         assert_eq!(
             b(&Out::Status(Status {
                 state: State::Unknown,

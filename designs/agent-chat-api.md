@@ -126,8 +126,8 @@ Reply, in order: `opened` (sequence 0), the newest page as
 - A conversation is **one ordered stream**: pages and live events share its
   `sequence`, and a page is built in one host step, so nothing of that
   conversation comes between its envelopes. Keep per `messageId` the version
-  with the highest sequence (a live `delta` at a higher sequence appends to
-  it); a page never replaces a newer version. Pages carry whole messages.
+  with the highest sequence (a message that grows is sent whole again and
+  replaces the earlier version); a page never replaces a newer version. Pages carry whole messages.
 - Older pages and lookups:
 
 ```json
@@ -166,8 +166,10 @@ Reply, in order: `opened` (sequence 0), the newest page as
   message. `holes: [{after_message_id, before_message_id, count?}]` are gaps
   inside the retained timeline (≤ 16, then `holes_more: true`). Show them;
   never reopen because of them. Without `control` you never see card ids
-  here: holes are named by the messages you can see, and `oldest_retained`
-  is the oldest one you can see.
+  here: holes are named by the messages you can see, a hole before
+  everything you can see is reported as `truncated: true` instead, and
+  `oldest_retained` is the oldest one you can see; a `before` naming a card
+  is `stale_target`.
 - `open.before` and `open.generation` (the 2026-10-17 paging form) are
   removed: `error{code:"unsupported_version"}`, nothing opened or reset.
   There is no `status.page` marker any more.
@@ -193,8 +195,7 @@ All carry `generation` and `sequence` (apply only `last + 1`):
 
 | op | fields |
 |---|---|
-| `message` | the message above (new user or assistant message, whole) |
-| `delta` | `messageId`, `part`: a later part appended to a message already sent (both agents; not a token stream); a part id already present is ignored |
+| `message` | the message above (a new user or assistant message, or a later version of one, always whole: replace what you had for that `messageId`) |
 | `status` | `state` (`ready`/`working`/`waiting`/`unknown`), `since`, optional `detail`; re-sent every 15 s with the original `since` |
 | `accepted` | `requestId`: your prompt reached the agent; `lease{lease_epoch, ms_left}` when your submit carried `acquire` (section 3.2) |
 | `history_end` | `page_id` (absent on the open's page), `page` (section 2.2) |
@@ -206,7 +207,7 @@ All carry `generation` and `sequence` (apply only `last + 1`):
 | `message{history:true, after_message_id}` | a message recovered after a burst of agent output was reloaded: place it after `after_message_id` (`null`: no retained message precedes it); the key's presence marks it as recovered |
 
 `complete` means the execution turn ended, not that nothing more can arrive: a
-late `message`/`delta` for the same `turnId` is possible. Accept it.
+late `message` for the same `turnId` is possible. Accept it.
 Message parts (`kind`):
 
 ```json
@@ -368,8 +369,11 @@ most 32 (`more: true`: fetch the rest with `history{request_id}`), without
 approval cards. `replies` is the turn's coverage (`partial` when part of the
 turn was evicted, lies in a hole, or an id couldn't be named). The ids are
 journaled, the replies computed from the retained history each time, so
-they can change. No `result` on other receipts, or when Atem couldn't
-record the turn's ids. Work executing across a broker restart
+they can change. Every completed prompt carries it; the user message id stays
+known after the message itself was evicted (`replies` is then `partial`, or
+`unavailable` when nothing of the turn is retained). No `result` on other
+receipts, nor in the one case where the agent's own turn or message id isn't a
+valid id (1-128 bytes of `[A-Za-z0-9._:-]`). Work executing across a broker restart
 becomes `outcome_unknown` and is never retried. Replay after a reconnect of the
 same chat submit is safe because the same `requestId` returns the recorded
 outcome, but the right first move is `receipt_query`.
@@ -533,16 +537,16 @@ approvals pending across a broker restart are released without
 | Chat availability | `chat-v1` once its hooks produced SessionStart (15 s wait; late one still enables) | only with `[codex] hooks = true` and hooks trusted in Codex's `/hooks` |
 | Content source | transcript JSONL | rollout JSONL |
 | `unavailable` | `["streaming","reasoning"]` | `["streaming","reasoning","error_details"]` |
-| Reply shape | whole messages; later content blocks of the same reply arrive as `delta` parts | whole messages (commentary and final answer are separate messages; a command is a `Bash` tool part); later parts also arrive as `delta` |
+| Reply shape | whole messages; a later content block of the same reply sends the message again, whole | whole messages (commentary and final answer are separate messages; a command is a `Bash` tool part); later parts also arrive as `delta` |
 | Status before first prompt | `ready` after SessionStart | `unknown` until the first prompt typed in the terminal |
 | First remote prompt | allowed when `ready` | refused until a first prompt was typed locally (the "type a first prompt" text) |
 | Always allow | agent's `permission_suggestions` as `always_rules` | an Atem session rule, shell commands only (section 5.5) |
 | Approval `waiting` | from Notification and open approvals | only from approvals this session has open (no native event) |
 | `expires_at` | 600 s | 300 s |
 
-`delta` is emitted by the shared chat state (`ChatSession`) for both agents: it
-means "one more part of an already known message" (for example a tool part after
-text), not a token stream. No agent streams partial text today, and both
+A message that gains a part (for example a tool part after text) is sent again
+whole by the shared chat state (`ChatSession`) for both agents, replacing the
+earlier version (r8; there is no `delta` any more). It is not a token stream. No agent streams partial text today, and both
 declare it in `unavailable` (`streaming`): Claude's transcript holds whole
 content blocks, Codex's rollout whole messages. Treat both as "parts arrive
 whole", and never animate text as a stream.
@@ -632,7 +636,7 @@ Ops: `hello`, `list`, chat `open`/`submit` or session-v1 `submit`
   use it when you need the reply text.
 - A script flow: submit with `acquire:true`; wait for `complete` or the receipt
   `completed`; its `result` names the turn and its reply ids; fetch them with
-  `history{request_id}` (or collect live `message`/`delta` by `turnId`); release.
+  `history{request_id}` (or collect live `message`s by `turnId`); release.
 - Exit codes should tell `rejected` (nothing happened, safe to retry later with
   a new `requestId`) from `outcome_unknown` (do not retry: check the terminal).
 - Pitfalls: a CI script must not retry `outcome_unknown` with a new

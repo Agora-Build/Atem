@@ -58,9 +58,7 @@
 //! rules come only from a Codex session), `chat_evict` (retention evicts
 //! only past 500 messages / 8 MiB), `worker_gap` (no backlog fault in the
 //! worker), `chat_turn` of a remote prompt (the real adapter's status events
-//! around the turn are sequenced too), a later version of a chat message
-//! (the runtime sends the appended part as a `delta`, the fixtures the whole
-//! message), and approval closes other
+//! around the turn are sequenced too), and approval closes other
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
 //! false`. An `r8-*` scenario runs once the host work it needs is
 //! implemented (`src/session_protocol/revision.rs`, shared with the core
@@ -546,7 +544,6 @@ fn unsupported(scenario: &Value) -> Option<String> {
             "{clients} clients: the runtime holds one Astation link, so one attachment at a time"
         ));
     }
-    let mut written: Vec<&Value> = Vec::new();
     for step in scenario["steps"].as_array().into_iter().flatten() {
         for (action, why) in [
             (
@@ -601,13 +598,6 @@ fn unsupported(scenario: &Value) -> Option<String> {
             .flatten()
             .chain(step.get("message"));
         for m in content {
-            if written.contains(&&m["messageId"]) {
-                return Some(format!(
-                    "{}: a later version of a message reaches the real runtime's conversations as chat-v1 delta{{part}} (one per appended part), where the fixture expects the whole message again; covered by the core harness",
-                    m["messageId"]
-                ));
-            }
-            written.push(&m["messageId"]);
             let text = m["parts"]
                 .as_array()
                 .is_some_and(|p| p.iter().all(|p| p["kind"] == "text"));
@@ -2022,9 +2012,8 @@ const NOT_RUN: &[&str] = &[
     "r8-two-simultaneous-sends-acquire-once",
     // r8 history scenarios the fake Claude's transcript can't express (each
     // reason is printed: eviction, a backlog fault, a remote turn's status
-    // events, a message's later version sent as a delta).
+    // events).
     "r8-backlog-hole-is-reported-not-reopened",
-    "r8-history-page-and-live-events-share-one-ordered-stream",
     "r8-receipt-result-bounds-reply-message-ids",
     "r8-stale-or-foreign-next-token-is-stale-target",
     "r8-truncated-history-reopens-once-then-stays-live",

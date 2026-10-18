@@ -219,7 +219,7 @@ work on macOS.)
     one poll so those lines are handled normally first);
   - a resumed session's transcript (source not `startup`/`clear`) usually
     already holds that session's earlier turns: that content is **backfill**,
-    added to history only (no `message`, `delta` or `complete`, no status
+    added to history only (no `message` or `complete`, no status
     change), and open conversations get `error` "the conversation was
     switched; reopen the chat" and `close`, so clients reload history. Later
     lines are live.
@@ -274,7 +274,7 @@ uses the same state (`ready`, `working`, `waiting`, `unknown`); the former
 `complete` means **Claude's execution turn has ended** (by `Stop`,
 `end_turn` or an interrupt). It does not promise that no more transcript
 content will arrive: a late entry for the same `turnId` may still come as
-`message`/`delta` after `complete`, and clients must accept it. On `Stop`,
+`message` after `complete`, and clients must accept it. On `Stop`,
 Atem reads the transcript to its end and sends what it found before
 `complete`.
 
@@ -333,21 +333,25 @@ message {
   after_message_id?   // recovered after a backlog gap: the retained message
                       // it follows, null when none precedes it (always present)
 }
-delta { messageId, part: { id, kind, … } }   // a later part appended to a
-                                             // message already sent; a part
-                                             // id already present is ignored
 ```
 
-- `delta` (both agents) means a later part (text, tool, …) was appended to a
-  message already sent, e.g. a tool call after the text of the same
-  assistant message. It is not a token stream: each part arrives whole
-  (`unavailable` lists `streaming`).
+- A message that grows (a later part, e.g. a tool call after the text of
+  the same assistant message) is sent again whole, with the same
+  `messageId` and every part so far, at the conversation's next sequence;
+  it replaces the earlier version (r8 §B; before r8 Atem sent the new part
+  alone as `delta`, which r8 no longer sends). It is not a token stream:
+  each part arrives whole (`unavailable` lists `streaming`). Trade-off: a
+  message that grows part by part costs its whole size each time, but a
+  message is capped (131 072 bytes of content, 2048 parts) and a version is
+  sent only when a transcript entry adds parts, so the cost is bounded,
+  and one rule (the highest sequence wins) covers live updates, pages and
+  recovered messages alike.
 - Markdown is CommonMark without raw HTML, so native apps can render it
   without a web view.
 - IDs never change, so clients can cache messages and merge updates.
-- History never replays deltas: each message is sent whole with all its parts
-  so far. A live `delta` at a higher sequence than a page is newer than the
-  page's copy (append it); a page never replaces a newer version.
+- Pages send each message whole with all its parts so far. Keep per
+  `messageId` the version with the highest sequence; a page never replaces
+  a newer version.
 - An approval card is an assistant message `approval-<approval_id>`; when its
   state changes the whole message is sent again with the same `messageId`
   (replace it). Final cards carry `reason`, the `approval_closed` reason
@@ -378,7 +382,7 @@ on the existing authenticated Astation connection.
 | `submit` | Astation → Atem | `generation`, `requestId` (UUID), `binding`, and one of `text` (optionally `acquire: true`, with `takeover: true` and `expected_controller`, r8 §F), `approval` (§6a answer; `control` only, no lease, r8 §G) or `approval_rule_revoke` (`{rule_id}`, r7.2; `control` only, no lease: r7.3) |
 | `rules` | Atem → Astation | `approvalRules` (the whole list, when it changed; conversations with `control` only) |
 | `accepted` | Atem → Astation | `requestId`; `lease {lease_epoch, ms_left}` when the admitted submit carried `acquire` (a grant, a takeover, or the sender's own lease unchanged; r8 §F) |
-| `message` / `delta` | Atem → Astation | see the message model |
+| `message` | Atem → Astation | see the message model (a later version replaces the earlier one) |
 | `status` | Atem → Astation | `state: ready|working|waiting|unknown`, `since`, optional `detail` |
 | `complete` | Atem → Astation | `turnId`, optional `requestId`, `outcome: "done"|"interrupted"` (below) |
 | `error` | Atem → Astation | `text` (safe, no secrets), optional `requestId`, and `code` on every `error` the session host makes: `rejected` or `outcome_unknown` (a submit's receipt), a session-v1 code from admission (`stale_target`, `stale_lease`, `lease_held` with `controller {controller_session, lease_epoch}`, `forbidden`, …), `invalid_request` (a `history` or Send field rule), `unsupported_version` (a malformed or removed chat message) or `busy` (`open` without chat-v1, too many `history` requests); a history request's error carries its `page_id` when that was valid; the chat's own errors (the agent exited or was restarted, the conversation was switched, chat withdrawn) carry no `code`; an `error` sent before a conversation is open (unknown agent, chat unavailable, bad request) carries no `generation`/`sequence` |
@@ -417,8 +421,10 @@ on the existing authenticated Astation connection.
   message); a `history_end` lists those whose `before_message_id` is in its
   page plus a live-edge hole on the newest page (≤ 16, then `holes_more`).
   A view-only attachment sees no card ids here: holes are named by visible
-  neighbours, one with no visible message before it is left out, and
-  `oldest_retained` is the oldest visible message. Truncation, holes and
+  neighbours, one with no visible message before it is left out and
+  reported as truncation (`truncated: true`, so the selection is
+  `partial`), `oldest_retained` is the oldest visible message, and a
+  `before` naming a card is `stale_target`. Truncation, holes and
   `coverage` events never ask for a reopen; only a sequence gap, another
   `generation`, a fenced attachment or `close` with a `reason` do.
 - `open` on a running session whose chat-v1 is off (Claude before its
@@ -508,7 +514,7 @@ on the existing authenticated Astation connection.
 - Integration (`tests/`, like `terminal_ui_binary`): a fake `claude` script
   that runs the hook commands from `settings.json` and writes a transcript, run by the real binary
   in a pseudo-terminal against a fake Astation WebSocket: open with history;
-  submit → accepted → message/delta → complete; refusal after local typing;
+  submit → accepted → message → complete; refusal after local typing;
   duplicate request; process exit → unknown; reconnect keeps state.
 - r8 history: `src/chat/history_tests.rs` (paging, bounds with escaping,
   lookups, token binding, coverage, holes, view-only), broker tests (gap
@@ -533,7 +539,7 @@ Additive to `mem_b3ccce1f`:
 - `message` gains `role`, `origin` (user messages), `turnId`, `createdAt`,
   `parts` (typed: `text` with CommonMark-no-HTML, `tool` with name/summary)
   instead of a single Markdown `text`, and `history`.
-- `delta` appends one typed part with an id; repeated part ids are ignored.
+- `delta` appended one typed part with an id (removed in r8: a growing message is sent whole again).
 - `complete` gains `turnId` and `outcome`; it means the execution turn ended,
   not that no more content can arrive.
 - `status` gains `since` and is re-sent every 15 s with the original `since`.

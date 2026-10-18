@@ -311,19 +311,35 @@ pub fn turn_replies(chat: &ChatSession, turn_id: &str, user_message_id: &str) ->
 
 /// The holes as an attachment sees them (r8 §C): with `control` as they
 /// are; for a view-only one, which never sees approval cards, named by
-/// their nearest visible neighbours (a hole with no visible message before
-/// it is older than anything it sees: left out, like truncation; holes
-/// that name the same neighbours are one, its count unknown).
+/// their nearest visible neighbours (holes that name the same neighbours
+/// are one, its count unknown). A hole with no visible message before it
+/// is older than anything it sees: it is left out and counts as
+/// truncation (`visible_truncated`).
 pub fn visible_holes(chat: &ChatSession, control: bool) -> Vec<Hole> {
+    visible_view(chat, control).0
+}
+
+/// Whether this attachment's history is truncated: anything evicted, or
+/// (view-only) a hole left out because no visible message precedes it.
+pub fn visible_truncated(chat: &ChatSession, control: bool) -> bool {
+    visible_view(chat, control).1
+}
+
+fn visible_view(chat: &ChatSession, control: bool) -> (Vec<Hole>, bool) {
     if control {
-        return chat.holes().to_vec();
+        return (chat.holes().to_vec(), chat.truncated());
     }
+    let mut dropped = false;
     let msgs: Vec<&ChatMessage> = chat.retained().collect();
     let index = |id: &str| msgs.iter().position(|m| m.message_id == id);
     let mut out: Vec<Hole> = Vec::new();
     for h in chat.holes() {
-        let Some(a) = index(&h.after) else { continue };
+        let Some(a) = index(&h.after) else {
+            dropped = true;
+            continue;
+        };
         let Some(after) = (0..=a).rev().find(|i| !is_card(msgs[*i])) else {
+            dropped = true;
             continue;
         };
         let before = h
@@ -345,7 +361,7 @@ pub fn visible_holes(chat: &ChatSession, control: bool) -> Vec<Hole> {
             None => out.push(hole),
         }
     }
-    out
+    (out, chat.truncated() || dropped)
 }
 
 /// The oldest retained message an attachment sees (cards aside for a
@@ -361,7 +377,7 @@ pub fn visible_oldest(chat: &ChatSession, control: bool) -> Option<String> {
 pub fn coverage_for(chat: &ChatSession, control: bool) -> super::session::CoverageState {
     super::session::CoverageState {
         oldest_retained: visible_oldest(chat, control),
-        truncated: chat.truncated(),
+        truncated: visible_truncated(chat, control),
         holes: visible_holes(chat, control),
     }
 }
@@ -456,7 +472,11 @@ pub fn page(
             end: msgs.len(),
         },
         Select::Before(id) => {
-            let end = msgs.iter().position(|m| m.message_id == id).ok_or(Stale)?;
+            // A card id is unknown to a view-only attachment: stale.
+            let end = msgs
+                .iter()
+                .position(|m| m.message_id == id && keep(m))
+                .ok_or(Stale)?;
             Plan::Back {
                 kind: Kind::Before,
                 end,
@@ -524,7 +544,7 @@ pub fn page(
         Plan::Empty { .. } => Vec::new(),
     };
     // Holes and the oldest message as this attachment sees them.
-    let visible = visible_holes(chat, to.control);
+    let (visible, truncated) = visible_view(chat, to.control);
     let oldest = visible_oldest(chat, to.control);
     // The largest `history_end` this page could have (a token, the 16
     // largest holes, seven-digit numbers): what the serialized bound must
@@ -617,7 +637,7 @@ pub fn page(
                 Some(b) => index_of.get(b.as_str()).is_some_and(|i| i <= end),
                 None => *end == msgs.len(),
             });
-            match (selected, chat.truncated() || holed) {
+            match (selected, truncated || holed) {
                 (false, true) => Coverage::Unavailable,
                 (false, false) => Coverage::Complete,
                 (true, true) => Coverage::Partial,
@@ -660,7 +680,7 @@ pub fn page(
         next,
         coverage: coverage_name(coverage),
         oldest_retained: oldest,
-        truncated: chat.truncated(),
+        truncated,
         holes,
     };
     let end_seq = first_seq + picked.len() as u64;

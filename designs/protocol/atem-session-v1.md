@@ -830,7 +830,9 @@ refuse every r7 peer.
 
 **Implementation notes (2026-10-18).** What building r8 showed the text
 above had wrong or left open, now written into the sections below (each is
-listed for Astation in `r8-astation-handoff.md`):
+listed for Astation in `r8-astation-handoff.md`). Notes 1, 3, 6 and 13
+change or narrow the signed text and need Astation's agreement; the others
+only make precise what the signed text leaves open.
 
 1. §H, a failed revocation write: the new link is **not closed**. As
    `r8-control-fence-holds-when-a-rejection-write-fails` step 12 requires,
@@ -838,8 +840,12 @@ listed for Astation in `r8-astation-handoff.md`):
    is `busy` "journal halted; restart Atem" until the restart.
 2. §B: the paragraph on today's code (#75 `open{before}` and `status.page`)
    described what r8 removed; it now names the r8 page builder.
-3. §B: the 8-a-second bound counts valid `history` requests only. An
+3. §B: the 8-a-second bound counts valid `history` requests only; each
    invalid one gets its sequenced `invalid_request` and is not counted.
+   The signed text counts every request, but
+   `r8-history-selectors-are-exclusive-and-validated` sends twelve invalid
+   requests and a valid one in the same instant and expects no `busy`; Atem
+   follows the fixture until the two are aligned.
 4. §B: `wire_bytes` (and the 1 MiB bound) includes the page's
    `history_end` itself.
 5. §B: "message bytes as counted by `ChatSession`" counts each message's
@@ -849,17 +855,17 @@ listed for Astation in `r8-astation-handoff.md`):
 6. §B: a chat `close` may come without a binding; it then closes only the
    sender attachment's own conversation of that id. With a binding it is
    checked like a read.
-7. §B: a later version of a live message may arrive as chat-v1
-   `delta{messageId, part}` (one part appended) rather than the whole
-   message; it is a newer version by the same sequence rule. Pages always
-   carry whole messages.
+7. (withdrawn: a later version of a live message goes out as the whole
+   `message`, as §B says; r8 sends no `delta`.)
 8. §C: a recovered message always carries `after_message_id`, `null` when
    no retained message precedes it (the key's presence marks it as
    recovered).
 9. §C: for a view-only attachment holes are named by their nearest visible
-   neighbours, a hole with no visible message before it is left out (like
-   truncation), and `oldest_retained` is the oldest message it can see, in
-   pages and in `coverage` events.
+   neighbours, and `oldest_retained` is the oldest message it can see, in
+   pages and in `coverage` events. A hole with no visible message before it
+   is left out and reported as truncation (`truncated: true`, so the
+   selection's `coverage` is `partial`). A `before` naming a card it can't
+   see is `stale_target`.
 10. §C: a `coverage` event carries the session's whole hole list (≤ 16,
     then `holes_more`) and follows a reload only when a hole was recorded.
     A reload that fails leaves a hole without `count` (the worker's `gap`
@@ -870,13 +876,18 @@ listed for Astation in `r8-astation-handoff.md`):
 12. §C: Atem sends `close.reason` `switched`, `withdrawn`, `restarted` and
     `evicted`; never `fenced` or `reset` (a fenced attachment's
     conversations end with its transport).
-13. §D: `reply_message_ids` leaves approval cards out (they aren't the
-    agent's reply, and a view-only `receipt_query` must not learn card ids;
-    `history{request_id}` pages them to attachments with `control`). A
-    reply id that can't be named (not an opaque id) is dropped and makes
-    `replies` `partial`. A completion whose user message isn't retained, or
-    whose turn or user message id is invalid, journals no result: the
-    receipt completes without `result`.
+13. §D: every completed `prompt` receipt carries `result`: its turn is
+    always known, and the user message id is recorded when the prompt is
+    accepted, so `result` names it even after retention evicted the
+    message (`replies` is then `partial`, or `unavailable` when nothing of
+    the turn is retained). The one narrowing: a turn or user message id
+    that isn't an opaque id (1–128 bytes of `[A-Za-z0-9._:-]`, the wire
+    rule for ids) can't be journaled or sent, so that receipt completes
+    without `result`. `reply_message_ids` leaves approval cards out (they
+    aren't the agent's reply, and a view-only `receipt_query` must not
+    learn card ids; `history{request_id}` pages them to attachments with
+    `control`); a reply id that isn't an opaque id is dropped and makes
+    `replies` `partial`.
 14. §F: the chat-v1 `lease_held` text is "another controller holds this
     session" (session-v1 `error` uses the same text).
 
@@ -988,9 +999,8 @@ the runtime and the fixtures' fake runtime share it.)
 Each message envelope's `sequence` is its position: a message version
 carried at a higher sequence is newer. A client keeps, per `messageId`, the
 version with the highest sequence and never lets a page replace a newer
-version. A live update may be a whole `message` or a chat-v1
-`delta{messageId, part}` that appends one part; either is the newer version
-at its sequence, and pages always carry whole messages. No per-message
+version. A live update of a message is the whole `message` again (it
+replaces the previous version; r8 sends no `delta`). No per-message
 revision is needed because the stream is the order.
 Astation, which returns pages over HTTP and changes over SSE, attaches its
 own replay cursor (the conversation sequence) to each page and applies the
@@ -1083,9 +1093,10 @@ and lookups:
   `before_message_id` is in its page (≤ 16, then `holes_more: true`); holes
   older than `oldest_retained` become truncation. Holes are persistent and
   no reopen repairs them. A view-only attachment never sees card ids in
-  this metadata: its holes are named by their nearest visible neighbours (a
-  hole with no visible message before it is left out, like truncation) and
-  its `oldest_retained` is the oldest message it can see.
+  this metadata: its holes are named by their nearest visible neighbours,
+  a hole with no visible message before it is left out and reported as
+  truncation (`truncated: true`), and its `oldest_retained` is the oldest
+  message it can see.
 - **Backlog gap handling (r8 implementation change from #75).** Today a
   worker chunk with `gap > 0` makes the broker reload the worker's history
   and then send every open conversation `error` "the chat history was
@@ -1127,9 +1138,10 @@ and lookups:
 
 - On `completed` `prompt` receipts only. `turn_id`, `user_message_id` and
   `outcome` (`done`|`interrupted`, equal to `detail`) are journaled with the
-  `completed` transition (ids only, never text); a completion whose user
-  message isn't retained, or whose ids aren't opaque ids, journals none and
-  its receipt has no `result`. `reply_message_ids` (the turn's assistant
+  `completed` transition (ids only, never text); the user message id is
+  the one recorded when the prompt was accepted, retained or not (only ids
+  that aren't opaque ids can't be journaled: that receipt has no
+  `result`). `reply_message_ids` (the turn's assistant
   messages, timeline order, approval cards left out, **at most 32**; an id
   that can't be named is dropped and makes `replies` `partial`), `more` (true
   when more replies are retained) and `replies` (`complete`|`partial`|

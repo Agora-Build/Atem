@@ -689,6 +689,35 @@ fn a_view_only_attachment_sees_holes_by_their_visible_neighbours() {
         "the hole after the oldest card is older than anything seen"
     );
     assert_eq!(coverage_for(&chat2, true).holes.len(), 2);
+    // The hole left out is truncation for the view-only attachment only.
+    assert!(seen.truncated, "a dropped hole is reported as truncation");
+    assert!(!coverage_for(&chat2, true).truncated);
+    let (_, end) = split(
+        &page(
+            &chat2,
+            &key,
+            &to(cx("a", "c"), None, false),
+            Select::Newest,
+            1,
+        )
+        .unwrap(),
+    );
+    assert_eq!(end["page"]["truncated"], true);
+    assert_eq!(end["page"]["coverage"], "partial");
+}
+
+/// A view-only attachment never saw a card: `before` naming one is stale.
+#[test]
+fn before_a_card_is_stale_for_a_view_only_attachment() {
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    chat.put_message(msg("m-0001", "turn-1", Role::User, "hi"));
+    chat.put_card(card("a1", "turn-1"));
+    chat.put_message(msg("m-0002", "turn-1", Role::Assistant, "ok"));
+    let key = HistoryKey::random();
+    let before = || Select::Before("approval-a1".into());
+    assert!(page(&chat, &key, &to(cx("a", "c"), None, false), before(), 1).is_err());
+    let (got, _) = split(&page(&chat, &key, &to(cx("a", "c"), None, true), before(), 1).unwrap());
+    assert_eq!(got, ["m-0001"]);
 }
 
 /// The serialized reserve covers the 16 largest holes, whichever a page

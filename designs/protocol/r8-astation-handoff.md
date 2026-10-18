@@ -52,7 +52,8 @@ Atem and Astation must ship together: Atem refuses every r7 peer.
    attachment or `close` with a `reason` (`switched`, `withdrawn`,
    `restarted`, `evicted`). A backlog gap no longer forces a reopen:
    recovered messages arrive as `message{history: true, after_message_id}`
-   and what stayed missing as a `coverage` event.
+   and what stayed missing as a `coverage` event. A message that gains a
+   part comes again whole and replaces the earlier version (no `delta`).
 6. **`receipt.result`** (§D) on completed prompt receipts: show the reply
    from `reply_message_ids` (≤ 32, `more` → page the rest with
    `history{request_id}`), and treat `replies: partial|unavailable` as
@@ -104,92 +105,112 @@ Changed:
 Every other fixture is unchanged. No fixture contradicts the appendix as
 now written.
 
-## Readings Astation must confirm
+## Edits to the signed text Astation must confirm
 
-Each is how Atem implements a point the appendix left open or stated
-differently; the appendix text now says what Atem does (its
-"Implementation notes" list them). Please confirm or object.
+The appendix's "Implementation notes" list every point where building r8
+changed or made the signed text precise. Only these four change or narrow
+it; please confirm or object:
 
-1. **A halted host's new link** (§H, failed revocation write). The appendix
-   said "the new link is closed without a `welcome`";
+1. **A halted host's new link** (note 1, §H failed revocation write). The
+   signed text said "the new link is closed without a `welcome`";
    `r8-control-fence-holds-when-a-rejection-write-fails` step 12 expects
    `busy "journal halted; restart Atem"` on that new link, which a closed
    link can't receive. Atem follows the fixture: no `welcome` (the `hello`
    gets no reply), the link stays open, and every request on it is `busy`.
-   The appendix now says so. (The link is closed without a reply only in
-   §I.4, when even the refusal can't be recorded.)
-2. **Recovered-work ordering** (§H, recovery). Recovered work waiting for
-   its principal's confirmation stays out of the session's prompt queue
-   until that principal is welcomed with `control`, so a newer prompt from
-   another principal (none exists today) can run before it. The appendix
-   doesn't fix this order.
-3. **`close` without a binding** (§B). The history fixtures
+   (The link is closed without a reply only in §I.4, when even the refusal
+   can't be recorded.)
+2. **Invalid history requests and the 8/s bound** (note 3, §B). The fixture
+   and the §B text disagree on whether invalid history requests count
+   toward the 8/s bound. Atem follows the fixture: invalid requests aren't
+   counted, and each gets one sequenced error. Choose one and we'll align.
+   (`r8-history-selectors-are-exclusive-and-validated` sends twelve invalid
+   requests and a valid one in the same instant and expects no `busy`.)
+3. **`close` without a binding** (note 6, §B). The history fixtures
    (`long-turn`, `backlog-hole`, `truncated-history`) send a chat `close`
    without `binding`. Atem accepts it and closes only the sender
    attachment's own conversation of that id; a `close` with a binding is
    checked like a read.
-4. **`wire_bytes` includes `history_end`** (§B): the serialized bound and
-   `wire_bytes` count the page's `history_end` envelope itself, as the
-   fixtures' 675 = 340 + 335 implies.
-5. **`open-N` page ids** (schema `recover`): for an `open`, which has no
-   `page_id`, the runners name continuation pages `open-2`, `open-3`, ….
-   Your Swift runner must do the same.
-6. **Coverage event scope** (§C): a `coverage` event carries the session's
-   whole hole list (≤ 16, then `holes_more`), not only the new hole, and is
-   sent after a reload only when a hole was recorded. A failed reload's
-   hole has no `count` (the worker's `gap` counts items, not messages).
-7. **Lookup `partial` rules** (§C, §D): a turn is `partial` when its oldest
-   messages were evicted (the newest evicted message belonged to it) or a
-   hole touches it (either neighbour is in the turn). `receipt.result`'s
-   `replies` uses the same rule, and is also `partial` when a reply id
-   can't be named (that id is dropped). Replies exclude approval cards. A
-   completion with no retained user message, or with invalid ids, journals
-   no result: the receipt completes without `result`.
-8. **Recovered `after_message_id: null`** (§C): a recovered message always
-   carries `after_message_id`, `null` when no retained message precedes it.
-   Treat the key's presence, even `null`, as "recovered".
-9. **View-only `oldest_retained`** (§C): a view-only attachment never sees
-   card ids in history metadata. Its holes are named by the nearest
-   visible neighbours, a hole with no visible message before it is left
-   out (like truncation), and `oldest_retained` is the oldest message it
-   can see, in pages and in `coverage` events.
-10. **The 2048-part cap** (§B bounds): "message bytes as counted by
-    `ChatSession`" counts the message's ids, each part's text and id plus
-    64 bytes per part, and 1 KiB per card. A message holds at most 2048
-    parts (131 072 / 64; the last becomes a truncation marker), so it
-    serializes far below 1 MiB however it escapes. The fixtures'
-    `max_content_bytes` checks count text only and still hold.
-11. **card_reason fixture coverage**: `approval.card_reason` was advertised
-    with no fixture of its own; `r8-approval-card-carries-the-close-reason`
-    now covers remote, terminal and interrupted closes (not `timed_out`,
-    `released`, `process_ended`, which a fixture can't trigger on the real
-    runtime; the core runner maps them as the runtime does: `timed_out` →
-    `expired`, the others → `closed`).
-12. **Invalid requests are not rate-limited** (§B): the 8-a-second bound
-    counts valid `history` requests only. Each invalid one gets one
-    sequenced `invalid_request` and isn't counted.
-13. **Live `delta` vs the fixture's whole message** (§B ordering).
-    `r8-history-page-and-live-events-share-one-ordered-stream` models
-    `m-0002` gaining a part as a live whole `message` (`parts.#: 2`). Atem's
-    runtime sends that update as chat-v1 `delta{messageId, part}` (as it
-    always has for an appended part); pages carry whole messages. Both are
-    the newer version by the sequence rule, and the appendix now says so.
-    The fixture passes in the core runner (its fake runtime sends the whole
-    message) and stays off the real runtime for this reason. Your client
-    must apply a `delta` at a higher sequence than a page to its newest
-    version.
-14. **`lease_held` text**: "another controller holds this session" (the
-    appendix example), for chat-v1 and session-v1. Fixtures don't match on
-    it.
+4. **`receipt.result` with an id that isn't an opaque id** (note 13, §D).
+   Every completed prompt receipt carries `result`: the turn is always
+   known, and the user message id is recorded when the prompt is accepted,
+   so it is named even after retention evicted the message (`replies` is
+   then `partial`, or `unavailable` when nothing of the turn is retained).
+   The one remaining narrowing: a turn or user message id that isn't an
+   opaque id (1–128 bytes of `[A-Za-z0-9._:-]`, the wire's id rule) can't be
+   journaled or sent, so that receipt completes without `result`. Claude
+   and Codex use UUIDs, so this doesn't happen with today's agents.
+
+## Clarifications (conforming; for information)
+
+These make precise what the signed text leaves open; nothing to agree,
+but your implementation and Swift runner must read them the same way.
+
+- **Recovered-work ordering** (§H recovery): recovered work waiting for its
+  principal's confirmation stays out of the session's prompt queue until
+  that principal is welcomed with `control`, so a newer prompt from another
+  principal (none exists today) could run before it.
+- **`wire_bytes` includes `history_end`** (note 4): the serialized bound and
+  `wire_bytes` count the page's `history_end` envelope itself, as the
+  fixtures' 675 = 340 + 335 implies.
+- **`open-N` page ids** (schema `recover`): for an `open`, which has no
+  `page_id`, the runners name continuation pages `open-2`, `open-3`, ….
+- **Coverage event scope** (note 10): a `coverage` event carries the
+  session's whole hole list (≤ 16, then `holes_more`), and follows a reload
+  only when a hole was recorded. A failed reload's hole has no `count`.
+- **Lookup `partial` rules** (note 11): a turn is `partial` when its oldest
+  messages were evicted (the newest evicted message belonged to it) or a
+  hole touches it (either neighbour is in the turn). `replies` uses the same
+  rule and is also `partial` when the user message was evicted or a reply
+  id isn't an opaque id (that id is dropped). Replies exclude approval
+  cards.
+- **Recovered `after_message_id: null`** (note 8): a recovered message
+  always carries `after_message_id`, `null` when no retained message
+  precedes it. Treat the key's presence as "recovered".
+- **View-only metadata** (note 9): a view-only attachment never sees card
+  ids. Its holes are named by the nearest visible neighbours; a hole with no
+  visible message before it is left out and reported as truncation
+  (`truncated: true`, so the selection is `partial`); `oldest_retained` is
+  the oldest message it can see; a `before` naming a card is
+  `stale_target`.
+- **The 2048-part cap** (note 5): "message bytes as counted by
+  `ChatSession`" counts ids, each part's text and id plus 64 bytes per
+  part, and 1 KiB per card; a message holds at most 2048 parts (the last a
+  truncation marker). The fixtures' `max_content_bytes` checks count text
+  only and still hold.
+- **Live updates are whole messages**: a message that gains a part is sent
+  again whole and replaces the earlier version, as the signed §B and
+  `r8-history-page-and-live-events-share-one-ordered-stream` say. r8 sends
+  no chat-v1 `delta` any more; drop `delta` handling, or keep it as dead
+  code.
+- **card_reason coverage**: `r8-approval-card-carries-the-close-reason`
+  covers remote, terminal and interrupted closes; `timed_out` → `expired`,
+  `released`/`process_ended` → `closed` follow the same rule (core runner
+  and runtime map them alike).
+- **`lease_held` text** (note 14): "another controller holds this session"
+  for chat-v1 and session-v1. Fixtures don't match on it.
+- **`close.reason`** (note 12): Atem sends `switched`, `withdrawn`,
+  `restarted`, `evicted`; never `fenced` or `reset`.
+
+## Known minor gaps (left as they are)
+
+- **Two answers during recovery.** While recovered work waits for its
+  principal (the 60 s confirmation window), two approval answers can both
+  be admitted; the second ends `rejected` "approval closed" instead of
+  `stale_target` at admission. Either way the answer isn't applied.
+- **Conversation id taken over by another attachment.**
+  `Conversations::open` lets another attachment reuse a conversation id
+  without closing it for the previous owner. It predates r8, and today's
+  runtime holds one link; it matters once several attachments exist
+  (account trust).
 
 ## Where the fixtures run
 
 - Core runner: all 72 fixtures (65 host, 7 client) pass, with the memory
   and the file journal.
-- Real runtime: 24 pass; 41 can't be expressed with one real link and a
-  fake agent (35 multi-attachment, `close_session`, and five history
-  scenarios: backlog fault, eviction ×2, a remote turn's `status` events,
-  the live `delta`). Details and reasons: `atem-host-handoff.md`.
+- Real runtime: 25 pass; 40 can't be expressed with one real link and a
+  fake agent (35 multi-attachment, `close_session`, and four history
+  scenarios: backlog fault, eviction ×2, a remote turn's `status` events).
+  Details and reasons: `atem-host-handoff.md`.
 
 ## Pin commit
 

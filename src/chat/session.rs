@@ -143,10 +143,6 @@ pub enum Out {
     },
     /// What stayed missing after a reload (r8 §C `coverage` event).
     Coverage(CoverageState),
-    Delta {
-        message_id: String,
-        part: Part,
-    },
     Status(Status),
     Accepted {
         request_id: String,
@@ -252,6 +248,9 @@ pub struct ChatSession {
     holes: Vec<Hole>,
     requests: HashMap<String, RequestState>,
     request_order: VecDeque<String>,
+    /// The user message of each recorded request (r8 §D: a completed
+    /// prompt's `result` names it even after retention evicted it).
+    user_messages: HashMap<String, String>,
     pending: Option<Pending>,
     /// Last request whose delivery timed out: a later matching transcript entry
     /// proves it was delivered, so its turn may still complete with its requestId.
@@ -398,6 +397,7 @@ impl ChatSession {
             holes: Vec::new(),
             requests: HashMap::new(),
             request_order: VecDeque::new(),
+            user_messages: HashMap::new(),
             pending: None,
             expired: None,
             input_mark: 0,
@@ -600,6 +600,12 @@ impl ChatSession {
         let mut recovered = Vec::new();
         let mut prev: Option<String> = None;
         for m in &self.history {
+            if m.role == Role::User
+                && let Some(r) = &m.request_id
+                && self.requests.contains_key(r)
+            {
+                self.user_messages.insert(r.clone(), m.message_id.clone());
+            }
             if old.get(&m.message_id) != Some(m) {
                 recovered.push((m.clone(), prev.clone()));
             }
@@ -617,14 +623,16 @@ impl ChatSession {
         self.history.iter()
     }
 
-    /// The retained user message that carried `request_id` (a remote
-    /// prompt's), newest first.
+    /// The user message that carried `request_id` (a remote prompt's): the
+    /// retained one, newest first, else the one recorded when it arrived
+    /// (it may have been evicted since).
     pub fn user_message_of(&self, request_id: &str) -> Option<&str> {
         self.history
             .iter()
             .rev()
             .find(|m| m.role == Role::User && m.request_id.as_deref() == Some(request_id))
             .map(|m| m.message_id.as_str())
+            .or_else(|| self.user_messages.get(request_id).map(String::as_str))
     }
 
     /// `message_id` is still in the retained history.
@@ -757,6 +765,7 @@ impl ChatSession {
             while self.request_order.len() > MAX_REQUESTS {
                 if let Some(old) = self.request_order.pop_front() {
                     self.requests.remove(&old);
+                    self.user_messages.remove(&old);
                 }
             }
         }
@@ -951,6 +960,12 @@ impl ChatSession {
                     request_id.clone(),
                     created_at_ms,
                 );
+                if let Some(r) = &request_id
+                    && self.requests.contains_key(r)
+                {
+                    self.user_messages
+                        .insert(r.clone(), message.message_id.clone());
+                }
                 self.current_turn = Some((turn_id, request_id));
                 self.push_message(message.clone());
                 out.push(Out::Message(message));
@@ -1067,15 +1082,15 @@ impl ChatSession {
         }
         match existing {
             Some(i) => {
+                // r8: a later version goes out whole and replaces the
+                // previous one (bounded: a message is capped above).
                 for p in new_parts {
                     self.history_bytes += part_bytes(&p);
-                    self.history[i].parts.push(p.clone());
-                    out.push(Out::Delta {
-                        message_id: message_id.clone(),
-                        part: p,
-                    });
+                    self.history[i].parts.push(p);
                 }
+                let message = self.history[i].clone();
                 self.trim_history();
+                out.push(Out::Message(message));
             }
             None => {
                 let request_id = match &self.current_turn {
@@ -1887,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_parts_become_message_then_deltas_and_repeats_are_ignored() {
+    fn assistant_parts_become_whole_message_versions_and_repeats_are_ignored() {
         let mut s = ready();
         let o = s.on_log(asst("m1", text_part("p1", "a"), "t1"), 2, 0);
         assert!(
@@ -1899,12 +1914,8 @@ mod tests {
             summary: "ls".into(),
         };
         let o = s.on_log(asst("m1", tool.clone(), "t1"), 3, 0);
-        assert_eq!(
-            o,
-            vec![Out::Delta {
-                message_id: "m1".into(),
-                part: tool
-            }]
+        assert!(
+            matches!(&o[..], [Out::Message(m)] if m.message_id == "m1" && m.parts.len() == 2 && m.parts[1] == tool)
         );
         assert!(
             s.on_log(asst("m1", text_part("p1", "again"), "t1"), 4, 0)
@@ -1938,6 +1949,20 @@ mod tests {
         let again = s.submit("r1", "g1", "go", 0, false).unwrap_err();
         assert!(matches!(again[0], Out::Accepted { .. }));
         assert!(matches!(again[1], Out::Complete { .. }));
+    }
+
+    #[test]
+    fn a_requests_user_message_is_known_after_it_was_evicted() {
+        let mut s = ready();
+        submit_ok(&mut s, "r1", "go");
+        s.on_log(user("u1", "t1", "go"), 2, 0);
+        s.on_log(asst("m1", text_part("p", "ok"), "t1"), 3, 0);
+        assert_eq!(s.user_message_of("r1"), Some("u1"));
+        s.evict(1);
+        assert!(!s.retains("u1"));
+        // r8 §D: the completed receipt's result still names it.
+        assert_eq!(s.user_message_of("r1"), Some("u1"));
+        assert_eq!(s.user_message_of("r2"), None);
     }
 
     #[test]
@@ -2159,7 +2184,8 @@ mod tests {
         let mut s = ready();
         s.on_log(asst("m", text_part("p1", &"a".repeat(130_000)), "t"), 2, 0);
         let o = s.on_log(asst("m", text_part("p2", &"b".repeat(2000)), "t"), 3, 0);
-        assert_eq!(o.len(), 2, "kept part + marker");
+        // One whole new version: the kept part, then the marker.
+        assert!(matches!(&o[..], [Out::Message(m)] if m.parts.len() == 3));
         assert!(
             s.on_log(asst("m", text_part("p3", "more"), "t"), 4, 0)
                 .is_empty()
@@ -2387,7 +2413,7 @@ mod tests {
         assert!(total <= 8 * 1024 * 1024, "{total}");
         assert_eq!(all.len(), 8 * 1024 * 1024 / 120_000);
         assert_eq!(all.last().unwrap().message_id, "m79");
-        // growing a message by deltas counts too
+        // growing a message part by part counts too
         let mut s = ready();
         for i in 0..69 {
             s.on_log(asst(&format!("m{i}"), text_part("p", &big), "t"), 2, 0);

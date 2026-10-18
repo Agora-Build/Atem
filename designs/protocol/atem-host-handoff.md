@@ -40,8 +40,8 @@ must do, is [r8-astation-handoff.md](r8-astation-handoff.md).
   | `approval-stays-pending-when-the-lease-ends` | `r8-approval-stays-pending-when-the-lease-ends` |
   | `approval-survives-takeover` | `r8-approval-survives-takeover` |
 
-- Results: all 72 fixtures pass in the core runner; 24 pass against the real
-  runtime and 41 can't be expressed there (see "Shared fixtures (r8)").
+- Results: all 72 fixtures pass in the core runner; 25 pass against the real
+  runtime and 40 can't be expressed there (see "Shared fixtures (r8)").
 - **Pin**: the merge commit of the r8 PR into `main`. Until it merges, pin
   `feat/r8` at `974a6e7`.
 
@@ -378,10 +378,10 @@ Two runners execute `fixtures/` (format in `fixtures/schema.md`):
   runtime and attachment generations, rule ids) are translated; the clock
   and PTY write faults use debug-only hooks (`src/runtime/test_hooks.rs`).
   Terminal `frame`s and `written` acks are not queued for `expect` (the
-  acks count toward `pty_writes_dropped`). **24 pass, 41 are not run, 0
+  acks count toward `pty_writes_dropped`). **25 pass, 40 are not run, 0
   fail**: 35 need two or three attachments (the runtime holds one
   Astation link, so one attachment), one needs `close_session` (nothing in
-  the runtime closes a running session), and five history scenarios need
+  the runtime closes a running session), and four history scenarios need
   what a real agent can't be made to produce (below). A not-run reason is
   printed for each; a scenario that starts passing fails the test until it
   is taken off the list. `removed-ops-have-no-effect` also runs folded onto
@@ -435,7 +435,7 @@ Two runners execute `fixtures/` (format in `fixtures/schema.md`):
 | `r8-failed-fence-write-then-control-restored-never-runs` | host | pass | not run: 2 attachments (one link) |
 | `r8-failed-persistence-changes-no-lease` | host | pass | not run: 2 attachments (one link) |
 | `r8-hello-without-revision-8-is-refused-before-any-attachment` | host | pass | pass |
-| `r8-history-page-and-live-events-share-one-ordered-stream` | host | pass | not run: the runtime sends a later message version as `delta`, the fixture the whole message |
+| `r8-history-page-and-live-events-share-one-ordered-stream` | host | pass | pass |
 | `r8-history-selectors-are-exclusive-and-validated` | host | pass | pass |
 | `r8-local-input-wins-over-a-send` | host | pass | not run: 2 attachments (one link) |
 | `r8-long-turn-is-recovered-in-bounded-pages` | host | pass | pass |
@@ -462,7 +462,7 @@ Two runners execute `fixtures/` (format in `fixtures/schema.md`):
 | `second-hello-replaces-the-attachment` | host | pass | pass |
 | `takeover-moves-control-and-the-old-holder-becomes-a-viewer` | host | pass | not run: 3 attachments (one link) |
 
-Why the five history scenarios stay off the real runtime (each runs in the
+Why the four history scenarios stay off the real runtime (each runs in the
 core runner, and the same `chat::history` code serves both):
 `r8-backlog-hole-is-reported-not-reopened` needs a worker backlog fault (the
 real worker drops only past 4096 items / 8 MiB, and its reload then finds
@@ -473,11 +473,7 @@ messages the fixture doesn't name into its pages);
 `r8-receipt-result-bounds-reply-message-ids` runs a remote prompt's turn, and
 the real Claude adapter also sends `status` `working`/`ready` in the
 conversation around it (sequenced events the fixture's sequence numbers don't
-model; `receipt.result` is checked live by the real-agent Codex test);
-`r8-history-page-and-live-events-share-one-ordered-stream` appends a part to
-a live message, which the runtime sends as chat-v1 `delta{part}` where the
-fixture expects the whole message again (both are newer versions by the
-sequence rule; see `r8-astation-handoff.md`).
+model; `receipt.result` is checked live by the real-agent Codex test).
 
 Not honoured against real processes: `timers: false` (the broker's loop runs
 `advance` whenever the clock moved 100 ms), `close_session`,
