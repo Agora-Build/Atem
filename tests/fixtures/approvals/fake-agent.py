@@ -7,7 +7,9 @@
 #
 # Control files in $FAKE_DIR (written by the test):
 #   ask-<n>.json        a tool call needing permission ({tool_name, tool_input,
-#                       permission_suggestions?}): the hook runs with it
+#                       permission_suggestions?, quiet?}): the hook runs with it
+#                       (quiet: no tool_use entry in the transcript, so a chat
+#                       the shared fixtures model gets no extra message)
 #   terminal-yes-<n>    the user allows it in the agent's own dialog (Claude:
 #                       the tool runs, PostToolUse fires)
 #   terminal-no-<n>     the user refuses it in the dialog (Claude writes its
@@ -15,6 +17,11 @@
 #   kill-<n>            the hook is killed (the prompt was interrupted)
 #   stop-<n>            the hook is stopped (SIGSTOP): it never takes a decision
 #   exit                the agent exits
+#   transcript-<n>.jsonl  transcript entries (one JSON object per line), appended
+#                       to the transcript as they are, in order of n from 1, with
+#                       no hook: what a conversation already held, or content
+#                       arriving that the shared fixtures name (event
+#                       "transcribed <n>")
 # What it saw, in $FAKE_DIR: input (every byte its terminal delivered),
 # events (one line per thing it did: "started", "input <bytes>", "asked <n>", "answer <n>
 # <allow|deny|none> <message>", "ran <n>", "refused <n>", "completed <turn>",
@@ -116,6 +123,7 @@ def answered(n, ask):
         tool_result(n, message, True)
 
 asks = {}  # n -> {"proc", "request", "done"}
+transcribed = 0
 START, END = b"\x1b[200~", b"\x1b[201~\r"
 buf = b""
 while True:
@@ -146,6 +154,13 @@ while True:
             turns.append(turn)
     if os.path.exists(os.path.join(ctl, "exit")):
         break
+    scripted = os.path.join(ctl, "transcript-%d.jsonl" % (transcribed + 1))
+    if transcript and os.path.exists(scripted):
+        transcribed += 1
+        for line in open(scripted):
+            if line.strip():
+                log(json.loads(line))
+        events.write("transcribed %d\n" % transcribed)
     complete = os.path.join(ctl, "complete")
     if turns and os.path.exists(complete):
         os.remove(complete)
@@ -161,10 +176,12 @@ while True:
             if n in asks:
                 continue
             request = json.load(open(os.path.join(ctl, name)))
-            log({"type": "assistant", "uuid": "t-%d" % n, "promptId": turn_id(),
-                 "message": {"id": "msg-t-%d" % n, "role": "assistant", "content": [
-                     {"type": "tool_use", "id": "toolu-%d" % n, "name": request["tool_name"],
-                      "input": request["tool_input"]}], "stop_reason": "tool_use"}})
+            quiet = request.pop("quiet", False)
+            if not quiet:
+                log({"type": "assistant", "uuid": "t-%d" % n, "promptId": turn_id(),
+                     "message": {"id": "msg-t-%d" % n, "role": "assistant", "content": [
+                         {"type": "tool_use", "id": "toolu-%d" % n, "name": request["tool_name"],
+                          "input": request["tool_input"]}], "stop_reason": "tool_use"}})
             payload = dict(request, hook_event_name="PermissionRequest", session_id=session)
             proc = subprocess.Popen(["sh", "-c", permission], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)

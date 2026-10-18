@@ -176,7 +176,7 @@ impl Peer {
     }
 
     async fn hello(&mut self) -> Value {
-        let id = self.request("hello", json!({}));
+        let id = self.request("hello", json!({"revision": 8}));
         let welcome = self.reply(&id).await;
         assert_eq!(welcome["op"], "welcome", "{welcome}");
         self.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
@@ -797,6 +797,31 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         let receipts = peer.reply(&id).await;
         assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
         assert_eq!(receipts["receipts"][0]["detail"], "done", "{receipts}");
+        // r8 §D: its turn, its user message and its replies, from history.
+        let user_message = events
+            .iter()
+            .find(|v| {
+                is_chat(v, "message")
+                    && v["data"]["role"] == "user"
+                    && v["data"]["requestId"] == request_id.as_str()
+            })
+            .unwrap()["data"]["messageId"]
+            .clone();
+        let turn = complete["data"]["turnId"].clone();
+        let mut replies: Vec<Value> = Vec::new();
+        for v in &events {
+            if is_chat(v, "message")
+                && v["data"]["role"] == "assistant"
+                && v["data"]["turnId"] == turn
+                && !replies.contains(&v["data"]["messageId"])
+            {
+                replies.push(v["data"]["messageId"].clone());
+            }
+        }
+        assert!(!replies.is_empty());
+        let want = json!({"turn_id": turn, "user_message_id": user_message, "outcome": "done",
+                          "reply_message_ids": replies, "more": false, "replies": "complete"});
+        assert_eq!(receipts["receipts"][0]["result"], want, "{receipts}");
         // The journal keeps no prompt text once the request left `accepted`.
         let journal = rt.dir.path().join("state").join("journal");
         let mut files = 0;
@@ -833,13 +858,36 @@ fn chat_submit_completes_through_its_receipt_and_survives_a_broker_restart() {
         );
         let receipts = peer.reply(&id).await;
         assert_eq!(receipts["receipts"][0]["state"], "completed", "{receipts}");
+        // The same result: ids from the journal, replies from the adopted
+        // worker's history (once its snapshot is in).
+        let mut tries = 0;
+        let mut receipts = receipts;
+        while receipts["receipts"][0]["result"] != want && tries < 50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let id = peer.request(
+                "receipt_query",
+                json!({"binding": peer.binding(&sid, &pg, None), "request_ids": [request_id]}),
+            );
+            receipts = peer.reply(&id).await;
+            tries += 1;
+        }
+        assert_eq!(receipts["receipts"][0]["result"], want, "{receipts}");
         // The old attachment is gone: requests naming it are refused.
         let mut stale = peer.binding(&sid, &pg, None);
         stale["attachment_gen"] = Value::String(old_attachment);
         let id = peer.request("acquire", json!({"binding": stale, "takeover": false}));
         assert_eq!(peer.reply(&id).await["code"], "stale_target");
-        // The duplicate submit returns the recorded receipt; nothing is typed.
+        // A duplicate session-v1 submit returns it too.
         let lease = peer.acquire(&sid, &pg).await;
+        let mut b = peer.binding(&sid, &pg, None);
+        b["lease_epoch"] = lease.into();
+        let id = peer.request(
+            "submit",
+            json!({"binding": b, "request_id": request_id, "kind": "prompt",
+                   "payload": {"text": "run the tests"}}),
+        );
+        assert_eq!(peer.reply(&id).await["result"], want);
+        // The duplicate submit returns the recorded receipt; nothing is typed.
         let again = submit_until_complete(
             peer,
             "conv-2",
@@ -889,8 +937,147 @@ fn sequences(seen: &[Value], conversation: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The page `page_id` (`None`: an open's) of `conversation` from `from`:
+/// its messages and its `history_end`.
+async fn take_page(
+    peer: &mut Peer,
+    from: usize,
+    conversation: &str,
+    page_id: Option<&str>,
+) -> (Vec<Value>, Value) {
+    let (c, p) = (conversation.to_string(), page_id.map(str::to_string));
+    let at = peer
+        .wait_from(from, move |v| {
+            is_chat(v, "history_end")
+                && v["data"]["conversationId"] == c.as_str()
+                && v["data"].get("page_id").and_then(Value::as_str) == p.as_deref()
+        })
+        .await;
+    let messages = peer.seen[from..at]
+        .iter()
+        .filter(|v| {
+            is_chat(v, "message")
+                && v["data"]["conversationId"] == conversation
+                && v["data"]["history"] == true
+                && v["data"].get("page_id").and_then(Value::as_str) == page_id
+        })
+        .map(|v| v["data"].clone())
+        .collect();
+    (messages, peer.seen[at]["data"].clone())
+}
+
+/// r8 §B over the runtime: an open ends with `history_end`; a lookup by
+/// `request_id` pages that turn from its user message; `before` pages the
+/// older history; an invalid selector and a stale `next` are errors in the
+/// stream with their `page_id`; nothing resets (sequences consecutive).
 #[test]
-fn paging_older_history_continues_the_live_sequence_and_unknown_cursors_are_refused() {
+fn history_pages_and_lookups_come_in_the_conversation_stream() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let session = rt.launch(&mut client, "claude", &fake_claude(), None).await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        open_chat(peer, "conv-1", &sid, &pg).await;
+        let lease = peer.acquire(&sid, &pg).await;
+        let mut rids = Vec::new();
+        for text in ["first", "second"] {
+            let rid = uuid::Uuid::new_v4().to_string();
+            submit_until_complete(peer, "conv-1", &sid, &pg, lease, &rid, text).await;
+            rids.push(rid);
+        }
+        peer.drain(Duration::from_millis(300)).await;
+
+        let from = peer.seen.len();
+        open_chat_any(peer, "conv-2", &sid, &pg).await;
+        let (newest, end) = take_page(peer, from, "conv-2", None).await;
+        let page = &end["page"];
+        assert_eq!(page["selector"], "newest", "{end}");
+        assert_eq!(page["end"], true);
+        assert_eq!(page["coverage"], "complete");
+        assert_eq!(page["truncated"], false);
+        assert_eq!(page["count"], newest.len());
+        assert!(newest.len() >= 4, "two turns: {newest:#?}");
+        let user_of = |rid: &str| {
+            newest
+                .iter()
+                .find(|m| m["role"] == "user" && m["requestId"] == rid)
+                .unwrap_or_else(|| panic!("no user message for {rid}: {newest:#?}"))
+                .clone()
+        };
+        let (first, second) = (user_of(&rids[0]), user_of(&rids[1]));
+
+        // The first prompt's turn, from its user message.
+        let from = peer.seen.len();
+        peer.chat(
+            "history",
+            "conv-2",
+            &sid,
+            &pg,
+            json!({"generation": pg, "page_id": "p1", "request_id": rids[0]}),
+        );
+        let (turn, end) = take_page(peer, from, "conv-2", Some("p1")).await;
+        assert_eq!(end["page"]["selector"], "request_id");
+        assert_eq!(end["page"]["coverage"], "complete");
+        assert_eq!(end["page"]["end"], true);
+        assert_eq!(turn[0]["messageId"], first["messageId"]);
+        assert!(turn.len() >= 2 && turn.iter().all(|m| m["turnId"] == first["turnId"]));
+
+        // Older than the second prompt: the first turn's messages.
+        let from = peer.seen.len();
+        peer.chat(
+            "history",
+            "conv-2",
+            &sid,
+            &pg,
+            json!({"generation": pg, "page_id": "p2", "before": second["messageId"]}),
+        );
+        let (older, end) = take_page(peer, from, "conv-2", Some("p2")).await;
+        assert_eq!(end["page"]["selector"], "before");
+        assert_eq!(end["page"]["end"], true);
+        let position = |id: &Value| newest.iter().position(|m| &m["messageId"] == id).unwrap();
+        assert!(!older.is_empty());
+        assert!(
+            older
+                .iter()
+                .all(|m| position(&m["messageId"]) < position(&second["messageId"]))
+        );
+
+        // Errors in the stream, with their page ids.
+        for (page_id, fields, code) in [
+            (
+                "p3",
+                json!({"before": first["messageId"], "turn_id": "t"}),
+                "invalid_request",
+            ),
+            ("p4", json!({"next": "AAAA"}), "stale_target"),
+        ] {
+            let from = peer.seen.len();
+            let mut fields = fields;
+            fields["generation"] = json!(pg);
+            fields["page_id"] = json!(page_id);
+            peer.chat("history", "conv-2", &sid, &pg, fields);
+            let at = peer
+                .wait_from(from, |v| {
+                    is_chat(v, "error") && v["data"]["conversationId"] == "conv-2"
+                })
+                .await;
+            let error = &peer.seen[at]["data"];
+            assert_eq!(error["code"], code, "{error}");
+            assert_eq!(error["page_id"], page_id);
+            assert!(error["sequence"].is_u64());
+        }
+        peer.drain(Duration::from_millis(300)).await;
+        let all = sequences(&peer.seen, "conv-2");
+        assert_eq!(all, (0..all.len() as u64).collect::<Vec<_>>(), "one stream");
+        rt.shutdown().await;
+    });
+}
+
+#[test]
+fn open_with_before_is_refused_and_the_conversation_goes_on() {
     local(async {
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
@@ -908,116 +1095,48 @@ fn paging_older_history_continues_the_live_sequence_and_unknown_cursors_are_refu
         }
         peer.drain(Duration::from_millis(300)).await;
         let live = sequences(&peer.seen, "conv-1");
-        let last = *live.last().unwrap();
 
-        // An older page of the open conversation: no `opened`, the page at
-        // the next sequences, nothing reset, then its end marker (a
-        // `status` naming the page).
-        let from = peer.seen.len();
-        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "u-2"}));
-        let end = peer
-            .wait_from(from, |v| {
-                is_chat(v, "status") && v["data"].get("page").is_some()
-            })
-            .await;
-        let page: Vec<&Value> = peer.seen[from..=end]
-            .iter()
-            .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1")
-            .collect();
-        assert!(!page.iter().any(|v| is_chat(v, "opened")), "{page:#?}");
-        let ids: Vec<&str> = page
-            .iter()
-            .filter(|v| is_chat(v, "message"))
-            .map(|v| v["data"]["messageId"].as_str().unwrap_or(""))
-            .collect();
-        assert_eq!(ids, ["u-1", "msg-1"], "{page:#?}");
-        assert_eq!(page.len(), 3, "the page, then its marker: {page:#?}");
-        assert!(page[..2].iter().all(|v| v["data"]["history"] == true));
-        assert_eq!(page[0]["data"]["sequence"], last + 1);
-        assert_eq!(page[1]["data"]["sequence"], last + 2);
-        let marker = &page[2]["data"];
-        assert_eq!(marker["sequence"], last + 3);
-        assert_eq!(marker["state"], "ready");
-        assert_eq!(
-            marker["page"],
-            json!({"before": "u-2", "count": 2, "start": true})
+        // r8 §A: `open.before`/`open.generation` (the r7.2 paging form) are
+        // removed: refused (unsupported, unsequenced), never a page, the
+        // open conversation not reset and no new one opened.
+        for (conversation, extra) in [
+            ("conv-1", json!({"before": "u-2"})),
+            ("conv-1", json!({"before": "u-1", "generation": pg})),
+            ("conv-2", json!({"before": "u-2"})),
+        ] {
+            let from = peer.seen.len();
+            peer.chat("open", conversation, &sid, &pg, extra.clone());
+            let at = peer
+                .wait_from(from, |v| {
+                    v["type"] == "agentChat" && v["data"]["conversationId"] == conversation
+                })
+                .await;
+            let error = peer.seen[at]["data"].clone();
+            assert_eq!(error["op"], "error", "{extra}: {error}");
+            assert_eq!(error["code"], "unsupported_version");
+            assert!(error.get("sequence").is_none(), "{error}");
+        }
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            !peer.seen.iter().any(|v| v["type"] == "agentChat"
+                && v["data"]["conversationId"] == "conv-2"
+                && v["data"]["op"] != "error"),
+            "conv-2 never opened"
         );
+        // No page but the first open's.
+        let pages = peer
+            .seen
+            .iter()
+            .filter(|v| is_chat(v, "history_end"))
+            .count();
+        assert_eq!(pages, 1);
 
-        // Live events go on after the page.
+        // Live events go on at the next sequences.
         let rid = uuid::Uuid::new_v4().to_string();
         submit_until_complete(peer, "conv-1", &sid, &pg, lease, &rid, "third").await;
         peer.drain(Duration::from_millis(300)).await;
         let all = sequences(&peer.seen, "conv-1");
-        assert_eq!(
-            all,
-            (0..all.len() as u64).collect::<Vec<_>>(),
-            "never reset or reused"
-        );
-
-        // A cursor that isn't retained is refused, never an empty page: in
-        // the open conversation (sequenced, it stays open) ...
-        let from = peer.seen.len();
-        peer.chat("open", "conv-1", &sid, &pg, json!({"before": "nope"}));
-        let at = peer
-            .wait_from(from, |v| {
-                is_chat(v, "error") && v["data"]["conversationId"] == "conv-1"
-            })
-            .await;
-        let error = peer.seen[at]["data"].clone();
-        assert_eq!(error["code"], "stale_target", "{error}");
-        assert_eq!(error["sequence"], all.len() as u64);
-        // ... and on a new one (not opened).
-        let from = peer.seen.len();
-        peer.chat("open", "conv-2", &sid, &pg, json!({"before": "nope"}));
-        let at = peer
-            .wait_from(from, |v| {
-                v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-2"
-            })
-            .await;
-        let error = peer.seen[at]["data"].clone();
-        assert_eq!(error["op"], "error", "{error}");
-        assert_eq!(error["code"], "stale_target");
-        assert!(error.get("sequence").is_none());
-        // A cursor named with another generation is refused too.
-        let from = peer.seen.len();
-        peer.chat(
-            "open",
-            "conv-1",
-            &sid,
-            &pg,
-            json!({"before": "u-2", "generation": "another-generation"}),
-        );
-        let at = peer
-            .wait_from(from, |v| {
-                is_chat(v, "error") && v["data"]["conversationId"] == "conv-1"
-            })
-            .await;
-        assert_eq!(peer.seen[at]["data"]["code"], "stale_target");
-        // The oldest message as the cursor: an empty page, whose marker
-        // says it is the start.
-        let from = peer.seen.len();
-        peer.chat(
-            "open",
-            "conv-1",
-            &sid,
-            &pg,
-            json!({"before": "u-1", "generation": pg}),
-        );
-        let end = peer
-            .wait_from(from, |v| {
-                is_chat(v, "status") && v["data"].get("page").is_some()
-            })
-            .await;
-        let got: Vec<&Value> = peer.seen[from..=end]
-            .iter()
-            .filter(|v| v["type"] == "agentChat" && v["data"]["conversationId"] == "conv-1")
-            .collect();
-        assert_eq!(got.len(), 1, "only the marker: {got:#?}");
-        assert_eq!(
-            got[0]["data"]["page"],
-            json!({"before": "u-1", "count": 0, "start": true})
-        );
-        let all = sequences(&peer.seen, "conv-1");
+        assert!(all.len() > live.len());
         assert_eq!(
             all,
             (0..all.len() as u64).collect::<Vec<_>>(),
@@ -1032,7 +1151,7 @@ fn a_link_that_is_not_a_verified_pairing_gets_no_attachment() {
     local(async {
         let mut rt = Runtime::start(false).await;
         let peer = &mut rt.peer;
-        let id = peer.request("hello", json!({}));
+        let id = peer.request("hello", json!({"revision": 8}));
         let error = peer.reply(&id).await;
         assert_eq!(error["op"], "error");
         assert_eq!(error["code"], "unauthorized");
@@ -1134,7 +1253,8 @@ fn re_authentication_fences_the_attachment_and_its_lease_expires() {
         let (sid, pg) = (session.id.clone(), session.generation.clone());
         let peer = &mut rt.peer;
         let hello_id = uuid::Uuid::new_v4().to_string();
-        let hello = json!({"type":"session","data":{"v":1,"op":"hello","id":hello_id}});
+        let hello =
+            json!({"type":"session","data":{"v":1,"op":"hello","id":hello_id,"revision":8}});
         peer.send(hello.clone());
         let welcome = peer.reply(&hello_id).await;
         peer.attachment = welcome["attachment_gen"].as_str().unwrap().to_string();
@@ -1233,7 +1353,7 @@ fn a_second_hello_on_the_link_replaces_the_attachment() {
         // Control again without takeover.
         assert!(peer.acquire(&sid, &pg).await > epoch);
         // At most one replacement a second.
-        let id = peer.request("hello", json!({}));
+        let id = peer.request("hello", json!({"revision": 8}));
         assert_eq!(peer.reply(&id).await["code"], "busy");
         rt.clock.skip(1_000);
         let again = rt.peer.hello().await;
@@ -1335,6 +1455,59 @@ async fn adoption_refuses_a_worker_epoch_beyond_the_reserved_block() {
     let again =
         super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
     assert_eq!(again.host().context().runtime_epoch, first + 1);
+}
+
+/// r8 §H: an orderly stop writes the journal's clean close for its runtime
+/// epoch, and the next start (reading the previous epoch before taking the
+/// next) finds it; a run that just ends (a crash) leaves none.
+#[test]
+fn an_orderly_stop_closes_the_journal_cleanly_for_the_next_start() {
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(!bridge.host().previous_run_clean());
+    let epoch = bridge.host().context().runtime_epoch;
+    bridge.close_cleanly();
+    drop(bridge);
+    let text = std::fs::read_to_string(journal.join("clean_close")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        serde_json::json!({ "runtime_epoch": epoch })
+    );
+    let bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(bridge.host().previous_run_clean());
+    assert!(!journal.join("clean_close").exists());
+    assert!(bridge.host_error().is_none());
+    drop(bridge);
+    let bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(
+        !bridge.host().previous_run_clean(),
+        "the last run didn't stop in order"
+    );
+}
+
+/// The link's principal is the paired Astation within the verified account,
+/// always an opaque id.
+#[test]
+fn the_link_principal_is_the_paired_astation_in_its_account() {
+    let identity = super::Identity {
+        account_id: "account-a".into(),
+        atem_device_id: "host-a".into(),
+        host_trust_gen: 1,
+    };
+    let p = super::link_principal(&identity, "astation-1").unwrap();
+    assert_eq!(p, "astation:account-a:astation-1");
+    let odd = super::link_principal(&identity, "a station/1").unwrap();
+    assert!(crate::session_protocol::wire::is_opaque_id(&odd), "{odd}");
+    assert_eq!(
+        super::link_principal(&identity, "a station/1").unwrap(),
+        odd
+    );
+    assert_ne!(
+        super::link_principal(&identity, "a station/2").unwrap(),
+        odd
+    );
+    assert_eq!(super::link_principal(&identity, ""), None);
 }
 
 #[test]
@@ -1987,7 +2160,7 @@ impl Runtime {
 }
 
 #[test]
-fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire() {
+fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_from_chat() {
     local(async {
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
@@ -2029,8 +2202,24 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire
         assert_eq!(card["tool"], "Bash");
         assert_eq!(card["summary"], "npm test");
         assert_eq!(card["always_rules"], request["always_rules"]);
+        assert!(card.get("reason").is_none(), "pending: no reason {card}");
 
-        // Answered from chat with acquire: the lease and the answer together.
+        // r8 removed `acquire` on an answer: refused, nothing taken.
+        let refused_id = uuid::Uuid::new_v4().to_string();
+        peer.chat(
+            "submit",
+            "conv-1",
+            &sid,
+            &pg,
+            json!({"generation": pg, "requestId": refused_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+        );
+        let refused = peer
+            .wait(|v| is_session(v, "error") && v["data"]["code"] == "unsupported_version")
+            .await;
+        assert!(refused["data"].get("re").is_none(), "{refused}");
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
+        // r8 §G: answered from chat without the lease, which stays free.
         let request_id = uuid::Uuid::new_v4().to_string();
         peer.chat(
             "submit",
@@ -2038,10 +2227,8 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire
             &sid,
             &pg,
             json!({"generation": pg, "requestId": request_id,
-                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+                   "approval": {"approval_id": aid, "decision": "allow_once"}}),
         );
-        let granted = peer.wait(|v| is_session(v, "lease_changed")).await;
-        assert_eq!(granted["data"]["reason"], "granted");
         let rid = request_id.clone();
         peer.wait(move |v| is_chat(v, "accepted") && v["data"]["requestId"] == rid.as_str())
             .await;
@@ -2054,7 +2241,12 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire
             })
             .await;
         assert_eq!(done["data"]["op"], "complete", "{done}");
-        peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
+        // r8 `approval.card_reason`: the final card says why it closed.
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_remote"
+        );
         let at = peer
             .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
             .await;
@@ -2065,7 +2257,7 @@ fn an_approval_without_a_lease_holder_is_carded_pushed_and_answered_with_acquire
             .find(|v| is_session(v, "approval_closed"))
             .unwrap();
         assert_eq!(closed["data"]["reason"], "answered_remote");
-        assert!(listed(peer, &sid).await["controller"].is_object());
+        assert_eq!(listed(peer, &sid).await["controller"], Value::Null);
         rt.shutdown().await;
     });
 }
@@ -2107,7 +2299,11 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
             })
             .await;
         assert_eq!(done["data"]["state"], "completed", "{done}");
-        peer.wait_from(0, |v| is_card(v, &aid, "denied")).await;
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "denied")).await;
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_remote"
+        );
 
         // Answered in the agent's own dialog first: the card and the push
         // resolve, and the hook gets no decision.
@@ -2132,15 +2328,20 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
             .wait_from(0, |v| is_relay(v, "push_resolved", &aid))
             .await;
         assert_eq!(peer.seen[at]["data"]["reason"], "answered_terminal");
-        peer.wait_from(0, |v| is_card(v, &aid, "answered_terminal"))
+        let at = peer
+            .wait_from(0, |v| is_card(v, &aid, "answered_terminal"))
             .await;
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_terminal"
+        );
         agent_event(&fake, "answer 2 none ").await;
-        // A late answer is refused and takes no lease.
+        // A late answer is refused.
         let id = peer.request(
             "submit",
-            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)), "request_id": uuid::Uuid::new_v4().to_string(),
                    "kind": "approval",
-                   "payload": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+                   "payload": {"approval_id": aid, "decision": "allow_once"}}),
         );
         assert_eq!(peer.reply(&id).await["code"], "stale_target");
         rt.shutdown().await;
@@ -2418,13 +2619,14 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
         std::fs::write(fake.join("stop-1"), "").unwrap();
         agent_event(&fake, "stopped 1").await;
         let request_id = uuid::Uuid::new_v4().to_string();
+        let lease = peer.acquire(&sid, &pg).await;
         peer.chat(
             "submit",
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": request_id,
-                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+            json!({"generation": pg, "lease_epoch": lease, "requestId": request_id,
+                   "approval": {"approval_id": aid, "decision": "allow_once"}}),
         );
         peer.wait_from(0, |v| is_card(v, &aid, "allowed")).await;
         rt.clock
@@ -2435,7 +2637,12 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
             .wait(move |v| is_chat(v, "error") && v["data"]["requestId"] == rid.as_str())
             .await;
         assert_eq!(done["data"]["code"], "outcome_unknown", "{done}");
-        peer.wait_from(0, |v| is_card(v, &aid, "closed")).await;
+        let at = peer.wait_from(0, |v| is_card(v, &aid, "closed")).await;
+        // Closed after the remote answer: the close reason stays that one.
+        assert_eq!(
+            peer.seen[at]["data"]["parts"][0]["reason"],
+            "answered_remote"
+        );
         rt.shutdown().await;
     });
 }
@@ -2693,8 +2900,8 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": answer,
-                   "approval": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+            json!({"generation": pg, "lease_epoch": lease, "requestId": answer,
+                   "approval": {"approval_id": aid, "decision": "allow_once"}}),
         );
         agent_event(&fake, "answer 1 allow").await;
         let peer = &mut rt.peer;
@@ -2816,10 +3023,11 @@ fn codex_behind_a_wrapper_keeps_chat_and_approvals_across_new() {
         let request = peer.wait(|v| is_session(v, "approval_request")).await["data"].clone();
         let aid = request["approval_id"].as_str().unwrap().to_string();
         activity_until(peer, &sid, "waiting").await;
+        let lease = peer.acquire(&sid, &pg).await;
         let id = peer.request(
             "submit",
-            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
-                   "kind": "approval", "payload": {"approval_id": aid, "decision": "allow_once", "acquire": true}}),
+            json!({"binding": peer.binding(&sid, &pg, Some(lease)), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval", "payload": {"approval_id": aid, "decision": "allow_once"}}),
         );
         peer.reply(&id).await;
         agent_event(&fake, "answer 1 allow").await;
@@ -2961,14 +3169,15 @@ fn codex_session_rules_allow_the_same_command_until_revoked() {
         );
         let rule_id = rule["rule_id"].as_str().unwrap().to_string();
         let from = peer.seen.len();
+        let lease = peer.acquire(&sid, &pg).await;
         peer.chat(
             "submit",
             "conv-1",
             &sid,
             &pg,
-            json!({"generation": pg, "requestId": uuid::Uuid::new_v4().to_string(),
+            json!({"generation": pg, "lease_epoch": lease, "requestId": uuid::Uuid::new_v4().to_string(),
                    "approval": {"approval_id": aid, "decision": "allow_always",
-                                "rule_id": rule_id, "acquire": true}}),
+                                "rule_id": rule_id}}),
         );
         agent_event(&fake, "answer 1 allow").await;
         let peer = &mut rt.peer;
@@ -3148,14 +3357,15 @@ async fn adopted_rules_dropped_after(change: &str) {
         .unwrap()
         .to_string();
     let from = peer.seen.len();
+    let lease = peer.acquire(&sid, &pg).await;
     peer.chat(
         "submit",
         "conv-1",
         &sid,
         &pg,
-        json!({"generation": pg, "requestId": uuid::Uuid::new_v4().to_string(),
+        json!({"generation": pg, "lease_epoch": lease, "requestId": uuid::Uuid::new_v4().to_string(),
                "approval": {"approval_id": aid, "decision": "allow_always",
-                            "rule_id": rule_id, "acquire": true}}),
+                            "rule_id": rule_id}}),
     );
     agent_event(&fake, "answer 1 allow").await;
     let peer = &mut rt.peer;
@@ -3555,4 +3765,92 @@ fn a_looping_client_gets_twenty_refusal_lines_per_window_and_a_summary() {
         assert_eq!(refused(&refusal_lines()), 20);
         rt.shutdown().await;
     });
+}
+
+// ── receipt result replies (r8 §D) ──
+
+fn message(
+    id: &str,
+    role: crate::chat::session::Role,
+    turn: &str,
+) -> crate::chat::session::ChatMessage {
+    crate::chat::session::ChatMessage {
+        message_id: id.into(),
+        role,
+        origin: None,
+        turn_id: turn.into(),
+        request_id: None,
+        created_at_ms: 0,
+        parts: vec![crate::chat::adapter::Part::Text {
+            id: "text".into(),
+            markdown: "x".into(),
+        }],
+    }
+}
+
+fn chat_with(history: Vec<crate::chat::session::ChatMessage>) -> crate::chat::session::ChatSession {
+    let mut snapshot = crate::chat::session::ChatSession::new("g".into(), 0).snapshot(0, 0);
+    snapshot.history = history;
+    crate::chat::session::ChatSession::restore("g".into(), snapshot)
+}
+
+/// A turn's replies from the retained history: its assistant messages
+/// without cards, timeline order; complete while its user message is
+/// retained, partial once it was evicted (or an id can't be named),
+/// unavailable when nothing of the turn is left.
+#[test]
+fn turn_replies_follow_the_retained_history() {
+    use crate::chat::adapter::{ApprovalCard, ApprovalCardState, Part};
+    use crate::chat::session::{MAX_HISTORY_MESSAGES, Role};
+    use crate::session_protocol::wire::Coverage;
+    let mut card = message("approval-a1", Role::Assistant, "t7");
+    card.parts = vec![Part::Approval(ApprovalCard {
+        id: "approval".into(),
+        approval_id: "a1".into(),
+        tool: "Bash".into(),
+        summary: "ls".into(),
+        always_rules: Vec::new(),
+        state: ApprovalCardState::Pending,
+        rule_id: None,
+        note: None,
+        reason: None,
+    })];
+    let history = vec![
+        message("t6-u", Role::User, "t6"),
+        message("t6-a", Role::Assistant, "t6"),
+        message("t7-u", Role::User, "t7"),
+        message("t7-a-1", Role::Assistant, "t7"),
+        card,
+        message("t7-a-2", Role::Assistant, "t7"),
+    ];
+    let chat = chat_with(history.clone());
+    let r = crate::chat::history::turn_replies(&chat, "t7", "t7-u");
+    assert_eq!(r.ids, vec!["t7-a-1", "t7-a-2"]);
+    assert_eq!(r.coverage, Coverage::Complete);
+    assert_eq!(
+        crate::chat::history::turn_replies(&chat, "t9", "t9-u").coverage,
+        Coverage::Unavailable
+    );
+
+    // Late content shows; an id that can't be named makes it partial.
+    let mut more = history.clone();
+    more.push(message("t7-a-3", Role::Assistant, "t7"));
+    more.push(message("t7 bad", Role::Assistant, "t7"));
+    let r = crate::chat::history::turn_replies(&chat_with(more), "t7", "t7-u");
+    assert_eq!(r.ids, vec!["t7-a-1", "t7-a-2", "t7-a-3"]);
+    assert_eq!(r.coverage, Coverage::Partial);
+
+    // Eviction (oldest first): the user message and the first reply go.
+    let mut long = vec![
+        message("t7-u", Role::User, "t7"),
+        message("t7-a-1", Role::Assistant, "t7"),
+    ];
+    for i in 0..MAX_HISTORY_MESSAGES {
+        long.push(message(&format!("t7-b-{i}"), Role::Assistant, "t7"));
+    }
+    let chat = chat_with(long);
+    let r = crate::chat::history::turn_replies(&chat, "t7", "t7-u");
+    assert_eq!(r.ids.len(), MAX_HISTORY_MESSAGES);
+    assert_eq!(r.ids[0], "t7-b-0");
+    assert_eq!(r.coverage, Coverage::Partial);
 }

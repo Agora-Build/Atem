@@ -1,6 +1,7 @@
-//! atem-session v1 (designs/protocol/atem-session-v1.md, r7, compatibility mode):
+//! atem-session v1 (designs/protocol/atem-session-v1.md, r8, compatibility mode):
 //! wire types, strict decoding and the canonical payload digest (`wire`,
-//! `canonical`), the client lease/registry state machines (`client`), the host
+//! `canonical`), r8 revision admission and features (`revision`), the client
+//! lease/registry/admission state machines (`client`), the host
 //! authority (`host`) and its durable receipt journal (`journal`, on disk
 //! `file_journal`), all checked against the shared fixtures (`fixtures`, run
 //! on the host through `fake_runtime`).
@@ -27,6 +28,8 @@ pub mod host;
 #[allow(dead_code)]
 pub mod journal;
 #[allow(dead_code)]
+pub mod revision;
+#[allow(dead_code)]
 pub mod wire;
 
 #[cfg(test)]
@@ -37,5 +40,7 @@ mod fake_runtime;
 mod fixtures;
 #[cfg(test)]
 mod host_tests;
+#[cfg(test)]
+mod persistence_tests;
 #[cfg(test)]
 mod tests;

@@ -194,7 +194,8 @@ impl Rig {
         }
         loop {
             let id = uuid();
-            self.send(json!({"type": "session", "data": {"v": 1, "op": "hello", "id": id}}));
+            self.send(json!({"type": "session",
+                "data": {"v": 1, "op": "hello", "id": id, "revision": 8}}));
             let reply = self.wait(Duration::from_secs(10), "welcome", |m| {
                 m["type"] == "session" && m["data"]["re"] == id.as_str()
             });
@@ -354,6 +355,62 @@ impl Rig {
         request_id
     }
 
+    /// An acquiring chat Send (r8 §F, `acquire: true`, no `lease_epoch`);
+    /// the request id.
+    fn chat_send_acquire(
+        &mut self,
+        conversation: &str,
+        sid: &str,
+        generation: &str,
+        text: &str,
+    ) -> String {
+        let request_id = uuid();
+        self.send(json!({"type": "agentChat", "data": {"v": 1, "op": "submit",
+            "conversationId": conversation, "agentId": sid,
+            "binding": self.binding(sid, generation), "generation": generation,
+            "requestId": request_id, "text": text, "acquire": true}}));
+        request_id
+    }
+
+    /// Lease changes for `sid` seen since index `from`.
+    fn lease_changes_since(&self, sid: &str, from: usize) -> Vec<Value> {
+        self.seen[from..]
+            .iter()
+            .filter(|m| m["data"]["op"] == "lease_changed" && m["data"]["session_id"] == sid)
+            .cloned()
+            .collect()
+    }
+
+    /// Renews this attachment's lease at `epoch`; the reply.
+    fn renew(&mut self, sid: &str, generation: &str, epoch: u64) -> Value {
+        let id = uuid();
+        let mut binding = self.binding(sid, generation);
+        binding["lease_epoch"] = epoch.into();
+        self.send(
+            json!({"type": "session", "data": {"v": 1, "op": "renew", "id": id,
+            "binding": binding}}),
+        );
+        self.wait(Duration::from_secs(10), "the renew's reply", |m| {
+            m["type"] == "session" && m["data"]["re"] == id.as_str()
+        })["data"]
+            .clone()
+    }
+
+    /// `request_id`'s receipt through `receipt_query` (r8 §D: a completed
+    /// prompt's carries `result`).
+    fn receipt_of(&mut self, sid: &str, generation: &str, request_id: &str) -> Value {
+        let id = uuid();
+        self.send(
+            json!({"type": "session", "data": {"v": 1, "op": "receipt_query",
+            "id": id, "binding": self.binding(sid, generation), "request_ids": [request_id]}}),
+        );
+        let reply = self.wait(Duration::from_secs(10), "receipts", |m| {
+            m["type"] == "session" && m["data"]["re"] == id.as_str()
+        });
+        assert_eq!(reply["data"]["op"], "receipts", "{reply}");
+        reply["data"]["receipts"][0].clone()
+    }
+
     /// The `complete` or `error` of chat request `request_id`.
     fn chat_done(&mut self, request_id: &str, time: Duration) -> Value {
         let rid = request_id.to_string();
@@ -391,15 +448,16 @@ impl Rig {
             .clone()
     }
 
-    /// Answers `approval_id` with `acquire: true`; returns the request id.
+    /// Answers `approval_id` without the lease (r8 §G: `control` only; the
+    /// binding carries no `lease_epoch` and nothing is acquired); returns
+    /// the submit's id and the request id.
     fn answer(&mut self, sid: &str, generation: &str, payload: Value) -> (String, String) {
         let id = uuid();
         let request_id = uuid();
-        let mut payload = payload;
-        payload["acquire"] = json!(true);
+        let binding = self.binding(sid, generation);
         self.send(
             json!({"type": "session", "data": {"v": 1, "op": "submit", "id": id,
-            "binding": self.binding(sid, generation), "request_id": request_id,
+            "binding": binding, "request_id": request_id,
             "kind": "approval", "payload": payload}}),
         );
         (id, request_id)
@@ -623,7 +681,8 @@ fn claude_approvals_end_to_end() {
     let mut known: Vec<String> = Vec::new();
     let mut report: Vec<String> = Vec::new();
 
-    // 1. allow_once from the non-holder, with acquire.
+    // 1. allow_once with nobody holding the lease (r8 §G): answered
+    //    without it, and nothing is acquired.
     ask_claude(&mut fe, "touch allow-once.txt");
     let request = rig.approval(&sid, &known, TURN);
     let aid = request["approval_id"].as_str().unwrap().to_string();
@@ -634,6 +693,7 @@ fn claude_approvals_end_to_end() {
     let push = rig.push("push_approval", &aid, Duration::from_secs(10));
     check_push(&push, &request, &sid, 600);
     // The dialog is up in the terminal too.
+    let from = rig.seen.len();
     let (_, rid) = rig.answer(
         &sid,
         &generation,
@@ -642,9 +702,6 @@ fn claude_approvals_end_to_end() {
     let (receipt, states) = rig.receipt_final(&rid, Duration::from_secs(30));
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
     assert_eq!(rig.closed(&aid, Duration::from_secs(10)), "answered_remote");
-    let lease = rig.wait(Duration::from_secs(5), "lease_changed", |m| {
-        m["data"]["op"] == "lease_changed"
-    });
     let resolved = rig.push("push_resolved", &aid, Duration::from_secs(10));
     assert_eq!(resolved["reason"], "answered_remote");
     let card_id = format!("approval-{aid}");
@@ -654,6 +711,11 @@ fn claude_approvals_end_to_end() {
             && m["data"]["messageId"] == card_id.as_str()
             && m["data"]["parts"][0]["state"] == "allowed"
     });
+    // r8 `approval.card_reason`.
+    assert_eq!(
+        card["data"]["parts"][0]["reason"], "answered_remote",
+        "{card}"
+    );
     let had_pending = rig.has(|m| {
         m["data"]["messageId"] == card_id.as_str() && m["data"]["parts"][0]["state"] == "pending"
     });
@@ -663,9 +725,15 @@ fn claude_approvals_end_to_end() {
         work.join("allow-once.txt").exists(),
         "allow-once.txt was not created"
     );
+    let granted = rig.lease_changes_since(&sid, from);
+    assert!(
+        granted.is_empty(),
+        "the answer moved the lease: {granted:?}"
+    );
+    assert_eq!(rig.descriptor(&sid).unwrap()["controller"], Value::Null);
     report.push(format!(
-        "1 allow_once: receipt {states:?}; closed answered_remote; lease {}; card pending→allowed; file created; push expires_at={}, resolved={}",
-        lease["data"]["reason"], push["expires_at"], resolved["reason"]
+        "1 allow_once: receipt {states:?}; closed answered_remote; answered without the lease (none taken, controller still null); card pending→allowed (reason answered_remote); file created; push expires_at={}, resolved={}",
+        push["expires_at"], resolved["reason"]
     ));
 
     // 2. deny with a message: not run, the model sees the message.
@@ -685,11 +753,31 @@ fn claude_approvals_end_to_end() {
     let card_id = format!("approval-{aid}");
     assert!(!rig.has(|m| m["data"]["messageId"] == card_id.as_str()
         && m.to_string().contains("AKIAIOSFODNN7EXAMPLE")));
-    let (_, rid) = rig.answer(
+    // The rig's one attachment holds the lease; answering (lease-free)
+    // leaves it with the holder at the same epoch.
+    let holder_epoch = rig.acquire(&sid, &generation);
+    let holder = rig.descriptor(&sid).unwrap()["controller"].clone();
+    let from = rig.seen.len();
+    let (id, rid) = rig.answer(
         &sid,
         &generation,
         json!({"approval_id": aid, "decision": "deny", "message": message}),
     );
+    let admitted = rig.wait(Duration::from_secs(10), "the answer's reply", |m| {
+        m["type"] == "session" && m["data"]["re"] == id.as_str()
+    });
+    assert_eq!(admitted["data"]["state"], "accepted", "{admitted}");
+    // Right away (well within the lease's 15 s): still the holder's, same
+    // epoch, and the answer carried no lease.
+    assert!(admitted["data"].get("lease").is_none(), "{admitted}");
+    let renewed = rig.renew(&sid, &generation, holder_epoch);
+    assert_eq!(renewed["op"], "lease", "{renewed}");
+    assert_eq!(renewed["binding"]["lease_epoch"], holder_epoch, "{renewed}");
+    assert!(
+        holder.is_object(),
+        "no lease holder after acquire: {holder}"
+    );
+    assert_eq!(rig.descriptor(&sid).unwrap()["controller"], holder);
     let (receipt, states) = rig.receipt_final(&rid, Duration::from_secs(30));
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
     assert_eq!(rig.closed(&aid, Duration::from_secs(10)), "answered_remote");
@@ -701,6 +789,13 @@ fn claude_approvals_end_to_end() {
     rig.wait(Duration::from_secs(10), "the denied card", |m| {
         m["data"]["messageId"] == card_id.as_str() && m["data"]["parts"][0]["state"] == "denied"
     });
+    // (Its own expiry, were the turn slow, is not a move by the answer.)
+    let moved: Vec<Value> = rig
+        .lease_changes_since(&sid, from)
+        .into_iter()
+        .filter(|m| m["data"]["reason"] != "expired")
+        .collect();
+    assert!(moved.is_empty(), "the answer moved the lease: {moved:?}");
     rig.ready(&sid, TURN);
     assert!(!work.join("denied.txt").exists(), "denied.txt was created");
     let seen_by_model = transcripts(&rig.sb.home.join(".claude"))
@@ -711,8 +806,19 @@ fn claude_approvals_end_to_end() {
         "the deny message never reached the transcript"
     );
     report.push(format!(
-        "2 deny+message: summary {:?} (example key redacted in request, push and card); receipt {states:?}; closed answered_remote; card denied; file not created; message in the tool_result of the transcript", request["summary"]
+        "2 deny+message: summary {:?} (example key redacted in request, push and card); answered while this attachment held the lease at epoch {holder_epoch}: no lease_changed, renew at the same epoch succeeds; receipt {states:?}; closed answered_remote; card denied; file not created; message in the tool_result of the transcript", request["summary"]
     ));
+    // Local typing would revoke it anyway; give it back now.
+    let id = uuid();
+    let mut binding = rig.binding(&sid, &generation);
+    binding["lease_epoch"] = holder_epoch.into();
+    rig.send(
+        json!({"type": "session", "data": {"v": 1, "op": "release", "id": id,
+        "binding": binding}}),
+    );
+    rig.wait(Duration::from_secs(10), "the release's reply", |m| {
+        m["type"] == "session" && m["data"]["re"] == id.as_str()
+    });
 
     // 4. the terminal answers first; a late remote answer is stale_target.
     ask_claude(&mut fe, "touch terminal.txt");
@@ -1286,14 +1392,35 @@ fn codex_chat_end_to_end() {
     ));
     assert!(!reply1.is_empty(), "no reply for the local prompt");
 
-    // 3. A remote chat prompt: accepted, the reply, complete.
-    let lease = rig.acquire(&sid, &generation);
-    let rid = rig.chat_submit(
+    // 3. A remote chat prompt: an acquiring Send (r8 §F) on the unowned
+    //    session (the terminal's prompt revoked the lease): accepted with
+    //    the lease, the reply, complete.
+    rig.pump(Duration::from_millis(500));
+    assert_eq!(
+        rig.descriptor(&sid).unwrap()["controller"],
+        Value::Null,
+        "the session is unowned before the Send"
+    );
+    let rid = rig.chat_send_acquire(
         "conv-1",
         &sid,
         &generation,
-        lease,
         "Reply with exactly the word: ping",
+    );
+    let accepted = rig.wait(Duration::from_secs(10), "the Send's accepted", |m| {
+        m["type"] == "agentChat"
+            && matches!(m["data"]["op"].as_str(), Some("accepted" | "error"))
+            && m["data"]["requestId"] == rid.as_str()
+    })["data"]
+        .clone();
+    assert_eq!(accepted["op"], "accepted", "{accepted}");
+    let lease = accepted["lease"]["lease_epoch"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no lease on the admitting accepted: {accepted}"));
+    assert!(
+        accepted["lease"]["ms_left"]
+            .as_u64()
+            .is_some_and(|ms| ms > 0 && ms <= 15_000)
     );
     let user = rig.wait(TURN, "the remote prompt's message", |m| {
         m["type"] == "agentChat"
@@ -1308,12 +1435,45 @@ fn codex_chat_end_to_end() {
     assert_eq!(user["turnId"], turn2.as_str());
     let reply2 = assistant_texts(&rig, &turn2);
     report.push(format!(
-        "3 remote prompt: user message origin {} with requestId; complete {} turn {turn2}; reply {:?}",
+        "3 remote prompt (acquiring Send on the unowned session, accepted with lease epoch {lease}, ms_left {}): user message origin {} with requestId; complete {} turn {turn2}; reply {:?}",
+        accepted["lease"]["ms_left"],
         user["origin"],
         done["outcome"],
         reply2.iter().map(|t| redact(t)).collect::<Vec<_>>()
     ));
     assert!(!reply2.is_empty(), "no reply for the remote prompt");
+    let ping = rid.clone();
+    // r8 §D: the receipt names the turn, the user message and its replies.
+    let receipt = rig.receipt_of(&sid, &generation, &rid);
+    let result = &receipt["result"];
+    let replies: Vec<Value> = rig
+        .seen
+        .iter()
+        .filter(|m| {
+            m["type"] == "agentChat"
+                && m["data"]["op"] == "message"
+                && m["data"]["role"] == "assistant"
+                && m["data"]["turnId"] == turn2.as_str()
+        })
+        .map(|m| m["data"]["messageId"].clone())
+        .collect();
+    assert_eq!(result["turn_id"], turn2.as_str(), "{receipt}");
+    assert_eq!(result["user_message_id"], user["messageId"], "{receipt}");
+    assert_eq!(result["outcome"], "done", "{receipt}");
+    let ids = result["reply_message_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!ids.is_empty(), "{receipt}");
+    assert!(ids.iter().all(|id| replies.contains(id)), "{receipt}");
+    report.push(format!(
+        "3b receipt result: turn {} user {} replies {} ({}), more {}",
+        result["turn_id"],
+        result["user_message_id"],
+        ids.len(),
+        result["replies"],
+        result["more"]
+    ));
     assert!(rig.has(|m| m["type"] == "agentChat"
         && m["data"]["op"] == "accepted"
         && m["data"]["requestId"] == rid.as_str()));
@@ -1352,6 +1512,91 @@ fn codex_chat_end_to_end() {
     rig.activity(&sid, "ready", TURN);
     assert_eq!(receipt["state"], "completed", "{receipt} {states:?}");
     assert_eq!(done["outcome"], "interrupted", "{done}");
+    let interrupted = rig.receipt_of(&sid, &generation, &rid);
+    assert_eq!(
+        interrupted["result"]["outcome"], "interrupted",
+        "{interrupted}"
+    );
+    assert_eq!(
+        interrupted["result"]["turn_id"], done["turnId"],
+        "{interrupted}"
+    );
+
+    // 4b. r8 §B after these turns: a new conversation's open page ends
+    //     with `history_end`; `before` the remote prompt pages the older
+    //     history; a lookup by the remote prompt's request_id pages its
+    //     turn from its user message, coverage complete.
+    let page = |rig: &mut Rig, conversation: &str, page_id: Option<&str>, from: usize| {
+        let (c, p) = (conversation.to_string(), page_id.map(str::to_string));
+        let end = rig.wait(Duration::from_secs(10), "a history_end", |m| {
+            m["type"] == "agentChat"
+                && m["data"]["op"] == "history_end"
+                && m["data"]["conversationId"] == c.as_str()
+                && m["data"].get("page_id").and_then(Value::as_str) == p.as_deref()
+        })["data"]
+            .clone();
+        let messages: Vec<Value> = rig.seen[from..]
+            .iter()
+            .filter(|m| {
+                m["type"] == "agentChat"
+                    && m["data"]["op"] == "message"
+                    && m["data"]["conversationId"] == conversation
+                    && m["data"]["history"] == true
+                    && m["data"].get("page_id").and_then(Value::as_str) == page_id
+            })
+            .map(|m| m["data"].clone())
+            .collect();
+        (messages, end)
+    };
+    let from = rig.seen.len();
+    rig.send(json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+        "conversationId": "conv-2", "agentId": sid, "binding": rig.binding(&sid, &generation)}}));
+    let (newest, end) = page(&mut rig, "conv-2", None, from);
+    assert_eq!(end["page"]["selector"], "newest", "{end}");
+    assert_eq!(end["page"]["count"], newest.len(), "{end}");
+    assert!(newest.iter().any(|m| m["messageId"] == user["messageId"]));
+    let from = rig.seen.len();
+    rig.send(
+        json!({"type": "agentChat", "data": {"v": 1, "op": "history",
+        "conversationId": "conv-2", "agentId": sid, "generation": generation,
+        "page_id": "p1", "before": user["messageId"],
+        "binding": rig.binding(&sid, &generation)}}),
+    );
+    let (older, before_end) = page(&mut rig, "conv-2", Some("p1"), from);
+    assert_eq!(before_end["page"]["selector"], "before", "{before_end}");
+    assert!(
+        older.iter().any(|m| m["turnId"] == turn1.as_str()),
+        "the local turn is older: {older:#?}"
+    );
+    assert!(!older.iter().any(|m| m["turnId"] == turn2.as_str()));
+    let from = rig.seen.len();
+    rig.send(
+        json!({"type": "agentChat", "data": {"v": 1, "op": "history",
+        "conversationId": "conv-2", "agentId": sid, "generation": generation,
+        "page_id": "p2", "request_id": ping,
+        "binding": rig.binding(&sid, &generation)}}),
+    );
+    let (turn, lookup_end) = page(&mut rig, "conv-2", Some("p2"), from);
+    assert_eq!(lookup_end["page"]["selector"], "request_id", "{lookup_end}");
+    assert_eq!(lookup_end["page"]["coverage"], "complete", "{lookup_end}");
+    assert_eq!(lookup_end["page"]["end"], true, "{lookup_end}");
+    assert_eq!(
+        turn.first().map(|m| m["messageId"].clone()),
+        Some(user["messageId"].clone())
+    );
+    assert!(turn.iter().all(|m| m["turnId"] == turn2.as_str()));
+    report.push(format!(
+        "4b history: open page {} messages (end {}, coverage {}, truncated {}); before the remote prompt {} messages (end {}); lookup by request_id {} messages (coverage {}, end {})",
+        newest.len(),
+        end["page"]["end"],
+        end["page"]["coverage"],
+        end["page"]["truncated"],
+        older.len(),
+        before_end["page"]["end"],
+        turn.len(),
+        lookup_end["page"]["coverage"],
+        lookup_end["page"]["end"]
+    ));
 
     // 5. /new (npm's codex: the hooks come from the real binary under the
     //    node wrapper): chat follows the new session, local and remote.

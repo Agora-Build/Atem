@@ -7,7 +7,13 @@
 //! The fixtures describe clients that are already attached; the harness does
 //! the `hello`/`welcome` itself (checking the welcome) and, for
 //! `holds_lease_epoch`, a real `acquire`, so every lease and attachment comes
-//! from the host's own rules.
+//! from the host's own rules. Each client name is its own principal (r8
+//! §H).
+//!
+//! Sessions with `chat` get a `ChatSession` the r8 steps feed
+//! (`chat_history`, `chat_message`, `chat_evict`, `chat_turn`,
+//! `worker_gap`) and chat-v1 conversations served by `chat::history`, the
+//! code the runtime serves them with.
 
 use super::fixtures::{HostEvent, HostUnderTest, Setup};
 use super::host::{
@@ -15,15 +21,23 @@ use super::host::{
     SessionSpec, random_ids,
 };
 use super::journal::{Journal, MemJournal};
+use super::revision::{FEATURES, REVISION};
 use super::wire::{
-    self, Binding, ClientKind, DecodeError, Envelope, Op, Permission, ReceiptKind, SessionMessage,
-    Target,
+    self, ApprovalCloseReason, ApprovalDecision, Binding, ClientKind, DecodeError, Envelope, Op,
+    Permission, ReceiptKind, SessionMessage, Target,
 };
+use crate::chat::adapter::{ApprovalCard, ApprovalCardState, Outcome, Part};
+use crate::chat::history::{self, Conversations, HistoryCall, HistoryKey, Opening, is_card};
+use crate::chat::session::{ChatMessage, ChatSession, Origin as ChatOrigin, Out, Role};
+use crate::chat::wire::{self as chat_wire, ChatEnvelope};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// The authenticated link's authorization in the fixtures (24 h).
 pub const AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The adapter's draft check refusing a prompt (`chat::session`).
+pub const DRAFT_REFUSAL: &str = "the terminal has unsent input; finish or clear it there";
 
 /// The fake PTY and dispatcher.
 #[derive(Debug)]
@@ -86,20 +100,43 @@ struct Client {
     client_kind: ClientKind,
 }
 
-/// Fixture failure injection on a journal (`fail_next_fsync`).
+/// Fixture failure injection on a journal (r8 schema: `fail_next_fsync`
+/// with `undo_fails`, `fail_fsync_of`, `crash_after_accepted`).
 pub trait FailFsync {
-    fn fail_next_fsync(&mut self);
+    fn fail_next_fsync(&mut self) {
+        self.fail_fsync_of(1, false);
+    }
+    /// The `n`-th next append fails; with `undo_fails` its record stays.
+    fn fail_fsync_of(&mut self, n: u64, undo_fails: bool);
+    fn crash_after_accepted(&mut self);
+    fn crashed(&self) -> bool;
 }
 
 impl FailFsync for MemJournal {
-    fn fail_next_fsync(&mut self) {
-        MemJournal::fail_next_fsync(self);
+    fn fail_fsync_of(&mut self, n: u64, undo_fails: bool) {
+        if undo_fails {
+            MemJournal::fail_fsync_and_undo_of(self, n);
+        } else {
+            MemJournal::fail_fsync_of(self, n);
+        }
+    }
+    fn crash_after_accepted(&mut self) {
+        MemJournal::crash_after_accepted(self);
+    }
+    fn crashed(&self) -> bool {
+        MemJournal::crashed(self)
     }
 }
 
 impl FailFsync for super::file_journal::FileJournal {
-    fn fail_next_fsync(&mut self) {
-        self.inject(super::file_journal::Fault::Fsync);
+    fn fail_fsync_of(&mut self, n: u64, undo_fails: bool) {
+        self.fail_append_of(n, undo_fails);
+    }
+    fn crash_after_accepted(&mut self) {
+        super::file_journal::FileJournal::crash_after_accepted(self);
+    }
+    fn crashed(&self) -> bool {
+        super::file_journal::FileJournal::crashed(self)
     }
 }
 
@@ -117,6 +154,12 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     pub reconcile_answer: DispatchReport,
     /// session_id → the prompt whose turn is running.
     turns: HashMap<String, String>,
+    /// Sessions whose terminal has unsent local input (a `local_input`
+    /// ending without CR/LF): the adapter's draft check refuses prompts.
+    drafts: HashSet<String>,
+    /// `crash_after_accepted`: the restart to perform once the next
+    /// `accepted` record is durable.
+    crash_after: Option<(String, u64)>,
     clients: BTreeMap<String, Client>,
     /// Every attachment ever used → client name.
     names: HashMap<String, String>,
@@ -126,6 +169,36 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     /// Every effect the host produced, in order.
     pub effects: Vec<Effect>,
     now: u64,
+    /// r8: the chat of each session with `chat`, and its conversations.
+    chats: HashMap<String, FakeChat>,
+    history_key: HistoryKey,
+    /// approval_id → (session, card, turn) of the chat's approval cards.
+    cards: HashMap<String, (String, ApprovalCard, String)>,
+    /// request id → (session, conversation) of chat submits.
+    chat_submitters: HashMap<String, (String, String)>,
+    chat_opens: u64,
+    chat_closes: u64,
+}
+
+struct FakeChat {
+    chat: ChatSession,
+    conversations: Conversations,
+}
+
+fn text_part(markdown: &str) -> Vec<Part> {
+    vec![Part::Text {
+        id: "p1".into(),
+        markdown: markdown.to_string(),
+    }]
+}
+
+fn chat_family(env: &ChatEnvelope) -> Envelope {
+    Envelope::Family(wire::FamilyMessage {
+        family: "agentChat".into(),
+        data: Some(serde_json::to_value(env).expect("chat envelopes serialize")),
+        binding: None,
+        request: None,
+    })
 }
 
 fn message(op: Op) -> Envelope {
@@ -136,11 +209,23 @@ fn message(op: Op) -> Envelope {
     })
 }
 
-/// Renders a chat reply as the chat runtime would (without its stream head).
-fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Envelope {
+/// Renders a chat reply as the chat runtime would; `head` (generation and
+/// sequence) when its conversation is open.
+fn render_chat(
+    conversation_id: &str,
+    session_id: &str,
+    reply: ChatReply,
+    head: Option<(String, u64)>,
+) -> Envelope {
     let mut data = json!({"v": 1, "conversationId": conversation_id, "agentId": session_id});
     let body = match reply {
-        ChatReply::Accepted { request_id } => json!({"op": "accepted", "requestId": request_id}),
+        ChatReply::Accepted { request_id, lease } => {
+            let mut b = json!({"op": "accepted", "requestId": request_id});
+            if let Some(l) = lease {
+                b["lease"] = json!({"lease_epoch": l.lease_epoch, "ms_left": l.ms_left});
+            }
+            b
+        }
         ChatReply::Complete {
             request_id,
             turn_id,
@@ -157,10 +242,19 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
             request_id,
             code,
             text,
+            controller,
+            page_id,
+            ..
         } => {
             let mut b = json!({"op": "error", "code": code, "text": text});
             if let Some(r) = request_id {
                 b["requestId"] = Value::String(r);
+            }
+            if let Some(p) = page_id {
+                b["page_id"] = Value::String(p);
+            }
+            if let Some(c) = controller {
+                b["controller"] = json!(c);
             }
             b
         }
@@ -168,6 +262,10 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
     data.as_object_mut()
         .unwrap()
         .extend(body.as_object().unwrap().clone());
+    if let Some((generation, sequence)) = head {
+        data["generation"] = Value::String(generation);
+        data["sequence"] = Value::from(sequence);
+    }
     Envelope::Family(wire::FamilyMessage {
         family: "agentChat".into(),
         data: Some(data),
@@ -177,6 +275,7 @@ fn render_chat(conversation_id: &str, session_id: &str, reply: ChatReply) -> Env
 }
 
 impl FakeRuntime {
+    /// The fixtures' host: the default configuration over a `MemJournal`.
     pub fn new(setup: &Setup) -> Result<Self, String> {
         Self::with_config(setup, HostConfig::default())
     }
@@ -209,6 +308,8 @@ impl<J: Journal> FakeRuntime<J> {
             queued_writes: Vec::new(),
             reconcile_answer: DispatchReport::Unknown,
             turns: HashMap::new(),
+            drafts: HashSet::new(),
+            crash_after: None,
             clients: BTreeMap::new(),
             names: HashMap::new(),
             live: HashMap::new(),
@@ -216,6 +317,12 @@ impl<J: Journal> FakeRuntime<J> {
             out: Vec::new(),
             effects: Vec::new(),
             now: 0,
+            chats: HashMap::new(),
+            history_key: HistoryKey::random(),
+            cards: HashMap::new(),
+            chat_submitters: HashMap::new(),
+            chat_opens: 0,
+            chat_closes: 0,
         };
         for s in &setup.sessions {
             let fx = rt.host.add_session(SessionSpec {
@@ -229,6 +336,15 @@ impl<J: Journal> FakeRuntime<J> {
             })?;
             rt.apply(fx);
             rt.sessions.push(s.session_id.clone());
+            if s.chat {
+                rt.chats.insert(
+                    s.session_id.clone(),
+                    FakeChat {
+                        chat: ChatSession::new(s.process_gen.clone(), 0),
+                        conversations: Conversations::default(),
+                    },
+                );
+            }
         }
         for c in &setup.clients {
             rt.clients.insert(
@@ -239,7 +355,12 @@ impl<J: Journal> FakeRuntime<J> {
                     client_kind: c.client_kind,
                 },
             );
-            rt.attach(&c.name, &c.attachment_gen)?;
+            if c.welcome == Some(false) {
+                // r8: the steps send this client's `hello`.
+                rt.connect_unwelcomed(&c.name, &c.attachment_gen)?;
+            } else {
+                rt.attach(&c.name, &c.attachment_gen)?;
+            }
             if let Some(epoch) = c.holds_lease_epoch {
                 rt.setup_lease(&c.name, epoch)?;
             }
@@ -273,6 +394,7 @@ impl<J: Journal> FakeRuntime<J> {
             .host
             .connect(Attach {
                 client: client.to_string(),
+                principal: client.to_string(),
                 attachment_gen: attachment_gen.to_string(),
                 permissions,
                 client_kind: ClientKind::Native,
@@ -294,13 +416,14 @@ impl<J: Journal> FakeRuntime<J> {
         self.clients[client].attachment_gen.clone()
     }
 
-    /// A new attachment for `client`: connect (fencing the previous one),
-    /// `hello`, and the checked `welcome` taken off the queue.
-    pub fn attach(&mut self, client: &str, attachment_gen: &str) -> Result<(), String> {
+    /// A new attachment for `client` without `hello` (fencing the previous
+    /// one).
+    fn connect_unwelcomed(&mut self, client: &str, attachment_gen: &str) -> Result<(), String> {
         let c = self.clients.get_mut(client).ok_or("unknown client")?;
         c.attachment_gen = attachment_gen.to_string();
         let attach = Attach {
             client: client.to_string(),
+            principal: client.to_string(),
             attachment_gen: attachment_gen.to_string(),
             permissions: c.permissions.clone(),
             client_kind: c.client_kind,
@@ -312,28 +435,53 @@ impl<J: Journal> FakeRuntime<J> {
             .insert(attachment_gen.to_string(), client.to_string());
         self.live
             .insert(attachment_gen.to_string(), client.to_string());
-        let fx = self.host.receive_decoded(
-            attachment_gen,
-            Ok(message(Op::Hello { resume: None })),
-            self.now,
-        );
+        Ok(())
+    }
+
+    /// A new attachment for `client`: connect (fencing the previous one),
+    /// `hello{revision: 8}`, and the checked `welcome` (r8: it echoes the
+    /// revision and advertises `revision::FEATURES`) taken off the queue. A
+    /// halted journal welcomes nobody (r8 §I): the client stays connected,
+    /// unwelcomed.
+    pub fn attach(&mut self, client: &str, attachment_gen: &str) -> Result<(), String> {
+        self.connect_unwelcomed(client, attachment_gen)?;
+        let hello = Op::Hello {
+            revision: Some(REVISION),
+            resume: None,
+        };
+        let fx = self
+            .host
+            .receive_decoded(attachment_gen, Ok(message(hello)), self.now);
         self.apply(fx);
-        let i = self
-            .out
-            .iter()
-            .rposition(|(n, m)| {
-                n == client
-                    && matches!(m, Envelope::Session(s) if matches!(s.op, Op::Welcome { .. }))
-            })
-            .ok_or("no welcome")?;
+        let i = self.out.iter().rposition(|(n, m)| {
+            n == client && matches!(m, Envelope::Session(s) if matches!(s.op, Op::Welcome { .. }))
+        });
+        let i = match i {
+            Some(i) => i,
+            None if self.host.journal_halted() => return Ok(()),
+            None => return Err("no welcome".into()),
+        };
         let (_, welcome) = self.out.remove(i);
         match welcome {
             Envelope::Session(SessionMessage {
-                op: Op::Welcome {
-                    attachment_gen: g, ..
-                },
+                op:
+                    Op::Welcome {
+                        attachment_gen: g,
+                        revision,
+                        features,
+                        ..
+                    },
                 ..
-            }) if g == attachment_gen => Ok(()),
+            }) if g == attachment_gen => {
+                let advertised: Vec<&str> = FEATURES.to_vec();
+                let got: Option<Vec<&str>> = features
+                    .as_ref()
+                    .map(|f| f.iter().map(String::as_str).collect());
+                if revision != Some(REVISION) || got.as_ref() != Some(&advertised) {
+                    return Err(format!("welcome revision {revision:?} features {got:?}"));
+                }
+                Ok(())
+            }
             other => Err(format!("unexpected welcome {other:?}")),
         }
     }
@@ -405,8 +553,23 @@ impl<J: Journal> FakeRuntime<J> {
             match effect {
                 Effect::Send {
                     attachment,
-                    message,
+                    mut message,
                 } => {
+                    // r8 §D: replies from the retained history, as the
+                    // runtime fills them.
+                    let chats = &self.chats;
+                    super::host::fill_results(&mut message, |target, result| {
+                        chats
+                            .get(&target.session_id)
+                            .filter(|c| c.chat.generation() == target.process_gen)
+                            .map(|c| {
+                                history::turn_replies(
+                                    &c.chat,
+                                    &result.turn_id,
+                                    &result.user_message_id,
+                                )
+                            })
+                    });
                     if let Some(name) = self.live.get(&attachment) {
                         self.out.push((name.clone(), message));
                     }
@@ -441,8 +604,15 @@ impl<J: Journal> FakeRuntime<J> {
                     target,
                 } => {
                     self.pty.dispatch_attempts += 1;
+                    let draft =
+                        kind == ReceiptKind::Prompt && self.drafts.contains(&target.session_id);
                     let report = if std::mem::take(&mut self.pty.fail_next_enqueue) {
                         Some(DispatchReport::FailedNoEffect)
+                    } else if draft {
+                        // The chat adapter's draft check: nothing is pasted.
+                        Some(DispatchReport::Refused {
+                            detail: DRAFT_REFUSAL.into(),
+                        })
                     } else if std::mem::take(&mut self.pty.fail_next_partial) {
                         self.pty.bytes_written = None;
                         Some(DispatchReport::FailedAfterPossibleEffect)
@@ -464,6 +634,7 @@ impl<J: Journal> FakeRuntime<J> {
                             let report = DispatchReport::Completed {
                                 detail: None,
                                 turn_id: None,
+                                user_message_id: None,
                             };
                             work.extend(self.host.dispatch_report(&request_id, report));
                             work.extend(
@@ -475,7 +646,11 @@ impl<J: Journal> FakeRuntime<J> {
                         // Written; completion comes from the provider later.
                         None
                     };
-                    if report != Some(DispatchReport::FailedNoEffect) {
+                    let refused = matches!(
+                        report,
+                        Some(DispatchReport::FailedNoEffect | DispatchReport::Refused { .. })
+                    );
+                    if !refused {
                         self.pty.dispatches += 1;
                     }
                     if let Some(report) = report {
@@ -500,6 +675,18 @@ impl<J: Journal> FakeRuntime<J> {
                         d["message"] = Value::String(m);
                     }
                     self.pty.approval_decisions.push(d);
+                    // The card says what was decided (as the runtime's
+                    // hand-off does), with why it closed (r8 card_reason).
+                    if let Some((_, card, _)) = self.cards.get_mut(&approval_id) {
+                        card.state = match decision {
+                            ApprovalDecision::AllowOnce => ApprovalCardState::Allowed,
+                            ApprovalDecision::AllowAlways => ApprovalCardState::AlwaysAllowed,
+                            ApprovalDecision::Deny => ApprovalCardState::Denied,
+                        };
+                        card.reason
+                            .get_or_insert(ApprovalCloseReason::AnsweredRemote);
+                        self.show_card(&approval_id);
+                    }
                 }
                 Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
                 Effect::PushApproval { request } => self
@@ -524,16 +711,359 @@ impl<J: Journal> FakeRuntime<J> {
                     session_id,
                     reply,
                 } => {
+                    if let ChatReply::Accepted { request_id, .. } = &reply {
+                        self.chat_submitters.insert(
+                            request_id.clone(),
+                            (session_id.clone(), conversation_id.clone()),
+                        );
+                    }
+                    let sequenced = !matches!(
+                        reply,
+                        ChatReply::Error {
+                            sequenced: false,
+                            ..
+                        }
+                    );
+                    let head = self
+                        .chats
+                        .get_mut(&session_id)
+                        .filter(|_| sequenced)
+                        .filter(|c| {
+                            c.conversations
+                                .map
+                                .get(&conversation_id)
+                                .is_some_and(|v| v.attachment == attachment)
+                        })
+                        .and_then(|c| {
+                            let generation = c.chat.generation().to_string();
+                            c.conversations
+                                .next_head(&conversation_id)
+                                .map(|s| (generation, s))
+                        });
                     if let Some(name) = self.live.get(&attachment) {
-                        let msg = render_chat(&conversation_id, &session_id, reply);
+                        let msg = render_chat(&conversation_id, &session_id, reply, head);
                         self.out.push((name.clone(), msg));
                     }
                 }
-                Effect::StreamOpened { .. }
-                | Effect::StreamClosed { .. }
-                | Effect::Forward { .. } => {}
+                Effect::Forward {
+                    attachment,
+                    session_id,
+                    message,
+                } => {
+                    if message.family == "agentChat" {
+                        self.chat_request(&attachment, &session_id, &message);
+                    }
+                }
+                Effect::StreamOpened { .. } | Effect::StreamClosed { .. } => {}
             }
         }
+    }
+
+    /// chat-v1 `open`, `close` and `history`, authorized by the host.
+    fn chat_request(&mut self, attachment: &str, sid: &str, message: &wire::FamilyMessage) {
+        let Some(data) = message.data.clone() else {
+            return;
+        };
+        let control = self.host.attachment_can(attachment, Permission::Control);
+        let rules = if control {
+            self.host.approval_rules(sid)
+        } else {
+            Vec::new()
+        };
+        let now = self.now;
+        let conversation = data["conversationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let Some(c) = self.chats.get_mut(sid) else {
+            return;
+        };
+        let envelopes = match data["op"].as_str() {
+            Some("open") => {
+                let opening = Opening {
+                    conversation: &conversation,
+                    agent: sid,
+                    attachment,
+                    control,
+                    status: c.chat.status(),
+                    unavailable: &[],
+                    rules: &rules,
+                };
+                c.conversations.open(&c.chat, &self.history_key, &opening)
+            }
+            Some("close") => {
+                c.conversations.close(&conversation, attachment);
+                Vec::new()
+            }
+            Some("history") => {
+                let call = HistoryCall {
+                    data: &data,
+                    conversation: &conversation,
+                    agent: sid,
+                    attachment,
+                    control,
+                    now_ms: now,
+                };
+                c.conversations.history(&c.chat, &self.history_key, &call)
+            }
+            _ => Vec::new(),
+        };
+        self.send_chat(attachment, envelopes);
+    }
+
+    fn send_chat(&mut self, attachment: &str, envelopes: Vec<ChatEnvelope>) {
+        let Some(name) = self.live.get(attachment).cloned() else {
+            return;
+        };
+        for env in envelopes {
+            match env.op.as_str() {
+                "opened" => self.chat_opens += 1,
+                "close" => self.chat_closes += 1,
+                _ => {}
+            }
+            self.out.push((name.clone(), chat_family(&env)));
+        }
+    }
+
+    /// `out` to every open conversation of `sid` on a live attachment (with
+    /// `control_only`, of attachments with `control`), except `except`.
+    fn broadcast(&mut self, sid: &str, out: &Out, except: Option<&str>, control_only: bool) {
+        let live: HashSet<String> = self.live.keys().cloned().collect();
+        let Some(c) = self.chats.get_mut(sid) else {
+            return;
+        };
+        // Conversations of fenced attachments end with them.
+        c.conversations
+            .map
+            .retain(|_, v| live.contains(&v.attachment));
+        let mut ids: Vec<(String, String, bool)> = c
+            .conversations
+            .map
+            .iter()
+            .filter(|(id, _)| Some(id.as_str()) != except)
+            .map(|(id, v)| {
+                let can = self.host.attachment_can(&v.attachment, Permission::Control);
+                (id.clone(), v.attachment.clone(), can)
+            })
+            .filter(|(_, _, can)| !control_only || *can)
+            .collect();
+        ids.sort();
+        let generation = c.chat.generation().to_string();
+        let mut sends = Vec::new();
+        for (id, attachment, can) in ids {
+            // A view-only conversation's coverage names no card (r8 §C).
+            let own = matches!(out, Out::Coverage(_))
+                .then(|| Out::Coverage(history::coverage_for(&c.chat, can)));
+            if let Some(sequence) = c.conversations.next_head(&id) {
+                let out = own.as_ref().unwrap_or(out);
+                sends.push((
+                    attachment,
+                    chat_wire::event(&id, sid, &generation, sequence, out),
+                ));
+            }
+        }
+        for (attachment, env) in sends {
+            self.send_chat(&attachment, vec![env]);
+        }
+    }
+
+    /// A message the agent produced: kept, and sent live.
+    fn chat_produced(&mut self, sid: &str, message: ChatMessage) {
+        let Some(c) = self.chats.get_mut(sid) else {
+            return;
+        };
+        c.chat.put_message(message.clone());
+        let card = is_card(&message);
+        self.broadcast(sid, &Out::Message(message), None, card);
+    }
+
+    fn chat_event(&mut self, event: &HostEvent) -> Result<(), String> {
+        let chat_of = |rt: &mut Self, sid: &str| -> Result<(), String> {
+            if rt.chats.contains_key(sid) {
+                Ok(())
+            } else {
+                Err(format!("{sid} has no chat"))
+            }
+        };
+        match event {
+            HostEvent::ChatHistory {
+                session_id,
+                messages,
+            } => {
+                chat_of(self, session_id)?;
+                for m in messages {
+                    let m = chat_wire::parse_message(m)?;
+                    self.chats.get_mut(session_id).unwrap().chat.put_message(m);
+                }
+            }
+            HostEvent::ChatMessage {
+                session_id,
+                message,
+            } => {
+                chat_of(self, session_id)?;
+                let m = chat_wire::parse_message(message)?;
+                self.chat_produced(session_id, m);
+            }
+            HostEvent::ChatEvict { session_id, count } => {
+                chat_of(self, session_id)?;
+                self.chats.get_mut(session_id).unwrap().chat.evict(*count);
+            }
+            HostEvent::ChatTurn {
+                session_id,
+                turn_id,
+                request_id,
+                origin,
+                assistant_messages,
+                text_bytes,
+                control,
+            } => {
+                chat_of(self, session_id)?;
+                let origin = match origin.as_str() {
+                    "local" => ChatOrigin::Local,
+                    "remote" => ChatOrigin::Remote,
+                    other => return Err(format!("origin {other:?}")),
+                };
+                let text = |markdown: String| {
+                    vec![Part::Text {
+                        id: "p1".into(),
+                        markdown,
+                    }]
+                };
+                self.chat_produced(
+                    session_id,
+                    ChatMessage {
+                        message_id: format!("{turn_id}-u"),
+                        role: Role::User,
+                        origin: Some(origin),
+                        turn_id: turn_id.clone(),
+                        request_id: request_id.clone(),
+                        created_at_ms: 0,
+                        parts: text("run the task".into()),
+                    },
+                );
+                let fill = if *control { "\u{1}" } else { "x" };
+                for n in 1..=*assistant_messages {
+                    self.chat_produced(
+                        session_id,
+                        ChatMessage {
+                            message_id: format!("{turn_id}-a-{n:04}"),
+                            role: Role::Assistant,
+                            origin: None,
+                            turn_id: turn_id.clone(),
+                            request_id: None,
+                            created_at_ms: 0,
+                            parts: text(fill.repeat(*text_bytes)),
+                        },
+                    );
+                }
+            }
+            HostEvent::WorkerGap {
+                session_id,
+                dropped,
+                recoverable,
+                delivered_after,
+            } => {
+                chat_of(self, session_id)?;
+                let delivered: Vec<ChatMessage> = delivered_after
+                    .iter()
+                    .map(chat_wire::parse_message)
+                    .collect::<Result<_, _>>()?;
+                let before_gap = self.chats[session_id]
+                    .chat
+                    .newest_retained()
+                    .map(str::to_string);
+                for m in &delivered {
+                    self.chat_produced(session_id, m.clone());
+                }
+                // The worker's history: what was retained here, with what it
+                // still has of the dropped items where they were.
+                let first_after = delivered.first().map(|m| m.message_id.clone());
+                let turn = delivered
+                    .first()
+                    .map_or_else(|| "turn-gap".to_string(), |m| m.turn_id.clone());
+                let recovered: Vec<ChatMessage> = dropped
+                    .iter()
+                    .filter(|id| recoverable.contains(id))
+                    .map(|id| ChatMessage {
+                        message_id: id.clone(),
+                        role: Role::Assistant,
+                        origin: None,
+                        turn_id: turn.clone(),
+                        request_id: None,
+                        created_at_ms: 0,
+                        parts: text_part(&format!("recovered {id}")),
+                    })
+                    .collect();
+                let c = self.chats.get_mut(session_id).unwrap();
+                let mut worker: Vec<ChatMessage> = c.chat.retained().cloned().collect();
+                let at = first_after
+                    .as_ref()
+                    .and_then(|f| worker.iter().position(|m| &m.message_id == f))
+                    .unwrap_or(worker.len());
+                worker.splice(at..at, recovered);
+                let outs: Vec<Out> = c
+                    .chat
+                    .reload(worker)
+                    .into_iter()
+                    .map(|(message, after)| Out::Recovered { message, after })
+                    .collect();
+                // What stays missing: each run of dropped items the reload
+                // didn't find, between its retained neighbours.
+                let mut holes = Vec::new();
+                let mut prev = before_gap;
+                let mut run = 0u64;
+                for id in dropped {
+                    if recoverable.contains(id) {
+                        if run > 0 {
+                            holes.push((prev.clone(), Some(id.clone()), run));
+                        }
+                        run = 0;
+                        prev = Some(id.clone());
+                    } else {
+                        run += 1;
+                    }
+                }
+                if run > 0 {
+                    holes.push((prev, first_after, run));
+                }
+                let mut holed = false;
+                for (after, before, count) in holes {
+                    holed |= c
+                        .chat
+                        .add_hole(after.as_deref(), before.as_deref(), Some(count));
+                }
+                let coverage = c.chat.coverage();
+                for out in outs {
+                    let card = matches!(&out, Out::Recovered { message, .. } if is_card(message));
+                    self.broadcast(session_id, &out, None, card);
+                }
+                if holed {
+                    self.broadcast(session_id, &Out::Coverage(coverage), None, false);
+                }
+            }
+            _ => unreachable!("not a chat event"),
+        }
+        Ok(())
+    }
+
+    /// The card of `approval_id` (opened or changed), in the history and
+    /// the conversations of attachments with `control`.
+    fn show_card(&mut self, approval_id: &str) {
+        let Some((sid, card, turn)) = self.cards.get(approval_id).cloned() else {
+            return;
+        };
+        self.chat_produced(
+            &sid,
+            ChatMessage {
+                message_id: format!("approval-{approval_id}"),
+                role: Role::Assistant,
+                origin: None,
+                turn_id: turn,
+                request_id: None,
+                created_at_ms: 0,
+                parts: vec![Part::Approval(card)],
+            },
+        );
     }
 
     /// The write boundary: remote chunks are written only if the host still
@@ -610,12 +1140,46 @@ impl<J: Journal> FakeRuntime<J> {
     }
 }
 
+impl<J: Journal + FailFsync> FakeRuntime<J> {
+    /// The runtime stops (orderly: it writes its clean close when the
+    /// journal is healthy; a crash doesn't) and starts with these values at
+    /// the current clock; workers are adopted, every link drops.
+    fn restart_runtime(
+        &mut self,
+        runtime_gen: &str,
+        epoch: u64,
+        orderly: bool,
+    ) -> Result<(), String> {
+        self.live.clear();
+        self.queued_writes.clear();
+        // Every link drops with its conversations; a new run has a new
+        // `next` key.
+        for c in self.chats.values_mut() {
+            c.conversations = Conversations::default();
+        }
+        self.history_key = HistoryKey::random();
+        let fx = self
+            .host
+            .restart_at(runtime_gen, epoch, self.now, orderly)?;
+        self.apply(fx);
+        Ok(())
+    }
+}
+
 impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
     /// The host sees the time with the message; no timer tick is run.
     fn receive(&mut self, client: &str, msg: Result<Envelope, DecodeError>, now_ms: u64) {
         self.now = now_ms;
         let att = self.attachment(client);
         let fx = self.host.receive_decoded(&att, msg, now_ms);
+        if self.crash_after.is_some() && self.host.journal().crashed() {
+            // The `accepted` record is durable; the runtime dies before
+            // acting on it: nothing it produced happens.
+            let (runtime_gen, epoch) = self.crash_after.take().unwrap();
+            self.restart_runtime(&runtime_gen, epoch, false)
+                .expect("crash restart");
+            return;
+        }
         self.apply(fx);
     }
 
@@ -642,6 +1206,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 c.attachment_gen = attachment_gen.clone();
                 let attach = Attach {
                     client: client.clone(),
+                    principal: client.clone(),
                     attachment_gen: attachment_gen.clone(),
                     permissions: c.permissions.clone(),
                     client_kind: c.client_kind,
@@ -654,31 +1219,67 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 let resume = Some(wire::Resume {
                     controller_session: uuid::Uuid::new_v4().to_string(),
                 });
-                self.host.receive_decoded(
-                    attachment_gen,
-                    Ok(message(Op::Hello { resume })),
-                    self.now,
-                )
+                let hello = Op::Hello {
+                    revision: Some(REVISION),
+                    resume,
+                };
+                self.host
+                    .receive_decoded(attachment_gen, Ok(message(hello)), self.now)
             }
             HostEvent::Reconnect {
                 client,
                 attachment_gen,
             } => return self.attach(client, attachment_gen),
             HostEvent::LocalInput { session_id, bytes } => {
+                if bytes.ends_with(b"\r") || bytes.ends_with(b"\n") {
+                    self.drafts.remove(session_id);
+                } else {
+                    self.drafts.insert(session_id.clone());
+                }
                 self.host.local_input(session_id, bytes.clone())
             }
             HostEvent::CrashWorker { session_id } => self.host.process_exited(session_id, None),
             HostEvent::RestartRuntime {
                 runtime_gen,
                 runtime_epoch,
+            } => return self.restart_runtime(runtime_gen, *runtime_epoch, true),
+            HostEvent::CrashRuntime {
+                runtime_gen,
+                runtime_epoch,
+            } => return self.restart_runtime(runtime_gen, *runtime_epoch, false),
+            HostEvent::CrashAfterAccepted {
+                runtime_gen,
+                runtime_epoch,
             } => {
-                self.live.clear();
-                self.queued_writes.clear();
-                self.host.restart(runtime_gen, *runtime_epoch)?
-            }
-            HostEvent::FailNextFsync => {
-                self.host.journal_mut().fail_next_fsync();
+                self.host.journal_mut().crash_after_accepted();
+                self.crash_after = Some((runtime_gen.clone(), *runtime_epoch));
                 Vec::new()
+            }
+            HostEvent::FailFsyncOf { n, undo_fails } => {
+                self.host.journal_mut().fail_fsync_of(*n, *undo_fails);
+                Vec::new()
+            }
+            HostEvent::SetPermissions {
+                client,
+                permissions,
+                attachment_gen,
+            } => {
+                // The principal re-authenticates: a new attachment with these
+                // permissions (the host fences first when `control` is gone).
+                let c = self.clients.get_mut(client).ok_or("unknown client")?;
+                c.permissions = permissions.clone();
+                return self.attach(client, attachment_gen);
+            }
+            HostEvent::ReplaceProcess {
+                session_id,
+                process_gen,
+            } => {
+                self.turns.remove(session_id);
+                if let Some(c) = self.chats.get_mut(session_id) {
+                    c.chat = ChatSession::new(process_gen.clone(), 0);
+                    c.conversations = Conversations::default();
+                }
+                self.host.replace_process(session_id, process_gen)?
             }
             HostEvent::ChangeTrustGen(n) => self.host.change_trust_gen(*n)?,
             HostEvent::FailNextPtyEnqueue => {
@@ -695,11 +1296,30 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 turn_id,
             } => {
                 let rid = self.turns.remove(session_id).ok_or("no running turn")?;
+                // A prompt's completion names its turn's outcome (§6) and,
+                // r8 §D, its user message in the chat history.
+                let user_message_id = self
+                    .chats
+                    .get(session_id)
+                    .and_then(|c| c.chat.user_message_of(&rid))
+                    .map(str::to_string);
                 let report = DispatchReport::Completed {
-                    detail: None,
+                    detail: Some(super::host::DETAIL_TURN_DONE.into()),
                     turn_id: Some(turn_id.clone()),
+                    user_message_id,
                 };
-                self.host.dispatch_report(&rid, report)
+                let fx = self.host.dispatch_report(&rid, report);
+                // The chat's turn end, to every conversation but the chat
+                // submitter's (it hears through its receipt).
+                let except = self.chat_submitters.remove(&rid).map(|(_, c)| c);
+                let complete = Out::Complete {
+                    turn_id: turn_id.clone(),
+                    request_id: Some(rid),
+                    outcome: Outcome::Done,
+                };
+                self.apply(fx);
+                self.broadcast(session_id, &complete, except.as_deref(), false);
+                Vec::new()
             }
             HostEvent::HoldPtyWrites => {
                 self.hold_writes = true;
@@ -714,6 +1334,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 tool,
                 summary,
                 always_rules,
+                turn_id,
             } => {
                 let info = super::host::ApprovalInfo {
                     tool: tool.clone(),
@@ -722,15 +1343,60 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 };
                 let process_gen = self.process_gen(session_id);
                 // Refused: the agent's own prompt asks; nothing is sent.
-                let (_, fx) = self
+                let (opened, fx) = self
                     .host
                     .open_approval(session_id, &process_gen, info, now_ms);
-                fx
+                self.apply(fx);
+                if let (Ok(approval_id), true) = (opened, self.chats.contains_key(session_id)) {
+                    let card = ApprovalCard {
+                        id: "approval".into(),
+                        approval_id: approval_id.clone(),
+                        tool: tool.clone(),
+                        summary: summary.clone(),
+                        always_rules: always_rules.clone(),
+                        state: ApprovalCardState::Pending,
+                        rule_id: None,
+                        note: None,
+                        reason: None,
+                    };
+                    let turn = turn_id.clone().unwrap_or_else(|| "approval".into());
+                    self.cards
+                        .insert(approval_id.clone(), (session_id.clone(), card, turn));
+                    self.show_card(&approval_id);
+                }
+                Vec::new()
             }
             HostEvent::CloseApproval {
                 approval_id,
                 reason,
-            } => self.host.close_approval(approval_id, *reason),
+            } => {
+                let fx = self.host.close_approval(approval_id, *reason);
+                self.apply(fx);
+                // The card says how it ended (as the runtime's does).
+                let state = match reason {
+                    ApprovalCloseReason::AnsweredRemote => None,
+                    ApprovalCloseReason::AnsweredTerminal => {
+                        Some(ApprovalCardState::AnsweredTerminal)
+                    }
+                    ApprovalCloseReason::TimedOut => Some(ApprovalCardState::Expired),
+                    _ => Some(ApprovalCardState::Closed),
+                };
+                if let (Some(state), Some((_, card, _))) = (state, self.cards.get_mut(approval_id))
+                {
+                    card.state = state;
+                    card.reason.get_or_insert(*reason);
+                    self.show_card(approval_id);
+                }
+                Vec::new()
+            }
+            HostEvent::ChatHistory { .. }
+            | HostEvent::ChatMessage { .. }
+            | HostEvent::ChatEvict { .. }
+            | HostEvent::ChatTurn { .. }
+            | HostEvent::WorkerGap { .. } => {
+                self.chat_event(event)?;
+                Vec::new()
+            }
             HostEvent::ApprovalApplied { approval_id, ok } => {
                 self.host.approval_applied(approval_id, *ok)
             }
@@ -761,6 +1427,16 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             "resizes" => p.resizes.into(),
             "stops" => p.stops.into(),
             "lease_holder" => self.lease_holder()?,
+            "attachments" => self.host.welcomed_attachments().into(),
+            "chat_opens" => self.chat_opens.into(),
+            "chat_closes" => self.chat_closes.into(),
+            "chat_conversations" => self
+                .chats
+                .values()
+                .map(|c| c.conversations.map.len())
+                .sum::<usize>()
+                .into(),
+            "journal_halted" => self.host.journal_halted().into(),
             "approval_decisions" => Value::from(p.approval_decisions.clone()),
             "approvals_released" => p.approvals_released.into(),
             "pushes" => Value::from(p.pushes.clone()),

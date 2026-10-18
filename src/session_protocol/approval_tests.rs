@@ -9,8 +9,8 @@ use super::fake_runtime::FakeRuntime;
 use super::host::*;
 use super::journal::{MemJournal, Record};
 use super::wire::{
-    self, AlwaysRule, ApprovalCloseReason, ApprovalDecision, ErrorCode, Op, ReceiptKind,
-    ReceiptState, Target,
+    self, AlwaysRule, ApprovalCloseReason, ApprovalDecision, ClientKind, ErrorCode, Op, Permission,
+    ReceiptKind, ReceiptState, Target,
 };
 use serde_json::{Value, json};
 
@@ -190,29 +190,40 @@ fn approval_payloads_decode_strictly() {
         json!({"approval_id": AID, "decision": "deny"}),
         json!({"approval_id": AID, "decision": "deny", "message": "not now\nuse the staging db"}),
         json!({"approval_id": AID, "decision": "deny", "message": "é".repeat(256)}),
-        json!({"approval_id": AID, "decision": "allow_once", "acquire": false}),
     ] {
         assert!(decodes(&submit_payload(ok.clone())), "{ok}");
     }
-    // `acquire: true` takes the lease: its binding carries no lease epoch
-    // (and one without acquire must).
+    // r8 removed `acquire` on an answer (§A, §G): refused in any form, in
+    // the payload or beside it, with or without a lease epoch.
     let acquiring = json!({"approval_id": AID, "decision": "allow_once", "acquire": true});
-    assert!(!decodes(&submit_payload(acquiring.clone())));
-    let mut m = submit_payload(acquiring.clone());
-    m["data"]["binding"]
-        .as_object_mut()
-        .unwrap()
-        .remove("lease_epoch");
-    assert!(decodes(&m));
+    for a in [
+        acquiring.clone(),
+        json!({"approval_id": AID, "decision": "allow_once", "acquire": false}),
+        json!({"approval_id": AID, "decision": "deny", "acquire": "yes"}),
+    ] {
+        assert!(!decodes(&submit_payload(a.clone())), "{a}");
+        let mut m = submit_payload(a.clone());
+        m["data"]["binding"]
+            .as_object_mut()
+            .unwrap()
+            .remove("lease_epoch");
+        assert!(!decodes(&m), "{a}");
+    }
+    let mut beside = submit_payload(json!({"approval_id": AID, "decision": "allow_once"}));
+    beside["data"]["acquire"] = json!(true);
+    let e = wire::decode(&serde_json::to_vec(&beside).unwrap()).unwrap_err();
+    assert_eq!(e.code, wire::ErrorCode::UnsupportedVersion);
+    assert_eq!(
+        e.id.as_ref(),
+        beside["data"]["id"].as_str().map(str::to_string).as_ref()
+    );
+    // r8 §G: a plain answer needs no lease epoch (optional, ignored).
     let mut m = submit_payload(json!({"approval_id": AID, "decision": "allow_once"}));
     m["data"]["binding"]
         .as_object_mut()
         .unwrap()
         .remove("lease_epoch");
-    assert!(!decodes(&m));
-    assert!(!decodes(&submit_payload(
-        json!({"approval_id": AID, "decision": "deny", "acquire": "yes"})
-    )));
+    assert!(decodes(&m));
     // chat-v1: `approval` instead of `text`, under the same rule.
     let chat = |approval: Value, lease: Option<u64>| {
         let mut b = json!({"target": target(P1), "attachment_gen": C1});
@@ -223,11 +234,15 @@ fn approval_payloads_decode_strictly() {
                "agentId": S1, "generation": P1, "requestId": rid(2), "approval": approval,
                "binding": b}})
     };
-    assert!(decodes(&chat(acquiring.clone(), None)));
+    assert!(!decodes(&chat(acquiring.clone(), None)));
     assert!(!decodes(&chat(acquiring, Some(1))));
     let plain = json!({"approval_id": AID, "decision": "deny"});
     assert!(decodes(&chat(plain.clone(), Some(1))));
-    assert!(!decodes(&chat(plain, None)));
+    assert!(decodes(&chat(plain.clone(), None)));
+    // `acquire` beside a chat answer is the removed r7 form too.
+    let mut beside = chat(plain, None);
+    beside["data"]["acquire"] = json!(true);
+    assert!(!decodes(&beside));
     assert!(!decodes(&chat(json!({"approval_id": AID}), Some(1))));
     for bad in [
         json!({}),
@@ -386,11 +401,12 @@ fn a_view_only_attachment_never_sees_approvals() {
     let fx = rt.host.close_approval(&id, ApprovalCloseReason::TimedOut);
     rt.apply(fx);
     assert!(got(&mut rt, "r").is_empty());
-    // Nor can it answer one, with or without acquire.
+    // Nor can it answer one.
     let id = open(&mut rt, vec![]);
-    let m = answer_acquiring(
+    let m = answer(
         &rt,
         "r",
+        1,
         1,
         json!({"approval_id": id, "decision": "allow_once"}),
     );
@@ -400,93 +416,42 @@ fn a_view_only_attachment_never_sees_approvals() {
     assert!(approval_effects(&rt).is_empty());
 }
 
+/// r8 §A, §G: `acquire` on an answer is a removed form: refused
+/// `unsupported_version` with no effect (the approval stays pending, the
+/// lease doesn't move, nothing is recorded or handed over), from a
+/// non-holder and from the holder alike.
 #[test]
-fn an_answer_with_acquire_takes_the_lease_and_applies_atomically() {
-    // From a controller while another attachment holds the lease: takeover.
+fn an_answer_with_acquire_is_refused_without_effect() {
     let mut rt = setup();
     let e = list_and_hold(&mut rt, "c1");
     rt.send("v", &msg("list", json!({})));
     let id = open(&mut rt, vec![]);
     got(&mut rt, "c1");
     got(&mut rt, "v");
-    // Without acquire and without the lease: stale_lease, nothing taken.
-    let plain = answer(
-        &rt,
-        "v",
-        e,
-        1,
-        json!({"approval_id": id, "decision": "allow_once"}),
-    );
-    rt.send("v", &plain);
-    assert_eq!(got(&mut rt, "v")[0]["code"], "stale_lease");
-    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("c1").as_str()));
-    // A stale answer with acquire takes nothing either.
-    let stale = answer_acquiring(
-        &rt,
-        "v",
-        2,
-        json!({"approval_id": AID, "decision": "allow_once"}),
-    );
-    rt.send("v", &stale);
-    assert_eq!(got(&mut rt, "v")[0]["code"], "stale_target");
-    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("c1").as_str()));
-    let m = answer_acquiring(
-        &rt,
-        "v",
-        3,
-        json!({"approval_id": id, "decision": "allow_once"}),
-    );
-    rt.send("v", &m);
-    let v = got(&mut rt, "v");
-    assert_eq!(
-        ops(&v),
-        [
-            "lease_changed",
-            "session_changed",
-            "receipt",
-            "receipt",
-            "approval_closed"
-        ]
-    );
-    assert_eq!(v[0]["reason"], "takeover");
-    assert_eq!(v[0]["lease_epoch"], e + 1);
-    assert_eq!(v[2]["state"], "accepted");
-    assert_eq!(v[3]["state"], "executing");
-    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("v").as_str()));
-    let c1 = got(&mut rt, "c1");
-    assert_eq!(
-        ops(&c1),
-        ["lease_changed", "session_changed", "approval_closed"]
-    );
-    assert_eq!(approval_effects(&rt).len(), 1);
-    // The duplicate returns the receipt and takes nothing again.
-    rt.send("v", &m);
-    assert_eq!(ops(&got(&mut rt, "v")), ["receipt"]);
-    // With no holder at all: granted.
-    let mut rt = setup();
-    rt.send("v", &msg("list", json!({})));
-    let id = open(&mut rt, vec![]);
-    got(&mut rt, "v");
-    let m = answer_acquiring(
-        &rt,
-        "v",
-        4,
-        json!({"approval_id": id, "decision": "deny", "message": "no"}),
-    );
-    rt.send("v", &m);
-    let v = got(&mut rt, "v");
-    assert_eq!(v[0]["op"], "lease_changed");
-    assert_eq!(v[0]["reason"], "granted");
-    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("v").as_str()));
-    // The holder answering with acquire keeps its lease (no new epoch).
-    let mut rt = setup();
-    let e = list_and_hold(&mut rt, "c1");
-    let id = open(&mut rt, vec![]);
-    got(&mut rt, "c1");
-    let m = answer_acquiring(
+    for (client, n) in [("v", 1), ("c1", 2)] {
+        let m = answer_acquiring(
+            &rt,
+            client,
+            n,
+            json!({"approval_id": id, "decision": "allow_once"}),
+        );
+        rt.send(client, &m);
+        let replies = got(&mut rt, client);
+        assert_eq!(ops(&replies), ["error"], "{client}");
+        assert_eq!(replies[0]["code"], "unsupported_version");
+        assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("c1").as_str()));
+        assert_eq!(rt.host.lease_epoch(S1), Some(e));
+        assert_eq!(rt.host.pending_approvals(S1), std::slice::from_ref(&id));
+        assert!(approval_effects(&rt).is_empty());
+        assert_eq!(rt.host.receipts_visible(&rt.attachment(client)), 0);
+    }
+    assert!(got(&mut rt, "c1").is_empty() && got(&mut rt, "v").is_empty());
+    // The holder's plain answer still works.
+    let m = answer(
         &rt,
         "c1",
-        5,
+        e,
+        3,
         json!({"approval_id": id, "decision": "allow_once"}),
     );
     rt.send("c1", &m);
@@ -494,7 +459,7 @@ fn an_answer_with_acquire_takes_the_lease_and_applies_atomically() {
         ops(&got(&mut rt, "c1")),
         ["receipt", "receipt", "approval_closed"]
     );
-    assert_eq!(rt.host.lease_epoch(S1), Some(e));
+    assert_eq!(approval_effects(&rt).len(), 1);
 }
 
 #[test]
@@ -838,8 +803,16 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
     assert!(rt.host.pending_approvals(S1).is_empty());
 
     // An approval answer recorded as accepted but never started (a crash
-    // between the two writes): after a restart its approval is gone, so it
-    // is rejected, never handed to the agent.
+    // between the two writes): no clean close, so it is rejected
+    // ("authorization history unknown", r8 §H) and never handed to the agent.
+    // After a clean close it waits for its principal, whose welcome finds
+    // the approval gone: rejected, never handed over either.
+    for clean in [false, true] {
+        unstarted_answer_after_restart(clean);
+    }
+}
+
+fn unstarted_answer_after_restart(clean: bool) {
     let mut journal = MemJournal::default();
     let t = Target {
         account_id: "account-a".into(),
@@ -858,6 +831,8 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
             payload_digest: super::canonical::payload_digest(&payload).unwrap(),
             payload,
             updated_at: 1,
+            principal: "c1".into(),
+            control_gen: 1,
         })
         .unwrap();
     let ctx = HostContext {
@@ -867,7 +842,11 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
         runtime_gen: "55555555-5555-4555-8555-555555555555".into(),
         runtime_epoch: 7,
     };
-    let mut host = SessionHost::new(ctx, HostConfig::default(), journal, random_ids()).unwrap();
+    if clean {
+        journal.write_clean_close(6).unwrap();
+    }
+    let mut host =
+        SessionHost::open(ctx, HostConfig::default(), journal, random_ids(), Some(6)).unwrap();
     host.restore_session(SessionSpec {
         session_id: S1.into(),
         process_gen: P1.into(),
@@ -878,11 +857,33 @@ fn a_restart_releases_pending_approvals_and_rejects_unstarted_answers() {
         cols: 80,
     })
     .unwrap();
-    let fx = host.recover();
+    let mut fx = host.recover();
+    if clean {
+        assert_eq!(host.receipt(&rid(1)).unwrap().state, ReceiptState::Accepted);
+        fx.extend(
+            host.connect(Attach {
+                client: "c1".into(),
+                principal: "c1".into(),
+                attachment_gen: C1.into(),
+                permissions: vec![Permission::View, Permission::Control],
+                client_kind: ClientKind::Native,
+                authorization_ms: 60_000,
+            })
+            .unwrap(),
+        );
+        let hello = json!({"type": "session", "data": {"v": 1, "op": "hello",
+            "id": "11111111-1111-4111-8111-000000000009", "revision": 8}});
+        fx.extend(host.receive(C1, &serde_json::to_vec(&hello).unwrap(), 0));
+    }
     assert!(!fx.iter().any(|e| matches!(e, Effect::Approval { .. })));
     let r = host.receipt(&rid(1)).unwrap();
     assert_eq!(r.state, ReceiptState::Rejected);
-    assert_eq!(r.detail.as_deref(), Some(DETAIL_APPROVAL_CLOSED));
+    let detail = if clean {
+        DETAIL_APPROVAL_CLOSED
+    } else {
+        DETAIL_HISTORY_UNKNOWN
+    };
+    assert_eq!(r.detail.as_deref(), Some(detail));
 }
 
 #[test]
@@ -1072,7 +1073,7 @@ fn a_takeover_keeps_the_pending_approval_for_the_new_holder() {
         vec![wire::Permission::View, wire::Permission::Control],
         1_000_000,
     );
-    rt.send("c2", &msg("hello", json!({})));
+    rt.send("c2", &msg("hello", json!({"revision": 8})));
     rt.send("c2", &msg("list", json!({})));
     let caught = got(&mut rt, "c2");
     assert_eq!(ops(&caught), ["welcome", "sessions", "approval_request"]);
@@ -1092,7 +1093,9 @@ fn a_takeover_keeps_the_pending_approval_for_the_new_holder() {
     assert_eq!(rt.host.pending_approvals(S1), std::slice::from_ref(&id));
     assert!(released(&rt).is_empty());
     assert!(!ops(&got(&mut rt, "c1")).contains(&"approval_closed".to_string()));
-    // The old holder's epoch is stale; the new holder answers with its own.
+    // r8 §G: the old holder's stale epoch is ignored and its answer, the
+    // first admitted, wins; the new holder's is `stale_target`. The lease
+    // stays the new holder's.
     let old = answer(
         &rt,
         "c1",
@@ -1101,7 +1104,10 @@ fn a_takeover_keeps_the_pending_approval_for_the_new_holder() {
         json!({"approval_id": id, "decision": "deny"}),
     );
     rt.send("c1", &old);
-    assert_eq!(got(&mut rt, "c1")[0]["code"], "stale_lease");
+    assert_eq!(
+        ops(&got(&mut rt, "c1")),
+        ["receipt", "receipt", "approval_closed"]
+    );
     let new = answer(
         &rt,
         "c2",
@@ -1110,11 +1116,9 @@ fn a_takeover_keeps_the_pending_approval_for_the_new_holder() {
         json!({"approval_id": id, "decision": "allow_once"}),
     );
     rt.send("c2", &new);
-    assert_eq!(
-        ops(&got(&mut rt, "c2")),
-        ["receipt", "receipt", "approval_closed"]
-    );
+    assert_eq!(ops(&got(&mut rt, "c2")), ["approval_closed", "error"]);
     assert_eq!(approval_effects(&rt).len(), 1);
+    assert_eq!(rt.host.lease_holder(S1), Some(c2));
 }
 
 #[test]
@@ -1423,7 +1427,10 @@ fn a_rule_revoked_from_chat_completes_in_chat() {
     assert_eq!(
         chats,
         [
-            ChatReply::Accepted { request_id: rid(7) },
+            ChatReply::Accepted {
+                request_id: rid(7),
+                lease: None,
+            },
             ChatReply::Complete {
                 request_id: rid(7),
                 turn_id: None,
@@ -1489,6 +1496,7 @@ fn a_duplicate_chat_prompt_after_a_restart_keeps_its_interrupted_outcome() {
         DispatchReport::Completed {
             detail: Some(DETAIL_TURN_INTERRUPTED.into()),
             turn_id: Some("t1".into()),
+            user_message_id: None,
         },
     );
     rt.apply(fx);
@@ -1520,5 +1528,134 @@ fn a_duplicate_chat_prompt_after_a_restart_keeps_its_interrupted_outcome() {
             turn_id: None,
             interrupted: true
         }]
+    );
+}
+
+fn chat_replies(rt: &FakeRuntime) -> Vec<ChatReply> {
+    rt.effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Chat { reply, .. } => Some(reply.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// r8 §G, chat-v1 form: a non-holder answers from chat without a lease
+/// epoch; the holder keeps its lease and deadline and hears nothing but
+/// the close. `acquire` beside it is the removed r7 form (refused at
+/// decoding) and changes nothing.
+#[test]
+fn a_chat_answer_needs_control_not_the_lease() {
+    let mut rt = setup();
+    let epoch = list_and_hold(&mut rt, "c1");
+    let id = open(&mut rt, vec![]);
+    got(&mut rt, "c1");
+    let chat = |rt: &FakeRuntime, n: u64, acquire: bool| {
+        let mut data = json!({"v": 1, "op": "submit", "conversationId": "conv",
+            "agentId": S1, "generation": P1, "requestId": rid(n),
+            "approval": {"approval_id": id, "decision": "allow_once"},
+            "binding": binding(rt, "v", None)});
+        if acquire {
+            data["acquire"] = json!(true);
+        }
+        json!({"type": "agentChat", "data": data})
+    };
+    rt.send("v", &chat(&rt, 1, true));
+    assert!(chat_replies(&rt).is_empty());
+    assert!(rt.host.receipt(&rid(1)).is_none());
+    assert_eq!(rt.host.pending_approvals(S1), std::slice::from_ref(&id));
+    let deadline = rt.host.lease_deadline(S1);
+    rt.send("v", &chat(&rt, 2, false));
+    assert_eq!(
+        chat_replies(&rt),
+        [ChatReply::Accepted {
+            request_id: rid(2),
+            lease: None,
+        }]
+    );
+    assert!(rt.host.pending_approvals(S1).is_empty());
+    assert_eq!(approval_effects(&rt).len(), 1);
+    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("c1").as_str()));
+    assert_eq!(rt.host.lease_epoch(S1), Some(epoch));
+    assert_eq!(rt.host.lease_deadline(S1), deadline);
+    assert_eq!(ops(&got(&mut rt, "c1")), ["approval_closed"]);
+    // A view-only attachment can't answer from chat either.
+    let id2 = open(&mut rt, vec![]);
+    let m = json!({"type": "agentChat", "data": {"v": 1, "op": "submit", "conversationId": "conv",
+        "agentId": S1, "generation": P1, "requestId": rid(3),
+        "approval": {"approval_id": id2, "decision": "deny"},
+        "binding": binding(&rt, "r", None)}});
+    rt.effects.clear();
+    rt.send("r", &m);
+    assert!(matches!(
+        chat_replies(&rt).as_slice(),
+        [ChatReply::Error { code, .. }] if code == "forbidden"
+    ));
+}
+
+/// r8 §F, chat-v1 form: a `text` Send with `acquire` while another holds
+/// the lease is `lease_held` naming the holder (nothing recorded); with the
+/// confirmed takeover it takes the lease, and the `accepted` carries it.
+#[test]
+fn a_chat_send_names_the_holder_then_takes_over_when_confirmed() {
+    let mut rt = setup();
+    let epoch = list_and_hold(&mut rt, "c1");
+    let holder = rt.host.descriptor_of(S1).unwrap().controller.unwrap();
+    assert_eq!(holder.lease_epoch, epoch);
+    let send = |rt: &FakeRuntime, extra: Value| {
+        let mut data = json!({"v": 1, "op": "submit", "conversationId": "conv",
+            "agentId": S1, "generation": P1, "requestId": rid(1), "text": "run the tests",
+            "acquire": true, "binding": binding(rt, "v", None)});
+        data.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"type": "agentChat", "data": data})
+    };
+    rt.send("v", &send(&rt, json!({})));
+    assert_eq!(
+        chat_replies(&rt),
+        [ChatReply::Error {
+            request_id: Some(rid(1)),
+            code: "lease_held".into(),
+            text: "another controller holds this session".into(),
+            sequenced: true,
+            controller: Some(holder.clone()),
+            page_id: None,
+        }]
+    );
+    assert!(rt.host.receipt(&rid(1)).is_none());
+    // Field rules: `takeover` without `expected_controller`.
+    rt.effects.clear();
+    rt.send("v", &send(&rt, json!({"takeover": true})));
+    assert!(matches!(
+        chat_replies(&rt).as_slice(),
+        [ChatReply::Error { code, .. }] if code == "invalid_request"
+    ));
+    rt.effects.clear();
+    rt.send(
+        "v",
+        &send(
+            &rt,
+            json!({"takeover": true, "expected_controller": holder}),
+        ),
+    );
+    let lease = match chat_replies(&rt).as_slice() {
+        [
+            ChatReply::Accepted {
+                request_id,
+                lease: Some(l),
+            },
+        ] if *request_id == rid(1) => l.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(lease.lease_epoch > epoch);
+    assert_eq!(lease.ms_left, 15_000);
+    assert_eq!(rt.host.lease_holder(S1), Some(rt.attachment("v").as_str()));
+    assert_eq!(rt.host.lease_epoch(S1), Some(lease.lease_epoch));
+    assert!(
+        got(&mut rt, "c1")
+            .iter()
+            .any(|m| m["op"] == "lease_changed" && m["reason"] == "takeover")
     );
 }

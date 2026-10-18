@@ -13,7 +13,8 @@
 //! Unknown actions, unknown assertion keys and unknown `setup` fields fail the
 //! scenario instead of being ignored.
 
-use super::client::{LeaseClient, LeaseRequest, RegistryClient};
+use super::client::{AdmissionClient, ChatClient, LeaseClient, LeaseRequest, RegistryClient};
+use super::revision::{self, CHAT_COVERAGE, CHAT_LOOKUP};
 use super::wire::{
     self, AlwaysRule, ApprovalCloseReason, ClientKind, DecodeError, Envelope, Op, Permission,
 };
@@ -52,7 +53,7 @@ pub struct ClientSetup {
     pub client_kind: ClientKind,
     #[serde(default)]
     pub holds_lease_epoch: Option<u64>,
-    /// r8 draft: `false` leaves the client without the harness's `hello`.
+    /// r8: `false` leaves the client without the harness's `hello`.
     #[serde(default)]
     pub welcome: Option<bool>,
 }
@@ -80,8 +81,9 @@ pub struct Scenario {
     pub name: String,
     #[serde(default)]
     pub side: Side,
-    /// A contract revision this runner doesn't implement yet (`"r8"`): the
-    /// scenario is parsed and reported as not run.
+    /// The contract revision a scenario is written for (`"r8"`). An `r8-*`
+    /// scenario runs once the host work it needs is implemented
+    /// (`revision::r8_fixture_runnable`), else it is reported as not run.
     #[serde(default)]
     pub requires: Option<String>,
     pub setup: Setup,
@@ -113,11 +115,41 @@ pub enum HostEvent {
     CrashWorker {
         session_id: String,
     },
+    /// r8: an orderly stop and start (the clean close is written when the
+    /// journal is healthy).
     RestartRuntime {
         runtime_gen: String,
         runtime_epoch: u64,
     },
-    FailNextFsync,
+    /// r8: the runtime is killed (no clean close) and restarts.
+    CrashRuntime {
+        runtime_gen: String,
+        runtime_epoch: u64,
+    },
+    /// r8: the next `accepted` record becomes durable, then the runtime
+    /// crashes before acting on it and restarts with these values.
+    CrashAfterAccepted {
+        runtime_gen: String,
+        runtime_epoch: u64,
+    },
+    /// The `n`-th next journal append fails and the journal halts; with
+    /// `undo_fails` its record stays on disk (`fail_next_fsync` is `n` 1).
+    FailFsyncOf {
+        n: u64,
+        undo_fails: bool,
+    },
+    /// r8 §H: the client's principal re-authenticates with these
+    /// permissions on a new attachment.
+    SetPermissions {
+        client: String,
+        permissions: Vec<Permission>,
+        attachment_gen: String,
+    },
+    /// r8: the agent process is replaced with a new `process_gen`.
+    ReplaceProcess {
+        session_id: String,
+        process_gen: String,
+    },
     ChangeTrustGen(u64),
     FailNextPtyEnqueue,
     FailNextPtyWriteAfterPartial,
@@ -142,6 +174,8 @@ pub enum HostEvent {
         tool: String,
         summary: String,
         always_rules: Vec<AlwaysRule>,
+        /// r8: the card's `turnId`.
+        turn_id: Option<String>,
     },
     /// The runtime saw the approval end without the remote answer.
     CloseApproval {
@@ -157,6 +191,41 @@ pub enum HostEvent {
     ApprovalRules {
         session_id: String,
         rules: Vec<AlwaysRule>,
+    },
+    /// r8: the session's retained chat history (chat-v1 message bodies,
+    /// oldest first).
+    ChatHistory {
+        session_id: String,
+        messages: Vec<Value>,
+    },
+    /// r8: the agent produced a message (new, or a whole replacement).
+    ChatMessage {
+        session_id: String,
+        message: Value,
+    },
+    /// r8: retention evicted the oldest `count` messages.
+    ChatEvict {
+        session_id: String,
+        count: usize,
+    },
+    /// r8: one turn arrives live (`fixtures/schema.md`, `chat_turn`).
+    ChatTurn {
+        session_id: String,
+        turn_id: String,
+        request_id: Option<String>,
+        origin: String,
+        assistant_messages: usize,
+        text_bytes: usize,
+        /// `escape: "control"`: the text is U+0001.
+        control: bool,
+    },
+    /// r8: the worker's backlog dropped `dropped`, then delivered
+    /// `delivered_after` with a gap; a reload finds only `recoverable`.
+    WorkerGap {
+        session_id: String,
+        dropped: Vec<String>,
+        recoverable: Vec<String>,
+        delivered_after: Vec<Value>,
     },
 }
 
@@ -179,19 +248,20 @@ pub trait HostUnderTest {
 
 pub type HostFactory<'a> = &'a dyn Fn(&Setup) -> Result<Box<dyn HostUnderTest>, String>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Passed,
     Skipped,
-    /// Needs a contract revision not implemented yet (`requires`).
-    NotRun,
+    /// Needs host work not implemented yet (the reason names it).
+    NotRun(String),
 }
 
 #[derive(Debug, Default)]
 pub struct Report {
     pub passed: Vec<String>,
     pub skipped: Vec<String>,
-    pub not_run: Vec<String>,
+    /// (name, reason)
+    pub not_run: Vec<(String, String)>,
     pub failed: Vec<(String, String)>,
 }
 
@@ -237,7 +307,7 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
         match result {
             Ok(Outcome::Passed) => report.passed.push(name),
             Ok(Outcome::Skipped) => report.skipped.push(name),
-            Ok(Outcome::NotRun) => report.not_run.push(name),
+            Ok(Outcome::NotRun(why)) => report.not_run.push((name, why)),
             Err(e) => report.failed.push((name, e)),
         }
     }
@@ -248,11 +318,20 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
 pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, String> {
     let scenario: Scenario =
         serde_json::from_value(file.clone()).map_err(|e| format!("scenario: {e}"))?;
-    if scenario.requires.is_some() {
-        return Ok(Outcome::NotRun);
-    }
-    if scenario.setup.clients.iter().any(|c| c.welcome.is_some()) {
-        return Err(format!("{}: welcome needs requires", scenario.name));
+    let r8 = scenario.name.starts_with("r8-");
+    match scenario.requires.as_deref() {
+        None if !r8 => {}
+        Some("r8") if r8 => {
+            if let Err(why) = revision::r8_fixture_runnable(&scenario.name) {
+                return Ok(Outcome::NotRun(why));
+            }
+        }
+        other => {
+            return Err(format!(
+                "{}: requires {other:?} does not fit its name",
+                scenario.name
+            ));
+        }
     }
     let mut runner = match scenario.side {
         Side::Host => match host {
@@ -338,6 +417,14 @@ struct ClientMachines {
     lists_requested: u64,
     authorization_deadline: Option<u64>,
     attachment_gen: String,
+    /// r8 revision admission. A client scenario starts welcomed (with this
+    /// host's features) unless it sends `hello`, which starts a handshake.
+    admission: AdmissionClient,
+    /// Messages the client machines sent on their own (`client_try`s they
+    /// allowed, chat resyncs) since the last `sent` check.
+    sent: Vec<Value>,
+    /// r8 chat conversations (`client_open_chat`).
+    chat: ChatClient,
 }
 
 struct Runner {
@@ -351,7 +438,13 @@ struct Runner {
     queues: HashMap<String, VecDeque<Value>>,
     holds: Vec<(String, String)>,
     held: Vec<(String, Value)>,
+    /// r8 `drop`: the next matching host message is lost in transit.
+    drops: Vec<(String, String)>,
     clients: HashMap<String, ClientMachines>,
+}
+
+fn env_of(msg: &wire::SessionMessage) -> Envelope {
+    Envelope::Session(msg.clone())
 }
 
 /// Decodes `msg` strictly, as the receiving side would.
@@ -397,6 +490,23 @@ fn same(expected: &Value, got: Option<&Value>, what: &str) -> Result<(), String>
     }
 }
 
+/// A chat-v1 message's content bytes as `ChatSession` counts them (part
+/// text; a tool's name and summary; a card's tool and summary).
+fn content_bytes(message: &Value) -> u64 {
+    let len = |v: &Value| v.as_str().map_or(0, str::len) as u64;
+    message["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| match p["kind"].as_str() {
+            Some("text") => len(&p["markdown"]),
+            Some("tool") => len(&p["name"]) + len(&p["summary"]),
+            Some("approval") => len(&p["tool"]) + len(&p["summary"]),
+            _ => 0,
+        })
+        .sum()
+}
+
 impl Runner {
     fn new(s: &Scenario, host: Option<Box<dyn HostUnderTest>>) -> Self {
         let client_names: Vec<String> = s.setup.clients.iter().map(|c| c.name.clone()).collect();
@@ -411,6 +521,9 @@ impl Runner {
                         lists_requested: 0,
                         authorization_deadline: None,
                         attachment_gen: c.attachment_gen.clone(),
+                        admission: AdmissionClient::admitted(revision::FEATURES),
+                        sent: Vec::new(),
+                        chat: ChatClient::default(),
                     };
                     (c.name.clone(), m)
                 })
@@ -436,6 +549,7 @@ impl Runner {
             host,
             holds: Vec::new(),
             held: Vec::new(),
+            drops: Vec::new(),
             clients,
         }
     }
@@ -471,13 +585,20 @@ impl Runner {
             ("hold", &[]),
             ("deliver", &[]),
             ("deliver_to_client", &["json"]),
+            ("client_try", &["json", "refused"]),
             ("disconnect", &[]),
             ("resume", &["attachment_gen"]),
             ("reconnect", &["attachment_gen"]),
             ("local_input", &["bytes"]),
             ("crash_worker", &[]),
             ("restart_runtime", &[]),
-            ("fail_next_fsync", &[]),
+            ("crash_runtime", &[]),
+            ("crash_after_accepted", &[]),
+            ("fail_next_fsync", &["undo_fails"]),
+            ("fail_fsync_of", &[]),
+            ("set_permissions", &["permissions", "attachment_gen"]),
+            ("replace_process", &["process_gen"]),
+            ("drop", &[]),
             ("change_trust_gen", &[]),
             ("fail_next_pty_enqueue", &[]),
             ("fail_next_pty_write_after_partial", &[]),
@@ -485,7 +606,39 @@ impl Runner {
             ("turn_complete", &["turn_id"]),
             ("hold_pty_writes", &[]),
             ("flush_pty_writes", &[]),
-            ("open_approval", &["tool", "summary", "always_rules"]),
+            (
+                "open_approval",
+                &["tool", "summary", "always_rules", "turn_id"],
+            ),
+            ("chat_history", &["messages"]),
+            ("chat_message", &["message"]),
+            ("chat_evict", &["count"]),
+            (
+                "chat_turn",
+                &[
+                    "turn_id",
+                    "request_id",
+                    "origin",
+                    "assistant_messages",
+                    "text_bytes",
+                    "escape",
+                ],
+            ),
+            ("worker_gap", &["dropped", "recoverable", "delivered_after"]),
+            ("expect_live", &["message_ids", "sequence_from"]),
+            (
+                "recover",
+                &[
+                    "request",
+                    "message_ids",
+                    "min_pages",
+                    "max_count",
+                    "max_content_bytes",
+                    "max_wire_bytes",
+                    "end",
+                ],
+            ),
+            ("client_open_chat", &["conversation", "session_id"]),
             ("close_approval", &["reason"]),
             ("approval_applied", &["ok"]),
             ("approval_rules", &["rules"]),
@@ -536,6 +689,11 @@ impl Runner {
                 self.client_deliver(&client, take(&step, "json")?)
             }
             ("assert_client", Side::Client) => self.assert_client(arg),
+            ("client_try", Side::Client) => {
+                let client = self.client(arg)?.to_string();
+                let refused = as_str(take(&step, "refused")?, "refused")?;
+                self.client_try(&client, take(&step, "json")?, refused)
+            }
             ("expect", Side::Host) => {
                 let client = self.client(arg)?.to_string();
                 let empty = Value::Object(Map::new());
@@ -569,16 +727,22 @@ impl Runner {
                     Some(m) => Err(format!("{client} received {m}")),
                 }
             }
-            ("hold", Side::Host) => {
+            ("hold" | "drop", Side::Host) => {
                 let to = self.client(take(
-                    arg.as_object().ok_or("hold must be an object")?,
+                    arg.as_object()
+                        .ok_or(format!("{action} must be an object"))?,
                     "to",
                 )?)?;
-                let op = as_str(take(arg.as_object().unwrap(), "op")?, "hold.op")?;
+                let op = as_str(take(arg.as_object().unwrap(), "op")?, "op")?;
                 if arg.as_object().unwrap().len() != 2 {
-                    return Err("hold takes exactly to and op".into());
+                    return Err(format!("{action} takes exactly to and op"));
                 }
-                self.holds.push((to.to_string(), op.to_string()));
+                let armed = (to.to_string(), op.to_string());
+                if *action == "hold" {
+                    self.holds.push(armed);
+                } else {
+                    self.drops.push(armed);
+                }
                 Ok(())
             }
             ("deliver", Side::Host) => {
@@ -594,7 +758,51 @@ impl Runner {
                 Ok(())
             }
             ("assert", Side::Host) => self.assert_host(arg),
-            (_, Side::Host) if !matches!(*action, "deliver_to_client" | "assert_client") => {
+            ("expect_live", Side::Host) => {
+                let client = self.client(arg)?.to_string();
+                let ids: Vec<String> = serde_json::from_value(take(&step, "message_ids")?.clone())
+                    .map_err(|e| format!("message_ids: {e}"))?;
+                let from = as_u64(take(&step, "sequence_from")?, "sequence_from")?;
+                for (k, id) in ids.iter().enumerate() {
+                    let op = serde_json::json!({"op": "message"});
+                    let data = self.expect(&client, Some("agentChat"), &op)?;
+                    if data.get("history").is_some() {
+                        return Err(format!("{id}: a history message, expected a live one"));
+                    }
+                    same(
+                        &Value::from(id.as_str()),
+                        data.get("messageId"),
+                        "messageId",
+                    )?;
+                    same(
+                        &Value::from(from + k as u64),
+                        data.get("sequence"),
+                        "sequence",
+                    )?;
+                }
+                Ok(())
+            }
+            ("recover", Side::Host) => {
+                let client = self.client(arg)?.to_string();
+                self.recover(&client, &step)
+            }
+            ("client_open_chat", Side::Client) => {
+                let client = self.client(arg)?.to_string();
+                let conversation = as_str(take(&step, "conversation")?, "conversation")?;
+                let session = as_str(take(&step, "session_id")?, "session_id")?;
+                let m = self.clients.get_mut(&client).unwrap();
+                if !m.admission.enabled(revision::CHAT_HISTORY_END) {
+                    return Err("the client can't open a chat without chat.history_end".into());
+                }
+                m.chat.open(conversation, session);
+                Ok(())
+            }
+            (_, Side::Host)
+                if !matches!(
+                    *action,
+                    "deliver_to_client" | "assert_client" | "client_try" | "client_open_chat"
+                ) =>
+            {
                 let event = self.event(action, arg, &step)?;
                 let now = self.now;
                 self.host()?.event(&event, now)?;
@@ -650,17 +858,59 @@ impl Runner {
             "crash_worker" => HostEvent::CrashWorker {
                 session_id: as_str(arg, "crash_worker")?.into(),
             },
-            "restart_runtime" => {
-                let o = arg.as_object().ok_or("restart_runtime must be an object")?;
+            "restart_runtime" | "crash_runtime" | "crash_after_accepted" => {
+                let o = arg
+                    .as_object()
+                    .ok_or(format!("{action} must be an object"))?;
                 if o.len() != 2 {
-                    return Err("restart_runtime takes runtime_gen and runtime_epoch".into());
+                    return Err(format!("{action} takes runtime_gen and runtime_epoch"));
                 }
-                HostEvent::RestartRuntime {
-                    runtime_gen: uuid(take(o, "runtime_gen")?, "runtime_gen")?,
-                    runtime_epoch: as_u64(take(o, "runtime_epoch")?, "runtime_epoch")?,
+                let runtime_gen = uuid(take(o, "runtime_gen")?, "runtime_gen")?;
+                let runtime_epoch = as_u64(take(o, "runtime_epoch")?, "runtime_epoch")?;
+                match action {
+                    "restart_runtime" => HostEvent::RestartRuntime {
+                        runtime_gen,
+                        runtime_epoch,
+                    },
+                    "crash_runtime" => HostEvent::CrashRuntime {
+                        runtime_gen,
+                        runtime_epoch,
+                    },
+                    _ => HostEvent::CrashAfterAccepted {
+                        runtime_gen,
+                        runtime_epoch,
+                    },
                 }
             }
-            "fail_next_fsync" => yes(arg).map(|_| HostEvent::FailNextFsync)?,
+            "fail_next_fsync" => {
+                yes(arg)?;
+                let undo_fails = match step.get("undo_fails") {
+                    None => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err("undo_fails must be a boolean".into()),
+                };
+                HostEvent::FailFsyncOf { n: 1, undo_fails }
+            }
+            "fail_fsync_of" => {
+                let n = as_u64(arg, "fail_fsync_of")?;
+                if n == 0 {
+                    return Err("fail_fsync_of counts from 1".into());
+                }
+                HostEvent::FailFsyncOf {
+                    n,
+                    undo_fails: false,
+                }
+            }
+            "set_permissions" => HostEvent::SetPermissions {
+                client: self.client(arg)?.into(),
+                permissions: serde_json::from_value(take(step, "permissions")?.clone())
+                    .map_err(|e| format!("permissions: {e}"))?,
+                attachment_gen: uuid(take(step, "attachment_gen")?, "attachment_gen")?,
+            },
+            "replace_process" => HostEvent::ReplaceProcess {
+                session_id: as_str(arg, "replace_process")?.into(),
+                process_gen: uuid(take(step, "process_gen")?, "process_gen")?,
+            },
             "change_trust_gen" => HostEvent::ChangeTrustGen(as_u64(arg, "change_trust_gen")?),
             "fail_next_pty_enqueue" => yes(arg).map(|_| HostEvent::FailNextPtyEnqueue)?,
             "fail_next_pty_write_after_partial" => {
@@ -684,7 +934,58 @@ impl Runner {
                     Some(v) => serde_json::from_value(v.clone())
                         .map_err(|e| format!("always_rules: {e}"))?,
                 },
+                turn_id: step
+                    .get("turn_id")
+                    .map(|t| as_str(t, "turn_id").map(str::to_string))
+                    .transpose()?,
             },
+            "chat_history" => HostEvent::ChatHistory {
+                session_id: as_str(arg, "chat_history")?.into(),
+                messages: take(step, "messages")?
+                    .as_array()
+                    .ok_or("messages must be a list")?
+                    .clone(),
+            },
+            "chat_message" => HostEvent::ChatMessage {
+                session_id: as_str(arg, "chat_message")?.into(),
+                message: take(step, "message")?.clone(),
+            },
+            "chat_evict" => HostEvent::ChatEvict {
+                session_id: as_str(arg, "chat_evict")?.into(),
+                count: as_u64(take(step, "count")?, "count")? as usize,
+            },
+            "chat_turn" => HostEvent::ChatTurn {
+                session_id: as_str(arg, "chat_turn")?.into(),
+                turn_id: as_str(take(step, "turn_id")?, "turn_id")?.into(),
+                request_id: step
+                    .get("request_id")
+                    .map(|r| as_str(r, "request_id").map(str::to_string))
+                    .transpose()?,
+                origin: as_str(take(step, "origin")?, "origin")?.into(),
+                assistant_messages: as_u64(take(step, "assistant_messages")?, "assistant_messages")?
+                    as usize,
+                text_bytes: as_u64(take(step, "text_bytes")?, "text_bytes")? as usize,
+                control: match step.get("escape") {
+                    None => false,
+                    Some(Value::String(e)) if e == "control" => true,
+                    Some(other) => return Err(format!("escape {other}")),
+                },
+            },
+            "worker_gap" => {
+                let ids = |key: &str| -> Result<Vec<String>, String> {
+                    serde_json::from_value(take(step, key)?.clone())
+                        .map_err(|e| format!("{key}: {e}"))
+                };
+                HostEvent::WorkerGap {
+                    session_id: as_str(arg, "worker_gap")?.into(),
+                    dropped: ids("dropped")?,
+                    recoverable: ids("recoverable")?,
+                    delivered_after: take(step, "delivered_after")?
+                        .as_array()
+                        .ok_or("delivered_after must be a list")?
+                        .clone(),
+                }
+            }
             "close_approval" => HostEvent::CloseApproval {
                 approval_id: as_str(arg, "close_approval")?.into(),
                 reason: serde_json::from_value(take(step, "reason")?.clone())
@@ -747,6 +1048,11 @@ impl Runner {
                 .get_mut(&client)
                 .ok_or(format!("host sent to unknown client {client:?}"))?;
             let op = msg["data"]["op"].as_str().unwrap_or_default();
+            if let Some(i) = self.drops.iter().position(|(c, o)| *c == client && o == op) {
+                // Lost in transit: never delivered, never expected.
+                self.drops.remove(i);
+                continue;
+            }
             if let Some(i) = self.holds.iter().position(|(c, o)| *c == client && o == op) {
                 self.holds.remove(i);
                 self.held.push((client, msg));
@@ -798,6 +1104,112 @@ impl Runner {
         Ok(())
     }
 
+    /// r8 `recover`: sends `request` and takes its pages, following each
+    /// `history_end`'s `next` until `end`, checking every page's bounds and
+    /// sequences; the messages taken must be `message_ids` exactly.
+    fn recover(&mut self, client: &str, step: &Map<String, Value>) -> Result<(), String> {
+        let request = take(step, "request")?.clone();
+        let data = request.get("data").ok_or("request without data")?.clone();
+        let want: Vec<String> = serde_json::from_value(take(step, "message_ids")?.clone())
+            .map_err(|e| format!("message_ids: {e}"))?;
+        let min_pages = as_u64(take(step, "min_pages")?, "min_pages")?;
+        let max_count = as_u64(take(step, "max_count")?, "max_count")?;
+        let max_content = as_u64(take(step, "max_content_bytes")?, "max_content_bytes")?;
+        let max_wire = as_u64(take(step, "max_wire_bytes")?, "max_wire_bytes")?;
+        let end_match = take(step, "end")?.clone();
+        let open = data["op"] == "open";
+        let base = data["page_id"].as_str().unwrap_or("open").to_string();
+        let now = self.now;
+        let msg = decode_value(&request);
+        self.host()?.receive(client, msg, now);
+        self.pump()?;
+        let mut generation = data.get("generation").cloned();
+        if open {
+            let opened = self.expect(
+                client,
+                Some("agentChat"),
+                &serde_json::json!({"op": "opened"}),
+            )?;
+            same(&Value::from(0), opened.get("sequence"), "opened sequence")?;
+            generation = opened.get("generation").cloned();
+        }
+        let mut pages: Vec<Vec<String>> = Vec::new();
+        let mut backwards;
+        loop {
+            let mut ids = Vec::new();
+            let (mut content, mut wire) = (0u64, 0u64);
+            let mut sequence: Option<u64> = None;
+            let end = loop {
+                let queue = self.queues.get_mut(client).unwrap();
+                let i = queue
+                    .iter()
+                    .position(|m| m["type"] == "agentChat")
+                    .ok_or("the page ended early")?;
+                let msg = queue.remove(i).unwrap();
+                wire += serde_json::to_vec(&msg).map_or(0, |v| v.len()) as u64;
+                let d = &msg["data"];
+                let seq = d["sequence"].as_u64().ok_or(format!("unsequenced {msg}"))?;
+                if sequence.is_some_and(|s| seq != s + 1) {
+                    return Err(format!("sequence {seq} after {sequence:?}"));
+                }
+                sequence = Some(seq);
+                match d["op"].as_str() {
+                    Some("message") if d["history"] == true => {
+                        ids.push(d["messageId"].as_str().unwrap_or_default().to_string());
+                        content += content_bytes(d);
+                    }
+                    Some("history_end") => break d.clone(),
+                    _ => return Err(format!("not part of a page: {msg}")),
+                }
+            };
+            let page = &end["page"];
+            same(&Value::from(ids.len()), page.get("count"), "page.count")?;
+            if ids.len() as u64 > max_count || content > max_content || wire > max_wire {
+                return Err(format!(
+                    "page {} over its bounds: {} messages, {content} content bytes, {wire} wire bytes",
+                    pages.len() + 1,
+                    ids.len()
+                ));
+            }
+            backwards = matches!(page["selector"].as_str(), Some("newest" | "before"));
+            pages.push(ids);
+            if page["end"] == true {
+                for (path, expected) in end_match.as_object().ok_or("end must be an object")? {
+                    same(expected, lookup(&end, path).as_ref(), path)
+                        .map_err(|e| format!("last history_end: {e}"))?;
+                }
+                break;
+            }
+            let next = page["next"].as_str().ok_or("no next before the end")?;
+            let mut more = serde_json::json!({"v": 1, "op": "history",
+                "conversationId": data["conversationId"], "agentId": data["agentId"],
+                "generation": generation.clone().unwrap_or(Value::Null),
+                "page_id": format!("{base}-{}", pages.len() + 1),
+                "binding": data["binding"], "next": next});
+            if more["generation"].is_null() {
+                more.as_object_mut().unwrap().remove("generation");
+            }
+            let msg = decode_value(&serde_json::json!({"type": "agentChat", "data": more}));
+            let now = self.now;
+            self.host()?.receive(client, msg, now);
+            self.pump()?;
+        }
+        if (pages.len() as u64) < min_pages {
+            return Err(format!(
+                "{} pages, expected at least {min_pages}",
+                pages.len()
+            ));
+        }
+        if backwards {
+            pages.reverse();
+        }
+        let got: Vec<String> = pages.into_iter().flatten().collect();
+        if got != want {
+            return Err(format!("recovered {got:?}, expected {want:?}"));
+        }
+        Ok(())
+    }
+
     // ── client side ──
 
     fn client_send(&mut self, client: &str, json: &Value) -> Result<(), String> {
@@ -808,6 +1220,18 @@ impl Runner {
         };
         let now = self.now;
         let m = self.clients.get_mut(client).unwrap();
+        if let Op::Hello { revision, .. } = &msg.op
+            && *revision != Some(revision::REVISION)
+        {
+            return Err("an r8 client's hello carries revision 8".into());
+        }
+        // A `hello` starts a new handshake inside `check_send`.
+        m.admission
+            .check_send(&env_of(&msg))
+            .map_err(|e| format!("client refused to send: {e}"))?;
+        if matches!(msg.op, Op::Hello { .. }) {
+            return Ok(());
+        }
         let (kind, binding) = match &msg.op {
             Op::List {} => {
                 m.registry.note_list_sent();
@@ -816,6 +1240,12 @@ impl Runner {
             Op::Acquire { binding, .. } => (LeaseRequest::Acquire, binding),
             Op::Renew { binding } => (LeaseRequest::Renew, binding),
             Op::Release { binding } => (LeaseRequest::Release, binding),
+            // r8 §F: an acquiring Send's admitting receipt carries the lease.
+            Op::Submit {
+                binding,
+                acquire: Some(true),
+                ..
+            } => (LeaseRequest::Send, binding),
             other => return Err(format!("client machines don't send {other:?}")),
         };
         if binding.attachment_gen != m.attachment_gen {
@@ -841,13 +1271,35 @@ impl Runner {
 
     fn client_deliver(&mut self, client: &str, json: &Value) -> Result<(), String> {
         let env = decode_value(json).map_err(|e| format!("host message does not decode: {e:?}"))?;
-        let Envelope::Session(msg) = env else {
-            return Err("client machines only model session messages".into());
+        let msg = match env {
+            Envelope::Session(msg) => msg,
+            Envelope::Family(f) if f.family == "agentChat" => {
+                let m = self.clients.get_mut(client).unwrap();
+                if m.admission.applies()
+                    && let Some(answer) = m.chat.on_message(f.data.as_ref().unwrap_or(&Value::Null))
+                {
+                    m.sent.push(answer);
+                }
+                return Ok(());
+            }
+            _ => return Err("client machines model session and chat messages only".into()),
         };
         let now = self.now;
         let m = self.clients.get_mut(client).unwrap();
+        if let Op::Welcome {
+            revision, features, ..
+        } = &msg.op
+            && !m.admission.on_welcome(*revision, features.as_deref())
+        {
+            // An older host (or one already refused): nothing is applied.
+            return Ok(());
+        }
+        if !m.admission.applies() {
+            // Refused or not welcomed: the client applies nothing.
+            return Ok(());
+        }
         match &msg.op {
-            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. } => {
+            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. } | Op::Receipt(_) => {
                 // Routed by `re`; a reply nobody is waiting for is dropped (rule 1).
                 let re = msg.re.as_deref().unwrap_or_default();
                 if let Some(l) = m.leases.values_mut().find(|l| l.is_outstanding(re)) {
@@ -868,6 +1320,18 @@ impl Runner {
             | Op::SessionChanged { .. }
             | Op::ApprovalRequest(_)
             | Op::ApprovalClosed { .. } => {
+                // A controller epoch in the registry is one seen (r8 §F rule
+                // (b)): an older lease on a late reply is not applied.
+                let descriptors = match &msg.op {
+                    Op::Sessions { sessions, .. } => sessions.iter().collect(),
+                    Op::SessionChanged { descriptor, .. } => vec![descriptor],
+                    _ => Vec::new(),
+                };
+                for d in descriptors {
+                    if let (Some(c), Some(l)) = (&d.controller, m.leases.get_mut(&d.session_id)) {
+                        l.on_lease_changed(&d.session_id, &d.process_gen, c.lease_epoch);
+                    }
+                }
                 m.registry.on_message(&msg.op);
                 if m.registry.take_list_request() {
                     m.lists_requested += 1;
@@ -876,10 +1340,17 @@ impl Runner {
             }
             Op::Welcome {
                 authorization_ms_left,
+                attachment_gen,
                 ..
             } => {
-                // A new attachment: its registry `seq` starts over.
+                // A new attachment: its registry `seq` starts over, and it
+                // holds no lease; replies to requests sent on the old one are
+                // never applied (r8 §F rule (a)).
                 m.registry.new_attachment();
+                if *attachment_gen != m.attachment_gen {
+                    m.attachment_gen = attachment_gen.clone();
+                    m.leases.clear();
+                }
                 let deadline = now.saturating_add(*authorization_ms_left);
                 m.authorization_deadline = Some(deadline);
                 m.leases
@@ -946,11 +1417,48 @@ impl Runner {
                 "runtime_epoch" => m.registry.runtime_epoch().map_or(Value::Null, Value::from),
                 "seq" => m.registry.seq().map_or(Value::Null, Value::from),
                 "sent_list" => Value::Bool(m.lists_requested > 0),
+                "admitted" => Value::Bool(m.admission.is_admitted()),
+                "revision" => m.admission.revision().map_or(Value::Null, Value::from),
+                "features_enabled" => Value::from(m.admission.features_enabled().to_vec()),
+                "lookup_enabled" => Value::Bool(m.admission.enabled(CHAT_LOOKUP)),
+                "coverage_enabled" => Value::Bool(m.admission.enabled(CHAT_COVERAGE)),
+                // Chat needs an admitted attachment (per-session chat-v1
+                // comes from the descriptor's capabilities).
+                "chat_enabled" => Value::Bool(m.admission.is_admitted()),
+                "sent" => Value::from(m.sent.clone()),
+                "chat_loaded" => Value::Bool(m.chat.only().is_some_and(|c| c.loaded)),
+                "chat_truncated" => Value::Bool(m.chat.only().is_some_and(|c| c.truncated)),
+                "chat_reopens" => Value::from(m.chat.only().map_or(0, |c| c.reopens)),
+                "chat_messages" => Value::from(
+                    m.chat
+                        .only()
+                        .map(|c| c.messages.clone())
+                        .unwrap_or_default(),
+                ),
                 other => return Err(format!("unknown assert_client key {other:?}")),
             };
             same(expected, Some(&got), key)?;
         }
+        if o.contains_key("sent") {
+            self.clients.get_mut(name).unwrap().sent.clear();
+        }
         Ok(())
+    }
+
+    /// The client is asked to send `json` and must refuse it locally with
+    /// exactly `refused` (nothing is sent).
+    fn client_try(&mut self, client: &str, json: &Value, refused: &str) -> Result<(), String> {
+        let env =
+            decode_value(json).map_err(|e| format!("client request does not decode: {e:?}"))?;
+        let m = self.clients.get_mut(client).unwrap();
+        match m.admission.check_send(&env) {
+            Err(reason) if reason == refused => Ok(()),
+            Err(reason) => Err(format!("refused with {reason:?}, expected {refused:?}")),
+            Ok(()) => {
+                m.sent.push(wire::to_value(&env));
+                Err(format!("the client sent it; expected refusal {refused:?}"))
+            }
+        }
     }
 }
 
@@ -959,8 +1467,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The scenarios this runner implements (r8-draft ones, with
-    /// `requires`, are left out; see `r8_draft_fixtures_parse_and_are_not_run`).
+    /// The scenarios this runner runs now: every r7.x one, and the `r8-*`
+    /// ones whose host work is implemented (`revision::R8_FIXTURE_NEEDS`).
     fn scenario_files() -> Vec<(String, Value)> {
         scenario_paths(&fixtures_dir())
             .into_iter()
@@ -968,25 +1476,211 @@ mod tests {
                 let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
                 (p.file_name().unwrap().to_string_lossy().into_owned(), v)
             })
-            .filter(|(_, v)| v.get("requires").is_none())
+            .filter(|(_, v)| {
+                let name = v["name"].as_str().unwrap();
+                !name.starts_with("r8-") || revision::r8_fixture_runnable(name).is_ok()
+            })
             .collect()
     }
 
+    /// Every `r8-*` fixture is listed with the work it needs; the ones whose
+    /// work is implemented run (and pass, see below), the rest are reported
+    /// as not run with what they still need.
     #[test]
-    fn r8_draft_fixtures_parse_and_are_not_run() {
-        let mut draft = Vec::new();
+    fn r8_fixtures_run_once_their_work_is_implemented() {
+        let mut waiting = Vec::new();
+        let mut names = Vec::new();
         for p in scenario_paths(&fixtures_dir()) {
             let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-            if v.get("requires").is_some() {
-                let s: Scenario = serde_json::from_value(v.clone()).expect("r8 fixture parses");
-                assert_eq!(s.requires.as_deref(), Some("r8"), "{}", s.name);
-                assert_eq!(run_scenario(&v, Some(&fake_runtime)), Ok(Outcome::NotRun));
-                draft.push(s.name);
+            let s: Scenario = serde_json::from_value(v.clone()).expect("fixture parses");
+            if !s.name.starts_with("r8-") {
+                assert_eq!(s.requires, None, "{}", s.name);
+                continue;
+            }
+            assert_eq!(s.requires.as_deref(), Some("r8"), "{}", s.name);
+            names.push(s.name.clone());
+            match revision::r8_fixture_runnable(&s.name) {
+                Ok(()) => {
+                    assert_eq!(
+                        run_scenario(&v, Some(&fake_runtime)),
+                        Ok(Outcome::Passed),
+                        "{}",
+                        s.name
+                    )
+                }
+                Err(why) => {
+                    assert!(why.starts_with("needs "), "{}: {why}", s.name);
+                    assert_eq!(
+                        run_scenario(&v, Some(&fake_runtime)),
+                        Ok(Outcome::NotRun(why.clone()))
+                    );
+                    waiting.push((s.name, why));
+                }
             }
         }
-        assert!(!draft.is_empty(), "r8 draft fixtures missing");
+        let mut listed: Vec<&str> = revision::R8_FIXTURE_NEEDS.iter().map(|(n, _)| *n).collect();
+        listed.sort();
+        assert_eq!(
+            listed, names,
+            "R8_FIXTURE_NEEDS lists exactly the r8 fixtures"
+        );
         let report = run_all(&fixtures_dir(), Some(&fake_runtime));
-        assert_eq!(report.not_run, draft);
+        let r8_not_run: Vec<_> = report
+            .not_run
+            .iter()
+            .filter(|(n, _)| n.starts_with("r8-"))
+            .cloned()
+            .collect();
+        assert_eq!(r8_not_run, waiting);
+        for name in [
+            "r8-client-refuses-a-host-without-revision-8",
+            "r8-client-enables-only-advertised-features",
+        ] {
+            assert!(report.passed.iter().any(|p| p == name), "{name} passes");
+        }
+    }
+
+    /// The admission scenario's welcome names every r8 feature in the
+    /// appendix's order (this host's list): it passes, and fails on a
+    /// changed expectation (another feature list, revision, code, or a
+    /// leftover attachment).
+    #[test]
+    fn hello_admission_names_this_hosts_features() {
+        let name = "r8-hello-without-revision-8-is-refused-before-any-attachment";
+        let f = fixture(name);
+        assert_eq!(run_scenario(&f, Some(&fake_runtime)), Ok(Outcome::Passed));
+        let welcome = |g: &mut Value| -> Value {
+            g["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["match"]["op"] == "welcome")
+                .unwrap()["match"]["features"]
+                .clone()
+        };
+        assert_eq!(welcome(&mut f.clone()), json!(revision::FEATURES));
+        let mut g = f.clone();
+        let step = g["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["match"]["op"] == "welcome")
+            .unwrap();
+        step["match"]["features"].as_array_mut().unwrap().pop();
+        assert!(run_scenario(&g, Some(&fake_runtime)).is_err());
+        for (path, to) in [("revision", json!(7)), ("code", json!("unauthorized"))] {
+            let mut g = f.clone();
+            let step = g["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["match"].get(path).is_some())
+                .unwrap();
+            step["match"][path] = to;
+            assert!(run_scenario(&g, Some(&fake_runtime)).is_err(), "{path}");
+        }
+        let mut g = f.clone();
+        let last = g["steps"].as_array_mut().unwrap().last_mut().unwrap();
+        last["assert"]["attachments"] = json!(0);
+        assert!(run_scenario(&g, Some(&fake_runtime)).is_err());
+    }
+
+    /// `recover` and `expect_live` fail when what they check changes: the
+    /// ids, the bounds, the page count, the last page or the sequences.
+    #[test]
+    fn recover_and_expect_live_fail_on_a_changed_expectation() {
+        let name = "r8-long-turn-is-recovered-in-bounded-pages";
+        let f = fixture(name);
+        let at = |f: &Value, action: &str| {
+            f["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|s| s.get(action).is_some())
+                .unwrap()
+        };
+        let (live, recover) = (at(&f, "expect_live"), at(&f, "recover"));
+        let changes: Vec<(usize, &str, Value)> = vec![
+            (live, "sequence_from", json!(3)),
+            (recover, "min_pages", json!(4)),
+            (recover, "max_count", json!(10)),
+            (recover, "max_content_bytes", json!(100_000)),
+            (recover, "max_wire_bytes", json!(500_000)),
+            (recover, "end", json!({"page.coverage": "partial"})),
+        ];
+        for (i, key, to) in changes {
+            let mut g = f.clone();
+            g["steps"][i][key] = to;
+            assert!(run_scenario(&g, Some(&fake_runtime)).is_err(), "{key}");
+        }
+        for i in [live, recover] {
+            let mut g = f.clone();
+            g["steps"][i]["message_ids"]
+                .as_array_mut()
+                .unwrap()
+                .swap(3, 4);
+            assert!(
+                run_scenario(&g, Some(&fake_runtime)).is_err(),
+                "step {i} ids"
+            );
+        }
+    }
+
+    #[test]
+    fn r8_client_fixtures_fail_on_a_changed_expectation() {
+        let shows = "r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap";
+        assert_eq!(run_scenario(&fixture(shows), None), Ok(Outcome::Passed));
+        for (key, from, to) in [
+            ("chat_reopens", json!(1), json!(0)),
+            ("chat_truncated", json!(true), json!(false)),
+            (
+                "chat_messages",
+                json!(["m-0005", "m-0006", "m-0007"]),
+                json!(["m-0006", "m-0005", "m-0007"]),
+            ),
+        ] {
+            let mut f = fixture(shows);
+            mutate_assert(&mut f, key, &from, to);
+            assert!(run_scenario(&f, None).is_err(), "{key}");
+        }
+        let refuses = "r8-client-refuses-a-host-without-revision-8";
+        let mut f = fixture(refuses);
+        mutate_assert(&mut f, "admitted", &json!(false), json!(true));
+        assert!(run_scenario(&f, None).is_err());
+        let mut f = fixture(refuses);
+        mutate_assert(&mut f, "registry", &json!([]), json!(["ses-aaaaaaaaaaaa"]));
+        assert!(run_scenario(&f, None).is_err());
+        // An older host's welcome followed by a correct one stays refused.
+        let mut f = fixture(refuses);
+        f["steps"][5]["json"]["data"]["revision"] = json!(8);
+        assert!(run_scenario(&f, None).is_ok());
+
+        let enables = "r8-client-enables-only-advertised-features";
+        let mut f = fixture(enables);
+        mutate_assert(&mut f, "lookup_enabled", &json!(false), json!(true));
+        assert!(run_scenario(&f, None).is_err());
+        let mut f = fixture(enables);
+        let try_step = f["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.get("client_try").is_some())
+            .unwrap();
+        try_step["refused"] = json!("feature chat.history not advertised");
+        assert!(run_scenario(&f, None).is_err());
+        // Advertised, the lookup is sent, not refused.
+        let mut f = fixture(enables);
+        f["steps"][1]["json"]["data"]["features"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("chat.lookup"));
+        f["steps"][2]["assert_client"]["features_enabled"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("chat.lookup"));
+        f["steps"][2]["assert_client"]["lookup_enabled"] = json!(true);
+        let err = run_scenario(&f, None).unwrap_err();
+        assert!(err.contains("the client sent it"), "{err}");
     }
 
     fn fake_runtime(setup: &Setup) -> Result<Box<dyn HostUnderTest>, String> {
@@ -995,8 +1689,11 @@ mod tests {
         )?))
     }
 
+    /// Every fixture whose work is implemented runs and passes, none is
+    /// skipped, and exactly the others (r8 ones waiting for their work) are
+    /// reported as not run.
     #[test]
-    fn every_fixture_runs_and_passes_with_none_skipped() {
+    fn every_runnable_fixture_passes_and_only_the_gated_ones_are_not_run() {
         let files = scenario_files();
         let host: Vec<String> = files
             .iter()
@@ -1018,6 +1715,20 @@ mod tests {
         for name in &host {
             assert!(report.passed.contains(name), "host scenario {name} ran");
         }
+        let mut gated: Vec<String> = scenario_paths(&fixtures_dir())
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .filter(|n| !files.iter().any(|(_, v)| v["name"] == n.as_str()))
+            .collect();
+        gated.sort();
+        let mut not_run: Vec<String> = report.not_run.iter().map(|(n, _)| n.clone()).collect();
+        not_run.sort();
+        assert_eq!(not_run, gated, "not run: exactly the gated fixtures");
+        eprintln!(
+            "fixtures not run ({}): {:?}",
+            report.not_run.len(),
+            report.not_run
+        );
 
         // Without a host, exactly the host scenarios are reported as skipped.
         let hostless = run_all(&fixtures_dir(), None);
@@ -1108,26 +1819,6 @@ mod tests {
                 json!("forbidden"),
             ),
             (
-                "approval-stays-pending-when-the-lease-ends",
-                "reason",
-                json!("timed_out"),
-            ),
-            (
-                "approval-opens-without-a-lease-holder",
-                "reason",
-                json!("takeover"),
-            ),
-            (
-                "approval-answer-with-acquire-takes-control-from-the-holder",
-                "code",
-                json!("forbidden"),
-            ),
-            (
-                "approval-late-answer-after-push-resolved-is-stale-target",
-                "code",
-                json!("stale_lease"),
-            ),
-            (
                 "approval-needs-control-and-the-lease",
                 "code",
                 json!("stale_lease"),
@@ -1142,7 +1833,88 @@ mod tests {
                 "reason",
                 json!("answered_remote"),
             ),
-            ("approval-survives-takeover", "code", json!("forbidden")),
+            ("r8-approval-survives-takeover", "code", json!("forbidden")),
+            (
+                "r8-failed-persistence-changes-no-lease",
+                "detail",
+                json!("authorization history unknown"),
+            ),
+            (
+                "r8-double-write-failure-takeover-never-runs",
+                "detail",
+                json!("authorization history unknown"),
+            ),
+            (
+                "r8-crash-rejects-queued-work-whose-history-is-unknown",
+                "detail",
+                json!("acceptance not confirmed"),
+            ),
+            (
+                "r8-recovered-work-needs-its-principal-confirmed",
+                "detail",
+                json!("control revoked"),
+            ),
+            (
+                "r8-revoked-control-fences-work-across-reconnect-and-restart",
+                "detail",
+                json!("authorization history unknown"),
+            ),
+            (
+                "r8-control-fence-holds-when-a-rejection-write-fails",
+                "receipts.0.detail",
+                json!("control revoked"),
+            ),
+            (
+                "r8-send-refused-while-another-holds-then-takeover",
+                "lease.ms_left",
+                json!(14999),
+            ),
+            (
+                "r8-stale-takeover-confirmation-is-refused",
+                "controller.lease_epoch",
+                json!(1),
+            ),
+            ("r8-open-with-before-is-refused", "page.count", json!(3)),
+            (
+                "r8-history-page-and-live-events-share-one-ordered-stream",
+                "parts.#",
+                json!(1),
+            ),
+            (
+                "r8-truncated-history-reopens-once-then-stays-live",
+                "page.oldest_retained",
+                json!("m-0005"),
+            ),
+            (
+                "r8-backlog-hole-is-reported-not-reopened",
+                "page.holes.#",
+                json!(0),
+            ),
+            (
+                "r8-backlog-hole-is-reported-not-reopened",
+                "holes",
+                json!([{"after_message_id": "m-0004", "before_message_id": "m-0006"}]),
+            ),
+            (
+                "r8-receipt-result-bounds-reply-message-ids",
+                "result.more",
+                json!(false),
+            ),
+            (
+                "r8-history-selectors-are-exclusive-and-validated",
+                "code",
+                json!("stale_target"),
+            ),
+            (
+                "r8-stale-or-foreign-next-token-is-stale-target",
+                "page.coverage",
+                json!("complete"),
+            ),
+            (
+                "r8-approval-card-carries-the-close-reason",
+                "parts.0.reason",
+                json!("timed_out"),
+            ),
         ];
         for (name, key, to) in mutations {
             let mut f = fixture(name);
@@ -1169,6 +1941,33 @@ mod tests {
         let last = f["steps"].as_array_mut().unwrap().last_mut().unwrap();
         last["assert"]["dispatch_attempts"] = json!(2);
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
+        // And on a changed journal state or dispatch count (r8).
+        for (name, key, to) in [
+            (
+                "r8-failed-fence-write-rejects-queued-work-at-once",
+                "journal_halted",
+                json!(true),
+            ),
+            (
+                "r8-clean-close-runs-queued-work-once-its-principal-is-confirmed",
+                "dispatch_attempts",
+                json!(1),
+            ),
+        ] {
+            let mut f = fixture(name);
+            let step = f["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .rev()
+                .find(|s| s["assert"].get(key).is_some())
+                .unwrap();
+            step["assert"][key] = to;
+            assert!(
+                run_scenario(&f, Some(&fake_runtime)).is_err(),
+                "{name} {key}"
+            );
+        }
         // And on a changed decision handed to the agent.
         let mut f = fixture("approval-deny-carries-the-message-to-the-agent");
         let step = f["steps"]
@@ -1180,14 +1979,15 @@ mod tests {
         step["assert"]["approval_decisions"][0]["message"] = json!("something else");
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
         // And on a changed push request.
-        let mut f = fixture("approval-late-answer-after-push-resolved-is-stale-target");
+        let mut f = fixture("approval-pending-is-sent-again-after-list");
+        assert_eq!(run_scenario(&f, Some(&fake_runtime)), Ok(Outcome::Passed));
         let step = f["steps"]
             .as_array_mut()
             .unwrap()
             .iter_mut()
             .find(|s| s["assert"].get("pushes").is_some())
             .unwrap();
-        step["assert"]["pushes"][1]["reason"] = json!("answered_remote");
+        step["assert"]["pushes"][1]["reason"] = json!("timed_out");
         assert!(run_scenario(&f, Some(&fake_runtime)).is_err());
     }
 
@@ -1339,6 +2139,8 @@ mod tests {
                         op: Op::Error {
                             code: wire::ErrorCode::Busy,
                             detail: None,
+                            revision: None,
+                            controller: None,
                         },
                     }),
                 ));

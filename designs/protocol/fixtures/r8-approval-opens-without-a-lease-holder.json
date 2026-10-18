@@ -1,10 +1,19 @@
 {
- "name": "approval-opens-without-a-lease-holder",
+ "name": "r8-approval-opens-without-a-lease-holder",
+ "requires": "r8",
  "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
   "sessions": [
    {
     "session_id": "ses-aaaaaaaaaaaa",
-    "process_gen": "22222222-2222-4222-8222-222222222222"
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
    }
   ],
   "clients": [
@@ -17,14 +26,7 @@
     ],
     "client_kind": "native"
    }
-  ],
-  "host": {
-   "account_id": "account-a",
-   "atem_device_id": "host-a",
-   "host_trust_gen": 1,
-   "runtime_gen": "55555555-5555-4555-8555-555555555555",
-   "runtime_epoch": 7
-  }
+  ]
  },
  "steps": [
   {
@@ -40,6 +42,7 @@
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "sessions",
     "re": "11111111-1111-4111-8111-000000000001",
@@ -55,16 +58,12 @@
      "rule_id": "r-npm-test",
      "label": "Bash(npm test:*)",
      "scope": "this project"
-    },
-    {
-     "rule_id": "r-npm",
-     "label": "Bash(npm:*)",
-     "scope": "this project"
     }
    ]
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "approval_request",
     "session_id": "ses-aaaaaaaaaaaa",
@@ -76,16 +75,11 @@
       "rule_id": "r-npm-test",
       "label": "Bash(npm test:*)",
       "scope": "this project"
-     },
-     {
-      "rule_id": "r-npm",
-      "label": "Bash(npm:*)",
-      "scope": "this project"
      }
     ]
    },
    "capture": {
-    "aid": "approval_id"
+    "a1": "approval_id"
    }
   },
   {
@@ -95,7 +89,7 @@
     "pushes": [
      {
       "op": "push_approval",
-      "approval_id": "${aid}"
+      "approval_id": "${a1}"
      }
     ]
    }
@@ -121,53 +115,39 @@
      "request_id": "44444444-4444-4444-8444-000000000001",
      "kind": "approval",
      "payload": {
-      "approval_id": "${aid}",
+      "approval_id": "${a1}",
       "decision": "allow_always",
-      "rule_id": "r-npm-test",
-      "acquire": true
+      "rule_id": "r-npm-test"
      }
     }
    }
   },
   {
    "expect": "c1",
-   "match": {
-    "op": "lease_changed",
-    "reason": "granted",
-    "lease_epoch": 1
-   }
-  },
-  {
-   "expect": "c1",
-   "match": {
-    "op": "session_changed",
-    "descriptor.controller.lease_epoch": 1
-   }
-  },
-  {
-   "expect": "c1",
+   "type": "session",
    "match": {
     "op": "receipt",
     "request_id": "44444444-4444-4444-8444-000000000001",
-    "kind": "approval",
     "state": "accepted",
-    "re": "11111111-1111-4111-8111-000000000002"
+    "re": "11111111-1111-4111-8111-000000000002",
+    "kind": "approval"
    }
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "receipt",
     "request_id": "44444444-4444-4444-8444-000000000001",
-    "kind": "approval",
     "state": "executing"
    }
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "approval_closed",
-    "approval_id": "${aid}",
+    "approval_id": "${a1}",
     "reason": "answered_remote"
    }
   },
@@ -175,39 +155,47 @@
    "assert": {
     "approval_decisions": [
      {
-      "approval_id": "${aid}",
+      "approval_id": "${a1}",
       "decision": "allow_always",
       "rule_id": "r-npm-test"
      }
     ],
     "approvals_pending": 0,
-    "lease_holder": "c1",
+    "lease_holder": null,
     "pushes": [
      {
       "op": "push_approval",
-      "approval_id": "${aid}"
+      "approval_id": "${a1}"
      },
      {
       "op": "push_resolved",
-      "approval_id": "${aid}",
+      "approval_id": "${a1}",
       "reason": "answered_remote"
      }
     ]
    }
   },
   {
-   "approval_applied": "${aid}",
+   "approval_applied": "${a1}",
    "ok": true
   },
   {
    "expect": "c1",
+   "type": "session",
    "match": {
     "op": "receipt",
     "request_id": "44444444-4444-4444-8444-000000000001",
-    "kind": "approval",
     "state": "completed"
    }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "lease_holder": null
+   }
   }
- ],
- "note": "With no lease holder the approval still opens: attachments with control get approval_request and the relay is asked to push it (push_approval). Answering with acquire: true takes the lease (granted) and hands the decision over atomically; the push is resolved."
+ ]
 }

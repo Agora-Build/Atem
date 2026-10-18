@@ -245,6 +245,8 @@ pub fn sanitize(reason: &str) -> String {
         "message is not an object",
         "data must be an object",
         "session data must be an object",
+        crate::session_protocol::wire::REMOVED_IN_R8,
+        crate::session_protocol::wire::FEATURE_NOT_ADVERTISED,
     ];
     // `canonical::StrictError` variants (`Syntax(offset)`).
     const STRICT: &[&str] = &[
@@ -436,6 +438,11 @@ mod tests {
             (
                 "terminal SECRET cannot carry a binding",
                 "unexpected binding",
+            ),
+            ("approval: removed in r8", "approval: removed in r8"),
+            (
+                "agentChat: feature not advertised",
+                "agentChat: feature not advertised",
             ),
             ("SECRET free text", "invalid"),
             ("invalid \"SECRET\"", "invalid"),

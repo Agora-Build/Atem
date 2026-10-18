@@ -481,6 +481,22 @@
    }
   },
   {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "session_changed",
+    "descriptor.controller": null
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "session_changed",
+    "descriptor.controller": null
+   }
+  },
+  {
    "open_approval": "ses-aaaaaaaaaaaa",
    "tool": "Bash",
    "summary": "npm run build",

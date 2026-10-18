@@ -20,8 +20,9 @@
 //!   message.
 //! - `local_input`: a local frontend attached to the session sends `input`.
 //! - `crash_worker`: SIGKILL to the session's worker process.
-//! - `restart_runtime`: SIGKILL to the runtime; the next one (with the
-//!   fixture's runtime epoch) adopts the surviving workers.
+//! - `restart_runtime`: SIGTERM to the runtime (an orderly stop, r8: it
+//!   writes its journal's clean close), `crash_runtime`: SIGKILL; the next
+//!   one (with the fixture's runtime epoch) adopts the surviving workers.
 //! - `reconnect`: the fake Astation closes the link; the runtime reconnects
 //!   and authenticates again (a new attachment).
 //! - `hold_pty_writes`/`flush_pty_writes`, `fail_next_pty_enqueue`,
@@ -37,16 +38,33 @@
 //!   `answered_terminal`: the user allows it in the agent's own dialog (the
 //!   tool runs); `approval_applied` with `ok: true`: nothing to do, the agent
 //!   acts on the decision its hook got by itself.
+//! - `chat_history`/`chat_message`/`chat_turn` (local origin): the fake
+//!   Claude appends the messages to its transcript as Claude Code writes
+//!   them (`transcript-<n>.jsonl`; no hook runs, so the chat status stays as
+//!   it is); after `chat_history` the harness waits until a probe
+//!   conversation's newest page holds them (the probe never reaches the
+//!   client or the counters). `expect_live` and `recover` work as in the
+//!   core runner; `chat_opens`/`chat_closes`/`chat_conversations` count the
+//!   `opened`/`close` the link carried (and the client's own `close`).
 //!
 //! Not honoured (the scenario is reported, with the reason, and not run):
 //! more than one client (the runtime holds one Astation link, so one
 //! attachment at a time), `close_session` (the runtime never closes a
 //! running session), `disconnect`/`resume` (no resume in compatibility
-//! mode), `fail_next_fsync`, `change_trust_gen`, `approval_rules` (session
-//! rules come only from a Codex session), and approval closes other
+//! mode), `fail_next_fsync`/`fail_fsync_of`/`crash_after_accepted` (no
+//! journal faults in the real runtime), `set_permissions` (the link's one
+//! principal always has `control`), `drop`, `replace_process`,
+//! `change_trust_gen`, `approval_rules` (session
+//! rules come only from a Codex session), `chat_evict` (retention evicts
+//! only past 500 messages / 8 MiB), `worker_gap` (no backlog fault in the
+//! worker), `chat_turn` of a remote prompt (the real adapter's status events
+//! around the turn are sequenced too), and approval closes other
 //! than `answered_terminal`/`interrupted` or `approval_applied` with `ok:
-//! false`. r8-draft scenarios (`requires: "r8"`) are reported as not run
-//! (`requires r8`) until r8 ships.
+//! false`. An `r8-*` scenario runs once the host work it needs is
+//! implemented (`src/session_protocol/revision.rs`, shared with the core
+//! runner), else it is reported as not run with what it still needs.
+//! The harness's `hello` carries `revision: 8` and the welcome must echo it
+//! and advertise exactly this host's features.
 //!
 //! A scenario the real runtime fails would be listed in `KNOWN_DEVIATIONS`
 //! with the failure it must keep showing, and why (none today).
@@ -69,6 +87,12 @@
 #![cfg(target_os = "linux")]
 
 mod support;
+
+/// r8 revision and features, and which `r8-*` fixtures can run: the same
+/// list the core runner gates on.
+#[allow(dead_code)]
+#[path = "../src/session_protocol/revision.rs"]
+mod revision;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
@@ -183,6 +207,11 @@ struct Session {
     real_id: String,
     chat: bool,
     dir: PathBuf,
+    /// `transcript-<n>.jsonl` files handed to the fake agent so far.
+    transcribed: usize,
+    /// Parts written per assistant message id (a later version of the
+    /// message adds only its new parts).
+    parts: HashMap<String, usize>,
 }
 
 /// A tool call the fake agent asked for (`ask-<n>.json`).
@@ -293,6 +322,23 @@ impl Sandbox {
         self.runtime = Some(child);
     }
 
+    /// An orderly stop (SIGTERM): the runtime writes its journal's clean
+    /// close when the journal is healthy, then exits; its workers stay.
+    fn stop_runtime(&mut self) {
+        if let Some(mut child) = self.runtime.take() {
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = Instant::now() + WAIT;
+            while child.try_wait().ok().flatten().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the runtime didn't stop on SIGTERM");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
     fn kill_runtime(&mut self) {
         if let Some(mut child) = self.runtime.take() {
             let _ = child.kill();
@@ -389,6 +435,19 @@ struct Host {
     pushes: Vec<Value>,
     /// Request ids of the receipts the client was told about.
     receipts_seen: Vec<String>,
+    /// The current link was welcomed (its one attachment).
+    welcomed: bool,
+    /// agentChat `opened`/`close` the link carried, and the conversations
+    /// open on it (the client's own `close` ends one too).
+    chat_opens: u64,
+    chat_closes: u64,
+    conversations: Vec<String>,
+    /// The harness's probe of the history: its page so far and its end.
+    probe_page: Vec<Value>,
+    probed: Option<Value>,
+    /// The scenario opens a chat: the fake Claude's tool calls write no
+    /// tool_use message (the fixture's conversation has none).
+    quiet_asks: bool,
 }
 
 fn replace_strings(v: &mut Value, pairs: &[(String, String)], forward: bool) {
@@ -494,6 +553,20 @@ fn unsupported(scenario: &Value) -> Option<String> {
             ("disconnect", "no resume in compatibility mode"),
             ("resume", "no resume in compatibility mode"),
             ("fail_next_fsync", "no fsync fault on the real journal"),
+            ("fail_fsync_of", "no fsync fault on the real journal"),
+            (
+                "crash_after_accepted",
+                "no crash hook between the runtime's journal writes",
+            ),
+            (
+                "set_permissions",
+                "the runtime's one principal (the paired Astation) always has control",
+            ),
+            ("drop", "the fake Astation link loses no message"),
+            (
+                "replace_process",
+                "the runtime replaces a process only when its agent restarts",
+            ),
             (
                 "change_trust_gen",
                 "trust generations change only by pairing",
@@ -502,9 +575,37 @@ fn unsupported(scenario: &Value) -> Option<String> {
                 "approval_rules",
                 "session rules come from a Codex session's allow_always (the fixture agent is Claude); covered by the core harness and the real-agent Codex test",
             ),
+            (
+                "chat_evict",
+                "the real chat session evicts only past 500 messages / 8 MiB, which would put hundreds of messages the fixture doesn't name into its pages; covered by the core harness and chat::history tests",
+            ),
+            (
+                "worker_gap",
+                "no backlog fault in the real worker (its backlog drops only past 4096 items / 8 MiB, and its reload then finds everything); covered by the core harness and broker_tests",
+            ),
         ] {
             if step.get(action).is_some() {
                 return Some(format!("{action}: {why}"));
+            }
+        }
+        if step.get("chat_turn").is_some() && step.get("request_id").is_some() {
+            return Some("chat_turn of a remote prompt: the real Claude adapter sends status working, then ready, in the conversation around the prompt's turn (UserPromptSubmit, Stop), sequenced events the fixture's sequence numbers don't model; receipt.result is covered by the core harness, host_bridge_tests and the real-agent Codex test".into());
+        }
+        let content = step
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .chain(step.get("message"));
+        for m in content {
+            let text = m["parts"]
+                .as_array()
+                .is_some_and(|p| p.iter().all(|p| p["kind"] == "text"));
+            if !text || (m["role"] == "user" && m["origin"] != "local") {
+                return Some(format!(
+                    "{}: only local user messages and text parts can be written to the transcript",
+                    m["messageId"]
+                ));
             }
         }
         let reason = step["reason"].as_str().unwrap_or_default();
@@ -585,6 +686,8 @@ impl Host {
                 real_id,
                 chat,
                 dir,
+                transcribed: 0,
+                parts: HashMap::new(),
             });
         }
         let mut me = Self {
@@ -611,13 +714,30 @@ impl Host {
             approvals_closed: HashMap::new(),
             pushes: Vec::new(),
             receipts_seen: Vec::new(),
+            welcomed: false,
+            chat_opens: 0,
+            chat_closes: 0,
+            conversations: Vec::new(),
+            probe_page: Vec::new(),
+            probed: None,
+            quiet_asks: scenario["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|s| s["json"]["type"] == "agentChat" && s["json"]["data"]["op"] == "open"),
         };
         me.wait_sessions_ready()?;
         let attachment = me.client_setup["attachment_gen"]
             .as_str()
             .unwrap()
             .to_string();
-        me.attach(&attachment)?;
+        if me.client_setup["welcome"] == false {
+            // r8: the steps send this client's `hello`.
+            me.authenticated_link()?;
+            me.attached_unwelcomed()?;
+        } else {
+            me.attach(&attachment)?;
+        }
         if let Some(epoch) = me.client_setup["holds_lease_epoch"].as_u64() {
             me.setup_lease(epoch)?;
         }
@@ -651,7 +771,9 @@ impl Host {
     /// The next authenticated link, then hello → welcome on it (retried
     /// until the runtime attached the link); maps the attachment to the
     /// fixture's `attachment_gen`.
-    fn attach(&mut self, attachment_gen: &str) -> Result<(), String> {
+    /// Waits for the runtime's next authenticated link and makes it the
+    /// client's (not welcomed yet).
+    fn authenticated_link(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + WAIT;
         while self.authenticated <= self.link {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -661,9 +783,37 @@ impl Host {
             }
         }
         self.link = self.authenticated;
+        self.welcomed = false;
+        Ok(())
+    }
+
+    /// Waits until the runtime attached the link (a session request is
+    /// then refused as before `welcome`, not `unauthorized`); sends no
+    /// `hello`.
+    fn attached_unwelcomed(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + WAIT;
         loop {
             let id = uuid();
-            let hello = json!({"type": "session", "data": {"v": 1, "op": "hello", "id": id}});
+            let probe = json!({"type": "session", "data": {"v": 1, "op": "list", "id": id}});
+            self.astation.send(self.link, probe.to_string());
+            let reply = self.raw_reply(&id)?;
+            match reply["code"].as_str() {
+                Some("unsupported_version") => return Ok(()),
+                Some("unauthorized") if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                _ => return Err(format!("probe: {reply}")),
+            }
+        }
+    }
+
+    fn attach(&mut self, attachment_gen: &str) -> Result<(), String> {
+        let deadline = Instant::now() + WAIT;
+        self.authenticated_link()?;
+        loop {
+            let id = uuid();
+            let hello = json!({"type": "session",
+                "data": {"v": 1, "op": "hello", "id": id, "revision": 8}});
             self.astation.send(self.link, hello.to_string());
             let reply = self.raw_reply(&id)?;
             if reply["op"] == "error" && reply["code"] == "unauthorized" {
@@ -675,6 +825,14 @@ impl Host {
             }
             if reply["op"] != "welcome" {
                 return Err(format!("hello: {reply}"));
+            }
+            if reply["revision"] != revision::REVISION
+                || reply["features"] != json!(revision::FEATURES)
+            {
+                return Err(format!(
+                    "welcome revision {} features {}",
+                    reply["revision"], reply["features"]
+                ));
             }
             for key in ["account_id", "atem_device_id", "host_trust_gen"] {
                 if reply[key] != self.host[key] {
@@ -699,6 +857,7 @@ impl Host {
             }
             let real_attachment = reply["attachment_gen"].as_str().unwrap().to_string();
             self.ids.push((attachment_gen.to_string(), real_attachment));
+            self.welcomed = true;
             return Ok(());
         }
     }
@@ -769,8 +928,30 @@ impl Host {
             return;
         }
         let data = &value["data"];
+        let conversation = data["conversationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if family == "agentChat" && conversation.starts_with(PROBE) {
+            // The harness's own look at the history (`chat_history`).
+            if op == "history_end" {
+                self.probed = Some(data.clone());
+            } else if op == "message" {
+                self.probe_page.push(data.clone());
+            }
+            return;
+        }
         let id = data["approval_id"].as_str().unwrap_or_default().to_string();
         match (family.as_str(), op.as_str()) {
+            ("agentChat", "opened") => {
+                self.chat_opens += 1;
+                self.conversations.retain(|c| *c != conversation);
+                self.conversations.push(conversation);
+            }
+            ("agentChat", "close") => {
+                self.chat_closes += 1;
+                self.conversations.retain(|c| *c != conversation);
+            }
             ("session", "approval_request") if !self.approvals_opened.contains(&id) => {
                 self.approvals_opened.push(id)
             }
@@ -778,6 +959,7 @@ impl Host {
                 let reason = data["reason"].as_str().unwrap_or_default().to_string();
                 self.approvals_closed.insert(id, reason);
             }
+            ("session", "welcome") => self.welcomed = true,
             ("session", "receipt") => {
                 let rid = data["request_id"].as_str().unwrap_or_default().to_string();
                 if !self.receipts_seen.contains(&rid) {
@@ -827,6 +1009,10 @@ impl Host {
 
     fn send(&mut self, json: &Value) {
         let mut message = json.clone();
+        if message["type"] == "agentChat" && message["data"]["op"] == "close" {
+            let conversation = &message["data"]["conversationId"];
+            self.conversations.retain(|c| conversation != c.as_str());
+        }
         if message["type"] == "terminal" && message["data"]["op"] == "input" {
             let sid = message["data"]["terminal_id"].as_str().unwrap_or_default();
             let real = self.real(sid);
@@ -927,8 +1113,20 @@ impl Host {
                     .ok_or("no worker pid")?;
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             }
-            "restart_runtime" => {
-                self.sandbox.kill_runtime();
+            "restart_runtime" | "crash_runtime" => {
+                if action == "restart_runtime" {
+                    self.sandbox.stop_runtime();
+                    // The orderly stop recorded it in the journal (r8 §H).
+                    if !self
+                        .sandbox
+                        .logs()
+                        .contains("session journal closed cleanly")
+                    {
+                        return Err("the orderly stop didn't close the journal cleanly".into());
+                    }
+                } else {
+                    self.sandbox.kill_runtime();
+                }
                 self.sandbox
                     .next_epoch(arg["runtime_epoch"].as_u64().ok_or("runtime_epoch")?);
                 self.next_runtime_gen = arg["runtime_gen"].as_str().ok_or("runtime_gen")?.into();
@@ -960,6 +1158,40 @@ impl Host {
                 std::fs::write(dir.join("complete"), turn).unwrap();
             }
             "open_approval" => self.open_approval(arg, step)?,
+            "chat_history" => {
+                let session = arg.as_str().unwrap_or_default().to_string();
+                let messages = step["messages"].as_array().ok_or("messages")?.clone();
+                self.transcribe(&session, &messages)?;
+                self.probe(&session, &messages)?;
+            }
+            "chat_message" => {
+                let session = arg.as_str().unwrap_or_default().to_string();
+                self.transcribe(&session, &[step["message"].clone()])?;
+            }
+            "chat_turn" => {
+                let session = arg.as_str().unwrap_or_default().to_string();
+                let turn = step["turn_id"].as_str().ok_or("turn_id")?;
+                let n = step["assistant_messages"]
+                    .as_u64()
+                    .ok_or("assistant_messages")?;
+                let bytes = step["text_bytes"].as_u64().ok_or("text_bytes")? as usize;
+                let fill = if step["escape"] == "control" {
+                    '\u{1}'
+                } else {
+                    'x'
+                };
+                let text: String = std::iter::repeat_n(fill, bytes).collect();
+                let at = 1_760_600_000_000u64;
+                let mut messages = vec![json!({"messageId": format!("{turn}-u"), "role": "user",
+                    "turnId": turn, "createdAt": at, "origin": step["origin"],
+                    "parts": [{"id": "p1", "kind": "text", "markdown": format!("prompt {turn}")}]})];
+                for k in 1..=n {
+                    messages.push(json!({"messageId": format!("{turn}-a-{k:04}"),
+                        "role": "assistant", "turnId": turn, "createdAt": at,
+                        "parts": [{"id": "p1", "kind": "text", "markdown": text}]}));
+                }
+                self.transcribe(&session, &messages)?;
+            }
             "close_approval" => {
                 let ask = self.ask(arg.as_str().unwrap_or_default())?;
                 let what = match step["reason"].as_str() {
@@ -1008,7 +1240,7 @@ impl Host {
         }
         let n = self.asks.len() + 1;
         let request = json!({"tool_name": tool, "tool_input": {"command": summary},
-                             "permission_suggestions": suggestions});
+                             "permission_suggestions": suggestions, "quiet": self.quiet_asks});
         let temp = dir.join(format!("tmp-ask-{n}"));
         std::fs::write(&temp, request.to_string()).unwrap();
         std::fs::rename(&temp, dir.join(format!("ask-{n}.json"))).unwrap();
@@ -1055,6 +1287,231 @@ impl Host {
             suggestions,
             rule_ids,
         });
+        Ok(())
+    }
+
+    /// Chat content the fixture names, written to the Claude session's
+    /// transcript by the fake agent (no hook runs, so the chat status stays
+    /// as it is), as Claude Code writes it: a user message is a user entry
+    /// (`uuid` = message id, `promptId` = turn id); an assistant message is
+    /// an entry with `message.id` = message id and one text block per part
+    /// (a later version adds an entry with its new parts).
+    fn transcribe(&mut self, fixture: &str, messages: &[Value]) -> Result<(), String> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.fixture_id == fixture)
+            .ok_or(format!("unknown session {fixture}"))?;
+        if !session.chat {
+            return Err("chat content needs the Claude session".into());
+        }
+        let mut lines = String::new();
+        for m in messages {
+            let id = m["messageId"].as_str().ok_or("messageId")?;
+            let turn = m["turnId"].as_str().ok_or("turnId")?;
+            let stamp = rfc3339(m["createdAt"].as_u64().ok_or("createdAt")?);
+            let mut texts = Vec::new();
+            for part in m["parts"].as_array().ok_or("parts")? {
+                if part["kind"] != "text" {
+                    return Err(format!("{id}: only text parts can be written"));
+                }
+                texts.push(part["markdown"].as_str().ok_or("markdown")?.to_string());
+            }
+            let entry = match m["role"].as_str() {
+                Some("user") if m["origin"] == "local" => {
+                    json!({"type": "user", "uuid": id, "promptId": turn, "timestamp": stamp,
+                           "message": {"role": "user", "content": texts.join("\n")}})
+                }
+                Some("assistant") => {
+                    let written = session.parts.entry(id.to_string()).or_insert(0);
+                    if *written >= texts.len() {
+                        continue;
+                    }
+                    let blocks: Vec<Value> = texts[*written..]
+                        .iter()
+                        .map(|t| json!({"type": "text", "text": t}))
+                        .collect();
+                    let uuid = format!("{id}.{written}");
+                    *written = texts.len();
+                    json!({"type": "assistant", "uuid": uuid, "promptId": turn, "timestamp": stamp,
+                           "message": {"id": id, "role": "assistant", "content": blocks}})
+                }
+                _ => return Err(format!("{id}: only local user and assistant messages")),
+            };
+            lines.push_str(&entry.to_string());
+            lines.push('\n');
+        }
+        session.transcribed += 1;
+        let (n, dir) = (session.transcribed, session.dir.clone());
+        let temp = dir.join(format!("tmp-transcript-{n}"));
+        std::fs::write(&temp, lines).unwrap();
+        std::fs::rename(&temp, dir.join(format!("transcript-{n}.jsonl"))).unwrap();
+        let deadline = Instant::now() + WAIT;
+        let done = format!("transcribed {n}\n");
+        while !std::fs::read_to_string(dir.join("events")).is_ok_and(|e| e.contains(&done)) {
+            if Instant::now() > deadline {
+                return Err(format!("the fake agent never wrote transcript {n}"));
+            }
+            self.pump(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
+    /// Waits until the runtime's history holds `messages` (the newest
+    /// page of a probe conversation, closed after; nothing of it reaches
+    /// the client or the counters): the worker reads the transcript on its
+    /// own schedule.
+    fn probe(&mut self, fixture: &str, messages: &[Value]) -> Result<(), String> {
+        let Some(last) = messages.last() else {
+            return Ok(());
+        };
+        let session = self.session(fixture)?;
+        let binding = self.binding(session);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let conversation = format!("{PROBE}{}", uuid());
+            self.probe_page.clear();
+            self.probed = None;
+            self.send(&json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+                "conversationId": conversation, "agentId": fixture, "binding": binding}}));
+            while self.probed.is_none() {
+                if Instant::now() > deadline {
+                    return Err("the probe's page never came".into());
+                }
+                self.pump(Duration::from_millis(50));
+            }
+            self.send(&json!({"type": "agentChat", "data": {"v": 1, "op": "close",
+                "conversationId": conversation, "agentId": fixture}}));
+            let parts = last["parts"].as_array().map_or(0, Vec::len);
+            let held = self.probe_page.iter().any(|m| {
+                m["messageId"] == last["messageId"]
+                    && m["parts"].as_array().is_some_and(|p| p.len() >= parts)
+            });
+            if held {
+                self.pump(SETTLE);
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!("the history never held {}", last["messageId"]));
+            }
+            self.pump(Duration::from_millis(200));
+        }
+    }
+
+    /// The next agentChat message (whole, fixture identifiers).
+    fn next_chat(&mut self) -> Result<Value, String> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(i) = self.queue.iter().position(|m| m["type"] == "agentChat") {
+                return Ok(self.queue.remove(i).unwrap());
+            }
+            if Instant::now() > deadline {
+                return Err("the page ended early".into());
+            }
+            self.pump(Duration::from_millis(50));
+        }
+    }
+
+    /// r8 `recover` (as the core runner does it): sends `request`, takes
+    /// its pages following each `history_end`'s `next` until `end`, checks
+    /// each page's sequences and bounds; the messages must be
+    /// `message_ids` exactly.
+    fn recover(&mut self, step: &Map<String, Value>) -> Result<(), String> {
+        let request = step["request"].clone();
+        let data = request["data"].clone();
+        let want = step["message_ids"].clone();
+        let num = |k: &str| step[k].as_u64().ok_or(k.to_string());
+        let (min_pages, max_count) = (num("min_pages")?, num("max_count")?);
+        let (max_content, max_wire) = (num("max_content_bytes")?, num("max_wire_bytes")?);
+        let base = data["page_id"].as_str().unwrap_or("open").to_string();
+        self.send(&request);
+        let mut generation = data.get("generation").cloned();
+        if data["op"] == "open" {
+            let opened = self.expect(
+                Some("agentChat"),
+                json!({"op": "opened"}).as_object().unwrap(),
+            )?;
+            if opened["sequence"] != 0 {
+                return Err(format!("opened at {}", opened["sequence"]));
+            }
+            generation = opened.get("generation").cloned();
+        }
+        let mut pages: Vec<Vec<Value>> = Vec::new();
+        let mut backwards;
+        loop {
+            let mut ids = Vec::new();
+            let (mut content, mut wire) = (0u64, 0u64);
+            let mut sequence: Option<u64> = None;
+            let end = loop {
+                let msg = self.next_chat()?;
+                wire += serde_json::to_vec(&msg).map_or(0, |v| v.len()) as u64;
+                let d = &msg["data"];
+                let seq = d["sequence"].as_u64().ok_or(format!("unsequenced {msg}"))?;
+                if sequence.is_some_and(|s| seq != s + 1) {
+                    return Err(format!("sequence {seq} after {sequence:?}"));
+                }
+                sequence = Some(seq);
+                match d["op"].as_str() {
+                    Some("message") if d["history"] == true => {
+                        ids.push(d["messageId"].clone());
+                        content += content_bytes(d);
+                    }
+                    Some("history_end") => break d.clone(),
+                    _ => return Err(format!("not part of a page: {msg}")),
+                }
+            };
+            let page = &end["page"];
+            if page["count"] != ids.len() {
+                return Err(format!(
+                    "page.count {} for {} messages",
+                    page["count"],
+                    ids.len()
+                ));
+            }
+            if ids.len() as u64 > max_count || content > max_content || wire > max_wire {
+                return Err(format!(
+                    "page {} over its bounds: {} messages, {content} content bytes, {wire} wire bytes",
+                    pages.len() + 1,
+                    ids.len()
+                ));
+            }
+            backwards = matches!(page["selector"].as_str(), Some("newest" | "before"));
+            pages.push(ids);
+            if page["end"] == true {
+                for (path, expected) in step["end"].as_object().ok_or("end")? {
+                    let got = lookup(&end, path);
+                    if got.as_ref() != Some(expected) {
+                        return Err(format!(
+                            "last history_end {path}: expected {expected}, got {got:?}"
+                        ));
+                    }
+                }
+                break;
+            }
+            let next = page["next"].as_str().ok_or("no next before the end")?;
+            let mut more = json!({"v": 1, "op": "history",
+                "conversationId": data["conversationId"], "agentId": data["agentId"],
+                "generation": generation.clone().unwrap_or(Value::Null),
+                "page_id": format!("{base}-{}", pages.len() + 1),
+                "binding": data["binding"], "next": next});
+            if more["generation"].is_null() {
+                more.as_object_mut().unwrap().remove("generation");
+            }
+            self.send(&json!({"type": "agentChat", "data": more}));
+        }
+        if (pages.len() as u64) < min_pages {
+            return Err(format!(
+                "{} pages, expected at least {min_pages}",
+                pages.len()
+            ));
+        }
+        if backwards {
+            pages.reverse();
+        }
+        let got = Value::from(pages.into_iter().flatten().collect::<Vec<_>>());
+        if got != want {
+            return Err(format!("recovered {got}, expected {want}"));
+        }
         Ok(())
     }
 
@@ -1216,6 +1673,11 @@ impl Host {
             ),
             "pushes" => json!(self.pushes),
             "receipts_visible" => json!({self.client.clone(): self.receipts_seen.len()}),
+            // The runtime holds one link: its attachment, once welcomed.
+            "attachments" => json!(u64::from(self.welcomed)),
+            "chat_opens" => json!(self.chat_opens),
+            "chat_closes" => json!(self.chat_closes),
+            "chat_conversations" => json!(self.conversations.len()),
             "pty_bytes_written" if used.contains("fail_next_partial") => json!("unknown"),
             "pty_bytes_written" => json!(paste_bytes),
             "pty_writes" => json!(local + remote),
@@ -1258,6 +1720,21 @@ impl Host {
             "always_rules",
             "reason",
             "ok",
+            "messages",
+            "message",
+            "request_id",
+            "origin",
+            "assistant_messages",
+            "text_bytes",
+            "escape",
+            "message_ids",
+            "sequence_from",
+            "request",
+            "min_pages",
+            "max_count",
+            "max_content_bytes",
+            "max_wire_bytes",
+            "end",
         ];
         let actions: Vec<&String> = step
             .keys()
@@ -1330,6 +1807,32 @@ impl Host {
                 let held = std::mem::take(&mut self.held);
                 self.queue.extend(held);
             }
+            "expect_live" => {
+                client_ok(arg)?;
+                let ids = step["message_ids"].as_array().ok_or("message_ids")?;
+                let from = step["sequence_from"].as_u64().ok_or("sequence_from")?;
+                for (k, id) in ids.iter().enumerate() {
+                    let data = self.expect(
+                        Some("agentChat"),
+                        json!({"op": "message"}).as_object().unwrap(),
+                    )?;
+                    if data.get("history").is_some() {
+                        return Err(format!("{id}: a history message, expected a live one"));
+                    }
+                    if &data["messageId"] != id || data["sequence"] != from + k as u64 {
+                        return Err(format!(
+                            "expected live {id} at {}, got {} at {}",
+                            from + k as u64,
+                            data["messageId"],
+                            data["sequence"]
+                        ));
+                    }
+                }
+            }
+            "recover" => {
+                client_ok(arg)?;
+                self.recover(&step)?;
+            }
             "assert" => {
                 self.pump(SETTLE);
                 for (key, expected) in arg.as_object().ok_or("assert must be an object")? {
@@ -1371,6 +1874,47 @@ impl Host {
         }
         Ok(())
     }
+}
+
+/// Conversations the harness opens to look at the history (`probe`).
+const PROBE: &str = "probe-";
+
+/// Content bytes of a chat message as the fixtures count them.
+fn content_bytes(message: &Value) -> u64 {
+    let len = |v: &Value| v.as_str().map_or(0, str::len) as u64;
+    message["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| match p["kind"].as_str() {
+            Some("text") => len(&p["markdown"]),
+            Some("tool") => len(&p["name"]) + len(&p["summary"]),
+            Some("approval") => len(&p["tool"]) + len(&p["summary"]),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Unix milliseconds as an RFC 3339 UTC timestamp (transcript `timestamp`).
+fn rfc3339(ms: u64) -> String {
+    let (secs, millis) = (ms / 1000, ms % 1000);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1415,17 +1959,64 @@ fn scenarios() -> Vec<Value> {
         .collect()
 }
 
+/// Why a scenario waits for host work (an `r8-*` one whose work isn't
+/// implemented).
+fn waiting(scenario: &Value) -> Option<String> {
+    let name = scenario["name"].as_str().unwrap();
+    if name.starts_with("r8-") {
+        revision::r8_fixture_runnable(name).err()
+    } else {
+        None
+    }
+}
+
 /// The host scenarios that can't be honoured against real processes (the
 /// reason is printed); every other scenario runs.
 const NOT_RUN: &[&str] = &[
-    "approval-answer-with-acquire-takes-control-from-the-holder",
     "approval-needs-control-and-the-lease",
     "approval-rule-revoke-needs-control-not-the-lease",
-    "approval-survives-takeover",
     "closed-session-refuses-work-before-the-lease-check",
     "receipt-query-is-scoped-to-the-exact-target",
     "removed-ops-have-no-effect",
     "takeover-moves-control-and-the-old-holder-becomes-a-viewer",
+    // r8 scenarios with two or three attachments (core harness only).
+    "r8-approval-answer-by-a-non-holder-leaves-the-lease",
+    "r8-approval-answer-keeps-the-holders-deadline",
+    "r8-approval-answer-to-a-closed-request-is-stale-target",
+    "r8-approval-answer-with-acquire-is-refused",
+    "r8-approval-answers-crossing-first-wins",
+    "r8-approval-survives-takeover",
+    "r8-clean-close-runs-queued-work-once-its-principal-is-confirmed",
+    "r8-control-fence-holds-when-a-rejection-write-fails",
+    "r8-crash-after-durable-acceptance-grants-no-lease",
+    "r8-crash-rejects-queued-work-whose-history-is-unknown",
+    "r8-delayed-send-reply-does-not-regrant-lost-control",
+    "r8-disconnect-right-after-acceptance",
+    "r8-double-write-failure-takeover-never-runs",
+    "r8-duplicate-send-never-reacquires-or-replays",
+    "r8-expired-lease-is-checked-at-admission",
+    "r8-failed-fence-write-rejects-queued-work-at-once",
+    "r8-failed-fence-write-then-control-restored-never-runs",
+    "r8-failed-persistence-changes-no-lease",
+    "r8-local-input-wins-over-a-send",
+    "r8-ownership-is-checked-at-admission-not-as-displayed",
+    "r8-process-replaced-before-dispatch",
+    "r8-recovered-work-needs-its-principal-confirmed",
+    "r8-revoked-control-fences-work-across-reconnect-and-restart",
+    "r8-revoked-control-refuses-the-send-and-its-queued-prompt",
+    "r8-send-acquire-wire-rules",
+    "r8-send-acquires-an-unowned-session",
+    "r8-send-refused-while-another-holds-then-takeover",
+    "r8-send-under-the-own-lease-checks-the-epoch",
+    "r8-stale-takeover-confirmation-is-refused",
+    "r8-two-simultaneous-sends-acquire-once",
+    // r8 history scenarios the fake Claude's transcript can't express (each
+    // reason is printed: eviction, a backlog fault, a remote turn's status
+    // events).
+    "r8-backlog-hole-is-reported-not-reopened",
+    "r8-receipt-result-bounds-reply-message-ids",
+    "r8-stale-or-foreign-next-token-is-stale-target",
+    "r8-truncated-history-reopens-once-then-stays-live",
 ];
 
 /// Scenarios the real runtime fails, each with the failure it must still
@@ -1439,9 +2030,8 @@ fn run_named(scenarios: &[Value], only: Option<&str>) -> Vec<(String, Result<(),
             .filter(|s| only.is_none_or(|o| s["name"] == o))
             .map(|s| {
                 let name = s["name"].as_str().unwrap().to_string();
-                let handle = scope.spawn(move || match s.get("requires") {
-                    // r8-draft fixtures: parsed, not run until r8 ships.
-                    Some(r) => Err(format!("not run: requires {}", r.as_str().unwrap_or("?"))),
+                let handle = scope.spawn(move || match waiting(s) {
+                    Some(why) => Err(format!("not run: {why}")),
                     None => match unsupported(s) {
                         Some(why) => Err(format!("not run: {why}")),
                         None => run(s),
@@ -1465,7 +2055,7 @@ fn shared_host_fixtures_run_against_the_real_runtime() {
     let results = run_named(&scenarios, only.as_deref());
     let draft: Vec<&str> = scenarios
         .iter()
-        .filter(|s| s.get("requires").is_some())
+        .filter(|s| waiting(s).is_some())
         .map(|s| s["name"].as_str().unwrap())
         .collect();
     let mut failed = Vec::new();
@@ -1531,7 +2121,25 @@ fn a_changed_expectation_fails_against_the_real_runtime() {
         .find(|s| s["assert"].get("approval_decisions").is_some())
         .unwrap();
     step["assert"]["approval_decisions"][0]["message"] = json!("something else");
-    let results = run_named(&[lease, dispatch, deny], None);
+    // History written through the fake Claude's transcript: a page and a
+    // recovery are checked against what the runtime sent.
+    let mut before = named("r8-open-with-before-is-refused");
+    let step = before["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["match"]["op"] == "history_end")
+        .unwrap();
+    step["match"]["page.count"] = json!(5);
+    let mut long = named("r8-long-turn-is-recovered-in-bounded-pages");
+    let step = long["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s.get("recover").is_some())
+        .unwrap();
+    step["message_ids"].as_array_mut().unwrap().pop();
+    let results = run_named(&[lease, dispatch, deny, before, long], None);
     for (name, result) in results {
         let error = result.expect_err(&name);
         assert!(error.contains("expected"), "{name}: {error}");

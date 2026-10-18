@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::adapter::{Outcome, Part};
-use super::session::{ChatMessage, Origin, Out, Role, State, Status};
+use super::session::{ChatMessage, CoverageState, Hole, Origin, Out, Role, State, Status};
 
 const MAX_ID: usize = 128;
 
@@ -21,11 +21,10 @@ pub struct ChatEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
-    Open {
-        before: Option<String>,
-        /// The generation the client's `before` came from (optional).
-        generation: Option<String>,
-    },
+    /// Opens a conversation at the newest page. r8 removed `open.before`/
+    /// `open.generation` (the r7.2 paging form): the session host refuses
+    /// such an open (`unsupported_version`) before it gets here.
+    Open,
     Submit {
         generation: String,
         request_id: String,
@@ -73,19 +72,7 @@ pub fn parse_inbound(env: &ChatEnvelope) -> Result<Inbound, String> {
         return Err("invalid agentId".into());
     }
     match env.op.as_str() {
-        "open" => {
-            let before = match env.body.get("before") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if s.len() <= MAX_ID => Some(s.clone()),
-                Some(_) => return Err("invalid before".into()),
-            };
-            let generation = match env.body.get("generation") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if s.len() <= MAX_ID => Some(s.clone()),
-                Some(_) => return Err("invalid generation".into()),
-            };
-            Ok(Inbound::Open { before, generation })
-        }
+        "open" => Ok(Inbound::Open),
         "submit" => {
             let generation = str_field(env, "generation")?;
             let request_id = str_field(env, "requestId")?;
@@ -191,6 +178,10 @@ enum PartBody<'a> {
         rule_id: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<&'a str>,
+        /// r8 `approval.card_reason`: the `approval_closed` reason of a
+        /// final card.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::session_protocol::wire::ApprovalCloseReason>,
     },
 }
 
@@ -208,13 +199,14 @@ struct MessageBody<'a> {
     parts: Vec<PartBody<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     history: Option<bool>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeltaBody<'a> {
-    message_id: &'a str,
-    part: PartBody<'a>,
+    /// The history page this message belongs to (r8 §B).
+    #[serde(rename = "page_id", skip_serializing_if = "Option::is_none")]
+    page_id: Option<&'a str>,
+    /// A recovered message: the retained message it follows, `null` when
+    /// it is the oldest (r8 §C; always present on a recovered message, so
+    /// it is never mistaken for an open's page message).
+    #[serde(rename = "after_message_id", skip_serializing_if = "Option::is_none")]
+    after_message_id: Option<Option<&'a str>>,
 }
 
 #[derive(Serialize)]
@@ -270,11 +262,17 @@ fn part_body(p: &Part) -> PartBody<'_> {
             state: c.state,
             rule_id: c.rule_id.as_deref(),
             note: c.note.as_deref(),
+            reason: c.reason,
         },
     }
 }
 
-fn message_body(m: &ChatMessage, history: bool) -> MessageBody<'_> {
+fn message_body<'a>(
+    m: &'a ChatMessage,
+    history: bool,
+    page_id: Option<&'a str>,
+    after_message_id: Option<Option<&'a str>>,
+) -> MessageBody<'a> {
     MessageBody {
         message_id: &m.message_id,
         role: match m.role {
@@ -290,6 +288,8 @@ fn message_body(m: &ChatMessage, history: bool) -> MessageBody<'_> {
         created_at: m.created_at_ms,
         parts: m.parts.iter().map(part_body).collect(),
         history: history.then_some(true),
+        page_id,
+        after_message_id,
     }
 }
 
@@ -366,17 +366,21 @@ pub fn event(conv: &str, agent: &str, generation: &str, sequence: u64, out: &Out
         sequence,
     };
     match out {
-        Out::Message(m) => envelope(conv, agent, "message", Some(head), message_body(m, false)),
-        Out::Delta { message_id, part } => envelope(
+        Out::Message(m) => envelope(
             conv,
             agent,
-            "delta",
+            "message",
             Some(head),
-            DeltaBody {
-                message_id,
-                part: part_body(part),
-            },
+            message_body(m, false, None, None),
         ),
+        Out::Recovered { message, after } => envelope(
+            conv,
+            agent,
+            "message",
+            Some(head),
+            message_body(message, true, None, Some(after.as_deref())),
+        ),
+        Out::Coverage(c) => envelope(conv, agent, "coverage", Some(head), coverage_body(c)),
         Out::Status(s) => envelope(conv, agent, "status", Some(head), status_body(s)),
         Out::Accepted { request_id } => envelope(
             conv,
@@ -416,12 +420,15 @@ pub fn event(conv: &str, agent: &str, generation: &str, sequence: u64, out: &Out
     }
 }
 
+/// A message of a history page (r8 §B: `history: true` and its `page_id`;
+/// the open's page has none).
 pub fn history_message(
     conv: &str,
     agent: &str,
     generation: &str,
     sequence: u64,
     m: &ChatMessage,
+    page_id: Option<&str>,
 ) -> ChatEnvelope {
     envelope(
         conv,
@@ -431,14 +438,238 @@ pub fn history_message(
             generation,
             sequence,
         }),
-        message_body(m, true),
+        message_body(m, true, page_id, None),
     )
+}
+
+/// At most this many holes in a `history_end` or `coverage` (r8 §C), then
+/// `holes_more`.
+pub const MAX_HOLES: usize = 16;
+
+#[derive(Serialize)]
+struct HoleBody<'a> {
+    after_message_id: &'a str,
+    before_message_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u64>,
+}
+
+fn hole_bodies(holes: &[Hole]) -> (Vec<HoleBody<'_>>, bool) {
+    let more = holes.len() > MAX_HOLES;
+    let bodies = holes
+        .iter()
+        .take(MAX_HOLES)
+        .map(|h| HoleBody {
+            after_message_id: &h.after,
+            before_message_id: h.before.as_deref(),
+            count: h.count,
+        })
+        .collect();
+    (bodies, more)
+}
+
+#[derive(Serialize)]
+struct CoverageBody<'a> {
+    oldest_retained: Option<&'a str>,
+    truncated: bool,
+    holes: Vec<HoleBody<'a>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    holes_more: bool,
+}
+
+fn coverage_body(c: &CoverageState) -> CoverageBody<'_> {
+    let (holes, holes_more) = hole_bodies(&c.holes);
+    CoverageBody {
+        oldest_retained: c.oldest_retained.as_deref(),
+        truncated: c.truncated,
+        holes,
+        holes_more,
+    }
+}
+
+/// What a `history_end` says about its page (r8 §B, §C).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageInfo {
+    /// `newest`, `before`, `turn_id` or `request_id`.
+    pub selector: &'static str,
+    pub count: usize,
+    pub content_bytes: usize,
+    pub wire_bytes: usize,
+    pub end: bool,
+    pub next: Option<String>,
+    /// `complete`, `partial` or `unavailable`.
+    pub coverage: &'static str,
+    pub oldest_retained: Option<String>,
+    pub truncated: bool,
+    pub holes: Vec<Hole>,
+}
+
+#[derive(Serialize)]
+struct PageBody<'a> {
+    selector: &'static str,
+    count: usize,
+    content_bytes: usize,
+    wire_bytes: usize,
+    end: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<&'a str>,
+    coverage: &'static str,
+    oldest_retained: Option<&'a str>,
+    truncated: bool,
+    holes: Vec<HoleBody<'a>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    holes_more: bool,
+}
+
+#[derive(Serialize)]
+struct HistoryEndBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_id: Option<&'a str>,
+    page: PageBody<'a>,
+}
+
+/// The end of a history page (r8 §B): sequenced, after its messages.
+pub fn history_end(
+    conv: &str,
+    agent: &str,
+    generation: &str,
+    sequence: u64,
+    page_id: Option<&str>,
+    page: &PageInfo,
+) -> ChatEnvelope {
+    let (holes, holes_more) = hole_bodies(&page.holes);
+    envelope(
+        conv,
+        agent,
+        "history_end",
+        Some(Head {
+            generation,
+            sequence,
+        }),
+        HistoryEndBody {
+            page_id,
+            page: PageBody {
+                selector: page.selector,
+                count: page.count,
+                content_bytes: page.content_bytes,
+                wire_bytes: page.wire_bytes,
+                end: page.end,
+                next: page.next.as_deref(),
+                coverage: page.coverage,
+                oldest_retained: page.oldest_retained.as_deref(),
+                truncated: page.truncated,
+                holes,
+                holes_more,
+            },
+        },
+    )
+}
+
+/// An error in a conversation: sequenced when it is open (`head`), with the
+/// history request's `page_id` when that was valid (r8 §B).
+pub fn error(
+    conv: &str,
+    agent: &str,
+    head: Option<(&str, u64)>,
+    code: &str,
+    text: &str,
+    page_id: Option<&str>,
+) -> ChatEnvelope {
+    let mut body = Map::new();
+    body.insert("code".into(), Value::String(code.into()));
+    body.insert("text".into(), Value::String(text.into()));
+    if let Some(p) = page_id {
+        body.insert("page_id".into(), Value::String(p.into()));
+    }
+    envelope(
+        conv,
+        agent,
+        "error",
+        head.map(|(generation, sequence)| Head {
+            generation,
+            sequence,
+        }),
+        body,
+    )
+}
+
+/// Why Atem ends a conversation (r8 §C `close.reason`); the client reopens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// `/clear`, a resume, `/new`: another conversation of the agent.
+    Switched,
+    /// Chat was withdrawn.
+    Withdrawn,
+    /// A new agent process.
+    Restarted,
+    /// A ninth conversation replaced the oldest.
+    Evicted,
+    // `fenced` and `reset` are the contract's too; Atem never sends them: a
+    // fenced attachment's conversations end with its transport.
 }
 
 /// Atem ends a conversation: after an `error` saying why, or without one when a
 /// ninth conversation replaces the oldest.
-pub fn close(conv: &str, agent: &str) -> ChatEnvelope {
-    envelope(conv, agent, "close", None, Map::new())
+pub fn close(conv: &str, agent: &str, reason: CloseReason) -> ChatEnvelope {
+    let mut body = Map::new();
+    body.insert(
+        "reason".into(),
+        serde_json::to_value(reason).expect("reasons serialize"),
+    );
+    envelope(conv, agent, "close", None, body)
+}
+
+#[cfg(test)]
+/// A chat-v1 message body as it is on the wire (`message` without its
+/// envelope fields), back into a `ChatMessage`: text and tool parts only.
+pub fn parse_message(v: &Value) -> Result<ChatMessage, String> {
+    let s = |name: &str| v.get(name).and_then(Value::as_str).map(str::to_string);
+    let role = match s("role").as_deref() {
+        Some("user") => Role::User,
+        Some("assistant") => Role::Assistant,
+        other => return Err(format!("role {other:?}")),
+    };
+    let origin = match s("origin").as_deref() {
+        None => None,
+        Some("local") => Some(Origin::Local),
+        Some("remote") => Some(Origin::Remote),
+        Some(other) => return Err(format!("origin {other:?}")),
+    };
+    let mut parts = Vec::new();
+    for p in v
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or("missing parts")?
+    {
+        let f = |name: &str| {
+            p.get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or(format!("part {name}"))
+        };
+        parts.push(match p.get("kind").and_then(Value::as_str) {
+            Some("text") => Part::Text {
+                id: f("id")?,
+                markdown: f("markdown")?,
+            },
+            Some("tool") => Part::Tool {
+                id: f("id")?,
+                name: f("name")?,
+                summary: f("summary")?,
+            },
+            other => return Err(format!("part kind {other:?}")),
+        });
+    }
+    Ok(ChatMessage {
+        message_id: s("messageId").ok_or("missing messageId")?,
+        role,
+        origin,
+        turn_id: s("turnId").ok_or("missing turnId")?,
+        request_id: s("requestId"),
+        created_at_ms: v.get("createdAt").and_then(Value::as_i64).unwrap_or(0),
+        parts,
+    })
 }
 
 #[cfg(test)]
@@ -523,12 +754,14 @@ mod tests {
             state: ApprovalCardState::AlwaysAllowed,
             rule_id: None,
             note: None,
+            reason: Some(crate::session_protocol::wire::ApprovalCloseReason::AnsweredRemote),
         })];
         let e = body(&event("c1", "claude", "g", 3, &Out::Message(m)));
         assert_eq!(
             e["parts"][0],
             json!({"id": "approval", "kind": "approval", "approval_id": "a1", "tool": "Bash",
                    "summary": "npm test", "state": "always_allowed",
+                   "reason": "answered_remote",
                    "always_rules": [{"rule_id": "r0-1", "label": "Allow Bash(npm test:*)",
                                      "scope": "this project"}]})
         );
@@ -574,6 +807,7 @@ mod tests {
             state: ApprovalCardState::AutoAllowed,
             rule_id: Some("s-1".into()),
             note: None,
+            reason: None,
         })];
         let e = body(&event("c1", "codex", "g", 3, &Out::Message(m)));
         assert_eq!(
@@ -588,17 +822,7 @@ mod tests {
     fn parse_each_op() {
         assert_eq!(
             parse_inbound(&env("open", json!({}))).unwrap(),
-            Inbound::Open {
-                before: None,
-                generation: None
-            }
-        );
-        assert_eq!(
-            parse_inbound(&env("open", json!({"before":"m9","generation":"g"}))).unwrap(),
-            Inbound::Open {
-                before: Some("m9".into()),
-                generation: Some("g".into())
-            }
+            Inbound::Open
         );
         assert_eq!(
             parse_inbound(&env(
@@ -662,10 +886,6 @@ mod tests {
         let mut e = env("open", json!({}));
         e.agent_id = String::new();
         assert_eq!(parse_inbound(&e).unwrap_err(), "invalid agentId");
-        assert_eq!(
-            parse_inbound(&env("open", json!({"before":long}))).unwrap_err(),
-            "invalid before"
-        );
         // text size is not checked here
         let big = "y".repeat(100_000);
         assert!(
@@ -754,19 +974,6 @@ mod tests {
         assert_eq!(v["role"], "assistant");
         assert!(v.get("origin").is_none() && v.get("requestId").is_none());
         assert_eq!(
-            b(&Out::Delta {
-                message_id: "m1".into(),
-                part: Part::Text {
-                    id: "p3".into(),
-                    markdown: "x".into()
-                }
-            }),
-            merged(
-                "delta",
-                json!({"messageId":"m1","part":{"id":"p3","kind":"text","markdown":"x"}})
-            )
-        );
-        assert_eq!(
             b(&Out::Status(Status {
                 state: State::Unknown,
                 since_ms: 9,
@@ -825,7 +1032,7 @@ mod tests {
 
     #[test]
     fn history_message_is_marked() {
-        let v = body(&history_message("c1", "claude", "g", 4, &msg()));
+        let v = body(&history_message("c1", "claude", "g", 4, &msg(), None));
         assert_eq!(v["op"], "message");
         assert_eq!(v["history"], true);
         assert_eq!(v["sequence"], 4);
@@ -848,10 +1055,10 @@ mod tests {
     }
 
     #[test]
-    fn close_carries_only_the_ids() {
+    fn close_carries_the_ids_and_its_reason() {
         assert_eq!(
-            serde_json::to_value(close("c1", "claude")).unwrap(),
-            json!({"v":1,"op":"close","conversationId":"c1","agentId":"claude"})
+            serde_json::to_value(close("c1", "claude", CloseReason::Evicted)).unwrap(),
+            json!({"v":1,"op":"close","conversationId":"c1","agentId":"claude","reason":"evicted"})
         );
     }
 }

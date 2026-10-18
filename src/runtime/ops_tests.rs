@@ -216,7 +216,7 @@ impl Peer {
 
     /// session-v1 hello; the welcome (or the error).
     async fn hello(&mut self) -> Value {
-        let id = self.request("hello", json!({}));
+        let id = self.request("hello", json!({"revision": 8}));
         let reply = self.reply(&id).await;
         if reply["op"] == "welcome" {
             self.welcome = reply.clone();

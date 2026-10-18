@@ -5,10 +5,14 @@ mobile app, a Discord-style bot, a headless tool. It tells you what to send,
 what you get back and what to do when something goes wrong.
 
 This is a guide, not the contract. Contracts: `designs/protocol/atem-session-v1.md`
-(r7.2: sessions, leases, receipts, approvals, Atem session rules), `designs/agent-chat-host.md`
+(r8, its appendix authoritative: revision admission, history pages and
+coverage, receipt results, chat Send that acquires the lease, lease-free
+approval answers; plus sessions, leases, receipts, approvals and Atem session
+rules from r7.x), `designs/agent-chat-host.md`
 (chat-v1 host side) and `designs/protocol/atem-host-handoff.md` (what Astation
 and the relay do). Field names below were checked against `src/chat/wire.rs`,
-`src/chat/session.rs`, `src/chat/adapter.rs` and `src/runtime/host_bridge.rs`.
+`src/chat/session.rs`, `src/chat/history.rs`, `src/chat/adapter.rs`,
+`src/session_protocol/` and `src/runtime/host_bridge.rs`.
 
 ## 1. Model
 
@@ -51,11 +55,18 @@ Unknown fields are ignorable everywhere; new fields are always optional.
 
 ### 2.1 Attach and discover
 
-1. `hello` -> `welcome`. In compatibility mode (today) every `hello` gets a new
-   `controller_session` and `attachment_gen` and holds no lease.
-   `welcome` has `account_id`, `atem_device_id`, `host_trust_gen`, `runtime_gen`,
-   `controller_session`, `attachment_gen`, `client_kind`, `permissions`
-   (`view`, `control`), `authorization_ms_left`, `server_time`.
+1. `hello` (with `"revision": 8`, required) -> `welcome`. A `hello` without
+   it (or with another number) gets `error{code:"unsupported_version",
+   revision: 8}` and no attachment. In compatibility mode (today) every
+   `hello` gets a new `controller_session` and `attachment_gen` and holds no
+   lease. `welcome` has `revision: 8`, `features` (Atem advertises all nine
+   r8 features: `chat.history_end`, `chat.history`, `chat.lookup`,
+   `chat.coverage`, `receipt.result`, `approval.session_rules`,
+   `approval.card_reason`, `chat.send_acquire`, `approval.lease_free`; use
+   only what is listed), `account_id`, `atem_device_id`, `host_trust_gen`,
+   `runtime_gen`, `controller_session`, `attachment_gen`, `client_kind`,
+   `permissions` (`view`, `control`), `authorization_ms_left`,
+   `server_time`. Refuse a `welcome` without `revision: 8`.
    Only an attachment with `control` can submit, answer approvals or see
    approval cards.
 2. `list` -> `sessions`, then `session_changed` events (`seq` per attachment;
@@ -81,9 +92,11 @@ Every message that targets a session carries a `binding`:
  "attachment_gen":"33333333-…","lease_epoch":7}
 ```
 
-`lease_epoch` is present on mutations (submit, renew-bound ops) and absent on
-reads (`open`, `close`) and on `acquire`. A mismatch of anything is
-`stale_target`: re-list.
+`lease_epoch` is present on mutations under your lease (a submit without
+`acquire`, `renew`, `release`, terminal input) and absent on reads (`open`,
+`history`, `close`, `receipt_query`), on `acquire`, on an acquiring Send and
+on approval answers and rule revokes (ignored if sent). A mismatch of
+anything else is `stale_target`: re-list.
 
 ### 2.2 Open a conversation
 
@@ -92,7 +105,8 @@ reads (`open`, `close`) and on `acquire`. A mismatch of anything is
  "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
 ```
 
-Reply, in order: `opened`, then history as `message` events.
+Reply, in order: `opened` (sequence 0), the newest page as
+`message{history:true}` events, then a sequenced `history_end`.
 
 ```json
 {"v":1,"op":"opened","conversationId":"c1","agentId":"ses-abcdefghijkl",
@@ -103,34 +117,64 @@ Reply, in order: `opened`, then history as `message` events.
  "generation":"22222222-…","sequence":1,"messageId":"m1","role":"user","origin":"remote",
  "turnId":"t1","requestId":"4444…","createdAt":1700000000000,
  "parts":[{"kind":"text","id":"p1","markdown":"run the tests"}],"history":true}
+{"v":1,"op":"history_end","conversationId":"c1","agentId":"ses-abcdefghijkl",
+ "generation":"22222222-…","sequence":2,
+ "page":{"selector":"newest","count":1,"content_bytes":120,"wire_bytes":640,"end":true,
+         "coverage":"complete","oldest_retained":"m1","truncated":false,"holes":[]}}
 ```
 
-- History is the latest 50 messages / 256 KiB, sent whole (never as deltas),
-  each with `history: true` and the next `sequence`. Replace anything you cached
-  with the same `messageId`.
-- Older pages: `open` again on the same open conversation with
-  `before: "<messageId>"` (usually the oldest `messageId` you hold). No
-  `opened` comes and nothing is reset: the older page (50 messages / 256 KiB
-  before that message) arrives as `message{history:true}` at the
-  conversation's next sequence numbers, so keep applying `last + 1`; live
-  events before and after it keep their own sequence numbers. Insert paged
-  messages by `messageId` and history order (they are older than what you
-  have), never by `sequence`. Every page ends with a sequenced `status`
-  that also carries `page`:
-  `{"op":"status",…,"state":"ready","since":…,"page":{"before":"m40","count":50,"start":false}}`.
-  `count` is how many messages the page held; `start: true` means it
-  reached the oldest message Atem retains, so stop paging. An empty page is
-  just that marker (`count: 0, start: true`). Treat it as a normal status
-  update too. Without `control`, approval cards are left out before the
-  page limits, so you still get older messages after a run of cards.
-- Send `generation` (the one from `opened`) with `before`. A `before` Atem
-  no longer retains (evicted), or one named with another `generation`, is
-  answered `error{code:"stale_target", text:"that message is no longer in
-  the history; reopen without before to get the newest page"}`, never an
-  empty page: "no more history" and "cursor unknown" are different. On an
-  open conversation the error is sequenced and the conversation stays open.
-- `open` without `before` on an open conversation resynchronizes it: a new
-  `opened` at `sequence` 0 and the newest page; replace your cache.
+- A conversation is **one ordered stream**: pages and live events share its
+  `sequence`, and a page is built in one host step, so nothing of that
+  conversation comes between its envelopes. Keep per `messageId` the version
+  with the highest sequence (a message that grows is sent whole again and
+  replaces the earlier version); a page never replaces a newer version. Pages carry whole messages.
+- Older pages and lookups:
+
+```json
+{"type":"agentChat","data":{"v":1,"op":"history","conversationId":"c1","agentId":"ses-abcdefghijkl",
+ "generation":"22222222-…","page_id":"p7","before":"m40",
+ "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
+```
+
+  Exactly one selector: `before` (a retained `messageId`; the page ends just
+  before it), `turn_id`, `request_id` (the turn whose user message carries
+  it) or `next` (the token from the last `history_end`). `page_id` is yours
+  (1-64 bytes `[A-Za-z0-9._:-]`) and comes back on every page message and
+  the `history_end`. The reply is `message{history:true, page_id}` then
+  `history_end{page_id, page}`, all sequenced.
+- Bounds per page: 50 messages, 256 KiB of content, 1 MiB serialized
+  (`history_end` included). `newest`/`before` go backwards (each page lists
+  its messages oldest first; `next` continues with older ones); `turn_id`/
+  `request_id` go forwards from the turn's oldest retained message to its
+  newest one when the first page was taken (later messages of the turn come
+  live). `end: true` means the selection is exhausted (no `next`).
+- `next` is opaque and bound to this attachment, conversation, session,
+  process, selector and history snapshot. Used elsewhere, altered, after
+  the history was reloaded or evicted past it, or after a runtime restart:
+  `error{code:"stale_target", page_id}`; start a new selection. A `before`
+  Atem no longer retains is `stale_target` too. A lookup with nothing
+  retained is an empty page (`count: 0`, `end: true`, `coverage:
+  "unavailable"`).
+- Field errors (no selector, two, a malformed value) are
+  `error{code:"invalid_request", page_id}` (the `page_id` only when it was
+  valid), sequenced; nothing resets. More than 8 valid `history` requests a
+  second per conversation is `busy`.
+- **Coverage.** `page.coverage` is `complete`, `partial` (some of the
+  selection was evicted or lies in a hole) or `unavailable`.
+  `truncated: true` once anything of this process's history was evicted
+  (500 messages / 8 MiB); `oldest_retained` names the oldest retained
+  message. `holes: [{after_message_id, before_message_id, count?}]` are gaps
+  inside the retained timeline (≤ 16, then `holes_more: true`). Show them;
+  never reopen because of them. Without `control` you never see card ids
+  here: holes are named by the messages you can see, a hole before
+  everything you can see is reported as `truncated: true` instead, and
+  `oldest_retained` is the oldest one you can see; a `before` naming a card
+  is `stale_target`.
+- `open.before` and `open.generation` (the 2026-10-17 paging form) are
+  removed: `error{code:"unsupported_version"}`, nothing opened or reset.
+  There is no `status.page` marker any more.
+- `open` on an open conversation resynchronizes it: a new `opened` at
+  `sequence` 0 and the newest page; replace your cache.
 - `opened.unavailable` lists what this agent's chat can't provide:
   `streaming` (no partial text), `reasoning`, `error_details` (no model/API
   error behind a failed turn). Hide the matching UI. Unknown names are
@@ -142,8 +186,8 @@ Reply, in order: `opened`, then history as `message` events.
 - If chat is not available for a running session the answer is
   `error{code:"busy", text:"chat is not available for this agent: <reason>"}`
   and no conversation. An exited agent's history stays readable.
-- A ninth open conversation closes the least recently opened one with a bare
-  `close`.
+- A ninth open conversation closes the least recently opened one with
+  `close{reason:"evicted"}`.
 
 ### 2.3 Live events
 
@@ -151,17 +195,19 @@ All carry `generation` and `sequence` (apply only `last + 1`):
 
 | op | fields |
 |---|---|
-| `message` | the message above (new user or assistant message, whole) |
-| `delta` | `messageId`, `part`: a later part appended to a message already sent (both agents; not a token stream); a part id already present is ignored |
+| `message` | the message above (a new user or assistant message, or a later version of one, always whole: replace what you had for that `messageId`) |
 | `status` | `state` (`ready`/`working`/`waiting`/`unknown`), `since`, optional `detail`; re-sent every 15 s with the original `since` |
-| `accepted` | `requestId`: your prompt reached the agent |
+| `accepted` | `requestId`: your prompt reached the agent; `lease{lease_epoch, ms_left}` when your submit carried `acquire` (section 3.2) |
+| `history_end` | `page_id` (absent on the open's page), `page` (section 2.2) |
+| `coverage` | `oldest_retained`, `truncated`, `holes` (≤ 16, `holes_more`): sent after a burst of agent output was reloaded and something stayed missing |
 | `complete` | `turnId`, optional `requestId`, `outcome`: `interrupted` when the turn ended interrupted (Esc, a deny at the agent's prompt, Codex's `turn_aborted`), else `done`; for your own submit it comes from the receipt, whose `detail` keeps the outcome, so a duplicate after a broker restart says the same |
-| `error` | `text`, optional `requestId`, and `code` on host-made errors: `rejected`/`outcome_unknown` (your submit's receipt), a session-v1 admission code (`stale_target`, `stale_lease`, `lease_held`, `forbidden`, `session_closed`, `busy`, `paused`, ...), `unsupported_version` (malformed message), `busy` (open without chat). The chat's own notices (agent restarted, conversation switched, chat withdrawn) have no `code` |
+| `error` | `text`, optional `requestId`, optional `page_id` (a history request's), and `code` on host-made errors: `rejected`/`outcome_unknown` (your submit's receipt), a session-v1 admission code (`stale_target`, `stale_lease`, `lease_held` with `controller{controller_session, lease_epoch}` and the text "another controller holds this session", `forbidden`, `session_closed`, `busy`, `paused`, ...), `invalid_request` (a field rule), `unsupported_version` (malformed or removed message), `busy` (open without chat, too many history requests). The chat's own notices (agent restarted, conversation switched, chat withdrawn) have no `code` |
 | `rules` | `approvalRules`: the whole list of active Atem session rules, when it changed (conversations with `control` only) |
-| `close` | the conversation ended |
+| `close` | the conversation ended; `reason`: `switched`, `withdrawn`, `restarted` or `evicted` (not sequenced) |
+| `message{history:true, after_message_id}` | a message recovered after a burst of agent output was reloaded: place it after `after_message_id` (`null`: no retained message precedes it); the key's presence marks it as recovered |
 
 `complete` means the execution turn ended, not that nothing more can arrive: a
-late `message`/`delta` for the same `turnId` is possible. Accept it.
+late `message` for the same `turnId` is possible. Accept it.
 Message parts (`kind`):
 
 ```json
@@ -174,7 +220,9 @@ Message parts (`kind`):
  "always_rules":[],"state":"auto_allowed","rule_id":"s-0123456789abcdef"}
 ```
 
-An approval part may also carry `rule_id` (an `auto_allowed` card: the Atem
+An approval part may also carry `reason` (every final card, r8
+`approval.card_reason`: the `approval_closed` reason, e.g. `answered_remote`
+on an `allowed` card), `rule_id` (an `auto_allowed` card: the Atem
 session rule that allowed it) and `note` (for example on an `allowed` card
 whose session rule wasn't kept: "allowed once; the rule wasn't kept: this
 session already holds 32 rules").
@@ -187,18 +235,21 @@ marks the cut). Text and summaries pass the credential redactor.
 
 | Event | What you get | What to do |
 |---|---|---|
-| You send `close` | nothing | -- |
+| You send `close` (with or without `binding`; without it, your attachment's own conversation of that id closes) | nothing | -- |
 | Your attachment drops or re-authenticates, or a second `hello` replaces it (r7.1) | all your conversations close, leases end, pending replies are dropped | `hello`, `list`, `open` again |
 | Second `hello` on a welcomed attachment | `welcome` with new `attachment_gen` and `controller_session`; same permissions; authorization deadline not renewed; more than once a second is `busy`; the old `attachment_gen` is `stale_target` | rebuild every binding |
 | Link/broker restart (new `runtime_gen`) | all attachments and leases invalid | same; receipts stay queryable |
-| Agent restarted | `error` "the agent was restarted; reopen the chat", then `close`; new `generation` | open again, expect new history |
-| Another session resumed inside the agent (`/resume`, Codex `/new`) | `error` "the conversation was switched; reopen the chat", `close`; same `generation` | open again; the earlier turns are history only |
+| Agent restarted | `error` "the agent was restarted; reopen the chat", then `close{reason:"restarted"}`; new `generation` | open again, expect new history |
+| Another session resumed inside the agent (`/resume`, Codex `/new`) | `error` "the conversation was switched; reopen the chat", `close{reason:"switched"}`; same `generation` | open again; the earlier turns are history only |
 | Agent exits | status `unknown`, errors to open conversations, generation retired | history stays readable |
-| Chat withdrawn (log format changed) | `error`, `close`; descriptor loses `chat-v1` | fall back to the terminal view |
-| Atem dropped chat items before they reached the runtime (a huge burst of agent output) | `error` "the chat history was incomplete (some items were dropped) and was reloaded; reopen the chat", `close`; same `generation` | open again: the history is complete again |
+| Chat withdrawn (log format changed) | `error`, `close{reason:"withdrawn"}`; descriptor loses `chat-v1` | fall back to the terminal view |
+| Atem dropped chat items before they reached the runtime (a huge burst of agent output) | the runtime reloads the worker's history and sends what was missing as `message{history:true, after_message_id}`; if something stays missing, a `coverage` event with the hole; no `error`, no `close` | keep consuming; show the hole |
+| Ninth conversation opened | `close{reason:"evicted"}` for the oldest | -- |
 
-A new `open` always restores status and history. Atem keeps the newest 500
-messages / 8 MiB per agent process.
+A new `open` always restores status and the newest page. Reopen only on a
+sequence gap, another `generation`, a fenced attachment or a `close` with a
+`reason`; truncation, holes and `coverage` events never need one. Atem keeps
+the newest 500 messages / 8 MiB per agent process.
 
 ## 3. Sending prompts
 
@@ -210,9 +261,10 @@ Control is one lease per session, 15 s long, held by one attachment.
 {"type":"session","data":{"v":1,"op":"acquire","id":"<uuid>","binding":{…no lease_epoch…},"takeover":false}}
 ```
 
-Reply `lease{binding (with lease_epoch), ms_left}`. Renew every 5 s (`renew`),
+Reply `lease{binding (with lease_epoch), ms_left}`. A chat Send can take the
+lease with its prompt instead (section 3.2). Renew every 5 s (`renew`),
 never after your own monotonic estimate of expiry (compute the deadline from
-the request's send time + `ms_left`). `lease_held` means someone else has it;
+the request's send time + `ms_left`). `lease_held` means someone else has it (it names `controller`);
 `takeover:true` (needs `control`) takes it and moves the other holder to
 viewer. Local typing on the host revokes any remote lease
 (`lease_changed{reason:"local_input"}`). A renew after expiry is `stale_lease`:
@@ -239,6 +291,22 @@ Two equivalent forms; the chat form answers in chat ops.
 - Same `requestId` and same content: returns the recorded receipt, executes
   nothing. Same `requestId` with different content: `request_id_reused`.
 - A chat submit hears back only in chat ops, never as a session `receipt`.
+- **Send that acquires** (r8 `chat.send_acquire`): either form may carry
+  `"acquire": true` instead of `lease_epoch`. Nobody holds the lease: the
+  prompt is accepted and the lease granted to you in one step. You hold it:
+  it submits under your lease (same epoch, deadline not extended). Someone
+  else holds it: `lease_held` with `controller`, nothing recorded; after
+  the user confirms "Take over and send", resend with the **same**
+  `requestId` plus `"takeover": true` and `"expected_controller"` (the
+  `controller` you were shown); a holder that changed meanwhile is
+  `lease_held` again. The admitting reply (`receipt{state:"accepted"}` or
+  chat `accepted`) carries `lease{lease_epoch, ms_left}`: apply it as an
+  `acquire` reply sent when the submit was sent, only if that submit is
+  still outstanding on your current attachment, the epoch isn't lower than
+  one you saw since, and the deadline is still ahead. Only prompts acquire;
+  `interrupt`, `stop` and rule revokes with `acquire` are
+  `invalid_request`. A duplicate `requestId` returns its receipt and never
+  acquires.
 
 ### 3.3 Receipt states and their chat form
 
@@ -289,7 +357,23 @@ survive broker restarts. A session-v1 `receipt` has `request_id`, `target`,
 `kind`, `state`, `detail?`, `updated_at`. A `completed` `prompt` receipt's
 `detail` is the turn's outcome: `"done"` or `"interrupted"` (the same as the
 chat `complete.outcome`; the journal keeps only that word, never prompt or
-reply text). Work executing across a broker restart
+reply text). It also carries `result` (r8 `receipt.result`):
+
+```json
+"result":{"turn_id":"turn-7","user_message_id":"turn-7-u","outcome":"done",
+          "reply_message_ids":["turn-7-a-0001","…"],"more":true,"replies":"complete"}
+```
+
+`reply_message_ids` are the turn's assistant messages in timeline order, at
+most 32 (`more: true`: fetch the rest with `history{request_id}`), without
+approval cards. `replies` is the turn's coverage (`partial` when part of the
+turn was evicted, lies in a hole, or an id couldn't be named). The ids are
+journaled, the replies computed from the retained history each time, so
+they can change. Every completed prompt carries it; the user message id stays
+known after the message itself was evicted (`replies` is then `partial`, or
+`unavailable` when nothing of the turn is retained). No `result` on other
+receipts, nor in the one case where the agent's own turn or message id isn't a
+valid id (1-128 bytes of `[A-Za-z0-9._:-]`). Work executing across a broker restart
 becomes `outcome_unknown` and is never retried. Replay after a reconnect of the
 same chat submit is safe because the same `requestId` returns the recorded
 outcome, but the right first move is `receipt_query`.
@@ -297,7 +381,7 @@ outcome, but the right first move is `receipt_query`.
 ### 3.6 Interrupt and stop
 
 Session-v1 `submit` with `kind:"interrupt"` or `kind:"stop"` and `payload: {}`
-(under the lease):
+(under the lease; these never acquire):
 
 - `interrupt` writes Esc only while the status is `working` or `waiting`;
   completes when the turn ends (chat `complete` with outcome `interrupted`).
@@ -331,6 +415,7 @@ Session-v1 `submit` with `kind:"interrupt"` or `kind:"stop"` and `payload: {}`
 
 When the agent asks for permission, Atem opens an approval for every
 attachment with `control` (whoever holds the lease), and asks the relay to push it.
+Answering needs `control`, never the lease (r8 `approval.lease_free`).
 
 ### 5.1 Cards in chat and session-v1
 
@@ -361,7 +446,7 @@ A `kind:"approval"` submission, from chat with `approval` in place of `text`:
 ```json
 {"type":"agentChat","data":{"v":1,"op":"submit","conversationId":"c1","agentId":"ses-aaaaaaaaaaaa",
  "generation":"22222222-…","requestId":"45454545-…",
- "approval":{"approval_id":"88888888-…","decision":"allow_once","acquire":true},
+ "approval":{"approval_id":"88888888-…","decision":"allow_once"},
  "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
 ```
 
@@ -369,10 +454,11 @@ A `kind:"approval"` submission, from chat with `approval` in place of `text`:
   `always_rules`), `deny` (optional `message`, <= 512 bytes, handed to the agent
   with the denial). `rule_id` only with `allow_always`; `message` only with
   `deny`; anything else is refused. A submit carries `text` or `approval`, never both.
-- `acquire:true` takes the lease with the answer (takeover allowed), only once
-  the answer is durably accepted, and the binding then has no `lease_epoch`. Without
-  it, the normal lease and `lease_epoch` apply. This is the right call for a
-  phone tap that arrives with no lease.
+- No lease: the binding's `lease_epoch` is optional and ignored (a stale one
+  is fine), an answer never takes, renews or moves the lease, and `acquire`
+  (in the payload or beside it) is refused `unsupported_version`. A phone
+  tap that arrives with no lease just answers. The first answer Atem admits
+  wins, whoever holds the lease; a later one is `stale_target`.
 - A closed, answered or unknown approval, or a `rule_id` it did not offer, is
   `stale_target` ("already answered"); nothing is applied.
 - Receipt: `accepted`, `executing` (approval closed everywhere,
@@ -388,8 +474,9 @@ A `kind:"approval"` submission, from chat with `approval` in place of `text`:
 `answered_remote`, `answered_terminal`, `interrupted`, `timed_out`,
 `released` (Atem gave the prompt back: for Codex any input first releases the
 hook, and that input is consumed; or the runtime restarted), `process_ended`.
-Lease changes never close an approval; a takeover keeps it pending, and the previous
-holder's epoch becomes `stale_lease`.
+Lease changes never close an approval; a takeover keeps it pending, and an
+answer from the previous holder is still admitted (the epoch is ignored).
+The final card carries the reason as `reason`.
 
 ### 5.4 Notifications
 
@@ -450,16 +537,16 @@ approvals pending across a broker restart are released without
 | Chat availability | `chat-v1` once its hooks produced SessionStart (15 s wait; late one still enables) | only with `[codex] hooks = true` and hooks trusted in Codex's `/hooks` |
 | Content source | transcript JSONL | rollout JSONL |
 | `unavailable` | `["streaming","reasoning"]` | `["streaming","reasoning","error_details"]` |
-| Reply shape | whole messages; later content blocks of the same reply arrive as `delta` parts | whole messages (commentary and final answer are separate messages; a command is a `Bash` tool part); later parts also arrive as `delta` |
+| Reply shape | whole messages; a later content block of the same reply sends the message again, whole | whole messages (commentary and final answer are separate messages; a command is a `Bash` tool part); later parts also arrive as `delta` |
 | Status before first prompt | `ready` after SessionStart | `unknown` until the first prompt typed in the terminal |
 | First remote prompt | allowed when `ready` | refused until a first prompt was typed locally (the "type a first prompt" text) |
 | Always allow | agent's `permission_suggestions` as `always_rules` | an Atem session rule, shell commands only (section 5.5) |
 | Approval `waiting` | from Notification and open approvals | only from approvals this session has open (no native event) |
 | `expires_at` | 600 s | 300 s |
 
-`delta` is emitted by the shared chat state (`ChatSession`) for both agents: it
-means "one more part of an already known message" (for example a tool part after
-text), not a token stream. No agent streams partial text today, and both
+A message that gains a part (for example a tool part after text) is sent again
+whole by the shared chat state (`ChatSession`) for both agents, replacing the
+earlier version (r8; there is no `delta` any more). It is not a token stream. No agent streams partial text today, and both
 declare it in `unavailable` (`streaming`): Claude's transcript holds whole
 content blocks, Codex's rollout whole messages. Treat both as "parts arrive
 whole", and never animate text as a stream.
@@ -478,15 +565,19 @@ Common rules for every client:
 
 ### (a) A mobile chat screen
 
-Ops: `hello`, `list` (session picker, activity dot), `open` (with `before` for
-scroll-back), `submit` (chat form), `acquire`/`renew`/`release`, `close`,
-`receipt_query` on resume, approval answer with `acquire:true`.
+Ops: `hello` (`revision: 8`), `list` (session picker, activity dot), `open`,
+`history` (`before`/`next` for scroll-back, `request_id` to recover a reply),
+`submit` (chat form, `acquire:true` to send without a separate Take
+Control), `renew`/`release`, `close`, `receipt_query` on resume, approval
+answers (no lease).
 
 - Open only for sessions with `chat-v1`; render markdown as CommonMark without
   HTML, `tool` parts as chips, approval parts as cards. Render `origin: local`
   user messages as the user's own, labelled as typed on the computer.
-- Acquire the lease only when the user sends or taps; renew every 5 s while the
+- Take the lease only by sending (`acquire:true`); renew every 5 s while the
   composer is focused, release when it closes. Do not hold control while idle.
+  On `lease_held` offer "Take over and send" (same `requestId`, `takeover`,
+  `expected_controller`).
 - A send button state: enabled only when `status.state == ready`, no draft
   refusal and you hold or can take the lease. Show `detail` for `unknown`.
 - Pitfalls: backgrounding kills the socket; on foreground do the full
@@ -512,15 +603,15 @@ the bot.
   Do not echo your own prompt back: its user `message` has `origin:"remote"`
   and your `requestId`.
 - Approval card -> a message with buttons (Allow once, Deny, and one button per
-  `always_rules` entry when present). A click is an approval submit with
-  `acquire:true`; edit the message when the card state changes (`allowed`,
+  `always_rules` entry when present). A click is an approval submit (no
+  lease); edit the message when the card state changes (`allowed`,
   `denied`, `answered_terminal`, ...). Authorize who may click: the bot's
   attachment has `control`, so any click acts with it.
 - `status` -> presence or typing indicator: typing while `working`, a
   "waiting for approval" presence for `waiting`, idle for `ready`, grey for
   `unknown`/`exited`.
-- Shared channel and leases: the bot's attachment is one controller. Acquire per
-  send (without `takeover`), serialize prompts in the bot (one in flight per
+- Shared channel and leases: the bot's attachment is one controller. Send with
+  `acquire:true` (without `takeover`), serialize prompts in the bot (one in flight per
   session; queue the rest in Discord order), and renew only while a prompt is
   pending. On `lease_held` tell the user a person or another client is in
   control, and do not `takeover` automatically. Local typing revokes the lease
@@ -536,15 +627,16 @@ the bot.
 
 ### (c) A headless API/CLI client
 
-Ops: `hello`, `list`, `acquire`, chat `open`/`submit` or session-v1 `submit`
-(`kind:"prompt"`), `receipt_query`, `release`.
+Ops: `hello`, `list`, chat `open`/`submit` or session-v1 `submit`
+(`kind:"prompt"`, `acquire:true`), `receipt_query`, `history{request_id}`,
+`release`.
 
 - Session-v1 `submit` with `kind:"prompt"` returns receipts you can poll with
   `receipt_query` (and no conversation needed). Chat gives you the content;
   use it when you need the reply text.
-- A script flow: acquire; submit; wait for `complete` or the receipt `completed`;
-  collect assistant `message`/`delta` by `turnId` (or `requestId` on the assistant
-  messages of that turn); release.
+- A script flow: submit with `acquire:true`; wait for `complete` or the receipt
+  `completed`; its `result` names the turn and its reply ids; fetch them with
+  `history{request_id}` (or collect live `message`s by `turnId`); release.
 - Exit codes should tell `rejected` (nothing happened, safe to retry later with
   a new `requestId`) from `outcome_unknown` (do not retry: check the terminal).
 - Pitfalls: a CI script must not retry `outcome_unknown` with a new
@@ -564,8 +656,10 @@ Ops: `hello`, `list`, `acquire`, chat `open`/`submit` or session-v1 `submit`
   relay (end-to-end encryption of chat is a follow-up).
 - No remote session launch: sessions start locally with `atem agent launch` (or the
   bare `atem` menu). Clients only attach to what is already running.
-- Sizes: prompt 32 768 bytes; message 131 072 bytes; history on open 50 messages /
-  256 KiB (older pages with `before`); 8 conversations per session (the oldest is
+- Sizes: prompt 32 768 bytes; message 131 072 bytes (≤ 2048 parts); a history
+  page 50 messages / 256 KiB of content / 1 MiB serialized (older pages and
+  lookups with `history`, 8 a second); `receipt.result` 32 reply ids; 8
+  conversations per session (the oldest is
   closed); 500 messages / 8 MiB kept per agent process; 64 in-flight requests per
   attachment; inbound chat/session messages 1 MiB (larger are dropped with an
   `unsupported_version` error); `receipt_query` 64 ids; 16 pending approvals per

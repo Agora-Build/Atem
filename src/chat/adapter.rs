@@ -42,6 +42,11 @@ pub struct ApprovalCard {
     /// A short note on how it ended (e.g. the session rule wasn't kept).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// On a final card of an approval that was opened: why it closed, the
+    /// `approval_closed` reason (r8 `approval.card_reason`). `None` while
+    /// pending and on `auto_allowed` (no approval was opened).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::session_protocol::wire::ApprovalCloseReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -256,7 +256,8 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     // Compatibility mode: resume and resume_proof are refused, never trusted.
     let resume = session(
         "hello",
-        json!({"resume": {"controller_session": "12345678-1234-4234-8234-123456789012"}}),
+        json!({"revision": 8,
+               "resume": {"controller_session": "12345678-1234-4234-8234-123456789012"}}),
     );
     rt.send("n", &resume);
     assert_error(&only(&mut rt, "n"), "unauthorized");
@@ -264,7 +265,7 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     assert_error(&only(&mut rt, "n"), "unauthorized");
 
     rt.set_now(1000);
-    let hello = session("hello", json!({}));
+    let hello = session("hello", json!({"revision": 8}));
     rt.send("n", &hello);
     let w = only(&mut rt, "n");
     assert_eq!(w["op"], "welcome");
@@ -279,17 +280,114 @@ fn hello_gets_a_welcome_and_nothing_works_before_it() {
     assert!(wire::is_uuid_v4(w["controller_session"].as_str().unwrap()));
     // A second hello replaces the attachment (r7.1); one more within a
     // second is busy.
-    rt.send("n", &session("hello", json!({})));
+    rt.send("n", &session("hello", json!({"revision": 8})));
     let w2 = only(&mut rt, "n");
     assert_eq!(w2["op"], "welcome");
     assert_ne!(w2["attachment_gen"], fresh);
     assert_ne!(w2["controller_session"], w["controller_session"]);
     assert_eq!(w2["authorization_ms_left"], AUTHORIZATION_MS - 1000);
-    rt.send("n", &session("hello", json!({})));
+    rt.send("n", &session("hello", json!({"revision": 8})));
     assert_error(&only(&mut rt, "n"), "busy");
     // Host-only ops are not requests.
     rt.send("n", &session("lease_released", json!({})));
     assert_error(&only(&mut rt, "n"), "unsupported_version");
+}
+
+/// r8 §A: only `hello{revision: 8}` is welcomed; anything else gets
+/// `unsupported_version` naming the host's revision and changes nothing,
+/// on a fresh attachment or a welcomed one (no replacement).
+#[test]
+fn only_a_hello_naming_revision_8_is_welcomed() {
+    let mut rt = setup();
+    let fresh = "88888888-8888-4888-8888-888888888888";
+    rt.connect_only("n", fresh, vec![Permission::View], AUTHORIZATION_MS);
+    for fields in [
+        json!({}),
+        json!({"revision": 7}),
+        json!({"revision": 9}),
+        json!({"revision": "r8"}),
+        json!({"revision": 8.5}),
+        json!({"revision": null}),
+    ] {
+        let hello = session("hello", fields.clone());
+        rt.send("n", &hello);
+        let e = only(&mut rt, "n");
+        assert_error(&e, "unsupported_version");
+        assert_eq!(e["re"], hello["data"]["id"], "{fields}");
+        assert_eq!(e["revision"], 8, "{fields}");
+        assert_eq!(rt.host.welcomed_attachments(), 3, "{fields}");
+    }
+    rt.send("n", &session("list", json!({})));
+    assert_error(&only(&mut rt, "n"), "unsupported_version");
+    let hello = session("hello", json!({"revision": 8}));
+    rt.send("n", &hello);
+    let w = only(&mut rt, "n");
+    assert_eq!(w["op"], "welcome");
+    assert_eq!(w["revision"], 8);
+    assert_eq!(w["features"], json!(super::revision::FEATURES));
+    assert_eq!(rt.host.welcomed_attachments(), 4);
+    // On the welcomed attachment: refused, not replaced.
+    rt.send("n", &session("hello", json!({})));
+    let e = only(&mut rt, "n");
+    assert_error(&e, "unsupported_version");
+    assert_eq!(rt.attachment("n"), fresh);
+    rt.send("n", &session("list", json!({})));
+    assert_eq!(only(&mut rt, "n")["op"], "sessions");
+}
+
+/// r8 §A: `open.before`/`open.generation` are removed: each is refused in
+/// chat-v1 with `unsupported_version`, and nothing reaches the runtime. A
+/// `history` (advertised) is forwarded to the runtime, which serves it.
+#[test]
+fn removed_chat_forms_are_refused_and_history_is_forwarded() {
+    let mut rt = setup();
+    let chat = |rt: &FakeRuntime, op: &str, extra: Value| {
+        let mut data = json!({"v": 1, "op": op, "conversationId": "conv-1", "agentId": S1,
+            "binding": binding(rt, "c1", S1, None)});
+        data.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"type": "agentChat", "data": data})
+    };
+    for (op, extra) in [
+        ("open", json!({"before": "m-0003"})),
+        ("open", json!({"generation": P1})),
+        ("open", json!({"before": "m-0003", "generation": P1})),
+    ] {
+        let forwarded = rt.effects.len();
+        let m = chat(&rt, op, extra.clone());
+        rt.send("c1", &m);
+        let msgs = rt.take("c1");
+        assert_eq!(msgs.len(), 1, "{op} {extra}: {msgs:#?}");
+        assert_eq!(msgs[0]["type"], "agentChat");
+        assert_eq!(msgs[0]["data"]["op"], "error");
+        assert_eq!(msgs[0]["data"]["code"], "unsupported_version");
+        assert_eq!(msgs[0]["data"]["conversationId"], "conv-1");
+        assert!(
+            !rt.effects[forwarded..]
+                .iter()
+                .any(|e| matches!(e, Effect::Forward { .. })),
+            "{op} {extra}"
+        );
+    }
+    // A plain open and a history go to the runtime.
+    for (op, extra) in [
+        ("open", json!({})),
+        (
+            "history",
+            json!({"generation": P1, "page_id": "p1", "turn_id": "turn-1"}),
+        ),
+    ] {
+        let forwarded = rt.effects.len();
+        rt.send("c1", &chat(&rt, op, extra));
+        assert!(
+            rt.effects[forwarded..]
+                .iter()
+                .any(|e| matches!(e, Effect::Forward { message, .. }
+                    if message.data.as_ref().unwrap()["op"] == op)),
+            "{op}"
+        );
+    }
 }
 
 #[test]
@@ -314,7 +412,7 @@ fn a_second_hello_replaces_the_attachment() {
     got(&mut rt, "c1");
     rt.set_now(2000);
     rt.effects.clear();
-    let hello = session("hello", json!({}));
+    let hello = session("hello", json!({"revision": 8}));
     rt.send("c1", &hello);
     // Only the welcome reaches the client: the old attachment's lease end
     // and stream close are not sent to it.
@@ -358,13 +456,13 @@ fn a_second_hello_replaces_the_attachment() {
     // At most one replacement a second.
     rt.set_now(2999);
     got(&mut rt, "c1");
-    rt.send("c1", &session("hello", json!({})));
+    rt.send("c1", &session("hello", json!({"revision": 8})));
     assert_error(&only(&mut rt, "c1"), "busy");
     assert_eq!(rt.attachment("c1"), new);
     assert!(rt.host.lease_holder(S1).is_some());
     rt.set_now(3000);
     got(&mut rt, "c1");
-    rt.send("c1", &session("hello", json!({})));
+    rt.send("c1", &session("hello", json!({"revision": 8})));
     assert_eq!(only(&mut rt, "c1")["op"], "welcome");
     assert_ne!(rt.attachment("c1"), new);
 }
@@ -374,11 +472,11 @@ fn a_second_hello_after_the_authorization_deadline_is_paused() {
     let mut rt = setup();
     let short = "88888888-8888-4888-8888-888888888888";
     rt.connect_only("s", short, vec![Permission::View], 5000);
-    rt.send("s", &session("hello", json!({})));
+    rt.send("s", &session("hello", json!({"revision": 8})));
     got(&mut rt, "s");
     rt.set_now(5000);
     got(&mut rt, "s");
-    rt.send("s", &session("hello", json!({})));
+    rt.send("s", &session("hello", json!({"revision": 8})));
     assert_error(&only(&mut rt, "s"), "paused");
     assert_eq!(rt.attachment("s"), short);
 }
@@ -393,7 +491,7 @@ fn authorization_bounds_leases_and_then_pauses() {
         vec![Permission::View, Permission::Control],
         5000,
     );
-    rt.send("s", &session("hello", json!({})));
+    rt.send("s", &session("hello", json!({"revision": 8})));
     got(&mut rt, "s");
     rt.set_now(1000);
     let m = acquire(&rt, "s", S1, false);
@@ -681,7 +779,7 @@ fn registry_seq_is_per_attachment_and_a_gap_recovers_with_a_new_snapshot() {
     // A viewer without `view` gets no registry.
     let blind = "88888888-8888-4888-8888-888888888888";
     rt.connect_only("b", blind, vec![Permission::Control], AUTHORIZATION_MS);
-    rt.send("b", &session("hello", json!({})));
+    rt.send("b", &session("hello", json!({"revision": 8})));
     got(&mut rt, "b");
     rt.send("b", &session("list", json!({})));
     assert_error(&only(&mut rt, "b"), "forbidden");
@@ -779,6 +877,7 @@ fn prompt_runs_to_completion_and_duplicates_return_the_receipt() {
         DispatchReport::Completed {
             detail: None,
             turn_id: None,
+            user_message_id: None,
         },
     );
     assert_eq!(receipts_of(&mut rt, "c1"), vec![st("completed", "")]);
@@ -835,6 +934,7 @@ fn trust_change_before_dispatch_rejects_and_revokes() {
         DispatchReport::Completed {
             detail: None,
             turn_id: None,
+            user_message_id: None,
         },
     );
     assert_eq!(receipts_of(&mut rt, "c1"), vec![st("completed", "")]);
@@ -864,6 +964,8 @@ fn accepted_record(n: u64, trust: u64) -> Record {
         payload_digest: "0".repeat(64),
         payload: json!({"text": "hi"}),
         updated_at: 1,
+        principal: "c1".into(),
+        control_gen: 1,
     }
 }
 
@@ -878,11 +980,55 @@ fn crash_rules_dispatch_accepted_once_and_reconcile_executing() {
     });
 }
 
+/// A host over `j` at a runtime start whose previous run (epoch 8) ended
+/// cleanly or not (r8 §H).
+fn start_host<J: Journal>(mut j: J, trust: u64, clean: bool) -> SessionHost<J> {
+    if clean {
+        j.write_clean_close(8).unwrap();
+    }
+    SessionHost::open(ctx(trust), HostConfig::default(), j, random_ids(), Some(8)).unwrap()
+}
+
+/// `principal` connects with `control` on `att` and is welcomed: its
+/// recovered work may run (r8 §H confirmation).
+fn welcome_principal<J: Journal>(
+    host: &mut SessionHost<J>,
+    principal: &str,
+    att: &str,
+) -> Vec<Effect> {
+    let mut fx = host
+        .connect(Attach {
+            client: principal.into(),
+            principal: principal.into(),
+            attachment_gen: att.into(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: wire::ClientKind::Native,
+            authorization_ms: AUTHORIZATION_MS,
+        })
+        .unwrap();
+    let hello = session("hello", json!({"revision": 8}));
+    fx.extend(host.receive(att, &serde_json::to_vec(&hello).unwrap(), host.now()));
+    fx
+}
+
 fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
-    // Accepted under an older trust generation: rejected, never dispatched.
+    // No clean close: accepted work is rejected whatever the journal holds.
     let mut j = journal();
     j.append_ok(accepted_record(1, 1));
-    let mut host = SessionHost::new(ctx(2), HostConfig::default(), j, random_ids()).unwrap();
+    let mut host = start_host(j, 1, false);
+    host.restore_session(spec(S1, P1)).unwrap();
+    let mut fx = host.recover();
+    fx.extend(welcome_principal(&mut host, "c1", C1));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Dispatch { .. })));
+    let r = host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+
+    // After a clean close, accepted under an older trust generation:
+    // rejected, never dispatched.
+    let mut j = journal();
+    j.append_ok(accepted_record(1, 1));
+    let mut host = start_host(j, 2, true);
     host.restore_session(spec(S1, P1)).unwrap();
     let fx = host.recover();
     assert!(!fx.iter().any(|e| matches!(e, Effect::Dispatch { .. })));
@@ -890,13 +1036,18 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     assert_eq!(r.state, ReceiptState::Rejected);
     assert_eq!(r.detail.as_deref(), Some(DETAIL_TRUST_CHANGED));
 
-    // Same trust generation: dispatched once, and a second crash only
+    // Same trust generation: it waits for its principal (another one
+    // doesn't confirm it), is dispatched once, and a second restart only
     // reconciles it.
     let mut j = journal();
     j.append_ok(accepted_record(1, 1));
-    let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
+    let mut host = start_host(j, 1, true);
     host.restore_session(spec(S1, P1)).unwrap();
-    let fx = host.recover();
+    let mut fx = host.recover();
+    fx.extend(welcome_principal(&mut host, "c2", C2));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Dispatch { .. })));
+    assert_eq!(host.receipt(&rid(1)).unwrap().state, ReceiptState::Accepted);
+    let fx = welcome_principal(&mut host, "c1", C1);
     let dispatches = fx
         .iter()
         .filter(|e| matches!(e, Effect::Dispatch { .. }))
@@ -916,16 +1067,34 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     assert_eq!(r.state, ReceiptState::OutcomeUnknown);
     assert_eq!(r.detail.as_deref(), Some(DETAIL_UNRECONCILED));
 
-    // Accepted for a process that is gone: rejected, session closed.
+    // Accepted for a process that is gone: rejected, session closed, once
+    // its principal is confirmed.
     let mut j = journal();
     j.append_ok(accepted_record(1, 1));
-    let mut host = SessionHost::new(ctx(1), HostConfig::default(), j, random_ids()).unwrap();
+    let mut host = start_host(j, 1, true);
     host.restore_session(spec(S1, "33333333-3333-4333-8333-000000000001"))
         .unwrap();
     host.recover();
+    welcome_principal(&mut host, "c1", C1);
     assert_eq!(
         host.receipt(&rid(1)).unwrap().detail.as_deref(),
         Some(DETAIL_SESSION_CLOSED)
+    );
+
+    // A clean-close record naming another epoch is stale: no clean close.
+    let mut j = journal();
+    j.append_ok(accepted_record(1, 1));
+    j.write_clean_close(5).unwrap();
+    let mut host =
+        SessionHost::open(ctx(1), HostConfig::default(), j, random_ids(), Some(8)).unwrap();
+    host.restore_session(spec(S1, P1)).unwrap();
+    host.recover();
+    let r = host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+    assert_eq!(
+        host.journal_mut().take_clean_close(),
+        None,
+        "removed at start"
     );
 }
 
@@ -949,9 +1118,16 @@ fn crash_after_executing<J: Journal + FailFsync>(mut setup: impl FnMut() -> Fake
     }
     assert_eq!(rt.pty.dispatch_attempts, 1);
     rt.restart(GEN2, 8);
-    // A is reconciled (unknown), then B — accepted, trust unchanged — runs once.
+    // An orderly restart (clean close): A is reconciled (unknown); B —
+    // accepted, trust and control unchanged — waits for its principal and
+    // runs once when it is welcomed with control (r8 §H rule 3).
     let a = rt.host.receipt(&rid(1)).unwrap();
     assert_eq!(a.state, ReceiptState::OutcomeUnknown);
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    rt.event_reconnect("c1", C1B);
     assert_eq!(
         rt.host.receipt(&rid(2)).unwrap().state,
         ReceiptState::Executing
@@ -974,6 +1150,7 @@ fn crash_after_executing<J: Journal + FailFsync>(mut setup: impl FnMut() -> Fake
     rt.reconcile_answer = DispatchReport::Completed {
         detail: None,
         turn_id: None,
+        user_message_id: None,
     };
     rt.restart(GEN2, 8);
     assert_eq!(
@@ -983,8 +1160,9 @@ fn crash_after_executing<J: Journal + FailFsync>(mut setup: impl FnMut() -> Fake
 }
 
 /// A host process crash with receipts on disk: a new host over the reopened
-/// `FileJournal` reconciles the executing prompt, dispatches the accepted one
-/// once, and never issues a lease epoch at or below the reserved floor.
+/// `FileJournal` reconciles the executing prompt, rejects the accepted one
+/// (no clean close: "authorization history unknown", r8 §H) and never
+/// issues a lease epoch at or below the reserved floor.
 #[test]
 fn a_crashed_host_reloads_receipts_and_lease_floors_from_disk() {
     let dir = tempfile::tempdir().unwrap();
@@ -1004,7 +1182,10 @@ fn a_crashed_host_reloads_receipts_and_lease_floors_from_disk() {
     let mut host = SessionHost::new(ctx(1), HostConfig::default(), journal, random_ids()).unwrap();
     assert!(host.index_matches_receipts());
     let after: Vec<_> = [1, 2].map(|n| host.receipt(&rid(n)).unwrap()).into();
-    assert_eq!(after, before);
+    assert_eq!(
+        after, before,
+        "reloaded as they were, before the start's rules"
+    );
     // The session id stays used; the surviving worker is restored.
     assert!(host.add_session(spec(S1, P1)).is_err());
     host.restore_session(spec(S1, P1)).unwrap();
@@ -1018,20 +1199,16 @@ fn a_crashed_host_reloads_receipts_and_lease_floors_from_disk() {
         })
         .collect();
     assert_eq!(reconciled, vec![rid(1)]);
-    // `B` waits for `A`'s outcome, then runs once.
-    let fx = host.dispatch_report(&rid(1), DispatchReport::Unknown);
-    let dispatched = fx
-        .iter()
-        .filter(|f| matches!(f, Effect::Dispatch { request_id, .. } if *request_id == rid(2)))
-        .count();
-    assert_eq!(dispatched, 1);
+    let b = host.receipt(&rid(2)).unwrap();
+    assert_eq!(b.state, ReceiptState::Rejected);
+    assert_eq!(b.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+    // `A`'s outcome dispatches nothing, nor does `B`'s principal returning.
+    let mut fx = host.dispatch_report(&rid(1), DispatchReport::Unknown);
+    fx.extend(welcome_principal(&mut host, "c1", C1B));
+    assert!(!fx.iter().any(|f| matches!(f, Effect::Dispatch { .. })));
     assert_eq!(
         host.receipt(&rid(1)).unwrap().state,
         ReceiptState::OutcomeUnknown
-    );
-    assert_eq!(
-        host.receipt(&rid(2)).unwrap().state,
-        ReceiptState::Executing
     );
 }
 
@@ -1085,36 +1262,40 @@ fn evicted_receipts_stay_gone_after_a_reload() {
     );
 }
 
+/// r8 §I: every failed journal write halts the journal until the restart.
 #[test]
-fn failed_durable_writes() {
-    // `accepted` can't be recorded: busy, nothing recorded, retry works.
+fn failed_durable_writes_halt_the_journal() {
+    // `accepted` can't be recorded: busy ("acceptance not recorded"),
+    // nothing recorded, the refusal listed; the retry is busy (halted).
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
     rt.host.journal_mut().fail_next_fsync();
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
     rt.send("c1", &m);
-    assert_error(&only(&mut rt, "c1"), "busy");
+    let err = only(&mut rt, "c1");
+    assert_error(&err, "busy");
+    assert_eq!(err["detail"], DETAIL_ACCEPTANCE_NOT_RECORDED);
     assert!(rt.host.receipt(&rid(1)).is_none());
-    assert_eq!(rt.pty.dispatch_attempts, 0);
+    assert!(rt.host.journal_halted());
+    assert_eq!(rt.host.journal().refusals().unwrap().len(), 1);
     rt.send("c1", &m);
-    assert_eq!(
-        rt.host.receipt(&rid(1)).unwrap().state,
-        ReceiptState::Executing
-    );
+    let err = only(&mut rt, "c1");
+    assert_eq!(err["detail"], DETAIL_JOURNAL_HALTED);
+    assert_eq!(rt.pty.dispatch_attempts, 0);
 
-    // `executing` can't be recorded: rejected before any side effect.
+    // `executing` can't be recorded: nothing reaches the agent, the request
+    // stays accepted (unreported) and the journal halts.
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
     rt.host.journal_mut().fail_fsync_of(2);
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
     rt.send("c1", &m);
-    assert_eq!(
-        receipts_of(&mut rt, "c1"),
-        vec![st("accepted", ""), st("rejected", DETAIL_NOT_RECORDED)]
-    );
+    assert_eq!(receipts_of(&mut rt, "c1"), vec![st("accepted", "")]);
     assert_eq!(rt.pty.dispatch_attempts, 0);
+    assert!(rt.host.journal_halted());
 
-    // A final state that can't be recorded isn't reported until it is.
+    // A final state that can't be recorded isn't reported; the restart
+    // reconciles it.
     let mut rt = setup();
     let e = hold(&mut rt, "c1", S1);
     let m = submit(&rt, "c1", S1, e, 1, "prompt");
@@ -1128,10 +1309,7 @@ fn failed_durable_writes() {
         ReceiptState::Executing
     );
     rt.set_now(1);
-    assert_eq!(
-        receipts_of(&mut rt, "c1"),
-        vec![st("outcome_unknown", DETAIL_WRITE_INTERRUPTED)]
-    );
+    assert!(got(&mut rt, "c1").is_empty(), "never retried while halted");
     // The lease grant's epoch reservation is durable too.
     let mut rt = setup();
     rt.host.journal_mut().fail_next_fsync();
@@ -1139,6 +1317,7 @@ fn failed_durable_writes() {
     rt.send("c1", &m);
     assert_error(&only(&mut rt, "c1"), "busy");
     assert_eq!(rt.host.lease_holder(S1), None);
+    assert!(rt.host.journal_halted());
 }
 
 #[test]
@@ -1258,7 +1437,7 @@ fn receipt_query_is_scoped_to_the_exact_target() {
     assert_eq!(only(&mut rt, "v")["receipts"][0]["request_id"], rid(2));
     let blind = "88888888-8888-4888-8888-888888888888";
     rt.connect_only("b", blind, vec![Permission::Control], AUTHORIZATION_MS);
-    rt.send("b", &session("hello", json!({})));
+    rt.send("b", &session("hello", json!({"revision": 8})));
     got(&mut rt, "b");
     let q = query(&rt, "b", target_with(S1, 1), vec![rid(1)]);
     rt.send("b", &q);
@@ -1338,6 +1517,7 @@ fn chat_submit_results_use_chat_ops() {
         DispatchReport::Completed {
             detail: None,
             turn_id: Some("turn-7".into()),
+            user_message_id: None,
         },
     );
     let msgs = rt.take("c1");
@@ -1732,31 +1912,13 @@ fn a_restart_over_a_corrupt_journal_changes_nothing() {
             state: ReceiptState::Executing,
             detail: None,
             updated_at: 0,
+            result: None,
         })
         .unwrap();
     let before = rt.host.context().clone();
     assert!(rt.host.restart(GEN2, 8).is_err());
     assert_eq!(rt.host.context(), &before);
     assert_eq!(rt.host.lease_holder(S1), Some(C1));
-}
-
-#[test]
-fn durable_write_retries_are_deduplicated() {
-    let mut rt = setup();
-    let e = hold(&mut rt, "c1", S1);
-    let m = submit(&rt, "c1", S1, e, 1, "prompt");
-    rt.send("c1", &m);
-    rt.host.journal_mut().fail_next_fsync();
-    rt.dispatch_report(&rid(1), DispatchReport::FailedAfterPossibleEffect);
-    rt.host.journal_mut().fail_next_fsync();
-    rt.process_exited(S1);
-    assert_eq!(rt.host.pending_retries(), 1);
-    rt.set_now(1);
-    assert_eq!(rt.host.pending_retries(), 0);
-    assert_eq!(
-        rt.host.receipt(&rid(1)).unwrap().state,
-        ReceiptState::OutcomeUnknown
-    );
 }
 
 impl<J: Journal + FailFsync> FakeRuntime<J> {
@@ -1841,4 +2003,239 @@ impl<J: Journal> AppendOk for J {
     fn append_ok(&mut self, r: Record) {
         self.append(r).unwrap();
     }
+}
+
+// ── receipt result (r8 §D) ──
+
+fn with_result() -> HostConfig {
+    HostConfig {
+        receipt_result: true,
+        ..HostConfig::default()
+    }
+}
+
+fn turn_done(detail: &str, turn: &str, user: Option<&str>) -> DispatchReport {
+    DispatchReport::Completed {
+        detail: Some(detail.into()),
+        turn_id: Some(turn.into()),
+        user_message_id: user.map(str::to_string),
+    }
+}
+
+/// A completed prompt's receipt carries its turn's `result` (ids journaled
+/// with the outcome; replies unavailable without a history) on the state
+/// change, a duplicate submit, `receipt_query` and after a restart.
+#[test]
+fn a_completed_prompt_receipt_carries_its_turns_result() {
+    let mut rt = setup_with(with_result());
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    let early = got(&mut rt, "c1");
+    assert!(early.iter().all(|r| r.get("result").is_none()), "{early:?}");
+    rt.dispatch_report(&rid(1), turn_done("done", "turn-7", Some("turn-7-u")));
+    let want = json!({"turn_id": "turn-7", "user_message_id": "turn-7-u", "outcome": "done",
+                      "reply_message_ids": [], "more": false, "replies": "unavailable"});
+    let done = only(&mut rt, "c1");
+    assert_eq!(done["state"], "completed");
+    assert_eq!(done["result"], want);
+    // Journaled: the ids with the transition, never the prompt text.
+    let records = rt.host.journal().load().unwrap();
+    let journaled = format!("{records:?}");
+    assert!(journaled.contains("turn-7-u") && !journaled.contains("run the tests"));
+    // A duplicate and a query return the same result.
+    rt.send("c1", &m);
+    assert_eq!(only(&mut rt, "c1")["result"], want);
+    let q = query(&rt, "c1", target_with(S1, 1), vec![rid(1)]);
+    rt.send("c1", &q);
+    assert_eq!(only(&mut rt, "c1")["receipts"][0]["result"], want);
+    // After an orderly restart the journal gives the same ids back.
+    rt.restart(GEN2, 8);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(serde_json::to_value(r.result).unwrap(), want);
+}
+
+#[test]
+fn an_interrupted_turn_has_the_interrupted_outcome() {
+    let mut rt = setup_with(with_result());
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    got(&mut rt, "c1");
+    rt.dispatch_report(&rid(1), turn_done("interrupted", "t9", Some("u9")));
+    let r = only(&mut rt, "c1");
+    assert_eq!(r["detail"], "interrupted");
+    assert_eq!(r["result"]["outcome"], "interrupted");
+    assert_eq!(r["result"]["turn_id"], "t9");
+}
+
+/// No `result`: an `outcome_unknown` prompt, a turn without a known user
+/// message or with ids that can't be named, other kinds, and a host
+/// without `receipt.result`.
+#[test]
+fn receipts_without_a_result() {
+    let cases: Vec<(HostConfig, &str, DispatchReport)> = vec![
+        (
+            with_result(),
+            "prompt",
+            DispatchReport::FailedAfterPossibleEffect,
+        ),
+        (with_result(), "prompt", turn_done("done", "t1", None)),
+        (
+            with_result(),
+            "prompt",
+            turn_done("done", "t 1", Some("u1")),
+        ),
+        (
+            with_result(),
+            "prompt",
+            turn_done("done", "t1", Some(&"u".repeat(129))),
+        ),
+        (
+            with_result(),
+            "prompt",
+            turn_done("no turn", "t1", Some("u1")),
+        ),
+        (
+            with_result(),
+            "interrupt",
+            turn_done("done", "t1", Some("u1")),
+        ),
+        (
+            HostConfig {
+                receipt_result: false,
+                ..HostConfig::default()
+            },
+            "prompt",
+            turn_done("done", "t1", Some("u1")),
+        ),
+    ];
+    for (n, (config, kind, report)) in cases.into_iter().enumerate() {
+        let mut rt = setup_with(config);
+        let e = hold(&mut rt, "c1", S1);
+        if kind == "interrupt" {
+            // An interrupt dispatches only with a turn to stop.
+            let p = submit(&rt, "c1", S1, e, 1, "prompt");
+            rt.send("c1", &p);
+        }
+        let m = submit(&rt, "c1", S1, e, 2, kind);
+        rt.send("c1", &m);
+        got(&mut rt, "c1");
+        rt.dispatch_report(&rid(2), report);
+        let r = rt.host.receipt(&rid(2)).unwrap();
+        assert!(journal_final(r.state), "case {n}: {r:?}");
+        assert_eq!(r.result, None, "case {n}");
+        rt.send("c1", &m);
+        let msgs = got(&mut rt, "c1");
+        assert!(
+            !msgs.is_empty() && msgs.iter().all(|r| r.get("result").is_none()),
+            "case {n}"
+        );
+    }
+}
+
+fn journal_final(state: ReceiptState) -> bool {
+    super::journal::is_final(state)
+}
+
+/// A crash with the result on disk: a new host over the reopened
+/// `FileJournal` returns the same ids.
+#[test]
+fn a_reloaded_file_journal_keeps_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let mut rt = FakeRuntime::from_json_with(setup_json(), with_result(), journal);
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.dispatch_report(&rid(1), turn_done("done", "turn-7", Some("turn-7-u")));
+    let before = rt.host.receipt(&rid(1)).unwrap();
+    assert!(before.result.is_some());
+    drop(rt);
+    let journal = FileJournal::open(&dir.path().join("state")).unwrap();
+    let host = SessionHost::new(ctx(1), with_result(), journal, random_ids()).unwrap();
+    assert_eq!(host.receipt(&rid(1)).unwrap(), before);
+}
+
+/// The replies: the first 32 in timeline order, `more` when more are
+/// retained, the coverage as given; no history, unavailable.
+#[test]
+fn fill_result_bounds_the_reply_ids() {
+    let mut rt = setup_with(with_result());
+    let e = hold(&mut rt, "c1", S1);
+    let m = submit(&rt, "c1", S1, e, 1, "prompt");
+    rt.send("c1", &m);
+    rt.dispatch_report(&rid(1), turn_done("done", "turn-7", Some("turn-7-u")));
+    let base = rt.host.receipt(&rid(1)).unwrap();
+    let ids = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("turn-7-a-{i:04}")).collect() };
+    for (n, more) in [(0, false), (1, false), (32, false), (33, true), (40, true)] {
+        let mut r = base.clone();
+        fill_result(
+            &mut r,
+            Some(TurnReplies {
+                ids: ids(n),
+                coverage: wire::Coverage::Complete,
+            }),
+        );
+        let res = r.result.as_ref().unwrap();
+        assert_eq!(res.reply_message_ids, ids(n.min(32)), "{n}");
+        assert_eq!(res.more, more, "{n}");
+        assert_eq!(res.replies, wire::Coverage::Complete);
+    }
+    let mut r = base.clone();
+    fill_result(&mut r, None);
+    let res = r.result.unwrap();
+    assert!(res.reply_message_ids.is_empty() && !res.more);
+    assert_eq!(res.replies, wire::Coverage::Unavailable);
+}
+
+/// §D bounds on the wire: a receipt with the largest `result` stays within
+/// 6 KiB, at most 32 reply ids and 64 receipts are accepted, and `result`
+/// belongs to a completed prompt only.
+#[test]
+fn receipt_result_wire_bounds() {
+    let id128 = |i: usize| format!("{i:0>128}");
+    let result = json!({"turn_id": id128(0), "user_message_id": id128(1),
+        "outcome": "interrupted",
+        "reply_message_ids": (0..32).map(id128).collect::<Vec<_>>(),
+        "more": true, "replies": "partial"});
+    let receipt = json!({"request_id": rid(1), "target": target_with(S1, 1), "kind": "prompt",
+        "state": "completed", "detail": "interrupted", "updated_at": 9_007_199_254_740_991u64,
+        "result": result});
+    let msg = |op: &str, body: Value| {
+        let mut data = json!({"v": 1, "op": op, "id": id()});
+        data.as_object_mut()
+            .unwrap()
+            .extend(body.as_object().unwrap().clone());
+        serde_json::to_vec(&json!({"type": "session", "data": data})).unwrap()
+    };
+    let one = msg("receipt", receipt.clone());
+    assert!(wire::decode(&one).is_ok());
+    assert!(
+        one.len() <= wire::MAX_RESULT_RECEIPT_BYTES,
+        "{} bytes",
+        one.len()
+    );
+    let bad = |edit: &dyn Fn(&mut Value)| {
+        let mut r = receipt.clone();
+        edit(&mut r);
+        wire::decode(&msg("receipt", r)).is_err()
+    };
+    assert!(bad(&|r| r["result"]["reply_message_ids"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("x"))));
+    assert!(bad(
+        &|r| r["result"]["reply_message_ids"][0] = json!(id128(0) + "0")
+    ));
+    assert!(bad(&|r| r["result"]["outcome"] = json!("done")));
+    assert!(bad(&|r| r["kind"] = json!("interrupt")));
+    assert!(bad(&|r| r["state"] = json!("outcome_unknown")));
+    assert!(bad(&|r| r["result"]["replies"] = json!("some")));
+    assert!(bad(&|r| r["result"]["extra"] = json!(1)));
+    let many = |n: usize| msg("receipts", json!({"receipts": vec![receipt.clone(); n]}));
+    let full = many(64);
+    assert!(wire::decode(&full).is_ok());
+    assert!(full.len() < wire::MAX_MESSAGE_BYTES);
+    assert!(wire::decode(&many(65)).is_err());
 }

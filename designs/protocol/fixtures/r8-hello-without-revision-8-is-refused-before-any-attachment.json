@@ -217,7 +217,9 @@
      "chat.coverage",
      "receipt.result",
      "approval.session_rules",
-     "approval.card_reason"
+     "approval.card_reason",
+     "chat.send_acquire",
+     "approval.lease_free"
     ]
    },
    "capture": {

@@ -1,13 +1,17 @@
 //! Client-side state machines for atem-session v1: the control-lease client
-//! (§5 reply-correlation rules 1–5) and the session registry client (§4),
-//! which also keeps the pending approvals (r7) of the processes it holds.
+//! (§5 reply-correlation rules 1–5), the session registry client (§4),
+//! which also keeps the pending approvals (r7) of the processes it holds,
+//! and r8 revision admission (`AdmissionClient`, §A).
 //!
 //! Both are pure: the caller passes a monotonic `now_ms` with every event and
 //! performs any I/O they ask for (`RegistryClient::take_list_request`).
 //! Neither relies on a timer having fired: every query and every reply checks
 //! `now >= deadline` itself.
 
-use super::wire::{ApprovalRequest, Binding, Descriptor, Op, SessionMessage, SessionState, Target};
+use super::revision::{CHAT_HISTORY, CHAT_LOOKUP, KNOWN_FEATURES, REVISION};
+use super::wire::{
+    ApprovalRequest, Binding, Descriptor, Envelope, Op, SessionMessage, SessionState, Target,
+};
 use std::collections::{BTreeMap, HashMap};
 
 // ── Control lease (§5) ────────────────────────────────────────────────────
@@ -17,6 +21,9 @@ pub enum LeaseRequest {
     Acquire,
     Renew,
     Release,
+    /// An acquiring Send (r8 §F): a `prompt` submit with `acquire: true`,
+    /// whose admitting `receipt` carries the lease.
+    Send,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,8 +63,12 @@ pub enum ReplyOutcome {
     Mismatch,
     /// The granted epoch is older than one already seen in `lease_changed`.
     StaleEpoch,
-    /// Not a lease reply (`lease`, `lease_released` or `error`).
+    /// Not a lease reply (`lease`, `lease_released` or `error`, or a
+    /// `receipt` to an acquiring Send).
     NotALeaseReply,
+    /// A reply to an acquiring Send that grants nothing: a refusal (the
+    /// host changed nothing), or a receipt without `lease`.
+    NoLease,
 }
 
 /// One client's view of its control lease on one session.
@@ -161,7 +172,7 @@ impl LeaseClient {
             return Err(RequestRefused::TooManyInFlight);
         }
         match kind {
-            LeaseRequest::Acquire => {}
+            LeaseRequest::Acquire | LeaseRequest::Send => {}
             LeaseRequest::Renew | LeaseRequest::Release if self.deadline.is_none() => {
                 return Err(RequestRefused::NotControlling);
             }
@@ -180,12 +191,16 @@ impl LeaseClient {
         Ok(())
     }
 
-    /// Applies a host reply (`lease`, `lease_released` or `error`) per §5
-    /// rules 1–5.
+    /// Applies a host reply (`lease`, `lease_released` or `error`, or the
+    /// `receipt` admitting an acquiring Send) per §5 rules 1–5 and r8 §F's
+    /// client rule: a Send's `lease` applies only to a submit still
+    /// outstanding on this attachment (a new attachment starts a new
+    /// `LeaseClient`), with an epoch not lower than any seen since, and a
+    /// deadline (send time + `ms_left`) still ahead.
     pub fn on_reply(&mut self, msg: &SessionMessage, now_ms: u64) -> ReplyOutcome {
         if !matches!(
             msg.op,
-            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. }
+            Op::Lease { .. } | Op::LeaseReleased {} | Op::Error { .. } | Op::Receipt(_)
         ) {
             return ReplyOutcome::NotALeaseReply;
         }
@@ -198,8 +213,22 @@ impl LeaseClient {
             self.become_viewer();
             return ReplyOutcome::DeadlinePassed;
         }
+        if pending.kind == LeaseRequest::Send {
+            // A refused Send changed nothing on the host, and a receipt
+            // without `lease` (a duplicate) grants nothing.
+            return match &msg.op {
+                Op::Receipt(r) if r.target != self.target => ReplyOutcome::Mismatch,
+                Op::Receipt(r) => match &r.lease {
+                    Some(l) => self.grant(pending, l.lease_epoch, l.ms_left, now_ms),
+                    None => ReplyOutcome::NoLease,
+                },
+                Op::Error { .. } => ReplyOutcome::NoLease,
+                _ => ReplyOutcome::Mismatch,
+            };
+        }
         match &msg.op {
             Op::Lease { binding, ms_left } => self.apply_lease(pending, binding, *ms_left, now_ms),
+            Op::Receipt(_) => ReplyOutcome::Mismatch,
             Op::LeaseReleased {} if pending.kind == LeaseRequest::Release => {
                 self.become_viewer();
                 ReplyOutcome::Applied
@@ -227,6 +256,11 @@ impl LeaseClient {
         if binding.target != self.target || binding.attachment_gen != self.attachment_gen {
             return ReplyOutcome::Mismatch;
         }
+        self.grant(pending, epoch, ms_left, now_ms)
+    }
+
+    /// A granted lease (`lease` reply, or an admitting Send's `lease`).
+    fn grant(&mut self, pending: Pending, epoch: u64, ms_left: u64, now_ms: u64) -> ReplyOutcome {
         if self.highest_epoch_seen.is_some_and(|h| epoch < h) {
             return ReplyOutcome::StaleEpoch;
         }
@@ -244,9 +278,10 @@ impl LeaseClient {
                 return ReplyOutcome::Mismatch;
             }
             (LeaseRequest::Renew, Some(_)) => candidate,
-            // Rule 4: a repeat acquire never extends.
-            (LeaseRequest::Acquire, Some(prev)) => prev.min(candidate),
-            (LeaseRequest::Acquire, None) => candidate,
+            // Rule 4: a repeat acquire (or a Send under the own lease)
+            // never extends.
+            (LeaseRequest::Acquire | LeaseRequest::Send, Some(prev)) => prev.min(candidate),
+            (LeaseRequest::Acquire | LeaseRequest::Send, None) => candidate,
         };
         // Rule 5: never hold control with zero remaining lifetime.
         if now_ms >= new {
@@ -566,6 +601,289 @@ impl RegistryClient {
     }
 }
 
+// ── Revision admission (r8 §A) ────────────────────────────────────────────
+
+/// Where the client stands with the host's `welcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// `hello` sent, no `welcome` yet: nothing is sent or applied.
+    Awaiting,
+    /// The welcome named revision 8; `features` are the advertised ones this
+    /// client knows, in the host's order.
+    Admitted { features: Vec<String> },
+    /// The welcome named no revision or another one (an older host): the
+    /// attachment is refused for good. The client sends nothing further,
+    /// applies nothing it receives and tells the user the host's Atem must
+    /// be updated.
+    Refused,
+}
+
+/// Why the client won't send something (shown to the user).
+pub const HOST_TOO_OLD: &str = "the host's Atem must be updated (atem-session revision 8)";
+pub const NOT_WELCOMED: &str = "not welcomed yet";
+
+/// The client side of r8 revision admission: checks `welcome.revision`
+/// before anything else, enables only the advertised features it knows and
+/// refuses locally to send an op of a feature the host didn't advertise.
+#[derive(Debug, Clone)]
+pub struct AdmissionClient {
+    state: Admission,
+}
+
+impl AdmissionClient {
+    /// A client that sent `hello` and waits for the welcome.
+    pub fn awaiting() -> Self {
+        Self {
+            state: Admission::Awaiting,
+        }
+    }
+
+    /// A client already admitted with these advertised features (unknown
+    /// names are dropped).
+    pub fn admitted(advertised: &[&str]) -> Self {
+        let mut c = Self::awaiting();
+        let features: Vec<String> = advertised.iter().map(|f| f.to_string()).collect();
+        c.on_welcome(Some(REVISION), Some(&features));
+        c
+    }
+
+    pub fn state(&self) -> &Admission {
+        &self.state
+    }
+
+    /// The client sends a new `hello`: a new handshake (`Err` once refused,
+    /// it sends nothing further). `check_send` calls it for a `hello`.
+    pub fn hello_sent(&mut self) -> Result<(), &'static str> {
+        if self.state == Admission::Refused {
+            return Err(HOST_TOO_OLD);
+        }
+        self.state = Admission::Awaiting;
+        Ok(())
+    }
+
+    /// The host's `welcome`: admitted only with `revision == 8`; anything
+    /// else refuses the attachment for good. Returns whether it was
+    /// admitted (so the welcome may be applied).
+    pub fn on_welcome(&mut self, revision: Option<u64>, features: Option<&[String]>) -> bool {
+        if self.state == Admission::Refused {
+            return false;
+        }
+        if revision != Some(REVISION) {
+            self.state = Admission::Refused;
+            return false;
+        }
+        let mut enabled: Vec<String> = Vec::new();
+        for f in features.unwrap_or_default() {
+            if KNOWN_FEATURES.contains(&f.as_str()) && !enabled.contains(f) {
+                enabled.push(f.clone());
+            }
+        }
+        self.state = Admission::Admitted { features: enabled };
+        true
+    }
+
+    pub fn is_admitted(&self) -> bool {
+        matches!(self.state, Admission::Admitted { .. })
+    }
+
+    /// Host messages apply only once admitted.
+    pub fn applies(&self) -> bool {
+        self.is_admitted()
+    }
+
+    pub fn revision(&self) -> Option<u64> {
+        self.is_admitted().then_some(REVISION)
+    }
+
+    /// The advertised features this client enabled (empty unless admitted).
+    pub fn features_enabled(&self) -> &[String] {
+        match &self.state {
+            Admission::Admitted { features } => features,
+            _ => &[],
+        }
+    }
+
+    pub fn enabled(&self, feature: &str) -> bool {
+        self.features_enabled().iter().any(|f| f == feature)
+    }
+
+    /// Whether the client may send `env` now; `Err` is the reason it
+    /// refuses locally (nothing is sent). Every outgoing message goes
+    /// through here, a `hello` too: an allowed `hello` starts a new
+    /// handshake (`hello_sent`), so callers never call that themselves.
+    pub fn check_send(&mut self, env: &Envelope) -> Result<(), String> {
+        if matches!(env, Envelope::Session(m) if matches!(m.op, Op::Hello { .. })) {
+            return self.hello_sent().map_err(str::to_string);
+        }
+        match &self.state {
+            Admission::Refused => return Err(HOST_TOO_OLD.into()),
+            Admission::Awaiting => return Err(NOT_WELCOMED.into()),
+            Admission::Admitted { .. } => {}
+        }
+        match required_feature(env) {
+            Some(f) if !self.enabled(f) => Err(format!("feature {f} not advertised")),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The feature an outgoing message needs (§A): chat `history` by `turn_id`
+/// or `request_id` is `chat.lookup`, by `before`/`next` `chat.history`.
+pub fn required_feature(env: &Envelope) -> Option<&'static str> {
+    let Envelope::Family(f) = env else {
+        return None;
+    };
+    let data = f.data.as_ref()?;
+    if f.family != "agentChat" || data.get("op").and_then(|o| o.as_str()) != Some("history") {
+        return None;
+    }
+    if data.get("turn_id").is_some() || data.get("request_id").is_some() {
+        Some(CHAT_LOOKUP)
+    } else {
+        Some(CHAT_HISTORY)
+    }
+}
+
+/// One chat conversation as an r8 client keeps it (§B, §C): an ordered
+/// stream per `opened`, message ids in timeline order, whether its history
+/// loaded (`history_end`) and is truncated. Truncation, holes and
+/// `coverage` events are shown, never a reason to reopen; the client
+/// reopens only on a sequence gap, another `generation` or a `close` with a
+/// `reason`.
+#[derive(Debug, Default, Clone)]
+pub struct ChatView {
+    pub session_id: String,
+    generation: Option<String>,
+    /// The next sequence expected (`None` until `opened`).
+    next: Option<u64>,
+    pub loaded: bool,
+    pub truncated: bool,
+    /// Message ids, timeline order.
+    pub messages: Vec<String>,
+    /// The current page's messages (`history: true`, no `after_message_id`).
+    page: Vec<String>,
+    /// Opens sent after the first.
+    pub reopens: u64,
+}
+
+impl ChatView {
+    fn reset(&mut self) {
+        self.generation = None;
+        self.next = None;
+        self.loaded = false;
+        self.truncated = false;
+        self.messages.clear();
+        self.page.clear();
+    }
+
+    fn insert_after(&mut self, id: &str, after: Option<&str>) {
+        if self.messages.iter().any(|m| m == id) {
+            return;
+        }
+        let at = after
+            .and_then(|a| self.messages.iter().position(|m| m == a))
+            .map_or(0, |i| i + 1);
+        self.messages.insert(at, id.to_string());
+    }
+}
+
+/// The client's chat conversations, by `conversationId`.
+#[derive(Debug, Default)]
+pub struct ChatClient {
+    conversations: BTreeMap<String, ChatView>,
+}
+
+impl ChatClient {
+    /// The client opens `conversation` (its `open` is sent).
+    pub fn open(&mut self, conversation: &str, session_id: &str) {
+        let view = self
+            .conversations
+            .entry(conversation.to_string())
+            .or_default();
+        view.session_id = session_id.to_string();
+        view.reset();
+    }
+
+    /// The only conversation (client scenarios open one).
+    pub fn only(&self) -> Option<&ChatView> {
+        match self.conversations.len() {
+            1 => self.conversations.values().next(),
+            _ => None,
+        }
+    }
+
+    /// A chat-v1 message from the host; returns what the client sends in
+    /// answer (an `open` when it resyncs).
+    pub fn on_message(&mut self, data: &serde_json::Value) -> Option<serde_json::Value> {
+        let conversation = data["conversationId"].as_str()?.to_string();
+        let view = self.conversations.get_mut(&conversation)?;
+        let op = data["op"].as_str().unwrap_or_default();
+        let resync = |view: &mut ChatView| {
+            view.reset();
+            view.reopens += 1;
+            Some(
+                serde_json::json!({"type": "agentChat", "data": {"v": 1, "op": "open",
+                "conversationId": conversation, "agentId": view.session_id}}),
+            )
+        };
+        match op {
+            "close" if data.get("reason").is_some() => return resync(view),
+            "opened" => {
+                view.reset();
+                view.generation = data["generation"].as_str().map(str::to_string);
+                view.next = Some(1);
+                return None;
+            }
+            _ => {}
+        }
+        let sequence = data["sequence"].as_u64()?;
+        let expected = view.next?;
+        if data["generation"].as_str() != view.generation.as_deref() {
+            return resync(view);
+        }
+        if sequence < expected {
+            return None;
+        }
+        if sequence > expected {
+            return resync(view);
+        }
+        view.next = Some(expected + 1);
+        let id = data["messageId"].as_str().unwrap_or_default();
+        match op {
+            // A recovered message (`after_message_id`, `null` when it is
+            // the oldest) goes after its neighbour; a page's waits for its
+            // `history_end`.
+            "message" if data["history"] == true => match data.get("after_message_id") {
+                Some(after) => view.insert_after(id, after.as_str()),
+                None => view.page.push(id.to_string()),
+            },
+            "message" => {
+                if !view.messages.iter().any(|m| m == id) {
+                    view.messages.push(id.to_string());
+                }
+            }
+            "history_end" => {
+                view.loaded = true;
+                view.truncated = data["page"]["truncated"] == true;
+                let page = std::mem::take(&mut view.page);
+                let older = matches!(data["page"]["selector"].as_str(), Some("newest" | "before"));
+                let new: Vec<String> = page
+                    .into_iter()
+                    .filter(|p| !view.messages.contains(p))
+                    .collect();
+                if older {
+                    view.messages.splice(0..0, new);
+                } else {
+                    view.messages.extend(new);
+                }
+            }
+            "coverage" => view.truncated = data["truncated"] == true,
+            _ => {}
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +1130,8 @@ mod tests {
         let err = Op::Error {
             code: ErrorCode::StaleLease,
             detail: None,
+            revision: None,
+            controller: None,
         };
         assert_eq!(
             c.on_reply(&reply(&id(2), err), 5_100),
@@ -1190,5 +1510,32 @@ mod tests {
             r.on_message(&Op::List {}),
             RegistryOutcome::NotARegistryMessage
         );
+    }
+
+    /// Every send goes through `check_send`, a `hello` too: it starts a new
+    /// handshake, and once the attachment was refused nothing is sent.
+    #[test]
+    fn a_hello_through_check_send_starts_a_new_handshake() {
+        let hello = Envelope::Session(SessionMessage {
+            id: "11111111-1111-4111-8111-000000000001".into(),
+            re: None,
+            op: Op::Hello {
+                revision: Some(REVISION),
+                resume: None,
+            },
+        });
+        let list = Envelope::Session(SessionMessage {
+            id: "11111111-1111-4111-8111-000000000002".into(),
+            re: None,
+            op: Op::List {},
+        });
+        let mut c = AdmissionClient::admitted(&[]);
+        assert!(c.check_send(&list).is_ok());
+        assert!(c.check_send(&hello).is_ok());
+        assert_eq!(c.state(), &Admission::Awaiting);
+        assert_eq!(c.check_send(&list), Err(NOT_WELCOMED.into()));
+        assert!(!c.on_welcome(Some(7), None));
+        assert_eq!(c.check_send(&hello), Err(HOST_TOO_OLD.into()));
+        assert_eq!(c.check_send(&list), Err(HOST_TOO_OLD.into()));
     }
 }

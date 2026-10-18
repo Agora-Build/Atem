@@ -164,11 +164,22 @@ fn strict_parser_rules() {
 
 // ── fixtures: every wire message decodes and round-trips ─────────────────
 
+/// A placeholder for a captured UUID: `${aid}`, `${a1}`…, `${gen2}`,
+/// `${…ctl}`.
+fn is_captured_id(s: &str) -> bool {
+    let numbered_approval = s
+        .strip_prefix("${a")
+        .and_then(|r| r.strip_suffix('}'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    s == "${aid}" || s == "${gen2}" || s.ends_with("ctl}") || numbered_approval
+}
+
 /// Replaces harness placeholders (`${name}`) with a valid value (a captured
 /// approval id or attachment generation is a UUID).
 fn substitute(v: &mut Value) {
     match v {
-        Value::String(s) if s == "${aid}" || s == "${gen2}" => {
+        // Captured ids (approval ids, generations, controller sessions).
+        Value::String(s) if is_captured_id(s) => {
             *s = "88888888-8888-4888-8888-888888888888".to_string()
         }
         Value::String(s) if s.contains("${") => *s = "stream-0001".to_string(),
@@ -224,8 +235,12 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let file = read_fixture(&name);
-        // r8-draft fixtures use wire forms the r7.2 decoder doesn't know yet.
-        if file.get("requires").is_some() {
+        // r8 fixtures whose work isn't implemented use wire forms the
+        // decoder doesn't know yet.
+        let fixture_name = file["name"].as_str().unwrap_or_default();
+        let r8_waiting = fixture_name.starts_with("r8-")
+            && super::revision::r8_fixture_runnable(fixture_name).is_err();
+        if r8_waiting {
             continue;
         }
         let steps = file["steps"].as_array().unwrap();
@@ -236,10 +251,17 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
                 substitute(&mut msg);
                 total += 1;
                 if refused_by_next(steps, i) {
-                    let e = wire::decode(&serde_json::to_vec(&msg).unwrap())
-                        .expect_err(&format!("{name}: refused message decoded: {msg}"));
-                    assert_eq!(e.code, ErrorCode::UnsupportedVersion);
                     refused += 1;
+                    match wire::decode(&serde_json::to_vec(&msg).unwrap()) {
+                        Err(e) => assert_eq!(e.code, ErrorCode::UnsupportedVersion),
+                        // r8 refusals the host makes, not the decoder: a
+                        // `hello` without `revision: 8`, anything before
+                        // its `welcome`, `open.before` (§A).
+                        Ok(_) if fixture_name.starts_with("r8-") => {
+                            round_trip(&msg);
+                        }
+                        Ok(_) => panic!("{name}: refused message decoded: {msg}"),
+                    }
                     continue;
                 }
                 match round_trip(&msg) {
@@ -302,8 +324,11 @@ fn all_ops() -> Vec<Value> {
     let receipt = json!({"request_id":RE,"target":target(),"kind":"prompt","state":"completed",
                          "detail":"done","updated_at":1760500000000u64});
     vec![
-        session("hello", json!({})),
-        session("hello", json!({"resume":{"controller_session":RE}})),
+        session("hello", json!({"revision":8})),
+        session(
+            "hello",
+            json!({"revision":8,"resume":{"controller_session":RE}}),
+        ),
         session(
             "challenge",
             json!({"re":RE,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}),
@@ -314,7 +339,8 @@ fn all_ops() -> Vec<Value> {
             json!({"re":RE,"account_id":"account-a","atem_device_id":"host-a",
             "host_trust_gen":1,"runtime_gen":PG,"controller_session":RE,"attachment_gen":AG,
             "client_kind":"native","permissions":["view","control"],
-            "authorization_ms_left":86400000,"server_time":1760500000000u64}),
+            "authorization_ms_left":86400000,"server_time":1760500000000u64,
+            "revision":8,"features":["approval.session_rules","chat.future-thing"]}),
         ),
         session("list", json!({})),
         session(
@@ -974,6 +1000,28 @@ fn enums_and_codes() {
         "permissions",
         Some(json!(["view", "root"])),
     ));
+    // r8 welcome: features are opaque names, bounded.
+    rejects(&with(
+        all_ops()[4].clone(),
+        "features",
+        Some(json!(["bad name"])),
+    ));
+    rejects(&with(
+        all_ops()[4].clone(),
+        "features",
+        Some(json!(vec!["f"; 65])),
+    ));
+    rejects(&with(all_ops()[4].clone(), "revision", Some(json!("8"))));
+    rejects(&session(
+        "error",
+        json!({"code":"invalid_request","revision":-1}),
+    ));
+    assert!(
+        wire::decode(
+            &serde_json::to_vec(&session("error", json!({"code":"invalid_request"}))).unwrap()
+        )
+        .is_ok()
+    );
     rejects(&with(all_ops()[20].clone(), "state", Some(json!("done"))));
     rejects(&with(
         all_ops()[20].clone(),

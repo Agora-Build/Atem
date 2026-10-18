@@ -1,4 +1,55 @@
-# Atem host handoff: atem-session r6 on `feat/runtime`, r7 approvals on `feat/approvals`
+# Atem host handoff: atem-session r8 on `feat/r8` (r6 runtime, r7 approvals)
+
+## atem-session r8 on `feat/r8` (2026-10-18)
+
+Atem's host now speaks **r8 only** ([atem-session-v1.md](atem-session-v1.md),
+appendix "r8", authoritative). The consolidated note for the Astation agent,
+with every fixture change, every reading to confirm and the work Astation
+must do, is [r8-astation-handoff.md](r8-astation-handoff.md).
+
+- **Astation must send `revision: 8`** in every session-v1 `hello`. A `hello`
+  without it (or with another number) is answered
+  `error{code:"unsupported_version", revision: 8, detail}` and nothing else:
+  no attachment, no `welcome`, and every later request on that link is
+  refused as before `welcome`.
+- `welcome` carries `revision: 8` and `features`, all nine:
+  `chat.history_end`, `chat.history`, `chat.lookup`, `chat.coverage`,
+  `receipt.result`, `approval.session_rules`, `approval.card_reason`,
+  `chat.send_acquire`, `approval.lease_free`.
+- Live: history pages in the conversation's sequenced stream (`open` ends
+  with `history_end`; `history{before|turn_id|request_id|next}`; coverage,
+  truncation, holes and the `coverage` event; a backlog gap is reloaded and
+  reported, never a forced reopen; `close.reason`), `receipt.result` on
+  completed prompts, chat Send that acquires the lease with the prompt
+  (session `submit` or chat-v1 `submit` with `acquire`, `takeover`,
+  `expected_controller`; the admitting reply carries `lease`; `lease_held`
+  names `controller`), lease-free approval answers (`control` only; the
+  first admitted answer wins; `acquire` refused), final cards with
+  `reason`, the submitter principal with its durable control fence and
+  clean close (§H), and one admission persistence rule (§I).
+- Removed and refused (`unsupported_version`): chat `open.before`/
+  `open.generation`, the `status.page` marker, `acquire` on an approval
+  answer, `hello` without `revision`.
+- Deleted r7 fixtures and their r8 replacements:
+
+  | deleted (r7) | replaced by |
+  |---|---|
+  | `approval-answer-with-acquire-takes-control-from-the-holder` | `r8-approval-answer-with-acquire-is-refused` |
+  | `approval-late-answer-after-push-resolved-is-stale-target` | `r8-approval-late-answer-after-push-resolved-is-stale-target` |
+  | `approval-opens-without-a-lease-holder` | `r8-approval-opens-without-a-lease-holder` |
+  | `approval-stays-pending-when-the-lease-ends` | `r8-approval-stays-pending-when-the-lease-ends` |
+  | `approval-survives-takeover` | `r8-approval-survives-takeover` |
+
+- Results: all 72 fixtures pass in the core runner; 25 pass against the real
+  runtime and 40 can't be expressed there (see "Shared fixtures (r8)").
+- **Pin**: the merge commit of the r8 PR into `main`. Until it merges, pin
+  `feat/r8` at `10e089a`.
+
+The sections below describe the runtime (r6) and approvals (r7) as they
+were handed over; where they say an answer carries `acquire` or needs the
+lease, r8 §G replaces it.
+
+## Earlier handoff: atem-session r6 on `feat/runtime`, r7 approvals on `feat/approvals`
 
 For the Astation team, 2026-10-16. The Atem side of
 [atem-session-v1.md](atem-session-v1.md) (r6, compatibility mode) now runs in
@@ -303,52 +354,134 @@ Known limits: filesystems and logs with whole-second times allow same-second
 races when pairing a prompt or a turn end; tool-result evidence keeps 1 s
 slack; a hook read after its npm-wrapper parent exited is dropped (harmless).
 
-## Shared fixtures against the real runtime
+## Shared fixtures (r8)
 
-`tests/runtime_fixtures_binary.rs` runs every host scenario in `fixtures/`
-against the `atem runtime` binary on a temp profile (paired and verified as
-the fixture's account, device and trust generation), real `atem worker`
-processes with a fake agent in their PTYs (a fake Claude that fires Atem's
-chat hooks and writes a transcript; turn ids `turn-<n>`), a local frontend
-for local input, and a fake Astation that authenticates the runtime's link
-and plays the fixture's client. Runtime-chosen ids (session ids, process,
-runtime and attachment generations) are translated; the clock and PTY write
-faults use debug-only hooks (`src/runtime/test_hooks.rs`). Terminal `frame`s
-and `written` acks are not queued for `expect` (the acks count toward
-`pty_writes_dropped`).
+Two runners execute `fixtures/` (format in `fixtures/schema.md`):
 
-| Fixture | Result |
-|---|---|
-| dispatch-failure-after-partial-write-is-outcome-unknown | pass (incl. `restart_runtime` + `reconnect`) |
-| lease-expiry-at-the-deadline-needs-no-timer | pass (the remote chunk held at the PTY writer past the deadline is dropped by its `not_after`) |
-| dispatch-failure-before-any-effect-is-rejected | pass (incl. `restart_runtime` + `reconnect`) |
-| duplicate-submit-returns-receipt-and-reuse-is-rejected | pass |
-| exited-session-refuses-work-before-the-lease-check | pass (`crash_worker` = SIGKILL to the worker) |
-| family-errors-and-chat-results | pass |
-| lease-expires-without-renewal | pass |
-| local-input-revokes-the-lease-and-drops-queued-bytes | pass |
-| reconnect-restarts-the-registry-sequence | pass |
-| second-hello-replaces-the-attachment | pass (r7.1) |
-| removed-ops-have-no-effect | pass folded onto one attachment (the lease holder itself sends every removed op, with and without the lease; `lease_changed` for the second client left out); the two-attachment original runs in the core harness |
-| receipt-query-is-scoped-to-the-exact-target | core harness only (3 attachments) |
-| takeover-moves-control-and-the-old-holder-becomes-a-viewer | core harness only (3 attachments) |
-| closed-session-refuses-work-before-the-lease-check | core harness only: the runtime has no trigger that closes a running session yet |
-| approval-allow-once-is-handed-to-the-agent-and-completes, approval-allow-always-must-name-an-offered-rule, approval-deny-carries-the-message-to-the-agent, approval-duplicate-submit-returns-the-receipt, approval-answered-in-the-terminal-first-refuses-the-late-remote-answer, approval-pending-is-sent-again-after-list, approval-stays-pending-when-the-lease-ends, approval-opens-without-a-lease-holder, approval-late-answer-after-push-resolved-is-stale-target | pass (`feat/approvals`; the fake Claude runs the real hook, see Approvals) |
-| approval-needs-control-and-the-lease, approval-survives-takeover, approval-answer-with-acquire-takes-control-from-the-holder | core harness only (2 attachments) |
+- **Core runner** (`src/session_protocol/fixtures.rs`, `cargo test --bin
+  atem session_protocol::fixtures`): `SessionHost` through the fixtures' fake
+  runtime, once with the memory journal and once with the `FileJournal`.
+  **All 72 fixtures pass** (65 host, 7 client), with both journals; every
+  `r8-*` one is gated on the host work it needs (`R8_FIXTURE_NEEDS` in
+  `src/session_protocol/revision.rs`) and all of it is implemented.
+- **Real runtime** (`tests/runtime_fixtures_binary.rs`, `cargo test --test
+  runtime_fixtures_binary`; `ATEM_FIXTURE=<name>` runs one): every host
+  scenario against the `atem runtime` binary on a temp profile (paired and
+  verified as the fixture's account, device and trust generation), real
+  `atem worker` processes with a fake agent in their PTYs (a fake Claude
+  that fires Atem's chat hooks and writes a transcript, turn ids
+  `turn-<n>`; chat content a fixture names is appended to that transcript
+  as Claude Code writes it, and after `chat_history` the harness waits on a
+  probe conversation that never reaches the client), a local frontend for
+  local input, and a fake Astation that authenticates the runtime's link
+  and plays the fixture's client. Runtime-chosen ids (session ids, process,
+  runtime and attachment generations, rule ids) are translated; the clock
+  and PTY write faults use debug-only hooks (`src/runtime/test_hooks.rs`).
+  Terminal `frame`s and `written` acks are not queued for `expect` (the
+  acks count toward `pty_writes_dropped`). **25 pass, 40 are not run, 0
+  fail**: 35 need two or three attachments (the runtime holds one
+  Astation link, so one attachment), one needs `close_session` (nothing in
+  the runtime closes a running session), and four history scenarios need
+  what a real agent can't be made to produce (below). A not-run reason is
+  printed for each; a scenario that starts passing fails the test until it
+  is taken off the list. `removed-ops-have-no-effect` also runs folded onto
+  one attachment (`removed_ops_have_no_effect_on_one_attachment`).
 
-The multi-attachment fixtures (receipt-query, removed-ops, takeover) run
-only in the core harness (`SessionHost` in `src/session_protocol/fixtures.rs`)
-because the runtime holds one Astation link, so one attachment, at a time
-today; closed-session runs only there because nothing in the runtime closes
-a running session yet.
+| Fixture | Side | Core runner | Real runtime |
+|---|---|---|---|
+| `approval-allow-always-must-name-an-offered-rule` | host | pass | pass |
+| `approval-allow-once-is-handed-to-the-agent-and-completes` | host | pass | pass |
+| `approval-answered-in-the-terminal-first-refuses-the-late-remote-answer` | host | pass | pass |
+| `approval-deny-carries-the-message-to-the-agent` | host | pass | pass |
+| `approval-duplicate-submit-returns-the-receipt` | host | pass | pass |
+| `approval-needs-control-and-the-lease` | host | pass | not run: 2 attachments (one link) |
+| `approval-pending-is-sent-again-after-list` | host | pass | pass |
+| `approval-rule-revoke-needs-control-not-the-lease` | host | pass | not run: 3 attachments (one link) |
+| `closed-session-refuses-work-before-the-lease-check` | host | pass | not run: the runtime never closes a running session |
+| `dispatch-failure-after-partial-write-is-outcome-unknown` | host | pass | pass |
+| `dispatch-failure-before-any-effect-is-rejected` | host | pass | pass |
+| `duplicate-submit-returns-receipt-and-reuse-is-rejected` | host | pass | pass |
+| `exited-session-refuses-work-before-the-lease-check` | host | pass | pass |
+| `family-errors-and-chat-results` | host | pass | pass |
+| `late-renew-reply-does-not-resurrect-control` | client | pass | — (client machines run in the core runner only) |
+| `lease-expires-without-renewal` | host | pass | pass |
+| `lease-expiry-at-the-deadline-needs-no-timer` | host | pass | pass |
+| `local-input-revokes-the-lease-and-drops-queued-bytes` | host | pass | pass |
+| `r8-approval-answer-by-a-non-holder-leaves-the-lease` | host | pass | not run: 3 attachments (one link) |
+| `r8-approval-answer-keeps-the-holders-deadline` | host | pass | not run: 2 attachments (one link) |
+| `r8-approval-answer-to-a-closed-request-is-stale-target` | host | pass | not run: 2 attachments (one link) |
+| `r8-approval-answer-with-acquire-is-refused` | host | pass | not run: 2 attachments (one link) |
+| `r8-approval-answers-crossing-first-wins` | host | pass | not run: 2 attachments (one link) |
+| `r8-approval-card-carries-the-close-reason` | host | pass | pass |
+| `r8-approval-late-answer-after-push-resolved-is-stale-target` | host | pass | pass |
+| `r8-approval-opens-without-a-lease-holder` | host | pass | pass |
+| `r8-approval-stays-pending-when-the-lease-ends` | host | pass | pass |
+| `r8-approval-survives-takeover` | host | pass | not run: 2 attachments (one link) |
+| `r8-backlog-hole-is-reported-not-reopened` | host | pass | not run: no backlog fault in the real worker |
+| `r8-clean-close-runs-queued-work-once-its-principal-is-confirmed` | host | pass | not run: 2 attachments (one link) |
+| `r8-client-delayed-send-reply-never-restores-control` | client | pass | — (client machines run in the core runner only) |
+| `r8-client-enables-only-advertised-features` | client | pass | — (client machines run in the core runner only) |
+| `r8-client-refuses-a-host-without-revision-8` | client | pass | — (client machines run in the core runner only) |
+| `r8-client-shows-truncation-and-resyncs-only-on-a-sequence-gap` | client | pass | — (client machines run in the core runner only) |
+| `r8-control-fence-holds-when-a-rejection-write-fails` | host | pass | not run: 2 attachments (one link) |
+| `r8-crash-after-durable-acceptance-grants-no-lease` | host | pass | not run: 2 attachments (one link) |
+| `r8-crash-rejects-queued-work-whose-history-is-unknown` | host | pass | not run: 2 attachments (one link) |
+| `r8-delayed-send-reply-does-not-regrant-lost-control` | host | pass | not run: 2 attachments (one link) |
+| `r8-disconnect-right-after-acceptance` | host | pass | not run: 2 attachments (one link) |
+| `r8-double-write-failure-takeover-never-runs` | host | pass | not run: 2 attachments (one link) |
+| `r8-duplicate-send-never-reacquires-or-replays` | host | pass | not run: 2 attachments (one link) |
+| `r8-expired-lease-is-checked-at-admission` | host | pass | not run: 2 attachments (one link) |
+| `r8-failed-fence-write-rejects-queued-work-at-once` | host | pass | not run: 2 attachments (one link) |
+| `r8-failed-fence-write-then-control-restored-never-runs` | host | pass | not run: 2 attachments (one link) |
+| `r8-failed-persistence-changes-no-lease` | host | pass | not run: 2 attachments (one link) |
+| `r8-hello-without-revision-8-is-refused-before-any-attachment` | host | pass | pass |
+| `r8-history-page-and-live-events-share-one-ordered-stream` | host | pass | pass |
+| `r8-history-selectors-are-exclusive-and-validated` | host | pass | pass |
+| `r8-local-input-wins-over-a-send` | host | pass | not run: 2 attachments (one link) |
+| `r8-long-turn-is-recovered-in-bounded-pages` | host | pass | pass |
+| `r8-open-with-before-is-refused` | host | pass | pass |
+| `r8-ownership-is-checked-at-admission-not-as-displayed` | host | pass | not run: 2 attachments (one link) |
+| `r8-process-replaced-before-dispatch` | host | pass | not run: 2 attachments (one link) |
+| `r8-receipt-result-bounds-reply-message-ids` | host | pass | not run: the real adapter also sends sequenced `status` around a remote turn |
+| `r8-recovered-work-needs-its-principal-confirmed` | host | pass | not run: 2 attachments (one link) |
+| `r8-revoked-control-fences-work-across-reconnect-and-restart` | host | pass | not run: 2 attachments (one link) |
+| `r8-revoked-control-refuses-the-send-and-its-queued-prompt` | host | pass | not run: 2 attachments (one link) |
+| `r8-send-acquire-wire-rules` | host | pass | not run: 2 attachments (one link) |
+| `r8-send-acquires-an-unowned-session` | host | pass | not run: 2 attachments (one link) |
+| `r8-send-refused-while-another-holds-then-takeover` | host | pass | not run: 2 attachments (one link) |
+| `r8-send-under-the-own-lease-checks-the-epoch` | host | pass | not run: 2 attachments (one link) |
+| `r8-stale-or-foreign-next-token-is-stale-target` | host | pass | not run: real retention evicts only past 500 messages / 8 MiB |
+| `r8-stale-takeover-confirmation-is-refused` | host | pass | not run: 3 attachments (one link) |
+| `r8-truncated-history-reopens-once-then-stays-live` | host | pass | not run: real retention evicts only past 500 messages / 8 MiB |
+| `r8-two-simultaneous-sends-acquire-once` | host | pass | not run: 2 attachments (one link) |
+| `receipt-query-is-scoped-to-the-exact-target` | host | pass | not run: 3 attachments (one link) |
+| `reconnect-restarts-the-registry-sequence` | host | pass | pass |
+| `registry-restarts-on-a-new-attachment` | client | pass | — (client machines run in the core runner only) |
+| `removed-ops-have-no-effect` | host | pass | not run: 2 attachments (one link) |
+| `runtime-epoch-and-sequence-ordering` | client | pass | — (client machines run in the core runner only) |
+| `second-hello-replaces-the-attachment` | host | pass | pass |
+| `takeover-moves-control-and-the-old-holder-becomes-a-viewer` | host | pass | not run: 3 attachments (one link) |
 
-The same fixtures all pass against the in-process `SessionHost`
-(`src/session_protocol/fixtures.rs`, with the memory and the file journal).
+Why the four history scenarios stay off the real runtime (each runs in the
+core runner, and the same `chat::history` code serves both):
+`r8-backlog-hole-is-reported-not-reopened` needs a worker backlog fault (the
+real worker drops only past 4096 items / 8 MiB, and its reload then finds
+everything); `r8-stale-or-foreign-next-token-is-stale-target` and
+`r8-truncated-history-reopens-once-then-stays-live` need `chat_evict` (real
+retention evicts only past 500 messages / 8 MiB, which would put hundreds of
+messages the fixture doesn't name into its pages);
+`r8-receipt-result-bounds-reply-message-ids` runs a remote prompt's turn, and
+the real Claude adapter also sends `status` `working`/`ready` in the
+conversation around it (sequenced events the fixture's sequence numbers don't
+model; `receipt.result` is checked live by the real-agent Codex test).
 
 Not honoured against real processes: `timers: false` (the broker's loop runs
 `advance` whenever the clock moved 100 ms), `close_session`,
-`disconnect`/`resume` (no resume in compatibility mode), `fail_next_fsync`,
-`change_trust_gen`, and more than one client per scenario.
+`disconnect`/`resume` (no resume in compatibility mode), journal faults
+(`fail_next_fsync`, `fail_fsync_of`, `crash_after_accepted`),
+`set_permissions`, `drop`, `replace_process`, `change_trust_gen`,
+`approval_rules`, `chat_evict`, `worker_gap`, and more than one client per
+scenario.
 
 ## Approvals (r7 §6a, on `feat/approvals`)
 
@@ -379,7 +512,11 @@ Astation sees that changed since r6.2.
   allow_once|allow_always|deny, rule_id?, message?, acquire?}`: `rule_id`
   iff `allow_always` (one of the request's `always_rules`), `message` only
   with `deny` (≤ 512 bytes, given to the agent; without one the agent reads
-  "Denied from Astation"). Without `acquire` the binding carries the current
+  "Denied from Astation"). (**r8 §G replaces the rest of this item**: an
+  answer needs only `control`, its `lease_epoch` is optional and ignored,
+  it never takes or moves the lease, `acquire` is refused
+  `unsupported_version`, and the first admitted answer wins.) r7: without
+  `acquire` the binding carries the current
   `lease_epoch` (else `stale_lease`). **With `acquire: true`** the binding
   has no `lease_epoch`: Atem needs `control` and a running session, and once
   the answer is durably `accepted` it gives this attachment the lease (a
@@ -491,7 +628,8 @@ Astation sees that changed since r6.2.
 - On `push_resolved`: replace or remove that notification everywhere (same
   collapse id / tag).
 - A tap wakes the app, which reconnects, authenticates, `list`s (the pending
-  approval follows the snapshot) and answers with `acquire: true`. A late tap
+  approval follows the snapshot) and answers (r8: without the lease and
+  without `acquire`). A late tap
   gets `stale_target`: "already answered". Until the device list (account
   trust step 1) exists, only the paired Astation has an attachment, so only
   it can answer.

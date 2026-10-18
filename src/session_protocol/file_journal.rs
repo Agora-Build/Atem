@@ -6,6 +6,9 @@
 //! ```text
 //! <state>/journal.lock          flock held for the journal's life (one writer)
 //! <state>/floors                0600, lease-epoch floors of every session
+//! <state>/principals            0600, each principal's control state (r8 §H)
+//! <state>/refused               0600, the refusal list (r8 §I.2)
+//! <state>/clean_close           0600, `{"runtime_epoch": n}` after an orderly stop (r8 §H)
 //! <state>/receipts/             0700
 //! <state>/receipts/<sid>.log    0600, append-only, one per session with live receipts
 //! ```
@@ -16,7 +19,13 @@
 //! framed record replaced atomically (temp, fsync, rename, directory fsync)
 //! whenever a floor rises; a damaged floors file is refused, never guessed.
 //! Floors are kept for every session ever seen (one small entry each, also in
-//! `SessionHost`'s in-memory map): a session id is never reused.
+//! `SessionHost`'s in-memory map): a session id is never reused. Principals'
+//! control states (`Control`) live the same way in `principals`; a control
+//! generation never goes down. The refusal list and the clean-close record
+//! are replaced the same way (temp, fsync, rename, directory fsync) and are
+//! not appends: they are written after a failed append too (the refusal
+//! list) or only with a healthy journal (the clean close, refused once an
+//! append failed).
 //!
 //! Each record is one line, `<len> <crc32> <json>\n`: `len` is the JSON's
 //! byte length in decimal, `crc32` the IEEE CRC-32 of those bytes in 8 lower
@@ -31,9 +40,11 @@
 //! `Ok` (a new log also fsyncs the directory). After any write or sync error
 //! the journal cuts the log back to its previous length and fails: every
 //! later `append` returns `Err` until the process restarts and reopens it
-//! (`SessionHost` answers a failed `accepted` write with `busy`). If the cut
-//! itself fails it is retried on every refused append and on drop; after a
-//! double failure a request answered `busy` may still be on disk (§6).
+//! (`SessionHost` halts: a failed `accepted` write is answered `busy` and
+//! put on the refusal list, r8 §I). If the cut itself fails it is retried on
+//! every refused append, on `reopen` and on drop; after such a double failure
+//! the refused request's record may still be on disk, which the refusal list
+//! resolves at restart.
 //!
 //! Compaction rewrites a log with only its live state — the current receipts
 //! with their latest state (a payload only while `accepted`; the digest
@@ -50,7 +61,7 @@
 //! Prompt payloads are user content: the files are private and nothing here
 //! logs a payload.
 
-use super::journal::{self, Journal, JournalError, Record};
+use super::journal::{self, Journal, JournalError, Record, Refusal, TurnIds};
 use super::wire::{self, ReceiptKind, ReceiptState, Target};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,10 +78,38 @@ const MAX_RECORD_BYTES: usize = 8 << 20;
 const LOG_SUFFIX: &str = ".log";
 const TMP_SUFFIX: &str = ".log.tmp";
 const FLOORS: &str = "floors";
+const PRINCIPALS: &str = "principals";
+const REFUSED: &str = "refused";
+const CLEAN_CLOSE: &str = "clean_close";
 
 #[derive(Serialize, Deserialize)]
 struct FloorsFile {
     floors: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskControl {
+    control: bool,
+    control_gen: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalsFile {
+    principals: BTreeMap<String, DiskControl>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefusedFile {
+    refused: Vec<Refusal>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanClose {
+    runtime_epoch: u64,
 }
 
 // ── CRC-32 (IEEE 802.3, reflected) ──
@@ -118,6 +157,22 @@ enum Disk {
         payload_digest: String,
         payload: Value,
         updated_at: u64,
+        /// r8 §H. A record from before r8 has neither: its principal is
+        /// unknown (empty) and it is resolved at the first r8 start, which
+        /// never follows a clean close.
+        #[serde(default)]
+        principal: String,
+        #[serde(default)]
+        control_gen: u64,
+    },
+    Rejected {
+        seq: u64,
+        request_id: String,
+        target: Target,
+        kind: ReceiptKind,
+        payload_digest: String,
+        detail: String,
+        updated_at: u64,
     },
     Transition {
         seq: u64,
@@ -125,6 +180,9 @@ enum Disk {
         state: ReceiptState,
         detail: Option<String>,
         updated_at: u64,
+        /// r8 §D: a completed prompt's turn ids.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<TurnIds>,
     },
     Evicted {
         seq: u64,
@@ -147,6 +205,8 @@ impl Disk {
                 payload_digest,
                 payload,
                 updated_at,
+                principal,
+                control_gen,
             } => Disk::Accepted {
                 seq,
                 request_id,
@@ -155,18 +215,38 @@ impl Disk {
                 payload_digest,
                 payload,
                 updated_at,
+                principal,
+                control_gen,
+            },
+            Record::Rejected {
+                request_id,
+                target,
+                kind,
+                payload_digest,
+                detail,
+                updated_at,
+            } => Disk::Rejected {
+                seq,
+                request_id,
+                target,
+                kind,
+                payload_digest,
+                detail,
+                updated_at,
             },
             Record::Transition {
                 request_id,
                 state,
                 detail,
                 updated_at,
+                result,
             } => Disk::Transition {
                 seq,
                 request_id,
                 state,
                 detail,
                 updated_at,
+                result,
             },
             Record::Evicted { request_id } => Disk::Evicted { seq, request_id },
             Record::LeaseEpochs {
@@ -177,6 +257,7 @@ impl Disk {
                 session_id,
                 reserved,
             },
+            Record::Control { .. } => unreachable!("control states live in the principals file"),
         }
     }
 
@@ -190,6 +271,8 @@ impl Disk {
                 payload_digest,
                 payload,
                 updated_at,
+                principal,
+                control_gen,
             } => (
                 seq,
                 Record::Accepted {
@@ -199,6 +282,27 @@ impl Disk {
                     payload_digest,
                     payload,
                     updated_at,
+                    principal,
+                    control_gen,
+                },
+            ),
+            Disk::Rejected {
+                seq,
+                request_id,
+                target,
+                kind,
+                payload_digest,
+                detail,
+                updated_at,
+            } => (
+                seq,
+                Record::Rejected {
+                    request_id,
+                    target,
+                    kind,
+                    payload_digest,
+                    detail,
+                    updated_at,
                 },
             ),
             Disk::Transition {
@@ -207,6 +311,7 @@ impl Disk {
                 state,
                 detail,
                 updated_at,
+                result,
             } => (
                 seq,
                 Record::Transition {
@@ -214,6 +319,7 @@ impl Disk {
                     state,
                     detail,
                     updated_at,
+                    result,
                 },
             ),
             Disk::Evicted { seq, request_id } => (seq, Record::Evicted { request_id }),
@@ -289,7 +395,7 @@ struct Parsed {
 /// Reads records while they are well formed and coherent: the session they
 /// name is this log's, `seq` never goes back, a transition follows the §6
 /// table from the request's current state, an eviction names a live request,
-/// and no lease floor appears (those live in the floors file).
+/// and no lease floor or control state appears (those live in their files).
 fn parse_log(bytes: &[u8], sid: &str) -> Parsed {
     let mut records = Vec::new();
     let mut at = 0usize;
@@ -320,8 +426,16 @@ fn parse_log(bytes: &[u8], sid: &str) -> Parsed {
                 }
                 _ => false,
             },
+            Record::Rejected {
+                request_id, target, ..
+            } => {
+                target.session_id == sid
+                    && live
+                        .insert(request_id.clone(), ReceiptState::Rejected)
+                        .is_none()
+            }
             Record::Evicted { request_id } => live.remove(request_id).is_some(),
-            Record::LeaseEpochs { .. } => false,
+            Record::LeaseEpochs { .. } | Record::Control { .. } => false,
         };
         if !coherent {
             break;
@@ -444,6 +558,24 @@ pub enum Fault {
     CrashAfterRename,
 }
 
+/// Failure injection for the shared fixtures' steps (r8), counted in
+/// appends of any record (the refusal list and the clean close are not
+/// appends).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Plan {
+    /// Appends left before the one that fails, and whether its rollback
+    /// fails too (the record is durable although the append failed).
+    fail_in: Option<(u64, bool)>,
+    /// The next `Accepted` becomes durable, then the process "dies": every
+    /// later write fails until `reopen`.
+    crash_after_accepted: bool,
+    crashed: bool,
+    fail_refusal: bool,
+    /// Every rollback attempt fails (a log that can't be cut back).
+    undo_stuck: bool,
+}
+
 struct SessionLog {
     file: File,
     len: u64,
@@ -464,6 +596,8 @@ pub struct FileJournal {
     compacted_len: HashMap<String, u64>,
     /// The lease-epoch floors, as in the `floors` file.
     floors: BTreeMap<String, u64>,
+    /// The principals' control states, as in the `principals` file.
+    principals: BTreeMap<String, DiskControl>,
     /// Logs whose failed append could not be undone yet: handle and the
     /// length before that append. Retried on every refused append and on drop.
     undo: HashMap<String, SessionLog>,
@@ -475,6 +609,8 @@ pub struct FileJournal {
     _lock: crate::daemon::HeldLock,
     #[cfg(test)]
     fault: Option<Fault>,
+    #[cfg(test)]
+    plan: Plan,
 }
 
 impl std::fmt::Debug for FileJournal {
@@ -534,6 +670,7 @@ impl FileJournal {
             with_payload: HashSet::new(),
             compacted_len: HashMap::new(),
             floors: BTreeMap::new(),
+            principals: BTreeMap::new(),
             undo: HashMap::new(),
             next_seq: 1,
             compact_bytes: COMPACT_BYTES,
@@ -542,10 +679,18 @@ impl FileJournal {
             _lock: lock,
             #[cfg(test)]
             fault: None,
+            #[cfg(test)]
+            plan: Plan::default(),
         };
-        journal.load_floors()?;
-        journal.recover_files()?;
+        journal.load_state()?;
         Ok(journal)
+    }
+
+    /// Reads the floors and principals and recovers the session logs.
+    fn load_state(&mut self) -> Result<(), JournalError> {
+        self.load_floors()?;
+        self.load_principals()?;
+        self.recover_files()
     }
 
     /// Compacts a log once it is larger than `bytes` (and than twice its
@@ -573,6 +718,38 @@ impl FileJournal {
     #[cfg(test)]
     pub fn inject(&mut self, fault: Fault) {
         self.fault = Some(fault);
+    }
+
+    /// The `n`-th next append fails (its record lost, or kept when
+    /// `undo_fails`: the worst case of a failed rollback).
+    #[cfg(test)]
+    pub fn fail_append_of(&mut self, n: u64, undo_fails: bool) {
+        self.plan.fail_in = Some((n.saturating_sub(1), undo_fails));
+    }
+
+    /// The next `Accepted` becomes durable, then every write fails until
+    /// `reopen` (a crash right after the durable acceptance).
+    #[cfg(test)]
+    pub fn crash_after_accepted(&mut self) {
+        self.plan.crash_after_accepted = true;
+    }
+
+    #[cfg(test)]
+    pub fn crashed(&self) -> bool {
+        self.plan.crashed
+    }
+
+    /// Rollbacks fail until `false` (survives `reopen`, which is refused
+    /// while one is pending).
+    #[cfg(test)]
+    pub fn set_undo_stuck(&mut self, stuck: bool) {
+        self.plan.undo_stuck = stuck;
+    }
+
+    /// The next refusal-list write fails.
+    #[cfg(test)]
+    pub fn fail_next_refusal(&mut self) {
+        self.plan.fail_refusal = true;
     }
 
     #[cfg(test)]
@@ -648,13 +825,21 @@ impl FileJournal {
             floors: floors.clone(),
         })
         .map_err(|e| JournalError(format!("cannot encode the floors: {e}")))?;
-        let path = self.floors_path();
-        let tmp = self.state.join(format!("{FLOORS}.tmp"));
+        self.replace_file(FLOORS, &frame(&json))
+            .map_err(|e| self.fail(e.0))
+    }
+
+    /// Atomically replaces `<state>/<name>` with `bytes` (temp, fsync,
+    /// rename, directory fsync); the old file or the new one is there after
+    /// a crash at any point.
+    fn replace_file(&self, name: &str, bytes: &[u8]) -> Result<(), JournalError> {
+        let path = self.state.join(name);
+        let tmp = self.state.join(format!("{name}.tmp"));
         let state = self.state.clone();
         let written = (|| {
             remove_entry(&tmp)?;
             let mut f = create_private(&tmp, false)?;
-            f.write_all(&frame(&json))?;
+            f.write_all(bytes)?;
             f.sync_all()?;
             drop(f);
             fs::rename(&tmp, &path)?;
@@ -662,8 +847,63 @@ impl FileJournal {
         })();
         written.map_err(|e| {
             let _ = remove_entry(&tmp);
-            self.fail(format!("cannot write {}: {e}", path.display()))
+            JournalError(format!("cannot write {}: {e}", path.display()))
         })
+    }
+
+    /// A small framed file (`<len> <crc> <json>\n`) that must parse whole,
+    /// or `None` when it doesn't exist. A damaged one is an error.
+    fn read_framed<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+    ) -> Result<Option<T>, JournalError> {
+        let path = self.state.join(name);
+        let tmp = self.state.join(format!("{name}.tmp"));
+        remove_entry(&tmp).map_err(|e| io_err("cannot remove", &tmp, e))?;
+        if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            return Ok(None);
+        }
+        let bytes = Self::read_private(&path)?;
+        unframe(&bytes)
+            .filter(|(_, used)| *used == bytes.len())
+            .and_then(|(json, _)| serde_json::from_slice::<T>(json).ok())
+            .map(Some)
+            .ok_or_else(|| JournalError(format!("{} is damaged", path.display())))
+    }
+
+    /// Reads the principals file. A damaged one is refused: forgetting a
+    /// control generation could let revoked work run.
+    fn load_principals(&mut self) -> Result<(), JournalError> {
+        let file: Option<PrincipalsFile> = self.read_framed(PRINCIPALS)?;
+        self.principals = file.map(|f| f.principals).unwrap_or_default();
+        Ok(())
+    }
+
+    fn append_control(
+        &mut self,
+        principal: String,
+        state: DiskControl,
+    ) -> Result<(), JournalError> {
+        if principal.is_empty() || principal.len() > wire::MAX_OPAQUE_ID_BYTES {
+            return Err(JournalError("invalid principal".into()));
+        }
+        let current = self.principals.get(&principal).copied();
+        if current.is_some_and(|c| c.control_gen > state.control_gen) {
+            return Err(JournalError("a control generation never goes down".into()));
+        }
+        if current == Some(state) {
+            return Ok(()); // already durable
+        }
+        let mut principals = self.principals.clone();
+        principals.insert(principal, state);
+        let json = serde_json::to_vec(&PrincipalsFile {
+            principals: principals.clone(),
+        })
+        .map_err(|e| JournalError(format!("cannot encode the principals: {e}")))?;
+        self.replace_file(PRINCIPALS, &frame(&json))
+            .map_err(|e| self.fail(e.0))?;
+        self.principals = principals;
+        Ok(())
     }
 
     /// Open-time recovery: drop compaction temps, truncate torn tails, learn
@@ -714,6 +954,10 @@ impl FileJournal {
                         *self.live.entry(sid.clone()).or_default() += 1;
                         self.owner.insert(request_id.clone(), sid.clone());
                     }
+                    Record::Rejected { request_id, .. } => {
+                        *self.live.entry(sid.clone()).or_default() += 1;
+                        self.owner.insert(request_id.clone(), sid.clone());
+                    }
                     Record::Transition { request_id, .. } => {
                         stale_payload |= self.with_payload.remove(&request_id);
                     }
@@ -722,7 +966,7 @@ impl FileJournal {
                         self.owner.remove(&request_id);
                         *self.live.entry(sid.clone()).or_default() -= 1;
                     }
-                    Record::LeaseEpochs { .. } => {}
+                    Record::LeaseEpochs { .. } | Record::Control { .. } => {}
                 }
             }
             if self.live.get(&sid).is_none_or(|n| *n == 0) {
@@ -746,8 +990,13 @@ impl FileJournal {
     }
 
     /// Cuts logs back to their length before a failed append, where the
-    /// first attempt failed.
+    /// first attempt failed. Safe only because nothing is appended while a
+    /// rollback is pending (the journal stays failed, `reopen` included).
     fn retry_undo(&mut self) {
+        #[cfg(test)]
+        if self.plan.undo_stuck {
+            return;
+        }
         self.undo.retain(|_, log| {
             log.file
                 .set_len(log.len)
@@ -790,6 +1039,9 @@ impl FileJournal {
         let sid = match record {
             Record::Accepted {
                 request_id, target, ..
+            }
+            | Record::Rejected {
+                request_id, target, ..
             } => {
                 if self.owner.contains_key(request_id) {
                     return Err(JournalError(format!("request {request_id} admitted twice")));
@@ -797,6 +1049,7 @@ impl FileJournal {
                 target.session_id.clone()
             }
             Record::LeaseEpochs { session_id, .. } => session_id.clone(),
+            Record::Control { .. } => unreachable!("control states are not logged"),
             Record::Transition { request_id, .. } | Record::Evicted { request_id } => self
                 .owner
                 .get(request_id)
@@ -896,26 +1149,30 @@ impl FileJournal {
                         Value::Null
                     },
                     updated_at: s.updated_at,
+                    principal: s.principal,
+                    control_gen: s.control_gen,
                 },
             )?);
-            let mut step = |state: ReceiptState, detail: Option<String>| {
-                encode(
-                    seq,
-                    Record::Transition {
-                        request_id: s.request_id.clone(),
-                        state,
-                        detail,
-                        updated_at: s.updated_at,
-                    },
-                )
-                .map(|line| out.extend(line))
-            };
+            let mut step =
+                |state: ReceiptState, detail: Option<String>, result: Option<TurnIds>| {
+                    encode(
+                        seq,
+                        Record::Transition {
+                            request_id: s.request_id.clone(),
+                            state,
+                            detail,
+                            updated_at: s.updated_at,
+                            result,
+                        },
+                    )
+                    .map(|line| out.extend(line))
+                };
             match s.state {
                 ReceiptState::Accepted => {}
-                ReceiptState::Executing | ReceiptState::Rejected => step(s.state, s.detail)?,
+                ReceiptState::Executing | ReceiptState::Rejected => step(s.state, s.detail, None)?,
                 final_state => {
-                    step(ReceiptState::Executing, None)?;
-                    step(final_state, s.detail)?;
+                    step(ReceiptState::Executing, None, None)?;
+                    step(final_state, s.detail, s.result)?;
                 }
             }
         }
@@ -993,8 +1250,8 @@ impl Drop for FileJournal {
     }
 }
 
-impl Journal for FileJournal {
-    fn append(&mut self, record: Record) -> Result<(), JournalError> {
+impl FileJournal {
+    fn append_now(&mut self, record: Record) -> Result<(), JournalError> {
         if let Some(f) = &self.failed {
             let f = f.clone();
             self.retry_undo();
@@ -1007,16 +1264,29 @@ impl Journal for FileJournal {
         {
             return self.append_floor(session_id, reserved);
         }
+        if let Record::Control {
+            principal,
+            control,
+            control_gen,
+        } = record
+        {
+            let state = DiskControl {
+                control,
+                control_gen,
+            };
+            return self.append_control(principal, state);
+        }
         let sid = self.session_of(&record)?;
         let request_id = match &record {
             Record::Accepted { request_id, .. }
+            | Record::Rejected { request_id, .. }
             | Record::Transition { request_id, .. }
             | Record::Evicted { request_id } => request_id.clone(),
-            Record::LeaseEpochs { .. } => unreachable!("handled above"),
+            Record::LeaseEpochs { .. } | Record::Control { .. } => unreachable!("handled above"),
         };
         let with_content =
             matches!(&record, Record::Accepted { payload, .. } if has_content(payload));
-        let is_accepted = matches!(record, Record::Accepted { .. });
+        let is_accepted = matches!(record, Record::Accepted { .. } | Record::Rejected { .. });
         let is_evicted = matches!(record, Record::Evicted { .. });
         self.write_line(&sid, &encode(self.next_seq, record)?)?;
         let mut rewrite = false;
@@ -1053,6 +1323,127 @@ impl Journal for FileJournal {
         }
         Ok(())
     }
+}
+
+impl Journal for FileJournal {
+    fn append(&mut self, record: Record) -> Result<(), JournalError> {
+        #[cfg(test)]
+        {
+            if self.plan.crashed {
+                return Err(JournalError("the process crashed".into()));
+            }
+            match self.plan.fail_in {
+                Some((0, undo_fails)) => {
+                    self.plan.fail_in = None;
+                    if undo_fails && self.failed.is_none() {
+                        // The write happened; its rollback didn't.
+                        let _ = self.append_now(record);
+                    }
+                    return Err(self.fail("injected fsync failure".into()));
+                }
+                Some((n, undo_fails)) => self.plan.fail_in = Some((n - 1, undo_fails)),
+                None => {}
+            }
+            let accepted = matches!(record, Record::Accepted { .. });
+            let result = self.append_now(record);
+            if result.is_ok() && accepted && std::mem::take(&mut self.plan.crash_after_accepted) {
+                self.plan.crashed = true;
+            }
+            result
+        }
+        #[cfg(not(test))]
+        self.append_now(record)
+    }
+
+    fn record_refusal(&mut self, refusal: Refusal) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.plan.fail_refusal) || self.plan.crashed {
+            return Err(JournalError("injected refusal-list failure".into()));
+        }
+        let mut refused = self.refusals()?;
+        refused.retain(|r| r.request_id != refusal.request_id);
+        refused.push(refusal);
+        let json = serde_json::to_vec(&RefusedFile { refused })
+            .map_err(|e| JournalError(format!("cannot encode the refusal list: {e}")))?;
+        self.replace_file(REFUSED, &frame(&json))
+    }
+
+    fn refusals(&self) -> Result<Vec<Refusal>, JournalError> {
+        let path = self.state.join(REFUSED);
+        if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            return Ok(Vec::new());
+        }
+        let bytes = Self::read_private(&path)?;
+        unframe(&bytes)
+            .filter(|(_, used)| *used == bytes.len())
+            .and_then(|(json, _)| serde_json::from_slice::<RefusedFile>(json).ok())
+            .map(|f| f.refused)
+            .ok_or_else(|| JournalError(format!("{} is damaged", path.display())))
+    }
+
+    fn clear_refusals(&mut self) -> Result<(), JournalError> {
+        if let Some(f) = &self.failed {
+            return Err(JournalError(f.clone()));
+        }
+        let path = self.state.join(REFUSED);
+        remove_entry(&path).map_err(|e| io_err("cannot remove", &path, e))?;
+        sync_dir(&self.state).map_err(|e| io_err("cannot sync", &self.state, e))
+    }
+
+    fn write_clean_close(&mut self, runtime_epoch: u64) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if self.plan.crashed {
+            return Err(JournalError("the process crashed".into()));
+        }
+        if let Some(f) = &self.failed {
+            return Err(JournalError(f.clone()));
+        }
+        let json = serde_json::to_vec(&CleanClose { runtime_epoch })
+            .map_err(|e| JournalError(format!("cannot encode the clean close: {e}")))?;
+        self.replace_file(CLEAN_CLOSE, &json)
+    }
+
+    fn take_clean_close(&mut self) -> Option<u64> {
+        let path = self.state.join(CLEAN_CLOSE);
+        let _ = remove_entry(&self.state.join(format!("{CLEAN_CLOSE}.tmp")));
+        let epoch = Self::read_private(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CleanClose>(&bytes).ok())
+            .map(|c| c.runtime_epoch);
+        if remove_entry(&path).is_ok() {
+            let _ = sync_dir(&self.state);
+        }
+        epoch
+    }
+
+    /// Refused while a failed append's rollback is still pending: the log
+    /// may hold a record the host was told isn't written, and the rollback
+    /// cuts it back to its old length, which would destroy anything durable
+    /// written after it. The journal stays failed until a real process
+    /// restart opens it from disk. A reload that fails leaves it failed too
+    /// (its in-memory state is gone).
+    fn reopen(&mut self) -> Result<(), JournalError> {
+        self.retry_undo();
+        if !self.undo.is_empty() {
+            let why = "a failed write could not be rolled back; restart Atem".to_string();
+            return Err(self.fail(why));
+        }
+        self.open.clear();
+        self.owner.clear();
+        self.live.clear();
+        self.with_payload.clear();
+        self.compacted_len.clear();
+        self.floors.clear();
+        self.principals.clear();
+        self.next_seq = 1;
+        self.failed = None;
+        #[cfg(test)]
+        {
+            self.plan = Plan::default();
+        }
+        self.load_state()
+            .map_err(|e| self.fail(format!("cannot reload: {}", e.0)))
+    }
 
     fn load(&self) -> Result<Vec<Record>, JournalError> {
         let mut all: Vec<(u64, Record)> = self
@@ -1066,6 +1457,14 @@ impl Journal for FileJournal {
                 (0, record)
             })
             .collect();
+        all.extend(self.principals.iter().map(|(principal, c)| {
+            let record = Record::Control {
+                principal: principal.clone(),
+                control: c.control,
+                control_gen: c.control_gen,
+            };
+            (0, record)
+        }));
         for sid in self.session_ids()? {
             all.extend(self.read_log(&sid)?.records);
         }
