@@ -12,7 +12,9 @@ must build. Test results and the per-fixture table are in
 Pin the shared fixtures and the contract to **the merge commit of the r8 PR
 into `main`**. Until it merges, pin `feat/r8` at the commit named here:
 
-- `feat/r8` pin: see "Pin commit" at the end of this note.
+- `feat/r8` pin: **`974a6e7`** (`974a6e7` completes r8: code, fixtures and
+  docs; later commits on `feat/r8` that touch only this note keep the same
+  fixtures).
 
 Atem and Astation must ship together: Atem refuses every r7 peer.
 
@@ -191,5 +193,5 @@ differently; the appendix text now says what Atem does (its
 
 ## Pin commit
 
-`feat/r8` pin (the commit that completed r8, fixtures included): filled in
-by the commit after it, see `git log -- designs/protocol/r8-astation-handoff.md`.
+`feat/r8` at `974a6e7` until the r8 PR merges; then the PR's merge commit
+on `main`.
