@@ -1,0 +1,354 @@
+{
+ "name": "r8-failed-persistence-changes-no-lease",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   },
+   {
+    "name": "c2",
+    "attachment_gen": "66666666-6666-4666-8666-666666666666",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "fail_next_fsync": true
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "code": "busy",
+    "detail": "acceptance not recorded"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "lease_holder": null,
+    "dispatch_attempts": 0,
+    "journal_halted": true
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "code": "busy",
+    "detail": "journal halted; restart Atem"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "code": "busy",
+    "detail": "journal halted; restart Atem"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "lease_holder": null,
+    "dispatch_attempts": 0
+   }
+  },
+  {
+   "restart_runtime": {
+    "runtime_gen": "99999999-9999-4999-8999-999999999999",
+    "runtime_epoch": 8
+   }
+  },
+  {
+   "reconnect": "c1",
+   "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  },
+  {
+   "reconnect": "c2",
+   "attachment_gen": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  },
+  {
+   "assert": {
+    "journal_halted": false,
+    "dispatch_attempts": 0
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "rejected",
+    "re": "11111111-1111-4111-8111-000000000004",
+    "detail": "acceptance not confirmed"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "lease_holder": null,
+    "dispatch_attempts": 0
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000005",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipts",
+    "re": "11111111-1111-4111-8111-000000000005",
+    "receipts.#": 1,
+    "receipts.0.request_id": "44444444-4444-4444-8444-000000000001",
+    "receipts.0.state": "rejected",
+    "receipts.0.detail": "acceptance not confirmed"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000006",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000006"
+   },
+   "capture": {
+    "e1": "lease.lease_epoch"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": "${e1}"
+   }
+  },
+  {
+   "assert": {
+    "lease_holder": "c1",
+    "dispatch_attempts": 1,
+    "dispatches": 1
+   }
+  }
+ ],
+ "note": "Appendix §I. The admission's journal write fails (the epoch reservation or the accepted record; the rollback succeeds, so nothing of the request is on disk): the Send is answered busy (acceptance not recorded), no lease is granted, c2 hears nothing and nothing runs. The journal halts: the retry with the same request_id and c2's acquire are busy until the runtime restarts. The refusal was recorded on the refusal list before the reply, so at the restart the request is resolved rejected (acceptance not confirmed) whatever reached the disk: the same request_id now returns that receipt and is never re-admitted (no lease). The resend uses a new request_id, which is admitted normally and acquires (its epoch is captured: reservations may skip epochs)."
+}

@@ -1,5 +1,13 @@
 # atem-session v1: sessions, control leases, receipts and approvals (r7.3: r7.2 with lease-free rule revocation — for review)
 
+Draft (not implemented): r8 — required `hello.revision`, `welcome.features`,
+history pages in the sequenced stream with bounded selectors and coverage,
+`receipt.result`, removal of `open.before`, chat Send that acquires the lease
+with the prompt (`chat.send_acquire`) and lease-free approval answers
+(`approval.lease_free`), with the submitter principal and its durable
+control fence (§H) and one admission persistence rule (§I) — is in the
+appendix "r8 draft" at the end; this
+r7.3 text stays authoritative until r8 ships.
 Status: r7.3 (2026-10-17) lets any attachment with `control` revoke an Atem
 session rule (§6a) with or without the lease: `approval_rule_revoke` needs
 only `control`, a running session and an active rule of that exact process
@@ -325,7 +333,8 @@ Normative rules:
   is persisted per session so it never repeats.
 - **Scope**: the lease governs terminal input/resize/stop, chat submission,
   interrupt, approval answers and future mutations. Disconnect stops renewal;
-  the lease then expires.
+  the lease then expires. (r8 draft: approval answers leave the lease's scope,
+  appendix §G; a chat Send may acquire the lease with its prompt, §F.)
 
 ## 6. Submissions and receipts
 
@@ -365,7 +374,11 @@ Kinds and payloads (v1):
   the client may retry with the same `request_id`. After a double I/O failure
   (the write fails and so does undoing it) a request answered `busy` may still
   be dispatched once, under its original target and trust generation; a retry
-  with the same `request_id` returns its receipt.
+  with the same `request_id` returns its receipt. (r8 draft: this exception
+  and the same-id retry are **removed**; a `busy` for a failed admission
+  write is a definitive refusal, the journal halts, and the request is
+  resolved `rejected` "acceptance not confirmed" at restart and never
+  executed; appendix §I.)
 - A duplicate `submit` names the current target: one naming an earlier
   `process_gen` of the session is `stale_target`, while `receipt_query` for
   that earlier target still returns its receipts.
@@ -419,6 +432,11 @@ Kinds and payloads (v1):
   `accepted` work has provably not started any side effect, so it may still be
   dispatched — once, under its original target, and only if the host trust
   generation is unchanged (else `rejected`, `detail:"host trust changed"`).
+  (r8 draft: only when the previous run ended with a clean close, and then
+  only once its submitter principal's control is confirmed in the new run
+  at the recorded `control_gen`; after any other end it is `rejected`
+  "authorization history unknown", appendix §H; a request on the refusal
+  list is `rejected` first, §I.)
   `executing` work may have started a side effect: it is never dispatched again;
   it is reconciled with the worker/provider, and if that can't establish the
   outcome it becomes `outcome_unknown`.
@@ -440,6 +458,13 @@ agent's own prompt asks. Delivery is independent of control (user decision,
 2026-10-16): every approval opens a card for all attachments with `control`
 and is pushed to the account's devices, whoever holds the lease; answering
 takes the lease with the answer (`acquire`).
+
+**r8 draft (appendix §G, `approval.lease_free`, user decision 2026-10-18):**
+an answer needs only a verified attachment with `control` and the exact
+pending request. It never takes, needs or moves the lease, its binding's
+`lease_epoch` is ignored, `acquire` is refused `unsupported_version`, and
+the first admitted answer wins (later ones `stale_target`). This r7 text
+stays authoritative until r8 ships.
 
 | op | dir | fields |
 |---|---|---|
@@ -769,3 +794,781 @@ reconnection, an old signature or a relay timestamp; rollback protection and
 conservative restart/clock handling), channel key establishment with
 replay/downgrade protection binding endpoint keys, account, roles, permissions
 and generations, the `resume_proof` format, and QR grant binding.
+
+## Appendix: r8 draft (not implemented; r7.3 above stays authoritative)
+
+Status: **draft**, 2026-10-17, answering Astation's review of Atem's agent
+control API response r1 (`agent-control-api-atem.md` r2). Nothing here is
+emitted or accepted by any build until r8 ships on both sides together and
+the `r8-*` fixtures (`fixtures/schema.md`, "r8 draft fixtures") pass in Rust
+and Swift. Then this appendix replaces the affected r7.2 text. No backward
+compatibility: an r8 host and an r8 client refuse every r7 peer.
+
+Revised 2026-10-18 for Astation's review of the §F/§G draft (r3 review):
+control is a permission of an authenticated **principal**, recorded with
+accepted work and revoked through a durable fence that outlives
+attachments, reconnects and restarts (§H, finding 1); one persistence rule
+for admission (§I, finding 2): a request is accepted only once its
+`accepted` record is durable, a `busy` for a failed write is a definitive
+refusal resolved `rejected` ("acceptance not confirmed") at restart, and
+§6's double-I/O exception (a request answered `busy` "may still be
+dispatched once") is **removed**, as is "the client may retry with the
+same `request_id`" after such a `busy` (a resend uses a new id, §I.5).
+Fixtures: the captures in `r8-failed-persistence-changes-no-lease` moved
+to the step level and the scenario now follows §I; new
+`r8-double-write-failure-takeover-never-runs`,
+`r8-crash-after-durable-acceptance-grants-no-lease`,
+`r8-revoked-control-fences-work-across-reconnect-and-restart`,
+`r8-control-fence-holds-when-a-rejection-write-fails`,
+`r8-recovered-work-needs-its-principal-confirmed`,
+`r8-approval-answer-keeps-the-holders-deadline`,
+`r8-delayed-send-reply-does-not-regrant-lost-control` and the client
+scenario `r8-client-delayed-send-reply-never-restores-control`; the two
+r2 history corrections (`chat_opens` 2, `wire_bytes` 675) are applied.
+
+Revised 2026-10-18 for Astation's r4 review (a failed fence write could
+lose a revocation if control was restored before the next
+authentication): queued work whose authorization history can't be
+established never runs. A failure while writing a revocation rejects
+that principal's queued work at once in memory and nothing queued is
+dispatched after a journal halt (§H, "A failed revocation write"); the
+journal gets a **clean close** record, and after any run that didn't end
+with one every recovered accepted request not yet executing is `rejected`
+"authorization history unknown", for every principal (§H, "Recovery").
+The 60 s confirmation stays, after a clean close only. Fixtures: new
+`r8-failed-fence-write-rejects-queued-work-at-once`,
+`r8-failed-fence-write-then-control-restored-never-runs` (rollback
+succeeds, then rollback fails), `r8-crash-rejects-queued-work-whose-history-is-unknown`,
+`r8-clean-close-runs-queued-work-once-its-principal-is-confirmed`;
+`r8-recovered-work-needs-its-principal-confirmed` now starts from a clean
+close, and `r8-crash-after-durable-acceptance-grants-no-lease` and
+`r8-control-fence-holds-when-a-rejection-write-fails` now end
+`rejected` "authorization history unknown"; the second welcome of
+`r8-client-delayed-send-reply-never-restores-control` names a new
+`controller_session` (§3). Schema: `crash_runtime`, and `restart_runtime`
+is an orderly stop.
+
+### A. Version admission
+
+The envelope stays `v: 1`; the revision named in `hello` is the gate. One
+mechanism covers every family (a new `v` would need the same check in
+session, terminal and chat parsers and still say nothing about features), and
+the refusal is explicit at admission rather than a silent misreading later.
+
+| op | dir | r8 fields |
+|---|---|---|
+| `hello` | C→H | **`revision`** (required, the JSON integer `8`), `resume?` |
+| `welcome` | H→C | r7.2 fields plus **`revision: 8`** and **`features: [string]`** |
+
+- An r8 host answers a `hello` with no `revision`, another number or a
+  non-integer with session `error{re, code:"unsupported_version", revision:
+  8, detail}` and does nothing else: no attachment, no `welcome`, no lease,
+  receipt, subscription or conversation. Every later request on that
+  transport is refused as before `welcome` (in its family,
+  `unsupported_version`) until a `hello{revision: 8}` is welcomed.
+- The client checks `welcome.revision == 8` before anything else; without
+  it (an r7 host ignores the unknown `hello.revision` and welcomes without
+  one) the client refuses the attachment: it sends nothing further and
+  applies nothing it receives, and tells the user the host's Atem must be
+  updated.
+- `features` lists what this host implements. The client enables only the
+  advertised features it knows (unknown names are ignored) and never sends
+  an op of a feature it didn't see; an operation that needs a missing
+  feature is shown unavailable. A host never advertises a feature before its
+  fixtures pass; an op of an unadvertised feature is `unsupported_version`.
+  Per-session abilities stay in the descriptor's `capabilities`.
+
+| feature | adds |
+|---|---|
+| `chat.history_end` | `open` ends with a sequenced `history_end` (§B) |
+| `chat.history` | `history{before|next}` pages in the sequenced stream (§B) |
+| `chat.lookup` | `history{turn_id|request_id}` (§B) |
+| `chat.coverage` | `oldest_retained`, `truncated`, `holes`, `coverage`, the `coverage` event, `close.reason` (§C) |
+| `receipt.result` | `result` on completed `prompt` receipts (§D) |
+| `approval.session_rules` | r7.2 session rules (already shipped) |
+| `approval.card_reason` | final cards carry `reason` (the `approval_closed` reason) |
+| `chat.send_acquire` | a `prompt` submit may acquire the lease with the prompt (§F) |
+| `approval.lease_free` | approval answers need `control`, never the lease (§G) |
+
+- **Removed in r8**, refused explicitly with `unsupported_version` and no
+  effect (never read as another form): chat `open.before`, `open.generation`
+  (the r7.2/#75 paging form; an open conversation is not reset and no new
+  one opens), the `status.page` marker (replaced by `history_end`), a
+  `hello` without `revision`, and `acquire` on an approval answer (r7 §6a;
+  in the payload or beside it, §G).
+
+### B. History pages in the ordered conversation stream
+
+**Ordering guarantee.** A conversation is one ordered stream with one
+`sequence` counter. The host builds a page in a single step of its
+single-threaded broker pass: it snapshots the retained history and enqueues
+the page's envelopes with consecutive sequences, and no live event of that
+conversation is enqueued between them. Every live event produced after the
+snapshot has a higher sequence. (Today's code already does this:
+`host_bridge.rs` `open_conversation` builds the open page and, since #75, the
+`open{before}` page plus its `status.page` marker synchronously from
+`ChatSession::page`, numbering every envelope with the conversation's
+`next_head`; r8 makes it a contract.)
+
+Each message envelope's `sequence` is its position: a message version
+carried at a higher sequence is newer. A client keeps, per `messageId`, the
+version with the highest sequence and never lets a page replace a newer
+version. No per-message revision is needed because the stream is the order.
+Astation, which returns pages over HTTP and changes over SSE, attaches its
+own replay cursor (the conversation sequence) to each page and applies the
+same rule. A reopen starts a new stream (`opened` at 0), so positions are
+compared within one `opened` only.
+
+`open` (no `before`, no `generation`) replies `opened` (sequence 0), the
+newest page as `message{history: true}`, then `history_end`. Older pages
+and lookups:
+
+```json
+{"type":"agentChat","data":{"v":1,"op":"history","conversationId":"conv-1","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-2222-4222-8222-222222222222","page_id":"p7","turn_id":"turn-9",
+ "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
+```
+
+- **Selectors**: exactly one of `before` (a retained `messageId`: the page
+  ends just before it), `turn_id`, `request_id` (the turn whose user message
+  carries it) or `next` (a continuation token, which carries its selector).
+  None, two or more → chat `error{code:"invalid_request"}`.
+- **Validation**: `before`, `turn_id`: 1–128 bytes of `[A-Za-z0-9._:-]`;
+  `request_id`: lowercase v4 UUID; `next`: 1–512 bytes of base64url;
+  `page_id`: 1–64 bytes of `[A-Za-z0-9._:-]`, chosen by the client;
+  `generation` must equal `binding.target.process_gen` and the conversation
+  must be open on this attachment (`stale_target`). At most 8 history
+  requests a second per conversation (`busy`).
+- **Reply**: `message{history: true, page_id}` envelopes, then
+  `history_end`, all sequenced:
+
+```json
+{"type":"agentChat","data":{"v":1,"op":"history_end","conversationId":"conv-1","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-…","sequence":58,"page_id":"p7",
+ "page":{"selector":"turn_id","count":28,"content_bytes":168000,"wire_bytes":1017000,
+         "end":false,"next":"<opaque>","coverage":"complete",
+         "oldest_retained":"m-0001","truncated":true,"holes":[]}}}
+```
+
+  `page_id` is absent on the open's `history_end` (`selector: "newest"`).
+- **Order**: `newest`/`before` pages go backwards (each page lists its
+  messages oldest first; `next` continues with older ones). `turn_id`/
+  `request_id` pages go forwards from the turn's oldest retained message to
+  its newest message at the first page's snapshot; later messages of the
+  turn arrive live.
+- **Bounds** (every page, lookups included): ≤ 50 messages, ≤ 256 KiB of
+  content (message bytes as counted by `ChatSession`), and ≤ 1 MiB
+  serialized (the sum of the page's envelopes, so Astation can return it as
+  one body); a page stops before the message that would pass any bound and
+  holds at least one message when one remains (a message is ≤ 128 KiB of
+  content, < 1 MiB however escaped). Cards filtered out for a view-only
+  attachment don't count.
+- **`end`**: `true` when the selected result is exhausted (no older retained
+  message, or the turn's last message at the snapshot was sent); then there
+  is no `next`.
+- **`next`**: opaque, made by the host (MAC under a key of this runtime),
+  binding the attachment, `conversationId`, full target (session and
+  `process_gen`), selector and value, the continuation point and the history
+  snapshot (the history's reload count). Used in another conversation,
+  attachment or target, altered, after its continuation point was evicted,
+  after a history reload, or after a runtime restart → chat
+  `error{code:"stale_target", page_id}`; the client starts a new selection.
+- **`before` not retained** → `stale_target` (as #75). A `turn_id`/
+  `request_id` with nothing retained is not an error: `count: 0`, `end:
+  true`, `coverage: "unavailable"`.
+- Errors for a history request are sequenced in the conversation and carry
+  its `page_id` when that was valid; nothing else is sent and nothing resets.
+
+### C. Coverage: truncation and holes
+
+- **`coverage`** of the selected result: `complete` (every message of it is
+  retained), `partial` (some were evicted or fall in a hole; for a lookup,
+  the turn's oldest messages were evicted or a hole lies inside the turn),
+  `unavailable` (none is retained).
+- **Truncation** is persistent: `oldest_retained` (the oldest retained
+  `messageId`, `null` when empty) and `truncated: true` once anything of this
+  process's history was evicted (retention 500 messages / 8 MiB, or an
+  adoption cut). It is shown, never a reset; clients keep consuming the
+  stream and never reopen because of it.
+- **Holes** are gaps inside the retained timeline: items the worker's
+  backlog dropped (`gap`) that a reload of the worker's history could not
+  restore. `holes: [{after_message_id, before_message_id, count?}]` names the
+  retained neighbours (`before_message_id: null` at the live edge until the
+  next message); `count` when known. A `history_end` lists the holes whose
+  `before_message_id` is in its page (≤ 16, then `holes_more: true`); holes
+  older than `oldest_retained` become truncation. Holes are persistent and
+  no reopen repairs them.
+- **Backlog gap handling (r8 implementation change from #75).** Today a
+  worker chunk with `gap > 0` makes the broker reload the worker's history
+  and then send every open conversation `error` "the chat history was
+  incomplete…" and `close`, forcing a reopen. In r8 the broker reloads, sends
+  each recovered message to open conversations as a sequenced
+  `message{history: true, after_message_id}` (timeline order; `after_message_id`
+  is the retained message it follows), and reports what stayed missing in a
+  sequenced event, with no `error` or `close`:
+
+```json
+{"type":"agentChat","data":{"v":1,"op":"coverage","conversationId":"conv-1","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-…","sequence":9,"oldest_retained":"m-0001","truncated":false,
+ "holes":[{"after_message_id":"m-0004","before_message_id":"m-0006","count":1}]}}
+```
+
+  A reload that fails (worker gone, over the reload bound) reports the gap as
+  a hole with `count` when known.
+- **Resync** (reopen) only on: a sequence gap in the conversation, a fenced
+  conversation (`stale_target` for its attachment, a new attachment), another
+  `generation`, or `close` with a `reason`. r8 `close` carries `reason`:
+  `switched` (`/clear`, resume, `/new`), `withdrawn` (chat withdrawn),
+  `restarted` (new process), `evicted` (a ninth conversation), `fenced`,
+  `reset` (any other host reset). Truncation, holes and `coverage` events
+  never ask for one.
+
+### D. `receipt.result`
+
+```json
+{"type":"session","data":{"v":1,"op":"receipt","request_id":"44444444-…","target":{…},"kind":"prompt",
+ "state":"completed","detail":"done","updated_at":1760600000000,
+ "result":{"turn_id":"turn-7","user_message_id":"turn-7-u","outcome":"done",
+           "reply_message_ids":["turn-7-a-0001","…","turn-7-a-0032"],"more":true,"replies":"complete"}}}
+```
+
+- On `completed` `prompt` receipts only. `turn_id`, `user_message_id` and
+  `outcome` (`done`|`interrupted`, equal to `detail`) are journaled with the
+  `completed` transition (ids only, never text). `reply_message_ids` (the
+  turn's assistant messages, timeline order, **at most 32**), `more` (true
+  when more replies are retained) and `replies` (`complete`|`partial`|
+  `unavailable`, the turn's coverage as in §C) are computed from retained
+  history each time the receipt is sent, so they may change with late
+  content or eviction. The rest come from `history{request_id}`; nothing is
+  ever re-run to recover replies. An `outcome_unknown` prompt has no
+  `result`.
+- Bounds: a receipt with `result` is ≤ 6 KiB (32 ids ≤ 128 bytes each, plus
+  r7.2 bounds); a `receipts` reply holds ≤ 64 receipts (r7.2's
+  `request_ids` bound), so ≤ 384 KiB, below the 1 MiB message bound without
+  continuation.
+
+### F. Chat Send acquires the lease with the prompt (`chat.send_acquire`)
+
+User-approved behaviour (2026-10-18, Astation handoff "Chat Send and session
+control"). Chat and the remote terminal share one lease per session; viewing
+either needs none. Remote terminal input still needs an explicit Take
+Control (§5 `acquire`). A chat Send needs no separate step:
+
+| ownership at admission | Send |
+|---|---|
+| nobody | acquires and submits in one host operation |
+| this attachment | submits under its current lease |
+| another attachment | refused `lease_held` naming the holder; only an explicit, confirmed takeover takes it |
+
+**Wire.** A §6 `submit` of kind `prompt`, or a chat-v1 `submit` with
+`text`, may carry `acquire: true`, and with it `takeover: true` plus
+`expected_controller`, the lease the user confirmed taking over, in the
+descriptor's `controller` shape (§4). Its binding then carries no
+`lease_epoch` (as for §5 `acquire`):
+
+```json
+{"type":"session","data":{"v":1,"op":"submit","id":"…",
+ "binding":{"target":{…},"attachment_gen":"33333333-…"},
+ "request_id":"44444444-…","kind":"prompt","payload":{"text":"run the tests"},
+ "acquire":true}}
+{"type":"session","data":{"v":1,"op":"submit","id":"…",
+ "binding":{"target":{…},"attachment_gen":"66666666-…"},
+ "request_id":"44444444-…","kind":"prompt","payload":{"text":"run the tests"},
+ "acquire":true,"takeover":true,
+ "expected_controller":{"controller_session":"…","lease_epoch":7}}}
+{"type":"agentChat","data":{"v":1,"op":"submit","conversationId":"…","agentId":"ses-aaaaaaaaaaaa",
+ "generation":"22222222-…","requestId":"44444444-…","text":"run the tests","acquire":true,
+ "binding":{"target":{…},"attachment_gen":"33333333-…"}}}
+```
+
+- **Field rules** (each `invalid_request`, nothing recorded, no lease
+  change): `acquire` and `takeover` appear only as `true`; `takeover` needs
+  `acquire` and `expected_controller`, and `expected_controller` needs
+  `takeover`; `acquire` excludes `binding.lease_epoch`. Only `prompt` (chat:
+  `text`) may acquire. `interrupt`, `stop` and `approval_rule_revoke` with
+  `acquire` are `invalid_request`; an approval answer with `acquire` is the
+  removed r7 form, `unsupported_version` (§G). Without the advertised
+  feature, `acquire` is `unsupported_version` (§A).
+- **Why `prompt` only.** The user approved Send. `interrupt` acts on the
+  turn the current controller started: an acquiring interrupt from someone
+  else is exactly the silent ownership change Send must never make, and on
+  an unowned session an explicit Take Control first loses nothing (a raced
+  interrupt is refused `stale_lease`, never misapplied). `stop` ends the
+  process and with it every lease (`process_ended`), so acquiring for it
+  means nothing. Either can become its own feature later.
+- **Without `acquire`** a `prompt` is the r7 submit: the current lease
+  (`lease_epoch`) is checked as in §6 and a wrong one is `stale_lease`. A
+  client that holds the lease sends this form; a client that doesn't (or no
+  longer knows) sends `acquire: true`.
+
+**Request identity.** `acquire`, `takeover` and `expected_controller` are
+admission parameters, like `binding.lease_epoch` and `attachment_gen`: they
+are in neither the payload digest nor the immutable request (§6 unchanged:
+`payload` is `{"text"}`). A duplicate `request_id` returns the recorded
+receipt whatever flags it carries; it never acquires, takes over, renews or
+re-executes. Why: a retry must be safe whatever the client believed about
+ownership when it resent. The client keeps the `request_id` and text from
+the first Send through a `lease_held` refusal, the takeover confirmation
+and any uncertain delivery. If the first attempt was in fact accepted (its
+reply lost), the confirmed retry gets the original receipt instead of
+`request_id_reused`, which would tempt a new id and a second run. Flags in
+the digest would buy nothing, since a duplicate never acts on them. A
+refused Send records nothing, so the retry is a new admission. Before
+offering a new Send or a takeover after an uncertain delivery, the client
+checks the receipt (`receipt_query`). Neither a query nor a duplicate
+acquires.
+
+**Admission** (one step of the broker's single-threaded pass, so no other
+admission, local input or lease change comes between its checks and its
+commit). The order follows today's `SessionHost::submit`:
+
+1. Binding (attachment, full target, trust and process generation):
+   `unauthorized`/`stale_target`/`unknown_session` as §2.
+2. Decode and field rules: `unsupported_version`/`invalid_request`.
+3. Duplicate `request_id`: the recorded receipt (view only, no `lease`
+   field) or `request_id_reused`.
+4. `control` → `forbidden`: the attachment's principal holds `control`
+   now (§H). Control authorizes the operation; the lease only coordinates
+   writers.
+5. A session that accepts work → `session_closed`; one whose descriptor
+   lacks `chat-v1` → `busy` ("chat is not available for this agent"), so
+   nobody takes control for a prompt that can't run.
+6. Ownership, on the host's monotonic clock at this instant (a lease with
+   `now >= deadline` has expired: the host applies the expiry first, with
+   its `lease_changed{expired}`, as on any clock step). Never as Astation
+   last displayed it:
+   - held live by this attachment: **own**, no lease change;
+   - held by this `controller_session` on another attachment: `stale_lease`
+     (as §5 `acquire`);
+   - held by another, no `takeover`: `lease_held`;
+   - held by another, `takeover` with an `expected_controller` other than
+     the current (`controller_session`, `lease_epoch`): `lease_held` (a
+     stale confirmation never authorizes a different takeover);
+   - held by another, `takeover` matching: a **takeover** is planned;
+   - nobody: a **grant** is planned (also with `takeover`: nobody's control
+     is taken, so the confirmation isn't needed).
+7. The prompt's static checks: text ≤ 32 768 bytes after trimming, not
+   starting with `/` or `!` (`ChatSession`'s `clean_prompt`), now at
+   admission → `invalid_request`. Dynamic ones (status ready, no unsent
+   terminal input, the same generation) stay at dispatch (`rejected` with
+   the adapter's text), as in r7.
+8. `receipt_limit`; the attachment's in-flight bound → `busy`.
+9. A planned grant or takeover reserves its epochs durably (§5 epoch
+   blocks). Failure → `busy`.
+10. `accepted` is written durably (fsync), with the submitter principal
+    and its `control_gen` (§H). A failure here or in step 9 is §I: `busy`,
+    no lease change, nothing executes, the journal halts, and after the
+    restart the request is `rejected` ("acceptance not confirmed"); a
+    resend uses a new `request_id` (§I.5). Epochs reserved in step 9 may
+    then be skipped, which §5 allows.
+11. **Commit.** Only now the lease moves: a grant or takeover gives this
+    attachment a new epoch with the full 15 s (capped by its authorization);
+    a takeover also raises the input epoch, so the previous holder's queued
+    bytes are dropped at the write boundary. Every other attachment with
+    `view` gets `lease_changed{granted|takeover}` and subscribers get
+    `session_changed`. Then the reply, then scheduling as any prompt (§6).
+
+This is today's approval `acquire` transaction (`lease_to_acquire` reserves
+before the journal append, `grant` runs only after it succeeds), with two
+differences. The takeover must be explicit and must match
+`expected_controller`. And the sender gets its lease in the reply, not in
+`lease_changed`, per §5's recipient rule.
+
+**Reply.** The reply that admits the Send carries the sender's lease:
+session `receipt{state:"accepted", …, lease:{lease_epoch, ms_left}}`, or
+chat-v1 `accepted{requestId, lease:{lease_epoch, ms_left}}`. That covers a
+grant, a takeover and own. For own the epoch is unchanged and `ms_left` is
+what remains: a Send never extends a lease (§5 rule 4). The client applies
+it as the reply to an `acquire` sent when the Send was sent (§5 rules 2–5:
+deadline = send time + `ms_left`). No other receipt carries `lease`: not
+`executing`/final ones, duplicates or `receipts`. A client whose admitting
+reply was lost doesn't control. If the registry shows it as controller, an
+explicit `acquire` (the repeat-acquire rule) returns the current lease
+unchanged.
+
+**Refusal.** `lease_held` names the holder in the descriptor's shape so the
+UI can offer "Take over and send":
+
+```json
+{"type":"session","data":{"v":1,"op":"error","re":"…","code":"lease_held",
+ "controller":{"controller_session":"…","lease_epoch":7}}}
+{"type":"agentChat","data":{"v":1,"op":"error","conversationId":"…","requestId":"44444444-…",
+ "code":"lease_held","text":"another controller holds this session",
+ "controller":{"controller_session":"…","lease_epoch":7}}}
+```
+
+r8 adds `controller` to every `lease_held`, the §5 `acquire` refusal
+included. The host names only the opaque `controller_session`. Mapping it
+to a person or device is Astation's job (its link is one attachment, and it
+arbitrates its own clients before they reach the host). Nothing in a
+refusal is recorded or executed, and no takeover happens.
+
+**Renewal and release.** The lease is the attachment's, as after §5
+`acquire`: it lasts 15 s and its holder renews it every 5 s (§5). Astation
+owns renewal. The native app renews while that session's chat or terminal
+view is in the foreground on the device whose user sent. It stops when the
+view closes, the app goes to the background or the device sleeps, and then
+sends `release` (best effort; otherwise the lease expires). For the
+protected local API, the caller holds the lease explicitly: Astation renews
+only while that caller keeps renewing through the API and releases when the
+caller's API session ends. An abandoned caller loses control within 15 s.
+The host renews nothing implicitly: not chat `open`, `history`, terminal
+`subscribe`, `receipt_query`, a duplicate submit, a Send under the own
+lease, nor execution of an accepted prompt. Expiry, release, local input or
+a takeover don't cancel accepted work (§6).
+
+**Unchanged.** Local terminal input revokes any remote lease before it is
+written (`local_input`, §5). A Send queued behind a running turn is then
+refused at dispatch by the adapter's unsent-input check. A Send's prompt is
+a §6 receipt with every r7 check and transition. Process replacement ends
+the lease (`process_ended`) and rejects accepted prompts (`session closed`);
+a trust change rejects them (`host trust changed`). New in r8: a
+principal that loses `control` is fenced durably (§H): leases held by any
+of its attachments are revoked (`lease_changed{revoked}`), and its
+`accepted` work not yet `executing`, from any of its attachments, live or
+gone, is rejected (`detail:"control revoked"`), now or at dispatch after a
+restart; executing work isn't cancelled. In compatibility mode this
+happens when the link re-authenticates with fewer permissions, before the
+new attachment is welcomed.
+
+Fixtures: `r8-send-acquires-an-unowned-session`,
+`r8-send-under-the-own-lease-checks-the-epoch`,
+`r8-send-refused-while-another-holds-then-takeover`,
+`r8-two-simultaneous-sends-acquire-once`,
+`r8-ownership-is-checked-at-admission-not-as-displayed`,
+`r8-local-input-wins-over-a-send`,
+`r8-stale-takeover-confirmation-is-refused`,
+`r8-duplicate-send-never-reacquires-or-replays`,
+`r8-disconnect-right-after-acceptance`,
+`r8-failed-persistence-changes-no-lease`,
+`r8-expired-lease-is-checked-at-admission`,
+`r8-revoked-control-refuses-the-send-and-its-queued-prompt`,
+`r8-process-replaced-before-dispatch`, `r8-send-acquire-wire-rules`,
+`r8-delayed-send-reply-does-not-regrant-lost-control` and, client side,
+`r8-client-delayed-send-reply-never-restores-control`.
+
+**Client rule for the reply's `lease`** (normative; §5 rules 1–5 apply as
+to an `acquire` reply). The `lease` on an admitting receipt is applied only
+if (a) its `re` is a submit still outstanding on the current attachment (a
+reply to a submit sent on a replaced or fenced attachment is dropped: the
+receipt state may be shown, the lease never), (b) its `lease_epoch` is not
+lower than the highest `lease_epoch` the client has seen for that session
+since the submit was sent (from `lease_changed`, `session_changed`,
+`sessions` or another `lease`): a lower one was superseded by local input,
+takeover, expiry, release or revocation while the reply was in flight, and
+(c) the deadline it gives (submit send time + `ms_left`) is still ahead
+(`now < deadline`). Otherwise the client stays a viewer; only an explicit
+`acquire` or a new Send regains control. The host side is unchanged: a
+superseded grant is already gone there, so the old epoch is `stale_lease`.
+
+### G. Lease-free approval answers (`approval.lease_free`)
+
+User decision, 2026-10-18. It replaces r7's "answering takes the lease with
+the answer (`acquire`)". Answering a permission prompt is a decision about
+that prompt, not writer coordination: it doesn't need the lease and never
+moves it.
+
+- **Payload** (strict): `{approval_id, decision, rule_id?, message?}`, as
+  r7 without `acquire`. `acquire` is refused `unsupported_version` as a
+  removed form, with no effect: in the payload (the r7 form) or beside it
+  (§F's submit field). The binding's `lease_epoch` is optional and ignored,
+  as for `approval_rule_revoke` (r7.3): a stale epoch or someone else's
+  isn't refused. chat-v1 answers (`submit` with `approval`) follow the same
+  rules.
+- **Admission**, in order: a duplicate `request_id` returns its receipt
+  (view only); `control` → `forbidden` (a verified attachment with
+  `control`; view-only ones get no card and can't answer); a session that
+  accepts work → `session_closed`; the approval pending for exactly the
+  binding's `session_id` and `process_gen`, and an `allow_always`
+  `rule_id` it offered, else `stale_target`. No lease check of any kind.
+- **Never moves the lease.** No grant, takeover, renewal or release, no
+  `lease_changed`, no `session_changed`. The holder keeps its epoch and
+  deadline, and its queued input isn't fenced. A non-holder's answer is
+  handed over like the holder's.
+- **First answer wins.** The first answer the host admits while the request
+  is pending wins. In the same step it goes `executing` and the approval
+  closes (`approval_closed{answered_remote}`, push resolved). A later
+  answer, from the holder or anyone, is `stale_target` and nothing of it is
+  recorded; so is one to a request already closed (`answered_terminal`,
+  `timed_out`, `interrupted`, `released`, `process_ended`). Holding the
+  lease gives no priority. A duplicate of the winning answer returns its
+  receipt. The terminal's own prompt still races as in r7
+  (`outcome_unknown` when both crossed).
+- **Rules** are granted only with the exact rule and scope the card showed
+  (`allow_always` names an offered `rule_id`; r7.2 unchanged). Rule revoke
+  stays r7.3: `control`, no lease, `acquire` refused.
+- Unchanged from r7: delivery to every attachment with `control` whoever
+  holds the lease, push, the receipt lifecycle, the 630 s hand-off deadline,
+  release on Codex input, restart behaviour, and lease changes never
+  closing an approval.
+
+r8 text for §6a then reads: the intro's "answering takes the lease with the
+answer (`acquire`)" becomes "answering needs `control`, never the lease"; the
+`submit` row drops `acquire?`; the payload, admission and "Acquire is
+atomic" paragraphs are replaced by the rules above; §5 "Scope" drops
+approval answers; §6's admission note on approval answers with `acquire`
+becomes "approval answers skip the lease check (§G)".
+
+Fixtures: `r8-approval-answer-by-a-non-holder-leaves-the-lease`,
+`r8-approval-answer-keeps-the-holders-deadline` (answers by the holder
+and a non-holder at t = 6000/9000 leave the holder's deadline at 15 000,
+its queued input is written, and an answer with no holder grants
+nothing), `r8-approval-answer-with-acquire-is-refused`,
+`r8-approval-answers-crossing-first-wins`,
+`r8-approval-answer-to-a-closed-request-is-stale-target`.
+
+### H. Submitter principal and the control fence (r8)
+
+Answers the r3 review's finding 1. Control is a permission of an
+authenticated principal, not of an attachment, and accepted work keeps the
+authority it was accepted under only while that principal keeps `control`.
+
+- **Principal.** The authenticated identity an attachment speaks for, set
+  by the host from the link's authentication, never from message fields
+  and never from the relay (relay labels are display only). Today
+  (compatibility mode) there is exactly one: the paired Astation the link
+  captured and `cred_state.json` verified, under the current
+  `host_trust_gen`. With account trust (`../account-trust.md` §3.3) each
+  device with a signed grant on the account is its own principal (its
+  verified device id); Astation's native and API callers stay inside
+  Astation's principal, and Astation arbitrates them (§F). `attachment_gen`
+  and `controller_session` are not principals: every connect,
+  re-authentication or replacement (r7.1) makes new ones for the same
+  principal.
+- **Control generation.** Per principal the host keeps, durably in the
+  journal, whether it holds `control` and a `control_gen`: an integer from
+  1 that never decreases and is never reset (kept like the lease-epoch
+  floors). Every revocation of `control` raises it by one. Granting
+  `control` again keeps the raised value; it never restores an old one.
+- **Recorded at acceptance.** The `accepted` record carries the submitter
+  `principal` and its `control_gen` at admission. Like `attachment_gen`
+  this is admission metadata: it is in neither the payload digest nor the
+  immutable request (§6), so duplicates and `request_id_reused` are
+  unchanged (a duplicate needs only view).
+- **Revocation is a durable fence.** When the host learns that a principal
+  lost `control` (today: its link re-authenticates with fewer permissions;
+  with account trust also: its grant is removed or lapses,
+  `../account-trust.md` §3.4), it does in one step of the pass:
+  1. write the fence `control_revoked{principal, control_gen}` (the raised
+     value) durably (fsync);
+  2. fence the principal's live attachments that had `control`, and revoke
+     a lease held by any of its attachments (`lease_changed{revoked}`; the
+     input epoch rises, so queued bytes are dropped);
+  3. reject each of its `accepted` requests not yet `executing`, whichever
+     of its attachments submitted it, live or gone (`rejected`,
+     `detail:"control revoked"`, each persisted);
+  4. only then welcome the new attachment.
+
+  Executing work isn't cancelled (§6).
+- **A failed revocation write** (r4 review). If any write of that step
+  fails (the fence in step 1, or a rejection in step 3), whatever the
+  rollback did, the host goes on in memory, in the same step: it fences
+  the principal's live attachments that had `control` and revokes the
+  lease as in step 2 (the input epoch rises, so the worker drops queued
+  remote bytes at the write boundary; the epoch of that `lease_changed` is
+  not persisted, which is harmless: clients order by `runtime_epoch`
+  first, and the restart starts a new one), and marks every one of the
+  principal's `accepted` requests not yet `executing` `rejected`,
+  `detail:"control revoked"`, in memory, sent to any live attachment
+  entitled to the receipt (today none: the principal's attachments were
+  just fenced). The journal halts (§I): every later session request but
+  `hello` is `busy`, the new link is closed without a `welcome`, and
+  **nothing queued is dispatched after a journal halt**, of any principal
+  (nor any remote terminal input admitted), until the restart. These
+  in-memory rejections aren't persisted; the restart rejects the same
+  requests anyway, because a halted run never writes a clean close
+  (Recovery, below), so they can never run.
+- **Clean close.** At an orderly shutdown (SIGTERM/SIGINT, idle exit,
+  replacement) whose journal is healthy (not halted, no failed write in
+  this run), after admission has stopped and the last other journal write
+  is durable, the host writes `<journal>/clean_close`
+  (`{"runtime_epoch": n}`, the run's own epoch; temp, fsync, rename,
+  directory fsync). A crash, a kill, a halted journal or a failed write
+  (including a failed fence) means no clean close. At startup the host
+  reads it before incrementing `runtime_epoch`: the previous run ended
+  cleanly only when the file exists, parses and names the stored epoch.
+  Then it removes the file (and the incremented epoch supersedes it in any
+  case, so a removal that fails can't vouch for a later crash). An
+  unreadable or stale file counts as no clean close.
+- **Dispatch check.** Before an `accepted` request becomes `executing`
+  (queued in this run, or recovered after a broker restart or worker
+  adoption) the host checks its recorded principal: it must hold `control`
+  now, with `control_gen` equal to the recorded one. Otherwise `rejected`,
+  `detail:"control revoked"`, never executed. Kinds dispatched in the step
+  that admits them (`interrupt`, `stop`, approval answers, rule revokes)
+  pass trivially.
+- **Same principal, new connection.** A disconnect, a reconnect, a
+  re-authentication with the same permissions or an attachment replacement
+  leaves `control_gen` unchanged, so accepted work goes on, as it does
+  after lease expiry or release (§6). A principal that regains `control`
+  after a revocation has no authority over work accepted before it: that
+  work carries the older `control_gen` and was rejected at the fence, or is
+  at dispatch.
+- **Recovery** (broker restart, with worker adoption). Before anything is
+  dispatched, every recovered `accepted` request not yet `executing` is
+  resolved in this order, each resolution persisted:
+  1. on the refusal list (§I.3) → `rejected`, `detail:"acceptance not
+     confirmed"`;
+  2. the previous run did **not** end with a clean close → `rejected`,
+     `detail:"authorization history unknown"`, for every principal,
+     whatever the journal holds (a fence on disk or not: a failed write
+     may have left it, so what reached the disk never changes the
+     outcome);
+  3. after a clean close: host trust changed → `host trust changed` (§6);
+     `control_gen` below its principal's durable one → `control revoked`;
+     the rest is dispatched only once its principal's control is
+     confirmed in this run: today when an attachment of that principal is
+     welcomed with `control` (welcomed without it, the fence is written
+     first and the work is `control revoked`); with account trust, when its
+     stored grant verifies. Not confirmed 60 s after the host's start
+     (`now >= start + 60 000`) → `rejected`, `detail:"control not
+     confirmed"`.
+
+  `executing` work is unaffected: reconciled, else `outcome_unknown`
+  (§6). If a resolution can't be persisted, the host starts with remote
+  sessions disabled (`welcome.host_error`) and dispatches nothing.
+  Requests already `rejected` in the journal keep their detail; the
+  in-memory rejections of a failed revocation write (above) were never
+  persisted, so the same requests come back `rejected` with step 2's
+  detail. Only the state is final; a detail is the best the journal can
+  establish.
+
+  Why rule 2: a clean close proves every revocation this host observed is
+  durably fenced, so the stored `control_gen` is a complete history of
+  them. Without one, a revocation may have been observed and lost (the
+  r4 trace: the fence write fails, the host restarts, control is restored
+  before the principal next authenticates, and a current `control` flag
+  can't show the missed revocation), so no recovered queued work runs.
+  The cost: after a crash, queued prompts that never started must be sent
+  again by the client, with a new `request_id` (the old one is final,
+  §I.5).
+
+  Why the 60 s confirmation stays (after a clean close only): rule 2
+  covers revocations the host saw; confirmation covers those that happen
+  while it is down, learned only from the principal's next
+  authentication (welcomed without `control`, the fence is written before
+  anything of it runs), and the bound keeps a prompt from running long
+  after its sender went away. A revocation and a re-grant that both happen
+  entirely while the host is down are invisible to it; the authority
+  (today Astation, which arbitrates its callers, §F) owns that case. The
+  restart disconnected every client anyway; they reconnect and query.
+- **Today.** One principal, whose control changes only when it
+  re-authenticates with fewer permissions; unpair raises
+  `host_trust_gen`, which already rejects accepted work (`host trust
+  changed`, §6). The rule is per principal so account trust adds
+  principals without changing it. The relay supplies none of this.
+
+Fixtures: `r8-revoked-control-refuses-the-send-and-its-queued-prompt`,
+`r8-revoked-control-fences-work-across-reconnect-and-restart`,
+`r8-control-fence-holds-when-a-rejection-write-fails`,
+`r8-failed-fence-write-rejects-queued-work-at-once`,
+`r8-failed-fence-write-then-control-restored-never-runs`,
+`r8-crash-rejects-queued-work-whose-history-is-unknown`,
+`r8-clean-close-runs-queued-work-once-its-principal-is-confirmed`,
+`r8-recovered-work-needs-its-principal-confirmed`.
+
+Conformance obligations (r4 review; implementation tests, not wire
+fixtures): fault the fence write with both rollback outcomes and the
+rejection writes; check that a halted journal also blocks queued raw
+terminal writes at the PTY write boundary (they don't pass through the
+`accepted` → `executing` transition); fault the refusal-list write and
+its atomic replacement, with crashes before and after its rename and
+before and after the `rejected` transition is durable: replaying or
+clearing the list is idempotent and never lets a refused request run;
+and crash before, during and after the clean-close write and its removal.
+
+### I. Admission persistence: one rule (r8)
+
+Answers the r3 review's finding 2. It replaces §6's "If the durable write
+of `accepted` fails … the client may retry with the same `request_id`.
+After a double I/O failure … a request answered `busy` may still be
+dispatched once …": that exception is removed, and a request answered
+`busy` never executes. It applies to every kind and to both forms of
+submit (session `submit`, chat-v1 `submit`). It matches `FileJournal`
+today: an fsync per transition, the log cut back after a failed write,
+and every later append refused until the journal is reopened.
+
+1. **Accepted means durable.** A request is accepted only when its
+   `accepted` record is written and fsync'd. Only then does anything act
+   on it: the lease moves (§F step 11), the reply is sent, the work is
+   scheduled.
+2. **A failed admission write is a definitive refusal.** If a journal
+   write of an admission fails (the epoch reservation, §F step 9, or the
+   `accepted` record, step 10): no lease change, no `lease_changed` or
+   `session_changed`, no receipt, nothing scheduled. The journal halts:
+   until the runtime restarts and reopens it, every session request but
+   `hello` is `busy` (`detail:"journal halted; restart Atem"`) and nothing
+   becomes `executing`, which needs a durable write too. Before replying,
+   the host records the refusal durably apart from the failed log: the
+   request's immutable values (§6; no payload) go on the journal's refusal
+   list (`<journal>/refused`, replaced atomically: temp, fsync, rename,
+   directory fsync). Then the reply: `error{code:"busy", detail:"acceptance
+   not recorded"}`.
+3. **Resolved at restart, never executed.** When the journal reopens,
+   before recovery dispatches anything, each request on the refusal list
+   is made durably `rejected`, `detail:"acceptance not confirmed"`: a
+   `Transition` when its `accepted` record is on disk after all (the write
+   failed after a partial or complete write, or the rollback failed), else
+   a receipt recorded directly as `rejected` (— → `rejected`, nothing
+   accepted) with its immutable values. Then the list is cleared. If that
+   can't be done, the host starts with remote sessions disabled
+   (`welcome.host_error`, as for a damaged `runtime_epoch`) and dispatches
+   nothing. What reached the disk never changes the outcome, so every
+   implementation agrees on it.
+4. **No durable refusal, no `busy`.** If the refusal can't be recorded
+   either, the host doesn't answer `busy`: it closes the link with no
+   reply and stays halted, and the client treats the request's delivery as
+   uncertain. After the restart the journal decides: nothing (the request
+   was never accepted), or, when the `accepted` record reached the disk, an
+   accepted request that §H's recovery rejects (`authorization history
+   unknown`: a halted run never ends with a clean close). The same holds
+   for a crash after the `accepted` record became durable and before the
+   lease moved or the reply was sent. Either way it never runs and no
+   lease is granted:
+   leases aren't persisted, and a lease is only ever granted in the step
+   that sends the admitting reply. The client follows §F: `receipt_query`
+   before any new Send or takeover.
+5. **Resending.** Before the restart a retry is `busy` (halted). After it,
+   a duplicate of the refused request returns its recorded `rejected`
+   receipt (view only, no `lease`) whatever flags it carries, and is never
+   re-admitted. To send the same text again the client uses a **new**
+   `request_id`. Why: the old id is final and can only ever return
+   `rejected`, and a new id can't run the prompt twice because the old one
+   is durably refused. It is the one case where the client changes ids,
+   and only once the old id is known to be final; §F keeps the id through
+   `lease_held`, the takeover confirmation and uncertain delivery because
+   there the old id may still run. A client that doesn't know why it got
+   `busy` queries after reconnecting: `rejected` (whatever the detail:
+   "acceptance not confirmed", "authorization history unknown") → a new
+   id; nothing recorded → the same id.
+7. **Which detail wins at restart.** "acceptance not confirmed" (the
+   refusal list) is resolved first and wins over §H's "authorization
+   history unknown": the client was told `busy`, and the detail confirms
+   that refusal. Both are `rejected`, final and never executed, so the
+   choice changes no outcome (§H, Recovery, gives the full order).
+6. Unchanged from §6: a failed `executing` write rejects the request
+   before any effect, and every exit from `executing` is persisted before
+   it is reported; any failed write halts the journal as in 2.
+
+Fixtures: `r8-failed-persistence-changes-no-lease` (single failure, the
+retry with the same id while halted, then the restart: `rejected`, the
+same id returns that receipt and isn't re-admitted, a new id is),
+`r8-double-write-failure-takeover-never-runs` (a confirmed takeover while
+another holds the lease: the write and its rollback fail, so the record
+may be on disk; no lease change, `rejected` after the restart, never
+executed, the same id returns the receipt),
+`r8-crash-after-durable-acceptance-grants-no-lease` (durable, then a
+crash before the grant: no lease, and after the restart `rejected`
+"authorization history unknown", never executed).
+
+### E. Errors (r8 additions)
+
+| code | when |
+|---|---|
+| `unsupported_version` | also: `hello` without `revision: 8`; anything before such a `welcome`; `open.before`/`open.generation`; an op of an unadvertised feature; `acquire` on an approval answer (§G) |
+| `invalid_request` | new: a well-formed message of a known op whose fields break its rules (history selector count, field formats or lengths; §F's `acquire`/`takeover`/`expected_controller` rules and a prompt's static checks) |
+| `stale_target` | also: a `next` token used out of its context or stale; a `before` no longer retained |
+| `busy` | also: more than 8 history requests a second in a conversation; an acquiring Send to a session without `chat-v1` (§F); a failed admission write (`detail:"acceptance not recorded"`, a definitive refusal) and every request after it, or after any other failed journal write such as a revocation's (§H), until restart (`journal halted; restart Atem`) (§I) |
+| `rejected` receipt details | new: `control revoked` (the submitter principal lost `control`, §H), `control not confirmed` (recovered work whose principal wasn't confirmed within 60 s after a clean close, §H), `authorization history unknown` (recovered work not yet executing after a run that didn't end with a clean close, §H), `acceptance not confirmed` (a request refused `busy` for a failed write, resolved at restart, §I) |
+| `lease_held` | now carries `controller{controller_session, lease_epoch}` (also for §5 `acquire`); also: an acquiring Send while another holds the lease, or a takeover whose `expected_controller` is no longer the holder (§F) |
+| `forbidden` | also: a Send or approval answer from an attachment without `control`, checked before any lease state (§F, §G) |

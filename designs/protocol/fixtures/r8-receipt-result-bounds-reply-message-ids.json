@@ -1,0 +1,325 @@
+{
+ "name": "r8-receipt-result-bounds-reply-message-ids",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native",
+    "holds_lease_epoch": 1
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 1,
+    "page.count": 0
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "summarize the repo"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "chat_turn": "ses-aaaaaaaaaaaa",
+   "turn_id": "turn-7",
+   "request_id": "44444444-4444-4444-8444-000000000001",
+   "origin": "remote",
+   "assistant_messages": 40,
+   "text_bytes": 200
+  },
+  {
+   "expect_live": "c1",
+   "message_ids": [
+    "turn-7-u",
+    "turn-7-a-0001",
+    "turn-7-a-0002",
+    "turn-7-a-0003",
+    "turn-7-a-0004",
+    "turn-7-a-0005",
+    "turn-7-a-0006",
+    "turn-7-a-0007",
+    "turn-7-a-0008",
+    "turn-7-a-0009",
+    "turn-7-a-0010",
+    "turn-7-a-0011",
+    "turn-7-a-0012",
+    "turn-7-a-0013",
+    "turn-7-a-0014",
+    "turn-7-a-0015",
+    "turn-7-a-0016",
+    "turn-7-a-0017",
+    "turn-7-a-0018",
+    "turn-7-a-0019",
+    "turn-7-a-0020",
+    "turn-7-a-0021",
+    "turn-7-a-0022",
+    "turn-7-a-0023",
+    "turn-7-a-0024",
+    "turn-7-a-0025",
+    "turn-7-a-0026",
+    "turn-7-a-0027",
+    "turn-7-a-0028",
+    "turn-7-a-0029",
+    "turn-7-a-0030",
+    "turn-7-a-0031",
+    "turn-7-a-0032",
+    "turn-7-a-0033",
+    "turn-7-a-0034",
+    "turn-7-a-0035",
+    "turn-7-a-0036",
+    "turn-7-a-0037",
+    "turn-7-a-0038",
+    "turn-7-a-0039",
+    "turn-7-a-0040"
+   ],
+   "sequence_from": 2
+  },
+  {
+   "turn_complete": "ses-aaaaaaaaaaaa",
+   "turn_id": "turn-7"
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "complete",
+    "sequence": 43,
+    "turnId": "turn-7",
+    "outcome": "done"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "completed",
+    "detail": "done",
+    "result.turn_id": "turn-7",
+    "result.user_message_id": "turn-7-u",
+    "result.outcome": "done",
+    "result.reply_message_ids.#": 32,
+    "result.reply_message_ids.0": "turn-7-a-0001",
+    "result.reply_message_ids.31": "turn-7-a-0032",
+    "result.more": true,
+    "result.replies": "complete"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipts",
+    "receipts.#": 1,
+    "receipts.0.result.reply_message_ids.#": 32,
+    "receipts.0.result.more": true
+   }
+  },
+  {
+   "recover": "c1",
+   "request": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p1",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001"
+    }
+   },
+   "message_ids": [
+    "turn-7-u",
+    "turn-7-a-0001",
+    "turn-7-a-0002",
+    "turn-7-a-0003",
+    "turn-7-a-0004",
+    "turn-7-a-0005",
+    "turn-7-a-0006",
+    "turn-7-a-0007",
+    "turn-7-a-0008",
+    "turn-7-a-0009",
+    "turn-7-a-0010",
+    "turn-7-a-0011",
+    "turn-7-a-0012",
+    "turn-7-a-0013",
+    "turn-7-a-0014",
+    "turn-7-a-0015",
+    "turn-7-a-0016",
+    "turn-7-a-0017",
+    "turn-7-a-0018",
+    "turn-7-a-0019",
+    "turn-7-a-0020",
+    "turn-7-a-0021",
+    "turn-7-a-0022",
+    "turn-7-a-0023",
+    "turn-7-a-0024",
+    "turn-7-a-0025",
+    "turn-7-a-0026",
+    "turn-7-a-0027",
+    "turn-7-a-0028",
+    "turn-7-a-0029",
+    "turn-7-a-0030",
+    "turn-7-a-0031",
+    "turn-7-a-0032",
+    "turn-7-a-0033",
+    "turn-7-a-0034",
+    "turn-7-a-0035",
+    "turn-7-a-0036",
+    "turn-7-a-0037",
+    "turn-7-a-0038",
+    "turn-7-a-0039",
+    "turn-7-a-0040"
+   ],
+   "min_pages": 1,
+   "max_count": 50,
+   "max_content_bytes": 262144,
+   "max_wire_bytes": 1048576,
+   "end": {
+    "page.end": true,
+    "page.selector": "request_id",
+    "page.coverage": "complete"
+   }
+  },
+  {
+   "assert": {
+    "dispatches": 1,
+    "receipts_visible": {
+     "c1": 1
+    }
+   }
+  }
+ ],
+ "note": "A completed prompt receipt carries result {turn_id, user_message_id, outcome, reply_message_ids, more, replies}. reply_message_ids lists at most the first 32 replies in timeline order; more: true says history{request_id} pages hold the rest. Only turn_id, user_message_id and outcome are journaled; reply ids are computed from retained history when the receipt is sent. A receipts reply holds at most 64 receipts, each bounded, so it stays far below 1 MiB. Nothing is dispatched again to recover replies."
+}

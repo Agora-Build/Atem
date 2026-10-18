@@ -1,0 +1,3055 @@
+{
+ "name": "r8-stale-or-foreign-next-token-is-stale-target",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "chat_history": "ses-aaaaaaaaaaaa",
+   "messages": [
+    {
+     "messageId": "m-0001",
+     "role": "user",
+     "turnId": "turn-1",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0002",
+     "role": "assistant",
+     "turnId": "turn-1",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0003",
+     "role": "user",
+     "turnId": "turn-2",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0004",
+     "role": "assistant",
+     "turnId": "turn-2",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0005",
+     "role": "user",
+     "turnId": "turn-3",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0006",
+     "role": "assistant",
+     "turnId": "turn-3",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0007",
+     "role": "user",
+     "turnId": "turn-4",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0008",
+     "role": "assistant",
+     "turnId": "turn-4",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0009",
+     "role": "user",
+     "turnId": "turn-5",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0010",
+     "role": "assistant",
+     "turnId": "turn-5",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0011",
+     "role": "user",
+     "turnId": "turn-6",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0012",
+     "role": "assistant",
+     "turnId": "turn-6",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0013",
+     "role": "user",
+     "turnId": "turn-7",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0014",
+     "role": "assistant",
+     "turnId": "turn-7",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0015",
+     "role": "user",
+     "turnId": "turn-8",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0016",
+     "role": "assistant",
+     "turnId": "turn-8",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0017",
+     "role": "user",
+     "turnId": "turn-9",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0018",
+     "role": "assistant",
+     "turnId": "turn-9",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0019",
+     "role": "user",
+     "turnId": "turn-10",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0020",
+     "role": "assistant",
+     "turnId": "turn-10",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0021",
+     "role": "user",
+     "turnId": "turn-11",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0022",
+     "role": "assistant",
+     "turnId": "turn-11",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0023",
+     "role": "user",
+     "turnId": "turn-12",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0024",
+     "role": "assistant",
+     "turnId": "turn-12",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0025",
+     "role": "user",
+     "turnId": "turn-13",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0026",
+     "role": "assistant",
+     "turnId": "turn-13",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0027",
+     "role": "user",
+     "turnId": "turn-14",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0028",
+     "role": "assistant",
+     "turnId": "turn-14",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0029",
+     "role": "user",
+     "turnId": "turn-15",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0030",
+     "role": "assistant",
+     "turnId": "turn-15",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0031",
+     "role": "user",
+     "turnId": "turn-16",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0032",
+     "role": "assistant",
+     "turnId": "turn-16",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0033",
+     "role": "user",
+     "turnId": "turn-17",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0034",
+     "role": "assistant",
+     "turnId": "turn-17",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0035",
+     "role": "user",
+     "turnId": "turn-18",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0036",
+     "role": "assistant",
+     "turnId": "turn-18",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0037",
+     "role": "user",
+     "turnId": "turn-19",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0038",
+     "role": "assistant",
+     "turnId": "turn-19",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0039",
+     "role": "user",
+     "turnId": "turn-20",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0040",
+     "role": "assistant",
+     "turnId": "turn-20",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0041",
+     "role": "user",
+     "turnId": "turn-21",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0042",
+     "role": "assistant",
+     "turnId": "turn-21",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0043",
+     "role": "user",
+     "turnId": "turn-22",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0044",
+     "role": "assistant",
+     "turnId": "turn-22",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0045",
+     "role": "user",
+     "turnId": "turn-23",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0046",
+     "role": "assistant",
+     "turnId": "turn-23",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0047",
+     "role": "user",
+     "turnId": "turn-24",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0048",
+     "role": "assistant",
+     "turnId": "turn-24",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0049",
+     "role": "user",
+     "turnId": "turn-25",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0050",
+     "role": "assistant",
+     "turnId": "turn-25",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0051",
+     "role": "user",
+     "turnId": "turn-26",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0052",
+     "role": "assistant",
+     "turnId": "turn-26",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0053",
+     "role": "user",
+     "turnId": "turn-27",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0054",
+     "role": "assistant",
+     "turnId": "turn-27",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0055",
+     "role": "user",
+     "turnId": "turn-28",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0056",
+     "role": "assistant",
+     "turnId": "turn-28",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0057",
+     "role": "user",
+     "turnId": "turn-29",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0058",
+     "role": "assistant",
+     "turnId": "turn-29",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0059",
+     "role": "user",
+     "turnId": "turn-30",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0060",
+     "role": "assistant",
+     "turnId": "turn-30",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0061",
+     "role": "user",
+     "turnId": "turn-31",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0062",
+     "role": "assistant",
+     "turnId": "turn-31",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0063",
+     "role": "user",
+     "turnId": "turn-32",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0064",
+     "role": "assistant",
+     "turnId": "turn-32",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0065",
+     "role": "user",
+     "turnId": "turn-33",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0066",
+     "role": "assistant",
+     "turnId": "turn-33",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0067",
+     "role": "user",
+     "turnId": "turn-34",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0068",
+     "role": "assistant",
+     "turnId": "turn-34",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0069",
+     "role": "user",
+     "turnId": "turn-35",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0070",
+     "role": "assistant",
+     "turnId": "turn-35",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0071",
+     "role": "user",
+     "turnId": "turn-36",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0072",
+     "role": "assistant",
+     "turnId": "turn-36",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0073",
+     "role": "user",
+     "turnId": "turn-37",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0074",
+     "role": "assistant",
+     "turnId": "turn-37",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0075",
+     "role": "user",
+     "turnId": "turn-38",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0076",
+     "role": "assistant",
+     "turnId": "turn-38",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0077",
+     "role": "user",
+     "turnId": "turn-39",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0078",
+     "role": "assistant",
+     "turnId": "turn-39",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0079",
+     "role": "user",
+     "turnId": "turn-40",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0080",
+     "role": "assistant",
+     "turnId": "turn-40",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0081",
+     "role": "user",
+     "turnId": "turn-41",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0082",
+     "role": "assistant",
+     "turnId": "turn-41",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0083",
+     "role": "user",
+     "turnId": "turn-42",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0084",
+     "role": "assistant",
+     "turnId": "turn-42",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0085",
+     "role": "user",
+     "turnId": "turn-43",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0086",
+     "role": "assistant",
+     "turnId": "turn-43",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0087",
+     "role": "user",
+     "turnId": "turn-44",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0088",
+     "role": "assistant",
+     "turnId": "turn-44",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0089",
+     "role": "user",
+     "turnId": "turn-45",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0090",
+     "role": "assistant",
+     "turnId": "turn-45",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0091",
+     "role": "user",
+     "turnId": "turn-46",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0092",
+     "role": "assistant",
+     "turnId": "turn-46",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0093",
+     "role": "user",
+     "turnId": "turn-47",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0094",
+     "role": "assistant",
+     "turnId": "turn-47",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0095",
+     "role": "user",
+     "turnId": "turn-48",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0096",
+     "role": "assistant",
+     "turnId": "turn-48",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0097",
+     "role": "user",
+     "turnId": "turn-49",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0098",
+     "role": "assistant",
+     "turnId": "turn-49",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0099",
+     "role": "user",
+     "turnId": "turn-50",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0100",
+     "role": "assistant",
+     "turnId": "turn-50",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0101",
+     "role": "user",
+     "turnId": "turn-51",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0102",
+     "role": "assistant",
+     "turnId": "turn-51",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0103",
+     "role": "user",
+     "turnId": "turn-52",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0104",
+     "role": "assistant",
+     "turnId": "turn-52",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0105",
+     "role": "user",
+     "turnId": "turn-53",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0106",
+     "role": "assistant",
+     "turnId": "turn-53",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0107",
+     "role": "user",
+     "turnId": "turn-54",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0108",
+     "role": "assistant",
+     "turnId": "turn-54",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0109",
+     "role": "user",
+     "turnId": "turn-55",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0110",
+     "role": "assistant",
+     "turnId": "turn-55",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0111",
+     "role": "user",
+     "turnId": "turn-56",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0112",
+     "role": "assistant",
+     "turnId": "turn-56",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0113",
+     "role": "user",
+     "turnId": "turn-57",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0114",
+     "role": "assistant",
+     "turnId": "turn-57",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0115",
+     "role": "user",
+     "turnId": "turn-58",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0116",
+     "role": "assistant",
+     "turnId": "turn-58",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0117",
+     "role": "user",
+     "turnId": "turn-59",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0118",
+     "role": "assistant",
+     "turnId": "turn-59",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    },
+    {
+     "messageId": "m-0119",
+     "role": "user",
+     "turnId": "turn-60",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ],
+     "origin": "local"
+    },
+    {
+     "messageId": "m-0120",
+     "role": "assistant",
+     "turnId": "turn-60",
+     "createdAt": 1760600000000,
+     "parts": [
+      {
+       "id": "p1",
+       "kind": "text",
+       "markdown": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 1,
+    "messageId": "m-0071",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 2,
+    "messageId": "m-0072",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 3,
+    "messageId": "m-0073",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 4,
+    "messageId": "m-0074",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 5,
+    "messageId": "m-0075",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 6,
+    "messageId": "m-0076",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 7,
+    "messageId": "m-0077",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 8,
+    "messageId": "m-0078",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 9,
+    "messageId": "m-0079",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 10,
+    "messageId": "m-0080",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 11,
+    "messageId": "m-0081",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 12,
+    "messageId": "m-0082",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 13,
+    "messageId": "m-0083",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 14,
+    "messageId": "m-0084",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 15,
+    "messageId": "m-0085",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 16,
+    "messageId": "m-0086",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 17,
+    "messageId": "m-0087",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 18,
+    "messageId": "m-0088",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 19,
+    "messageId": "m-0089",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 20,
+    "messageId": "m-0090",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 21,
+    "messageId": "m-0091",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 22,
+    "messageId": "m-0092",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 23,
+    "messageId": "m-0093",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 24,
+    "messageId": "m-0094",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 25,
+    "messageId": "m-0095",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 26,
+    "messageId": "m-0096",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 27,
+    "messageId": "m-0097",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 28,
+    "messageId": "m-0098",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 29,
+    "messageId": "m-0099",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 30,
+    "messageId": "m-0100",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 31,
+    "messageId": "m-0101",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 32,
+    "messageId": "m-0102",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 33,
+    "messageId": "m-0103",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 34,
+    "messageId": "m-0104",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 35,
+    "messageId": "m-0105",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 36,
+    "messageId": "m-0106",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 37,
+    "messageId": "m-0107",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 38,
+    "messageId": "m-0108",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 39,
+    "messageId": "m-0109",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 40,
+    "messageId": "m-0110",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 41,
+    "messageId": "m-0111",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 42,
+    "messageId": "m-0112",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 43,
+    "messageId": "m-0113",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 44,
+    "messageId": "m-0114",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 45,
+    "messageId": "m-0115",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 46,
+    "messageId": "m-0116",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 47,
+    "messageId": "m-0117",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 48,
+    "messageId": "m-0118",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 49,
+    "messageId": "m-0119",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 50,
+    "messageId": "m-0120",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 51,
+    "page.count": 50,
+    "page.end": false
+   },
+   "capture": {
+    "tok": "page.next"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "open",
+     "conversationId": "conv-2",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "opened",
+    "sequence": 0,
+    "conversationId": "conv-2"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 1,
+    "conversationId": "conv-2",
+    "messageId": "m-0071",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 2,
+    "conversationId": "conv-2",
+    "messageId": "m-0072",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 3,
+    "conversationId": "conv-2",
+    "messageId": "m-0073",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 4,
+    "conversationId": "conv-2",
+    "messageId": "m-0074",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 5,
+    "conversationId": "conv-2",
+    "messageId": "m-0075",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 6,
+    "conversationId": "conv-2",
+    "messageId": "m-0076",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 7,
+    "conversationId": "conv-2",
+    "messageId": "m-0077",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 8,
+    "conversationId": "conv-2",
+    "messageId": "m-0078",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 9,
+    "conversationId": "conv-2",
+    "messageId": "m-0079",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 10,
+    "conversationId": "conv-2",
+    "messageId": "m-0080",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 11,
+    "conversationId": "conv-2",
+    "messageId": "m-0081",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 12,
+    "conversationId": "conv-2",
+    "messageId": "m-0082",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 13,
+    "conversationId": "conv-2",
+    "messageId": "m-0083",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 14,
+    "conversationId": "conv-2",
+    "messageId": "m-0084",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 15,
+    "conversationId": "conv-2",
+    "messageId": "m-0085",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 16,
+    "conversationId": "conv-2",
+    "messageId": "m-0086",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 17,
+    "conversationId": "conv-2",
+    "messageId": "m-0087",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 18,
+    "conversationId": "conv-2",
+    "messageId": "m-0088",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 19,
+    "conversationId": "conv-2",
+    "messageId": "m-0089",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 20,
+    "conversationId": "conv-2",
+    "messageId": "m-0090",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 21,
+    "conversationId": "conv-2",
+    "messageId": "m-0091",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 22,
+    "conversationId": "conv-2",
+    "messageId": "m-0092",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 23,
+    "conversationId": "conv-2",
+    "messageId": "m-0093",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 24,
+    "conversationId": "conv-2",
+    "messageId": "m-0094",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 25,
+    "conversationId": "conv-2",
+    "messageId": "m-0095",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 26,
+    "conversationId": "conv-2",
+    "messageId": "m-0096",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 27,
+    "conversationId": "conv-2",
+    "messageId": "m-0097",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 28,
+    "conversationId": "conv-2",
+    "messageId": "m-0098",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 29,
+    "conversationId": "conv-2",
+    "messageId": "m-0099",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 30,
+    "conversationId": "conv-2",
+    "messageId": "m-0100",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 31,
+    "conversationId": "conv-2",
+    "messageId": "m-0101",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 32,
+    "conversationId": "conv-2",
+    "messageId": "m-0102",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 33,
+    "conversationId": "conv-2",
+    "messageId": "m-0103",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 34,
+    "conversationId": "conv-2",
+    "messageId": "m-0104",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 35,
+    "conversationId": "conv-2",
+    "messageId": "m-0105",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 36,
+    "conversationId": "conv-2",
+    "messageId": "m-0106",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 37,
+    "conversationId": "conv-2",
+    "messageId": "m-0107",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 38,
+    "conversationId": "conv-2",
+    "messageId": "m-0108",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 39,
+    "conversationId": "conv-2",
+    "messageId": "m-0109",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 40,
+    "conversationId": "conv-2",
+    "messageId": "m-0110",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 41,
+    "conversationId": "conv-2",
+    "messageId": "m-0111",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 42,
+    "conversationId": "conv-2",
+    "messageId": "m-0112",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 43,
+    "conversationId": "conv-2",
+    "messageId": "m-0113",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 44,
+    "conversationId": "conv-2",
+    "messageId": "m-0114",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 45,
+    "conversationId": "conv-2",
+    "messageId": "m-0115",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 46,
+    "conversationId": "conv-2",
+    "messageId": "m-0116",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 47,
+    "conversationId": "conv-2",
+    "messageId": "m-0117",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 48,
+    "conversationId": "conv-2",
+    "messageId": "m-0118",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 49,
+    "conversationId": "conv-2",
+    "messageId": "m-0119",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 50,
+    "conversationId": "conv-2",
+    "messageId": "m-0120",
+    "history": true
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 51,
+    "conversationId": "conv-2",
+    "page.end": false
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-2",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p1",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "next": "${tok}"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "error",
+    "sequence": 52,
+    "conversationId": "conv-2",
+    "code": "stale_target",
+    "page_id": "p1"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p2",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "next": "${tok}x"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "error",
+    "sequence": 52,
+    "code": "stale_target",
+    "page_id": "p2"
+   }
+  },
+  {
+   "chat_evict": "ses-aaaaaaaaaaaa",
+   "count": 75
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p3",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "next": "${tok}"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "error",
+    "sequence": 53,
+    "code": "stale_target",
+    "page_id": "p3"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p4",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "turn_id": "turn-40"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 54,
+    "messageId": "m-0079",
+    "history": true,
+    "page_id": "p4"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 55,
+    "messageId": "m-0080",
+    "history": true,
+    "page_id": "p4"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 56,
+    "page_id": "p4",
+    "page.end": true,
+    "page.selector": "turn_id",
+    "page.coverage": "complete"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p5",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "turn_id": "turn-1"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 57,
+    "page_id": "p5",
+    "page.count": 0,
+    "page.end": true,
+    "page.coverage": "unavailable"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "agentChat",
+    "data": {
+     "v": 1,
+     "op": "history",
+     "conversationId": "conv-1",
+     "agentId": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "page_id": "p6",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "turn_id": "turn-38"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "message",
+    "sequence": 58,
+    "messageId": "m-0076",
+    "history": true,
+    "page_id": "p6"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "agentChat",
+   "match": {
+    "op": "history_end",
+    "sequence": 59,
+    "page_id": "p6",
+    "page.count": 1,
+    "page.end": true,
+    "page.coverage": "partial"
+   }
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 0,
+    "pty_writes": 0,
+    "lease_holder": null,
+    "chat_closes": 0
+   }
+  }
+ ],
+ "note": "next is opaque and bound to the attachment, conversation, target (session and process generation), selector and the history snapshot it continues. Used in another conversation, altered, or after the message it continues from was evicted (or after a history reload, or another runtime), it is chat error stale_target, sequenced, and no page is sent; the client starts a new selection. A lookup whose turn is no longer retained is not an error: an empty page with coverage unavailable and end: true. A turn whose oldest messages were evicted (turn-38 lost m-0075) is coverage partial."
+}

@@ -1,0 +1,146 @@
+{
+ "name": "r8-client-refuses-a-host-without-revision-8",
+ "side": "client",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": false
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "hello",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "revision": 8
+    }
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "welcome",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "re": "11111111-1111-4111-8111-000000000900",
+     "account_id": "account-a",
+     "atem_device_id": "host-a",
+     "host_trust_gen": 1,
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "controller_session": "12121212-1212-4212-8212-121212121212",
+     "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+     "client_kind": "native",
+     "permissions": [
+      "view",
+      "control"
+     ],
+     "authorization_ms_left": 86400000,
+     "server_time": 1760500000000
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "admitted": false,
+    "revision": null,
+    "features_enabled": [],
+    "sent_list": false,
+    "input_enabled": false,
+    "chat_enabled": false
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "sessions",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "runtime_epoch": 7,
+     "seq": 1,
+     "sessions": []
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "admitted": false,
+    "registry": [],
+    "sent_list": false
+   }
+  },
+  {
+   "deliver_to_client": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "welcome",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "re": "11111111-1111-4111-8111-000000000900",
+     "account_id": "account-a",
+     "atem_device_id": "host-a",
+     "host_trust_gen": 1,
+     "runtime_gen": "55555555-5555-4555-8555-555555555555",
+     "controller_session": "12121212-1212-4212-8212-121212121212",
+     "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+     "client_kind": "native",
+     "permissions": [
+      "view",
+      "control"
+     ],
+     "authorization_ms_left": 86400000,
+     "server_time": 1760500000000,
+     "revision": 7,
+     "features": [
+      "chat.history_end",
+      "chat.history",
+      "chat.lookup",
+      "chat.coverage",
+      "receipt.result",
+      "approval.session_rules",
+      "approval.card_reason"
+     ]
+    }
+   }
+  },
+  {
+   "assert_client": {
+    "admitted": false,
+    "features_enabled": [],
+    "sent_list": false
+   }
+  }
+ ],
+ "note": "Client side: an r7 host ignores the unknown hello.revision and welcomes without revision (or names another one). The r8 client refuses the attachment: it enables no feature, sends no list, acquire, chat open or terminal request, and applies nothing the host sends afterwards. It reports that the host's Atem must be updated. No fallback to r7 behaviour."
+}

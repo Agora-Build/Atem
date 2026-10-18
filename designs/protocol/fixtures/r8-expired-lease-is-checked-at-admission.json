@@ -1,0 +1,235 @@
+{
+ "name": "r8-expired-lease-is-checked-at-admission",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native",
+    "holds_lease_epoch": 1
+   },
+   {
+    "name": "c2",
+    "attachment_gen": "66666666-6666-4666-8666-666666666666",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "advance_ms": 15000,
+   "timers": false
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "expired",
+    "lease_epoch": 2,
+    "controller": null
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "lease.lease_epoch": 3
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "expired",
+    "lease_epoch": 2,
+    "controller": null
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": 3
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "deploy to staging"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "code": "stale_lease"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "renew",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "code": "stale_lease"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "deploy to staging"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "error",
+    "re": "11111111-1111-4111-8111-000000000004",
+    "code": "lease_held",
+    "controller.lease_epoch": 3
+   }
+  },
+  {
+   "assert": {
+    "lease_holder": "c2",
+    "dispatch_attempts": 1,
+    "dispatches": 1
+   }
+  }
+ ],
+ "note": "Expiry is now >= deadline on the host's clock at admission, with or without a timer tick: an ordinary Send reaching the host after the holder's lease expired acquires (the host applies the expiry first, then grants), and the old holder's epoch is stale for submit and renew alike. The old holder's own ordinary Send is then refused lease_held."
+}

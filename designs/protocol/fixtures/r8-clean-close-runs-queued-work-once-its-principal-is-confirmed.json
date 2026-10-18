@@ -1,0 +1,266 @@
+{
+ "name": "r8-clean-close-runs-queued-work-once-its-principal-is-confirmed",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   },
+   {
+    "name": "c2",
+    "attachment_gen": "66666666-6666-4666-8666-666666666666",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000001",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "prompt",
+     "payload": {
+      "text": "run the tests"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "lease.lease_epoch": 1
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "granted",
+    "lease_epoch": 1
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000002",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "then deploy"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000002"
+   }
+  },
+  {
+   "restart_runtime": {
+    "runtime_gen": "99999999-9999-4999-8999-999999999999",
+    "runtime_epoch": 8
+   }
+  },
+  {
+   "reconnect": "c2",
+   "attachment_gen": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 1,
+    "lease_holder": null
+   }
+  },
+  {
+   "advance_ms": 30000
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 1
+   }
+  },
+  {
+   "reconnect": "c1",
+   "attachment_gen": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 2,
+    "dispatches": 2,
+    "lease_holder": null
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "receipt_query",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+     },
+     "request_ids": [
+      "44444444-4444-4444-8444-000000000001",
+      "44444444-4444-4444-8444-000000000002"
+     ]
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipts",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "receipts.#": 2,
+    "receipts.0.state": "outcome_unknown",
+    "receipts.1.state": "executing"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "prompt",
+     "payload": {
+      "text": "then deploy"
+     },
+     "acquire": true
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "executing",
+    "re": "11111111-1111-4111-8111-000000000004"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "dispatch_attempts": 2,
+    "lease_holder": null
+   }
+  }
+ ],
+ "note": "Appendix §H, Recovery rule 3. c1 executes P1 with P2 queued; the runtime stops in order with a healthy journal, so it writes a clean close. After the restart P2's control_gen equals its principal's durable one; it waits for that principal's confirmation: another principal (c2) reconnecting doesn't dispatch it, c1 welcomed with control 30 s after the start does, once, with no lease (leases aren't persisted). P1, executing at the stop, is outcome_unknown. The resend with the same id returns the receipt and neither acquires nor reruns."
+}

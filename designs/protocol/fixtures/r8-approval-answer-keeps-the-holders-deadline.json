@@ -1,0 +1,630 @@
+{
+ "name": "r8-approval-answer-keeps-the-holders-deadline",
+ "requires": "r8",
+ "setup": {
+  "host": {
+   "account_id": "account-a",
+   "atem_device_id": "host-a",
+   "host_trust_gen": 1,
+   "runtime_gen": "55555555-5555-4555-8555-555555555555",
+   "runtime_epoch": 7
+  },
+  "sessions": [
+   {
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "chat": true
+   }
+  ],
+  "clients": [
+   {
+    "name": "c1",
+    "attachment_gen": "33333333-3333-4333-8333-333333333333",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native",
+    "holds_lease_epoch": 1
+   },
+   {
+    "name": "c2",
+    "attachment_gen": "66666666-6666-4666-8666-666666666666",
+    "permissions": [
+     "view",
+     "control"
+    ],
+    "client_kind": "native"
+   }
+  ]
+ },
+ "steps": [
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000001"
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000001",
+    "sessions.#": 1
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "list",
+     "id": "11111111-1111-4111-8111-000000000002"
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "sessions",
+    "re": "11111111-1111-4111-8111-000000000002",
+    "sessions.#": 1
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "subscribe",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "terminal",
+   "match": {
+    "op": "attached",
+    "session.terminal_id": "ses-aaaaaaaaaaaa"
+   },
+   "capture": {
+    "s": "stream_id"
+   }
+  },
+  {
+   "hold_pty_writes": true
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "terminal",
+    "data": {
+     "v": 1,
+     "op": "input",
+     "terminal_id": "ses-aaaaaaaaaaaa",
+     "generation": "22222222-2222-4222-8222-222222222222",
+     "stream_id": "${s}",
+     "sequence": 0,
+     "bytes": "aGkN",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     }
+    }
+   }
+  },
+  {
+   "advance_ms": 6000
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "npm test",
+   "always_rules": [
+    {
+     "rule_id": "r-npm-test",
+     "label": "Bash(npm test:*)",
+     "scope": "this project"
+    }
+   ]
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "npm test",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     }
+    ]
+   },
+   "capture": {
+    "a1": "approval_id"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "npm test",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     }
+    ],
+    "approval_id": "${a1}"
+   }
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000003",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333",
+      "lease_epoch": 1
+     },
+     "request_id": "44444444-4444-4444-8444-000000000001",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${a1}",
+      "decision": "allow_once"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000003",
+    "kind": "approval"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a1}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a1}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "approval_applied": "${a1}",
+   "ok": true
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000001",
+    "state": "completed"
+   }
+  },
+  {
+   "advance_ms": 3000
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "cargo check",
+   "always_rules": [
+    {
+     "rule_id": "r-npm-test",
+     "label": "Bash(npm test:*)",
+     "scope": "this project"
+    }
+   ]
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "cargo check",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     }
+    ]
+   },
+   "capture": {
+    "a2": "approval_id"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "cargo check",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     }
+    ],
+    "approval_id": "${a2}"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000004",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000002",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${a2}",
+      "decision": "deny",
+      "message": "not now"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000004",
+    "kind": "approval"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000002",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a2}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a2}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "send": "c1",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "acquire",
+     "id": "11111111-1111-4111-8111-000000000005",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "33333333-3333-4333-8333-333333333333"
+     },
+     "takeover": false
+    }
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease",
+    "re": "11111111-1111-4111-8111-000000000005",
+    "binding.lease_epoch": 1,
+    "ms_left": 6000
+   }
+  },
+  {
+   "flush_pty_writes": true
+  },
+  {
+   "assert": {
+    "lease_holder": "c1",
+    "pty_writes_remote": 1,
+    "pty_writes_dropped": 0
+   }
+  },
+  {
+   "advance_ms": 5999
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "advance_ms": 1
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "expired",
+    "lease_epoch": 2,
+    "controller": null
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "lease_changed",
+    "reason": "expired",
+    "lease_epoch": 2,
+    "controller": null
+   }
+  },
+  {
+   "open_approval": "ses-aaaaaaaaaaaa",
+   "tool": "Bash",
+   "summary": "npm run build",
+   "always_rules": [
+    {
+     "rule_id": "r-npm-test",
+     "label": "Bash(npm test:*)",
+     "scope": "this project"
+    }
+   ]
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "npm run build",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     }
+    ]
+   },
+   "capture": {
+    "a3": "approval_id"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "approval_request",
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "22222222-2222-4222-8222-222222222222",
+    "tool": "Bash",
+    "summary": "npm run build",
+    "always_rules": [
+     {
+      "rule_id": "r-npm-test",
+      "label": "Bash(npm test:*)",
+      "scope": "this project"
+     }
+    ],
+    "approval_id": "${a3}"
+   }
+  },
+  {
+   "send": "c2",
+   "json": {
+    "type": "session",
+    "data": {
+     "v": 1,
+     "op": "submit",
+     "id": "11111111-1111-4111-8111-000000000006",
+     "binding": {
+      "target": {
+       "account_id": "account-a",
+       "atem_device_id": "host-a",
+       "host_trust_gen": 1,
+       "session_id": "ses-aaaaaaaaaaaa",
+       "process_gen": "22222222-2222-4222-8222-222222222222"
+      },
+      "attachment_gen": "66666666-6666-4666-8666-666666666666"
+     },
+     "request_id": "44444444-4444-4444-8444-000000000003",
+     "kind": "approval",
+     "payload": {
+      "approval_id": "${a3}",
+      "decision": "allow_once"
+     }
+    }
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000003",
+    "state": "accepted",
+    "re": "11111111-1111-4111-8111-000000000006",
+    "kind": "approval"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "receipt",
+    "request_id": "44444444-4444-4444-8444-000000000003",
+    "state": "executing"
+   }
+  },
+  {
+   "expect": "c1",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a3}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "expect": "c2",
+   "type": "session",
+   "match": {
+    "op": "approval_closed",
+    "approval_id": "${a3}",
+    "reason": "answered_remote"
+   }
+  },
+  {
+   "expect_none": "c1",
+   "for_ms": 0
+  },
+  {
+   "expect_none": "c2",
+   "for_ms": 0
+  },
+  {
+   "assert": {
+    "lease_holder": null,
+    "approval_decisions": [
+     {
+      "approval_id": "${a1}",
+      "decision": "allow_once"
+     },
+     {
+      "approval_id": "${a2}",
+      "decision": "deny",
+      "message": "not now"
+     },
+     {
+      "approval_id": "${a3}",
+      "decision": "allow_once"
+     }
+    ]
+   }
+  }
+ ],
+ "note": "Appendix §G at a non-zero clock. c1 holds the lease from t=0 (deadline 15000) and has terminal input queued at the writer under epoch 1. At t=6000 c1 itself answers (its lease_epoch is ignored) and at t=9000 c2, a non-holder, answers: neither renews, grants or fences anything (no lease_changed, no session_changed). Without renewing, c1's repeat acquire at t=9000 returns the same epoch with ms_left 6000 (the deadline is still 15000, it was not reset by either answer), the queued input is written, not dropped, and the lease expires exactly at 15000. With nobody holding the lease, c2 answers a third prompt: accepted and handed over, and no lease is granted."
+}
