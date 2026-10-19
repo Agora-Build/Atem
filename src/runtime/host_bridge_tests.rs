@@ -118,7 +118,48 @@ fn echo_agent(dir: &Path) -> PathBuf {
     )
 }
 
+/// The fake agents are Python (`/usr/bin/python3 -I`, also run by
+/// fake-claude.sh). Its first start on a machine can take far longer than
+/// any wait in these tests: under Rosetta (the x86_64-apple-darwin tests on
+/// an arm64 Mac, where children of this process run as x86_64 too) every
+/// binary and library is translated on its first use, while the tests that
+/// need it all start at once. It is started once, from this process (so as
+/// the same architecture), with the modules the fake agents import, before
+/// any test launches one: that one-time cost then counts against no wait
+/// for what a test checks. Bounded: 300 s.
+fn python_ready() {
+    static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    READY.get_or_init(|| {
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-I",
+                "-c",
+                "import json, os, select, signal, subprocess, sys, time, tty, uuid",
+            ])
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("the fake agents need /usr/bin/python3");
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert!(status.success(), "python3 failed: {status}");
+                    break;
+                }
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("python3 did not start within 300 s");
+                }
+            }
+        }
+    });
+}
+
 fn fake_claude() -> PathBuf {
+    python_ready();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/fake-claude.sh");
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     if perms.mode() & 0o111 != 0o111 {
@@ -2104,6 +2145,7 @@ fn the_duplicate_window_is_bounded() {
 
 /// `tests/fixtures/approvals/fake-agent.py`: runs the real permission hook.
 fn approval_agent() -> PathBuf {
+    python_ready();
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approvals/fake-agent.py");
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -2706,6 +2748,7 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
 }
 
 fn fixture_program(name: &str) -> PathBuf {
+    python_ready();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/chat")
         .join(name);
