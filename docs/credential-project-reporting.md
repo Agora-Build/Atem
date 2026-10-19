@@ -28,7 +28,7 @@ The recipient is the Astation encryption key pinned during verification.
 ## Project spelling and compatibility
 
 Project identity remains the lowercase canonical key. An updated CLI passes
-the current repository's original-case `RepoInfo.label` to the key agent.
+the current repository's original-case `RepoInfo.label` to the cred agent.
 The agent adds an optional encrypted `labels` envelope to the legacy report,
 containing a JSON array of `{key, label}` for exactly the reported keys. Both
 arrays together are limited to 64 KiB and 256 projects. Labels must be
@@ -50,7 +50,7 @@ Astation verifies both envelopes against its current pin and requires the
 same identity, timestamp and canonical project set. Malformed extensions
 reject the report. Removing labels affects display only, never permissions.
 Legacy Astation builds ignore this optional field and continue reading the
-lowercase array; legacy key agents omit the field. Both envelopes are sent in
+lowercase array; legacy cred agents omit the field. Both envelopes are sent in
 one message, so ephemeral CLIs do not need another capability exchange or a
 persistent connection. Unlocked older agents remain running until the user
 runs `atem cred lock` and `atem cred unlock` with the updated binary.

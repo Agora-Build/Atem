@@ -98,6 +98,13 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo test --release --target ${{ matrix.target }}
 
+      # The shared session fixtures need the debug-only test hooks (fixture
+      # clock, PTY faults; src/runtime/test_hooks.rs): the release run above
+      # ignores them. Linux only (the fixture binary is Linux-only).
+      - name: Run session fixtures (debug build)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --test runtime_fixtures_binary
+
       - name: Package binary
         run: |
           VERSION="${{ github.ref_name }}"

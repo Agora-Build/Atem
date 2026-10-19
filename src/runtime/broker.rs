@@ -684,6 +684,7 @@ impl BrokerSession {
             rows,
             cols,
             generation: self.process_gen.clone(),
+            worker_build: self.worker.as_ref().and_then(|w| w.info.build.clone()),
         }
     }
 

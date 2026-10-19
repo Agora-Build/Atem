@@ -17,7 +17,7 @@
 - One authority: every remote mutation goes through `SessionHost` with a binding and the current lease; local frontend input goes through the broker, which revokes any remote lease before the bytes are written; the worker's write boundary drops bytes with a stale epoch.
 - Welcome uses the authenticated account/device identity and the durable `pairing.json` host trust generation; §9 features (resume, browser grants, account-wide access, relay confidentiality) stay refused.
 - Never rustfmt `src/app.rs`, `src/main.rs`, `src/cli.rs`, `src/websocket_client.rs`, `src/memory/{mod,crypto,secrets}.rs`; new files may be formatted; check others with `--check` first. Never project-wide `cargo fmt`.
-- Never run the installed `atem`; never touch the real `~/.config/atem`, `$XDG_RUNTIME_DIR/atem`, the user's running atem/agents or key agent; tests use temp HOME/XDG dirs, fake agents, and only signal processes they started.
+- Never run the installed `atem`; never touch the real `~/.config/atem`, `$XDG_RUNTIME_DIR/atem`, the user's running atem/agents or cred agent; tests use temp HOME/XDG dirs, fake agents, and only signal processes they started.
 - Every task: full `cargo test` reading every `test result` line (unit + all `tests/*` binaries), session_protocol tests ×3, clippy not above the branch baseline.
 
 ## Tasks

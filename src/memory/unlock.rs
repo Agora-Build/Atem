@@ -1,8 +1,8 @@
 //! The CLI side of unlock and storage-key rotation (`atem cred …`, and the
-//! first escrow in `atem pair`): carries the key agent's requests to the home
+//! first escrow in `atem pair`): carries the cred agent's requests to the home
 //! Astation and Astation's answers back. The storage key never passes
 //! through here in plain form. Every agent call runs on a blocking thread
-//! (`key_agent::blocking`): the client's socket I/O must not stall the runtime.
+//! (`cred_agent::blocking`): the client's socket I/O must not stall the runtime.
 //! See designs/e2e-encryption.md "Unlock policy" and "Keys on disk (atem)".
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -11,15 +11,16 @@ use std::time::Duration;
 
 use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::encoding::dec;
-use crate::memory::key_agent::{
-    KeyAgentApi, LOCKED, RESET, blocking, build_unlock_request, running_agent,
+use crate::memory::cred_agent::{
+    CredAgentApi, LOCKED, RESET, blocking, build_unlock_request, running_agent,
 };
 use crate::memory::statements::{SignedWire, StorageRotate};
 use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, UnlockGrantWire, check_storage_ack, check_unlock_grant,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::{KeyPaths, key_needed};
+use crate::memory::verification::key_needed;
+use crate::paths::CredPaths;
 use crate::runtime::protocol::PrintLevel;
 use crate::websocket_client::{AstationClient, AstationMessage};
 
@@ -35,7 +36,7 @@ pub const ESCROW_TIMEOUT: Duration = Duration::from_secs(15);
 pub const ESCROW_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait for Astation to store a handed-over storage key.
-fn escrow_wait(paths: &KeyPaths) -> Duration {
+fn escrow_wait(paths: &CredPaths) -> Duration {
     let unanswered = TrustStore::load_from(&paths.trust)
         .map(|trust| trust.escrow_unanswered())
         .unwrap_or(false);
@@ -173,7 +174,7 @@ impl std::fmt::Display for NoAnswer {
 impl std::error::Error for NoAnswer {}
 
 /// The pins of `astation_id` (blocking: file read).
-fn home_pins(paths: &KeyPaths, astation_id: &str) -> Result<AstationTrust> {
+fn home_pins(paths: &CredPaths, astation_id: &str) -> Result<AstationTrust> {
     TrustStore::load_from(&paths.trust)?
         .verified(astation_id)
         .cloned()
@@ -199,7 +200,7 @@ fn rotation_kid(rotation: &StorageRotation) -> Result<String> {
 /// What is wrong with this device's key files, when it has a verified home
 /// Astation and they can't be unlocked as they are (the fix is the reset).
 /// A plain `device_keys` file is fine: the agent seals it when it starts.
-pub fn key_file_problem(paths: &KeyPaths, trust: &TrustStore) -> Option<String> {
+pub fn key_file_problem(paths: &CredPaths, trust: &TrustStore) -> Option<String> {
     trust.home()?;
     if paths.device_keys.exists() {
         return None;
@@ -229,8 +230,8 @@ pub fn key_file_problem(paths: &KeyPaths, trust: &TrustStore) -> Option<String> 
 /// The agent's challenge as an `atem-unlock-request-v1` signed by the
 /// unlock-auth key (blocking: agent call and file read).
 fn signed_request(
-    agent: &dyn KeyAgentApi,
-    paths: &KeyPaths,
+    agent: &dyn CredAgentApi,
+    paths: &CredPaths,
     astation_id: &str,
 ) -> Result<SignedWire> {
     let challenge = agent.begin_unlock(astation_id)?;
@@ -262,8 +263,8 @@ fn denial_revokes(reason: &str, revoked: bool) -> bool {
 /// Returns the storage key id Astation released.
 pub(crate) async fn unlock_via<L: AstationLink>(
     link: &mut L,
-    agent: &Arc<dyn KeyAgentApi>,
-    paths: &KeyPaths,
+    agent: &Arc<dyn CredAgentApi>,
+    paths: &CredPaths,
     astation_id: &str,
     wait: Duration,
 ) -> Result<String> {
@@ -334,7 +335,7 @@ pub(crate) async fn unlock_via<L: AstationLink>(
                 bail!("Astation denied the unlock: {}", shown(&reason));
             }
             // Unsigned (it came over the relay), so all it may cause is a
-            // note in cred_state.json; `atem unpair` then sets the old key
+            // note in cred/state.json; `atem unpair` then sets the old key
             // files aside (renamed, never deleted) and `atem pair` verifies with
             // new keys and a new safety code. A forged one costs a re-pair,
             // never keys or trust.
@@ -366,8 +367,8 @@ pub(crate) async fn unlock_via<L: AstationLink>(
 /// new rotation begins. Returns the new storage key id.
 pub(crate) async fn rotate_via<L: AstationLink>(
     link: &mut L,
-    agent: &Arc<dyn KeyAgentApi>,
-    paths: &KeyPaths,
+    agent: &Arc<dyn CredAgentApi>,
+    paths: &CredPaths,
     astation_id: &str,
     wait: Duration,
 ) -> Result<String> {
@@ -404,7 +405,7 @@ pub(crate) async fn rotate_via<L: AstationLink>(
 }
 
 async fn abandon_via_agent(
-    agent: &Arc<dyn KeyAgentApi>,
+    agent: &Arc<dyn CredAgentApi>,
     astation_id: &str,
     storage_kid: &str,
 ) -> Result<SignedWire> {
@@ -430,8 +431,8 @@ async fn abandon_via_agent(
 /// still needs it) and the same rotation is sent once more.
 async fn send_rotation<L: AstationLink>(
     link: &mut L,
-    agent: &Arc<dyn KeyAgentApi>,
-    paths: &KeyPaths,
+    agent: &Arc<dyn CredAgentApi>,
+    paths: &CredPaths,
     astation_id: &str,
     home: &AstationTrust,
     rotation: StorageRotation,
@@ -534,8 +535,8 @@ async fn send_rotation<L: AstationLink>(
 /// unchanged, never begun again. `None` when there is nothing to send.
 pub(crate) async fn escrow_if_needed<L: AstationLink>(
     link: &mut L,
-    agent: &Arc<dyn KeyAgentApi>,
-    paths: &KeyPaths,
+    agent: &Arc<dyn CredAgentApi>,
+    paths: &CredPaths,
     astation_id: &str,
 ) -> Result<Option<String>> {
     if TrustStore::load_from(&paths.trust)?.home() != Some(astation_id) {
@@ -570,8 +571,8 @@ pub enum PairEscrow {
 /// it; without one, hands over any storage key Astation doesn't hold yet.
 pub(crate) async fn pair_escrow<L: AstationLink>(
     link: &mut L,
-    agent: &Arc<dyn KeyAgentApi>,
-    paths: &KeyPaths,
+    agent: &Arc<dyn CredAgentApi>,
+    paths: &CredPaths,
     astation_id: &str,
     escrow: Option<StorageRotation>,
 ) -> Result<PairEscrow> {
@@ -627,11 +628,11 @@ pub(crate) async fn pair_escrow<L: AstationLink>(
 pub fn escrow_failure_message(error: &anyhow::Error) -> String {
     if error.downcast_ref::<NoAnswer>().is_some() {
         return format!(
-            "Astation didn't answer the storage-key handover ({error:#}); it may not support storage keys yet. This device keeps its keys in the plain ~/.config/atem/device_keys file (re-sealed whenever the key agent starts) and hands the key over at the next `atem cred unlock` once Astation does, which deletes that file."
+            "Astation didn't answer the storage-key handover ({error:#}); it may not support storage keys yet. This device keeps its keys in the plain ~/.config/atem/cred/device_keys file (re-sealed whenever the cred agent starts) and hands the key over at the next `atem cred unlock` once Astation does, which deletes that file."
         );
     }
     format!(
-        "Astation doesn't hold this device's storage key yet ({error:#}). Until it does, this device keeps its keys in the plain ~/.config/atem/device_keys file (re-sealed whenever the key agent starts); run `atem cred unlock` to hand the key over, which deletes that file."
+        "Astation doesn't hold this device's storage key yet ({error:#}). Until it does, this device keeps its keys in the plain ~/.config/atem/cred/device_keys file (re-sealed whenever the cred agent starts); run `atem cred unlock` to hand the key over, which deletes that file."
     )
 }
 
@@ -640,8 +641,8 @@ pub fn escrow_failure_message(error: &anyhow::Error) -> String {
 /// unlocked, hand Astation any storage key it doesn't hold yet.
 pub(crate) async fn unlock_and_rotate<L: AstationLink>(
     link: &mut L,
-    agent: &Arc<dyn KeyAgentApi>,
-    paths: &KeyPaths,
+    agent: &Arc<dyn CredAgentApi>,
+    paths: &CredPaths,
     home: &str,
     wait: Duration,
 ) -> Result<()> {
@@ -678,17 +679,17 @@ pub(crate) async fn unlock_and_rotate<L: AstationLink>(
 /// `atem cred lock`: what happened, or why the agent couldn't be reached.
 /// The agent wipes its keys and exits; the next `atem cred unlock` starts
 /// this build's.
-pub fn lock_keys_message(agent: Option<&dyn KeyAgentApi>) -> Result<String> {
+pub fn lock_keys_message(agent: Option<&dyn CredAgentApi>) -> Result<String> {
     match agent {
-        None => Ok("Locked: no key agent was running.".into()),
+        None => Ok("Locked: no cred agent was running.".into()),
         Some(agent) => {
             let stopped = agent
                 .lock_and_stop()
                 .map_err(|error| anyhow!("Not locked: {error:#}"))?;
             Ok(if stopped {
-                "Locked: the key agent wiped this device's keys and stopped.".into()
+                "Locked: the cred agent wiped this device's keys and stopped.".into()
             } else {
-                "Locked: the key agent wiped this device's keys, but it is still running from an older atem build; the next `atem cred unlock` replaces it.".into()
+                "Locked: the cred agent wiped this device's keys, but it hasn't stopped yet; the next `atem cred unlock` replaces it.".into()
             })
         }
     }
@@ -704,7 +705,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
     match command {
         CredCommands::Projects => {
             crate::auth::require_pairing("credential project discovery")?;
-            let trust = TrustStore::load_from(&KeyPaths::default_paths().trust)?;
+            let trust = TrustStore::load_from(&CredPaths::default_paths().trust)?;
             trust.home().ok_or_else(|| anyhow!("Verify this device with Astation first"))?;
             let options = OpOptions {
                 cwd: std::env::current_dir().ok(),
@@ -712,7 +713,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
             };
             crate::runtime::op_client::run(OpKind::CredProjects, options).await
         }
-        CredCommands::Unlock => unlock_command(&crate::status::Sources::current()?).await,
+        CredCommands::Unlock => unlock_command(&crate::profile::Sources::current()?).await,
         CredCommands::Lock => {
             let message = blocking(|| lock_keys_message(running_agent().as_deref())).await?;
             println!("{message}");
@@ -723,8 +724,8 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
 
 /// The home Astation `atem cred unlock` unlocks with: never pairs or
 /// verifies, so an unverified device stops here, offline.
-pub(crate) fn unlock_home(src: &crate::status::Sources) -> Result<String> {
-    let trust = TrustStore::load_from(&src.keys.trust)?;
+pub(crate) fn unlock_home(src: &crate::profile::Sources) -> Result<String> {
+    let trust = TrustStore::load_from(&src.paths.cred.trust)?;
     match (trust.home(), trust.recorded_home()) {
         (Some(home), _) => Ok(home.to_string()),
         (None, Some(stale)) => bail!(
@@ -736,7 +737,7 @@ pub(crate) fn unlock_home(src: &crate::status::Sources) -> Result<String> {
 
 /// `atem cred unlock`: the offline checks, then the unlock in `atem
 /// runtime` on its link.
-pub(crate) async fn unlock_command(src: &crate::status::Sources) -> Result<()> {
+pub(crate) async fn unlock_command(src: &crate::profile::Sources) -> Result<()> {
     unlock_home(src)?;
     crate::runtime::op_client::run(
         crate::runtime::protocol::OpKind::CredUnlock,
@@ -759,8 +760,8 @@ pub(crate) fn migration_pending(trust: &TrustStore, home: &str) -> Result<bool> 
 /// the keys are unlocked, Astation holds their storage key, no rotation is
 /// waiting to be resent and `K` isn't missing (blocking: agent call).
 pub(crate) fn already_unlocked(
-    agent: &dyn KeyAgentApi,
-    paths: &KeyPaths,
+    agent: &dyn CredAgentApi,
+    paths: &CredPaths,
     home: &str,
 ) -> Result<Option<String>> {
     let status = agent.status()?;
@@ -787,8 +788,8 @@ const KEY_TIMEOUT: Duration = Duration::from_secs(15);
 /// grant. Nothing is asked when no signed state needs `K`.
 async fn request_missing_key<L: AstationLink>(
     link: &mut L,
-    agent: &Arc<dyn KeyAgentApi>,
-    paths: &KeyPaths,
+    agent: &Arc<dyn CredAgentApi>,
+    paths: &CredPaths,
     home: &str,
 ) -> Result<()> {
     let public_key = {
@@ -842,8 +843,8 @@ mod tests {
         ASTATION_ID, DEVICE_ID, FakeKeyServer, captured_rotation, sealed_device, set_state,
     };
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::key_agent::RESET;
-    use crate::memory::key_agent::{error_of, test_agent};
+    use crate::memory::cred_agent::RESET;
+    use crate::memory::cred_agent::{error_of, test_agent};
     use crate::memory::statements::AccountState;
     use crate::memory::statements::{FakeAstation, SignedWire, StorageAck};
     use crate::memory::storage_key::{SealedDeviceKeys, StorageRotation, new_storage_key};
@@ -853,7 +854,7 @@ mod tests {
     #[test]
     fn escrow_waits_briefly_and_less_once_unanswered() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         assert_eq!(escrow_wait(&paths), ESCROW_TIMEOUT);
         let mut trust = TrustStore::default();
         trust.record_escrow_unanswered();
@@ -888,7 +889,7 @@ mod tests {
         abandons: usize,
         rotates: usize,
         /// Encryption messages are applied to these paths and this agent.
-        keys: Option<(KeyPaths, Arc<dyn KeyAgentApi>)>,
+        keys: Option<(CredPaths, Arc<dyn CredAgentApi>)>,
         /// What each applied encryption message did (`Applied`, as Debug).
         applied: Vec<String>,
         /// Queued just before the answer to the next rotate.
@@ -922,7 +923,7 @@ mod tests {
             }
         }
 
-        fn with_keys(mut self, paths: &KeyPaths, agent: &Arc<dyn KeyAgentApi>) -> Self {
+        fn with_keys(mut self, paths: &CredPaths, agent: &Arc<dyn CredAgentApi>) -> Self {
             self.keys = Some((paths.clone(), agent.clone()));
             self
         }
@@ -1176,7 +1177,7 @@ mod tests {
         assert_eq!(state.mode, EncryptionMode::Off);
     }
 
-    fn agent(paths: &KeyPaths) -> Arc<dyn KeyAgentApi> {
+    fn agent(paths: &CredPaths) -> Arc<dyn CredAgentApi> {
         Arc::new(test_agent(paths))
     }
 
@@ -1224,7 +1225,7 @@ mod tests {
     /// generation) right after it sends `when`, before Astation's answer.
     struct UnpairOnSend {
         inner: ScriptedLink,
-        src: crate::status::Sources,
+        src: crate::profile::Sources,
         when: fn(&AstationMessage) -> bool,
         confirms: usize,
     }
@@ -1237,7 +1238,7 @@ mod tests {
             }
             self.inner.send(message).await?;
             if unpair {
-                crate::pairing_binding::commit_unpair(&self.src)?;
+                crate::pairing::unpair(&self.src)?;
             }
             Ok(())
         }
@@ -1254,11 +1255,11 @@ mod tests {
     /// `agent` bound to a fresh pairing of the profile in `dir`.
     fn bound(
         dir: &std::path::Path,
-        agent: Arc<dyn KeyAgentApi>,
-    ) -> (Arc<dyn KeyAgentApi>, crate::status::Sources) {
-        let capture = crate::pairing_binding::tests::bound_profile(dir, ASTATION_ID);
+        agent: Arc<dyn CredAgentApi>,
+    ) -> (Arc<dyn CredAgentApi>, crate::profile::Sources) {
+        let capture = crate::pairing::tests::bound_profile(dir, ASTATION_ID);
         let src = capture.sources().clone();
-        let agent = crate::pairing_binding::BoundAgent::new(capture, agent).unwrap();
+        let agent = crate::pairing::BoundAgent::new(capture, agent).unwrap();
         (Arc::new(agent), src)
     }
 
@@ -1275,7 +1276,7 @@ mod tests {
             confirms: 0,
         };
         let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
-        assert!(error.contains(crate::pairing_binding::CHANGED), "{error}");
+        assert!(error.contains(crate::pairing::CHANGED), "{error}");
         assert!(!inner.status().unwrap().unlocked, "the grant was dropped");
     }
 
@@ -1296,7 +1297,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains(crate::pairing_binding::CHANGED),
+            format!("{error:#}").contains(crate::pairing::CHANGED),
             "{error:#}"
         );
         // Not promoted, not confirmed: the rotation stays pending for the
@@ -1565,12 +1566,12 @@ mod tests {
     /// A device whose storage key no Astation ever confirmed holding (a
     /// fresh device or a migrated step-1 one before its first escrow),
     /// unlocked in its agent.
-    fn never_escrowed(dir: &std::path::Path) -> (KeyPaths, FakeKeyServer, Arc<dyn KeyAgentApi>) {
+    fn never_escrowed(dir: &std::path::Path) -> (CredPaths, FakeKeyServer, Arc<dyn CredAgentApi>) {
         let (paths, mut server, keys) = sealed_device(dir, "0a1b2c3d");
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&paths.trust).unwrap()).unwrap();
         raw.as_object_mut().unwrap().remove("escrowed_storage_kid");
-        std::fs::write(&paths.trust, serde_json::to_vec(&raw).unwrap()).unwrap();
+        crate::paths::write_test_file(&paths.trust, serde_json::to_vec(&raw).unwrap());
         assert_eq!(
             TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
             None
@@ -1792,7 +1793,7 @@ mod tests {
     fn the_reset_names_every_key_file_and_the_trust_state() {
         assert_eq!(
             RESET,
-            "To set this device up again: move ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json into a backup folder (don't delete them: device_keys.sealed holds the memory encryption key and its older keys, which older data may need), then run `atem unpair` and `atem pair`. Astation grants the current memory key again; older keys come back only from that backup."
+            "To set this device up again: move ~/.config/atem/cred into a backup folder (don't delete it: its device_keys.sealed holds the memory encryption key and its older keys, which older data may need), then run `atem unpair` and `atem pair`. Astation grants the current memory key again; older keys come back only from that backup."
         );
     }
 
@@ -1805,7 +1806,7 @@ mod tests {
         std::fs::remove_file(&paths.unlock_auth_key).unwrap();
         let problem = key_file_problem(&paths, &trust).unwrap();
         assert!(problem.contains("unlock_auth_key"), "{problem}");
-        std::fs::write(&paths.device_keys_sealed, b"junk").unwrap();
+        crate::paths::write_test_file(&paths.device_keys_sealed, b"junk");
         let problem = key_file_problem(&paths, &trust).unwrap();
         assert!(problem.contains("device_keys.sealed"), "{problem}");
         std::fs::remove_file(&paths.device_keys_sealed).unwrap();
@@ -1814,7 +1815,7 @@ mod tests {
         // A device that was never verified has nothing to fix.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
-            key_file_problem(&KeyPaths::in_dir(empty.path()), &TrustStore::default()),
+            key_file_problem(&CredPaths::in_dir(empty.path()), &TrustStore::default()),
             None
         );
     }
@@ -1866,7 +1867,7 @@ mod tests {
 
     /// A freshly verified device: unlocked, sealed under a key Astation
     /// doesn't hold yet, the first escrow begun (outcome.escrow).
-    fn fresh_device(dir: &std::path::Path) -> (KeyPaths, FakeKeyServer, Arc<dyn KeyAgentApi>) {
+    fn fresh_device(dir: &std::path::Path) -> (CredPaths, FakeKeyServer, Arc<dyn CredAgentApi>) {
         let (paths, mut server, keys) = sealed_device(dir, "0a1b2c3d");
         let storage_key = [9u8; 32];
         SealedDeviceKeys::seal(&keys, DEVICE_ID, "0a1b2c3d", &storage_key)
@@ -2040,14 +2041,14 @@ mod tests {
     fn lock_reports_what_it_did() {
         assert_eq!(
             lock_keys_message(None).unwrap(),
-            "Locked: no key agent was running."
+            "Locked: no cred agent was running."
         );
         let dir = tempfile::tempdir().unwrap();
         let (paths, _server, _) = sealed_device(dir.path(), "0a1b2c3d");
         let agent = agent(&paths);
         assert_eq!(
             lock_keys_message(Some(agent.as_ref())).unwrap(),
-            "Locked: the key agent wiped this device's keys and stopped."
+            "Locked: the cred agent wiped this device's keys and stopped."
         );
     }
 

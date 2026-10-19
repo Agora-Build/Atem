@@ -296,9 +296,9 @@ pub(crate) struct DeviceVerifiedReply {
 /// pair`) is dropped and nothing is pinned. `agent` must not be a
 /// `BoundAgent` (the lock is already held).
 pub(crate) fn apply_device_verified(
-    capture: &crate::pairing_binding::Captured,
-    paths: &crate::memory::verification::KeyPaths,
-    agent: &dyn crate::memory::key_agent::KeyAgentApi,
+    capture: &crate::pairing::Captured,
+    paths: &crate::paths::CredPaths,
+    agent: &dyn crate::memory::cred_agent::CredAgentApi,
     astation_id: &str,
     keys: crate::memory::verification::VerificationKeys,
     reply: &DeviceVerifiedReply,
@@ -646,8 +646,13 @@ mod tests {
         let (url, server) = astation(Vec::new()).await;
         let client = connected(&url).await;
         let failure = code_failure(CodeAnswer::Refused).unwrap();
-        let error =
-            abandon_verification(&client, &dir.path().join("cred_state.json"), "a", failure).await;
+        let error = abandon_verification(
+            &client,
+            &crate::paths::CredPaths::in_dir(dir.path()).trust,
+            "a",
+            failure,
+        )
+        .await;
         drop(client);
         assert!(error.to_string().contains("codes didn't match"));
         let frames = server.await.unwrap();
@@ -668,8 +673,13 @@ mod tests {
             failure.abort_reason(),
             Some("timed out waiting for Astation")
         );
-        let error =
-            abandon_verification(&client, &dir.path().join("cred_state.json"), "a", failure).await;
+        let error = abandon_verification(
+            &client,
+            &crate::paths::CredPaths::in_dir(dir.path()).trust,
+            "a",
+            failure,
+        )
+        .await;
         drop(client);
         assert!(error.to_string().contains("Timed out"));
         let frames = server.await.unwrap();
@@ -692,8 +702,13 @@ mod tests {
             panic!("expected Astation's abort");
         };
         assert_eq!(failure.abort_reason(), None);
-        let error =
-            abandon_verification(&client, &dir.path().join("cred_state.json"), "a", failure).await;
+        let error = abandon_verification(
+            &client,
+            &crate::paths::CredPaths::in_dir(dir.path()).trust,
+            "a",
+            failure,
+        )
+        .await;
         drop(client);
         assert!(error.to_string().contains("declined on the Mac"));
         assert!(server.await.unwrap().is_empty());
@@ -742,11 +757,11 @@ mod tests {
     /// (or replaced) meanwhile is never applied.
     #[test]
     fn a_delayed_device_verified_for_an_old_binding_is_not_applied() {
-        use crate::memory::key_agent::{KeyAgentApi, Reply, Request};
+        use crate::memory::cred_agent::{CredAgentApi, Reply, Request};
         struct NeverCalled;
-        impl KeyAgentApi for NeverCalled {
+        impl CredAgentApi for NeverCalled {
             fn call(&self, _: Request) -> Result<Reply> {
-                panic!("the key agent was asked to apply a stale verification")
+                panic!("the cred agent was asked to apply a stale verification")
             }
         }
         let wire = || SignedWire {
@@ -755,12 +770,12 @@ mod tests {
         };
         for re_pair in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let capture = crate::pairing_binding::tests::bound_profile(dir.path(), "astation-1");
+            let capture = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
             let src = capture.sources().clone();
-            crate::pairing_binding::commit_unpair(&src).unwrap();
+            crate::pairing::unpair(&src).unwrap();
             if re_pair {
-                let before = crate::pairing_binding::capture(&src).unwrap();
-                crate::pairing_binding::bind_new(&src, &before, "astation-1").unwrap();
+                let before = crate::pairing::capture(&src).unwrap();
+                crate::pairing::bind_new(&src, &before, "astation-1").unwrap();
             }
             let before = crate::status::tests::snapshot(dir.path());
             let reply = DeviceVerifiedReply {
@@ -771,16 +786,16 @@ mod tests {
             let keys = crate::memory::device_keys::DeviceKeys::generate().into();
             let error = apply_device_verified(
                 &capture,
-                &src.keys,
+                &src.paths.cred,
                 &NeverCalled,
                 "astation-1",
                 keys,
                 &reply,
             )
             .unwrap_err();
-            assert_eq!(error.to_string(), crate::pairing_binding::CHANGED);
+            assert_eq!(error.to_string(), crate::pairing::CHANGED);
             assert_eq!(crate::status::tests::snapshot(dir.path()), before);
-            assert!(!src.keys.trust.exists());
+            assert!(!src.paths.cred.trust.exists());
         }
     }
 }

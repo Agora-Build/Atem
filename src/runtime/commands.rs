@@ -210,6 +210,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            worker_build: None,
         }
     }
 
@@ -221,6 +222,7 @@ mod tests {
             pid: 42,
             astation: false,
             host_error: None,
+            worker_protocol: None,
         };
         let text = format_list(&welcome, &[]);
         assert!(text.starts_with("Runtime pid 42 \u{b7} protocol 1 \u{b7} build 0.7.0+1"));

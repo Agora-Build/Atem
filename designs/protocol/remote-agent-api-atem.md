@@ -83,7 +83,7 @@ Atem has no command for it.
 (or, for the account-recovery entry, by the recovery key pinned in genesis). Anyone can carry entries; the
 signatures decide.
 
-**Head** (`membership.json`, 0600, atomic, `flock`, beside `pairing.json`):
+**Head** (`pairing/membership.json`, 0600, atomic, under `pairing/trust_gen.lock`):
 `{account_id, genesis_hash, host_trust_gen, recovery_key, head:{seq, hash},
 entries:[…], evidence:[…], frozen?:{evidence}}`. `entries` is Atem's copy of
 the log it applied (small: ≤ 4 KiB per entry, a handful of devices), kept to

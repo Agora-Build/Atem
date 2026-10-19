@@ -1435,7 +1435,7 @@ authority it was accepted under only while that principal keeps `control`.
   by the host from the link's authentication, never from message fields
   and never from the relay (relay labels are display only). Today
   (compatibility mode) there is exactly one: the paired Astation the link
-  captured and `cred_state.json` verified, under the current
+  captured and `cred/state.json` verified, under the current
   `host_trust_gen`. With account trust (`../account-trust.md` §3.3) each
   device with a signed grant on the account is its own principal (its
   verified device id); Astation's native and API callers stay inside

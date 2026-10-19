@@ -118,7 +118,48 @@ fn echo_agent(dir: &Path) -> PathBuf {
     )
 }
 
+/// The fake agents are Python (`/usr/bin/python3 -I`, also run by
+/// fake-claude.sh). Its first start on a machine can take far longer than
+/// any wait in these tests: under Rosetta (the x86_64-apple-darwin tests on
+/// an arm64 Mac, where children of this process run as x86_64 too) every
+/// binary and library is translated on its first use, while the tests that
+/// need it all start at once. It is started once, from this process (so as
+/// the same architecture), with the modules the fake agents import, before
+/// any test launches one: that one-time cost then counts against no wait
+/// for what a test checks. Bounded: 300 s.
+fn python_ready() {
+    static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    READY.get_or_init(|| {
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-I",
+                "-c",
+                "import json, os, select, signal, subprocess, sys, time, tty, uuid",
+            ])
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("the fake agents need /usr/bin/python3");
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert!(status.success(), "python3 failed: {status}");
+                    break;
+                }
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("python3 did not start within 300 s");
+                }
+            }
+        }
+    });
+}
+
 fn fake_claude() -> PathBuf {
+    python_ready();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat/fake-claude.sh");
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     if perms.mode() & 0o111 != 0o111 {
@@ -132,13 +173,13 @@ fn fake_claude() -> PathBuf {
 /// `ACCOUNT`/`DEVICE` unless `verified` is false.
 fn profile(dir: &Path, verified: bool) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("pairing.json"),
-        json!({"version":1,"host_trust_gen":TRUST_GEN,"binding_id":"binding-1",
-               "astation_id":ASTATION,"created_at":1})
-        .to_string(),
-    )
-    .unwrap();
+    crate::pairing::tests::write_bound(
+        dir,
+        ASTATION,
+        TRUST_GEN,
+        "binding-1",
+        ("session-1", "token-1"),
+    );
     if verified {
         let entry = json!({
             "device_id": DEVICE, "data_account": ACCOUNT, "sign_gen": 1,
@@ -146,20 +187,11 @@ fn profile(dir: &Path, verified: bool) {
             "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
             "safety_code": "", "epoch_floor": 0, "account_state": null, "account_epoch": 0,
         });
-        std::fs::write(
-            dir.join("cred_state.json"),
+        crate::paths::write_test_file(
+            &crate::paths::CredPaths::in_dir(dir).trust,
             json!({"version":1,"astations":{ASTATION: entry}}).to_string(),
-        )
-        .unwrap();
+        );
     }
-    let mut sessions = crate::auth::SessionManager::default();
-    sessions.insert_session(crate::auth::AuthSession::new(
-        "session-1".into(),
-        "token-1".into(),
-        ASTATION.into(),
-        "test-machine".into(),
-    ));
-    sessions.save_to(&dir.join("sessions.json")).unwrap();
 }
 
 /// The Astation end of the link.
@@ -349,12 +381,9 @@ impl Runtime {
             }
         });
         let mut app = App::new();
-        // Never the user's sessions.json.
+        // Never the user's profile.
         app.last_session_refresh = Some(Instant::now());
-        app.astation_client = AstationClient::new_with_test_state(
-            "atem-host-test",
-            profile_dir.join("sessions.json"),
-        );
+        app.astation_client = AstationClient::new_with_test_state("atem-host-test", &profile_dir);
         app.astation_client
             .connect_raw(&format!("ws://{address}"))
             .await
@@ -377,7 +406,7 @@ impl Runtime {
                 socket_dir: root.join("ws"),
                 chat_root: root.join("run"),
             }),
-            profile: profile_at_start.then(|| crate::status::Sources::in_dir(&profile_dir)),
+            profile: profile_at_start.then(|| crate::profile::Sources::in_dir(&profile_dir)),
             clock: clock.clone(),
             ops: crate::runtime::ops::OpEnv::unavailable(),
         };
@@ -1822,11 +1851,8 @@ fn a_changed_pairing_drops_the_link_without_a_reload() {
     local(async {
         let mut rt = Runtime::start(true).await;
         rt.peer.hello().await;
-        std::fs::write(
-            rt.dir.path().join("profile").join("pairing.json"),
-            json!({"version": 1, "host_trust_gen": TRUST_GEN + 1}).to_string(),
-        )
-        .unwrap();
+        let profile = crate::profile::Sources::in_dir(&rt.dir.path().join("profile"));
+        crate::pairing::unpair(&profile).unwrap();
         tokio::time::timeout(WAIT, async {
             while rt.peer.from_atem.recv().await.is_some() {}
         })
@@ -2104,6 +2130,7 @@ fn the_duplicate_window_is_bounded() {
 
 /// `tests/fixtures/approvals/fake-agent.py`: runs the real permission hook.
 fn approval_agent() -> PathBuf {
+    python_ready();
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approvals/fake-agent.py");
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -2706,6 +2733,7 @@ fn a_hand_off_the_agent_never_confirms_closes_its_card_at_the_deadline() {
 }
 
 fn fixture_program(name: &str) -> PathBuf {
+    python_ready();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/chat")
         .join(name);
@@ -3438,15 +3466,15 @@ async fn adopted_rules_dropped_after(change: &str) {
     let dir = rt.shutdown().await;
     let profile = dir.path().join("profile");
     match change {
-        "trust" => std::fs::write(
-            profile.join("pairing.json"),
-            json!({"version":1,"host_trust_gen":TRUST_GEN + 1,"binding_id":"binding-2",
-                   "astation_id":ASTATION,"created_at":2})
-            .to_string(),
-        )
-        .unwrap(),
+        "trust" => crate::pairing::tests::write_bound(
+            &profile,
+            ASTATION,
+            TRUST_GEN + 1,
+            "binding-2",
+            ("session-1", "token-1"),
+        ),
         _ => {
-            let path = profile.join("cred_state.json");
+            let path = crate::paths::CredPaths::in_dir(&profile).trust;
             let mut state: Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             state["astations"][ASTATION]["data_account"] = json!("account-other");
@@ -3912,4 +3940,54 @@ fn turn_replies_follow_the_retained_history() {
     assert_eq!(r.ids.len(), MAX_HISTORY_MESSAGES);
     assert_eq!(r.ids[0], "t7-b-0");
     assert_eq!(r.coverage, Coverage::Partial);
+}
+
+async fn status(client: &mut RuntimeClient) -> crate::runtime::protocol::RuntimeStatus {
+    client.send(&ClientMsg::Status).await.unwrap();
+    expect(client, |m| match m {
+        RuntimeMsg::Status { status } => Some(status),
+        _ => None,
+    })
+    .await
+}
+
+/// The runtime's `status` (`atem status`): the link, its attachment, the
+/// last refused `hello` and the welcome with what is left of its
+/// authorization.
+#[test]
+fn status_reports_the_attachment_its_refusals_and_its_welcome() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        // Wait for the broker to consider the link.
+        let mut first = status(&mut client).await;
+        while !first.attachment {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            first = status(&mut client).await;
+        }
+        assert!(first.astation && first.welcomed.is_none() && first.refused.is_none());
+        assert!(!first.journal_halted && first.host_error.is_none());
+        // A hello of revision 7 is refused and remembered.
+        let id = rt.peer.request("hello", json!({"revision": 7}));
+        assert_eq!(rt.peer.reply(&id).await["code"], "unsupported_version");
+        let refused = status(&mut client).await;
+        let refusal = refused.refused.expect("the refusal is reported");
+        assert_eq!((refusal.revision, refusal.needs), (Some(7), 8));
+        assert!(refused.welcomed.is_none());
+        // A welcome clears it and reports the revision and time left.
+        rt.peer.hello().await;
+        rt.clock.skip(3_600_000);
+        let welcomed = status(&mut client).await;
+        assert!(welcomed.refused.is_none());
+        let welcome = welcomed.welcomed.expect("the welcome is reported");
+        assert_eq!(welcome.revision, 8);
+        let left = super::LINK_AUTHORIZATION_MS - 3_600_000;
+        assert!(
+            welcome.ms_left <= left && welcome.ms_left > left - 10_000,
+            "{}",
+            welcome.ms_left
+        );
+        assert!(welcome.at_ms > 0);
+        rt.shutdown().await;
+    });
 }

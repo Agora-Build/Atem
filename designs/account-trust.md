@@ -30,7 +30,7 @@ signatures that chain back to what it pinned.
 | Log entry | in the log | `{account_id, seq, prev_hash, action: add\|remove\|set_roles, device_id, device_sign_pub, device_enc_pub, roles, signer_device_id, signed_at}` + signature by a device whose roles include `manage` at `seq-1` |
 | Genesis | entry `seq = 1` | `add` of the first Astation by itself, roles `manage, view, control`, plus the Recovery Kit's public key (`recovery_sign_pub`) |
 | Recovery Kit | offline, saved by the user (password manager, printed QR + phrase, or another device) | Astation account-recovery feature: a mandatory Ed25519 key created at account setup; never a member; used only in Astation's restore-account flow when every Astation device is lost |
-| Atem pin | Atem's `membership.json`, beside `pairing.json` | `{account_id, genesis_hash, host_trust_gen, recovery_sign_pub, head:{seq, hash}, entries, evidence, frozen?}`; the head only moves forward and is made durable before anything depends on it |
+| Atem pin | Atem's `pairing/membership.json`, beside `pairing/pairing.enc` and `pairing/trust_gen` | `{account_id, genesis_hash, host_trust_gen, recovery_sign_pub, head:{seq, hash}, entries, evidence, frozen?}`; the head only moves forward and is made durable before anything depends on it |
 
 Roles: `view` (see sessions/output), `control` (take the lease, type, submit;
 answer the agent's permission prompts without the lease, r8 §G), `manage` (add/remove devices).

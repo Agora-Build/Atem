@@ -1,6 +1,8 @@
-//! Runs the real `atem key-agent` binary on a temp HOME and runtime dir and
+//! Runs the real `atem cred-agent` binary on a temp HOME and runtime dir and
 //! talks to it over its socket.
 #![cfg(unix)]
+mod support;
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
@@ -32,7 +34,7 @@ fn the_real_agent_starts_locked_and_answers_on_its_socket() {
     .unwrap();
     let _agent = Agent(
         Command::new(env!("CARGO_BIN_EXE_atem"))
-            .arg("key-agent")
+            .arg("cred-agent")
             .env("HOME", &home)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env_remove("XDG_CONFIG_HOME")
@@ -42,7 +44,7 @@ fn the_real_agent_starts_locked_and_answers_on_its_socket() {
             .spawn()
             .unwrap(),
     );
-    let socket = runtime.join("atem").join("agent.sock");
+    let socket = support::profile::agent_sock(&runtime);
     let mut stream = (0..50)
         .find_map(|_| {
             UnixStream::connect(&socket).ok().or_else(|| {
@@ -63,11 +65,11 @@ fn the_real_agent_starts_locked_and_answers_on_its_socket() {
     assert_eq!(reply["reply"]["unlocked"], false);
 }
 
-/// `atem key-agent` for `home` with its socket under `runtime`.
+/// `atem cred-agent` for `home` with its socket under `runtime`.
 fn agent_process(home: &std::path::Path, runtime: &std::path::Path) -> Agent {
     Agent(
         Command::new(env!("CARGO_BIN_EXE_atem"))
-            .arg("key-agent")
+            .arg("cred-agent")
             .env("HOME", home)
             .env("XDG_RUNTIME_DIR", runtime)
             .env_remove("XDG_CONFIG_HOME")
@@ -116,7 +118,7 @@ fn an_agent_whose_runtime_dir_was_removed_exits_and_a_new_one_starts() {
         std::fs::set_permissions(run, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     }
     let mut first = agent_process(&home, &run_a);
-    let socket_a = run_a.join("atem").join("agent.sock");
+    let socket_a = support::profile::agent_sock(&run_a);
     assert!(
         within(5, || status_at(&socket_a).is_some()),
         "the first agent didn't start"
@@ -129,11 +131,11 @@ fn an_agent_whose_runtime_dir_was_removed_exits_and_a_new_one_starts() {
         "the orphaned agent kept running"
     );
     // A clean exit clears its pid from the lock file.
-    let lock = home.join(".config").join("atem").join("key_agent.lock");
+    let lock = support::profile::CredPaths::in_dir(&home.join(".config").join("atem")).agent_lock;
     assert_eq!(std::fs::read_to_string(&lock).unwrap().trim(), "");
     // The next session's agent takes over the key files.
     let mut second = agent_process(&home, &run_b);
-    let socket_b = run_b.join("atem").join("agent.sock");
+    let socket_b = support::profile::agent_sock(&run_b);
     assert!(
         within(10, || status_at(&socket_b).is_some()),
         "the new agent didn't start"

@@ -10,11 +10,11 @@
 //! operations through the runtime".
 
 use super::protocol::{AnswerValue, AskKind, OpKind, OpOptions, PrintLevel, RuntimeMsg};
-use crate::memory::key_agent::{KeyAgentApi, LOCKED, blocking, default_agent};
+use crate::memory::cred_agent::{CredAgentApi, LOCKED, blocking, default_agent};
 use crate::memory::unlock::{AstationLink, shown};
-use crate::memory::verification::KeyPaths;
 use crate::pair_verify::{CodeAnswer, VerifyFailure};
-use crate::status::Sources;
+use crate::paths::CredPaths;
+use crate::profile::Sources;
 use crate::websocket_client::{AstationClient, AstationMessage};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -142,10 +142,10 @@ impl OpUi for ClientUi {
 
 /// Where an operation's profile comes from (read when it starts).
 type ProfileSource = Arc<dyn Fn() -> Result<Sources> + Send + Sync>;
-/// Where an operation's key agent comes from.
-type AgentSource = Arc<dyn Fn() -> Result<Arc<dyn KeyAgentApi>> + Send + Sync>;
+/// Where an operation's cred agent comes from.
+type AgentSource = Arc<dyn Fn() -> Result<Arc<dyn CredAgentApi>> + Send + Sync>;
 
-/// What operations need besides the link: the profile, the key agent and
+/// What operations need besides the link: the profile, the cred agent and
 /// how long to wait for the link. Named explicitly: this user's
 /// (`for_user`, `atem runtime`), a given one (`for_profile`, tests), or
 /// none (`unavailable`: every operation fails).
@@ -158,7 +158,7 @@ pub struct OpEnv {
 }
 
 impl OpEnv {
-    /// This user's profile (read when each operation starts) and key agent.
+    /// This user's profile (read when each operation starts) and cred agent.
     pub fn for_user() -> Self {
         Self {
             profile: Arc::new(Sources::current),
@@ -167,9 +167,9 @@ impl OpEnv {
         }
     }
 
-    /// The profile `src` and the key agent `agent`.
+    /// The profile `src` and the cred agent `agent`.
     #[cfg(test)]
-    pub fn for_profile(src: Sources, agent: Arc<dyn KeyAgentApi>) -> Self {
+    pub fn for_profile(src: Sources, agent: Arc<dyn CredAgentApi>) -> Self {
         Self {
             profile: Arc::new(move || Ok(src.clone())),
             agent: Arc::new(move || Ok(agent.clone())),
@@ -198,7 +198,7 @@ impl OpEnv {
         (self.profile)()
     }
 
-    fn agent(&self) -> Result<Arc<dyn KeyAgentApi>> {
+    fn agent(&self) -> Result<Arc<dyn CredAgentApi>> {
         (self.agent)()
     }
 
@@ -443,7 +443,7 @@ async fn pair_verify<U: OpUi>(
         &format!("Verifying this device with Astation {astation_id}..."),
     );
     let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.keys, env.agent()?, ui).await,
+        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await,
         |line| ui.print(PrintLevel::Warn, line),
     );
     settle_encryption(&mut view, ui).await;
@@ -470,8 +470,8 @@ fn code_answer(answer: Option<AnswerValue>) -> CodeAnswer {
 pub(crate) async fn verify_device<U: OpUi>(
     client: &mut AstationClient,
     astation_id: &str,
-    paths: &KeyPaths,
-    raw_agent: Arc<dyn KeyAgentApi>,
+    paths: &CredPaths,
+    raw_agent: Arc<dyn CredAgentApi>,
     ui: &U,
 ) -> Result<()> {
     use crate::memory::trust::TrustStore;
@@ -482,18 +482,18 @@ pub(crate) async fn verify_device<U: OpUi>(
         code_failure, next_verify_message, request_key_after_verification,
     };
 
-    // The pairing this verification runs under: every key-agent request,
+    // The pairing this verification runs under: every cred-agent request,
     // the pending pin, Astation's certificate and the escrow apply only while
     // it is current.
     let capture = client
         .capture()
         .cloned()
-        .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
+        .ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?;
     capture.bound_to(astation_id)?;
     // The device id is this atem's relay identity (`atem_id`): Astation checks it
     // equals the id the connection authenticated as.
     let device_id = client.device_atem_id();
-    let agent: Arc<dyn KeyAgentApi> = Arc::new(crate::pairing_binding::BoundAgent::new(
+    let agent: Arc<dyn CredAgentApi> = Arc::new(crate::pairing::BoundAgent::new(
         capture.clone(),
         raw_agent.clone(),
     )?);
@@ -711,7 +711,7 @@ async fn pair<U: OpUi>(
     // if nothing changed meanwhile (another atem pair or atem unpair).
     let before = {
         let src = src.clone();
-        blocking(move || crate::pairing_binding::capture_for_pairing(&src)).await?
+        blocking(move || crate::pairing::capture(&src)).await?
     };
     let config = src.config.clone();
     ui.print(PrintLevel::Info, "Connecting to Astation...");
@@ -784,22 +784,23 @@ async fn pair<U: OpUi>(
     };
     // The new pairing's binding, in the next host trust generation; the
     // connection goes on under it.
-    let after = crate::pairing_binding::bind_new(&src, &before, &astation_id)?;
+    let after = crate::pairing::bind_new(&src, &before, &astation_id)?;
     active.adopt_binding(&before, &after)?;
+    let login = crate::records::Login::shared_by_astation(
+        received.login_id.clone(),
+        crate::records::Tokens {
+            access_token: received.access_token.clone(),
+            refresh_token: received.refresh_token.clone(),
+            expires_at: received.expires_at,
+        },
+    );
     active.apply_bound(&astation_id, || {
-        active.remember_relay_code(&astation_id);
-        let mut store = crate::credentials::CredentialStore::load_from(&src.credentials);
-        let now = crate::credentials::CredentialEntry::now_secs();
-        store.upsert(crate::credentials::CredentialEntry::new_paired(
-            received.access_token.clone(),
-            received.refresh_token.clone(),
-            received.expires_at,
-            received.login_id.clone(),
-            astation_id.clone(),
-            save_credentials,
-            now,
-        ));
-        store.save_to(&src.credentials)
+        crate::records::PairingRecord::receive_login(
+            &src.paths.pairing,
+            &astation_id,
+            login,
+            Some(save_credentials),
+        )
     })?;
     ui.print(
         PrintLevel::Info,
@@ -840,7 +841,7 @@ async fn pair<U: OpUi>(
     // A failed verification is shown, then makes the result a failure; the
     // pairing stays saved.
     let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.keys, env.agent()?, ui).await,
+        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await,
         |line| ui.print(PrintLevel::Warn, line),
     );
     settle_encryption(&mut view, ui).await;
@@ -905,7 +906,7 @@ async fn cred_unlock<U: OpUi>(
         already_unlocked, migration_pending, unlock_and_rotate, unlock_home,
     };
     let src = env.sources()?;
-    let paths = &src.keys;
+    let paths = &src.paths.cred;
     let home = unlock_home(&src)?;
     let agent = env.agent()?;
     let nothing_to_do = {
@@ -932,15 +933,14 @@ async fn cred_unlock<U: OpUi>(
         return Ok(());
     }
     let mut view = link_to(calls, env, &home, "this device's home Astation", true).await?;
-    // Every key-agent request from here on (finishing the unlock, rotation,
+    // Every cred-agent request from here on (finishing the unlock, rotation,
     // escrow) runs only while the pairing the link authenticated under is
     // current: a grant or ack arriving after `atem unpair` is dropped.
     let capture = view
         .capture()
         .cloned()
-        .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
-    let agent: Arc<dyn KeyAgentApi> =
-        Arc::new(crate::pairing_binding::BoundAgent::new(capture, agent)?);
+        .ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?;
+    let agent: Arc<dyn CredAgentApi> = Arc::new(crate::pairing::BoundAgent::new(capture, agent)?);
     {
         let mut link = UiLink {
             client: &mut view,
@@ -971,7 +971,7 @@ async fn cred_projects<U: OpUi>(
     env: &OpEnv,
 ) -> Result<()> {
     let src = env.sources()?;
-    let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust)?;
+    let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)?;
     let home = trust
         .home()
         .ok_or_else(|| anyhow!("Verify this device with Astation first"))?
@@ -984,24 +984,12 @@ async fn cred_projects<U: OpUi>(
     let view = link_to(calls, env, &home, "this device's home Astation", false).await?;
     view.report_credential_projects_with(cwd, agent)
         .await
-        .context("Project reporting requires an updated, unlocked Atem key agent")?;
+        .context("Project reporting requires an updated, unlocked Atem cred agent")?;
     ui.print(PrintLevel::Info, "Sent project suggestions to Astation.");
     Ok(())
 }
 
 // ── The paired-token refresh ──
-
-/// The paired entry for `astation_id` has time left.
-pub(crate) fn paired_fresh(credentials: &std::path::Path, astation_id: &str) -> bool {
-    crate::credentials::CredentialStore::load_from(credentials)
-        .entries
-        .iter()
-        .any(|entry| {
-            entry.source == crate::credentials::CredentialSource::AstationPaired
-                && entry.astation_id.as_deref() == Some(astation_id)
-                && !entry.needs_refresh()
-        })
-}
 
 /// Fresh paired credentials for `astation_id`: Astation sends a
 /// `credentialSync` on connect and whenever it refreshes its own session;
@@ -1014,12 +1002,15 @@ async fn token<U: OpUi>(
 ) -> Result<()> {
     let astation_id = astation_id.ok_or_else(|| anyhow!("no Astation named for the token"))?;
     let src = env.sources()?;
-    if paired_fresh(&src.credentials, &astation_id) {
+    let sso_url = src.config.effective_sso_url();
+    let fresh =
+        || crate::sso_auth::fresh_shared(&src.paths.pairing, sso_url, &astation_id).is_some();
+    if fresh() {
         return Ok(());
     }
     let mut view =
         link_routing(calls, env, &astation_id, "the paired Astation", false, true).await?;
-    if paired_fresh(&src.credentials, &astation_id) {
+    if fresh() {
         return Ok(());
     }
     // The link routes `credentialSync` here from now on.
@@ -1031,22 +1022,26 @@ async fn token<U: OpUi>(
                     access_token,
                     refresh_token,
                     expires_at,
+                    login_id,
                     astation_id: from,
                     ..
                 }) if from == astation_id => {
                     // Saved only under the pairing the link authenticated with.
+                    let login = crate::records::Login::shared_by_astation(
+                        login_id,
+                        crate::records::Tokens {
+                            access_token,
+                            refresh_token,
+                            expires_at,
+                        },
+                    );
                     view.apply_bound(&from, || {
-                        let mut store =
-                            crate::credentials::CredentialStore::load_from(&src.credentials);
-                        let Some(paired) = store.find_paired_mut(&from) else {
-                            bail!(
-                                "the pairing with Astation {from} was removed meanwhile; nothing was saved"
-                            );
-                        };
-                        paired.access_token = access_token;
-                        paired.refresh_token = refresh_token;
-                        paired.expires_at = expires_at;
-                        store.save_to(&src.credentials)
+                        crate::records::PairingRecord::receive_login(
+                            &src.paths.pairing,
+                            &from,
+                            login,
+                            None,
+                        )
                     })?;
                     return Ok(());
                 }

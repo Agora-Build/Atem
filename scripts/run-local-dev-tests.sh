@@ -107,7 +107,7 @@ run_contains "atem --version"          "atem"            -- "$ATEM" --version
 run_contains "atem token --help"       "rtc"             -- "$ATEM" token --help
 run_contains "atem token rtc --help"   "create"          -- "$ATEM" token rtc --help
 run_contains "atem token rtm --help"   "create"          -- "$ATEM" token rtm --help
-run_contains "atem list --help"        "project"         -- "$ATEM" list --help
+run_contains "atem project --help"     "list"            -- "$ATEM" project --help
 run_contains "atem project --help"     "use"             -- "$ATEM" project --help
 run_contains "atem config --help"      "show"            -- "$ATEM" config --help
 run_contains "atem agent --help"       ""                -- "$ATEM" agent --help
@@ -121,7 +121,7 @@ echo
 
 # ── Config ───────────────────────────────────────────────────────────
 echo "$(yellow "Config")"
-run_contains "atem config show"        "SSO"             -- "$ATEM" config show
+run_contains "atem config show"        "Login:"          -- "$ATEM" config show
 echo
 
 # ── Project ──────────────────────────────────────────────────────────
@@ -131,12 +131,12 @@ echo
 
 # ── List (requires SSO login or cache) ───────────────────────────────
 echo "$(yellow "List (requires SSO login)")"
-if [[ -f "$HOME/.config/atem/credentials.enc" ]]; then
-    run "atem list project"                      -- "$ATEM" list project
-    run "atem list project --show-certificates"  -- "$ATEM" list project --show-certificates
+if [[ -f "$HOME/.config/atem/login.enc" || -f "$HOME/.config/atem/pairing/pairing.enc" ]]; then
+    run "atem project list"                      -- "$ATEM" project list
+    run "atem project list --show-certificates"  -- "$ATEM" project list --show-certificates
 else
-    skip "atem list project"                    "no credentials.enc — run atem login first"
-    skip "atem list project --show-certificates" "needs SSO"
+    skip "atem project list"                    "no login.enc or pairing — run atem login first"
+    skip "atem project list --show-certificates" "needs SSO"
 fi
 echo
 

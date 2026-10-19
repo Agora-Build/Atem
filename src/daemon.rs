@@ -1,4 +1,4 @@
-//! Plumbing shared by Atem's detached daemons (the key agent, the runtime):
+//! Plumbing shared by Atem's detached daemons (the cred agent, the runtime):
 //! per-user socket directories, peer checks, pid-bearing lock files, socket
 //! binding and detached spawning. Same-user only; nothing here knows a
 //! protocol.
@@ -470,7 +470,7 @@ pub fn remove_socket(files: &DaemonFiles) {
 }
 
 /// Writes `bytes` to `path` through a private temporary file and a rename.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -624,11 +624,11 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        assert!(!confirmed_atem_pid(child.id(), "key-agent"));
-        assert!(!confirmed_atem_pid(0, "key-agent"));
+        assert!(!confirmed_atem_pid(child.id(), "cred-agent"));
+        assert!(!confirmed_atem_pid(0, "cred-agent"));
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!confirmed_atem_pid(child.id(), "key-agent"));
+        assert!(!confirmed_atem_pid(child.id(), "cred-agent"));
     }
 
     #[tokio::test]
@@ -678,7 +678,18 @@ mod tests {
         let log = dir.path().join("logs").join("d.log");
         // `sh <subcommand>` runs the named script file: write one.
         let script = dir.path().join("script.sh");
-        std::fs::write(&script, "pwd; echo \"$MARK\"; ps -o sid= -p $$; echo $$\n").unwrap();
+        // It stays alive (its log written) until the test has read its
+        // session: `getsid` of a reaped pid would fail. (`ps -o sid` is
+        // Linux-only: macOS `ps` has no such keyword.)
+        let gate = dir.path().join("gate");
+        std::fs::write(
+            &script,
+            format!(
+                "pwd; echo \"$MARK\"; echo $$; while [ ! -e '{}' ]; do sleep 0.05; done\n",
+                gate.display()
+            ),
+        )
+        .unwrap();
         let pid = spawn_detached(
             Path::new("/bin/sh"),
             script.to_str().unwrap(),
@@ -689,18 +700,21 @@ mod tests {
         .unwrap();
         assert!(pid > 0);
         let mut text = String::new();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while text.lines().count() < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
             text = std::fs::read_to_string(&log).unwrap_or_default();
-            if text.lines().count() >= 4 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // A new session: its id is its own pid, not ours (and it leads its
+        // own process group).
+        let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        std::fs::write(&gate, "").unwrap();
         let lines: Vec<_> = text.lines().map(str::trim).collect();
-        assert_eq!(lines[0], "/");
-        assert_eq!(lines[1], "hello");
-        // A new session: its id is its own pid, not ours.
-        assert_eq!(lines[2], pid.to_string());
+        assert_eq!(lines, ["/", "hello", &pid.to_string()], "{text:?}");
+        assert_eq!(sid, pid as libc::pid_t);
+        assert_eq!(pgid, pid as libc::pid_t);
+        assert_ne!(sid, unsafe { libc::getsid(0) });
         assert_eq!(std::fs::metadata(&log).unwrap().mode() & 0o777, 0o600);
     }
 }

@@ -30,25 +30,7 @@ fn hex(text: &str) -> Vec<u8> {
 
 /// A profile paired with `ASTATION` (binding and saved session), not verified.
 fn paired(config: &std::path::Path) {
-    std::fs::create_dir_all(config).unwrap();
-    std::fs::write(
-        config.join("pairing.json"),
-        json!({"version":1,"host_trust_gen":1,"binding_id":"binding-1",
-               "astation_id":ASTATION,"created_at":1})
-        .to_string(),
-    )
-    .unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    std::fs::write(
-        config.join("sessions.json"),
-        json!({"sessions": {ASTATION: {"session_id": "session-1", "token": "token-1",
-               "astation_id": ASTATION, "hostname": "h", "last_activity": now}}})
-        .to_string(),
-    )
-    .unwrap();
+    support::profile::write_pairing(config, ASTATION, 1);
 }
 
 /// A fake local Astation on its own thread: authenticates the runtime's

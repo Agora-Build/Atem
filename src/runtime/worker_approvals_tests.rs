@@ -1135,14 +1135,16 @@ fn a_codex_nested_through_one_shell_with_another_session_never_matches() {
     let s = Session::new();
     let mut a = watcher(&s, Agent::Codex);
     always_allow(&s, &mut a, &codex_ask("npm test", "/p"));
-    // A non-shell process (`timeout`, standing in for a nested `codex`)
+    // A non-shell process (`find`, standing in for a nested `codex`)
     // started by the agent through one shell runs the hook, for another
-    // Codex session with the very same command and cwd.
+    // Codex session with the very same command and cwd. `find -exec` is
+    // POSIX: it runs the hook as its child, stdin inherited, and waits
+    // (GNU `timeout` did that too, but macOS has none).
     let script = approvals::shell_quote(&s.path().join(approvals::SCRIPT_NAME).to_string_lossy());
     let other = codex_ask("npm test", "/p").replace(r#""session_id":"s1""#, r#""session_id":"s9""#);
     assert!(other.contains(r#""session_id":"s9""#));
     let nested = s.run(
-        &format!("timeout 30 /bin/sh {script} codex 30; true"),
+        &format!("find /dev/null -prune -exec /bin/sh {script} codex 30 ';'; true"),
         &other,
     );
     known(&mut a, 1, true);

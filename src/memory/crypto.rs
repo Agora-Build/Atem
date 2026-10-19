@@ -1,6 +1,6 @@
 //! End-to-end encryption for relay-backed memory, skills, and vaults.
 //! Local knowledge.db remains plaintext; transforms happen only at HTTP edges.
-//! `K` lives only in the key agent: `EncryptionContext` reads
+//! `K` lives only in the cred agent: `EncryptionContext` reads
 //! the mode from the signed account state and asks the agent to seal, open
 //! and hash. Also: private atomic file writes for every key file.
 
@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::memory::account_keys::{CryptOp, CryptOut};
-use crate::memory::key_agent::KeyAgentApi;
+use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::model::{content_hash, skill_hash, Memory, Skill};
-use crate::memory::verification::KeyPaths;
+use crate::paths::CredPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -164,7 +164,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if FAILING_WRITES.with(|failing| failing.borrow().iter().any(|failing| failing == path)) {
         bail!("injected write failure for {}", path.display());
     }
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() { crate::paths::create_private_dir(parent)?; }
     sweep_stale_temps(path);
     let temp = unique_temp(path);
     let mut options = fs::OpenOptions::new();
@@ -211,7 +211,7 @@ const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 
-/// One Astation's encryption mode, and a handle on the key agent, which
+/// One Astation's encryption mode, and a handle on the cred agent, which
 /// holds `K` and does every seal, open and keyed hash: this process never
 /// sees `K`. Mode and kid come from the latest signed account state; off
 /// (and unverified) contexts never touch the agent. Methods that reach the
@@ -223,7 +223,7 @@ pub struct EncryptionContext {
     pub kid: Option<String>,
     astation_id: String,
     /// `None` while encryption is off.
-    agent: Option<Arc<dyn KeyAgentApi>>,
+    agent: Option<Arc<dyn CredAgentApi>>,
     names_path: PathBuf,
     remember_off_projects: bool,
 }
@@ -239,11 +239,11 @@ impl std::fmt::Debug for EncryptionContext {
 }
 
 fn next_text(results: &mut impl Iterator<Item = CryptOut>) -> Result<String> {
-    results.next().ok_or_else(|| anyhow!("the key agent answered too few operations"))?.into_text()
+    results.next().ok_or_else(|| anyhow!("the cred agent answered too few operations"))?.into_text()
 }
 
 fn next_plain(results: &mut impl Iterator<Item = CryptOut>) -> Result<Vec<u8>> {
-    Ok(results.next().ok_or_else(|| anyhow!("the key agent answered too few operations"))?.into_plain()?.to_vec())
+    Ok(results.next().ok_or_else(|| anyhow!("the cred agent answered too few operations"))?.into_plain()?.to_vec())
 }
 
 #[cfg(test)]
@@ -255,12 +255,12 @@ impl EncryptionContext {
     pub fn for_astation(astation_id: &str) -> Result<Self> {
         Self::for_astation_with(
             astation_id,
-            &KeyPaths::default_paths(),
-            Arc::from(crate::memory::key_agent::default_agent()),
+            &CredPaths::default_paths(),
+            Arc::from(crate::memory::cred_agent::default_agent()),
         )
     }
 
-    pub(crate) fn for_astation_with(astation_id: &str, paths: &KeyPaths, agent: Arc<dyn KeyAgentApi>) -> Result<Self> {
+    pub(crate) fn for_astation_with(astation_id: &str, paths: &CredPaths, agent: Arc<dyn CredAgentApi>) -> Result<Self> {
         let state = crate::memory::verification::account_mode(&paths.trust, astation_id)?;
         let remember_off_projects = crate::memory::trust::TrustStore::load_from(&paths.trust)?
             .verified(astation_id).is_some_and(|entry| entry.data_account == state.data_account);
@@ -275,7 +275,7 @@ impl EncryptionContext {
         })
     }
 
-    /// Runs `work` on a blocking thread when it may reach the key agent
+    /// Runs `work` on a blocking thread when it may reach the cred agent
     /// (socket I/O and autostart must not stall the runtime); inline
     /// when encryption is off.
     pub async fn blocking<T: Send + 'static>(
@@ -286,7 +286,7 @@ impl EncryptionContext {
             return work(self);
         }
         let context = self.clone();
-        crate::memory::key_agent::blocking(move || work(&context)).await
+        crate::memory::cred_agent::blocking(move || work(&context)).await
     }
 
     /// `ops` in as few `Crypt` requests as the budget allows, results in order.
@@ -601,10 +601,10 @@ fn skill_record(skill: &Skill) -> String {
 /// once read back, `None` when no migration is pending.
 pub async fn migrate_account_in(
     astation_id: &str,
-    src: &crate::status::Sources,
-    agent: Arc<dyn KeyAgentApi>,
+    src: &crate::profile::Sources,
+    agent: Arc<dyn CredAgentApi>,
 ) -> Result<Option<&'static str>> {
-    let encryption = EncryptionContext::for_astation_with(astation_id, &src.keys, agent.clone())?;
+    let encryption = EncryptionContext::for_astation_with(astation_id, &src.paths.cred, agent.clone())?;
     let target = match encryption.mode {
         EncryptionMode::Enabling => "on",
         EncryptionMode::Disabling => "off",
@@ -627,14 +627,14 @@ pub async fn migrate_account_in(
         paired.session_id.clone(),
         paired.astation_id.clone(),
     )
-    .with_encryption(src.keys.clone(), agent.clone());
+    .with_encryption(src.paths.cred.clone(), agent.clone());
     let vault = crate::vault_client::VaultClient::new(
         paired.relay_base,
         client_id,
         paired.session_id,
         paired.astation_id,
     )
-    .with_encryption(src.keys.clone(), agent);
+    .with_encryption(src.paths.cred.clone(), agent);
     knowledge.migrate_encryption().await
         .map_err(|error| anyhow!(error.to_string()))?;
     vault.migrate_encryption().await?;
@@ -649,14 +649,14 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use crate::memory::fake_astation::{ASTATION_ID, UnlockedDevice};
-    use crate::memory::key_agent::{Reply, Request};
+    use crate::memory::cred_agent::{Reply, Request};
 
     /// An agent an off context must never reach.
     struct NoAgent;
 
-    impl KeyAgentApi for NoAgent {
+    impl CredAgentApi for NoAgent {
         fn call(&self, _request: Request) -> Result<Reply> {
-            panic!("an off or unverified context must not call the key agent")
+            panic!("an off or unverified context must not call the cred agent")
         }
     }
 
@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn off_and_unverified_contexts_never_touch_the_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let unverified = EncryptionContext::for_astation_with(ASTATION_ID, &paths, Arc::new(NoAgent)).unwrap();
         assert_eq!(unverified.mode, EncryptionMode::Off);
         let plain = memory("mem-1", "github.com/agora/atem", "fact");
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     fn concurrent_private_writes_to_one_file_never_collide() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
+        let path = dir.path().join("store.json");
         let writers: Vec<_> = (0..4u8)
             .map(|id| {
                 let path = path.clone();
@@ -876,14 +876,14 @@ mod tests {
         let last = fs::read(&path).unwrap();
         assert!(last.len() == 64 && last.iter().all(|byte| *byte == last[0]));
         let left: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-        assert_eq!(left, vec![std::ffi::OsString::from("cred_state.json")], "no temp files left");
+        assert_eq!(left, vec![std::ffi::OsString::from("store.json")], "no temp files left");
     }
 
     #[cfg(unix)]
     #[test]
     fn write_private_replaces_a_stale_temp_without_following_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
+        let path = dir.path().join("store.json");
         let victim = dir.path().join("victim");
         fs::write(&victim, b"untouched").unwrap();
         std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
@@ -904,20 +904,20 @@ mod tests {
     #[test]
     fn write_private_sweeps_temps_left_by_a_crashed_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
-        let crashed = dir.path().join(format!(".cred_state.json.{DEAD_PID}.3.0badf00d.tmp"));
+        let path = dir.path().join("store.json");
+        let crashed = dir.path().join(format!(".store.json.{DEAD_PID}.3.0badf00d.tmp"));
         fs::write(&crashed, b"half a secret").unwrap();
         // A crashed writer's temp that is a symlink: the link goes, never its target.
         let victim = dir.path().join("victim");
         fs::write(&victim, b"untouched").unwrap();
-        let linked = dir.path().join(format!(".cred_state.json.{DEAD_PID}.4.0badf00e.tmp"));
+        let linked = dir.path().join(format!(".store.json.{DEAD_PID}.4.0badf00e.tmp"));
         std::os::unix::fs::symlink(&victim, &linked).unwrap();
         // A live writer's temp (this process: another thread may be writing) stays.
-        let live = dir.path().join(format!(".cred_state.json.{}.9.0badf00f.tmp", std::process::id()));
+        let live = dir.path().join(format!(".store.json.{}.9.0badf00f.tmp", std::process::id()));
         fs::write(&live, b"in flight").unwrap();
         // Another file's temp, and names that only look alike, stay.
-        let other = dir.path().join(format!(".data_keys.enc.{DEAD_PID}.1.0badf010.tmp"));
-        let unlike = dir.path().join(".cred_state.json.notapid.tmp");
+        let other = dir.path().join(format!(".other.json.{DEAD_PID}.1.0badf010.tmp"));
+        let unlike = dir.path().join(".store.json.notapid.tmp");
         fs::write(&other, b"x").unwrap();
         fs::write(&unlike, b"x").unwrap();
 

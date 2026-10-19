@@ -421,9 +421,7 @@ pub struct AstationClient {
     receiver: Option<mpsc::Receiver<AstationMessage>>,
     transport_tasks: Vec<tokio::task::JoinHandle<()>>,
     atem_id_override: Option<String>,
-    session_path_override: Option<std::path::PathBuf>,
     #[cfg(test)]
-    relay_code_path_override: Option<std::path::PathBuf>,
     #[cfg(test)]
     local_token_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
@@ -438,21 +436,50 @@ pub struct AstationClient {
     held_encryption: Vec<AstationMessage>,
     /// The profile whose pairing errors advise on (`with_profile`); `None`
     /// is this user's profile.
-    profile: Option<crate::status::Sources>,
+    profile: Option<crate::profile::Sources>,
     /// The pairing state and session this connection's authentication
     /// started under, captured before the proof went out. Every reply with
     /// effects (auth success, credentials, encryption, keys) is applied only
-    /// while it is still current (`pairing_binding::Captured::apply`).
-    capture: Option<crate::pairing_binding::Captured>,
+    /// while it is still current (`pairing::Captured::apply`).
+    capture: Option<crate::pairing::Captured>,
     /// Shows the pairing code and its outcome (`authenticate_with_pairing`);
     /// `None` prints them. The runtime sends them to the CLI that pairs.
     pairing_notice: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
-    /// The key agent encryption messages and reports use (`with_agent`);
+    /// The cred agent encryption messages and reports use (`with_agent`);
     /// `None` is this user's agent.
-    agent: Option<std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>>,
+    agent: Option<std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>>,
     /// A handle for one runtime operation (`op_view`): it waits for a
     /// migration the link is finishing instead of skipping its own.
     is_op_view: bool,
+    /// How this client reached Astation, once connected (`atem status`).
+    via: Option<LinkVia>,
+}
+
+/// How a link reached Astation, for `atem status`: never a secret (no
+/// session, token or relay room code).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkVia {
+    Local,
+    /// The relay's host and this Atem's id in the room.
+    Relay { label: String },
+}
+
+/// `<relay host> as <atem_id>`: what `atem status` shows for a relay link.
+pub(crate) fn relay_label(relay_url: &str, atem_id: &str) -> String {
+    let host = relay_url
+        .split_once("://")
+        .map_or(relay_url, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if atem_id.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host} as {atem_id}")
+    }
 }
 
 /// One encryption migration at a time per process: the runtime's link and
@@ -507,9 +534,7 @@ impl AstationClient {
             terminal_sender: None,
             transport_tasks: Vec::new(),
             atem_id_override: None,
-            session_path_override: None,
             #[cfg(test)]
-            relay_code_path_override: None,
             #[cfg(test)]
             local_token_path_override: None,
             ws_closed: false,
@@ -521,42 +546,38 @@ impl AstationClient {
             pairing_notice: None,
             agent: None,
             is_op_view: false,
+            via: None,
         }
     }
 
     /// Encryption messages and reports use `agent` (not this user's).
     pub(crate) fn with_agent(
         mut self,
-        agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>,
+        agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>,
     ) -> Self {
         self.agent = Some(agent);
         self
     }
 
-    /// The key agent of this client (started on demand when it's the user's).
-    fn key_agent(&self) -> std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> {
+    /// The cred agent of this client (started on demand when it's the user's).
+    fn cred_agent(&self) -> std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi> {
         match &self.agent {
             Some(agent) => agent.clone(),
-            None => std::sync::Arc::from(crate::memory::key_agent::default_agent()),
+            None => std::sync::Arc::from(crate::memory::cred_agent::default_agent()),
         }
     }
 
-    /// The running key agent of this client, never started.
-    fn running_key_agent(&self) -> Option<std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>> {
+    /// The running cred agent of this client, never started.
+    fn running_cred_agent(&self) -> Option<std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>> {
         match &self.agent {
             Some(agent) => Some(agent.clone()),
-            None => crate::memory::key_agent::running_agent().map(std::sync::Arc::from),
+            None => crate::memory::cred_agent::running_agent().map(std::sync::Arc::from),
         }
     }
 
     /// This client's profile (`with_profile`, else this user's).
-    pub(crate) fn profile(&self) -> Result<crate::status::Sources> {
+    pub(crate) fn profile(&self) -> Result<crate::profile::Sources> {
         self.profile_sources()
-    }
-
-    /// The legacy single-session file of this client's profile.
-    pub(crate) fn saved_session_file(&self) -> Result<std::path::PathBuf> {
-        Ok(self.profile_sources()?.config_dir().join("session.json"))
     }
 
     /// Pairing lines go to `notice` instead of stdout.
@@ -587,10 +608,8 @@ impl AstationClient {
         view.terminal_sender = self.terminal_sender.clone();
         view.receiver = Some(rx);
         view.atem_id_override = self.atem_id_override.clone();
-        view.session_path_override = self.session_path_override.clone();
         #[cfg(test)]
         {
-            view.relay_code_path_override = self.relay_code_path_override.clone();
             view.local_token_path_override = self.local_token_path_override.clone();
         }
         view.connected_astation_id = self.connected_astation_id.clone();
@@ -606,23 +625,18 @@ impl AstationClient {
         self.resolved_atem_id(&crate::auth::get_hostname())
     }
 
-    /// Records `astation_id` as the relay identity room to reconnect to.
-    pub(crate) fn remember_relay_code(&self, astation_id: &str) {
-        self.remember_astation_relay_code(astation_id);
-    }
-
     /// The profile this client reads and writes (`with_profile`, else this
     /// user's). Test clients must name one.
-    fn profile_sources(&self) -> Result<crate::status::Sources> {
+    fn profile_sources(&self) -> Result<crate::profile::Sources> {
         match &self.profile {
             Some(profile) => Ok(profile.clone()),
             None if cfg!(test) => Err(anyhow!("test client without a profile")),
-            None => crate::status::Sources::current(),
+            None => crate::profile::Sources::current(),
         }
     }
 
     /// The pairing this connection authenticated under.
-    pub(crate) fn capture(&self) -> Option<&crate::pairing_binding::Captured> {
+    pub(crate) fn capture(&self) -> Option<&crate::pairing::Captured> {
         self.capture.as_ref()
     }
 
@@ -630,12 +644,12 @@ impl AstationClient {
     /// the connection goes on under it.
     pub(crate) fn adopt_binding(
         &mut self,
-        before: &crate::pairing_binding::TrustState,
-        after: &crate::pairing_binding::TrustState,
+        before: &crate::pairing::TrustState,
+        after: &crate::pairing::TrustState,
     ) -> Result<()> {
         self.capture
             .as_mut()
-            .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?
+            .ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?
             .adopt(before, after)
     }
 
@@ -654,14 +668,13 @@ impl AstationClient {
     }
 
     /// The saved session is still the one the proof used (when one was).
-    fn check_session(&self, capture: &crate::pairing_binding::Captured) -> Result<()> {
+    fn check_session(&self, capture: &crate::pairing::Captured) -> Result<()> {
         let (Some((session_id, token)), Some(astation_id)) =
             (&capture.session, self.connected_astation_id.as_deref())
         else {
             return Ok(());
         };
-        let manager = self.load_session_manager()?;
-        let current = manager.get(astation_id);
+        let current = self.saved_session(astation_id)?;
         if current.is_some_and(|s| &s.session_id == session_id && &s.token == token) {
             Ok(())
         } else {
@@ -677,7 +690,7 @@ impl AstationClient {
         let capture = self
             .capture
             .as_ref()
-            .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
+            .ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?;
         capture.bound_to(astation_id)?;
         if self.connected_astation_id.as_deref() != Some(astation_id) {
             return Err(anyhow!("this connection authenticated another Astation than {astation_id}"));
@@ -704,7 +717,7 @@ impl AstationClient {
             .as_ref()
             .is_some_and(|capture| capture.state.binding.is_none());
         let message = if paired && unbound {
-            format!("{lead}. {}", crate::pairing_binding::NO_BINDING)
+            format!("{lead}. {}", crate::pairing::NO_BINDING)
         } else if paired {
             format!("{lead}. {}", crate::status::SESSION_GONE)
         } else {
@@ -714,12 +727,12 @@ impl AstationClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_capture_for_test(&mut self, capture: crate::pairing_binding::Captured) {
+    pub(crate) fn set_capture_for_test(&mut self, capture: crate::pairing::Captured) {
         self.capture = Some(capture);
     }
 
     /// Advise on pairing errors from `profile` instead of this user's profile.
-    pub(crate) fn with_profile(mut self, profile: crate::status::Sources) -> Self {
+    pub(crate) fn with_profile(mut self, profile: crate::profile::Sources) -> Self {
         self.profile = Some(profile);
         self
     }
@@ -737,15 +750,16 @@ impl AstationClient {
         self.connected_astation_id.as_deref()
     }
 
+    /// How this client reached Astation (`None`: not connected yet).
+    pub fn via(&self) -> Option<&LinkVia> {
+        self.via.as_ref()
+    }
+
     #[cfg(test)]
-    pub(crate) fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
+    pub(crate) fn new_with_test_state(atem_id: &str, profile: &std::path::Path) -> Self {
         let mut client = Self::new();
         client.atem_id_override = Some(atem_id.to_string());
-        if let Some(dir) = session_path.parent() {
-            client.profile = Some(crate::status::Sources::in_dir(dir));
-        }
-        client.relay_code_path_override = Some(session_path.with_file_name("relay-code"));
-        client.session_path_override = Some(session_path);
+        client.profile = Some(crate::profile::Sources::in_dir(profile));
         client
     }
 
@@ -766,12 +780,11 @@ impl AstationClient {
     pub(crate) fn pin_astation_for_test(&mut self, astation_id: &str) {
         self.connected_astation_id = Some(astation_id.to_string());
         let profile = self.profile_sources().expect("a test profile");
-        let mut capture = crate::pairing_binding::Captured::now(&profile).unwrap();
+        let mut capture = crate::pairing::Captured::now(&profile).unwrap();
         capture.session = self
-            .load_session_manager()
+            .saved_session(astation_id)
             .unwrap()
-            .get(astation_id)
-            .map(|s| (s.session_id.clone(), s.token.clone()));
+            .map(|s| (s.session_id, s.token));
         self.capture = Some(capture);
     }
 
@@ -781,38 +794,22 @@ impl AstationClient {
             .unwrap_or_else(|| resolved_atem_id(hostname))
     }
 
-    fn load_session_manager(&self) -> Result<crate::auth::SessionManager> {
-        match (self.session_path_override.as_deref(), &self.profile) {
-            (Some(path), _) => crate::auth::SessionManager::load_from(path),
-            (None, Some(profile)) => crate::auth::SessionManager::load_from(&profile.sessions),
-            (None, None) => crate::auth::SessionManager::load(),
-        }
+    /// The pairing's valid saved session for `astation_id`.
+    fn saved_session(&self, astation_id: &str) -> Result<Option<crate::records::SavedSession>> {
+        let paths = self.profile_sources()?.paths.pairing;
+        Ok(crate::records::PairingRecord::load(&paths)?
+            .and_then(|record| record.session_for(astation_id).cloned()))
     }
 
-    fn save_session_manager(&self, manager: &crate::auth::SessionManager) -> Result<()> {
-        match (self.session_path_override.as_deref(), &self.profile) {
-            (Some(path), _) => manager.save_to(path),
-            (None, Some(profile)) => manager.save_to(&profile.sessions),
-            (None, None) => manager.save(),
-        }
-    }
-
-    fn persist_session(&self, session: crate::auth::AuthSession) -> Result<()> {
-        let mut manager = self.load_session_manager()?;
-        manager.insert_session(session);
-        self.save_session_manager(&manager)
-    }
-
-    fn remember_astation_relay_code(&self, astation_id: &str) {
-        #[cfg(test)]
-        if let Some(path) = self.relay_code_path_override.as_deref() {
-            let _ = std::fs::write(path, astation_id);
-            return;
-        }
-        match &self.profile {
-            Some(profile) => AtemConfig::store_astation_relay_code_in(&profile.config_dir(), astation_id),
-            None => AtemConfig::store_astation_relay_code(astation_id),
-        }
+    /// The session Astation granted `astation_id` (a pairing in progress
+    /// starts the record).
+    fn persist_session(&self, astation_id: &str, session: crate::records::SavedSession) -> Result<()> {
+        let paths = self.profile_sources()?.paths.pairing;
+        let mut record = crate::records::PairingRecord::load(&paths)?
+            .filter(|record| record.astation_id == astation_id)
+            .unwrap_or_else(|| crate::records::PairingRecord::new(astation_id));
+        record.session = Some(session);
+        record.save(&paths)
     }
 
     fn abort_transport(&mut self) {
@@ -825,13 +822,6 @@ impl AstationClient {
         self.ws_closed = true;
         self.answered_challenge = None;
         self.capture = None;
-    }
-
-    /// Alias for `connect_without_pairing`: the saved session is looked up
-    /// from disk by Astation id when the challenge arrives, so `_session_id`
-    /// is unused.
-    pub async fn connect_with_session(&mut self, base_url: &str, _session_id: &str) -> Result<()> {
-        self.connect_without_pairing(base_url).await
     }
 
     /// Connect WebSocket and authenticate (local Astation connections).
@@ -855,6 +845,8 @@ impl AstationClient {
             .await;
         if result.is_err() {
             self.abort_transport();
+        } else {
+            self.via = Some(LinkVia::Local);
         }
         result
     }
@@ -981,7 +973,7 @@ impl AstationClient {
         // What this authentication runs under, captured before any proof
         // goes out: a reply that arrives after `atem unpair`/`atem pair`
         // can't adopt the later binding or refresh its session.
-        self.capture = Some(crate::pairing_binding::Captured::now(&self.profile_sources()?)?);
+        self.capture = Some(crate::pairing::Captured::now(&self.profile_sources()?)?);
 
         if let Some((proof, session)) = self.auth_proof(&challenge)? {
             if let Some(capture) = self.capture.as_mut() {
@@ -1035,9 +1027,8 @@ impl AstationClient {
         self.authenticate_with_pairing(&astation_id, &atem_id).await?;
         // Later checks compare against the session the grant saved.
         let granted = self
-            .load_session_manager()?
-            .get(&astation_id)
-            .map(|s| (s.session_id.clone(), s.token.clone()));
+            .saved_session(&astation_id)?
+            .map(|s| (s.session_id, s.token));
         if let Some(capture) = self.capture.as_mut() {
             capture.session = granted;
         }
@@ -1122,8 +1113,7 @@ impl AstationClient {
             if !self.session_usable(astation_id) {
                 return Ok(None);
             }
-            let session_mgr = self.load_session_manager()?;
-            let Some(session) = session_mgr.get(astation_id) else {
+            let Some(session) = self.saved_session(astation_id)? else {
                 return Ok(None);
             };
             used = Some((session.session_id.clone(), session.token.clone()));
@@ -1157,12 +1147,12 @@ impl AstationClient {
 
     /// Refresh the saved session's activity after a successful session proof.
     fn refresh_saved_session(&self, astation_id: &str) {
-        let result = self.load_session_manager().and_then(|mut session_mgr| {
-            match session_mgr.get_mut(astation_id) {
-                Some(session) => session.refresh(),
-                None => return Ok(()),
-            }
-            self.save_session_manager(&session_mgr)
+        let result = self.profile_sources().and_then(|src| {
+            crate::records::PairingRecord::update_locked(&src.paths.pairing, astation_id, |record| {
+                if let Some(session) = record.session.as_mut().filter(|s| s.is_valid()) {
+                    session.last_activity = crate::credentials::now_secs();
+                }
+            })
         });
         if let Err(error) = result {
             crate::diagnostics::warn(format!(
@@ -1214,10 +1204,11 @@ impl AstationClient {
         })
     }
 
-    /// Re-authentication succeeded: keep the saved session fresh, as connect
-    /// does, only while the pairing and session are still the ones this
-    /// connection authenticated with (else nothing is touched).
-    pub(crate) fn reauthenticated(&self) -> Result<()> {
+    /// Keeps the saved session fresh (after a re-authentication, and while
+    /// the link is in use; it expires after 7 days without activity), only
+    /// while the pairing and session are still the ones this connection
+    /// authenticated with (else nothing is touched).
+    pub(crate) fn refresh_session(&self) -> Result<()> {
         self.guarded(|| {
             if let Some(astation_id) = self.connected_astation_id.as_deref() {
                 self.refresh_saved_session(astation_id);
@@ -1241,19 +1232,13 @@ impl AstationClient {
                     let token = data.get("token").ok_or_else(|| {
                         anyhow!("Pairing response missing session token")
                     })?;
-                    let hostname = crate::auth::get_hostname();
-                    let session = crate::auth::AuthSession::new(
+                    let session = crate::records::SavedSession::new(
                         session_id.clone(),
                         token.clone(),
-                        astation_id.to_string(),
-                        hostname,
+                        crate::auth::get_hostname(),
                     );
 
-                    self.guarded(|| {
-                        self.persist_session(session)?;
-                        self.remember_astation_relay_code(astation_id);
-                        Ok(())
-                    })?;
+                    self.guarded(|| self.persist_session(astation_id, session))?;
                     Ok(Some(AuthResponse::Authenticated))
                 }
                 Some("denied") => {
@@ -1266,10 +1251,7 @@ impl AstationClient {
             },
             "authenticated" => {
                 // Alternative authenticated message format
-                self.guarded(|| {
-                    self.remember_astation_relay_code(astation_id);
-                    Ok(())
-                })?;
+                self.guarded(|| Ok(()))?;
                 Ok(Some(AuthResponse::Authenticated))
             }
             "error" => Ok(data.get("message").map(|msg| {
@@ -1375,13 +1357,13 @@ impl AstationClient {
     /// `report_credential_projects` naming the Git project of `cwd`.
     pub(crate) async fn report_credential_projects_in(&self, cwd: Option<std::path::PathBuf>) -> Result<()> {
         // The binding first: nothing else is asked for a connection that has none.
-        self.capture.as_ref().ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?.bound()?;
+        self.capture.as_ref().ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?.bound()?;
         crate::auth::pairing_session_in(&self.profile_sources()?)
             .map_err(|_| anyhow!("this machine isn't paired with an Astation"))?;
         let agent = match &self.agent {
             Some(agent) => agent.clone(),
-            None => crate::memory::key_agent::blocking(|| {
-                crate::memory::key_agent::running_agent().ok_or_else(|| anyhow!("key agent is not running"))
+            None => crate::memory::cred_agent::blocking(|| {
+                crate::memory::cred_agent::running_agent().ok_or_else(|| anyhow!("cred agent is not running"))
             })
             .await
             .map(std::sync::Arc::from)?,
@@ -1394,16 +1376,16 @@ impl AstationClient {
     pub(crate) async fn report_credential_projects_with(
         &self,
         cwd: Option<std::path::PathBuf>,
-        agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>,
+        agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>,
     ) -> Result<()> {
-        use crate::memory::key_agent::{blocking, KeyAgentApi};
+        use crate::memory::cred_agent::{blocking, CredAgentApi};
         let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
         // Signed only under the pairing this connection authenticated with.
-        let capture = self.capture.clone().ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
+        let capture = self.capture.clone().ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?;
         capture.bound()?;
         let report = blocking(move || {
-            let agent = crate::pairing_binding::BoundAgent::new(capture, agent)?;
-            if !agent.status()?.unlocked { return Err(anyhow!("key agent is locked")); }
+            let agent = crate::pairing::BoundAgent::new(capture, agent)?;
+            if !agent.status()?.unlocked { return Err(anyhow!("cred agent is locked")); }
             let project = cwd.and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.label);
             agent.credential_projects(&astation_id, project)
         }).await?;
@@ -1416,7 +1398,7 @@ impl AstationClient {
         &mut self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
-        use crate::memory::key_agent::{blocking, LOCKED};
+        use crate::memory::cred_agent::{blocking, LOCKED};
         use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied};
 
         if matches!(message, AstationMessage::CredentialProjectListRequest) {
@@ -1441,14 +1423,14 @@ impl AstationClient {
             self.hold_encryption(message.clone());
             return Ok(Some(HOLDING_ENCRYPTION.into()));
         };
-        let paths = self.profile_sources()?.keys;
-        let agent = self.key_agent();
+        let paths = self.profile_sources()?.paths.cred;
+        let agent = self.cred_agent();
         let applied = match message {
             AstationMessage::EncryptionMode { account_state } => {
                 capture.apply(|| apply_account_state(&paths, &astation_id, account_state.as_ref()))?
             }
             AstationMessage::KeyGrant { grant } => {
-                // Grants are opened only inside the key agent (blocking socket I/O).
+                // Grants are opened only inside the cred agent (blocking socket I/O).
                 let (paths, astation_id, grant) = (paths.clone(), astation_id.clone(), grant.clone());
                 let (capture, agent) = (capture.clone(), agent.clone());
                 blocking(move || capture.apply(|| apply_grant(&paths, agent.as_ref(), &astation_id, grant.as_ref()))).await?
@@ -1492,7 +1474,7 @@ impl AstationClient {
                     // A running, unlocked agent drops the account's keys now; a
                     // locked one does at its next unlock.
                     let astation = astation_id.clone();
-                    let running = self.running_key_agent();
+                    let running = self.running_cred_agent();
                     blocking(move || {
                         if let Some(agent) = running {
                             let _ = agent.held_kid(&astation);
@@ -1513,7 +1495,7 @@ impl AstationClient {
     /// The migration's signed completion goes out only under the captured
     /// pairing.
     fn check_capture(&self) -> Result<()> {
-        self.capture.as_ref().ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?.check()
+        self.capture.as_ref().ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?.check()
     }
 
     /// Keeps an encryption message to apply later (`apply_held_encryption`).
@@ -1560,7 +1542,7 @@ impl AstationClient {
     /// `astation_id`'s account under the newest signed state (`atem cred
     /// unlock` on an already unlocked device).
     pub(crate) async fn finish_pending_migration(&self, astation_id: &str) -> Result<Option<String>> {
-        let trust = crate::memory::trust::TrustStore::load_from(&self.profile_sources()?.keys.trust)?;
+        let trust = crate::memory::trust::TrustStore::load_from(&self.profile_sources()?.paths.cred.trust)?;
         let kid = crate::memory::verification::effective_state(&trust, astation_id)?
             .and_then(|(_, state)| state).and_then(|state| state.kid);
         self.finish_encryption_migration(astation_id, kid).await
@@ -1580,15 +1562,15 @@ impl AstationClient {
             }
         };
         let src = self.profile_sources()?;
-        let agent = self.key_agent();
-        let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust)?;
+        let agent = self.cred_agent();
+        let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)?;
         let epoch = crate::memory::verification::effective_state(&trust, astation_id)?
             .and_then(|(_, state)| state).map(|state| state.epoch);
         if let Some(target) = crate::memory::crypto::migrate_account_in(astation_id, &src, agent.clone()).await? {
             let kid = kid.ok_or_else(|| anyhow!("encryption migration has no key id"))?;
             let (account, proof_kid) = (astation_id.to_string(), kid.clone());
             let epoch = epoch.ok_or_else(|| anyhow!("the signed migration state is missing"))?;
-            let completion = crate::memory::key_agent::blocking(move ||
+            let completion = crate::memory::cred_agent::blocking(move ||
                 agent.migration_completion(&account, epoch, target, &proof_kid)).await?;
             self.send_message_flushed(AstationMessage::EncryptionMigrationComplete { mode: target.to_string(), kid, completion }).await?;
             return Ok(Some(format!("Encryption migration complete; requesting {target}")));
@@ -1694,6 +1676,10 @@ impl AstationClient {
         };
         let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
         self.connect_raw(&ws_url).await?;
+        // A pairing room: its code is a secret until the pairing ends.
+        self.via = Some(LinkVia::Relay {
+            label: relay_label(&station_url, ""),
+        });
 
         // Return the code — caller is responsible for any UI (println!, open_browser, etc.)
         // so this function stays silent and TUI-safe.
@@ -1703,7 +1689,7 @@ impl AstationClient {
     /// Connect to Astation's persistent identity relay room for TUI auto-reconnect.
     ///
     /// Astation registers its identity UUID as a permanent relay room on startup.
-    /// After `atem pair`, Atem stores the identity as `astation_relay_code` in config.
+    /// After `atem pair`, the pairing names the identity (`PairingRecord::astation_id`).
     /// The TUI calls this to auto-connect without a new `atem pair`.
     ///
     /// Flow: connect_raw → hello → challenge/response authentication.
@@ -1771,6 +1757,10 @@ impl AstationClient {
         .await;
         if result.is_err() {
             self.abort_transport();
+        } else {
+            self.via = Some(LinkVia::Relay {
+                label: relay_label(relay_url, &atem_id),
+            });
         }
         result
     }
@@ -1982,16 +1972,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         for transport in ["relay", "loopback"] {
             let state = tempfile::tempdir().unwrap();
-            let session_path = state.path().join("sessions.json");
-            crate::pairing_binding::tests::bound_profile(state.path(), "mac-a");
-            let mut sessions = crate::auth::SessionManager::default();
-            sessions.insert_session(crate::auth::AuthSession::new(
-                "old-session".into(),
-                "old-token".into(),
-                "mac-a".into(),
-                "host".into(),
-            ));
-            sessions.save_to(&session_path).unwrap();
+            crate::pairing::tests::bound_profile(state.path(), "mac-a");
+            crate::pairing::tests::set_session(state.path(), "mac-a", "old-session", "old-token");
             let token_path = state.path().join("local-bootstrap-token");
             fs::write(&token_path, "bootstrap-secret\n").unwrap();
             fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2009,18 +1991,11 @@ mod tests {
                 // The proof is out; meanwhile the profile is unpaired and
                 // paired again, with a new session.
                 socket.next().await.unwrap().unwrap();
-                let src = crate::status::Sources::in_dir(&dir);
-                crate::pairing_binding::commit_unpair(&src).unwrap();
-                let before = crate::pairing_binding::capture(&src).unwrap();
-                crate::pairing_binding::bind_new(&src, &before, "mac-a").unwrap();
-                let mut sessions = crate::auth::SessionManager::default();
-                sessions.insert_session(crate::auth::AuthSession::new(
-                    "new-session".into(),
-                    "new-token".into(),
-                    "mac-a".into(),
-                    "host".into(),
-                ));
-                sessions.save_to(&dir.join("sessions.json")).unwrap();
+                let src = crate::profile::Sources::in_dir(&dir);
+                crate::pairing::unpair(&src).unwrap();
+                let before = crate::pairing::capture(&src).unwrap();
+                crate::pairing::bind_new(&src, &before, "mac-a").unwrap();
+                crate::pairing::tests::set_session(&dir, "mac-a", "new-session", "new-token");
                 let reply = AstationMessage::StatusUpdate {
                     status: "authenticated".into(),
                     data: std::collections::HashMap::new(),
@@ -2031,21 +2006,21 @@ mod tests {
                     .unwrap();
                 let _ = socket.next().await;
             });
-            let mut client = AstationClient::new_with_test_state("atem-test", session_path.clone());
+            let mut client = AstationClient::new_with_test_state("atem-test", state.path());
             client.local_token_path_override = Some(token_path);
             let error = client
                 .connect_without_pairing(&format!("ws://{address}"))
                 .await
                 .unwrap_err();
             assert!(
-                format!("{error:#}").contains(crate::pairing_binding::CHANGED),
+                format!("{error:#}").contains(crate::pairing::CHANGED),
                 "{transport}: {error:#}"
             );
             assert!(client.capture().is_none());
-            let after = fs::read(&session_path).unwrap();
-            let sessions: crate::auth::SessionManager = serde_json::from_slice(&after).unwrap();
-            assert_eq!(sessions.get("mac-a").unwrap().session_id, "new-session");
-            assert!(!state.path().join("relay-code").exists(), "{transport}");
+            assert_eq!(
+                crate::pairing::tests::session_id(state.path()).as_deref(),
+                Some("new-session")
+            );
             server.await.unwrap();
         }
     }
@@ -2118,11 +2093,11 @@ mod tests {
         // The authenticated connection takes them over and applies them,
         // through the same signature checks (unsigned here: ignored).
         let profile = tempfile::tempdir().unwrap();
-        let capture = crate::pairing_binding::tests::bound_profile(profile.path(), "astation-1");
-        let paths = capture.sources().keys.clone();
+        let capture = crate::pairing::tests::bound_profile(profile.path(), "astation-1");
+        let paths = capture.sources().paths.cred.clone();
         let mut authenticated = AstationClient::new()
             .with_profile(capture.sources().clone())
-            .with_agent(std::sync::Arc::new(crate::memory::key_agent::test_agent(&paths)));
+            .with_agent(std::sync::Arc::new(crate::memory::cred_agent::test_agent(&paths)));
         authenticated.connected_astation_id = Some("astation-1".into());
         authenticated.set_capture_for_test(capture.clone());
         let held = pairing.take_held_encryption();
@@ -2136,13 +2111,13 @@ mod tests {
         assert!(authenticated.apply_held_encryption().await.is_empty());
 
         // After `atem unpair`, nothing reaches the keys or the trust state.
-        crate::pairing_binding::commit_unpair(capture.sources()).unwrap();
+        crate::pairing::unpair(capture.sources()).unwrap();
         for message in held {
             authenticated.hold_encryption(message);
         }
         assert_eq!(
             authenticated.apply_held_encryption().await,
-            vec![format!("Ignored an encryption message: {}", crate::pairing_binding::CHANGED)]
+            vec![format!("Ignored an encryption message: {}", crate::pairing::CHANGED)]
         );
         // Without a pairing binding yet (`atem pair` waiting for its
         // credentials), they are held, not applied.
@@ -2169,8 +2144,7 @@ mod tests {
 
     fn isolated_client(atem_id: &str) -> (tempfile::TempDir, AstationClient) {
         let directory = tempfile::tempdir().unwrap();
-        let session_path = directory.path().join("sessions.json");
-        let client = AstationClient::new_with_test_state(atem_id, session_path);
+        let client = AstationClient::new_with_test_state(atem_id, directory.path());
         (directory, client)
     }
 
@@ -2248,19 +2222,12 @@ mod tests {
     }
 
     /// `dir`'s profile after an `atem unpair` that crashed after its commit:
-    /// the paired credentials and the saved session for `astation_id` are
-    /// still on disk, but the binding is gone.
+    /// the pairing record with its saved session for `astation_id` is still
+    /// on disk, but its binding is of an older generation.
     fn interrupted_unpair(dir: &std::path::Path, astation_id: &str) {
-        crate::pairing_binding::tests::bound_profile(dir, astation_id);
-        let mut sessions = crate::auth::SessionManager::default();
-        sessions.insert_session(crate::auth::AuthSession::new(
-            "leftover-session".into(),
-            "leftover-token".into(),
-            astation_id.into(),
-            "host".into(),
-        ));
-        sessions.save_to(&dir.join("sessions.json")).unwrap();
-        crate::pairing_binding::commit_unpair(&crate::status::Sources::in_dir(dir)).unwrap();
+        crate::pairing::tests::bound_profile(dir, astation_id);
+        crate::pairing::tests::set_session(dir, astation_id, "leftover-session", "leftover-token");
+        crate::pairing::tests::interrupted_unpair(dir);
     }
 
     #[tokio::test]
@@ -2468,17 +2435,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn practical_websocket_pairing_fails_when_session_cannot_be_persisted() {
-        use std::os::unix::fs::symlink;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind test Astation");
         let address = listener.local_addr().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let session_path = directory.path().join("sessions.json");
-        let target_path = directory.path().join("protected-target");
-        let server_session_path = session_path.clone();
-        let server_target_path = target_path.clone();
+        // The record can't be written: a directory (not empty) is in its place.
+        let record = crate::paths::ProfilePaths::in_dir(directory.path()).pairing.record;
+        let server_record = record.clone();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener
@@ -2513,8 +2477,7 @@ mod tests {
                 .expect("Atem closed before pairing request")
                 .expect("failed to read pairing request");
 
-            fs::write(&server_target_path, "must remain unchanged").unwrap();
-            symlink(&server_target_path, &server_session_path).unwrap();
+            fs::create_dir_all(server_record.join("occupied")).unwrap();
             let granted = AstationMessage::StatusUpdate {
                 status: "auth".to_string(),
                 data: std::collections::HashMap::from([
@@ -2530,17 +2493,12 @@ mod tests {
         });
 
         let mut client =
-            AstationClient::new_with_test_state("atem-test-persist-failure", session_path);
-        let error = client
+            AstationClient::new_with_test_state("atem-test-persist-failure", directory.path());
+        client
             .connect(&format!("ws://{address}"))
             .await
             .expect_err("pairing unexpectedly ignored session persistence failure");
-        assert!(error.to_string().contains("Failed to open private file"));
-        assert_eq!(
-            fs::read_to_string(target_path).unwrap(),
-            "must remain unchanged"
-        );
-        assert!(!directory.path().join("relay-code").exists());
+        assert!(record.join("occupied").is_dir(), "left alone");
         server.await.unwrap();
     }
 
@@ -2554,18 +2512,12 @@ mod tests {
             .expect("failed to bind test Astation");
         let address = listener.local_addr().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let session_path = directory.path().join("sessions.json");
         let target_path = directory.path().join("protected-target");
         let astation_id = "astation-refresh-failure".to_string();
 
-        let mut sessions = crate::auth::SessionManager::default();
-        sessions.insert_session(crate::auth::AuthSession::new(
-            "session-existing".to_string(),
-            "token-existing".to_string(),
-            astation_id.clone(),
-            "test-machine".to_string(),
-        ));
-        sessions.save_to(&session_path).unwrap();
+        crate::pairing::tests::bound_profile(directory.path(), &astation_id);
+        crate::pairing::tests::set_session(directory.path(), &astation_id, "session-existing", "token-existing");
+        let session_path = crate::paths::ProfilePaths::in_dir(directory.path()).pairing.record;
 
         let server_session_path = session_path.clone();
         let server_target_path = target_path.clone();
@@ -2619,21 +2571,20 @@ mod tests {
         });
 
         let mut client =
-            AstationClient::new_with_test_state("atem-test-refresh-failure", session_path);
+            AstationClient::new_with_test_state("atem-test-refresh-failure", directory.path());
         // The saved session the proof used can't be read back (a symlink is
         // refused), so the success can't be tied to it: nothing is adopted.
         let error = client
             .connect_without_pairing(&format!("ws://{address}"))
             .await
             .expect_err("an unverifiable session authorized the connection");
-        assert!(format!("{error:#}").contains("private file"), "{error:#}");
+        assert!(format!("{error:#}").contains("could not read"), "{error:#}");
         assert!(client.sender.is_none());
         assert!(client.capture().is_none());
         assert_eq!(
             fs::read_to_string(target_path).unwrap(),
             "must remain unchanged"
         );
-        assert!(!directory.path().join("relay-code").exists());
         server.await.unwrap();
     }
 
@@ -2782,18 +2733,9 @@ mod tests {
         });
 
         let (state, mut client) = isolated_client("atem-test-proof-only");
-        // A paired credential entry in the client's profile (a temp dir).
-        let mut store = crate::credentials::CredentialStore { entries: Vec::new() };
-        store.upsert(crate::credentials::CredentialEntry::new_paired(
-            "a".into(),
-            "r".into(),
-            u64::MAX,
-            None,
-            "astation-x".into(),
-            true,
-            1,
-        ));
-        store.save_to(&state.path().join("credentials.enc")).unwrap();
+        // A pairing without a saved session in the client's profile (a temp dir).
+        crate::pairing::tests::bound_profile(state.path(), "astation-x");
+        crate::pairing::tests::edit(state.path(), |record| record.session = None);
         let error = client
             .connect_without_pairing(&format!("ws://{address}"))
             .await

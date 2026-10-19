@@ -1,5 +1,7 @@
 # Astation Identity Relay
 
+> **Superseded (2026-10-19):** `astation_relay_code` is gone; the relay identity room is the paired Astation's id from `pairing/pairing.enc`.
+
 Status: device authentication v2 is implemented for Atem identity-room clients.
 The relay still has production security blockers listed below.
 

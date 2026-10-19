@@ -12,7 +12,7 @@ This approval records the design; implementation has not started.
 Enroll Atem once per machine, OS user, and account profile. Further launches and
 reconnects reuse that approved identity through automatic authentication.
 Account login, device verification, and key unlock are separate states; a locked
-key agent or expired login must not automatically mean "pair again."
+cred agent or expired login must not automatically mean "pair again."
 
 `atem pair` is a no-op for an already paired profile: report its current
 pairing/verification status without changing identity, trust bindings, keys, or
@@ -151,7 +151,7 @@ process.
 ## 3. Runtime and process recovery
 
 Recommended architecture: one shared runtime per OS user/account profile owns
-connection management, device/key-agent access, and the session registry.
+connection management, device/cred-agent access, and the session registry.
 Individual `atem` launches attach through owner-restricted local IPC.
 Concurrent launches must elect one owner without displacing a live runtime.
 Pairing, unlock, sync, and short-lived commands use that shared ownership.

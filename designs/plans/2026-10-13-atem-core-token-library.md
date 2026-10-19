@@ -21,7 +21,7 @@
 - App ID and App Certificate: exactly 32 ASCII hex characters. Channel: 1–64 bytes. RTC user account: 1–255 bytes. RTM user id: 1–64 bytes. Every expiry: ≥ 1 second. Decode input ≤ 16 KiB, decompressed ≤ 64 KiB.
 - `atem token rtc|rtm create|decode`, `/api/token` and the ConvoAI server keep their documented behaviour (the `s/` prefix, int-uid vs string-account detection, empty certificate → no token).
 - Tests: `cargo test -p atem-core -p atem-core-ffi`; the `atem` package with `cargo test -- --test-threads=1` and plain `cargo test` (CI runs tests in parallel). `cargo clippy --all-targets` (workspace) adds no warnings to existing files and none in new crates.
-- Don't touch a running `atem key-agent`, `~/.config/atem`, or run `atem pair`/`atem cred`/`atem sync`.
+- Don't touch a running `atem cred-agent`, `~/.config/atem`, or run `atem pair`/`atem cred`/`atem sync`.
 - Pinned upstream: `agora_token` git `https://github.com/AgoraIO/Tools.git`, rev `374cd21f5220d2c921ec903c1eae2ee1464be651`, subdirectory `DynamicKey/AgoraDynamicKey/rust`.
 
 ## File Structure

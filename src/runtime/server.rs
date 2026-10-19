@@ -33,9 +33,16 @@ const TICK: Duration = Duration::from_millis(16);
 const CLIENT_QUEUE: usize = 8;
 /// Messages handled per client per pass, so one client can't starve others.
 const PER_PASS: usize = 64;
-/// The prefix of the error a runtime without live sessions sends before it
-/// exits for a client of another protocol (`client::RESTARTING` matches it).
-pub const RESTARTING: &str = "This runtime speaks another protocol and is restarting";
+/// The prefix of the error a runtime sends a new client while it exits for
+/// a restart (`client::RESTARTING` matches it: the client waits for it to
+/// go and connects to the next one).
+pub const RESTARTING: &str = "This runtime is restarting";
+/// The start of the error a `restart` gets while the runtime is busy: an
+/// Astation operation runs or a session is starting (`client` matches it).
+pub const BUSY_RESTART: &str = "Atem's runtime is busy";
+/// The error new work gets once a restart was asked for: the runtime exits
+/// after this pass (the next runtime takes it).
+pub const RESTARTING_NOW: &str = "Atem's runtime is restarting; try again in a moment";
 
 pub struct Options {
     /// Exit after this long with no sessions and no clients.
@@ -46,7 +53,7 @@ pub struct Options {
     pub launcher: Launcher,
     /// The profile whose pairing names the session host at start (`None`:
     /// unpaired until an authenticated, verified link names it).
-    pub profile: Option<crate::status::Sources>,
+    pub profile: Option<crate::profile::Sources>,
     /// The session host's monotonic clock.
     pub clock: Clock,
     /// What Astation operations (pairing, unlock) run with.
@@ -748,6 +755,20 @@ impl Server {
                 return;
             }
         };
+        if self.restart {
+            // Exiting after this pass: nothing new starts here.
+            match &message {
+                ClientMsg::Hello { .. } if !greeted => {
+                    self.error(id, format!("{RESTARTING} for a client"), "hello");
+                    return self.close(id);
+                }
+                ClientMsg::Launch { .. }
+                | ClientMsg::AstationOp { .. }
+                | ClientMsg::Attach { .. }
+                | ClientMsg::Restart => return self.error(id, RESTARTING_NOW, message.op()),
+                _ => {}
+            }
+        }
         if !greeted {
             match message {
                 ClientMsg::Hello { passive, .. } => {
@@ -760,10 +781,11 @@ impl Server {
                         client.passive = passive;
                         client.send(&RuntimeMsg::Welcome {
                             protocol: PROTOCOL,
-                            build: crate::memory::key_agent::build_id().to_string(),
+                            build: crate::memory::cred_agent::build_id().to_string(),
                             pid: std::process::id(),
                             astation: self.astation,
                             host_error,
+                            worker_protocol: Some(super::worker_protocol::WORKER_PROTOCOL),
                         });
                     }
                 }
@@ -1016,7 +1038,76 @@ impl Server {
                     },
                 );
             }
+            ClientMsg::Status => {
+                let status = self.status();
+                self.send(id, &RuntimeMsg::Status { status });
+            }
+            ClientMsg::Restart => self.restart_for(id),
         }
+    }
+
+    /// What `status` reports: the link, the attachment, the journal and the
+    /// sessions.
+    fn status(&self) -> super::protocol::RuntimeStatus {
+        use super::protocol::{RuntimeStatus, Transport};
+        use crate::websocket_client::LinkVia;
+        let app = &self.app;
+        let connected = app.astation_connected && !app.astation_client.is_ws_closed();
+        let (transport, relay) = match app.astation_client.via().filter(|_| connected) {
+            Some(LinkVia::Local) => (Some(Transport::Local), None),
+            Some(LinkVia::Relay { label }) => (Some(Transport::Relay), Some(label.clone())),
+            None => (None, None),
+        };
+        let link = self.bridge.as_ref().map(HostBridge::link_status);
+        let host_error = self
+            .host_error
+            .clone()
+            .or_else(|| self.bridge.as_ref().and_then(HostBridge::host_error));
+        RuntimeStatus {
+            astation: connected && app.astation_reauth.is_none(),
+            transport,
+            relay,
+            retrying: !connected
+                && (app.astation_connect_rx.is_some() || app.astation_reconnect_at.is_some()),
+            reauthenticating: connected && app.astation_reauth.is_some(),
+            attachment: link.as_ref().is_some_and(|l| l.attachment),
+            welcomed: link.as_ref().and_then(|l| l.welcomed.clone()),
+            refused: link.as_ref().and_then(|l| l.refused.clone()),
+            journal_halted: link.as_ref().is_some_and(|l| l.journal_halted),
+            host_error,
+            adopting: self.adopting,
+            sessions: self.order.iter().map(|sid| self.summary(sid)).collect(),
+        }
+    }
+
+    /// `restart`: the runtime exits after this pass so the client can start
+    /// its own build (the workers keep running; the next runtime adopts
+    /// them). Never while an Astation operation runs (its link would go) or
+    /// a session is starting (its launch would be cut off). The other
+    /// frontends get `restarting` too: they reattach to the next runtime.
+    fn restart_for(&mut self, id: u64) {
+        let busy = if self.op.is_some() || self.op_waiting.is_some() {
+            Some("an Astation operation is running")
+        } else if self.launching > 0 {
+            Some("a session is starting")
+        } else {
+            None
+        };
+        if let Some(why) = busy {
+            return self.error(
+                id,
+                format!("{BUSY_RESTART}: {why}; restart it once that ends"),
+                "restart",
+            );
+        }
+        for (other, client) in &self.clients {
+            if *other != id && client.greeted && !client.passive {
+                client.send(&RuntimeMsg::Restarting);
+            }
+        }
+        eprintln!("atem runtime: restarting for a client");
+        self.restart = true;
+        self.send(id, &RuntimeMsg::Restarting);
     }
 
     /// Starts an Astation operation for client `id`, unless one runs.
@@ -1192,7 +1283,7 @@ impl Server {
         let live = self.live_count() + self.launching;
         let text = if live == 0 {
             self.restart = true;
-            format!("{RESTARTING} (protocol {PROTOCOL}, client {version})")
+            format!("{RESTARTING} for another protocol (protocol {PROTOCOL}, client {version})")
         } else {
             format!(
                 "This runtime speaks protocol {PROTOCOL}, not {version}, and has {live} live sessions; stop your sessions (`atem agent list`) or use the atem that started them"

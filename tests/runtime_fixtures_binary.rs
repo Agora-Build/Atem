@@ -28,6 +28,11 @@
 //! - `hold_pty_writes`/`flush_pty_writes`, `fail_next_pty_enqueue`,
 //!   `fail_next_pty_write_after_partial`: markers the workers' PTY writer
 //!   reads (`ATEM_TEST_PTY_FAULTS`, debug builds; `src/runtime/test_hooks.rs`).
+//!
+//!   The scenarios need the clock and these markers, which release builds
+//!   compile out (the runtime then runs on its real clock and never fails a
+//!   PTY write): under `cargo test --release` the tests that run scenarios
+//!   are ignored rather than failed or passed vacuously.
 //! - `turn_complete`: the fake Claude ends its running turn (its prompt ids
 //!   are `turn-<n>`, which the chat adapter reports as turn ids).
 //! - `open_approval`: the fake Claude (a scenario with approvals runs its
@@ -2048,6 +2053,7 @@ fn run_named(scenarios: &[Value], only: Option<&str>) -> Vec<(String, Result<(),
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the fixture clock and PTY faults of a debug build (src/runtime/test_hooks.rs)")]
 fn shared_host_fixtures_run_against_the_real_runtime() {
     let scenarios = scenarios();
     assert!(scenarios.len() >= 13, "host fixtures missing");
@@ -2088,6 +2094,7 @@ fn shared_host_fixtures_run_against_the_real_runtime() {
 /// The harness fails a scenario whose expectation or counter is changed, so
 /// a pass means the runtime produced what the fixture says.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the fixture clock and PTY faults of a debug build (src/runtime/test_hooks.rs)")]
 fn a_changed_expectation_fails_against_the_real_runtime() {
     let scenarios = scenarios();
     let named = |name: &str| {

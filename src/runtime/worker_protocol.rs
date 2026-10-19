@@ -313,6 +313,10 @@ pub enum WorkerMsg {
         /// The session has a chat adapter (Claude's; Codex's with Atem's
         /// Codex hooks on): it offers chat-v1.
         chat: bool,
+        /// The worker's atem build (`cred_agent::build_id`); absent from a
+        /// worker started by an atem from before the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
     },
     /// Raw PTY output (base64) starting at stream position `offset`.
     Output {
@@ -662,6 +666,7 @@ mod tests {
                 dropped: 1,
                 exited: None,
                 chat: true,
+                build: Some("0.7.1+1".into()),
             },
             WorkerMsg::output(b"x", 9),
             WorkerMsg::Screen {

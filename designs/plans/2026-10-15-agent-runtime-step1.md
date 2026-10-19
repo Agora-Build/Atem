@@ -4,7 +4,7 @@
 
 **Goal:** Move agent sessions and the Astation connection out of the TUI into one background `atem runtime` per profile that hosts any number of Claude/Codex sessions, with `atem agent launch|attach|list|stop` as local frontends.
 
-**Architecture:** First turn `App`'s two fixed agent slots into a map of sessions inside today's process (Tasks 1–2), so all host logic is session-keyed and tested before anything moves. Then extract the key agent's daemon plumbing (Task 3), run the host loop headless behind a same-user Unix socket (Task 4), and make the terminal UI a client of it (Task 5). Step 2 (pair/cred through the runtime) and step 3 (cleanup) get their own plans; the three ship in one release.
+**Architecture:** First turn `App`'s two fixed agent slots into a map of sessions inside today's process (Tasks 1–2), so all host logic is session-keyed and tested before anything moves. Then extract the cred agent's daemon plumbing (Task 3), run the host loop headless behind a same-user Unix socket (Task 4), and make the terminal UI a client of it (Task 5). Step 2 (pair/cred through the runtime) and step 3 (cleanup) get their own plans; the three ship in one release.
 
 **Tech Stack:** Rust 2024 bin crate `atem`; tokio (UnixListener/UnixStream, signal), serde_json lines, portable-pty, vt100, ratatui/crossterm, libc (flock, SO_PEERCRED/getpeereid, setsid).
 
@@ -16,11 +16,11 @@
 - Behaviour visible to Astation must stay compatible: agent-list bytes for an entry without capabilities unchanged (pinned test); terminal ids `claude`/`codex` keep working as aliases for the most recently used live session of that provider; chat-v1 unchanged.
 - `session_id` = `ses-` + 12 lowercase base32 chars (`[a-z2-7]`), random; used as registry id, terminal-v1 `terminal_id` and chat-v1 `agentId`. At most 16 live sessions.
 - Launch environment bounds: ≤ 512 entries, ≤ 256 KiB total; never logged, listed or kept after spawn.
-- Runtime files: `runtime.lock` (flock + pid) and `runtime.socket` (recorded path) and `runtime.log` in the config dir; socket `$XDG_RUNTIME_DIR/atem/runtime.sock` else `<config>/runtime.sock`; dir 0700, socket 0600, same-UID peers only. Must not collide with the key agent's `agent.sock`/`agent.lock`/`key_agent.lock`.
+- Runtime files: `runtime.lock` (flock + pid) and `runtime.socket` (recorded path) and `runtime.log` in the config dir; socket `$XDG_RUNTIME_DIR/atem/runtime.sock` else `<config>/runtime.sock`; dir 0700, socket 0600, same-UID peers only. Must not collide with the cred agent's `agent.sock`/`agent.lock`/`cred_agent.lock`.
 - Idle exit: 10 min with no sessions (live or exited), no clients and no operation; exited sessions removed 10 min after exit.
 - Local protocol v1 per the spec table (JSON lines, `{"v":1,"op":…}`, base64 bytes); output backlog per client ≤ 256 KiB then drop + fresh restore; stop reading a client while the target PTY input queue is full.
 - Never rustfmt `src/app.rs`, `src/main.rs`, `src/cli.rs`, `src/websocket_client.rs`, `src/memory/crypto.rs`, `src/memory/mod.rs`, `src/memory/secrets.rs`; new files may use `rustfmt --edition 2024`; check others with `--check` first. Never project-wide `cargo fmt`.
-- Never run the installed `atem`; never touch the real `~/.config/atem`, `$XDG_RUNTIME_DIR/atem`, the user's running atem/claude/codex processes or key agent; tests use temp `HOME`/`XDG_RUNTIME_DIR` and fake agent binaries. No signals to processes a test didn't start.
+- Never run the installed `atem`; never touch the real `~/.config/atem`, `$XDG_RUNTIME_DIR/atem`, the user's running atem/claude/codex processes or cred agent; tests use temp `HOME`/`XDG_RUNTIME_DIR` and fake agent binaries. No signals to processes a test didn't start.
 - Every task: full `cargo test` reading EVERY `test result` line (unit + `tests/*` binaries), `cargo test --bin atem chat` 3× (flake check), `cargo clippy --all-targets` not above baseline (82 bin / 83 test).
 
 ## File Structure
@@ -142,7 +142,7 @@ Tests (write first): two Claude sessions + one Codex in one App: all three in th
 
 - [ ] tests → implement → verify → commit `feat(session): several sessions with ids, cwd/env and addressed routing`.
 
-### Task 3: Daemon plumbing shared with the key agent
+### Task 3: Daemon plumbing shared with the cred agent
 
 **Files:** create `src/daemon.rs`; modify `src/memory/agent_socket.rs` to use it (no behaviour change).
 
@@ -163,9 +163,9 @@ pub fn spawn_detached(exe: &Path, subcommand: &str, log: &Path, envs: &[(OsStrin
 pub fn bind_socket(files: &DaemonFiles, uid: u32) -> io::Result<tokio::net::UnixListener>; // replaces a dead socket, chmod 0600, records path
 ```
 
-The key agent keeps its file names (`agent.sock`, `agent.lock`, `key_agent.lock`, `agent.socket`, `key-agent.log`) by passing them explicitly; `spawn_detached(.., "key-agent", ..)` replaces `spawn_agent`'s hard-coded argument.
+The cred agent keeps its file names (`agent.sock`, `agent.lock`, `cred_agent.lock`, `agent.socket`, `cred-agent.log`) by passing them explicitly; `spawn_detached(.., "cred-agent", ..)` replaces `spawn_agent`'s hard-coded argument.
 
-- [ ] Move with tests (copy the relevant agent_socket tests to daemon.rs: dir checks, peer uid, lock held/free, pid read, short socket dirs); all key-agent tests and `tests/key_agent_binary.rs` pass unchanged → commit `refactor(daemon): socket, lock and spawn helpers shared with the key agent`.
+- [ ] Move with tests (copy the relevant agent_socket tests to daemon.rs: dir checks, peer uid, lock held/free, pid read, short socket dirs); all cred-agent tests and `tests/cred_agent_binary.rs` pass unchanged → commit `refactor(daemon): socket, lock and spawn helpers shared with the cred agent`.
 
 ### Task 4: `atem runtime` — headless host and local protocol
 
