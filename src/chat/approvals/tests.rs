@@ -34,13 +34,26 @@ fn spawn(command: &str, env: &[(&str, &Path)], stdin: &str) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // As an agent starts it: no signal ignored. A shell can't trap a signal
+    // ignored when it started (POSIX), which a test run started in the
+    // background of a non-interactive shell would pass on for SIGINT.
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `signal` is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
     let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // A command that exits at once (outside Atem) may be gone before it
+    // could read it.
+    match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        written => written.unwrap(),
+    }
     child
 }
 

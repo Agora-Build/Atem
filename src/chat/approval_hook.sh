@@ -37,7 +37,8 @@
 #       replaces an existing file: a name already taken moves to the next
 #       seq, so no event overwrites another even if two hooks ever held the
 #       lock. A lock whose pid is gone (a killed hook) is taken over after
-#       ~2 s; a live holder that long means this event is dropped. A hook
+#       ~2 s (wall time); a live holder that long means this event is
+#       dropped. A hook
 #       releases only a lock naming its own pid. PermissionRequest is never
 #       written here (its own mode).
 #       Readers take only ev-*.json files and must ignore everything else
@@ -67,13 +68,19 @@ if [ "$1" = event ]; then
     [ -d "$e" ] || exit 0
     l=$e/seq.lock
     held=
+    w=
     t=$(mktemp "$e/tmp.XXXXXXXX" 2>/dev/null) || exit 0
     # Releases the lock only while it still names this hook.
     release() {
         [ -n "$held" ] && [ "$(readlink "$l" 2>/dev/null)" = "$$" ] && rm -f "$l" 2>/dev/null
         held=
     }
-    trap 'rm -f "$t"; release; exit 0' HUP INT TERM
+    # The lock wait's timer, if one runs.
+    untime() {
+        [ -n "$w" ] && kill "$w" 2>/dev/null
+        w=
+    }
+    trap 'rm -f "$t"; untime; release; exit 0' HUP INT TERM
     { printf '%s %s\n' "$$" "$PPID" > "$t" && cat >> "$t"; } 2>/dev/null || { rm -f "$t"; exit 0; }
     ev=${2:-}
     case $ev in '' | *[!A-Za-z]*)
@@ -84,9 +91,19 @@ if [ "$1" = event ]; then
     # A directory there isn't a lock any hook makes (and `ln -s` would
     # put the link inside it): out of the way.
     if [ -d "$l" ] && [ ! -h "$l" ]; then rm -rf "$l" 2>/dev/null; fi
+    # The wait for a held lock is ~2 s of wall time, not a count of polls:
+    # each poll forks (`ln`, `sleep`), which a loaded machine makes slow,
+    # and Codex stops waiting at 3 s. A background `sleep 2` (no stdio, so
+    # Codex never waits for its output) is the timer; the builtin `kill -0`
+    # checks it. The poll count (the old bound) is only a backstop.
     n=0
     until ln -s "$$" "$l" 2>/dev/null; do
-        if [ "$n" -ge 20 ]; then
+        if [ -z "$w" ]; then
+            sleep 2 </dev/null >/dev/null 2>&1 &
+            w=$!
+        fi
+        if [ "$n" -ge 20 ] || ! kill -0 "$w" 2>/dev/null; then
+            untime
             if [ -h "$l" ]; then
                 p=$(readlink "$l" 2>/dev/null)
                 case $p in
@@ -110,6 +127,7 @@ if [ "$1" = event ]; then
             n=$((n + 10))
         fi
     done
+    untime
     held=1
     {
         s=$(cat "$e/seq" 2>/dev/null)

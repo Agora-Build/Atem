@@ -993,7 +993,11 @@ mod script {
 
     /// A pid that isn't running (a reaped child's).
     fn dead_pid() -> u32 {
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        // `/bin/sh`, not `/bin/true`: macOS has only `/usr/bin/true`.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
         let dead = child.id();
         child.wait().unwrap();
         dead

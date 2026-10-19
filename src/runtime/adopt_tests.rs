@@ -737,12 +737,18 @@ async fn input_to_codex_and_adoption_give_no_decision() {
     handle.known_approvals(vec!["other".into()]).unwrap();
     let seen = until(&mut handle, has_output("hook-done")).await;
     assert!(!output_text(&seen).contains("behavior"));
+    // No decision was handed over. Closing the reported request `released`
+    // is allowed (the broker drops its card): whether it comes before the
+    // hook's own exit shows is only a matter of timing.
     assert!(
-        !seen.iter().any(|m| matches!(
-            m,
-            WorkerMsg::ApprovalApplied { .. } | WorkerMsg::ApprovalClosed { .. }
-        )),
-        "a release reports nothing: {seen:?}"
+        seen.iter().all(|m| match m {
+            WorkerMsg::ApprovalApplied { .. } => false,
+            WorkerMsg::ApprovalClosed { request_id, reason } =>
+                (*request_id == id || *request_id == id2)
+                    && *reason == crate::session_protocol::wire::ApprovalCloseReason::Released,
+            _ => true,
+        }),
+        "a release hands over no decision: {seen:?}"
     );
     stop(running, handle).await;
 }
@@ -816,12 +822,19 @@ async fn a_broker_that_goes_away_releases_the_waiting_hook() {
     let Adoption::Adopted(mut handle, _) = adopted.remove(0) else {
         panic!("not adopted")
     };
+    // On the screen it restores, or in the output after it: the hook may
+    // still be noticing that its broker went away when the screen is cut.
     handle.request_screen().unwrap();
-    until(&mut handle, |m| match m {
-        WorkerMsg::Screen { restore, .. } => {
-            String::from_utf8_lossy(&unb64(restore).unwrap()).contains("hook-done")
+    let mut shown = String::new();
+    until(&mut handle, |m| {
+        match m {
+            WorkerMsg::Screen { restore, .. } => {
+                shown = String::from_utf8_lossy(&unb64(restore).unwrap()).into_owned()
+            }
+            _ if !shown.is_empty() => shown.push_str(&output_text(std::slice::from_ref(m))),
+            _ => {}
         }
-        _ => false,
+        shown.contains("hook-done")
     })
     .await;
     stop(running, handle).await;
