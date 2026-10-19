@@ -152,6 +152,7 @@ version = "0.7.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "atem-client",
  "atem-core",
  "base64 0.21.7",
  "cc",
@@ -195,6 +196,25 @@ dependencies = [
  "uuid",
  "vt100",
  "vte",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "atem-client"
+version = "0.1.0"
+dependencies = [
+ "atem-client",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "hkdf",
+ "hmac",
+ "hpke",
+ "p256",
+ "rand_core",
+ "serde_json",
+ "sha2",
+ "subtle",
  "x25519-dalek",
  "zeroize",
 ]

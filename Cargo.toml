@@ -45,6 +45,7 @@ rustls-pemfile = "2"
 ctrlc = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 atem-core = { path = "crates/atem-core" }
+atem-client = { path = "crates/atem-client" }
 urlencoding = "2"
 pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
@@ -60,5 +61,5 @@ openssl-vendored = ["openssl-sys/vendored"]
 cc = "1.0"
 
 [workspace]
-members = ["crates/atem-core", "crates/atem-core-ffi"]
+members = ["crates/atem-core", "crates/atem-core-ffi", "crates/atem-client"]
 resolver = "3"

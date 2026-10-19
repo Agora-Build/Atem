@@ -6,14 +6,8 @@ use serde::Serialize;
 use std::io::Write;
 use zeroize::Zeroizing;
 
-pub fn enc(fields: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(fields.iter().map(|field| field.len() + 4).sum());
-    for field in fields {
-        out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-        out.extend_from_slice(field);
-    }
-    out
-}
+/// The same encoding r9 signs over (`atem_client::encoding`, §R9.1).
+pub use atem_client::encoding::{enc, u64_field};
 
 pub fn dec(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut fields = Vec::new();
@@ -30,11 +24,6 @@ pub fn dec(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         bytes = &bytes[len..];
     }
     Ok(fields)
-}
-
-/// Encodes a number field (8 bytes, big-endian).
-pub fn u64_field(value: u64) -> [u8; 8] {
-    value.to_be_bytes()
 }
 
 pub fn read_u64(field: &[u8]) -> Result<u64> {
