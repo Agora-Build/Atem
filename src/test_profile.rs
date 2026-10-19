@@ -125,7 +125,7 @@ mod tests {
             "config_dir resolved without an injected profile"
         );
         assert!(std::panic::catch_unwind(crate::paths::ProfilePaths::default_paths).is_err());
-        assert!(std::panic::catch_unwind(crate::status::Sources::current).is_err());
+        assert!(std::panic::catch_unwind(crate::profile::Sources::current).is_err());
         assert!(std::panic::catch_unwind(crate::paths::CredPaths::default_paths).is_err());
         assert!(std::panic::catch_unwind(crate::rtc_test_server::servers_dir).is_err());
         assert!(std::panic::catch_unwind(crate::memory::cred_agent::default_agent).is_err());
@@ -136,7 +136,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _scope = use_dir(temp.path());
         assert_eq!(crate::config::AtemConfig::config_dir(), temp.path());
-        assert_eq!(crate::paths::ProfilePaths::default_paths().dir, temp.path());
+        assert_eq!(
+            crate::paths::ProfilePaths::default_paths().login,
+            crate::paths::ProfilePaths::in_dir(temp.path()).login
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use crate::daemon::{
-    self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, process_uid,
+    self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir,
 };
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::{
@@ -1116,7 +1116,7 @@ impl CredAgentClient {
         else {
             return Ok(());
         };
-        if theirs.as_deref() == Some(build) {
+        if theirs == build {
             return Ok(());
         }
         if unlocked {
@@ -1136,18 +1136,8 @@ impl CredAgentClient {
         if self.wait_gone(STOP_WAIT) {
             return Ok(());
         }
-        if let Some(lock) = self.lock.as_deref()
-            && lock_is_held(lock) == Some(true)
-            && let Some(pid) = confirmed_holder(lock)
-            && process_uid(pid) == Some(self.expected_uid)
-        {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-            if self.wait_gone(STOP_WAIT) {
-                return Ok(());
-            }
-        }
         bail!(
-            "the running cred agent is from an older atem build and doesn't stop when asked; find it with `pgrep -af '[a]tem cred-agent'` and stop it (`pkill -u \"$USER\" -f 'atem cred-agent'`), then retry (it is locked: its keys stay sealed on disk)"
+            "the running cred agent is another atem build and didn't stop when asked; run `atem cred lock`, then retry (it is locked: its keys stay sealed on disk)"
         )
     }
 }
@@ -1636,7 +1626,7 @@ mod tests {
         ));
         assert!(matches!(
             decode_response(&line(
-                r#"{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false}"#
+                r#"{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false,"build":"b"}"#
             ))
             .unwrap(),
             Reply::Status {
@@ -1806,7 +1796,7 @@ mod tests {
             &crate::paths::CredPaths::in_dir(profile.path()).device_keys_sealed,
             b"{}",
         );
-        let src = crate::status::Sources::in_dir(profile.path());
+        let src = crate::profile::Sources::in_dir(profile.path());
         let credentials = crate::status::gather_with(&src, Some(&client))
             .credentials
             .value;
@@ -2436,8 +2426,9 @@ mod tests {
         socket
     }
 
-    const OLD_LOCKED: &str = r#"{"v":2,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false}}"#;
-    const OLD_DONE: &str = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
+    /// A locked agent of another build that never stops when asked.
+    const OTHER_LOCKED: &str = r#"{"v":2,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false,"build":"0.0.0+other"}}"#;
+    const OTHER_DONE: &str = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
 
     #[test]
     fn lock_wipes_the_agent_and_stops_it() {
@@ -2470,20 +2461,19 @@ mod tests {
     }
 
     #[test]
-    fn lock_with_an_older_agent_that_only_wipes_says_it_is_still_running() {
+    fn lock_with_an_agent_that_doesnt_stop_says_it_is_still_running() {
         use crate::memory::unlock::lock_keys_message;
         let dir = short_dir();
-        let socket = start_scripted_agent(dir.path(), OLD_LOCKED, OLD_DONE);
+        let socket = start_scripted_agent(dir.path(), OTHER_LOCKED, OTHER_DONE);
         let client = CredAgentClient::at(socket);
-        assert!(!client.lock_and_stop().unwrap(), "an older agent stays");
+        assert!(!client.lock_and_stop().unwrap(), "it stays");
         let message = lock_keys_message(Some(&client)).unwrap();
         assert!(message.starts_with("Locked"), "{message}");
-        assert!(message.contains("older atem"), "{message}");
-        assert!(message.contains("atem cred unlock"), "{message}");
+        assert!(message.contains("hasn't stopped"), "{message}");
     }
 
     #[test]
-    fn the_status_reply_carries_the_build_and_none_means_older() {
+    fn the_status_reply_carries_the_build() {
         use crate::memory::cred_agent::build_id;
         let dir = short_dir();
         let (socket, _stopped) = start_stoppable_agent(dir.path());
@@ -2497,13 +2487,8 @@ mod tests {
         assert!(build_id().starts_with(env!("CARGO_PKG_VERSION")));
         let status = CredAgentClient::at(socket).status().unwrap();
         assert!(!status.older_build);
-        // An agent from before the field existed.
-        assert!(matches!(
-            decode_response(OLD_LOCKED).unwrap(),
-            Reply::Status { build: None, .. }
-        ));
         let old = short_dir();
-        let status = CredAgentClient::at(start_scripted_agent(old.path(), OLD_LOCKED, OLD_DONE))
+        let status = CredAgentClient::at(start_scripted_agent(old.path(), OTHER_LOCKED, OTHER_DONE))
             .status()
             .unwrap();
         assert!(status.older_build);
@@ -2539,16 +2524,16 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_older_agent_that_wont_stop_and_cant_be_confirmed_gets_guidance() {
+    fn a_locked_agent_of_another_build_that_wont_stop_gets_guidance() {
         let dir = short_dir();
-        let socket = start_scripted_agent(dir.path(), OLD_LOCKED, OLD_DONE);
+        let socket = start_scripted_agent(dir.path(), OTHER_LOCKED, OTHER_DONE);
         let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client =
             CredAgentClient::with_launcher(socket, relaunching(dir.path(), launches.clone()))
                 .checking_build("0.0.0+another-build");
         let error = format!("{:#}", client.status().err().unwrap());
-        assert!(error.contains("older atem build"), "{error}");
-        assert!(error.contains("pkill"), "{error}");
+        assert!(error.contains("didn't stop when asked"), "{error}");
+        assert!(error.contains("atem cred lock"), "{error}");
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -2592,7 +2577,7 @@ mod tests {
         let dir = short_dir();
         let socket = start_scripted_agent(
             dir.path(),
-            OLD_LOCKED,
+            OTHER_LOCKED,
             r#"{"v":2,"ok":false,"error":"cred agent request is malformed: unknown variant `credential_projects`, expected one of `status`, `lock`"}"#,
         );
         let client = CredAgentClient::at(socket);

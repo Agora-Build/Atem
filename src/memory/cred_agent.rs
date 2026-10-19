@@ -6,7 +6,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -15,7 +14,6 @@ use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::encoding::dec;
 use crate::memory::crypto::EncryptionMode;
 use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, open_grant as open_sealed_grant};
-use crate::memory::legacy_keys::{self, Legacy};
 use crate::memory::statements::{
     SignedWire, StorageAbandon, StorageConfirm, StorageRotate, UnlockRequest, sealed_hash,
     storage_key_info, unlock_info,
@@ -204,9 +202,8 @@ pub enum Reply {
         unlocked: bool,
         storage_kid: Option<String>,
         escrowed: bool,
-        /// The agent's `build_id`; absent from an agent older than the field.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        build: Option<String>,
+        /// The agent's `build_id`.
+        build: String,
     },
     PublicKeys {
         device_pub: String,
@@ -260,11 +257,10 @@ pub struct AgentStatus {
     pub storage_kid: Option<String>,
     /// Whether the home Astation holds that storage key.
     pub escrowed: bool,
-    /// The agent was started by another atem build than this one (or one
-    /// that doesn't say).
+    /// The agent was started by another atem build than this one.
     pub older_build: bool,
-    /// The agent's build, when it says.
-    pub build: Option<String>,
+    /// The agent's build.
+    pub build: String,
 }
 
 struct Unlocked {
@@ -385,7 +381,6 @@ impl CredAgent {
             &paths.device_keys_prev,
             &paths.unlock_auth_key,
             &paths.agent_socket,
-            &paths.data_keys,
             &paths.project_names,
         ] {
             crate::memory::crypto::sweep_stale_temps(path);
@@ -404,9 +399,7 @@ impl CredAgent {
             agent.wipe();
         }
         if agent.unlocked.is_some() {
-            agent.after_unlock();
-        } else if let Err(error) = agent.drop_unverified_data_keys() {
-            eprintln!("cred agent: {error:#}");
+            agent.prune_retired();
         }
         Ok(agent)
     }
@@ -513,7 +506,7 @@ impl CredAgent {
                 unlocked: true,
                 storage_kid: Some(unlocked.storage_kid.clone()),
                 escrowed: unlocked.escrowed,
-                build: Some(build_id().to_string()),
+                build: build_id().to_string(),
             },
             None => Reply::Status {
                 unlocked: false,
@@ -523,7 +516,7 @@ impl CredAgent {
                     .find_map(|path| SealedDeviceKeys::load_from(path).ok().flatten())
                     .map(|sealed| sealed.storage_kid),
                 escrowed: false,
-                build: Some(build_id().to_string()),
+                build: build_id().to_string(),
             },
         }
     }
@@ -766,142 +759,6 @@ impl CredAgent {
         Ok(())
     }
 
-    /// Once unlocked (and at the first escrow): moves a leftover
-    /// data_keys.enc in, then drops account keys a signed state retired
-    /// while the agent was locked. Never fatal: logged, and the move is
-    /// tried again at the next unlock.
-    fn after_unlock(&mut self) {
-        if let Err(error) = self.migrate_data_keys() {
-            eprintln!(
-                "cred agent: data_keys.enc not moved yet (tried again at the next unlock): {error:#}"
-            );
-        }
-        self.prune_retired();
-    }
-
-    /// Moves data_keys.enc (build steps 0–2a) into this agent: the project
-    /// names of every verified account into project_names.json, then `K`
-    /// and its previous keys into the sealed file (merged: a newer `K` the
-    /// agent holds stays current), and data_keys.enc is deleted last, only
-    /// once the home Astation is known to hold the storage key of the file
-    /// the keys now live in (escrowed, and not unlocked via `.prev`), and
-    /// only when every entry of every verified account parsed: a malformed
-    /// one keeps the file (logged at each unlock), while the account's
-    /// valid keys still move. Every crash point leaves data_keys.enc, or the
-    /// keys durably re-sealed; the next unlock repeats the merge, which
-    /// changes nothing the second time.
-    ///
-    /// Before the first escrow the file stays: an agent restarted then
-    /// re-seals the plain device_keys under a new storage key with no
-    /// account keys (the old sealed file can't be opened), and the keys come
-    /// back from data_keys.enc. A `K` granted on such a device (held only in
-    /// the sealed file) is lost by that restart, with any previous keys only
-    /// it held: atem asks Astation for the current `K` again (keyRequest),
-    /// but older keys may not be granted again.
-    ///
-    /// cred/state.json's lock is held throughout (before project_names.lock,
-    /// the order everywhere), so a first verification's purge of what the
-    /// unauthenticated path stored can't interleave with this read.
-    fn migrate_data_keys(&mut self) -> Result<()> {
-        if !exists(&self.paths.data_keys)? {
-            return Ok(());
-        }
-        let _trust_lock = TrustStore::lock(&self.paths.trust)?;
-        let legacy = match legacy_keys::read(&self.paths.data_keys)? {
-            Legacy::Missing => return Ok(()),
-            // It can never be read on this machine; K comes back by a signed
-            // grant. Kept aside, never deleted (another machine id may read it).
-            Legacy::Unreadable(error) => {
-                legacy_keys::move_aside(&self.paths.data_keys, &error)?;
-                eprintln!(
-                    "cred agent: moved data_keys.enc aside: it can't be read ({error:#}); atem asks Astation for the encryption key again"
-                );
-                return Ok(());
-            }
-            Legacy::Keys(legacy) => legacy,
-        };
-        let verified: BTreeSet<String> = TrustStore::load_from(&self.paths.trust)?
-            .verified_entries()
-            .map(|entry| entry.data_account.clone())
-            .collect();
-        // The names first: no secrets, merged, so a repeat is harmless.
-        for (account, names) in legacy.names_for(&verified) {
-            crate::memory::project_names::remember(&self.paths.project_names, &account, names)?;
-        }
-        let unlocked = self.unlocked()?;
-        let (escrowed, via_prev) = (unlocked.escrowed, unlocked.via_prev);
-        let mut accounts = unlocked.accounts.clone();
-        let mut changed = false;
-        let found = legacy.keys_for(&verified);
-        for (account, current, previous) in found.keys {
-            changed |= accounts.merge(&account, current, previous);
-        }
-        if changed {
-            // Sealed (and a pending rotation's .next) before anything goes.
-            self.persist(&accounts)?;
-            self.unlocked.as_mut().expect("unlocked above").accounts = accounts;
-        }
-        // An entry that didn't parse may still be readable some other way
-        // (or by a fixed atem): the file stays, the valid keys are in.
-        if !found.unreadable.is_empty() {
-            eprintln!(
-                "cred agent: kept data_keys.enc: some keys of {} can't be read (the readable ones were moved)",
-                found
-                    .unreadable
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        } else if escrowed && !via_prev {
-            remove_synced(&self.paths.data_keys)?;
-            eprintln!(
-                "cred agent: moved data_keys.enc into device_keys.sealed and project_names.json"
-            );
-        }
-        Ok(())
-    }
-
-    /// An unverified device never used data_keys.enc (step 1 ignores it):
-    /// it holds only what the unauthenticated #36 path stored, so it is
-    /// deleted at agent start. An unreadable one is moved aside instead.
-    fn drop_unverified_data_keys(&self) -> Result<()> {
-        if !exists(&self.paths.data_keys)? {
-            return Ok(());
-        }
-        let _trust_lock = TrustStore::lock(&self.paths.trust)?;
-        if TrustStore::load_from(&self.paths.trust)?
-            .verified_entries()
-            .next()
-            .is_some()
-        {
-            return Ok(());
-        }
-        match legacy_keys::read(&self.paths.data_keys)? {
-            Legacy::Missing => {}
-            Legacy::Unreadable(error) => legacy_keys::move_aside(&self.paths.data_keys, &error)?,
-            Legacy::Keys(_) => {
-                remove_synced(&self.paths.data_keys)?;
-                eprintln!(
-                    "cred agent: deleted data_keys.enc: this device isn't verified, so it was never used"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Test view: the current kid and previous kids held for `account`.
-    #[cfg(test)]
-    pub(crate) fn kids_for_test(&self, account: &str) -> (Option<String>, Vec<String>) {
-        match &self.unlocked {
-            Some(unlocked) => (
-                unlocked.accounts.current_kid(account).map(str::to_string),
-                unlocked.accounts.previous_kids(account),
-            ),
-            None => (None, Vec::new()),
-        }
-    }
-
     /// The pins of the home Astation, which must be `astation_id`.
     fn home(&self, astation_id: &str) -> Result<AstationTrust> {
         let store = TrustStore::load_from(&self.paths.trust)?;
@@ -1083,7 +940,7 @@ impl CredAgent {
             via_prev: source == SealedFile::Prev,
             unsaved: false,
         });
-        self.after_unlock();
+        self.prune_retired();
         Ok(Reply::Unlocked {
             storage_kid: granted.storage_kid,
         })
@@ -1207,9 +1064,8 @@ impl CredAgent {
         unlocked.storage_kid = pending.storage_kid.clone();
         unlocked.storage_key = pending.storage_key;
         unlocked.escrowed = true;
-        // Astation now holds the key of the file data_keys.enc was moved into.
         if first_escrow {
-            self.after_unlock();
+            self.prune_retired();
         }
         Ok(Reply::Confirmed {
             storage_kid: pending.storage_kid,
@@ -1412,24 +1268,6 @@ fn exists(path: &std::path::Path) -> Result<bool> {
     }
 }
 
-/// Deletes `path` (absent is fine) and syncs its directory, so the deletion
-/// survives a crash.
-fn remove_synced(path: &std::path::Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    std::fs::File::open(
-        path.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new(".")),
-    )?
-    .sync_all()?;
-    Ok(())
-}
-
 /// Deletes the plain `device_keys` file (absent is fine).
 fn remove_plain_keys(paths: &CredPaths) -> Result<()> {
     match std::fs::remove_file(&paths.device_keys) {
@@ -1469,7 +1307,7 @@ pub trait CredAgentApi: Send + Sync {
                 unlocked,
                 storage_kid,
                 escrowed,
-                older_build: build.as_deref() != Some(build_id()),
+                older_build: build != build_id(),
                 build,
             }),
             _ => unexpected(),

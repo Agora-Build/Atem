@@ -20,14 +20,14 @@
 //! `trust_gen.lock` (`Captured::apply`): a delayed reply never refreshes a
 //! replacement session or adopts a later binding.
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use crate::records::{BindingRecord, Login, PairingRecord, SavedSession};
 use std::sync::Arc;
 
-use crate::credentials::{Login, now_secs};
+use crate::credentials::now_secs;
 use crate::memory::cred_agent::{CredAgentApi, Reply, Request};
 use crate::memory::trust::{TrustLock, TrustStore};
 use crate::paths::PairingPaths;
-use crate::status::Sources;
+use crate::profile::Sources;
 
 /// A reply arrived for a pairing that is no longer the current one.
 pub const CHANGED: &str = "The Astation pairing changed while this was in progress (atem unpair or atem pair); nothing from it was applied";
@@ -40,16 +40,6 @@ const SESSION_IDLE_SECS: u64 = 7 * 24 * 60 * 60;
 /// After the link drops, a login shared without `save_credentials` stays
 /// usable this long.
 pub const GRACE_PERIOD_SECS: u64 = 5 * 60;
-
-/// The session Astation granted this device.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SavedSession {
-    pub session_id: String,
-    pub token: String,
-    pub hostname: String,
-    /// Unix seconds of the last connection that used it.
-    pub last_activity: u64,
-}
 
 impl SavedSession {
     pub fn new(session_id: String, token: String, hostname: String) -> Self {
@@ -65,33 +55,6 @@ impl SavedSession {
     pub fn is_valid(&self) -> bool {
         now_secs().saturating_sub(self.last_activity) < SESSION_IDLE_SECS
     }
-}
-
-/// A binding as the record keeps it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BindingRecord {
-    pub binding_id: String,
-    pub host_trust_gen: u64,
-    pub created_at: u64,
-}
-
-/// `pairing.enc`: the pairing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairingRecord {
-    pub astation_id: String,
-    /// Set by `atem pair` once Astation approved it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding: Option<BindingRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<SavedSession>,
-    /// The login Astation shares (`credentialSync`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shared: Option<Login>,
-    #[serde(default)]
-    pub save_credentials: bool,
-    /// When the link to this Astation last dropped (Unix seconds).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disconnected_at: Option<u64>,
 }
 
 impl PairingRecord {
@@ -118,7 +81,7 @@ impl PairingRecord {
                 );
             }
         };
-        let plain = crate::machine_key::decrypt(&raw)
+        let plain = crate::machine_key::decrypt(crate::machine_key::PAIRING, &raw)
             .with_context(|| format!("{} is unreadable", paths.record.display()))?;
         let record = serde_json::from_slice(&plain)
             .with_context(|| format!("{} is unreadable", paths.record.display()))?;
@@ -128,13 +91,33 @@ impl PairingRecord {
     /// Writes the record (machine-bound, atomically, 0600). Callers that
     /// apply Astation replies hold the lock (`Captured::apply`).
     pub fn save(&self, paths: &PairingPaths) -> Result<()> {
-        let sealed = crate::machine_key::encrypt(&serde_json::to_vec(self)?)?;
+        let sealed = crate::machine_key::encrypt(crate::machine_key::PAIRING, &serde_json::to_vec(self)?)?;
         crate::memory::crypto::write_private(&paths.record, &sealed)
     }
 
-    /// Changes the record at `paths` with `edit`, if there is one for
-    /// `astation_id` (never creates or re-creates one). Whether it did.
+    /// Changes the record at `paths` with `edit`, under the pairing lock,
+    /// only while it is still the pairing with `astation_id` and the binding
+    /// `binding_id` the caller read (never creates or re-creates one). Whether
+    /// it did. For callers outside `Captured::apply`.
     pub fn update(
+        paths: &PairingPaths,
+        astation_id: &str,
+        binding_id: Option<&str>,
+        edit: impl FnOnce(&mut Self),
+    ) -> Result<bool> {
+        let _lock = TrustStore::lock(&paths.trust_gen)?;
+        let same_binding = |record: &Self| {
+            record.binding.as_ref().map(|b| b.binding_id.as_str()) == binding_id
+        };
+        match Self::load(paths)? {
+            Some(record) if !same_binding(&record) => Ok(false),
+            _ => Self::update_locked(paths, astation_id, edit),
+        }
+    }
+
+    /// `update` for callers that hold the lock (inside `Captured::apply`,
+    /// which already checked the binding).
+    pub fn update_locked(
         paths: &PairingPaths,
         astation_id: &str,
         edit: impl FnOnce(&mut Self),
@@ -160,7 +143,7 @@ impl PairingRecord {
         login: Login,
         save: Option<bool>,
     ) -> Result<()> {
-        let updated = Self::update(paths, astation_id, |record| {
+        let updated = Self::update_locked(paths, astation_id, |record| {
             record.shared = Some(login);
             if let Some(save) = save {
                 record.save_credentials = save;
@@ -187,20 +170,25 @@ impl PairingRecord {
         self.session.as_ref().is_some_and(|s| !s.is_valid())
     }
 
-    /// The login Astation shared, when it may be used now (`now` in Unix
-    /// seconds): while the link to this Astation is up (`connected`), when
-    /// the user chose to keep it offline (`save_credentials`), or within
-    /// `GRACE_PERIOD_SECS` after the link dropped. Otherwise the user's own
-    /// login is used (`sso_auth::valid_token`).
-    pub fn usable_shared(&self, connected: Option<&str>, now: u64) -> Option<&Login> {
-        let shared = self.shared.as_ref()?;
-        let usable = connected == Some(self.astation_id.as_str())
-            || self.save_credentials
+    /// The login Astation shared, while the link to this Astation is up
+    /// (`connected`): it comes before the user's own login.
+    pub fn shared_while_connected(&self, connected: Option<&str>) -> Option<&Login> {
+        self.shared
+            .as_ref()
+            .filter(|_| connected == Some(self.astation_id.as_str()))
+    }
+
+    /// The login Astation shared, when it may be used offline (`now` in Unix
+    /// seconds): kept by choice (`save_credentials`), or within
+    /// `GRACE_PERIOD_SECS` after the link dropped. It comes after the
+    /// user's own login.
+    pub fn shared_offline(&self, now: u64) -> Option<&Login> {
+        let usable = self.save_credentials
             || match self.disconnected_at {
                 None => true,
                 Some(at) => now.saturating_sub(at) < GRACE_PERIOD_SECS,
             };
-        usable.then_some(shared)
+        self.shared.as_ref().filter(|_| usable)
     }
 }
 
@@ -455,7 +443,7 @@ impl CredAgentApi for BoundAgent {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::credentials::Tokens;
+    use crate::records::Tokens;
 
     /// A paired record for `astation_id` with a session and a shared login
     /// (no binding: `bound_profile` adds one).
@@ -466,8 +454,7 @@ pub(crate) mod tests {
                 "token".into(),
                 "host".into(),
             )),
-            shared: Some(Login::from_sso(
-                "https://sso2.agora.io",
+            shared: Some(Login::shared_by_astation(
                 Some("me".into()),
                 Tokens {
                     access_token: "access".into(),
@@ -535,6 +522,15 @@ pub(crate) mod tests {
     pub(crate) fn interrupted_unpair(dir: &std::path::Path) {
         let paths = crate::paths::ProfilePaths::in_dir(dir).pairing;
         write_trust_gen(&paths, read_trust_gen(&paths).unwrap() + 1).unwrap();
+    }
+
+    /// Edits the record of the profile at `dir` (under the lock).
+    pub(crate) fn edit(dir: &std::path::Path, edit: impl FnOnce(&mut PairingRecord)) {
+        let src = Sources::in_dir(dir);
+        let _lock = lock(&src).unwrap();
+        let mut record = PairingRecord::load(&src.paths.pairing).unwrap().unwrap();
+        edit(&mut record);
+        record.save(&src.paths.pairing).unwrap();
     }
 
     /// The saved session id of the profile at `dir`.
@@ -623,7 +619,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let captured = bound_profile(dir.path(), "astation-1");
         let paths = &captured.sources().paths.pairing;
-        interrupted_unpair(captured.sources().config_dir().as_path());
+        interrupted_unpair(dir.path());
         assert!(paths.record.exists());
         assert_eq!(load(captured.sources()).unwrap().binding, None);
         assert_eq!(captured.check().unwrap_err().to_string(), CHANGED);
@@ -672,19 +668,70 @@ pub(crate) mod tests {
         let now = now_secs();
         let mut record = paired_record("astation-1");
         record.save_credentials = false;
-        // Connected (or never disconnected): usable.
-        assert!(record.usable_shared(Some("astation-1"), now).is_some());
-        assert!(record.usable_shared(None, now).is_some());
-        // Dropped: usable for the grace period only.
+        // Connected to that Astation: first choice.
+        assert!(record.shared_while_connected(Some("astation-1")).is_some());
+        assert!(record.shared_while_connected(Some("another")).is_none());
+        assert!(record.shared_while_connected(None).is_none());
+        // Offline: never disconnected, or within the grace period.
+        assert!(record.shared_offline(now).is_some());
         record.disconnected_at = Some(now - GRACE_PERIOD_SECS + 10);
-        assert!(record.usable_shared(None, now).is_some());
+        assert!(record.shared_offline(now).is_some());
         record.disconnected_at = Some(now - GRACE_PERIOD_SECS - 1);
-        assert!(record.usable_shared(None, now).is_none());
-        assert!(record.usable_shared(Some("another"), now).is_none());
-        assert!(record.usable_shared(Some("astation-1"), now).is_some());
+        assert!(record.shared_offline(now).is_none());
         // Saved: usable offline.
         record.save_credentials = true;
-        assert!(record.usable_shared(None, now).is_some());
+        assert!(record.shared_offline(now).is_some());
+    }
+
+    #[test]
+    fn a_write_that_read_before_unpair_never_brings_the_pairing_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let src = captured.sources();
+        let paths = &src.paths.pairing;
+        let read = PairingRecord::load(paths).unwrap().unwrap();
+        let binding = read.binding.as_ref().map(|b| b.binding_id.clone());
+        unpair(src).unwrap();
+        let updated =
+            PairingRecord::update(paths, "astation-1", binding.as_deref(), |r| r.save_credentials = false)
+                .unwrap();
+        assert!(!updated);
+        assert!(!paths.record.exists());
+        // Paired again: another binding, still refused.
+        let before = capture(src).unwrap();
+        bind_new(src, &before, "astation-1").unwrap();
+        let updated =
+            PairingRecord::update(paths, "astation-1", binding.as_deref(), |r| r.save_credentials = false)
+                .unwrap();
+        assert!(!updated);
+    }
+
+    #[test]
+    fn concurrent_writers_lose_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let paths = captured.sources().paths.pairing.clone();
+        let binding = captured.state.binding.clone().map(|b| b.binding_id);
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let (paths, binding) = (paths.clone(), binding.clone());
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        PairingRecord::update(&paths, "astation-1", binding.as_deref(), |r| {
+                            let session = r.session.as_mut().unwrap();
+                            session.hostname.push_str(&format!("{n}.{i};"));
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let record = PairingRecord::load(&paths).unwrap().unwrap();
+        let hostname = &record.session.unwrap().hostname;
+        assert_eq!(hostname.matches(';').count(), 80, "{hostname}");
     }
 
     #[test]

@@ -24,7 +24,6 @@ pub mod cred_agent;
 pub mod account_keys;
 pub mod project_names;
 pub mod credential_projects;
-pub mod legacy_keys;
 pub mod unlock;
 pub mod migration;
 #[cfg(unix)]

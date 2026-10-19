@@ -71,13 +71,17 @@ fn paired(dir: &Path) {
 }
 
 /// The shared tokens of the profile at `dir`, when fresh.
-fn fresh_shared(dir: &Path) -> Option<crate::credentials::Tokens> {
-    crate::sso_auth::fresh_shared(&crate::paths::ProfilePaths::in_dir(dir).pairing, ASTATION)
+fn fresh_shared(dir: &Path) -> Option<crate::records::Tokens> {
+    crate::sso_auth::fresh_shared(
+        &crate::paths::ProfilePaths::in_dir(dir).pairing,
+        "https://sso2.agora.io",
+        ASTATION,
+    )
 }
 
 /// The pairing record of the profile at `dir`.
-fn record(dir: &Path) -> crate::pairing::PairingRecord {
-    crate::pairing::PairingRecord::load(&crate::paths::ProfilePaths::in_dir(dir).pairing)
+fn record(dir: &Path) -> crate::records::PairingRecord {
+    crate::records::PairingRecord::load(&crate::paths::ProfilePaths::in_dir(dir).pairing)
         .unwrap()
         .unwrap()
 }
@@ -399,10 +403,10 @@ impl Runtime {
                 socket_dir: root.join("ws"),
                 chat_root: root.join("run"),
             }),
-            profile: Some(crate::status::Sources::in_dir(&profile)),
+            profile: Some(crate::profile::Sources::in_dir(&profile)),
             clock: Default::default(),
             // A link that's gone is reported well within the test's wait.
-            ops: OpEnv::for_profile(crate::status::Sources::in_dir(&profile), agent)
+            ops: OpEnv::for_profile(crate::profile::Sources::in_dir(&profile), agent)
                 .with_link_wait(Duration::from_secs(3)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -962,7 +966,7 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
                 .any(|l| l.contains("Paired with Astation. (SSO: me)"))
         );
 
-        let src = crate::status::Sources::in_dir(&rt.profile);
+        let src = crate::profile::Sources::in_dir(&rt.profile);
         let binding = crate::pairing::load(&src).unwrap().binding.unwrap();
         assert_eq!(binding.astation_id, ASTATION);
         assert!(fresh_shared(&rt.profile).is_some());
@@ -982,11 +986,9 @@ fn the_token_op_saves_the_credentials_astation_sends() {
         let dir = Rc::new(short_dir());
         let profile = dir.path().join("profile");
         paired(&profile);
-        let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
-        crate::pairing::PairingRecord::update(&pairing, ASTATION, |record| {
+        crate::pairing::tests::edit(&profile, |record| {
             record.shared.as_mut().unwrap().tokens.expires_at = crate::credentials::now_secs() + 10;
-        })
-        .unwrap();
+        });
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&profile);
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
@@ -1041,7 +1043,7 @@ fn unpair_then_reload_drops_the_link_and_its_attachment() {
         .await;
         assert!(!peer.drain(Duration::from_millis(300)).await);
         // `atem unpair` commits a new trust generation, then reloads.
-        crate::pairing::unpair(&crate::status::Sources::in_dir(&rt.profile)).unwrap();
+        crate::pairing::unpair(&crate::profile::Sources::in_dir(&rt.profile)).unwrap();
         client.send(&ClientMsg::Reload).await.unwrap();
         expect(&mut client, |m| {
             matches!(m, RuntimeMsg::Notice { ref text } if text == "Reloaded").then_some(())
@@ -1202,7 +1204,7 @@ async fn migrating_device(
     std::fs::write(
         profile.join("config.toml"),
         format!(
-            "astation_relay_code = \"{ASTATION}\"\nastation_relay_url = \"{base}\"\ninstance_id = \"atem-1\"\n"
+            "astation_relay_url = \"{base}\"\ninstance_id = \"atem-1\"\n"
         ),
     )
     .unwrap();

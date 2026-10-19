@@ -532,7 +532,7 @@ mod tests {
         pump(&mut app, &mut peer).await;
         assert!(app.astation_connected);
         let paths = crate::paths::ProfilePaths::in_dir(peer._state.path()).pairing;
-        let record = crate::pairing::PairingRecord::load(&paths)
+        let record = crate::records::PairingRecord::load(&paths)
             .unwrap()
             .unwrap();
         let session = record.session_for(ASTATION).expect("saved session kept");
@@ -557,19 +557,18 @@ mod tests {
                     .unwrap();
                 next_auth(&mut app, &mut peer).await;
                 let dir = peer._state.path().to_path_buf();
-                let src = crate::status::Sources::in_dir(&dir);
+                let src = crate::profile::Sources::in_dir(&dir);
                 crate::pairing::unpair(&src).unwrap();
                 if re_pair {
                     let before = crate::pairing::capture(&src).unwrap();
                     crate::pairing::bind_new(&src, &before, ASTATION).unwrap();
-                    crate::pairing::PairingRecord::update(&src.paths.pairing, ASTATION, |record| {
-                        record.session = Some(crate::pairing::SavedSession::new(
+                    crate::pairing::tests::edit(&dir, |record| {
+                        record.session = Some(crate::records::SavedSession::new(
                             "new-session".into(),
                             "new-token".into(),
                             "test-machine".into(),
                         ));
-                    })
-                    .unwrap();
+                    });
                 }
                 let before = crate::status::tests::snapshot(&dir);
                 let link = app.astation_link_gen;
@@ -600,7 +599,7 @@ mod tests {
     async fn credentials_for_a_pairing_removed_meanwhile_are_dropped() {
         let (mut app, peer) = connected_app().await;
         let dir = peer._state.path().to_path_buf();
-        crate::pairing::unpair(&crate::status::Sources::in_dir(&dir)).unwrap();
+        crate::pairing::unpair(&crate::profile::Sources::in_dir(&dir)).unwrap();
         let before = crate::status::tests::snapshot(&dir);
         app.handle_astation_message(AstationMessage::CredentialSync {
             access_token: "access".into(),

@@ -1,7 +1,8 @@
 //! Every file of the profile (`~/.config/atem`): the one definition of its
-//! layout. Code and tests take paths from here (binary tests, which can't
-//! reach the crate, mirror it in `tests/support/profile.rs`). The runtime's
-//! own files are `runtime::files` and `runtime::state_dir`.
+//! layout. Code and tests take paths from here; std only, so binary tests
+//! include this file (`#[path]`). This user's profile is
+//! `profile::default_paths`. The runtime's own files are `runtime::files`
+//! and `runtime::state_dir`.
 //!
 //! ```text
 //! ~/.config/atem/
@@ -16,8 +17,6 @@ use std::path::{Path, PathBuf};
 /// The profile's layout.
 #[derive(Debug, Clone)]
 pub struct ProfilePaths {
-    /// `~/.config/atem` (tests: a temp dir).
-    pub dir: PathBuf,
     /// `config.toml`.
     pub config: PathBuf,
     /// `login.enc`: the user's own login (`credentials::Login`).
@@ -27,15 +26,9 @@ pub struct ProfilePaths {
 }
 
 impl ProfilePaths {
-    /// This user's profile.
-    pub fn default_paths() -> Self {
-        Self::in_dir(&crate::config::AtemConfig::config_dir())
-    }
-
     /// The layout under the profile directory `dir`.
     pub fn in_dir(dir: &Path) -> Self {
         Self {
-            dir: dir.to_path_buf(),
             config: dir.join("config.toml"),
             login: dir.join("login.enc"),
             pairing: PairingPaths::in_dir(dir),
@@ -72,10 +65,6 @@ impl PairingPaths {
 pub struct CredPaths {
     /// `<profile>/cred`.
     pub dir: PathBuf,
-    /// `data_keys.enc` from build steps 0–2a (`K`, project names, under the
-    /// machine-bound key). The cred agent moves it into `device_keys_sealed`
-    /// and `project_names` at the first unlock and deletes it.
-    pub data_keys: PathBuf,
     /// `project_names.json`: `h1.` project hash → readable project key
     /// (its lock: `project_names.lock`).
     pub project_names: PathBuf,
@@ -93,8 +82,6 @@ pub struct CredPaths {
     /// Astation holds the new storage key.
     pub device_keys_prev: PathBuf,
     pub unlock_auth_key: PathBuf,
-    /// The plain X25519 key from #36; deleted once a device is verified.
-    pub legacy_device_key: PathBuf,
     /// Held (flock, with its pid) by the one cred agent serving these
     /// files, for its life.
     pub agent_lock: PathBuf,
@@ -106,15 +93,10 @@ pub struct CredPaths {
 }
 
 impl CredPaths {
-    pub fn default_paths() -> Self {
-        Self::in_dir(&crate::config::AtemConfig::config_dir())
-    }
-
     /// The layout under the profile directory `profile`.
     pub fn in_dir(profile: &Path) -> Self {
         let dir = profile.join("cred");
         Self {
-            data_keys: dir.join("data_keys.enc"),
             project_names: dir.join("project_names.json"),
             trust: dir.join("state.json"),
             device_keys: dir.join("device_keys"),
@@ -122,7 +104,6 @@ impl CredPaths {
             device_keys_next: dir.join("device_keys.sealed.next"),
             device_keys_prev: dir.join("device_keys.sealed.prev"),
             unlock_auth_key: dir.join("unlock_auth_key"),
-            legacy_device_key: dir.join("device_key"),
             agent_lock: dir.join("agent.lock"),
             agent_socket: dir.join("agent.socket"),
             agent_log: dir.join("agent.log"),
@@ -217,10 +198,6 @@ mod tests {
         assert_eq!(
             socket_lock(&cred.join("agent.sock")),
             cred.join("agent.sock.lock")
-        );
-        assert_eq!(
-            crate::memory::trust::TrustStore::lock_path(&paths.trust),
-            cred.join("state.lock")
         );
     }
 }

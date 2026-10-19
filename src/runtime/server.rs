@@ -49,7 +49,7 @@ pub struct Options {
     pub launcher: Launcher,
     /// The profile whose pairing names the session host at start (`None`:
     /// unpaired until an authenticated, verified link names it).
-    pub profile: Option<crate::status::Sources>,
+    pub profile: Option<crate::profile::Sources>,
     /// The session host's monotonic clock.
     pub clock: Clock,
     /// What Astation operations (pairing, unlock) run with.

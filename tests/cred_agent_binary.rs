@@ -131,7 +131,7 @@ fn an_agent_whose_runtime_dir_was_removed_exits_and_a_new_one_starts() {
         "the orphaned agent kept running"
     );
     // A clean exit clears its pid from the lock file.
-    let lock = support::profile::agent_lock(&home.join(".config").join("atem"));
+    let lock = support::profile::CredPaths::in_dir(&home.join(".config").join("atem")).agent_lock;
     assert_eq!(std::fs::read_to_string(&lock).unwrap().trim(), "");
     // The next session's agent takes over the key files.
     let mut second = agent_process(&home, &run_b);

@@ -55,7 +55,7 @@ pub fn render(own: &str, runtime: &Look, agent: &AgentLook) -> String {
             out.push_str(&format!("{:<10} not answering ({error})\n", "cred agent"));
         }
         Some(Ok((status, pid))) => {
-            let build = status.build.as_deref().unwrap_or("unknown");
+            let build = status.build.as_str();
             let tag = if build == own {
                 "same as CLI"
             } else if !status.unlocked {
@@ -158,7 +158,7 @@ mod tests {
                 storage_kid: None,
                 escrowed: true,
                 older_build: build != OWN,
-                build: Some(build.into()),
+                build: build.into(),
             },
             pid,
         )))

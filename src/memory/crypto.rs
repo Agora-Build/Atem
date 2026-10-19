@@ -601,7 +601,7 @@ fn skill_record(skill: &Skill) -> String {
 /// once read back, `None` when no migration is pending.
 pub async fn migrate_account_in(
     astation_id: &str,
-    src: &crate::status::Sources,
+    src: &crate::profile::Sources,
     agent: Arc<dyn CredAgentApi>,
 ) -> Result<Option<&'static str>> {
     let encryption = EncryptionContext::for_astation_with(astation_id, &src.paths.cred, agent.clone())?;

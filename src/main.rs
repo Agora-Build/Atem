@@ -28,6 +28,8 @@ mod pair_verify;
 mod pairing;
 mod machine_key;
 mod paths;
+mod profile;
+mod records;
 mod status;
 mod version;
 mod chat;

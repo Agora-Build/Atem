@@ -111,8 +111,8 @@ pub(crate) fn paired_status_line(
 pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Build credential status line
     let paths = crate::paths::ProfilePaths::default_paths();
-    let pairing = crate::pairing::PairingRecord::load(&paths.pairing).ok().flatten();
-    let (cred_line, cred_style) = if let Some(login) = crate::credentials::Login::load(&paths.login)
+    let pairing = crate::records::PairingRecord::load(&paths.pairing).ok().flatten();
+    let (cred_line, cred_style) = if let Ok(Some(login)) = crate::records::Login::load(&paths.login)
     {
         let id = login.subject.as_deref().unwrap_or("-");
         (

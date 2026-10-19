@@ -11,17 +11,15 @@
 use anyhow::{Result, anyhow};
 #[cfg(test)]
 use std::path::Path;
-use std::path::PathBuf;
 
-use crate::config::AtemConfig;
-use crate::credentials::Login;
+use crate::profile::Sources;
+use crate::records::Login;
 use crate::memory::cred_agent::AgentStatus;
 #[cfg(test)]
 use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::trust::TrustStore;
-use crate::pairing::PairingRecord;
+use crate::records::PairingRecord;
 use crate::paths::CredPaths;
-use crate::paths::ProfilePaths;
 use crate::runtime::client::Look;
 
 /// `atem pair` on a profile that is already paired (after the status).
@@ -80,57 +78,6 @@ pub struct StatusReport {
     pub local_agents: Line,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
-}
-
-/// Where the status is read from. `current()` is this user's profile;
-/// `in_dir` a profile directory (tests).
-#[derive(Debug, Clone)]
-pub struct Sources {
-    /// Connection settings (`pair` and `pair verify` connect with them).
-    pub config: AtemConfig,
-    /// Every file of the profile.
-    pub paths: ProfilePaths,
-    /// Ask an already running cred agent whether the keys are unlocked
-    /// (never starts one). Off in tests, so they never reach the user's agent.
-    pub query_agent: bool,
-    /// Ask an already running `atem runtime` here for its link and sessions
-    /// (never starts one). `None` in tests unless they set it.
-    pub runtime: Option<crate::runtime::client::Locator>,
-}
-
-impl Sources {
-    /// This user's profile: `config.toml` with its env overrides and the
-    /// profile's files.
-    pub fn current() -> Result<Self> {
-        Ok(Self {
-            config: AtemConfig::load()?,
-            paths: ProfilePaths::default_paths(),
-            query_agent: true,
-            runtime: Some(crate::runtime::client::Locator::default_paths()),
-        })
-    }
-
-    /// The profile's directory.
-    pub fn config_dir(&self) -> PathBuf {
-        self.paths.dir.clone()
-    }
-
-    /// A profile directory: its `config.toml` (no env overrides), and every
-    /// file in it. Never queries a cred agent.
-    #[cfg(test)]
-    pub fn in_dir(dir: &Path) -> Self {
-        let paths = ProfilePaths::in_dir(dir);
-        let config = std::fs::read_to_string(&paths.config)
-            .ok()
-            .and_then(|content| toml::from_str(&content).ok())
-            .unwrap_or_default();
-        Self {
-            config,
-            paths,
-            query_agent: false,
-            runtime: None,
-        }
-    }
 }
 
 /// The Astation this profile is paired with; `session_expired` when its
@@ -217,8 +164,10 @@ fn account_line(src: &Sources, now: u64) -> Line {
             " (expired)"
         }
     };
-    if let Some(login) = Login::load(&src.paths.login) {
-        return Line::new(format!("signed in{}", expired(&login)));
+    match Login::load(&src.paths.login) {
+        Ok(Some(login)) => return Line::new(format!("signed in{}", expired(&login))),
+        Ok(None) => {}
+        Err(error) => return Line::new(format!("unknown ({error:#})")),
     }
     let shared = PairingRecord::load(&src.paths.pairing)
         .ok()
@@ -565,6 +514,8 @@ pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::paths::ProfilePaths;
+    use std::path::PathBuf;
     use crate::memory::cred_agent::{Reply, Request};
     use crate::memory::trust::AstationTrust;
 
@@ -574,7 +525,7 @@ pub(crate) mod tests {
     struct StubAgent {
         unlocked: bool,
         escrowed: bool,
-        build: Option<String>,
+        build: String,
     }
 
     impl StubAgent {
@@ -582,7 +533,7 @@ pub(crate) mod tests {
             Self {
                 unlocked,
                 escrowed: true,
-                build: Some(crate::memory::cred_agent::build_id().to_string()),
+                build: crate::memory::cred_agent::build_id().to_string(),
             }
         }
     }
@@ -648,11 +599,9 @@ pub(crate) mod tests {
     /// shares expires at `expires_at`.
     fn write_paired(dir: &Path, astation_id: &str, expires_at: u64) {
         crate::pairing::tests::bound_profile(dir, astation_id);
-        let paths = ProfilePaths::in_dir(dir).pairing;
-        PairingRecord::update(&paths, astation_id, |record| {
+        crate::pairing::tests::edit(dir, |record| {
             record.shared.as_mut().unwrap().tokens.expires_at = expires_at;
-        })
-        .unwrap();
+        });
     }
 
     /// A plain `device_keys` file: keys on disk that `key_file_problem`
@@ -770,7 +719,7 @@ pub(crate) mod tests {
         let login = Login::from_sso(
             "https://sso2.agora.io",
             Some("me".into()),
-            crate::credentials::Tokens {
+            crate::records::Tokens {
                 access_token: "a".into(),
                 refresh_token: "r".into(),
                 expires_at: later(),
@@ -902,11 +851,9 @@ pub(crate) mod tests {
     fn an_expired_session_is_shown_and_advises_unpair_then_pair() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
-        let paths = ProfilePaths::in_dir(dir.path()).pairing;
-        PairingRecord::update(&paths, ASTATION, |record| {
+        crate::pairing::tests::edit(dir.path(), |record| {
             record.session.as_mut().unwrap().last_activity = 0;
-        })
-        .unwrap();
+        });
         let src = Sources::in_dir(dir.path());
         assert_eq!(
             report(dir.path()).pairing.value,
@@ -973,7 +920,7 @@ pub(crate) mod tests {
         write_device_keys(dir.path());
         let src = Sources::in_dir(dir.path());
         let older = StubAgent {
-            build: Some("other".into()),
+            build: "other".into(),
             ..StubAgent::new(false)
         };
         assert_eq!(
@@ -1306,7 +1253,7 @@ pub(crate) mod tests {
         write_device_keys(dir.path());
         let src = Sources::in_dir(dir.path());
         let older = StubAgent {
-            build: Some("other".into()),
+            build: "other".into(),
             ..StubAgent::new(true)
         };
         let agent = older.status().map_err(|e| e.to_string());

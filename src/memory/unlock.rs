@@ -689,7 +689,7 @@ pub fn lock_keys_message(agent: Option<&dyn CredAgentApi>) -> Result<String> {
             Ok(if stopped {
                 "Locked: the cred agent wiped this device's keys and stopped.".into()
             } else {
-                "Locked: the cred agent wiped this device's keys, but it is still running from an older atem build; the next `atem cred unlock` replaces it.".into()
+                "Locked: the cred agent wiped this device's keys, but it hasn't stopped yet; the next `atem cred unlock` replaces it.".into()
             })
         }
     }
@@ -713,7 +713,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
             };
             crate::runtime::op_client::run(OpKind::CredProjects, options).await
         }
-        CredCommands::Unlock => unlock_command(&crate::status::Sources::current()?).await,
+        CredCommands::Unlock => unlock_command(&crate::profile::Sources::current()?).await,
         CredCommands::Lock => {
             let message = blocking(|| lock_keys_message(running_agent().as_deref())).await?;
             println!("{message}");
@@ -724,7 +724,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
 
 /// The home Astation `atem cred unlock` unlocks with: never pairs or
 /// verifies, so an unverified device stops here, offline.
-pub(crate) fn unlock_home(src: &crate::status::Sources) -> Result<String> {
+pub(crate) fn unlock_home(src: &crate::profile::Sources) -> Result<String> {
     let trust = TrustStore::load_from(&src.paths.cred.trust)?;
     match (trust.home(), trust.recorded_home()) {
         (Some(home), _) => Ok(home.to_string()),
@@ -737,7 +737,7 @@ pub(crate) fn unlock_home(src: &crate::status::Sources) -> Result<String> {
 
 /// `atem cred unlock`: the offline checks, then the unlock in `atem
 /// runtime` on its link.
-pub(crate) async fn unlock_command(src: &crate::status::Sources) -> Result<()> {
+pub(crate) async fn unlock_command(src: &crate::profile::Sources) -> Result<()> {
     unlock_home(src)?;
     crate::runtime::op_client::run(
         crate::runtime::protocol::OpKind::CredUnlock,
@@ -1225,7 +1225,7 @@ mod tests {
     /// generation) right after it sends `when`, before Astation's answer.
     struct UnpairOnSend {
         inner: ScriptedLink,
-        src: crate::status::Sources,
+        src: crate::profile::Sources,
         when: fn(&AstationMessage) -> bool,
         confirms: usize,
     }
@@ -1256,7 +1256,7 @@ mod tests {
     fn bound(
         dir: &std::path::Path,
         agent: Arc<dyn CredAgentApi>,
-    ) -> (Arc<dyn CredAgentApi>, crate::status::Sources) {
+    ) -> (Arc<dyn CredAgentApi>, crate::profile::Sources) {
         let capture = crate::pairing::tests::bound_profile(dir, ASTATION_ID);
         let src = capture.sources().clone();
         let agent = crate::pairing::BoundAgent::new(capture, agent).unwrap();

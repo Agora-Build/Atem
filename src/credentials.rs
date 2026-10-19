@@ -2,57 +2,24 @@
 //! shares with a pairing (inside `pairing/pairing.enc`), both a `Login`.
 //!
 //! Identity and Agora connection are kept apart. A login is issued by an
-//! identity provider (`issuer`, the host of the SSO URL that issued it, today
-//! Agora SSO `sso2.agora.io`) for a `subject` (the login id). Agora API calls
-//! (project list, the BFF) need Agora tokens: a login of another issuer would
-//! carry them as `connections.agora`; Agora SSO's own identity tokens are the
-//! Agora tokens. Callers get them only through `Login::agora_tokens`.
+//! identity provider (`issuer`: the host of the SSO URL `atem login` used,
+//! or `AGORA_SSO_ISSUER` for the login Astation shares) for a `subject` (the
+//! login id). Agora API calls (project list, the BFF) need Agora tokens: a
+//! login of another issuer would carry them as `connections.agora`; the
+//! identity tokens of Agora SSO (`AGORA_SSO_ISSUER`, or the host of the
+//! configured `sso_url`) are the Agora tokens. Callers get them only through
+//! `Login::agora_tokens`.
 //!
 //! Stored machine-bound (`machine_key`) and written atomically (0600).
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow};
+use crate::records::{Connections, Login, Tokens};
 use std::path::Path;
-
-/// An access token, its refresh token and when it expires (Unix seconds).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tokens {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_at: u64,
-}
 
 impl Tokens {
     /// Expired, or within a minute of it.
     pub fn needs_refresh(&self) -> bool {
         self.expires_at < now_secs() + 60
     }
-}
-
-/// An Agora account linked to a login of another issuer (none yet).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgoraConnection {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
-    pub tokens: Tokens,
-}
-
-/// Service connections of a login.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Connections {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agora: Option<AgoraConnection>,
-}
-
-/// One login: who issued it, for whom, its identity tokens and its
-/// connections.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Login {
-    pub issuer: String,
-    /// The login id.
-    pub subject: Option<String>,
-    pub tokens: Tokens,
-    #[serde(default)]
-    pub connections: Connections,
 }
 
 /// `agora_tokens` of a login that has none.
@@ -71,11 +38,14 @@ pub fn issuer_of(sso_url: &str) -> String {
         .to_string()
 }
 
-/// Whether `issuer` is Agora SSO (any `*.agora.io` host), whose identity
-/// tokens are Agora API tokens.
-pub fn issues_agora_tokens(issuer: &str) -> bool {
-    let host = issuer.split(':').next().unwrap_or_default();
-    host == "agora.io" || host.ends_with(".agora.io")
+/// The issuer of Agora SSO logins (the default `sso_url`'s host), and of the
+/// login Astation shares (`credentialSync` carries Agora tokens).
+pub const AGORA_SSO_ISSUER: &str = "sso2.agora.io";
+
+/// Whether `issuer` is Agora SSO, whose identity tokens are Agora API tokens:
+/// exactly `AGORA_SSO_ISSUER` or the host of the configured `sso_url`.
+pub fn issues_agora_tokens(issuer: &str, sso_url: &str) -> bool {
+    issuer == AGORA_SSO_ISSUER || issuer == issuer_of(sso_url)
 }
 
 impl Login {
@@ -89,32 +59,52 @@ impl Login {
         }
     }
 
+    /// The login Astation shares (`credentialSync`): Agora tokens.
+    pub fn shared_by_astation(subject: Option<String>, tokens: Tokens) -> Self {
+        Self {
+            issuer: AGORA_SSO_ISSUER.into(),
+            subject,
+            tokens,
+            connections: Connections::default(),
+        }
+    }
+
     /// The tokens for Agora API calls: the Agora connection's, else the
-    /// identity tokens when the issuer is Agora SSO.
-    pub fn agora_tokens(&self) -> Result<&Tokens> {
+    /// identity tokens when the issuer is Agora SSO (`sso_url`: the
+    /// configured one).
+    pub fn agora_tokens(&self, sso_url: &str) -> Result<&Tokens> {
         match &self.connections.agora {
             Some(agora) => Ok(&agora.tokens),
-            None if issues_agora_tokens(&self.issuer) => Ok(&self.tokens),
+            None if issues_agora_tokens(&self.issuer, sso_url) => Ok(&self.tokens),
             None => Err(anyhow!(NO_AGORA_CONNECTION)),
         }
     }
 
     /// The Agora tokens refresh with the identity's own refresh token
     /// (Agora SSO), not a connection's.
-    pub fn agora_tokens_are_identity(&self) -> bool {
-        self.connections.agora.is_none() && issues_agora_tokens(&self.issuer)
+    pub fn agora_tokens_are_identity(&self, sso_url: &str) -> bool {
+        self.connections.agora.is_none() && issues_agora_tokens(&self.issuer, sso_url)
     }
 
-    /// The login at `path`; `None` when there is none or it can't be read
-    /// (another machine's file).
-    pub fn load(path: &Path) -> Option<Self> {
-        let raw = std::fs::read(path).ok()?;
-        let plain = crate::machine_key::decrypt(&raw).ok()?;
-        serde_json::from_slice(&plain).ok()
+    /// The login at `path`: `None` without one; an error when it can't be
+    /// read (another machine's file, damaged).
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let raw = match std::fs::read(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(anyhow!(error).context(format!("could not read {}", path.display())));
+            }
+        };
+        let unreadable = || format!("{} is unreadable", path.display());
+        let plain = crate::machine_key::decrypt(crate::machine_key::LOGIN, &raw)
+            .with_context(unreadable)?;
+        Ok(Some(serde_json::from_slice(&plain).with_context(unreadable)?))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let sealed = crate::machine_key::encrypt(&serde_json::to_vec(self)?)?;
+        let sealed =
+            crate::machine_key::encrypt(crate::machine_key::LOGIN, &serde_json::to_vec(self)?)?;
         crate::memory::crypto::write_private(path, &sealed)
     }
 
@@ -138,6 +128,9 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::AgoraConnection;
+
+    const SSO: &str = "https://sso2.agora.io";
 
     fn tokens(access: &str) -> Tokens {
         Tokens {
@@ -148,22 +141,28 @@ mod tests {
     }
 
     #[test]
-    fn the_issuer_is_the_sso_host() {
+    fn agora_sso_is_an_exact_allowlist() {
         assert_eq!(issuer_of("https://sso2.agora.io"), "sso2.agora.io");
         assert_eq!(issuer_of("https://sso2.agora.io/path?x"), "sso2.agora.io");
         assert_eq!(issuer_of("http://127.0.0.1:9/"), "127.0.0.1:9");
-        assert!(issues_agora_tokens("sso2.agora.io"));
-        assert!(issues_agora_tokens("sso.staging.agora.io"));
-        assert!(!issues_agora_tokens("auth.agora.build"));
-        assert!(!issues_agora_tokens("notagora.io"));
+        assert!(issues_agora_tokens("sso2.agora.io", SSO));
+        // The configured sso_url's host, and only that one besides.
+        assert!(issues_agora_tokens("sso.staging.example", "https://sso.staging.example"));
+        assert!(issues_agora_tokens("sso2.agora.io", "https://sso.staging.example"));
+        assert!(!issues_agora_tokens("sso.staging.agora.io", SSO));
+        assert!(!issues_agora_tokens("auth.agora.build", SSO));
     }
 
     #[test]
     fn agora_sso_tokens_are_the_agora_tokens() {
-        let login = Login::from_sso("https://sso2.agora.io", Some("me".into()), tokens("id"));
+        let login = Login::from_sso(SSO, Some("me".into()), tokens("id"));
         assert_eq!(login.issuer, "sso2.agora.io");
-        assert_eq!(login.agora_tokens().unwrap().access_token, "id");
-        assert!(login.agora_tokens_are_identity());
+        assert_eq!(login.agora_tokens(SSO).unwrap().access_token, "id");
+        assert!(login.agora_tokens_are_identity(SSO));
+        // Astation's shared login is Agora SSO's whatever sso_url says.
+        let shared = Login::shared_by_astation(None, tokens("shared"));
+        assert_eq!(shared.issuer, AGORA_SSO_ISSUER);
+        assert!(shared.agora_tokens("https://sso.staging.example").is_ok());
     }
 
     #[test]
@@ -175,25 +174,25 @@ mod tests {
             connections: Connections::default(),
         };
         assert_eq!(
-            login.agora_tokens().unwrap_err().to_string(),
+            login.agora_tokens(SSO).unwrap_err().to_string(),
             NO_AGORA_CONNECTION
         );
         login.connections.agora = Some(AgoraConnection {
             account_id: Some("acct".into()),
             tokens: tokens("agora"),
         });
-        assert_eq!(login.agora_tokens().unwrap().access_token, "agora");
-        assert!(!login.agora_tokens_are_identity());
+        assert_eq!(login.agora_tokens(SSO).unwrap().access_token, "agora");
+        assert!(!login.agora_tokens_are_identity(SSO));
     }
 
     #[test]
     fn a_login_round_trips_machine_bound_and_private() {
         let dir = tempfile::tempdir().unwrap();
         let path = crate::paths::ProfilePaths::in_dir(dir.path()).login;
-        assert_eq!(Login::load(&path), None);
-        let login = Login::from_sso("https://sso2.agora.io", Some("me".into()), tokens("a"));
+        assert_eq!(Login::load(&path).unwrap(), None);
+        let login = Login::from_sso(SSO, Some("me".into()), tokens("a"));
         login.save(&path).unwrap();
-        assert_eq!(Login::load(&path), Some(login));
+        assert_eq!(Login::load(&path).unwrap(), Some(login));
         let raw = std::fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&raw).contains("sso2"), "encrypted");
         #[cfg(unix)]
@@ -204,6 +203,9 @@ mod tests {
         }
         Login::remove(&path).unwrap();
         Login::remove(&path).unwrap();
-        assert_eq!(Login::load(&path), None);
+        assert_eq!(Login::load(&path).unwrap(), None);
+        // Unreadable: an error, never "no login".
+        std::fs::write(&path, b"damaged").unwrap();
+        assert!(Login::load(&path).is_err());
     }
 }

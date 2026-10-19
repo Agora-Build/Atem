@@ -912,7 +912,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Login => {
             let config = crate::config::AtemConfig::load()?;
             let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
-            crate::credentials::Login::from_sso(
+            crate::records::Login::from_sso(
                 config.effective_sso_url(),
                 session.login_id.clone(),
                 session.tokens(),
@@ -925,22 +925,22 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Logout => {
-            crate::credentials::Login::remove(&crate::paths::ProfilePaths::default_paths().login)?;
+            crate::records::Login::remove(&crate::paths::ProfilePaths::default_paths().login)?;
             println!("Logged out.");
             reload_runtime().await;
             Ok(())
         }
         Commands::Status => {
-            let src = crate::status::Sources::current()?;
+            let src = crate::profile::Sources::current()?;
             print!("{}", crate::memory::cred_agent::blocking(move || Ok(crate::status::text(&src))).await?);
             Ok(())
         }
-        Commands::Pair { save, command: None } => run_pair(&crate::status::Sources::current()?, save).await,
+        Commands::Pair { save, command: None } => run_pair(&crate::profile::Sources::current()?, save).await,
         Commands::Pair { command: Some(PairCommands::Verify), .. } => {
-            run_pair_verify(&crate::status::Sources::current()?).await
+            run_pair_verify(&crate::profile::Sources::current()?).await
         }
         Commands::Unpair { yes } => {
-            let src = crate::status::Sources::current()?;
+            let src = crate::profile::Sources::current()?;
             if !crate::status::profile_paired(&src) && !revocation_recorded(&src) {
                 println!("No pairing to remove.");
                 return Ok(());
@@ -1209,7 +1209,7 @@ fn prompt_yes_no(question: &str) -> bool {
 }
 
 /// Whether an Astation revoked this device (`atem unpair` sets its keys aside).
-fn revocation_recorded(src: &crate::status::Sources) -> bool {
+fn revocation_recorded(src: &crate::profile::Sources) -> bool {
     crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)
         .is_ok_and(|trust| trust.revoked().is_some())
 }
@@ -1225,7 +1225,7 @@ fn revocation_recorded(src: &crate::status::Sources) -> bool {
 /// aside, a revocation left recorded, or a failure to set them aside (the
 /// pairing is removed regardless). Blocking.
 fn unpair_profile(
-    src: &crate::status::Sources,
+    src: &crate::profile::Sources,
     agent: Option<&dyn crate::memory::cred_agent::CredAgentApi>,
 ) -> Result<Vec<String>> {
     crate::pairing::unpair(src)?;
@@ -1256,7 +1256,7 @@ fn unpair_profile(
 /// status and changes nothing (no runtime, no connection). Otherwise the
 /// runtime pairs (pairing code or local), stores the credentials and the
 /// binding, makes the new connection its link and verifies this device on it.
-async fn run_pair(src: &crate::status::Sources, save: bool) -> Result<()> {
+async fn run_pair(src: &crate::profile::Sources, save: bool) -> Result<()> {
     run_pair_with(src, save, |options| {
         crate::runtime::op_client::run(crate::runtime::protocol::OpKind::Pair, options)
     })
@@ -1264,7 +1264,7 @@ async fn run_pair(src: &crate::status::Sources, save: bool) -> Result<()> {
 }
 
 async fn run_pair_with<F: std::future::Future<Output = Result<()>>>(
-    src: &crate::status::Sources,
+    src: &crate::profile::Sources,
     save: bool,
     op: impl FnOnce(crate::runtime::protocol::OpOptions) -> F,
 ) -> Result<()> {
@@ -1284,7 +1284,7 @@ async fn run_pair_with<F: std::future::Future<Output = Result<()>>>(
 /// connected). Does nothing when that Astation already verified it, and
 /// refuses after a revocation, offline. A cancelled or failed verification
 /// keeps the pairing.
-async fn run_pair_verify(src: &crate::status::Sources) -> Result<()> {
+async fn run_pair_verify(src: &crate::profile::Sources) -> Result<()> {
     run_pair_verify_with(src, || {
         crate::runtime::op_client::run(
             crate::runtime::protocol::OpKind::PairVerify,
@@ -1295,7 +1295,7 @@ async fn run_pair_verify(src: &crate::status::Sources) -> Result<()> {
 }
 
 async fn run_pair_verify_with<F: std::future::Future<Output = Result<()>>>(
-    src: &crate::status::Sources,
+    src: &crate::profile::Sources,
     op: impl FnOnce() -> F,
 ) -> Result<()> {
     match crate::status::verify_start(src)? {
@@ -2146,7 +2146,7 @@ mod tests {
 
     /// A local listener every Astation URL of the profile points at: a test
     /// fails if anything connects to it (`assert_never_dialed`).
-    fn trap(src: &mut crate::status::Sources) -> std::net::TcpListener {
+    fn trap(src: &mut crate::profile::Sources) -> std::net::TcpListener {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2204,7 +2204,7 @@ mod tests {
     async fn pair_on_a_paired_profile_changes_nothing_and_never_connects() {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
-        let mut src = crate::status::Sources::in_dir(dir.path());
+        let mut src = crate::profile::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let before = files(dir.path());
         // The runtime isn't asked either: the status is local.
@@ -2223,7 +2223,7 @@ mod tests {
     #[tokio::test]
     async fn pair_verify_without_a_pairing_says_to_pair() {
         let dir = tempfile::tempdir().unwrap();
-        let mut src = crate::status::Sources::in_dir(dir.path());
+        let mut src = crate::profile::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let never = || async { panic!("asked the runtime to verify") };
         let error = run_pair_verify_with(&src, never).await.unwrap_err();
@@ -2236,7 +2236,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
         trust_file(dir.path(), false);
-        let mut src = crate::status::Sources::in_dir(dir.path());
+        let mut src = crate::profile::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let before = files(dir.path());
         let never = || async { panic!("asked the runtime to verify") };
@@ -2250,7 +2250,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
         trust_file(dir.path(), true);
-        let mut src = crate::status::Sources::in_dir(dir.path());
+        let mut src = crate::profile::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let before = files(dir.path());
         let never = || async { panic!("asked the runtime to verify") };
@@ -2267,7 +2267,7 @@ mod tests {
     async fn cred_unlock_on_an_unverified_device_says_to_verify_and_never_connects() {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
-        let mut src = crate::status::Sources::in_dir(dir.path());
+        let mut src = crate::profile::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let error = crate::memory::unlock::unlock_command(&src)
             .await
@@ -2280,11 +2280,11 @@ mod tests {
     fn unpair_removes_the_pairing_but_keeps_the_login() {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
-        let src = crate::status::Sources::in_dir(dir.path());
-        let login = crate::credentials::Login::from_sso(
+        let src = crate::profile::Sources::in_dir(dir.path());
+        let login = crate::records::Login::from_sso(
             "https://sso2.agora.io",
             Some("me".into()),
-            crate::credentials::Tokens {
+            crate::records::Tokens {
                 access_token: "a".into(),
                 refresh_token: "r".into(),
                 expires_at: crate::credentials::now_secs() + 3600,
@@ -2295,7 +2295,7 @@ mod tests {
         assert!(unpair_profile(&src, None).unwrap().is_empty());
         assert_eq!(crate::status::pairing(&src), None);
         assert!(!crate::status::profile_paired(&src));
-        assert_eq!(crate::credentials::Login::load(&src.paths.login), Some(login));
+        assert_eq!(crate::records::Login::load(&src.paths.login).unwrap(), Some(login));
     }
 
     #[test]
@@ -2303,7 +2303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
         trust_file(dir.path(), true);
-        let src = crate::status::Sources::in_dir(dir.path());
+        let src = crate::profile::Sources::in_dir(dir.path());
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("old keys were moved aside"), "{notices:?}");
@@ -2318,7 +2318,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
         trust_file(dir.path(), false);
-        let src = crate::status::Sources::in_dir(dir.path());
+        let src = crate::profile::Sources::in_dir(dir.path());
         crate::memory::trust::TrustStore::update(&src.paths.cred.trust, |trust| {
             trust.record_revoked("astation-9", 1_700_000_000);
             Ok(())
@@ -2336,7 +2336,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
         crate::paths::write_test_file(&crate::paths::CredPaths::in_dir(dir.path()).trust, b"not json");
-        let src = crate::status::Sources::in_dir(dir.path());
+        let src = crate::profile::Sources::in_dir(dir.path());
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].starts_with("Couldn't set the revoked keys aside:"), "{notices:?}");
@@ -2347,7 +2347,7 @@ mod tests {
     fn unpair_commits_the_next_generation_before_removing_anything() {
         let dir = tempfile::tempdir().unwrap();
         let old = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
-        let src = crate::status::Sources::in_dir(dir.path());
+        let src = crate::profile::Sources::in_dir(dir.path());
         // Removing the record fails (a directory is in its place): the
         // unpair is interrupted after its commit.
         let record = &src.paths.pairing.record;
@@ -2371,7 +2371,7 @@ mod tests {
         trust_file(dir.path(), false);
         std::fs::write(dir.path().join("knowledge.db"), b"memories").unwrap();
         crate::paths::write_test_file(&crate::paths::CredPaths::in_dir(dir.path()).project_names, b"{}");
-        let src = crate::status::Sources::in_dir(dir.path());
+        let src = crate::profile::Sources::in_dir(dir.path());
         let cred = crate::paths::CredPaths::in_dir(dir.path());
         let kept = [cred.trust, cred.device_keys_sealed, dir.path().join("knowledge.db"), cred.project_names]
             .map(|path| { let contents = std::fs::read(&path).unwrap(); (path, contents) });

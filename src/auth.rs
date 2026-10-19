@@ -48,15 +48,15 @@ pub fn pairing_from(
 /// session. A config load failure maps to `NotConfigured`, no pairing (or
 /// no valid session) to `NotPaired`.
 pub fn pairing_session() -> std::result::Result<PairedSession, PairingProblem> {
-    let src = crate::status::Sources::current().map_err(|_| PairingProblem::NotConfigured)?;
+    let src = crate::profile::Sources::current().map_err(|_| PairingProblem::NotConfigured)?;
     pairing_session_in(&src)
 }
 
 /// `pairing_session` for the profile `src`.
 pub fn pairing_session_in(
-    src: &crate::status::Sources,
+    src: &crate::profile::Sources,
 ) -> std::result::Result<PairedSession, PairingProblem> {
-    let record = crate::pairing::PairingRecord::load(&src.paths.pairing)
+    let record = crate::records::PairingRecord::load(&src.paths.pairing)
         .ok()
         .flatten()
         .ok_or(PairingProblem::NotConfigured)?;
@@ -108,11 +108,12 @@ pub fn login_gate_message(feature: &str) -> String {
 /// own login or a login Astation shared with the pairing.
 pub fn require_login(feature: &str) -> Result<()> {
     let paths = crate::paths::ProfilePaths::default_paths();
-    let shared = crate::pairing::PairingRecord::load(&paths.pairing)
+    let shared = crate::records::PairingRecord::load(&paths.pairing)
         .ok()
         .flatten()
         .is_some_and(|record| record.shared.is_some());
-    if crate::credentials::Login::load(&paths.login).is_none() && !shared {
+    let own = crate::records::Login::load(&paths.login).ok().flatten();
+    if own.is_none() && !shared {
         return Err(anyhow!(login_gate_message(feature)));
     }
     Ok(())

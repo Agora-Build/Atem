@@ -112,7 +112,7 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     crate::chat::claude::hooks::sweep_stale(&crate::chat::claude::hooks::session_dir_root());
     // The identity the host starts under, read before the Astation connect
     // starts writing to the profile (`instance_id`, `atem_id`).
-    let profile = crate::status::Sources::current().ok();
+    let profile = crate::profile::Sources::current().ok();
     let mut app = crate::app::App::new();
     app.spawn_astation_connect();
     let options = server::Options {

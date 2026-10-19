@@ -406,7 +406,7 @@ impl Runtime {
                 socket_dir: root.join("ws"),
                 chat_root: root.join("run"),
             }),
-            profile: profile_at_start.then(|| crate::status::Sources::in_dir(&profile_dir)),
+            profile: profile_at_start.then(|| crate::profile::Sources::in_dir(&profile_dir)),
             clock: clock.clone(),
             ops: crate::runtime::ops::OpEnv::unavailable(),
         };
@@ -1851,7 +1851,7 @@ fn a_changed_pairing_drops_the_link_without_a_reload() {
     local(async {
         let mut rt = Runtime::start(true).await;
         rt.peer.hello().await;
-        let profile = crate::status::Sources::in_dir(&rt.dir.path().join("profile"));
+        let profile = crate::profile::Sources::in_dir(&rt.dir.path().join("profile"));
         crate::pairing::unpair(&profile).unwrap();
         tokio::time::timeout(WAIT, async {
             while rt.peer.from_atem.recv().await.is_some() {}

@@ -10,9 +10,6 @@ pub struct AtemConfig {
     pub rtm_account: Option<String>,
     pub astation_ws: Option<String>,
     pub astation_relay_url: Option<String>,
-    /// Most recently authenticated Astation identity. Learned automatically and
-    /// used to select its persistent relay room on remote reconnect.
-    pub astation_relay_code: Option<String>,
     pub bff_url: Option<String>,
     pub sso_url: Option<String>,
 
@@ -76,9 +73,6 @@ impl AtemConfig {
         }
         if let Ok(val) = std::env::var("ASTATION_RELAY_URL") {
             config.astation_relay_url = Some(val);
-        }
-        if let Ok(val) = std::env::var("ASTATION_RELAY_CODE") {
-            config.astation_relay_code = Some(val);
         }
         if let Ok(val) = std::env::var("ATEM_TERMINAL_PREFIX") {
             config.terminal_prefix = Some(val);
@@ -187,19 +181,6 @@ impl AtemConfig {
         Self::write_config_value("files_last_port", toml::Value::Integer(port as i64));
     }
 
-    /// Remember the authenticated Astation as the default identity-relay target.
-    pub fn store_astation_relay_code(astation_id: &str) {
-        Self::write_config_string("astation_relay_code", astation_id);
-    }
-
-    /// `store_astation_relay_code` into the profile in `config_dir`.
-    pub fn store_astation_relay_code_in(config_dir: &std::path::Path, astation_id: &str) {
-        Self::write_config_value_at(
-            &crate::paths::ProfilePaths::in_dir(config_dir).config,
-            "astation_relay_code",
-            toml::Value::String(astation_id.to_string()),
-        );
-    }
 
     /// Persist the config to disk.
     ///
@@ -229,9 +210,6 @@ impl AtemConfig {
             }
             if let Some(relay) = &self.astation_relay_url {
                 table.insert("astation_relay_url".into(), toml::Value::String(relay.clone()));
-            }
-            if let Some(code) = &self.astation_relay_code {
-                table.insert("astation_relay_code".into(), toml::Value::String(code.clone()));
             }
             if let Some(bff) = &self.bff_url {
                 table.insert("bff_url".into(), toml::Value::String(bff.clone()));
@@ -309,10 +287,6 @@ impl AtemConfig {
             self.astation_relay_url.as_deref().unwrap_or("(not set)")
         ));
         lines.push(format!(
-            "astation_relay_code: {}",
-            self.astation_relay_code.as_deref().unwrap_or("(not learned)")
-        ));
-        lines.push(format!(
             "instance_id: {}",
             self.instance_id.as_deref().unwrap_or("(not set)")
         ));
@@ -323,15 +297,16 @@ impl AtemConfig {
 
         // The user's own login and the pairing
         let paths = crate::paths::ProfilePaths::default_paths();
-        match crate::credentials::Login::load(&paths.login) {
-            Some(login) => lines.push(format!(
+        match crate::records::Login::load(&paths.login) {
+            Ok(Some(login)) => lines.push(format!(
                 "Login:    {}  ({})",
                 login.subject.as_deref().unwrap_or("-"),
                 login.issuer
             )),
-            None => lines.push("Login:    not logged in".to_string()),
+            Ok(None) => lines.push("Login:    not logged in".to_string()),
+            Err(error) => lines.push(format!("Login:    unknown ({error:#})")),
         }
-        match crate::pairing::PairingRecord::load(&paths.pairing) {
+        match crate::records::PairingRecord::load(&paths.pairing) {
             Ok(Some(record)) => {
                 let shared = record
                     .shared
@@ -513,7 +488,7 @@ impl ProjectCache {
         let Ok(raw) = fs::read(path) else {
             return Self::default();
         };
-        let Ok(plain) = crate::machine_key::decrypt(&raw) else {
+        let Ok(plain) = crate::machine_key::decrypt(crate::machine_key::PROJECT_CACHE, &raw) else {
             return Self::default();
         };
         serde_json::from_slice(&plain).unwrap_or_default()
@@ -528,7 +503,7 @@ impl ProjectCache {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec(self)?;
-        let ct = crate::machine_key::encrypt(&json)?;
+        let ct = crate::machine_key::encrypt(crate::machine_key::PROJECT_CACHE, &json)?;
         fs::write(path, ct)?;
         #[cfg(unix)]
         {

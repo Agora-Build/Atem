@@ -460,8 +460,13 @@ impl App {
                 Err(error) => note(error),
             }
 
-            // Local unavailable — try relay identity if configured
-            if let Some(relay_code) = config.astation_relay_code.clone() {
+            // Local unavailable: the paired Astation's identity room on the
+            // relay (no pairing, no relay connection).
+            let paired = crate::profile::Sources::current()
+                .ok()
+                .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing).ok().flatten())
+                .map(|record| record.astation_id);
+            if let Some(relay_code) = paired {
                 let relay_url = config.astation_relay_url().to_string();
                 let mut relay_client = crate::websocket_client::AstationClient::new();
                 match relay_client
@@ -667,15 +672,16 @@ impl App {
                 // never re-creates a pairing removed (or replaced) meanwhile.
                 // In the link's own profile (never another one).
                 let saved = self.astation_client.profile().and_then(|src| {
-                    let login = crate::runtime::ops::shared_login(
-                        &src,
+                    let login = crate::records::Login::shared_by_astation(
                         login_id.clone(),
-                        access_token,
-                        refresh_token,
-                        expires_at,
+                        crate::records::Tokens {
+                            access_token,
+                            refresh_token,
+                            expires_at,
+                        },
                     );
                     self.astation_client.apply_bound(&astation_id, || {
-                        crate::pairing::PairingRecord::receive_login(
+                        crate::records::PairingRecord::receive_login(
                             &src.paths.pairing,
                             &astation_id,
                             login,
@@ -705,11 +711,14 @@ impl App {
     /// (`PairingRecord::usable_shared`).
     pub fn on_astation_disconnect(&mut self) {
         // The link's own profile (never another one).
+        // Only under the pairing this link authenticated with.
         if let Some(aid) = self.connected_astation_id.take()
             && let Ok(profile) = self.astation_client.profile()
         {
-            let _ = crate::pairing::PairingRecord::update(&profile.paths.pairing, &aid, |record| {
-                record.disconnected_at = Some(crate::credentials::now_secs());
+            let _ = self.astation_client.apply_bound(&aid, || {
+                crate::records::PairingRecord::update_locked(&profile.paths.pairing, &aid, |record| {
+                    record.disconnected_at = Some(crate::credentials::now_secs());
+                })
             });
         }
     }

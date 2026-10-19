@@ -194,7 +194,7 @@ pub struct Identity {
 
 /// The identity `src` is verified under with `astation_id`, if it is.
 fn verified_identity(
-    src: &crate::status::Sources,
+    src: &crate::profile::Sources,
     astation_id: &str,
     host_trust_gen: u64,
 ) -> Option<Identity> {
@@ -210,7 +210,7 @@ fn verified_identity(
 }
 
 /// The identity of the profile's current pairing (at start), else none.
-fn start_identity(src: &crate::status::Sources) -> Identity {
+fn start_identity(src: &crate::profile::Sources) -> Identity {
     let state = crate::pairing::load(src).ok();
     let trust_gen = state.as_ref().map_or(0, |s| s.host_trust_gen);
     state
@@ -435,7 +435,7 @@ impl HostBridge {
     /// builds the host under `profile`'s current identity.
     pub fn open(
         dir: &Path,
-        profile: Option<&crate::status::Sources>,
+        profile: Option<&crate::profile::Sources>,
         clock: Clock,
     ) -> anyhow::Result<Self> {
         let journal = FileJournal::open(dir).map_err(|e| anyhow::anyhow!(e.0))?;

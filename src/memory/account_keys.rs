@@ -109,50 +109,6 @@ impl AccountKeys {
         true
     }
 
-    /// Adds keys found in data_keys.enc (build steps 0–2a): `current`
-    /// becomes the account's current key only if it has none; every other
-    /// key not held yet (by kid) is added to the previous keys, so a newer
-    /// `K` installed meanwhile stays current. Without a `current` (its entry
-    /// was missing or malformed) and with no key held, the newest previous
-    /// key stands in as current: it is used only if the signed state names
-    /// its kid, and a granted `K` replaces it. A repeat changes nothing.
-    /// Returns whether anything changed.
-    pub fn merge(
-        &mut self,
-        account: &str,
-        current: Option<AccountKey>,
-        mut previous: Vec<AccountKey>,
-    ) -> bool {
-        use std::collections::btree_map::Entry;
-        let current = current.or_else(|| match self.rings.contains_key(account) {
-            true => None,
-            false => previous.pop(),
-        });
-        let mut keys = current.into_iter().chain(previous).peekable();
-        if keys.peek().is_none() {
-            return false;
-        }
-        let (ring, mut changed) = match self.rings.entry(account.into()) {
-            Entry::Occupied(ring) => (ring.into_mut(), false),
-            Entry::Vacant(slot) => {
-                let current = keys.next().expect("peeked above");
-                let ring = slot.insert(KeyRing {
-                    current,
-                    previous: Vec::new(),
-                });
-                (ring, true)
-            }
-        };
-        for key in keys {
-            if key.kid != ring.current.kid && !ring.previous.iter().any(|held| held.kid == key.kid)
-            {
-                ring.previous.push(key);
-                changed = true;
-            }
-        }
-        changed
-    }
-
     /// Drops what the signed states retired: every key of an account no
     /// verified Astation names or whose state is `off`, and the previous keys
     /// once the state is `on` with the current kid (every field has moved to
@@ -768,46 +724,5 @@ mod tests {
         let back: CryptOut = serde_json::from_str(r#"{"opened":"aGk="}"#).unwrap();
         assert_eq!(&*back.into_plain().unwrap(), b"hi");
         assert!(CryptOut::Sealed("e1.x".into()).into_plain().is_err());
-    }
-
-    #[test]
-    fn merge_adds_older_keys_and_never_replaces_the_current_one() {
-        let mut keys = AccountKeys::default();
-        assert!(keys.merge("acct", Some(key("0123abcd", 1)), vec![key("11112222", 2)]));
-        assert_eq!(keys.current_kid("acct"), Some("0123abcd"));
-        assert_eq!(keys.previous_kids("acct"), vec!["11112222".to_string()]);
-        // A newer K installed meanwhile stays current; the merge only adds history.
-        keys.install("acct", "89abcdef", Zeroizing::new([3; 32]));
-        assert!(
-            !keys.merge("acct", Some(key("0123abcd", 1)), vec![key("11112222", 2)]),
-            "a repeat changes nothing"
-        );
-        assert_eq!(keys.current_kid("acct"), Some("89abcdef"));
-        let mut previous = keys.previous_kids("acct");
-        previous.sort();
-        assert_eq!(
-            previous,
-            vec!["0123abcd".to_string(), "11112222".to_string()]
-        );
-        // A key held under the same kid isn't replaced by the merge.
-        assert!(!keys.merge("acct", Some(key("89abcdef", 9)), vec![]));
-    }
-
-    #[test]
-    fn merge_without_a_current_key_keeps_the_valid_previous_ones() {
-        let mut keys = AccountKeys::default();
-        assert!(!keys.merge("acct", None, vec![]), "nothing to add");
-        assert!(keys.is_empty());
-        // No key held: the newest previous key stands in as current.
-        assert!(keys.merge("acct", None, vec![key("0123abcd", 1), key("11112222", 2)]));
-        assert_eq!(keys.current_kid("acct"), Some("11112222"));
-        assert_eq!(keys.previous_kids("acct"), vec!["0123abcd".to_string()]);
-        // A key held already stays current; the others are added as history.
-        keys.install("acct", "89abcdef", Zeroizing::new([3; 32]));
-        assert!(keys.merge("other", Some(key("44445555", 4)), vec![]));
-        assert!(!keys.merge("acct", None, vec![key("0123abcd", 1)]));
-        assert!(keys.merge("acct", None, vec![key("66667777", 6)]));
-        assert_eq!(keys.current_kid("acct"), Some("89abcdef"));
-        assert!(keys.previous_kids("acct").contains(&"66667777".to_string()));
     }
 }

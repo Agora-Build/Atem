@@ -422,7 +422,6 @@ pub struct AstationClient {
     transport_tasks: Vec<tokio::task::JoinHandle<()>>,
     atem_id_override: Option<String>,
     #[cfg(test)]
-    relay_code_path_override: Option<std::path::PathBuf>,
     #[cfg(test)]
     local_token_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
@@ -437,7 +436,7 @@ pub struct AstationClient {
     held_encryption: Vec<AstationMessage>,
     /// The profile whose pairing errors advise on (`with_profile`); `None`
     /// is this user's profile.
-    profile: Option<crate::status::Sources>,
+    profile: Option<crate::profile::Sources>,
     /// The pairing state and session this connection's authentication
     /// started under, captured before the proof went out. Every reply with
     /// effects (auth success, credentials, encryption, keys) is applied only
@@ -536,7 +535,6 @@ impl AstationClient {
             transport_tasks: Vec::new(),
             atem_id_override: None,
             #[cfg(test)]
-            relay_code_path_override: None,
             #[cfg(test)]
             local_token_path_override: None,
             ws_closed: false,
@@ -578,7 +576,7 @@ impl AstationClient {
     }
 
     /// This client's profile (`with_profile`, else this user's).
-    pub(crate) fn profile(&self) -> Result<crate::status::Sources> {
+    pub(crate) fn profile(&self) -> Result<crate::profile::Sources> {
         self.profile_sources()
     }
 
@@ -612,7 +610,6 @@ impl AstationClient {
         view.atem_id_override = self.atem_id_override.clone();
         #[cfg(test)]
         {
-            view.relay_code_path_override = self.relay_code_path_override.clone();
             view.local_token_path_override = self.local_token_path_override.clone();
         }
         view.connected_astation_id = self.connected_astation_id.clone();
@@ -628,18 +625,13 @@ impl AstationClient {
         self.resolved_atem_id(&crate::auth::get_hostname())
     }
 
-    /// Records `astation_id` as the relay identity room to reconnect to.
-    pub(crate) fn remember_relay_code(&self, astation_id: &str) {
-        self.remember_astation_relay_code(astation_id);
-    }
-
     /// The profile this client reads and writes (`with_profile`, else this
     /// user's). Test clients must name one.
-    fn profile_sources(&self) -> Result<crate::status::Sources> {
+    fn profile_sources(&self) -> Result<crate::profile::Sources> {
         match &self.profile {
             Some(profile) => Ok(profile.clone()),
             None if cfg!(test) => Err(anyhow!("test client without a profile")),
-            None => crate::status::Sources::current(),
+            None => crate::profile::Sources::current(),
         }
     }
 
@@ -740,7 +732,7 @@ impl AstationClient {
     }
 
     /// Advise on pairing errors from `profile` instead of this user's profile.
-    pub(crate) fn with_profile(mut self, profile: crate::status::Sources) -> Self {
+    pub(crate) fn with_profile(mut self, profile: crate::profile::Sources) -> Self {
         self.profile = Some(profile);
         self
     }
@@ -767,8 +759,7 @@ impl AstationClient {
     pub(crate) fn new_with_test_state(atem_id: &str, profile: &std::path::Path) -> Self {
         let mut client = Self::new();
         client.atem_id_override = Some(atem_id.to_string());
-        client.profile = Some(crate::status::Sources::in_dir(profile));
-        client.relay_code_path_override = Some(profile.join("relay-code"));
+        client.profile = Some(crate::profile::Sources::in_dir(profile));
         client
     }
 
@@ -804,33 +795,21 @@ impl AstationClient {
     }
 
     /// The pairing's valid saved session for `astation_id`.
-    fn saved_session(&self, astation_id: &str) -> Result<Option<crate::pairing::SavedSession>> {
+    fn saved_session(&self, astation_id: &str) -> Result<Option<crate::records::SavedSession>> {
         let paths = self.profile_sources()?.paths.pairing;
-        Ok(crate::pairing::PairingRecord::load(&paths)?
+        Ok(crate::records::PairingRecord::load(&paths)?
             .and_then(|record| record.session_for(astation_id).cloned()))
     }
 
     /// The session Astation granted `astation_id` (a pairing in progress
     /// starts the record).
-    fn persist_session(&self, astation_id: &str, session: crate::pairing::SavedSession) -> Result<()> {
+    fn persist_session(&self, astation_id: &str, session: crate::records::SavedSession) -> Result<()> {
         let paths = self.profile_sources()?.paths.pairing;
-        let mut record = crate::pairing::PairingRecord::load(&paths)?
+        let mut record = crate::records::PairingRecord::load(&paths)?
             .filter(|record| record.astation_id == astation_id)
-            .unwrap_or_else(|| crate::pairing::PairingRecord::new(astation_id));
+            .unwrap_or_else(|| crate::records::PairingRecord::new(astation_id));
         record.session = Some(session);
         record.save(&paths)
-    }
-
-    fn remember_astation_relay_code(&self, astation_id: &str) {
-        #[cfg(test)]
-        if let Some(path) = self.relay_code_path_override.as_deref() {
-            let _ = std::fs::write(path, astation_id);
-            return;
-        }
-        match &self.profile {
-            Some(profile) => AtemConfig::store_astation_relay_code_in(&profile.config_dir(), astation_id),
-            None => AtemConfig::store_astation_relay_code(astation_id),
-        }
     }
 
     fn abort_transport(&mut self) {
@@ -1169,7 +1148,7 @@ impl AstationClient {
     /// Refresh the saved session's activity after a successful session proof.
     fn refresh_saved_session(&self, astation_id: &str) {
         let result = self.profile_sources().and_then(|src| {
-            crate::pairing::PairingRecord::update(&src.paths.pairing, astation_id, |record| {
+            crate::records::PairingRecord::update_locked(&src.paths.pairing, astation_id, |record| {
                 if let Some(session) = record.session.as_mut().filter(|s| s.is_valid()) {
                     session.last_activity = crate::credentials::now_secs();
                 }
@@ -1253,17 +1232,13 @@ impl AstationClient {
                     let token = data.get("token").ok_or_else(|| {
                         anyhow!("Pairing response missing session token")
                     })?;
-                    let session = crate::pairing::SavedSession::new(
+                    let session = crate::records::SavedSession::new(
                         session_id.clone(),
                         token.clone(),
                         crate::auth::get_hostname(),
                     );
 
-                    self.guarded(|| {
-                        self.persist_session(astation_id, session)?;
-                        self.remember_astation_relay_code(astation_id);
-                        Ok(())
-                    })?;
+                    self.guarded(|| self.persist_session(astation_id, session))?;
                     Ok(Some(AuthResponse::Authenticated))
                 }
                 Some("denied") => {
@@ -1276,10 +1251,7 @@ impl AstationClient {
             },
             "authenticated" => {
                 // Alternative authenticated message format
-                self.guarded(|| {
-                    self.remember_astation_relay_code(astation_id);
-                    Ok(())
-                })?;
+                self.guarded(|| Ok(()))?;
                 Ok(Some(AuthResponse::Authenticated))
             }
             "error" => Ok(data.get("message").map(|msg| {
@@ -1717,7 +1689,7 @@ impl AstationClient {
     /// Connect to Astation's persistent identity relay room for TUI auto-reconnect.
     ///
     /// Astation registers its identity UUID as a permanent relay room on startup.
-    /// After `atem pair`, Atem stores the identity as `astation_relay_code` in config.
+    /// After `atem pair`, the pairing names the identity (`PairingRecord::astation_id`).
     /// The TUI calls this to auto-connect without a new `atem pair`.
     ///
     /// Flow: connect_raw → hello → challenge/response authentication.
@@ -2019,7 +1991,7 @@ mod tests {
                 // The proof is out; meanwhile the profile is unpaired and
                 // paired again, with a new session.
                 socket.next().await.unwrap().unwrap();
-                let src = crate::status::Sources::in_dir(&dir);
+                let src = crate::profile::Sources::in_dir(&dir);
                 crate::pairing::unpair(&src).unwrap();
                 let before = crate::pairing::capture(&src).unwrap();
                 crate::pairing::bind_new(&src, &before, "mac-a").unwrap();
@@ -2049,7 +2021,6 @@ mod tests {
                 crate::pairing::tests::session_id(state.path()).as_deref(),
                 Some("new-session")
             );
-            assert!(!state.path().join("relay-code").exists(), "{transport}");
             server.await.unwrap();
         }
     }
@@ -2528,7 +2499,6 @@ mod tests {
             .await
             .expect_err("pairing unexpectedly ignored session persistence failure");
         assert!(record.join("occupied").is_dir(), "left alone");
-        assert!(!directory.path().join("relay-code").exists());
         server.await.unwrap();
     }
 
@@ -2615,7 +2585,6 @@ mod tests {
             fs::read_to_string(target_path).unwrap(),
             "must remain unchanged"
         );
-        assert!(!directory.path().join("relay-code").exists());
         server.await.unwrap();
     }
 
@@ -2766,9 +2735,7 @@ mod tests {
         let (state, mut client) = isolated_client("atem-test-proof-only");
         // A pairing without a saved session in the client's profile (a temp dir).
         crate::pairing::tests::bound_profile(state.path(), "astation-x");
-        let paths = crate::paths::ProfilePaths::in_dir(state.path()).pairing;
-        crate::pairing::PairingRecord::update(&paths, "astation-x", |record| record.session = None)
-            .unwrap();
+        crate::pairing::tests::edit(state.path(), |record| record.session = None);
         let error = client
             .connect_without_pairing(&format!("ws://{address}"))
             .await

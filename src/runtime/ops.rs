@@ -14,7 +14,7 @@ use crate::memory::cred_agent::{CredAgentApi, LOCKED, blocking, default_agent};
 use crate::memory::unlock::{AstationLink, shown};
 use crate::pair_verify::{CodeAnswer, VerifyFailure};
 use crate::paths::CredPaths;
-use crate::status::Sources;
+use crate::profile::Sources;
 use crate::websocket_client::{AstationClient, AstationMessage};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -786,16 +786,16 @@ async fn pair<U: OpUi>(
     // connection goes on under it.
     let after = crate::pairing::bind_new(&src, &before, &astation_id)?;
     active.adopt_binding(&before, &after)?;
-    let login = shared_login(
-        &src,
+    let login = crate::records::Login::shared_by_astation(
         received.login_id.clone(),
-        received.access_token.clone(),
-        received.refresh_token.clone(),
-        received.expires_at,
+        crate::records::Tokens {
+            access_token: received.access_token.clone(),
+            refresh_token: received.refresh_token.clone(),
+            expires_at: received.expires_at,
+        },
     );
     active.apply_bound(&astation_id, || {
-        active.remember_relay_code(&astation_id);
-        crate::pairing::PairingRecord::receive_login(
+        crate::records::PairingRecord::receive_login(
             &src.paths.pairing,
             &astation_id,
             login,
@@ -991,25 +991,6 @@ async fn cred_projects<U: OpUi>(
 
 // ── The paired-token refresh ──
 
-/// The login Astation shares: issued by the configured Agora SSO.
-pub(crate) fn shared_login(
-    src: &Sources,
-    login_id: Option<String>,
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
-) -> crate::credentials::Login {
-    crate::credentials::Login::from_sso(
-        src.config.effective_sso_url(),
-        login_id,
-        crate::credentials::Tokens {
-            access_token,
-            refresh_token,
-            expires_at,
-        },
-    )
-}
-
 /// Fresh paired credentials for `astation_id`: Astation sends a
 /// `credentialSync` on connect and whenever it refreshes its own session;
 /// the link applies them. When they aren't fresh yet, waits for the next.
@@ -1021,7 +1002,9 @@ async fn token<U: OpUi>(
 ) -> Result<()> {
     let astation_id = astation_id.ok_or_else(|| anyhow!("no Astation named for the token"))?;
     let src = env.sources()?;
-    let fresh = || crate::sso_auth::fresh_shared(&src.paths.pairing, &astation_id).is_some();
+    let sso_url = src.config.effective_sso_url();
+    let fresh =
+        || crate::sso_auth::fresh_shared(&src.paths.pairing, sso_url, &astation_id).is_some();
     if fresh() {
         return Ok(());
     }
@@ -1044,10 +1027,16 @@ async fn token<U: OpUi>(
                     ..
                 }) if from == astation_id => {
                     // Saved only under the pairing the link authenticated with.
-                    let login =
-                        shared_login(&src, login_id, access_token, refresh_token, expires_at);
+                    let login = crate::records::Login::shared_by_astation(
+                        login_id,
+                        crate::records::Tokens {
+                            access_token,
+                            refresh_token,
+                            expires_at,
+                        },
+                    );
                     view.apply_bound(&from, || {
-                        crate::pairing::PairingRecord::receive_login(
+                        crate::records::PairingRecord::receive_login(
                             &src.paths.pairing,
                             &from,
                             login,

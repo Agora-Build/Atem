@@ -47,15 +47,28 @@ fn machine_id() -> String {
     format!("{host}-{user}")
 }
 
-/// `plain` encrypted: a 12-byte nonce, then the ciphertext.
-pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>> {
+/// The purpose of each machine-bound file, bound into its ciphertext as
+/// associated data: one file can't be swapped for another.
+pub const LOGIN: &str = "atem-login-v1";
+pub const PAIRING: &str = "atem-pairing-v1";
+pub const PROJECT_CACHE: &str = "atem-project-cache-v1";
+
+/// `plain` encrypted for `purpose`: a 12-byte nonce, then the ciphertext.
+pub fn encrypt(purpose: &str, plain: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Payload;
     use rand::RngCore;
     let key = derive_key();
     let cipher = Aes256Gcm::new((&key).into());
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plain)
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plain,
+                aad: purpose.as_bytes(),
+            },
+        )
         .map_err(|e| anyhow!("encrypt: {e}"))?;
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -63,8 +76,10 @@ pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// What `encrypt` made on this machine (an error for anything else).
-pub fn decrypt(raw: &[u8]) -> Result<Vec<u8>> {
+/// What `encrypt` made on this machine for `purpose` (an error for
+/// anything else).
+pub fn decrypt(purpose: &str, raw: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Payload;
     if raw.len() < 12 {
         bail!("ciphertext too short");
     }
@@ -72,6 +87,25 @@ pub fn decrypt(raw: &[u8]) -> Result<Vec<u8>> {
     let key = derive_key();
     let cipher = Aes256Gcm::new((&key).into());
     cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ct,
+                aad: purpose.as_bytes(),
+            },
+        )
         .map_err(|e| anyhow!("decrypt: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_opens_only_for_its_own_purpose() {
+        let sealed = encrypt(LOGIN, b"secret").unwrap();
+        assert_eq!(decrypt(LOGIN, &sealed).unwrap(), b"secret");
+        assert!(decrypt(PAIRING, &sealed).is_err());
+        assert!(decrypt(LOGIN, b"short").is_err());
+    }
 }

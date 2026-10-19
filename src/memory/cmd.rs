@@ -678,8 +678,12 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
         MemoryCommands::Status => {
             let ctx = build_ctx(false)?;
             let store = Store::open(&store_path())?;
-            let config = crate::config::AtemConfig::load()?;
-            let astation_id = config.astation_relay_code.clone().unwrap_or_default();
+            let paths = crate::paths::ProfilePaths::default_paths();
+            let astation_id = crate::records::PairingRecord::load(&paths.pairing)
+                .ok()
+                .flatten()
+                .map(|record| record.astation_id)
+                .unwrap_or_default();
             let last = store.get_state(LAST_SYNC_AT)?;
             println!("Astation:   {}", astation_status_line(&astation_id));
             println!("Machine:    {}", ctx.atem_id);
@@ -1069,7 +1073,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::paths::ProfilePaths::in_dir(dir.path());
         crate::pairing::tests::paired_record("a-1").save(&paths.pairing).unwrap();
-        let paired = crate::status::profile_paired(&crate::status::Sources::in_dir(dir.path()));
+        let paired = crate::status::profile_paired(&crate::profile::Sources::in_dir(dir.path()));
         assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired), paired), not_paired_msg(true));
         assert_eq!(history_unpaired(paired).to_string(), crate::status::SESSION_GONE);
         assert!(NOT_CONFIGURED_MSG.contains("atem pair") && NOT_CONFIGURED_MSG.contains("stay queued"));

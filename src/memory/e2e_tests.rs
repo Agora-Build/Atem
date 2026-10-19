@@ -574,7 +574,7 @@ fn a_copied_config_directory_yields_no_k() {
         }
     }
     assert!(paths.device_keys_sealed.exists() && paths.project_names.exists() && paths.trust.exists());
-    assert!(!paths.data_keys.exists() && !paths.device_keys.exists());
+    assert!(!paths.device_keys.exists());
     // No file holds K in any encoding.
     let k = [42u8; 32];
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, k);
