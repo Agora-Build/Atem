@@ -525,6 +525,8 @@ async fn stop_for_restart(
     match reply {
         Ok(()) => {}
         Err(text) if text.starts_with(BUSY_RESTART) => return Ok(Err(Kept::Busy)),
+        // Already on its way out (another client asked first): just wait for it.
+        Err(text) if text == crate::runtime::server::RESTARTING_NOW => {}
         Err(_) => {
             // A runtime from before `restart`: a confirmed SIGTERM ends it
             // as cleanly (workers survive; the journal is closed).

@@ -153,7 +153,6 @@ src/
 │   ├── account_keys.rs  #   K per account (current + previous) in the agent; e1./h1. field ops (Crypt)
 │   ├── project_names.rs #   project_names.json: h1. project hash → project key (+ original-case labels)
 │   ├── credential_projects.rs # signed HPKE Git-project reports for Astation's credential picker (atem cred projects)
-│   ├── legacy_keys.rs   #   read-only data_keys.enc (steps 0–2a), moved in by the agent
 │   ├── crypto.rs        #   EncryptionContext: mode from the signed state, batched Crypt via the agent; private writes
 │   ├── storage_key.rs   #   storage key + device_keys.sealed (XChaCha20-Poly1305); unlock-grant/ack checks
 │   ├── cred_agent.rs     #   cred agent state: unlock, rotation, abandon, K installed and used in memory (Crypt)
@@ -162,7 +161,7 @@ src/
 │   ├── migration.rs     #   migration read-back check + atem-migration-complete-v1 proof input
 │   ├── fake_astation.rs #   (test-only) Astation's side of unlock and rotation, mirrors the design doc
 │   ├── kat_tests.rs     #   (test-only) known-answer vectors listed in designs/e2e-encryption.md
-│   ├── k_agent_tests.rs #   (test-only) K in the agent: install, Crypt, rotation, data_keys.enc migration
+│   ├── k_agent_tests.rs #   (test-only) K in the cred agent: install, Crypt, rotation
 │   ├── e2e_tests.rs     #   (test-only) encrypted sync/vault end to end, migration and its signed completion
 │   └── cmd.rs           #   CLI handlers
 └── tui/

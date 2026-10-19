@@ -1107,9 +1107,7 @@ impl CredAgentClient {
 
     /// Once per client (with a build to compare): the running agent must be
     /// this build. A locked agent of another build holds no keys, so it is
-    /// asked to stop (or, an agent too old to stop when asked, confirmed as
-    /// this user's `atem cred-agent` and sent SIGTERM) and the next request
-    /// starts this build's. An unlocked one is never restarted: it is used,
+    /// asked to stop and the next request starts this build's. An unlocked one is never restarted: it is used,
     /// with a warning.
     fn check_build(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
