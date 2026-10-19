@@ -1,0 +1,173 @@
+{
+  "name": "r9-recovery-k-backup-crash-before-cas",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "client",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5 \"Writing a backup\" (Astation r4 review 3): mac uploads version 4 (the k_backup_rotated envelope) and crashes before its log CAS, so version 4 is occupied but uncommitted. phone, backing up the same K set, allocates 4 (its log's newest committed is 3), gets 409 {max_occupied: 4}, allocates 5 and commits it. mac restarts, resends its stored bytes in order (the upload is idempotent, then KB8), loses the CAS to phone's version-5 k_backup, and discards its envelope: version 4 can never be named, and version 5 already covers the K set. The orphaned version 4 is never trusted by a restore.",
+  "setup": {
+    "account_id": "acct-test-1",
+    "genesis_hash": "${hash:E1}",
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "client_log": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6",
+      "KB7"
+    ],
+    "relay_occupied": [
+      3
+    ]
+  },
+  "steps": [
+    {
+      "client_backup": {
+        "by": "mac",
+        "kids": [
+          "7a3c9e10",
+          "b982533d",
+          "1f2e3d4c"
+        ],
+        "kit": "recovery"
+      }
+    },
+    {
+      "expect_backup_put": {
+        "by": "mac",
+        "blob_version": 4,
+        "bytes": "${vector:r9-vectors-recovery:k_backup_rotated.wire}"
+      },
+      "name": "a4"
+    },
+    {
+      "relay_reply": {
+        "by": "mac",
+        "status": 200
+      }
+    },
+    {
+      "client_crash": "mac"
+    },
+    {
+      "client_backup": {
+        "by": "phone",
+        "kids": [
+          "7a3c9e10",
+          "b982533d",
+          "1f2e3d4c"
+        ],
+        "kit": "recovery"
+      }
+    },
+    {
+      "expect_backup_put": {
+        "by": "phone",
+        "blob_version": 4
+      },
+      "name": "p4"
+    },
+    {
+      "relay_reply": {
+        "by": "phone",
+        "status": 409,
+        "max_occupied": 4
+      }
+    },
+    {
+      "expect_backup_put": {
+        "by": "phone",
+        "blob_version": 5
+      },
+      "name": "p5"
+    },
+    {
+      "relay_reply": {
+        "by": "phone",
+        "status": 200
+      }
+    },
+    {
+      "expect_log_append": {
+        "by": "phone",
+        "action": "k_backup",
+        "blob_version": 5,
+        "seq": 8,
+        "expected": "KB7",
+        "backup_hash_of": "p5"
+      },
+      "name": "P8"
+    },
+    {
+      "relay_reply": {
+        "by": "phone",
+        "status": 200
+      }
+    },
+    {
+      "client_restart": "mac"
+    },
+    {
+      "expect_backup_put": {
+        "by": "mac",
+        "blob_version": 4,
+        "same_bytes_as": "a4"
+      }
+    },
+    {
+      "relay_reply": {
+        "by": "mac",
+        "status": 200
+      }
+    },
+    {
+      "expect_log_append": {
+        "by": "mac",
+        "action": "k_backup",
+        "blob_version": 4,
+        "seq": 8,
+        "expected": "KB7",
+        "entry": "KB8"
+      }
+    },
+    {
+      "relay_reply": {
+        "by": "mac",
+        "status": 409,
+        "head": "@P8",
+        "entries": [
+          "@P8"
+        ]
+      }
+    },
+    {
+      "assert_client": {
+        "by": "mac",
+        "discarded": [
+          "a4",
+          "KB8"
+        ],
+        "k_backup_committed": 5,
+        "backup_done": true
+      }
+    },
+    {
+      "expect_backup_put_none": {
+        "by": "mac"
+      }
+    }
+  ]
+}

@@ -223,7 +223,7 @@
     }
   ],
   "name": "r9-vectors-membership-log",
-  "note": "Log L: E1..E6, head (6, E6.entry_hash). Signing input = enc([\"atem-membership-entry-v1\", jcs(body)]); entry_hash = hex(SHA-256(enc([\"atem-membership-hash-v1\", jcs(body)]))) (the signature is not hashed). P-256 signatures are RFC 6979 deterministic here, normalized to low S; verifiers accept any valid low-S signature. Recovery decisions (R9.5): recovery_approve / recovery_veto name the pending entry's entry_hash in target; set_recovery_key carries recovery_key and kit (current | lost), and with kit current a kit_sig beside sig: Ed25519 by the current recovery key over enc([\"atem-recovery-cosign-v1\", jcs(body)]) (not hashed, like sig). k_backup (R9.5) records {blob_version, kids, recovery_key, backup_hash} of the newest K backup.",
+  "note": "Log L: E1..E6, head (6, E6.entry_hash). Signing input = enc([\"atem-membership-entry-v1\", jcs(body)]); entry_hash = hex(SHA-256(enc([\"atem-membership-hash-v1\", jcs(body)]))) (the signature is not hashed). P-256 signatures are RFC 6979 deterministic here, normalized to low S; verifiers accept any valid low-S signature. Recovery decisions (R9.5): recovery_approve / recovery_veto name the pending entry's entry_hash in target; set_recovery_key carries recovery_key and kit (current | lost), and with kit current a kit_sig beside sig: Ed25519 by the current recovery key over enc([\"atem-recovery-cosign-v1\", jcs(body)]) (not hashed, like sig). k_backup (R9.5) records {blob_version, kids, recovery_key, backup_hash} of the newest K backup. SUB1-SUB3 are a substitute chain (another genesis reusing kit 1's public key) that a restore must refuse because its genesis differs from the kit's.",
   "others": [
     {
       "entry": {
@@ -1153,6 +1153,108 @@
       "reason": "blob_version_not_increasing",
       "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d76310000020e7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a226b5f6261636b7570222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226b5f6261636b7570223a7b226261636b75705f68617368223a2261653838616635653862323733613161353930343832396133376332613962343865336563623536663037326465656539323361653065343365386637643365222c22626c6f625f76657273696f6e223a332c226b696473223a5b226239383235333364222c223166326533643463225d2c227265636f766572795f6b6579223a7b22616c67223a2265643235353139222c22707562223a226d485a386d495f777a334a36365a463445656e4537574f332d3068676a557779614932336e79375a513241227d7d2c22707265765f68617368223a2232623136373739323231616461323763613030653161343834613530373664663161633765663630353034393664626634623232376233393163656432646564222c22736571223a382c227369676e65645f6174223a313739333236343130303030382c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
       "valid": false
+    },
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "genesis",
+          "member": {
+            "auth_key": {
+              "alg": "p256",
+              "pub": "BGHvfcwAzX21tE5G_IMNMXHuvpmaEMVRPxp4gbnGWGEbinjKVDN0xR2ZanXa8pIJXYle82o8SdTS_I4DB0S3GJU"
+            },
+            "device_id": "dev-evil",
+            "enc_key": {
+              "alg": "x25519",
+              "pub": "RuTeaapyEz0YLHS52Rx0UjSKfrinZsJNdCS5QjHlEnA"
+            },
+            "kind": "native",
+            "roles": [
+              "control",
+              "manage",
+              "view"
+            ]
+          },
+          "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "recovery_key": {
+            "alg": "ed25519",
+            "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+          },
+          "seq": 1,
+          "signed_at": 1793264000000,
+          "signer": "dev-evil",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "da7Cqc7gdDLWensOdCSv0STOngTnwlTFrlRHNwS0KVRo6HQ_wc-kOP2tWRNJNiMz3WLGzAiBpO2N0gi8RyN_4w"
+      },
+      "entry_hash": "f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"genesis\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BGHvfcwAzX21tE5G_IMNMXHuvpmaEMVRPxp4gbnGWGEbinjKVDN0xR2ZanXa8pIJXYle82o8SdTS_I4DB0S3GJU\"},\"device_id\":\"dev-evil\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"RuTeaapyEz0YLHS52Rx0UjSKfrinZsJNdCS5QjHlEnA\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"recovery_key\":{\"alg\":\"ed25519\",\"pub\":\"mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A\"},\"seq\":1,\"signed_at\":1793264000000,\"signer\":\"dev-evil\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "SUB1",
+      "note": "substitute genesis (Astation r4 review 1): self-signed by dev-evil, recovery_key = kit 1's public key; fully valid on its own, but its entry_hash is not the genesis_hash kit 1 carries (E1's), so a restore with kit 1 refuses it (genesis_mismatch)",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d76310000024d7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2267656e65736973222c226d656d626572223a7b22617574685f6b6579223a7b22616c67223a2270323536222c22707562223a2242474876666377417a583231744535475f494d4e4d58487576706d61454d56525078703467626e4757474562696e6a4b56444e307852325a616e58613870494a58596c6538326f38536454535f49344442305333474a55227d2c226465766963655f6964223a226465762d6576696c222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a225275546561617079457a30594c48533532527830556a534b6672696e5a734a4e64435335516a486c456e41227d2c226b696e64223a226e6174697665222c22726f6c6573223a5b22636f6e74726f6c222c226d616e616765222c2276696577225d7d2c22707265765f68617368223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030222c227265636f766572795f6b6579223a7b22616c67223a2265643235353139222c22707562223a226d485a386d495f777a334a36365a463445656e4537574f332d3068676a557779614932336e79375a513241227d2c22736571223a312c227369676e65645f6174223a313739333236343030303030302c227369676e6572223a226465762d6576696c222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "add_host",
+          "genesis_hash": "f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94",
+          "host": {
+            "host_id": "host-a",
+            "host_key": {
+              "alg": "ed25519",
+              "pub": "3qRByoXs3q5KCugpBKEztSy81PInxeea3c3KafAbowg"
+            },
+            "host_trust_gen": 1
+          },
+          "prev_hash": "f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94",
+          "seq": 2,
+          "signed_at": 1793264000001,
+          "signer": "dev-evil",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "heoJEUNUDInPKVdtzt6XBIqlpMDXvwwS5EkFQOVGxhAiitEq-fOu1VMGzZ6gKo6Pi-8WB-XPLUwjugsYvMIrVg"
+      },
+      "entry_hash": "37e982209772a36fe98e60e63c9a8fdb794253ab87943f336ecfca170202963f",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"add_host\",\"genesis_hash\":\"f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94\",\"host\":{\"host_id\":\"host-a\",\"host_key\":{\"alg\":\"ed25519\",\"pub\":\"3qRByoXs3q5KCugpBKEztSy81PInxeea3c3KafAbowg\"},\"host_trust_gen\":1},\"prev_hash\":\"f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94\",\"seq\":2,\"signed_at\":1793264000001,\"signer\":\"dev-evil\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "SUB2",
+      "note": "substitute chain: add_host host-a with the host-evil key, signed by dev-evil; valid in the substitute chain only",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001ac7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a226164645f686f7374222c2267656e657369735f68617368223a2266393234346231623562346634656231666634616165626164303231613061363661623161333136343736323637336362373162626136633734353431623934222c22686f7374223a7b22686f73745f6964223a22686f73742d61222c22686f73745f6b6579223a7b22616c67223a2265643235353139222c22707562223a2233715242796f58733371354b43756770424b457a745379383150496e786565613363334b616641626f7767227d2c22686f73745f74727573745f67656e223a317d2c22707265765f68617368223a2266393234346231623562346634656231666634616165626164303231613061363661623161333136343736323637336362373162626136633734353431623934222c22736571223a322c227369676e65645f6174223a313739333236343030303030312c227369676e6572223a226465762d6576696c222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "k_backup",
+          "genesis_hash": "f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94",
+          "k_backup": {
+            "backup_hash": "4048ff89e71edd214965c8f0816a5663cd82ba54da4ca345c447e45bc900c2b3",
+            "blob_version": 1,
+            "kids": [
+              "e7e7e7e7"
+            ],
+            "recovery_key": {
+              "alg": "ed25519",
+              "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+            }
+          },
+          "prev_hash": "37e982209772a36fe98e60e63c9a8fdb794253ab87943f336ecfca170202963f",
+          "seq": 3,
+          "signed_at": 1793264000002,
+          "signer": "dev-evil",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "Ub9JI-FKrNTjNBTtnzt6eD6LIVNggqv6eXxIdW6LJgtnYiFIJDVK7gUYV0Z6HAZ23u9FmHNiv0g59i8Pk2sXdg"
+      },
+      "entry_hash": "601fb9f7320c5cf75e86bb2a7cd9187c46556db9c1e6a661ef4845ada3eaeeb4",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"k_backup\",\"genesis_hash\":\"f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94\",\"k_backup\":{\"backup_hash\":\"4048ff89e71edd214965c8f0816a5663cd82ba54da4ca345c447e45bc900c2b3\",\"blob_version\":1,\"kids\":[\"e7e7e7e7\"],\"recovery_key\":{\"alg\":\"ed25519\",\"pub\":\"mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A\"}},\"prev_hash\":\"37e982209772a36fe98e60e63c9a8fdb794253ab87943f336ecfca170202963f\",\"seq\":3,\"signed_at\":1793264000002,\"signer\":\"dev-evil\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "SUB3",
+      "note": "substitute chain: k_backup naming the substitute backup (blob_version 1, K-evil sealed to kit 1), signed by dev-evil; the envelope opens with kit 1",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002047b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a226b5f6261636b7570222c2267656e657369735f68617368223a2266393234346231623562346634656231666634616165626164303231613061363661623161333136343736323637336362373162626136633734353431623934222c226b5f6261636b7570223a7b226261636b75705f68617368223a2234303438666638396537316564643231343936356338663038313661353636336364383262613534646134636133343563343437653435626339303063326233222c22626c6f625f76657273696f6e223a312c226b696473223a5b226537653765376537225d2c227265636f766572795f6b6579223a7b22616c67223a2265643235353139222c22707562223a226d485a386d495f777a334a36365a463445656e4537574f332d3068676a557779614932336e79375a513241227d7d2c22707265765f68617368223a2233376539383232303937373261333666653938653630653633633961386664623739343235336162383739343366333336656366636131373032303239363366222c22736571223a332c227369676e65645f6174223a313739333236343030303030322c227369676e6572223a226465762d6576696c222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
     }
   ],
   "requires": "r9"

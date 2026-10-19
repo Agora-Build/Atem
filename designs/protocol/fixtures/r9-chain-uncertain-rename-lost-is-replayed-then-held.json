@@ -1,10 +1,10 @@
 {
-  "name": "r9-chain-uncertain-rename-lost-stays-unclean",
+  "name": "r9-chain-uncertain-rename-lost-is-replayed-then-held",
   "requires": "r9",
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation r3 review 1): as r9-chain-uncertain-rename-is-reconciled-at-restart, but the machine lost the unsynced rename: the stored head is still E6 while the intent names E7, so remote admission stays paused until a carriage re-establishes E7.",
+  "note": "R9.3 (Astation r3 review 1, r4 review 2): as r9-chain-uncertain-rename-is-reconciled-at-restart, but the machine lost the unsynced rename: membership.json still holds E6 while the intent names E7. The carriage record, durable before E7 was evaluated, is replayed at start, so E7 is committed and svc fenced without anyone carrying it again. The host is still held (no checkpoint from the halted run): a manager whose log is behind the host's head gets busy and must fetch first; one that reports the host's head reconciles it.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -205,30 +205,45 @@
     },
     {
       "assert": {
-        "head": "E6",
-        "membership_unclean": {
-          "seq": 7,
-          "hash": "${hash:E7}"
+        "head": "E7",
+        "membership_applied": "E7",
+        "membership_held": true,
+        "membership_unclean": null,
+        "carriage_record": false,
+        "control_gen": {
+          "service:svc-discord": 2
         }
       }
     },
     {
       "connect": "mac",
-      "carry": []
+      "carry": [],
+      "client_head": "E6"
     },
     {
       "expect": "mac",
       "match": {
         "op": "error",
         "code": "busy",
-        "detail": "device list not recorded"
+        "detail": "device list not reconciled"
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": []
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not reconciled"
       }
     },
     {
       "connect": "mac",
-      "carry": [
-        "E7"
-      ]
+      "carry": [],
+      "client_head": "E7"
     },
     {
       "expect": "mac",
@@ -243,7 +258,7 @@
     {
       "assert": {
         "head": "E7",
-        "membership_unclean": null
+        "membership_held": false
       }
     }
   ]

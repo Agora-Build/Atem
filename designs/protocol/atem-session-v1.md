@@ -1699,8 +1699,9 @@ browser grants, all over one end-to-end channel (`atem-ch1`) whose
 authority is a signed membership log pinned at pairing. It answers the
 §9 gate for those features. Design and user decisions:
 `remote-agent-api-atem.md` (r3) and `../account-trust.md`. Astation's
-reviews of r2 and of the first r9 pin `ffe840d` (its r3 review,
-2026-10-19) are answered point by point in `remote-agent-api-atem.md`
+reviews of r2, of the first r9 pin `ffe840d` (its r3 review) and of
+`016abe7` (its r4 review, both 2026-10-19; "Astation r4 review N" in
+this appendix means the latter) are answered point by point in `remote-agent-api-atem.md`
 §10. Fixtures: `fixtures/r9-*.json`
 (`requires: "r9"`; every runner reports them NOT RUN until r9 is built),
 format in `fixtures/schema.md` "r9 fixtures".
@@ -1746,6 +1747,7 @@ Other domain strings (never signing inputs of another kind):
 `atem-ch1-client-sig-v1`, `atem-ch1 finish c2h`, `atem-ch1 ap c2h`,
 `atem-ch1 ap h2c`, `atem-ch1-finish`, `atem-ch1-rec`,
 `atem-push-seal-v1`, `atem-enc-kid-v1`, `atem-k-backup-v2`,
+`atem-recovery-kit-v2`, `atem-recovery-kit-tag-v1`,
 `atem-k-backup-hash-v1`, `atem-recovery-sign-v1`, `atem-safety-code-v2`.
 Vectors: `r9-vectors-encoding`, `r9-vectors-keys`.
 
@@ -1793,9 +1795,22 @@ bodies differ (Astation review 2).
   `scope` and `expires_at` required (R9.6), `expires_at` ≤ `signed_at` +
   7 776 000 000 (90 days).
 
-Arrays in bodies are sorted ascending and duplicate-free (an unsorted
-array is invalid, so one meaning has one encoding). `signed_at` is the
-signer's display time, never authority (R9.6 says which times are).
+**Arrays** (Astation r4 review 4). Every array in a signed body
+(entry, grant, push hint, seen) and in the K-backup envelope and its
+plaintext is one of two kinds, fixed per field, so one meaning has one
+encoding:
+
+| kind | fields | rule |
+|---|---|---|
+| **set** | `member.roles`, `set_roles.roles`, `scope.hosts`, `scope.projects`, `scope.sessions`, `scope.ops`, a grant's `ops` | sorted ascending by bytes (UTF-8), no duplicates |
+| **sequence** | `k_backup.kids` (entry), the envelope's `kids` and its plaintext `keys` (R9.5) | in meaning order: the current key first, then retained previous generations newest first; no duplicate kid; never sorted. The entry's `kids`, the envelope's `kids` and the plaintext's `keys[].kid` are the same sequence |
+
+A set that isn't sorted, or any array with a duplicate, is invalid
+(for an entry `membership_invalid`, detail `array_not_canonical`; for an
+envelope `backup_invalid`); a field not in the table can't be an array. A verifier checks a sequence's length and
+duplicates and never reorders it (`KB7`, `KB8` and `KB8_stale` keep
+their current kid first). `signed_at` is the signer's display time,
+never authority (R9.6 says which times are).
 
 **Verifying entry `n` against a chain `C` whose head is `n-1`:** strict
 parse; `type`, `v`; `account_id` and `genesis_hash` equal the pin;
@@ -1852,8 +1867,9 @@ state change (R9.5).
 
 `host_channel_key` (Ed25519 seed) is `pairing/host_channel_key`, 0600,
 plain like `unlock_auth_key` (it only proves the host to clients, so it
-works while the cred agent is locked). `atem unpair` deletes both files,
-keeps `pairing/frozen_genesis` (≤ 16 hashes), and rotates the key at the
+works while the cred agent is locked). `atem unpair` deletes both files
+(and the carriage record, intent and checkpoint of "Writing the device
+list" below), keeps `pairing/frozen_genesis` (≤ 16 hashes), and rotates the key at the
 next pairing. The journal gains `<journal>/membership_applied`
 (`{seq, hash}`: the head whose fences are durable).
 
@@ -1911,63 +1927,129 @@ connections are serialized; the head may have moved since `accept`):
    deferral is not an error: the carrier is admitted, and its `welcome`
    shows the head below its own and the pending entry.
 
-**Writing the device list** (Astation r3 review 1). Every commit of
-`membership.json` is:
+**Writing the device list** (Astation r3 review 1, r4 review 2). A
+carriage that holds anything Atem doesn't store already (an entry beyond
+its head, or a different one at a stored `seq`), from any route or the
+host's own relay fetch, is processed as:
 
+0. **Carriage record:** `pairing/membership.carriage` = `{v:1,
+   runtime_epoch, base{seq,hash}, entries}`: the exact carried objects
+   (within the carriage bounds, so ≤ 64 entries / 256 KiB) and the head
+   they are judged against (temp, fsync, rename, directory fsync),
+   written **before any of them is evaluated**. Atem evaluates only what
+   is durably recorded.
 1. **Intent:** `pairing/membership.intent` = `{seq, hash}` of the head
-   about to be written (temp, fsync, rename, directory fsync).
-2. **State:** `membership.json` (temp, fsync, rename, directory fsync).
+   about to be written (same way).
+2. **State:** `membership.json` (same way).
 3. The effects (step 4 above), then `membership_applied`.
-4. Remove the intent (directory fsync). A leftover intent at or below
-   the stored head is harmless.
+4. Remove the intent, then the carriage record (directory fsync after
+   each). A leftover intent or record whose entries are all at or below
+   the stored head and equal to it is harmless.
 
-A freeze first writes `pairing/membership.freeze` (both entries) the
-same way, then `frozen` in `membership.json`.
+A freeze writes `pairing/membership.freeze` (both entries) the same way
+after the carriage record, then `frozen` in `membership.json`, then
+removes the record. A carriage with nothing new writes nothing.
 
-**A failed write** — of the intent, the temp file, its fsync, the
-rename or the directory fsync, or of the freeze file — makes the durable
-state uncertain, and Atem fails closed in the same step, exactly as §H
-"A failed revocation write": in memory, every principal the uncommitted
-prefix would remove, strip of `control` or fence (removal, `set_roles`,
-`remove_host` of this host, expiry shortening, grant fences) — **every
-remote principal** when Atem can't tell which (a freeze, or a batch it
-couldn't evaluate) — has its attachments fenced, its lease revoked (the
-input epoch rises, so the worker drops its queued raw bytes at the
-write boundary), and its `accepted` work not yet `executing` rejected
-(`control revoked`). A freeze also takes effect in memory at once
-(R9.4). Then the journal halts (§I): every `init` gets a clear `busy`,
-every later session request but `hello` is `busy` "journal halted;
-restart Atem", nothing queued is dispatched, no remote terminal input
-is written and no new push hint is sent, until the restart. Local use
-goes on. Atem never retries the write in the same run.
+**A failed write** — of the carriage record, the intent, the temp file,
+its fsync, the rename or the directory fsync, or of the freeze file —
+makes the durable state uncertain, and Atem fails closed in the same
+step, exactly as §H "A failed revocation write": in memory, every
+principal the uncommitted prefix would remove, strip of `control` or
+fence (removal, `set_roles`, `remove_host` of this host, expiry
+shortening, grant fences) — **every remote principal** when Atem can't
+tell which (a freeze, a batch it couldn't evaluate, or a carriage record
+that couldn't be written, whose carriage is then refused unread) — has
+its attachments fenced, its lease revoked (the input epoch rises, so the
+worker drops its queued raw bytes at the write boundary), and its
+`accepted` work not yet `executing` rejected (`control revoked`). A
+freeze also takes effect in memory at once (R9.4). Membership is then
+**faulted** for the run (every later carriage is refused unread) and
+the journal halts (§I): every `init` gets a clear `busy`, every later
+session request but `hello` is `busy` "journal halted; restart Atem",
+nothing queued is dispatched, no remote terminal input is written and no
+new push hint is sent, until the restart. Local use goes on. Atem never
+retries the write in the same run.
+
+**Membership checkpoint.** `pairing/membership.clean` = `{v:1,
+runtime_epoch, head{seq,hash}}` (temp, fsync, rename, directory fsync)
+is written only in an orderly stop, in the step that writes §H's clean
+close, and only when membership is idle and healthy: no carriage record,
+no intent, no device-list write fault in this run, the journal not
+halted, and the host not held (below). Nothing else writes it. Every
+start increments `runtime_epoch` (§H), so a checkpoint vouches for
+exactly one run: the one that wrote it.
 
 **Crash recovery.** At start, before any remote admission, Atem fsyncs
 `membership.json` and the `pairing/` directory (a rename that is
 visible becomes durable; a failure disables remote sessions,
-`welcome.host_error`), then reconciles:
+`welcome.host_error`), then, in order:
 
-- `membership.freeze` exists, in any state, even unreadable → frozen
-  (R9.4).
-- `membership.intent` names a head beyond the stored one (a higher
-  `seq`, or the same `seq` with another hash) → **unclean**: the last
-  commit may have been lost. Carriages are applied as usual, but no
-  remote principal is admitted (each `hello` gets `busy` "device list
-  not recorded" after its carriage) until the committed head reaches
-  the intent's `seq` with the intent's hash, from any carrier or the
-  host's own relay fetch; then the intent is removed and admission
-  resumes. A different entry at that `seq` keeps the host unclean
-  (evidence `intent_mismatch`); the way out is re-pairing.
-- Pre-restart `accepted` work follows §H Recovery (a run that halted
-  never wrote a clean close, so it is `rejected`, `authorization history
-  unknown`).
+1. `membership.freeze` exists, in any state, even unreadable → frozen
+   (R9.4).
+2. `membership.carriage` exists: readable → **replayed**, judged
+   against the stored chain exactly as when it arrived (steps 1–5 of
+   "Applying a carriage" without a reply, R9.4's conflict rule
+   included), written through steps 1–4 above, then removed. Because the
+   record was durable before anything in it was evaluated, losing the
+   intent, the state or the freeze write loses nothing: a conflict it
+   held freezes again, a removal is applied again. Unreadable → held
+   (evidence `carriage_unreadable`).
+3. Then `membership_applied`: for every entry after the applied head
+   Atem replays the fences (idempotent: a raised `control_gen` is never
+   raised twice for one entry, the fence names the entry's `seq`) and
+   writes `membership_applied`. An unreadable `membership.json` or an
+   applied head ahead of the stored head disables remote sessions
+   (`welcome.host_error`); nothing is reset silently.
+4. **Held** unless `membership.clean` names the previous run
+   (`runtime_epoch − 1`) and the head stored at start, and no intent is
+   left beyond the head. A crash, power loss or kill, a halted run, a
+   write fault, a lost or stale checkpoint, and a `pairing/` directory
+   restored from a backup all leave the host held.
+5. Pre-restart `accepted` work follows §H Recovery (a run that halted
+   never wrote a clean close, so it is `rejected`, `authorization
+   history unknown`).
 
-Then Atem reads
-`membership.json` and `membership_applied`; for every entry after the
-applied head it replays the fences (idempotent: a raised `control_gen`
-is never raised twice for one entry, the fence names the entry's `seq`)
-and then writes `membership_applied`. An unreadable `membership.json` or
-an applied head ahead of the stored head disables remote sessions
-(`welcome.host_error`); nothing is reset silently.
+**Held: no remote admission until reconciled.** Local use is
+unaffected. `init` is answered as usual (its signed head is what clients
+compare), carriages are still applied (through the carriage record, so
+removals land), and every `hello` except a reconciling one gets `busy`
+"device list not reconciled" after its carriage. No push hint is sent.
+`atem status`, `atem agent list` and the agent terminal's status row say
+that remote access waits for a managing device. Nothing on the host's
+side ends it: not time, not a restart (a held run writes no checkpoint),
+not the host's own relay fetch, not a carriage by a service, a view-only
+member or an unknown carrier. **Reconciliation** is a `hello` that,
+after its carriage is applied:
+
+- comes from a `native` member holding `manage`, in effect at the
+  committed head;
+- carried no conflicting, invalid or deferred entry, and no `more`;
+- reports `membership.head` equal to the committed head: the client
+  compared the host-signed head of `accept` (bound in `th2`) with the
+  log it verified from its pinned genesis and signed the transcript
+  with `sig_c`, so both signatures cover one head;
+- leaves no intent unsatisfied (an intent whose `seq` now holds another
+  hash keeps the host held, evidence `intent_mismatch`; the way out is
+  re-pairing).
+
+The host then leaves held for the run (logged; its next orderly stop
+writes the checkpoint) and admits that `hello` normally. A manager
+whose log is behind the host's head gets `busy` "device list not
+reconciled", fetches from the relay and reconnects.
+
+Why this is safe: everything the host evaluated was durable before it
+was evaluated and is replayed, so no conflict or removal it saw can be
+lost by a failed or lost later write; a carriage whose record never
+became durable was never evaluated, so the host learnt nothing that its
+carrier couldn't equally have withheld (and every honest copy, on
+devices and at the relay, still exists). The held state covers what the
+record can't: storage that lost an acknowledged write, and a `pairing/`
+directory rolled back as a whole. A managing device whose own verified
+log ends at the host's head is independent evidence that the head is
+current. A manager whose key was stolen can reconcile too; that key
+admits it anyway, and it can't erase a conflict the record holds. If
+no managing device can ever connect, the way out is re-pairing (`atem
+unpair`, `atem pair`).
 
 **On an open channel** a client sends `membership{id, entries}` whenever
 it learns newer entries; same algorithm; reply `membership_head{re,
@@ -2009,8 +2091,10 @@ row that matches (the first three are the recovery decisions of R9.5):
 
 **Freeze:** `frozen` (with both entries) is made durable first (R9.3
 "Writing the device list"; if that write fails, the host is frozen in
-memory at once and the journal halts, and a freeze file that reached the
-disk in any state keeps it frozen at the restart), then
+memory at once and the journal halts; at the restart a freeze file that
+reached the disk in any state keeps it frozen, and otherwise the
+carriage record, durable before the conflict was evaluated, is replayed
+and freezes it again), then
 every remote principal is fenced (§H, `control_revoked`; attachments
 closed with session `error{code:"account_frozen"}`), every `init` is
 answered `account_frozen` before any key work, membership processing
@@ -2228,14 +2312,42 @@ key of a pending `set_recovery_key` is deferred the same way.
 
 **Recovery Kit v2 and K** (Astation owns the kit, its UI and storage;
 the formats are shared so `atem-client` can implement them once). The
-kit holds one 256-bit secret `R` (plus account id and relay URL, as
-today); its text encoding is Astation's.
+kit holds one 256-bit secret `R`, the `account_id`, the account's
+**`genesis_hash`**, a `kit_tag` binding the three, and the relay URL;
+its text encoding is Astation's. **The printed kit format changes**
+(Astation r4 review 1): it now also carries the 32-byte genesis hash
+and the 16-byte tag.
 
 ```
 sign_seed    = HKDF-SHA256(salt = empty, ikm = R, info = "atem-recovery-sign-v1", L = 32)  -> Ed25519 key
 recovery_key = public key of sign_seed            (in genesis, or in set_recovery_key)
 kit X25519   = secret SHA-512(sign_seed)[0..32] (X25519 clamps it); public = Montgomery form of recovery_key
+tag_key      = HKDF-SHA256(salt = empty, ikm = R, info = "atem-recovery-kit-tag-v1", L = 32)
+kit_tag      = HMAC-SHA256(tag_key, enc(["atem-recovery-kit-v2", account_id, genesis_hash(32 bytes)]))[0..16]
 ```
+
+**The genesis anchor.** The log, its hosts and its backups come from the
+relay; the kit is the one thing the user kept apart from it. Anyone can
+seal to a kit's public key (HPKE base mode), so a relay could copy it
+into a genesis of its own, with its own manager and host, and seal a
+`K` of its choosing: every signature in that chain verifies and the
+envelope opens with the real kit. Only the kit's `genesis_hash` tells
+the two apart. What it binds to:
+
+- **At account setup:** Astation generates `R`, derives `recovery_key`,
+  builds and signs the genesis naming it, and commits it at the relay;
+  the kit is made from that genesis's `entry_hash` and shown to the
+  user only then.
+- **At replacement** (`set_recovery_key`, either `kit` mode): the new kit
+  is bound to the genesis the entry names in its `genesis_hash` (every
+  entry names its log's genesis, so it is the same genesis as the
+  replaced kit's). It is made when the entry is prepared and shown once
+  the entry commits.
+- A kit never moves to another genesis: a new list (re-pairing from
+  scratch) gets a new kit, and an old kit restores nothing in it.
+
+Hosts pin their genesis at pairing (R9.2) and devices at enrollment, so
+only the restore needed this anchor.
 
 The kit's X25519 public key is computed from `recovery_key` alone
 (`u = (1 + y) / (1 − y) mod 2^255 − 19`, as libsodium's
@@ -2259,8 +2371,9 @@ HKDF-SHA256, ChaCha20-Poly1305), to the kit's X25519 public key, `info
 = enc(["atem-k-backup-v2", account_id, genesis_hash(32 bytes),
 u64(blob_version), jcs(kids), recovery_key.pub(32 bytes)])`, empty AAD,
 plaintext `jcs({"keys":[{"k":"<b64u 32>","kid":"…"},…]})`: the current
-key first, then retained previous generations (1–8 keys; `kids` lists
-the same kids in the same order). Opening it authenticates the account,
+key first, then retained previous generations newest first (1–8 keys;
+`kids` lists the same kids in the same order: a sequence, R9.2, never
+sorted). Opening it authenticates the account,
 genesis, version, kids and kit (any change fails the tag). `backup_hash =
 hex(SHA-256(enc(["atem-k-backup-hash-v1", jcs(envelope)])))`.
 
@@ -2279,65 +2392,117 @@ recovery key or that of a pending `set_recovery_key`. Hosts verify it
 like any entry, keep the newest record, and never fetch or open a
 backup. The relay stores envelopes keyed by `(genesis_hash,
 blob_version)`, put-if-absent (the same bytes again: `200`; other bytes:
-`409`), and keeps those named by the two newest `k_backup` entries of
+`409 {max_occupied}`, the highest version it holds for that log), and
+keeps those named by the two newest `k_backup` entries of
 each recovery key; an envelope no entry names is garbage after an hour.
+
+**Committed and occupied versions** (Astation r4 review 3). A version
+is **committed** only when a `k_backup` entry in the verified log names
+it (with its `backup_hash`). A version the relay holds that no entry
+names is **occupied but uncommitted**: the leftover of a writer that
+crashed before its CAS, lost a race, or gave up. It is superseded by any
+higher version, collected by the relay after an hour, and never fetched,
+opened or trusted by a restore (a restore opens only the version the
+newest `k_backup` names, checked against its `backup_hash`). Versions
+may skip; the log only requires them to increase.
 
 **Writing a backup** (rotation, a changed retained set, a new kit):
 
-1. Seal the envelope (any manager with the `K` set; no `R` needed) at
-   `blob_version` = the newest in its verified log + 1, and store it
-   durably (envelope bytes and the prepared entry body, R9.4 rule 1).
-2. Upload the envelope (put-if-absent). Then publish the `k_backup`
-   entry with the log CAS (R9.4). Only after the relay commits the entry
-   may any device use a new `K` (Astation's rotation rule, now
-   checkable: "before first use" means "recorded in the log").
-3. `409` on the entry (another manager wrote first): discard both
-   durably, verify the returned entries; if the newest `k_backup`
-   already covers this `K` set, stop; otherwise reseal at the new
-   version + 1 (never reuse a version with other bytes) and retry.
-   `409` on the envelope means another seal took that version: the same.
-4. Interrupted (crash, timeout): resend the stored bytes in order; the
-   envelope put and the entry are idempotent. A device that finds an
-   envelope it uploaded without a committed entry publishes the entry
-   or, after a `409`, abandons it.
+1. **Allocate:** `blob_version` = 1 + the highest of: the newest
+   committed version in its verified log, every version it uploaded
+   itself (kept durably until committed or discarded), and the
+   `max_occupied` of the last `409` it got for this log.
+2. **Seal** (any manager with the `K` set; no `R` needed) and store
+   durably the envelope bytes, its version and the prepared entry body
+   (R9.4 rule 1).
+3. **Upload** (put-if-absent). `200`: stored (or the same bytes were
+   already there). `409 {max_occupied}`: other bytes hold that version.
+   Discard the envelope durably; if the newest committed backup already
+   covers this `K` set and the current kit, stop; else go back to 1,
+   which now allocates above `max_occupied`. Each `409` therefore moves
+   the next attempt strictly higher, so repeated collisions make
+   progress. A `max_occupied` more than 1024 above the newest committed
+   version is relay misbehaviour: stop and report it (availability only;
+   a relay can always refuse to store).
+4. **Publish** the `k_backup` entry with the log CAS (R9.4). Only after
+   the relay commits it may any device use a new `K` (Astation's
+   rotation rule, now checkable: "before first use" means "recorded in
+   the log").
+5. **`409` on the entry** (the log moved): verify and apply the returned
+   entries, then:
+   - a `k_backup` naming a version ≥ ours was committed: ours can never
+     be named. Discard both durably; if the newest committed backup
+     covers this `K` set and the current kit, stop; else go back to 1.
+   - otherwise (an unrelated entry won the `seq`, e.g. an `add`): keep
+     the uploaded envelope, whose bytes bind account, genesis, version,
+     kids and kit but not the head, and rebuild only the entry on the
+     new head (R9.4 rule 3), provided the kit it names is still current
+     or pending; if not, discard both and go back to 1 for the current
+     kit.
+6. **Interrupted** (crash, timeout): resend the stored bytes in order,
+   the upload (idempotent) and then the entry (CAS). A `409` on the
+   resent upload means the relay collected the envelope and another
+   writer took the version: step 3.
 
 Two managers rotating at once therefore serialize on the log; the
 loser's envelope is never named and is collected.
 
-**Restore** (Astation's restore-account flow on a new device):
+**Restore** (Astation's restore-account flow on a new device; Astation
+r4 review 1, user decision of 2026-10-19 "no recovery on a stale
+head"):
 
-1. Derive `sign_seed`, `recovery_key` and the kit X25519 secret from `R`.
-2. Fetch the log from the relay and verify it from genesis. **Freshness
-   checkpoint:** send `init` to each host the log names, over any route
-   that answers; each `accept` carries a head signed by the host's key
-   (R9.7; no membership is needed for `init`). A log that doesn't reach
-   the highest such head with the same hash is refused
-   (`log_behind_host`): the relay rolled it back; retry another route.
-3. Refuse unless the derived `recovery_key` is the current one in that
-   log (`kit_not_current`: "this Recovery Kit was replaced", or not this
-   account).
-4. Take the newest `k_backup` naming this kit; fetch the envelope;
-   refuse unless its `backup_hash` matches (`backup_hash_mismatch`: an
-   older authentic backup is caught here) and it opens with `info` for
-   this account and genesis (`backup_invalid`). This authenticates the
+1. **Read the kit.** Check `kit_tag` (a mismatch: "this Recovery Kit is
+   damaged or mistyped", nothing is fetched). The kit's `account_id`
+   and `genesis_hash` are the anchor; derive `sign_seed`,
+   `recovery_key` and the kit X25519 secret from `R`.
+2. **Fetch and anchor the log.** Fetch the log stored under the kit's
+   `genesis_hash`. Its entry 1 must be a genesis whose `entry_hash`
+   equals the kit's `genesis_hash` and whose `account_id` equals the
+   kit's (`genesis_mismatch`; a substitute genesis that reuses this
+   kit's public key is refused here, whatever else verifies). Verify
+   the chain from that genesis; every host key, manager and backup used
+   below comes from it.
+3. **Confirm the head.** Send `init` to each host the chain names, over
+   any route that answers (relay channel, Astation link, direct :8080 on
+   the LAN; `init` needs no membership); each `accept` carries a head
+   signed by that host's key **as the anchored chain records it**. At
+   least one is needed. A log that doesn't reach the highest such head
+   with the same hash is refused (`log_behind_host`: the relay rolled
+   it back; retry another route). In r9 a host-signed head is the only
+   proof of freshness. **No host answers → the restore waits**
+   (`withheld`): nothing is stored as current, nothing is signed or
+   published, and the device tells the user why ("Recovery needs to
+   reach one of your Atem hosts (<names>) to confirm the device list is
+   current. Turn one on or join its network; recovery then continues by
+   itself."). It retries; it never falls back to an unconfirmed head.
+4. Refuse unless the derived `recovery_key` is the current one in that
+   log (`kit_not_current`: "this Recovery Kit was replaced").
+5. Take the newest `k_backup` naming this kit; fetch that version's
+   envelope; refuse unless its `backup_hash` matches
+   (`backup_hash_mismatch`: an older authentic backup, or an
+   uncommitted one, is caught here) and it opens with `info` for the
+   kit's account and genesis (`backup_invalid`). This authenticates the
    account and genesis through the backup **before** anything is
    appended. Any failure is "this kit doesn't match the account, or the
    backup is damaged" and never creates a new `K` or a new trust root.
-5. Store the `K` set durably, then sign and publish the `recovery_add`
-   on the verified head (prepared durably, R9.4 rules 1–4, so an
+6. Store the `K` set durably, then sign and publish the `recovery_add`
+   on the confirmed head (prepared durably, R9.4 rules 1–4, so an
    interrupted restore retries the same entry), and show that it takes
-   effect after the wait unless another device approves it.
+   effect after the wait unless another device approves it. On a `409`
+   the device verifies the returned entries (they extend the confirmed
+   head), repeats steps 4–5 on the new head, and rebuilds the entry
+   there.
 
-**Residual rollback risk.** With no host reachable in step 2, the
-restore proceeds as **unconfirmed**: a relay that hides newer entries
-can hand it an older log and the backup that log names. The result is
-incomplete, never wrong: the keys it got are authentic, data sealed
-under a `kid` it lacks is reported as needing a newer backup and never
-rewritten or deleted, and the device neither rotates `K` nor seals a
-backup until a host-signed head confirms its log is current (then it
-fetches the newer backup). A `recovery_add` built on a stale head
-conflicts with what the hosts hold and, being signed by the recovery
-key, freezes them (R9.4): fail closed, re-pair.
+**No recovery on a stale head** (user decision of 2026-10-19, option
+A). The first r9 draft let a restore with no host reachable publish an
+unconfirmed `recovery_add`, at the price of freezing every host whose
+head was newer. That fallback is removed: a `recovery_add` is only
+built on a head that reaches every host-signed head the device
+obtained, so recovery never intentionally forces a freeze or a
+re-pair. A host the device couldn't reach that holds a newer head than
+the relay showed can only exist if the relay hid entries from the
+device; that host then freezes on the `recovery_add` like any relay CAS
+failure (R9.4), which is the relay's doing, not the recovery's.
 
 **A new kit.** After its `set_recovery_key` commits, the replacing
 device seals the retained keys to the new kit at the next version and
@@ -2353,14 +2518,17 @@ Atem never sees `K` from a backup, `R`, the kit's secret or an
 envelope.
 
 Vectors: `r9-vectors-recovery` (kit 1's derivations and X25519 form;
-`k_backup` (version 3) and `k_backup_rotated` (version 4, after a
+its `kit` binding (`account_id`, `genesis_hash`, `kit_tag`) and
+`kit_2.kit`; `substitute_chain`, the refused substitute genesis with its
+backup sealed to kit 1; `k_backup` (version 3) and `k_backup_rotated` (version 4, after a
 rotation to `K-gen-3`) sealed to kit 1; `kit_2` and its
 `k_backup_resealed`; each with `info`, `ikmE` and `backup_hash`), the
 entries in `r9-vectors-membership-log` (`R7`, `R7_backdated`, `A8`,
 `V8`, `A8_ipad`, `V8_ipad`, `N8`, `K7_current` with its `kit_sig`,
 `K7_current_no_kit_sig`, `R8_oldkit`, `R8_newkit`, `K7_lost`, `V8_k`,
-`A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale`) and the
-kits in `r9-vectors-keys` (`recovery`, `recovery-2`, `K-gen-3`).
+`A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale`, and the
+substitute chain `SUB1`–`SUB3`) and the kits in `r9-vectors-keys`
+(`recovery`, `recovery-2`, `K-gen-3`, `host-evil`, `K-evil`).
 
 ### R9.6 Principals, scope, expiry, keys
 
@@ -2374,7 +2542,7 @@ kits in `r9-vectors-keys` (`recovery`, `recovery-2`, `K-gen-3`).
 Each principal has its own §H `control_gen`; `attachment_gen` and
 `controller_session` stay per attachment.
 
-**Ops** (service `scope.ops`, grant `ops`; sorted): `view` (registry,
+**Ops** (service `scope.ops`, grant `ops`; sets, R9.2): `view` (registry,
 chat open/history, terminal subscribe, `receipt_query`; always
 required), `prompt` (prompt submits, with or without §F acquire),
 `interrupt`, `stop`, `terminal` (terminal input/resize), `approval`
@@ -2742,12 +2910,12 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `stale_target` | channel (clear) | `init` names another genesis, host id or trust generation |
 | `account_frozen` | channel (clear, advisory) and session | the host is frozen (R9.4); also closes every attachment when it freezes. A client never persists a freeze from the clear form |
 | `recovery_pending` | session | the principal is the subject of a `recovery_add` pending on this host, or is added only behind one; carries `entry_hash`, `effective_at` (R9.5) |
-| `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, `detail` (e.g. `signer_not_manager`, `recovery_key_retired`, `kit_sig_missing`, `self_approval`, `not_a_recovery_entry`, `blob_version_not_increasing`), and `need_before` when the window starts after a divergence |
+| `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, `detail` (e.g. `signer_not_manager`, `recovery_key_retired`, `kit_sig_missing`, `self_approval`, `not_a_recovery_entry`, `blob_version_not_increasing`, `array_not_canonical`), and `need_before` when the window starts after a divergence |
 | `membership_incomplete` | session | `more` and the principal isn't in the chain yet; carries `head`; reconnect with the next window |
 | `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a failed device-list write ("device list not recorded"), then the journal halt; an unclean device list at start ("device list not recorded") |
+| `busy` | channel/session | also: `init` rate; a failed device-list write ("device list not recorded"), then the journal halt; a held host at start: every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9` |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 
@@ -2766,8 +2934,11 @@ the crate's own dependencies and cross-checked independently):
 `removal-on-an-open-channel`, and the write faults:
 `membership-write-fault-fences-in-memory-and-halts`,
 `uncertain-rename-is-reconciled-at-restart`,
-`uncertain-rename-lost-stays-unclean`,
-`freeze-write-fault-stays-frozen-in-memory`), recovery (accepted,
+`uncertain-rename-lost-is-replayed-then-held`,
+`freeze-write-fault-stays-frozen-in-memory`, and the lost first marker
+with no re-carriage: `lost-carriage-record-restart-stays-held`,
+`lost-intent-restart-replays-and-stays-held`,
+`lost-freeze-restart-replays-the-freeze`), recovery (accepted,
 refused, `pending-then-in-effect-after-24h`,
 `wait-uses-the-host-clock-not-signed-at`, `approve-takes-effect-at-once`,
 `veto-cancels`, `late-veto-has-no-effect`,
@@ -2776,7 +2947,13 @@ refused, `pending-then-in-effect-after-24h`,
 `kit-replaced-without-the-kit-then-vetoed`,
 `kit-replaced-without-the-kit-then-in-effect`,
 `pending-summary-in-every-welcome`, `k-backup-version-only-increases`,
-`restore-refuses-a-rolled-back-backup`), handshake (success, wrong
+`restore-refuses-a-rolled-back-backup`,
+`restore-refuses-a-substitute-chain`,
+`stale-head-withholds-the-recovery`, and the backup writer:
+`k-backup-crash-before-cas`,
+`k-backup-envelope-409-allocates-above-occupied`,
+`k-backup-unrelated-cas-loss-keeps-the-envelope`,
+`k-backup-repeated-collisions-make-progress`), handshake (success, wrong
 head, tampered transcript, replay), hello revision, service scope and
 expiry, browser grant, push hints (sign and verify,
 `schedule-from-created-at-after-a-late-receipt`,
@@ -2799,7 +2976,14 @@ Answered by Astation's r3 review and adopted: the CAS endpoint and its
 bounded `409` (R9.4); no separate push key (R9.9); the native `auth_key`
 is the ceremony P-256 identity, with Astation's fresh / 5-minute
 owner-auth adapter (R9.6); clear errors are advisory (R9.7, R9.11).
-Still open:
+Decided after Astation's r4 review of `016abe7` (user, 2026-10-19,
+option A): **no recovery on a stale head**; the unconfirmed-restore
+fallback is removed and a restore waits for a host-signed head (R9.5).
+Answered from that review: the kit carries and binds the genesis hash
+(R9.5), a durable carriage record plus a membership checkpoint, with a
+held state that only a manager's reconciliation ends (R9.3), committed
+versus occupied backup versions with `409 {max_occupied}` (R9.5), and
+sets versus sequences (R9.2). Still open:
 
 1. Product records: push schedule (stages from `created_at`: 0 s / 60 s
    with `seen`), recovery enrolling a manager into the existing list
@@ -2807,8 +2991,9 @@ Still open:
    reuse are user decisions of 2026-10-19 on Atem's side; Astation's
    recorded policy must be updated to match before r9 is pinned.
 2. K-backup blob storage (`(genesis_hash, blob_version)` put-if-absent,
-   retention of the two newest per kit) is Astation's to shape; the
-   semantics in R9.5 are the requirement.
+   `409 {max_occupied}`, retention of the two newest per kit, an hour
+   for uncommitted envelopes) is Astation's to shape; the semantics in
+   R9.5 are the requirement.
 3. v0.7.2 device ids: re-verification keeps the device id; r9 never
    infers replacement from hostname, relay room or login. A new id is a
    new member (and the old one is removed explicitly).
@@ -2820,3 +3005,14 @@ Still open:
    X25519 conversion of the kit key, which CryptoKit doesn't offer) and
    WebCrypto/WASM must reproduce every `r9-vectors-*` value before the
    pin.
+6. **The printed Recovery Kit changes:** it now carries the account's
+   `genesis_hash` and a 16-byte `kit_tag` beside `R`, the account id and
+   the relay URL (R9.5). Astation owns the text/QR encoding, the setup
+   order (genesis committed before the kit is shown) and the restore
+   flow's waiting screen; kits printed before r9 have no genesis and
+   must be re-issued (`set_recovery_key`, `kit: "current"`).
+7. **Held after an unclean stop** (R9.3): any crash, power loss or
+   halted run pauses remote access to that host until a managing device
+   connects and reconciles. Astation's clients should reconnect a
+   manager promptly when a host reports held (the phone's normal
+   connect does it); services and view-only devices wait.

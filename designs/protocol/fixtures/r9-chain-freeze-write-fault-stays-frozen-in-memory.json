@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.4 (Astation r3 review 1): the freeze record can't be made durable. Atem is frozen in memory at once (every remote principal fenced, init refused account_frozen, push hints stop) and the journal halts; local input goes on. If the machine then loses the write, the host starts unfrozen and freezes again when the conflicting window is carried again (devices keep both entries); a freeze file that reached the disk in any state, even unreadable, keeps it frozen at start. A clear account_frozen is advisory to the client: never a reason to repin or to persist a freeze.",
+  "note": "R9.4 (Astation r3 review 1, r4 review 2): the freeze record can't be made durable. Atem is frozen in memory at once (every remote principal fenced, init refused account_frozen, push hints stop) and the journal halts; local input goes on. A freeze file that reached the disk in any state, even unreadable, keeps it frozen at start (r9-chain-lost-freeze-restart-replays-the-freeze covers a freeze write lost entirely). A clear account_frozen is advisory to the client: never a reason to repin or to persist a freeze.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -123,33 +123,22 @@
         "runtime_gen": "44444444-4444-4444-8444-444444444444",
         "runtime_epoch": 2
       },
-      "disk": "write_lost"
-    },
-    {
-      "assert": {
-        "frozen": false,
-        "head": "E6"
-      }
-    },
-    {
-      "connect": "svc",
-      "carry": [
-        "C6_mac"
-      ],
-      "window": true
-    },
-    {
-      "expect": "svc",
-      "match": {
-        "op": "error",
-        "code": "account_frozen"
-      }
+      "disk": "as_written"
     },
     {
       "assert": {
         "frozen": true,
-        "frozen_durable": true
+        "head": "E6"
       }
+    },
+    {
+      "connect": "phone",
+      "carry": []
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "account_frozen",
+      "at": "init"
     }
   ]
 }

@@ -138,7 +138,11 @@ effect 24 h after each host first sees it, on the host's own clock, unless
 a manager approves it (at once) or vetoes it (cancelled); meanwhile the
 new device has no access and every host shows the pending recovery. `K`
 comes back from an `atem-k-backup-v2` envelope sealed to the kit's public
-key. The kit is replaceable (`set_recovery_key`: with the current kit at
+key. The kit also carries the account's genesis hash (bound to `R` by a
+tag), so a restore trusts only the device list it was made for, never a
+substitute list a relay built around the kit's public key; and a restore
+publishes nothing until a host-signed head confirms the list is current
+(it waits, never recovers on a stale head). The kit is replaceable (`set_recovery_key`: with the current kit at
 once, without it after the same wait and veto). Atem has no command for
 it, and it is not a trust reset. Exact rules: atem-session r9, §R9.5.
 

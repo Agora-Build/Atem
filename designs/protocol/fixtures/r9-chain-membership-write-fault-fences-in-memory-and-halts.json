@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation r3 review 1): the commit of a valid removal fails before the rename (temp fsync). Atem fails closed in the same step, exactly like §H's failed revocation write: the removed principal's attachments are fenced, its lease revoked (its queued raw input is dropped at the write boundary), its accepted work rejected, all in memory; the journal halts, so remote admission, dispatch and remote input stop until the restart; local input goes on. At restart the intent marker (seq 7) is ahead of the stored head (6): the device list is unclean, and no remote principal is admitted (not even svc, still a member at E6) until a carriage re-establishes a head at or beyond the intent; pre-restart work is rejected (no clean close).",
+  "note": "R9.3 (Astation r3 review 1, r4 review 2): the commit of a valid removal fails before the rename (temp fsync of membership.json); the carriage record and the intent are durable. Atem fails closed in the same step, exactly like §H's failed revocation write: the removed principal's attachments are fenced, its lease revoked (its queued raw input is dropped at the write boundary), its accepted work rejected, all in memory; the journal halts, so remote admission, dispatch and remote input stop until the restart; local input goes on. At restart the carriage record is replayed (E7 committed, svc fenced) and, since the halted run wrote no membership checkpoint, the host is held: no remote principal is admitted, not even after another orderly restart and a day, until a managing device whose verified log ends at the host's head reconciles; pre-restart work is rejected (no clean close).",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -205,10 +205,13 @@
     },
     {
       "assert": {
-        "head": "E6",
-        "membership_unclean": {
-          "seq": 7,
-          "hash": "${hash:E7}"
+        "head": "E7",
+        "membership_applied": "E7",
+        "membership_held": true,
+        "membership_unclean": null,
+        "carriage_record": false,
+        "control_gen": {
+          "service:svc-discord": 2
         },
         "receipts": {
           "bbbbbbbb-0000-4000-8000-000000000001": {
@@ -227,14 +230,39 @@
       "match": {
         "op": "error",
         "code": "busy",
-        "detail": "device list not recorded"
+        "detail": "device list not reconciled"
+      }
+    },
+    {
+      "advance_ms": 86400000
+    },
+    {
+      "restart_runtime": {
+        "runtime_gen": "55555555-5555-4555-8555-555555555555",
+        "runtime_epoch": 3
+      }
+    },
+    {
+      "assert": {
+        "membership_held": true
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": []
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not reconciled"
       }
     },
     {
       "connect": "phone",
-      "carry": [
-        "E7"
-      ]
+      "carry": [],
+      "client_head": "E7"
     },
     {
       "expect": "phone",
@@ -249,8 +277,7 @@
     {
       "assert": {
         "head": "E7",
-        "membership_applied": "E7",
-        "membership_unclean": null
+        "membership_held": false
       }
     },
     {

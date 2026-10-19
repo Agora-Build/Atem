@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation r3 review 1): the rename succeeded but the directory fsync failed, so the durable head is uncertain: the run fails closed as for any membership write fault. At restart the renamed file survived: Atem fsyncs membership.json and its directory before trusting it, sees the intent equal to the stored head, replays the fences after membership_applied, and admits normally.",
+  "note": "R9.3 (Astation r3 review 1, r4 review 2): the rename succeeded but the directory fsync failed, so the durable head is uncertain: the run fails closed as for any membership write fault. At restart the renamed file survived: Atem fsyncs membership.json and its directory before trusting it, replays the carriage record (nothing new), replays the fences after membership_applied, and is held because the halted run wrote no checkpoint. A managing device reporting the host's head reconciles it; then the removed service is refused as removed.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -207,6 +207,7 @@
       "assert": {
         "head": "E7",
         "membership_applied": "E7",
+        "membership_held": true,
         "membership_unclean": null,
         "control_gen": {
           "service:svc-discord": 2
@@ -227,13 +228,14 @@
       "expect": "svc",
       "match": {
         "op": "error",
-        "code": "unauthorized",
-        "detail": "removed"
+        "code": "busy",
+        "detail": "device list not reconciled"
       }
     },
     {
       "connect": "phone",
-      "carry": []
+      "carry": [],
+      "client_head": "E7"
     },
     {
       "expect": "phone",
@@ -243,6 +245,23 @@
         "principal": "member:dev-phone",
         "head.seq": 7,
         "head.hash": "${hash:E7}"
+      }
+    },
+    {
+      "assert": {
+        "membership_held": false
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": []
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "unauthorized",
+        "detail": "removed"
       }
     }
   ]

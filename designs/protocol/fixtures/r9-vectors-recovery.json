@@ -50,6 +50,14 @@
     }
   },
   "kind": "vectors",
+  "kit": {
+    "account_id": "acct-test-1",
+    "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+    "kit_tag_hex": "38d5aeaebad0af036ba7bafdc86ab259",
+    "note": "what kit 1 carries besides R (R9.5 \"Recovery Kit v2\"): account_id and genesis_hash (E1's entry_hash, fixed when the kit is made at account setup), bound by kit_tag = HMAC-SHA256(tag_key, enc([\"atem-recovery-kit-v2\", account_id, genesis_hash(32)]))[0..16] with tag_key = HKDF-SHA256(salt empty, ikm R, info \"atem-recovery-kit-tag-v1\", 32). A restore checks the tag, then trusts only a log whose genesis entry hashes to genesis_hash",
+    "tag_input_hex": "000000146174656d2d7265636f766572792d6b69742d76320000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+    "tag_key_hex": "b6e8fc5277b53544165624db8de07eb8cffd9cf12b543fb1e5c3578705f79228"
+  },
   "kit_2": {
     "R_hex": "4a5242ed59c7082d090c9f231a12d2a9556b103487a1939f3cd247ea8c3b0ef8",
     "k_backup_resealed": {
@@ -75,6 +83,14 @@
         "v": 2
       }
     },
+    "kit": {
+      "account_id": "acct-test-1",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "kit_tag_hex": "87b5c6102d2cda3b49fc4696a6e8ea6d",
+      "note": "kit 2 is bound to the genesis its set_recovery_key names (E1): the same account_id and genesis_hash as kit 1, its own tag",
+      "tag_input_hex": "000000146174656d2d7265636f766572792d6b69742d76320000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "tag_key_hex": "24b87407df9e6a8cc823efd5aa2b1d6cc0a4d8d5ef8fea52d00e434200c5ed8d"
+    },
     "note": "Kit 2 replaces kit 1 through set_recovery_key (K7_current at once, or K7_lost after its wait). Any manager re-seals the retained keys to kit 2's public key with blob_version + 1 (no R needed); kit 1 can't open it.",
     "recovery_key": {
       "alg": "ed25519",
@@ -84,7 +100,7 @@
     "x25519_pub_hex": "9cf22770ff538106fbbc159283ddb03ba7edc84af5e945366628ba5016fea506"
   },
   "name": "r9-vectors-recovery",
-  "note": "Recovery Kit v2 (Astation-owned): one 256-bit secret R. sign_seed = HKDF-SHA256(salt empty, ikm R, info \"atem-recovery-sign-v1\", 32) is an Ed25519 seed; its public key is the recovery_key (genesis, or set_recovery_key). The kit's X25519 key is the same key in Montgomery form (secret SHA-512(sign_seed)[0..32], public = Montgomery(recovery_key)). K backup atem-k-backup-v2 = RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, to that X25519 public key, info = enc([\"atem-k-backup-v2\", account_id, genesis_hash(32), u64(blob_version), jcs(kids), recovery_key pub(32)]), empty AAD, plaintext jcs({keys}); the sender's ephemeral is DeriveKeyPair(ikmE). backup_hash = hex(SHA-256(enc([\"atem-k-backup-hash-v1\", jcs(envelope)]))), recorded by the k_backup log entry.",
+  "note": "Recovery Kit v2 (Astation-owned): one 256-bit secret R. sign_seed = HKDF-SHA256(salt empty, ikm R, info \"atem-recovery-sign-v1\", 32) is an Ed25519 seed; its public key is the recovery_key (genesis, or set_recovery_key). The kit's X25519 key is the same key in Montgomery form (secret SHA-512(sign_seed)[0..32], public = Montgomery(recovery_key)). K backup atem-k-backup-v2 = RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, to that X25519 public key, info = enc([\"atem-k-backup-v2\", account_id, genesis_hash(32), u64(blob_version), jcs(kids), recovery_key pub(32)]), empty AAD, plaintext jcs({keys}); the sender's ephemeral is DeriveKeyPair(ikmE). backup_hash = hex(SHA-256(enc([\"atem-k-backup-hash-v1\", jcs(envelope)]))), recorded by the k_backup log entry. The kit also carries account_id and genesis_hash, bound by kit_tag (kit, kit_2.kit); a restore trusts only a log whose genesis is the kit's (substitute_chain is refused).",
   "recovery_entry": {
     "entry": {
       "body": {
@@ -131,5 +147,37 @@
   "recovery_key_matches_genesis_E1": true,
   "recovery_key_x25519_pub_hex": "bf4e6c788975c3b940a9f5c0a51021855c6e2ddebd4da5910c5487604bccab11",
   "requires": "r9",
-  "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616"
+  "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616",
+  "substitute_chain": {
+    "backup": {
+      "backup_hash": "4048ff89e71edd214965c8f0816a5663cd82ba54da4ca345c447e45bc900c2b3",
+      "ikmE_hex": "fa0451e6e4084cf78112d19abd8f58ee53ef75d31bcb01538985a16a7413a9c0",
+      "info_hex": "000000106174656d2d6b2d6261636b75702d76320000000b616363742d746573742d3100000020f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b940000000800000000000000010000000c5b226537653765376537225d0000002098767c988ff0cf727ae9917811e9c4ed63b7fb48608d4c32688db79f2ed94360",
+      "opens_with_kit_1": true,
+      "plain_jcs": "{\"keys\":[{\"k\":\"Ik05R5asx2xd18PBEszg_FtFX9RcJx4pAqSNU5RrkGM\",\"kid\":\"e7e7e7e7\"}]}",
+      "wire": {
+        "account_id": "acct-test-1",
+        "blob_version": 1,
+        "ct": "Jn79-kn4lRHBnUW0vNSjZA5PPCrN3sssvY5Hone7GlESmI0IslUuCZr-FtmPINYbXm79ZdBTUMxn1G_CBBVCRuSqQOBm84MKuVp9dmVX3zfpbzFhsmxFkxHfCIeT9WE",
+        "enc": "4T0N1AwEdWRnravzMHSSPEXwU4qdGphQP4xGkHQT9Fw",
+        "genesis_hash": "f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94",
+        "kids": [
+          "e7e7e7e7"
+        ],
+        "recovery_key": {
+          "alg": "ed25519",
+          "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+        },
+        "v": 2
+      }
+    },
+    "entries": [
+      "SUB1",
+      "SUB2",
+      "SUB3"
+    ],
+    "genesis_hash": "f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94",
+    "note": "Astation r4 review 1: a hostile relay copies kit 1's public key into its own genesis (SUB1, manager dev-evil), adds its own host key as host-a (SUB2), seals an attacker-chosen K (K-evil) to kit 1 (HPKE base mode needs only the public key; ikmE = SHA-256(enc([\"atem-r9-test-key\", \"ikmE env1_sub\"]))) and records it with a k_backup (SUB3). Every signature verifies, the envelope opens with kit 1, and the substitute host can sign a matching accept head; the restore refuses it only because SUB1's entry_hash differs from the genesis_hash kit 1 carries",
+    "refused": "genesis_mismatch"
+  }
 }

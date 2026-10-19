@@ -1,5 +1,10 @@
 {
   "keys": {
+    "K-evil": {
+      "kid": "e7e7e7e7",
+      "note": "an attacker-chosen K (label \"K-evil\") sealed to kit 1's public key in the substitute backup",
+      "secret_hex": "224d394796acc76c5dd7c3c112cce0fc5b455fd45c271e2902a48d53946b9063"
+    },
     "K-gen-3": {
       "kid": "7a3c9e10",
       "note": "a rotated account key K (test value SHA-256(enc([\"atem-r9-test-key\", \"K-gen-3\"]))), first in env4_kit1",
@@ -73,6 +78,14 @@
         "secret_hex": "33f12d10a63332a050fc9a070b69b9b3b05f9a78f9a5c9bf9dcd8484691eaa50"
       }
     },
+    "host-evil": {
+      "host_key": {
+        "alg": "ed25519",
+        "pub_hex": "dea441ca85ecdeae4a0ae82904a133b52cbcd4f227c5e79addcdca69f01ba308",
+        "secret_hex": "ca4dce8e059fce9ad26c0196eb4e8492fb19861bd7e4e394a474f224d0f060f5"
+      },
+      "note": "the substitute chain's host (label \"host-evil host_key\"): SUB2 adds it as host-a; never in log L"
+    },
     "not-recovery": {
       "alg": "ed25519",
       "pub_hex": "239d75b7174b38b0d01499540b5864e9314d1e78b9bcc01fe6ba609e20ec175e",
@@ -81,7 +94,8 @@
     "note": "test keys only: secret = SHA-256(enc([\"atem-r9-test-key\", label])); p256 public keys are SEC1 uncompressed (65 bytes), all binary values base64url without padding in wire objects, hex here",
     "recovery": {
       "R_hex": "de7b07c173601dbcd9053ef7679fcd3a6864af071005397179134682a438dcc6",
-      "note": "the genesis Recovery Kit (kit 1). x25519_secret = SHA-512(sign_seed)[0..32] (X25519 clamps it), x25519_pub = the Montgomery form of sign_pub: K backups are sealed to it (R9.5)",
+      "kit_tag_hex": "38d5aeaebad0af036ba7bafdc86ab259",
+      "note": "the genesis Recovery Kit (kit 1). x25519_secret = SHA-512(sign_seed)[0..32] (X25519 clamps it), x25519_pub = the Montgomery form of sign_pub: K backups are sealed to it (R9.5). The kit also carries account_id acct-test-1, genesis_hash = E1's entry_hash and kit_tag_hex (R9.5 \"Recovery Kit v2\"; r9-vectors-recovery kit)",
       "sign_pub_hex": "98767c988ff0cf727ae9917811e9c4ed63b7fb48608d4c32688db79f2ed94360",
       "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616",
       "x25519_pub_hex": "bf4e6c788975c3b940a9f5c0a51021855c6e2ddebd4da5910c5487604bccab11",
@@ -89,7 +103,8 @@
     },
     "recovery-2": {
       "R_hex": "4a5242ed59c7082d090c9f231a12d2a9556b103487a1939f3cd247ea8c3b0ef8",
-      "note": "the replacement Recovery Kit (kit 2) of set_recovery_key (R9.5): R = SHA-256(enc([\"atem-r9-test-key\", \"recovery-kit-2\"])); x25519 forms as for kit 1",
+      "kit_tag_hex": "87b5c6102d2cda3b49fc4696a6e8ea6d",
+      "note": "the replacement Recovery Kit (kit 2) of set_recovery_key (R9.5): R = SHA-256(enc([\"atem-r9-test-key\", \"recovery-kit-2\"])); x25519 forms as for kit 1. Bound to the same genesis (E1) as kit 1: kit_tag_hex",
       "sign_pub_hex": "6ac71ad781df6ce7ed92841e5bc62f742da067719adaf123445a32160d9662e9",
       "sign_seed_hex": "8c883c0ac87d86005eb18840dc813b4e9e667d0454972f05555413c359ae97db",
       "x25519_pub_hex": "9cf22770ff538106fbbc159283ddb03ba7edc84af5e945366628ba5016fea506",
