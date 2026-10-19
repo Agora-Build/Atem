@@ -131,10 +131,16 @@ is used only in Astation's "restore account" flow on a new device, and does
 two things there: (a) restores the account key `K`, so encrypted memory,
 vault and credentials can be read again; (b) signs a log entry that makes
 the new device a manager of the existing device list, so hosts and phones
-keep working without re-pairing. Atem only verifies and applies that entry
-like any other: it chains from Atem's head and is signed by the recovery key
-pinned in genesis (`recovery_sign_pub`, as in the e2e verification design).
-Atem has no command for it, and it is not a trust reset.
+keep working without re-pairing. Atem verifies that entry like any other:
+it chains from Atem's head and is signed by the current recovery key
+(genesis `recovery_sign_pub`, or a later `set_recovery_key`). It takes
+effect 24 h after each host first sees it, on the host's own clock, unless
+a manager approves it (at once) or vetoes it (cancelled); meanwhile the
+new device has no access and every host shows the pending recovery. `K`
+comes back from an `atem-k-backup-v2` envelope sealed to the kit's public
+key. The kit is replaceable (`set_recovery_key`: with the current kit at
+once, without it after the same wait and veto). Atem has no command for
+it, and it is not a trust reset. Exact rules: atem-session r9, §R9.5.
 
 Without the kit, a lost-everything account re-pairs each Atem host (`atem
 unpair`, `atem pair`), a new genesis and trust generation; account data and

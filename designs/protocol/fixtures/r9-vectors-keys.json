@@ -10,6 +10,18 @@
       "pub_hex": "04a8ecb76c7ae4c016a4a65abc1064a76b3b13461b95f6b3428aed2a7e4ff9634b40ba605e519798b5a766317ec6cccd39aa603e6ca7b9df8a5973220449af0fbf",
       "secret_hex": "dc082d0cf69d63645c354e14ab2d03d086024b29a5680312e8bbc163d6d4467b"
     },
+    "dev-evil": {
+      "auth": {
+        "alg": "p256",
+        "pub_hex": "0461ef7dcc00cd7db5b44e46fc830d3171eebe999a10c5513f1a7881b9c658611b8a78ca543374c51d996a75daf292095d895ef36a3c49d4d2fc8e030744b71895",
+        "secret_hex": "8cbd62a3bedc95f96038163205b29244bb7f132d57d7e3ada69219d03dfc4609"
+      },
+      "enc": {
+        "pub_hex": "46e4de69aa72133d182c74b9d91c7452348a7eb8a766c24d7424b94231e51270",
+        "secret_hex": "94acf97ec62bc4e8cc13049af2f0f38c776208a3e17c228d812f5c960d099121"
+      },
+      "note": "an attacker's device (never a member): labels \"dev-evil auth\" and \"dev-evil enc\"; the member keys in C6_ipad, X7_ipad and X8_badsig"
+    },
     "dev-ipad": {
       "auth": {
         "alg": "p256",
