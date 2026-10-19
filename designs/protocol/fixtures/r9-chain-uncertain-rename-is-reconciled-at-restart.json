@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation r3 review 1, r4 review 2): the rename succeeded but the directory fsync failed, so the durable head is uncertain: the run fails closed as for any membership write fault. At restart the renamed file survived: Atem fsyncs membership.json and its directory before trusting it, replays the carriage record (nothing new), replays the fences after membership_applied, and is held because the halted run wrote no checkpoint. A managing device reporting the host's head reconciles it; then the removed service is refused as removed.",
+  "note": "R9.3 (Astation r3 review 1, r4 review 2): the rename succeeded but the directory fsync failed, so the durable head is uncertain: the run fails closed as for any membership write fault. At restart the renamed file survived: Atem fsyncs membership.json and its directory before trusting it, replays the carriage record (nothing new), replays the fences after membership_applied, and is held because the fault was recorded. A managing device reporting the host's head reconciles it; then the removed service is refused as removed.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -217,7 +217,8 @@
             "state": "rejected",
             "detail": "authorization history unknown"
           }
-        }
+        },
+        "fault_record": true
       }
     },
     {
@@ -249,7 +250,8 @@
     },
     {
       "assert": {
-        "membership_held": false
+        "membership_held": false,
+        "fault_record": false
       }
     },
     {

@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (r4 review 2): the runtime dies after membership.json is durable and before the fences; at start it replays the fences for entries after membership_applied before any remote admission. A crash writes no membership checkpoint, so the host starts held: the removed service gets busy, and a managing device reporting the host's head reconciles it; then the service is refused as removed.",
+  "note": "R9.3 (user decision 2026-10-19, option 2): the runtime dies after membership.json is durable and before the fences, with no write fault. At start it replays the carriage record and the fences after membership_applied before any remote admission, then resumes normally: a plain crash records no fault, so the host is not held.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -68,19 +68,17 @@
           "service:svc-discord": 2
         },
         "attachments": 0,
-        "membership_held": true
+        "membership_held": false,
+        "fault_record": false
       }
     },
     {
       "reconnect": "svc"
     },
     {
-      "expect": "svc",
-      "match": {
-        "op": "error",
-        "code": "busy",
-        "detail": "device list not reconciled"
-      }
+      "expect_channel_or_session_error": "svc",
+      "code": "unauthorized",
+      "detail": "removed"
     },
     {
       "connect": "mac",
@@ -101,19 +99,6 @@
         "head.seq": 7,
         "head.hash": "${hash:E7}"
       }
-    },
-    {
-      "assert": {
-        "membership_held": false
-      }
-    },
-    {
-      "reconnect": "svc"
-    },
-    {
-      "expect_channel_or_session_error": "svc",
-      "code": "unauthorized",
-      "detail": "removed"
     }
   ]
 }

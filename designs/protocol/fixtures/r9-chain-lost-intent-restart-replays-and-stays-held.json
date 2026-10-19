@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation r4 review 2): the carriage record of a valid removal (E7, svc) is durable, then the intent write fails and is lost entirely. Atem fences svc in memory and halts. At restart nothing re-carries E7: the carriage record is replayed, so E7 is committed and svc fenced again, and the host is held (no checkpoint): it admits nobody on its own, not after a day and another orderly restart. A managing device reporting E7 reconciles it; svc stays removed.",
+  "note": "R9.3 (Astation r4 review 2): the carriage record of a valid removal (E7, svc) is durable, then the intent write fails and is lost entirely. Atem fences svc in memory and halts. At restart nothing re-carries E7: the carriage record is replayed, so E7 is committed and svc fenced again, and the host is held (the fault was recorded): it admits nobody on its own, not after a day and another orderly restart. A managing device reporting E7 reconciles it; svc stays removed.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -123,7 +123,8 @@
         "carriage_record": false,
         "control_gen": {
           "service:svc-discord": 2
-        }
+        },
+        "fault_record": true
       }
     },
     {
@@ -181,7 +182,8 @@
     },
     {
       "assert": {
-        "membership_held": false
+        "membership_held": false,
+        "fault_record": false
       }
     },
     {

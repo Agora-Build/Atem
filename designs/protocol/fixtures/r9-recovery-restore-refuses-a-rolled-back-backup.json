@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "client",
   "log": "r9-vectors-membership-log",
-  "note": "R9.5 (Astation r3 review 3, r4 reviews 1 and 3): a restore takes its anchor from the kit (account_id and genesis_hash, bound by kit_tag), its version floor from the log's newest k_backup entry and its freshness from host-signed accept heads (an init needs no membership). A relay serving an older log than a host signed, an older authentic backup than the newest k_backup, or an occupied but uncommitted version (the version-4 envelope while the log names version 3) is refused; a kit whose bound fields were altered, or a replaced kit, is refused before any recovery_add is published. The no-host case is r9-recovery-stale-head-withholds-the-recovery.",
+  "note": "R9.5 (Astation r3 review 3, r4 reviews 1 and 3): a restore takes its anchor from the kit (account_id and genesis_hash, bound by kit_tag), its version floor from the log's newest k_backup entry and its freshness from host-signed accept heads (an init needs no membership). A relay serving an older log than a host signed, an older authentic backup than the newest k_backup, or an occupied but uncommitted version (the version-4 envelope while the log names version 3) is refused; a kit whose bound fields were altered, or a replaced kit, is refused before any recovery_add is published. The no-host case is r9-recovery-stale-head-withholds-the-recovery. A backup whose hash matches its k_backup entry (KB8_badct) but whose ciphertext was altered fails to open with the correct kit: backup_invalid.",
   "setup": {
     "account_id": "acct-test-1",
     "genesis_hash": "${hash:E1}",
@@ -104,6 +104,28 @@
       },
       "result": "refused",
       "detail": "kit_tag_mismatch",
+      "published": false
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7",
+          "KB8_badct"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup_bad_ct.wire}",
+        "host_heads": {
+          "host-a": "KB8_badct"
+        }
+      },
+      "result": "refused",
+      "detail": "backup_invalid",
       "published": false
     },
     {

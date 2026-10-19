@@ -122,7 +122,8 @@
         "frozen": true,
         "frozen_durable": true,
         "head": "E6",
-        "carriage_record": false
+        "carriage_record": false,
+        "fault_record": true
       }
     },
     {

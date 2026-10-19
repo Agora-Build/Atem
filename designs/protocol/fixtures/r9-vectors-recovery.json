@@ -24,6 +24,28 @@
       "v": 2
     }
   },
+  "k_backup_bad_ct": {
+    "backup_hash": "9e684321f2c6baa90f290bab5fb1baf1983c45cf056b5ebea5a3cd215507bb56",
+    "note": "k_backup_rotated with the last ciphertext byte flipped; named by KB8_badct, so backup_hash matches but opening fails the AEAD tag: backup_invalid",
+    "opens_with_kit_1": false,
+    "wire": {
+      "account_id": "acct-test-1",
+      "blob_version": 4,
+      "ct": "KL265NP4y9601aVJ7tUU9I-9qrEgIkQRPMQ-SwZy5Fz1O1XVp6EC3bvIeU3kGhtYAjT1hY49G0QcwjgigSpAHEGd-ES2iRykJNprgeMiHprlSUPQnJiwl6cpKrHP3vF0ufLi0kT6fn6fc3KsEjv9gc8d4jn1-86zJGt0cbD9HoS3pVOxOvq_J9ez86w09y_txkcFofbfeGwCsRPRGPAFeB9KQ3xTDi-PVCt911UkI5Wj5rI1f1klinJuz1wj9boFqRdGUqoY4JaFUEl7IB6N-0T7j7FvBW0RDyfb6cnIyqc9agMwXvCVjB0",
+      "enc": "JMRVEMOWHqxazgjDJZXL55CYxHFuht1IGbaeWxihMC0",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "kids": [
+        "7a3c9e10",
+        "b982533d",
+        "1f2e3d4c"
+      ],
+      "recovery_key": {
+        "alg": "ed25519",
+        "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+      },
+      "v": 2
+    }
+  },
   "k_backup_rotated": {
     "backup_hash": "e074775d6eac5f2b12b8d2e30ccc6d5b3ae0d783146796ffc12aae96c5401675",
     "ikmE_hex": "9beed52415255516760924aeb4430cea5c5da955e8e538e82380625ebc9eeb7e",

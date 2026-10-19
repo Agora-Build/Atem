@@ -1868,8 +1868,8 @@ state change (R9.5).
 `host_channel_key` (Ed25519 seed) is `pairing/host_channel_key`, 0600,
 plain like `unlock_auth_key` (it only proves the host to clients, so it
 works while the cred agent is locked). `atem unpair` deletes both files
-(and the carriage record, intent and checkpoint of "Writing the device
-list" below), keeps `pairing/frozen_genesis` (≤ 16 hashes), and rotates the key at the
+(and the carriage record, intent and fault record of "Writing the
+device list" below), keeps `pairing/frozen_genesis` (≤ 16 hashes), and rotates the key at the
 next pairing. The journal gains `<journal>/membership_applied`
 (`{seq, hash}`: the head whose fences are durable).
 
@@ -1963,21 +1963,22 @@ its attachments fenced, its lease revoked (the input epoch rises, so the
 worker drops its queued raw bytes at the write boundary), and its
 `accepted` work not yet `executing` rejected (`control revoked`). A
 freeze also takes effect in memory at once (R9.4). Membership is then
-**faulted** for the run (every later carriage is refused unread) and
-the journal halts (§I): every `init` gets a clear `busy`, every later
+**faulted** for the run (every later carriage is refused unread), the
+fault is **recorded** (below), and the journal halts (§I): every `init` gets a clear `busy`, every later
 session request but `hello` is `busy` "journal halted; restart Atem",
 nothing queued is dispatched, no remote terminal input is written and no
 new push hint is sent, until the restart. Local use goes on. Atem never
 retries the write in the same run.
 
-**Membership checkpoint.** `pairing/membership.clean` = `{v:1,
-runtime_epoch, head{seq,hash}}` (temp, fsync, rename, directory fsync)
-is written only in an orderly stop, in the step that writes §H's clean
-close, and only when membership is idle and healthy: no carriage record,
-no intent, no device-list write fault in this run, the journal not
-halted, and the host not held (below). Nothing else writes it. Every
-start increments `runtime_epoch` (§H), so a checkpoint vouches for
-exactly one run: the one that wrote it.
+**Fault record** (user decision of 2026-10-19, option 2).
+`pairing/membership.fault` = `{v:1, runtime_epoch, file, at}` (temp,
+fsync, rename, directory fsync) is written in the fail-closed step of
+any observed device-list write fault: a failed write, fsync, rename or
+directory fsync of the carriage record, the intent, `membership.json`
+or the freeze file. A fault record in any state, even unreadable, counts.
+If it can't be written either, the run is halted as above and the
+failure is logged; the restart then relies on the carriage record
+alone. Only a manager's reconciliation removes it (below).
 
 **Crash recovery.** At start, before any remote admission, Atem fsyncs
 `membership.json` and the `pairing/` directory (a rename that is
@@ -2000,11 +2001,11 @@ visible becomes durable; a failure disables remote sessions,
    writes `membership_applied`. An unreadable `membership.json` or an
    applied head ahead of the stored head disables remote sessions
    (`welcome.host_error`); nothing is reset silently.
-4. **Held** unless `membership.clean` names the previous run
-   (`runtime_epoch − 1`) and the head stored at start, and no intent is
-   left beyond the head. A crash, power loss or kill, a halted run, a
-   write fault, a lost or stale checkpoint, and a `pairing/` directory
-   restored from a backup all leave the host held.
+4. **Held** when a fault record exists, or when the replay can't
+   reconcile the carriage record (unreadable, or an intent left beyond
+   the head after it). Otherwise the host resumes remote admission
+   normally: an unclean stop with no recorded fault (a crash, power
+   loss or kill) replays the carriage record and goes on.
 5. Pre-restart `accepted` work follows §H Recovery (a run that halted
    never wrote a clean close, so it is `rejected`, `authorization
    history unknown`).
@@ -2016,8 +2017,8 @@ removals land), and every `hello` except a reconciling one gets `busy`
 "device list not reconciled" after its carriage. No push hint is sent.
 `atem status`, `atem agent list` and the agent terminal's status row say
 that remote access waits for a managing device. Nothing on the host's
-side ends it: not time, not a restart (a held run writes no checkpoint),
-not the host's own relay fetch, not a carriage by a service, a view-only
+side ends it: not time, not a restart (the fault record stays), not
+the host's own relay fetch, not a carriage by a service, a view-only
 member or an unknown carrier. **Reconciliation** is a `hello` that,
 after its carriage is applied:
 
@@ -2032,24 +2033,32 @@ after its carriage is applied:
   hash keeps the host held, evidence `intent_mismatch`; the way out is
   re-pairing).
 
-The host then leaves held for the run (logged; its next orderly stop
-writes the checkpoint) and admits that `hello` normally. A manager
+The host then removes the fault record (directory fsync; if that
+fails, it stays held for the run), leaves held (logged) and admits that
+`hello` normally. A manager
 whose log is behind the host's head gets `busy` "device list not
 reconciled", fetches from the relay and reconnects.
 
 Why this is safe: everything the host evaluated was durable before it
 was evaluated and is replayed, so no conflict or removal it saw can be
-lost by a failed or lost later write; a carriage whose record never
-became durable was never evaluated, so the host learnt nothing that its
-carrier couldn't equally have withheld (and every honest copy, on
-devices and at the relay, still exists). The held state covers what the
-record can't: storage that lost an acknowledged write, and a `pairing/`
-directory rolled back as a whole. A managing device whose own verified
-log ends at the host's head is independent evidence that the head is
-current. A manager whose key was stolen can reconcile too; that key
-admits it anyway, and it can't erase a conflict the record holds. If
-no managing device can ever connect, the way out is re-pairing (`atem
-unpair`, `atem pair`).
+lost by a failed or lost later write, with or without a crash; a
+carriage whose record never became durable was never evaluated, so the
+host learnt nothing that its carrier couldn't equally have withheld
+(and every honest copy, on devices and at the relay, still exists). A
+recorded fault holds the host until a managing device whose own verified
+log ends at the host's head confirms it. A manager whose key was stolen
+can reconcile too; that key admits it anyway, and it can't erase a
+conflict the record holds. If no managing device can ever connect, the
+way out is re-pairing (`atem unpair`, `atem pair`).
+
+**Residual risks (accepted, user decision of 2026-10-19, option 2).**
+Without a fault the host trusts its disk at start, so two cases are not
+covered: storage that drops writes it already reported as done (a
+carriage record, intent or freeze that fsync acknowledged and the disk
+then lost, with no fault observed), and a `pairing/` directory restored
+as a whole from an older backup. Either can bring back an older head
+or lose a freeze; the next carriage of the newer entries or the
+conflict re-establishes them. Both are accepted.
 
 **On an open channel** a client sends `membership{id, entries}` whenever
 it learns newer entries; same algorithm; reply `membership_head{re,
@@ -2094,7 +2103,7 @@ row that matches (the first three are the recovery decisions of R9.5):
 memory at once and the journal halts; at the restart a freeze file that
 reached the disk in any state keeps it frozen, and otherwise the
 carriage record, durable before the conflict was evaluated, is replayed
-and freezes it again), then
+and freezes it again; the fault record also holds it, R9.3), then
 every remote principal is fenced (§H, `control_revoked`; attachments
 closed with session `error{code:"account_frozen"}`), every `init` is
 answered `account_frozen` before any key work, membership processing
@@ -2519,14 +2528,15 @@ envelope.
 
 Vectors: `r9-vectors-recovery` (kit 1's derivations and X25519 form;
 its `kit` binding (`account_id`, `genesis_hash`, `kit_tag`) and
-`kit_2.kit`; `substitute_chain`, the refused substitute genesis with its
+`kit_2.kit`; `k_backup_bad_ct` (named by `KB8_badct`, fails to open);
+`substitute_chain`, the refused substitute genesis with its
 backup sealed to kit 1; `k_backup` (version 3) and `k_backup_rotated` (version 4, after a
 rotation to `K-gen-3`) sealed to kit 1; `kit_2` and its
 `k_backup_resealed`; each with `info`, `ikmE` and `backup_hash`), the
 entries in `r9-vectors-membership-log` (`R7`, `R7_backdated`, `A8`,
 `V8`, `A8_ipad`, `V8_ipad`, `N8`, `K7_current` with its `kit_sig`,
 `K7_current_no_kit_sig`, `R8_oldkit`, `R8_newkit`, `K7_lost`, `V8_k`,
-`A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale`, and the
+`A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale`, `KB8_badct`, and the
 substitute chain `SUB1`–`SUB3`) and the kits in `r9-vectors-keys`
 (`recovery`, `recovery-2`, `K-gen-3`, `host-evil`, `K-evil`).
 
@@ -2915,7 +2925,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a failed device-list write ("device list not recorded"), then the journal halt; a held host at start: every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
+| `busy` | channel/session | also: `init` rate; a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9` |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 
@@ -2938,7 +2948,8 @@ the crate's own dependencies and cross-checked independently):
 `freeze-write-fault-stays-frozen-in-memory`, and the lost first marker
 with no re-carriage: `lost-carriage-record-restart-stays-held`,
 `lost-intent-restart-replays-and-stays-held`,
-`lost-freeze-restart-replays-the-freeze`), recovery (accepted,
+`lost-freeze-restart-replays-the-freeze`, and
+`crash-after-a-recorded-fault-stays-held`), recovery (accepted,
 refused, `pending-then-in-effect-after-24h`,
 `wait-uses-the-host-clock-not-signed-at`, `approve-takes-effect-at-once`,
 `veto-cancels`, `late-veto-has-no-effect`,
@@ -2980,8 +2991,8 @@ Decided after Astation's r4 review of `016abe7` (user, 2026-10-19,
 option A): **no recovery on a stale head**; the unconfirmed-restore
 fallback is removed and a restore waits for a host-signed head (R9.5).
 Answered from that review: the kit carries and binds the genesis hash
-(R9.5), a durable carriage record plus a membership checkpoint, with a
-held state that only a manager's reconciliation ends (R9.3), committed
+(R9.5), a durable carriage record replayed at start plus a fault record,
+with a held state that only a manager's reconciliation ends (R9.3), committed
 versus occupied backup versions with `409 {max_occupied}` (R9.5), and
 sets versus sequences (R9.2). Still open:
 
@@ -3011,8 +3022,12 @@ sets versus sequences (R9.2). Still open:
    order (genesis committed before the kit is shown) and the restore
    flow's waiting screen; kits printed before r9 have no genesis and
    must be re-issued (`set_recovery_key`, `kit: "current"`).
-7. **Held after an unclean stop** (R9.3): any crash, power loss or
-   halted run pauses remote access to that host until a managing device
-   connects and reconciles. Astation's clients should reconnect a
-   manager promptly when a host reports held (the phone's normal
-   connect does it); services and view-only devices wait.
+7. **Held only after a recorded fault** (decided, user, 2026-10-19,
+   option 2; R9.3): a plain crash or power loss replays the carriage
+   record and resumes; a recorded device-list write fault, or a carriage
+   record the start can't reconcile, holds remote access until a
+   managing device reconciles. Accepted residual risks: storage that
+   drops acknowledged writes, and a `pairing/` directory restored from
+   an older backup. Astation's clients should reconnect a manager
+   promptly when a host reports held; services and view-only devices
+   wait.

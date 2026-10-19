@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation r4 review 2): the first device-list write, the carriage record, fails and is lost entirely, so nothing about the carriage (here a conflicting window, C6_mac) reached the disk. Atem never evaluated it: it refuses the carriage unread, fences every remote principal in memory and halts. At restart the host is not frozen (it never learnt of a conflict) but held, since the halted run wrote no membership checkpoint: no remote hello is admitted, not after a day and another orderly restart, and nothing re-carries the conflict. Only a managing device whose verified log ends at the host's head reconciles it.",
+  "note": "R9.3 (Astation r4 review 2): the first device-list write, the carriage record, fails and is lost entirely, so nothing about the carriage (here a conflicting window, C6_mac) reached the disk. Atem never evaluated it: it refuses the carriage unread, fences every remote principal in memory and halts. At restart the host is not frozen (it never learnt of a conflict) but held, since the fault was recorded (the fault record is a separate write that succeeded): no remote hello is admitted, not after a day and another orderly restart, and nothing re-carries the conflict. Only a managing device whose verified log ends at the host's head reconciles it.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -125,7 +125,8 @@
         "frozen": false,
         "head": "E6",
         "membership_held": true,
-        "carriage_record": false
+        "carriage_record": false,
+        "fault_record": true
       }
     },
     {
@@ -203,7 +204,8 @@
     },
     {
       "assert": {
-        "membership_held": false
+        "membership_held": false,
+        "fault_record": false
       }
     }
   ]

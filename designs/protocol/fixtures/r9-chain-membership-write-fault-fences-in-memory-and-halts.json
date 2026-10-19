@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation r3 review 1, r4 review 2): the commit of a valid removal fails before the rename (temp fsync of membership.json); the carriage record and the intent are durable. Atem fails closed in the same step, exactly like §H's failed revocation write: the removed principal's attachments are fenced, its lease revoked (its queued raw input is dropped at the write boundary), its accepted work rejected, all in memory; the journal halts, so remote admission, dispatch and remote input stop until the restart; local input goes on. At restart the carriage record is replayed (E7 committed, svc fenced) and, since the halted run wrote no membership checkpoint, the host is held: no remote principal is admitted, not even after another orderly restart and a day, until a managing device whose verified log ends at the host's head reconciles; pre-restart work is rejected (no clean close).",
+  "note": "R9.3 (Astation r3 review 1, r4 review 2): the commit of a valid removal fails before the rename (temp fsync of membership.json); the carriage record and the intent are durable. Atem fails closed in the same step, exactly like §H's failed revocation write: the removed principal's attachments are fenced, its lease revoked (its queued raw input is dropped at the write boundary), its accepted work rejected, all in memory; the journal halts, so remote admission, dispatch and remote input stop until the restart; local input goes on. At restart the carriage record is replayed (E7 committed, svc fenced) and, since the fault was recorded, the host is held: no remote principal is admitted, not even after another orderly restart and a day, until a managing device whose verified log ends at the host's head reconciles; pre-restart work is rejected (no clean close).",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -218,7 +218,8 @@
             "state": "rejected",
             "detail": "authorization history unknown"
           }
-        }
+        },
+        "fault_record": true
       }
     },
     {
@@ -277,7 +278,8 @@
     {
       "assert": {
         "head": "E7",
-        "membership_held": false
+        "membership_held": false,
+        "fault_record": false
       }
     },
     {
