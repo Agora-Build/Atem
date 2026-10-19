@@ -17,7 +17,12 @@ use atem_client::encoding::{Hash32, b64u, b64u_decode, enc, hex, u64_field};
 use atem_client::hpke;
 use atem_client::keys::{Alg, PublicKey, ed25519_public_to_x25519, enc_kid};
 use atem_client::kit::{self, RecoveryKit};
+use atem_client::membership::{
+    Check, Entry, Head, HostNow, Invalid, Member, MemberKind, Membership, RECOVERY_WAIT_MS,
+    RecoveryState, Role, Stop,
+};
 use atem_client::provider::sign;
+use atem_client::restore::{HostHead, restore};
 use atem_client::{Error, KeyId, KeyProvider, SignedObject, SoftwareKeys};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -28,10 +33,8 @@ fn strict(value: &Value) -> StrictValue {
     StrictValue::parse(value.to_string().as_bytes(), usize::MAX).unwrap()
 }
 
-const TASK2: &str = "Task 2 (membership-log verifier: chain and action rules)";
 const TASK3: &str = "Task 3 (atem-ch1 transcript, key schedule, framing)";
 const TASK4: &str = "Task 4 (principals, grants, push hint and seen rules)";
-const RESTORE: &str = "the restore flow over the verified chain (Task 2's verifier, then a client machine; the plan names no task)";
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../designs/protocol/fixtures")
@@ -447,19 +450,215 @@ fn signer_of(label: &str, signer: &str) -> SigExpect {
 }
 
 /// Context-dependent refusals of the membership-log vectors: they need the
-/// chain, the host's pending state or the action rules.
+/// chain, the verifier's pending state or the action rules.
 fn chain_reason(label: &str) -> Option<&'static str> {
     match label {
-        "X7_ipad" => Some("invalid: signer not a manager at the head"),
-        "X5_svc91d" => Some("invalid: service expiry over 90 days"),
-        "R7_roles" => Some("invalid: recovery_add roles not exactly control/manage/view"),
-        "R7_remove" => Some("invalid: the recovery signer may only recovery_add"),
+        "X7_ipad" => Some("invalid: signer not a manager at the head: signer_not_manager"),
+        "X5_svc91d" => Some("invalid: service expiry over 90 days: service_expiry"),
+        "R7_roles" => {
+            Some("invalid: recovery_add roles not exactly control/manage/view: bad_roles")
+        }
+        "R7_remove" => {
+            Some("invalid: the recovery signer may only recovery_add: recovery_signer_action")
+        }
         "A8_ipad" | "V8_ipad" => Some("invalid: signer_not_manager"),
         "R8_oldkit" | "R8_oldkit_after_lost" => Some("invalid: recovery_key_retired"),
         "A8_k_self" => Some("invalid: self_approval"),
         "KB8_stale" => Some("invalid: blob_version_not_increasing"),
         _ => None,
     }
+}
+
+/// The membership-log vectors as entries, and chains built from them on a
+/// verifier's clock.
+struct Context {
+    vectors: BTreeMap<String, Value>,
+    genesis: Hash32,
+    now: HostNow,
+}
+
+impl Context {
+    fn new(log: &Value, others: &Value, genesis: Hash32) -> Self {
+        let vectors = log
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(others.as_array().unwrap())
+            .map(|v| (s(v, "label").to_owned(), v.clone()))
+            .collect();
+        Context {
+            vectors,
+            genesis,
+            now: HostNow {
+                wall_ms: 1_793_177_601_000,
+                mono_ms: 1_000,
+                boot_id: "boot-1".into(),
+            },
+        }
+    }
+
+    fn parse(&self, label: &str) -> Result<Entry, Invalid> {
+        Entry::from_strict(&strict(&self.vectors[label]["entry"]))
+    }
+
+    fn entry(&self, label: &str) -> Entry {
+        self.parse(label).unwrap_or_else(|e| panic!("{label}: {e}"))
+    }
+
+    /// Log L (E1–E6) followed by `more`.
+    fn chain(&self, more: &[&str]) -> Membership {
+        let labels = ["E1", "E2", "E3", "E4", "E5", "E6"].iter().chain(more);
+        let entries: Vec<Entry> = labels.map(|l| self.entry(l)).collect();
+        let verified =
+            Membership::verify_chain("acct-test-1", &self.genesis, &entries, &self.now).unwrap();
+        assert!(verified.deferred.is_none());
+        verified.membership
+    }
+
+    /// Checks `label` as the next entry after L + `more`.
+    fn check(&self, more: &[&str], label: &str) -> Check {
+        self.chain(more).check_next(&self.entry(label))
+    }
+
+    fn hash(&self, label: &str) -> Hash32 {
+        self.entry(label).hash()
+    }
+
+    /// The vector's refusal in its context: the `membership_invalid` detail.
+    fn refusal(&self, label: &str) -> String {
+        let invalid = |check: Check| match check {
+            Check::Invalid(reason) => reason.code().to_owned(),
+            other => panic!("{label}: {other:?}"),
+        };
+        match label {
+            "X5_svc91d" | "R7_roles" | "R7_remove" => {
+                self.parse(label).unwrap_err().code().to_owned()
+            }
+            "X7_ipad" => invalid(self.check(&[], label)),
+            "A8_ipad" | "V8_ipad" => invalid(self.check(&["R7"], label)),
+            "R8_oldkit" => invalid(self.check(&["K7_current"], label)),
+            "R8_oldkit_after_lost" => {
+                // Valid while K7_lost is pending (the old kit is still
+                // current); retired once the replacement takes effect.
+                let mut m = self.chain(&["K7_lost"]);
+                assert_eq!(m.check_next(&self.entry(label)), Check::Valid);
+                let mut later = self.now.clone();
+                later.wall_ms += RECOVERY_WAIT_MS;
+                later.mono_ms += RECOVERY_WAIT_MS;
+                m.advance(&later);
+                invalid(m.check_next(&self.entry(label)))
+            }
+            "A8_k_self" => invalid(self.check(&["K7_lost"], label)),
+            "KB8_stale" => invalid(self.check(&["KB7"], label)),
+            other => panic!("no context for {other}"),
+        }
+    }
+}
+
+/// Every alternative in its context (§R9.2–§R9.5): validity, deferral,
+/// pending recovery and kit replacement, and the conflict rule.
+fn alternatives_in_context(run: &mut Run, ctx: &Context) {
+    let state = |m: &Membership, label: &str| m.record(&ctx.hash(label)).unwrap().state();
+    let conflict = |base: &[&str], label: &str| {
+        let m = ctx.chain(base);
+        let eval = m.evaluate(&[strict(&ctx.vectors[label]["entry"])], &ctx.now);
+        match eval.stop {
+            Some(Stop::Conflict { outcome, .. }) => outcome,
+            other => panic!("{label}: {other:?}"),
+        }
+    };
+
+    // Plain successors and a bad signature.
+    assert_eq!(ctx.check(&[], "E7"), Check::Valid);
+    assert_eq!(ctx.hash("E7_retry"), ctx.hash("E7"));
+    assert_eq!(
+        ctx.check(&["E7"], "X8_badsig"),
+        Check::Invalid(Invalid::BadSignature)
+    );
+    let before_e6 = Membership::verify_chain(
+        "acct-test-1",
+        &ctx.genesis,
+        &["E1", "E2", "E3", "E4", "E5"].map(|l| ctx.entry(l)),
+        &ctx.now,
+    )
+    .unwrap()
+    .membership;
+    assert_eq!(before_e6.check_next(&ctx.entry("S6_phone")), Check::Valid);
+    run.pass("E7 on L, X8_badsig refused bad_signature, S6_phone valid on E5");
+
+    // Conflicts at seq 6 against L (§R9.4).
+    use atem_client::membership::{Conflict, EvidenceReason};
+    assert_eq!(
+        conflict(&[], "C6_ipad"),
+        Conflict::Ignored(EvidenceReason::SignerRemoved)
+    );
+    assert_eq!(conflict(&[], "C6_mac"), Conflict::Freeze);
+    assert_eq!(conflict(&[], "S6_phone"), Conflict::Freeze);
+    assert_eq!(conflict(&[], "R6_conflict"), Conflict::Freeze);
+    run.pass("C6_ipad ignored (signer removed); C6_mac, S6_phone, R6_conflict freeze");
+
+    // Recovery entries and decisions.
+    assert_eq!(ctx.check(&[], "R7"), Check::Valid);
+    assert_eq!(
+        ctx.check(&[], "R7_wrong_key"),
+        Check::Invalid(Invalid::BadSignature)
+    );
+    assert_eq!(ctx.check(&[], "R7_backdated"), Check::Valid);
+    let m = ctx.chain(&["R7"]);
+    assert_eq!(state(&m, "R7"), RecoveryState::Pending);
+    assert_eq!(
+        m.check_next(&ctx.entry("N8")),
+        Check::Deferred(ctx.hash("R7"))
+    );
+    assert_eq!(
+        state(&ctx.chain(&["R7", "A8"]), "R7"),
+        RecoveryState::Active
+    );
+    assert_eq!(
+        state(&ctx.chain(&["R7", "V8"]), "R7"),
+        RecoveryState::Cancelled
+    );
+    let mut later = ctx.now.clone();
+    later.wall_ms += RECOVERY_WAIT_MS;
+    later.mono_ms += RECOVERY_WAIT_MS;
+    let mut waited = ctx.chain(&["R7"]);
+    waited.advance(&later);
+    assert_eq!(state(&waited, "R7"), RecoveryState::Active);
+    assert_eq!(waited.check_next(&ctx.entry("N8")), Check::Valid);
+    run.pass("R7 pending (R7_wrong_key refused); A8 activates, V8 cancels, 24 h activates; N8 deferred, then valid");
+
+    // Kit replacement both ways.
+    let current = ctx.chain(&["K7_current"]);
+    assert_ne!(*current.recovery_key(), *ctx.chain(&[]).recovery_key());
+    assert_eq!(
+        ctx.parse("K7_current_no_kit_sig").unwrap_err(),
+        Invalid::KitSigMissing
+    );
+    assert_eq!(current.check_next(&ctx.entry("R8_newkit")), Check::Valid);
+    let lost = ctx.chain(&["K7_lost"]);
+    assert_eq!(state(&lost, "K7_lost"), RecoveryState::Pending);
+    let vetoed = ctx.chain(&["K7_lost", "V8_k"]);
+    assert_eq!(state(&vetoed, "K7_lost"), RecoveryState::Cancelled);
+    assert_eq!(vetoed.recovery_key(), ctx.chain(&[]).recovery_key());
+    run.pass("K7_current in effect at once (R8_newkit valid); K7_lost pending, V8_k cancels it");
+
+    // K backups.
+    let kb = ctx.chain(&["KB7", "KB8"]);
+    assert_eq!(kb.k_backup().unwrap().blob_version, 4);
+    assert_eq!(ctx.check(&["KB7"], "KB8_badct"), Check::Valid);
+    run.pass("KB7 then KB8 (version 3 → 4), KB8_badct valid on KB7");
+
+    // The substitute chain: valid under its own genesis, never under E1's.
+    let sub = ["SUB1", "SUB2", "SUB3"].map(|l| ctx.entry(l));
+    let own = Membership::verify_chain("acct-test-1", &sub[0].hash(), &sub, &ctx.now).unwrap();
+    assert_eq!(own.membership.head().seq, 3);
+    assert_eq!(
+        Membership::verify_chain("acct-test-1", &ctx.genesis, &sub, &ctx.now)
+            .unwrap_err()
+            .reason,
+        Invalid::GenesisMismatch
+    );
+    run.pass("SUB1–SUB3 verify on their own genesis and are refused genesis_mismatch under E1");
 }
 
 #[test]
@@ -471,6 +670,7 @@ fn membership_log() {
     let log = run.get("log");
     let others = run.get("others");
     let head = run.get("head");
+    let context = Context::new(&log, &others, genesis);
 
     let mut hashes: BTreeMap<String, Hash32> = BTreeMap::new();
     for vector in log
@@ -580,7 +780,9 @@ fn membership_log() {
             if let Some(code) = vector.get("reason") {
                 assert!(reason.ends_with(code.as_str().unwrap()), "{label}");
             }
-            run.pending(format!("{label}: {reason}"), TASK2);
+            let detail = context.refusal(label);
+            assert!(reason.ends_with(&detail), "{label}: {detail}");
+            run.pass(format!("{label}: {reason} (in context)"));
         } else if vector.get("valid") == Some(&Value::Bool(false)) {
             assert!(
                 matches!(signer_of(label, s(body, "signer")), SigExpect::Bad(_)),
@@ -620,14 +822,13 @@ fn membership_log() {
         }
     }
     run.pass("log L: genesis_hash, head, member and host keys, E7_retry = E7");
-    run.pending(
-        "log L E1–E6: chain verification (seq, prev_hash, signers in effect, action rules)",
-        TASK2,
-    );
-    run.pending(
-        "alternatives in context (conflicts, deferral, pending recovery, kit replacement)",
-        TASK2,
-    );
+    let l = context.chain(&[]);
+    assert_eq!(l.head().seq, 6);
+    assert_eq!(l.head().hash.to_hex(), s(&head, "hash"));
+    assert_eq!(l.members(), ["dev-mac", "dev-phone", "svc-discord"]);
+    assert!(l.host("host-a").is_some());
+    run.pass("log L E1–E6: chain verification (seq, prev_hash, signers in effect, action rules)");
+    alternatives_in_context(&mut run, &context);
     run.finish();
 }
 
@@ -920,10 +1121,71 @@ fn recovery() {
     assert_eq!(evil[0].kid, s(&book.keys["K-evil"], "kid"));
     assert_eq!(hex(&*evil[0].k), s(&book.keys["K-evil"], "secret_hex"));
     run.pass("substitute_chain: opens with kit 1 yet refused genesis_mismatch by the kit's anchor");
-    run.pending(
-        "restore flow (fetch, host-signed heads, kit_not_current, backup_hash_mismatch, publish)",
-        RESTORE,
+
+    // The restore flow over these vectors (§R9.5 "Restore"; the scenarios
+    // r9-recovery-restore-* run it step by step).
+    let entries = |labels: &[&str]| -> Vec<Entry> {
+        labels
+            .iter()
+            .map(|l| Entry::from_strict(&strict(&entry(l)["entry"])).unwrap())
+            .collect()
+    };
+    let full = entries(&["E1", "E2", "E3", "E4", "E5", "E6", "KB7", "KB8"]);
+    let kb8 = full.last().unwrap();
+    let host_head = |entry: &Entry| HostHead {
+        host_id: "host-a".into(),
+        head: Head {
+            seq: entry.seq,
+            hash: entry.hash(),
+        },
+    };
+    let now = HostNow {
+        wall_ms: 1_793_264_200_000,
+        mono_ms: 1,
+        boot_id: "b".into(),
+    };
+    let env4 = v_env4["wire"].to_string();
+    let env3 = v_env3["wire"].to_string();
+    let restored = restore(&kit1, &full, env4.as_bytes(), &[host_head(kb8)], &now).unwrap();
+    assert_eq!(restored.keys.len(), 3);
+    assert_eq!(restored.keys[0].kid, s(&book.keys["K-gen-3"], "kid"));
+    let fail = |kit: &RecoveryKit, log: &[Entry], blob: &str, heads: &[HostHead]| {
+        restore(kit, log, blob.as_bytes(), heads, &now)
+            .err()
+            .unwrap()
+            .code()
+    };
+    assert_eq!(fail(&kit1, &full, &env4, &[]), "no_host_reachable");
+    assert_eq!(
+        fail(&kit1, &full[..7], &env3, &[host_head(kb8)]),
+        "log_behind_host"
     );
+    assert_eq!(
+        fail(&kit1, &full, &env3, &[host_head(kb8)]),
+        "backup_hash_mismatch"
+    );
+    assert_eq!(
+        fail(&kit2, &full, &env4, &[host_head(kb8)]),
+        "kit_not_current"
+    );
+    let sub = entries(&["SUB1", "SUB2", "SUB3"]);
+    let sub_blob = sub_env.jcs();
+    assert_eq!(
+        fail(&kit1, &sub, &sub_blob, &[host_head(&sub[2])]),
+        "genesis_mismatch"
+    );
+    let member = Member {
+        device_id: "dev-newmac".into(),
+        auth_key: book.signer_public("dev-newmac"),
+        kind: MemberKind::Native {
+            enc_key: book.public("dev-newmac/enc"),
+            roles: [Role::Control, Role::Manage, Role::View].into(),
+        },
+    };
+    let published = restored.recovery_add(&kit1, member, 1).unwrap();
+    assert_eq!((published.seq, published.prev_hash), (9, kb8.hash()));
+    assert_eq!(restored.log.check_next(&published), Check::Valid);
+    run.pass("restore flow: kit anchor, host-signed head, kit_not_current, backup_hash_mismatch, K opened, recovery_add published on the confirmed head");
     run.finish();
 }
 
