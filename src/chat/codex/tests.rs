@@ -977,17 +977,41 @@ mod script {
         let threads: Vec<_> = (0..n)
             .map(|_| {
                 let (cmd, input, dir) = (cmd.clone(), input.clone(), s.path().to_path_buf());
-                std::thread::spawn(move || run(&cmd, Some(&dir), &input))
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let out = run(&cmd, Some(&dir), &input);
+                    (out, started.elapsed())
+                })
             })
             .collect();
+        let mut waited_out = 0;
         for t in threads {
-            let (ok, stdout, stderr) = t.join().unwrap();
+            let ((ok, stdout, stderr), took) = t.join().unwrap();
             assert!(ok && stdout.is_empty() && stderr.is_empty());
+            if took >= Duration::from_millis(1900) {
+                waited_out += 1;
+            }
         }
-        let want: Vec<String> = (1..=n)
+        // Published: distinct, consecutive seqs from 1, the counter at the
+        // last. All of them, unless the machine is so slow that the hooks
+        // holding the lock in turn outlast a waiting one's ~2 s bound
+        // (Codex stops waiting at 3 s): only a hook that waited that long
+        // may drop its event.
+        let got = event_files(s.path());
+        let published = got.len();
+        let want: Vec<String> = (1..=published)
             .map(|i| format!("ev-{i:010}-PreToolUse.json"))
             .collect();
-        assert_eq!(event_files(s.path()), want);
+        assert_eq!(got, want);
+        assert_eq!(
+            fs::read_to_string(s.path().join("events/seq")).unwrap(),
+            format!("{published}\n")
+        );
+        assert!(
+            n - published <= waited_out,
+            "{} dropped, {waited_out} waited the bound out",
+            n - published
+        );
         assert!(leftovers(s.path()).is_empty(), "{:?}", leftovers(s.path()));
     }
 

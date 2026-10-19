@@ -70,9 +70,10 @@ if [ "$1" = event ]; then
     held=
     w=
     t=$(mktemp "$e/tmp.XXXXXXXX" 2>/dev/null) || exit 0
-    # Releases the lock only while it still names this hook.
+    # While this hook lives no other hook removes the lock it made (only
+    # one whose pid is gone), so it needs no check (no fork) first.
     release() {
-        [ -n "$held" ] && [ "$(readlink "$l" 2>/dev/null)" = "$$" ] && rm -f "$l" 2>/dev/null
+        [ -n "$held" ] && rm -f "$l" 2>/dev/null
         held=
     }
     # The lock wait's timer, if one runs.
@@ -129,23 +130,30 @@ if [ "$1" = event ]; then
     done
     untime
     held=1
+    # Under the lock, as few forks as can be (each one is slow on a loaded
+    # machine, and every hook waiting for the lock waits for them): the
+    # counter is read and the name padded by builtins; `ln` publishes, `mv`
+    # replaces the counter, `rm` releases.
     {
-        s=$(cat "$e/seq" 2>/dev/null)
+        s=
+        read -r s < "$e/seq"
         case $s in '' | *[!0-9]*) s=0 ;; esac
         k=0
         while [ "$k" -lt 100 ]; do
             s=$((s + 1))
-            f=$e/$(printf 'ev-%010d-%s.json' "$s" "$ev")
+            z=0000000000$s
+            f=$e/ev-${z#"${z%??????????}"}-$ev.json
             if ln "$t" "$f"; then break; fi
             # No hard links here: a rename, only onto a free name.
             if [ ! -e "$f" ] && mv "$t" "$f"; then break; fi
             k=$((k + 1))
         done
-        [ "$k" -lt 100 ] && printf '%s\n' "$s" > "$e/seq.$$" && mv "$e/seq.$$" "$e/seq"
-        rm -f "$e/seq.$$"
+        if [ "$k" -lt 100 ]; then
+            printf '%s\n' "$s" > "$e/seq.$$" && mv "$e/seq.$$" "$e/seq" || rm -f "$e/seq.$$"
+        fi
     } 2>/dev/null
-    rm -f "$t" 2>/dev/null
     release
+    rm -f "$t" 2>/dev/null
     exit 0
 fi
 

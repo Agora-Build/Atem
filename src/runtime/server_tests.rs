@@ -478,11 +478,20 @@ fn a_slow_frontend_gets_a_fresh_restore_instead_of_unbounded_output() {
 fn input_is_never_dropped_while_the_pty_queue_is_full() {
     local(async {
         let runtime = Runtime::new();
-        // Raw, no echo: the agent reads nothing for two seconds, then echoes it all.
+        // Raw, no echo: the agent reads nothing for two seconds, then
+        // records everything it reads (and echoes it). What it read is the
+        // check: the echo the frontend gets may lawfully be replaced by a
+        // screen restore when this client lags (it reads nothing while it
+        // writes, so its backlog passes `BACKLOG_LIMIT` wherever the
+        // socket buffer is small, as on macOS).
+        let got = runtime.dir.path().join("got");
         let agent = script(
             runtime.dir.path(),
             "sleepy",
-            "stty raw -echo\nprintf 'SLEEPING\\r\\n'\nsleep 2\nexec cat",
+            &format!(
+                "stty raw -echo\nprintf 'SLEEPING\\r\\n'\nsleep 2\nexec tee '{}'",
+                got.display()
+            ),
         );
         let mut client = runtime.client().await;
         client
@@ -501,11 +510,13 @@ fn input_is_never_dropped_while_the_pty_queue_is_full() {
         let mut view = View::new();
         view.until(&mut client, "SLEEPING").await;
         let count = 300;
+        let mut sent = Vec::new();
         let writer = async {
             for i in 0..count {
                 let mut chunk = format!("M{i:04}").into_bytes();
                 chunk.resize(1000, b'.');
                 chunk.extend_from_slice(b"\r\n");
+                sent.extend_from_slice(&chunk);
                 client
                     .send(&ClientMsg::input(&session.id, &chunk))
                     .await
@@ -516,24 +527,29 @@ fn input_is_never_dropped_while_the_pty_queue_is_full() {
         let mut client = tokio::time::timeout(Duration::from_secs(30), writer)
             .await
             .expect("the runtime kept reading");
-        let last = format!("M{:04}", count - 1);
-        let found = tokio::time::timeout(Duration::from_secs(20), async {
-            while !String::from_utf8_lossy(&view.output).contains(&last) {
-                let message = client.recv().await.unwrap().expect("closed");
-                view.apply(&message);
+        // Until the agent has read as much as was sent (bounded), the
+        // client keeps reading: no input may be refused on the way.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let read = std::fs::read(&got).unwrap_or_default();
+            if read.len() >= sent.len() {
+                assert!(read == sent, "the agent read other bytes than were sent");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent read {} of {} bytes",
+                read.len(),
+                sent.len()
+            );
+            if let Ok(message) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv()).await
+            {
+                let message = message.unwrap().expect("closed");
                 if let RuntimeMsg::Error { text, .. } = &message {
                     panic!("input refused: {text}");
                 }
             }
-        })
-        .await;
-        assert!(found.is_ok(), "the last input never arrived");
-        let output = String::from_utf8_lossy(&view.output).to_string();
-        for i in 0..count {
-            assert!(
-                output.contains(&format!("M{i:04}")),
-                "input {i} was dropped"
-            );
         }
         runtime.shutdown().await;
     });
