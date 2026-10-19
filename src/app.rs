@@ -30,8 +30,6 @@ use crate::config::AtemConfig;
 use crate::runtime::protocol::SessionSummary;
 use crate::websocket_client::{AstationClient, AstationMessage};
 
-/// The answer to every `visualizeRequest` from Astation.
-pub const VISUALIZE_REMOVED: &str = "Diagram generation was removed from atem";
 /// A mark task whose file no live Claude session's directory has.
 pub const NO_PROJECT_SESSION: &str =
     "no Claude session for this project; run `atem agent launch claude` there";
@@ -653,13 +651,6 @@ impl App {
                     Some(hosted::REMOVED_OP),
                 );
             }
-            AstationMessage::VisualizeRequest { session_id, .. } => {
-                // Diagram generation was removed; answer so Astation stops waiting.
-                let _ = self
-                    .astation_client
-                    .send_visualize_result(&session_id, false, VISUALIZE_REMOVED, None)
-                    .await;
-            }
             AstationMessage::CredentialSync {
                 access_token,
                 refresh_token,
@@ -962,55 +953,6 @@ mod tests {
         let _profile = crate::test_profile::temp();
         let app = App::new();
         assert!(app.pairing_code.is_none());
-    }
-
-    /// Diagram generation was removed: every `visualizeRequest` is answered
-    /// at once with an unsupported `visualizeResult`, and nothing is sent to
-    /// an agent.
-    #[tokio::test]
-    async fn visualize_request_is_answered_as_unsupported() {
-        let _profile = crate::test_profile::temp();
-        use futures_util::StreamExt;
-        use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            loop {
-                match socket.next().await {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        return serde_json::from_str::<AstationMessage>(&text).unwrap();
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("socket ended before a reply: {other:?}"),
-                }
-            }
-        });
-
-        let mut app = App::new();
-        app.astation_client.connect_raw(&format!("ws://{address}")).await.unwrap();
-        app.handle_astation_message(AstationMessage::VisualizeRequest {
-            session_id: "vis-1".into(),
-            topic: "WebRTC flow".into(),
-            relay_url: Some("https://relay.test".into()),
-        })
-        .await;
-
-        let reply = tokio::time::timeout(Duration::from_secs(3), peer)
-            .await
-            .expect("no visualizeResult reached Astation")
-            .unwrap();
-        match reply {
-            AstationMessage::VisualizeResult { session_id, success, message, file_path } => {
-                assert_eq!(session_id, "vis-1");
-                assert!(!success);
-                assert_eq!(message, "Diagram generation was removed from atem");
-                assert!(file_path.is_none());
-            }
-            other => panic!("expected VisualizeResult, got {other:?}"),
-        }
     }
 
     // ── Menu tests ──────────────────────────────────────────────────────
