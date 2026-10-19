@@ -20,8 +20,22 @@
 //! - [`backup`]: the `atem-k-backup-v2` envelope;
 //! - [`provider`]: [`KeyProvider`], and `SoftwareKeys` with the
 //!   `software-keys` feature.
+//!
+//! The membership log (§R9.2–§R9.5), pure functions and state machines the
+//! host and the clients call:
+//!
+//! - [`membership`]: typed entries and their schemas, [`membership::Membership`]
+//!   (chain verification, signer authority, carriage evaluation, the
+//!   conflict rule and freeze, the recovery state machine on the verifier's
+//!   clock, the membership side of admission); `publish`, the manager's
+//!   CAS append rules;
+//! - [`backup_writer`]: K-backup version allocation, upload and `k_backup`
+//!   publication with their `409` paths;
+//! - [`restore`]: the Recovery Kit restore over the fetched log, envelope
+//!   and host-signed heads.
 
 pub mod backup;
+pub mod backup_writer;
 pub mod canonical;
 pub mod domain;
 pub mod encoding;
@@ -29,7 +43,9 @@ pub mod error;
 pub mod hpke;
 pub mod keys;
 pub mod kit;
+pub mod membership;
 pub mod provider;
+pub mod restore;
 pub mod signed;
 #[cfg(feature = "software-keys")]
 pub mod software;

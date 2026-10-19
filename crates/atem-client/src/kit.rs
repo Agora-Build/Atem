@@ -14,10 +14,11 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
 use zeroize::Zeroizing;
 
-use crate::domain;
+use crate::domain::{self, SigningInput};
 use crate::encoding::{Hash32, ct_eq, enc};
 use crate::error::{Error, Result};
 use crate::keys::{Alg, PublicKey, ed25519_public_to_x25519};
+use crate::provider::{KeyId, KeyProvider};
 
 /// The kit's secret `R` with its anchor. `R` is wiped on drop.
 pub struct RecoveryKit {
@@ -90,6 +91,72 @@ impl RecoveryKit {
             return Err(Error::GenesisMismatch);
         }
         Ok(())
+    }
+}
+
+/// A Recovery Kit is the key provider of its two keys: the recovery key
+/// (signs a `recovery_add` or a `kit_sig`) and the kit's X25519 key (opens a
+/// K backup). Their ids are `RecoveryKit::SIGN` and `RecoveryKit::X25519`.
+impl RecoveryKit {
+    pub const SIGN: &'static str = "recovery-kit/sign";
+    pub const X25519: &'static str = "recovery-kit/x25519";
+
+    pub fn sign_id() -> KeyId {
+        KeyId::new(Self::SIGN)
+    }
+
+    pub fn x25519_id() -> KeyId {
+        KeyId::new(Self::X25519)
+    }
+}
+
+impl KeyProvider for RecoveryKit {
+    fn public_key(&self, key: &KeyId) -> Result<PublicKey> {
+        match key.0.as_str() {
+            Self::SIGN => Ok(self.recovery_key()),
+            Self::X25519 => PublicKey::new(Alg::X25519, &kit_x25519_public(&self.recovery_key())?),
+            _ => Err(Error::UnknownKey),
+        }
+    }
+
+    fn sign(&self, key: &KeyId, input: &SigningInput) -> Result<Vec<u8>> {
+        if key.0 != Self::SIGN {
+            return Err(if key.0 == Self::X25519 {
+                Error::WrongAlg
+            } else {
+                Error::UnknownKey
+            });
+        }
+        let signing = ed25519_dalek::SigningKey::from_bytes(&self.sign_seed());
+        Ok(ed25519_dalek::Signer::sign(&signing, input.as_bytes())
+            .to_bytes()
+            .to_vec())
+    }
+
+    fn x25519(&self, key: &KeyId, peer: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+        if key.0 != Self::X25519 {
+            return Err(Error::WrongAlg);
+        }
+        let secret = x25519_dalek::StaticSecret::from(*self.x25519_secret());
+        let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*peer));
+        if !shared.was_contributory() {
+            return Err(Error::ZeroSharedSecret);
+        }
+        Ok(Zeroizing::new(*shared.as_bytes()))
+    }
+
+    fn hpke_open(
+        &self,
+        key: &KeyId,
+        enc: &[u8],
+        ct: &[u8],
+        info: &[u8],
+        aad: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        if key.0 != Self::X25519 {
+            return Err(Error::WrongAlg);
+        }
+        crate::hpke::open_with_secret(&self.x25519_secret(), enc, ct, info, aad)
     }
 }
 

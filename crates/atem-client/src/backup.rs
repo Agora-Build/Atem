@@ -42,7 +42,7 @@ impl std::fmt::Debug for BackupKey {
 
 /// A key id: 1–64 bytes of `[A-Za-z0-9._:-]` (kids are short hex today), so
 /// it needs no JSON escaping.
-fn kid_ok(kid: &str) -> bool {
+pub(crate) fn kid_ok(kid: &str) -> bool {
     (1..=64).contains(&kid.len())
         && kid
             .bytes()
