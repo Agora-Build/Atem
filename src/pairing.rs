@@ -32,8 +32,7 @@ use crate::profile::Sources;
 /// A reply arrived for a pairing that is no longer the current one.
 pub const CHANGED: &str = "The Astation pairing changed while this was in progress (atem unpair or atem pair); nothing from it was applied";
 /// Work that needs a pairing binding on a profile without one.
-pub const NO_BINDING: &str =
-    "This profile has no current pairing binding. Run `atem unpair`, then `atem pair`.";
+pub const NO_BINDING: &str = "This profile has no current pairing binding. Run `atem pair`.";
 
 /// Seconds a session stays valid without activity.
 const SESSION_IDLE_SECS: u64 = 7 * 24 * 60 * 60;

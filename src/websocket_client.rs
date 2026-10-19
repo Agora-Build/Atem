@@ -17,6 +17,19 @@ pub(crate) enum AuthResponse {
     Denied(String),
 }
 
+/// What a session Astation grants may do with the pairing record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantSave {
+    /// Nothing is saved (re-authentication over an open socket).
+    Never,
+    /// Only `atem pair`'s connections: may start the record.
+    Pairing,
+    /// Background connections: only the existing record of the pairing
+    /// this connection captured, bound to that Astation, gets the session;
+    /// without one it stays in memory (never creates a record).
+    UpdateBound,
+}
+
 /// A validated `auth_required` challenge (protocol v2).
 struct AuthChallenge {
     astation_id: String,
@@ -779,15 +792,39 @@ impl AstationClient {
             .and_then(|record| record.session_for(astation_id).cloned()))
     }
 
-    /// The session Astation granted `astation_id` (a pairing in progress
-    /// starts the record).
-    fn persist_session(&self, astation_id: &str, session: crate::records::SavedSession) -> Result<()> {
+    /// Saves the session Astation granted `astation_id` as `mode` allows
+    /// (under the pairing lock, `guarded`): whether it was saved. Only a
+    /// pairing in progress (`atem pair`) starts a record.
+    fn persist_session(
+        &self,
+        astation_id: &str,
+        session: crate::records::SavedSession,
+        mode: GrantSave,
+    ) -> Result<bool> {
         let paths = self.profile_sources()?.paths.pairing;
-        let mut record = crate::records::PairingRecord::load(&paths)?
-            .filter(|record| record.astation_id == astation_id)
-            .unwrap_or_else(|| crate::records::PairingRecord::new(astation_id));
-        record.session = Some(session);
-        record.save(&paths)
+        match mode {
+            GrantSave::Never => Ok(false),
+            GrantSave::Pairing => {
+                let mut record = crate::records::PairingRecord::load(&paths)?
+                    .filter(|record| record.astation_id == astation_id)
+                    .unwrap_or_else(|| crate::records::PairingRecord::new(astation_id));
+                record.session = Some(session);
+                record.save(&paths)?;
+                Ok(true)
+            }
+            GrantSave::UpdateBound => {
+                let bound = self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.bound_to(astation_id).is_ok());
+                if !bound {
+                    return Ok(false);
+                }
+                crate::records::PairingRecord::update_locked(&paths, astation_id, |record| {
+                    record.session = Some(session);
+                })
+            }
+        }
     }
 
     fn abort_transport(&mut self) {
@@ -959,7 +996,8 @@ impl AstationClient {
             }
             self.send_message(proof).await?;
             self.answered_challenge = Some((astation_id.clone(), challenge.challenge.clone()));
-            let response = self.wait_for_auth_response(&astation_id).await?;
+            let save = if allow_pairing { GrantSave::Pairing } else { GrantSave::UpdateBound };
+            let response = self.wait_for_auth_response(&astation_id, save).await?;
             if challenge.transport == "loopback" {
                 return match response {
                     Some(AuthResponse::Authenticated) => self.guarded(|| Ok(())),
@@ -1038,7 +1076,7 @@ impl AstationClient {
         // Wait for pairing response (longer timeout for user to approve)
         let response = tokio::time::timeout(
             Duration::from_secs(300), // 5 minutes for user to approve
-            self.wait_for_auth_response(astation_id)
+            self.wait_for_auth_response(astation_id, GrantSave::Pairing)
         )
         .await
         .map_err(|_| anyhow!("Pairing timed out after 5 minutes"))??;
@@ -1196,13 +1234,21 @@ impl AstationClient {
     }
 
     /// Classify one message as an authentication response for `astation_id`.
-    /// `None` when it is not one. A grant persists the new session only with
-    /// `persist_grant` (pairing can grant one; re-authentication never pairs).
-    pub(crate) fn auth_response(&self, msg: &AstationMessage, astation_id: &str, persist_grant: bool) -> Result<Option<AuthResponse>> {
+    /// `None` when it is not one. A grant's new session is saved as `save`
+    /// allows (only pairing starts a record; re-authentication saves none).
+    pub(crate) fn auth_response(&self, msg: &AstationMessage, astation_id: &str, save: GrantSave) -> Result<Option<AuthResponse>> {
+        Ok(self.auth_response_saving(msg, astation_id, save)?.map(|(response, _)| response))
+    }
+
+    /// `auth_response`, plus the granted session (`(session_id, token)`)
+    /// when it was saved.
+    #[allow(clippy::type_complexity)]
+    fn auth_response_saving(&self, msg: &AstationMessage, astation_id: &str, save: GrantSave) -> Result<Option<(AuthResponse, Option<(String, String)>)>> {
         let AstationMessage::StatusUpdate { status, data } = msg else { return Ok(None); };
+        let response = |response| Ok(Some((response, None)));
         match status.as_str() {
             "auth" => match data.get("status").map(String::as_str) {
-                Some("granted") if !persist_grant => Ok(Some(AuthResponse::Authenticated)),
+                Some("granted") if save == GrantSave::Never => response(AuthResponse::Authenticated),
                 Some("granted") => {
                     let session_id = data.get("session_id").ok_or_else(|| {
                         anyhow!("Pairing response missing session ID")
@@ -1216,21 +1262,22 @@ impl AstationClient {
                         crate::auth::get_hostname(),
                     );
 
-                    self.guarded(|| self.persist_session(astation_id, session))?;
-                    Ok(Some(AuthResponse::Authenticated))
+                    let saved = self.guarded(|| self.persist_session(astation_id, session, save))?;
+                    let saved = saved.then(|| (session_id.clone(), token.clone()));
+                    Ok(Some((AuthResponse::Authenticated, saved)))
                 }
                 Some("denied") => {
                     let msg = data.get("message")
                         .map(|s| s.as_str())
                         .unwrap_or("Unknown reason");
-                    Ok(Some(AuthResponse::Denied(msg.to_string())))
+                    response(AuthResponse::Denied(msg.to_string()))
                 }
                 _ => Ok(None),
             },
             "authenticated" => {
                 // Alternative authenticated message format
                 self.guarded(|| Ok(()))?;
-                Ok(Some(AuthResponse::Authenticated))
+                response(AuthResponse::Authenticated)
             }
             "error" => Ok(data.get("message").map(|msg| {
                 let lower = msg.to_ascii_lowercase();
@@ -1239,24 +1286,21 @@ impl AstationClient {
                 } else {
                     AuthResponse::Denied(msg.clone())
                 }
-            })),
+            }).map(|response| (response, None))),
             _ => Ok(None),
         }
     }
 
-    /// Wait for auth response message and extract session if granted
-    async fn wait_for_auth_response(&mut self, astation_id: &str) -> Result<Option<AuthResponse>> {
+    /// Wait for auth response message and save the session if granted (as
+    /// `save` allows).
+    async fn wait_for_auth_response(&mut self, astation_id: &str, save: GrantSave) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
-            if let Some(response) = self.auth_response(&msg, astation_id, true)? {
+            if let Some((response, saved)) = self.auth_response_saving(&msg, astation_id, save)? {
                 // A grant saved a new session (under the captured pairing):
-                // later checks compare against that one.
-                if let AstationMessage::StatusUpdate { status, data } = &msg
-                    && status == "auth"
-                    && let (Some(id), Some(token), Some(capture)) =
-                        (data.get("session_id"), data.get("token"), self.capture.as_mut())
-                    && data.get("status").map(String::as_str) == Some("granted")
-                {
-                    capture.session = Some((id.clone(), token.clone()));
+                // later checks compare against that one. One kept in memory
+                // only leaves the capture as it was.
+                if let (Some(saved), Some(capture)) = (saved, self.capture.as_mut()) {
+                    capture.session = Some(saved);
                 }
                 return Ok(Some(response));
             }
@@ -2138,6 +2182,167 @@ mod tests {
         }
     }
 
+    /// A test Astation that challenges over `transport`, grants the session
+    /// `granted-session` to the first `auth` it gets, then keeps the socket
+    /// open until Atem closes it.
+    async fn granting_peer(astation_id: &str, transport: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let challenge = reauth_challenge(astation_id, transport);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(serde_json::to_string(&challenge).unwrap()))
+                .await
+                .unwrap();
+            while let Some(Ok(frame)) = socket.next().await {
+                let Message::Text(text) = frame else { continue };
+                let Ok(AstationMessage::StatusUpdate { status, .. }) = serde_json::from_str(&text) else {
+                    continue;
+                };
+                if status != "auth" {
+                    continue;
+                }
+                let granted = AstationMessage::StatusUpdate {
+                    status: "auth".into(),
+                    data: std::collections::HashMap::from([
+                        ("status".to_string(), "granted".to_string()),
+                        ("session_id".to_string(), "granted-session".to_string()),
+                        ("token".to_string(), "granted-token".to_string()),
+                    ]),
+                };
+                socket
+                    .send(Message::Text(serde_json::to_string(&granted).unwrap()))
+                    .await
+                    .unwrap();
+                break;
+            }
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        (format!("ws://{address}"), server)
+    }
+
+    #[cfg(unix)]
+    fn with_bootstrap_token(state: &std::path::Path, client: &mut AstationClient) {
+        use std::os::unix::fs::PermissionsExt;
+        let token_path = state.join("local-bootstrap-token");
+        fs::write(&token_path, "bootstrap-secret\n").unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        client.local_token_path_override = Some(token_path);
+    }
+
+    /// After `atem unpair` (or on a profile never paired), the runtime's
+    /// background reconnect to the local Astation authenticates with the
+    /// loopback proof; the session Astation grants stays in memory: no
+    /// pairing record appears, and the profile stays not paired.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_local_grant_never_creates_a_pairing() {
+        for unpaired in [true, false] {
+            let (state, mut client) = isolated_client("atem-test-local-grant");
+            let _profile = crate::test_profile::use_dir(state.path());
+            with_bootstrap_token(state.path(), &mut client);
+            let src = crate::profile::Sources::in_dir(state.path());
+            if unpaired {
+                crate::pairing::tests::bound_profile(state.path(), "mac-local");
+                crate::pairing::unpair(&src).unwrap();
+            }
+            let (url, server) = granting_peer("mac-local", "loopback").await;
+            client.connect_without_pairing(&url).await.unwrap();
+            assert_eq!(client.connected_astation_id(), Some("mac-local"));
+            assert!(!src.paths.pairing.record.exists(), "unpaired {unpaired}: a record appeared");
+            assert!(!crate::status::profile_paired(&src));
+            assert_eq!(crate::status::already_paired(&src), None);
+            let report = crate::status::gather_with(&src, None);
+            assert_eq!(report.pairing.value, "not paired");
+            // Still usable: the guard compares against no saved session.
+            client.refresh_session().unwrap();
+            assert!(!src.paths.pairing.record.exists());
+            drop(client);
+            server.await.unwrap();
+        }
+    }
+
+    /// The background reconnect of a pairing (bound) still keeps the session
+    /// Astation grants on the loopback, in the existing record.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_local_grant_updates_the_bound_pairings_session() {
+        let (state, mut client) = isolated_client("atem-test-local-bound");
+        let _profile = crate::test_profile::use_dir(state.path());
+        with_bootstrap_token(state.path(), &mut client);
+        crate::pairing::tests::bound_profile(state.path(), "mac-local");
+        let src = crate::profile::Sources::in_dir(state.path());
+        let before = crate::pairing::load(&src).unwrap();
+        let (url, server) = granting_peer("mac-local", "loopback").await;
+        client.connect_without_pairing(&url).await.unwrap();
+        assert_eq!(
+            crate::pairing::tests::session_id(state.path()).as_deref(),
+            Some("granted-session")
+        );
+        assert_eq!(crate::pairing::load(&src).unwrap(), before, "binding kept");
+        // Later checks compare against the granted session.
+        client.refresh_session().unwrap();
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// A leftover record without a binding (from v0.7.2) is not updated by
+    /// a background grant, and is not a pairing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_local_grant_leaves_a_record_without_a_binding_alone() {
+        let (state, mut client) = isolated_client("atem-test-local-unbound");
+        let _profile = crate::test_profile::use_dir(state.path());
+        with_bootstrap_token(state.path(), &mut client);
+        crate::pairing::tests::set_session(state.path(), "mac-local", "stale", "stale-token");
+        let src = crate::profile::Sources::in_dir(state.path());
+        let (url, server) = granting_peer("mac-local", "loopback").await;
+        client.connect_without_pairing(&url).await.unwrap();
+        assert_eq!(crate::pairing::tests::session_id(state.path()).as_deref(), Some("stale"));
+        assert_eq!(crate::status::already_paired(&src), None);
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// `atem pair`'s connections (local and relay) still start the record
+    /// with the granted session; `bind_new` then binds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pairing_connections_save_the_granted_session_and_bind() {
+        for transport in ["loopback", "relay"] {
+            let (state, mut client) = isolated_client("atem-test-pair-grant");
+            let _profile = crate::test_profile::use_dir(state.path());
+            with_bootstrap_token(state.path(), &mut client);
+            let src = crate::profile::Sources::in_dir(state.path());
+            let before = crate::pairing::capture(&src).unwrap();
+            let (url, server) = granting_peer("mac-pair", transport).await;
+            if transport == "relay" {
+                let base = url.replace("ws://", "http://");
+                client.connect_relay_identity(&base, "mac-pair").await.unwrap();
+            } else {
+                client.connect(&url).await.unwrap();
+            }
+            assert_eq!(
+                crate::pairing::tests::session_id(state.path()).as_deref(),
+                Some("granted-session"),
+                "{transport}"
+            );
+            let after = crate::pairing::bind_new(&src, &before, "mac-pair").unwrap();
+            client.adopt_binding(&before, &after).unwrap();
+            client.refresh_session().unwrap();
+            assert_eq!(crate::status::pairing(&src).unwrap().astation_id, "mac-pair");
+            assert!(crate::status::already_paired(&src).is_some(), "{transport}");
+            assert_eq!(
+                crate::pairing::tests::session_id(state.path()).as_deref(),
+                Some("granted-session")
+            );
+            drop(client);
+            server.await.unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn reauth_over_loopback_answers_with_the_local_proof() {
@@ -2219,7 +2424,7 @@ mod tests {
             .connect_without_pairing(&format!("ws://{address}"))
             .await
             .expect_err("authenticated with a leftover session");
-        assert!(format!("{error:#}").contains("atem unpair"), "{error:#}");
+        assert!(format!("{error:#}").contains(crate::pairing::NO_BINDING), "{error:#}");
         let frames = server.await.unwrap();
         assert!(
             !frames.iter().any(|frame| frame.contains("leftover-session")),
@@ -2238,7 +2443,7 @@ mod tests {
             .answer_auth_required(&reauth_challenge("astation-a", "relay"))
             .await
             .expect_err("answered with a leftover session");
-        assert!(error.to_string().contains("atem unpair"), "{error}");
+        assert!(error.to_string().contains(crate::pairing::NO_BINDING), "{error}");
         drop(client);
         assert!(server.await.unwrap().is_none(), "sent the leftover session");
     }

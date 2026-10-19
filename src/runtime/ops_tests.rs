@@ -886,10 +886,25 @@ fn cred_unlock_runs_on_the_runtimes_link_while_sessions_stay_attached() {
 
 #[test]
 fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
+    first_pairing(None);
+}
+
+/// A record without a binding (left by v0.7.2's background reconnect) is
+/// not a pairing: `atem pair` proceeds and replaces it.
+#[test]
+fn pair_replaces_a_record_without_a_binding() {
+    first_pairing(Some(ASTATION));
+    first_pairing(Some("astation-other"));
+}
+
+fn first_pairing(leftover: Option<&str>) {
     local(async {
         let dir = Rc::new(short_dir());
         let profile = dir.path().join("profile");
         std::fs::create_dir_all(&profile).unwrap();
+        if let Some(astation_id) = leftover {
+            crate::pairing::tests::set_session(&profile, astation_id, "leftover", "leftover-token");
+        }
         let (url, mut peer) = Peer::listen().await;
         // Local first: the fake is the local Astation; the relay is unreachable.
         std::fs::write(
@@ -971,6 +986,12 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
         assert_eq!(binding.astation_id, ASTATION);
         assert!(fresh_shared(&rt.profile).is_some());
         assert!(record(&rt.profile).save_credentials);
+        assert_eq!(record(&rt.profile).astation_id, ASTATION);
+        assert_eq!(
+            record(&rt.profile).session.unwrap().session_id,
+            "session-new",
+            "the pairing saved the granted session"
+        );
         assert!(verified_as(&rt.keys(), "acct-new"));
         // The pairing connection is the runtime's link: it attaches.
         let welcome = peer.hello().await;

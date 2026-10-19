@@ -98,6 +98,17 @@ pub fn pairing(src: &Sources) -> Option<Pairing> {
     })
 }
 
+/// Whether the pairing with `astation_id` has its current binding: only
+/// `atem pair` finishes one. A record without one (a pairing that never
+/// finished, an `atem unpair` interrupted after its commit) is not a pairing:
+/// `atem pair` replaces it.
+fn bound(src: &Sources, astation_id: &str) -> bool {
+    crate::pairing::load(src)
+        .ok()
+        .and_then(|state| state.binding)
+        .is_some_and(|binding| binding.astation_id == astation_id)
+}
+
 /// Whether this profile holds a pairing record `atem unpair` removes.
 pub fn profile_paired(src: &Sources) -> bool {
     src.paths.pairing.record.exists()
@@ -238,6 +249,16 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
     } else {
         ""
     };
+    if let Ok(state) = crate::pairing::load(src)
+        && state.binding.is_none()
+    {
+        return (
+            Line::new(format!(
+                "not paired (unfinished pairing with {astation_id}; run `atem pair`)"
+            )),
+            Line::new("—"),
+        );
+    }
     let trust = trust_note(src, astation_id);
     let verification = match verification(&src.paths.cred, astation_id) {
         Verification::Verified { safety_code } => format!("verified (safety code {safety_code})"),
@@ -263,7 +284,8 @@ fn trust_note(src: &Sources, astation_id: &str) -> String {
                 ", trust gen {} is with {}; run `atem unpair`, then `atem pair`",
                 binding.host_trust_gen, binding.astation_id
             ),
-            None => ", no pairing binding; run `atem unpair`, then `atem pair`".into(),
+            // `pairing_lines` shows a pairing without a binding as not paired.
+            None => ", no pairing binding; run `atem pair`".into(),
         },
         Err(error) => format!(", trust gen unknown: {error:#}"),
     }
@@ -483,7 +505,10 @@ pub fn text(src: &Sources) -> String {
 /// `atem pair`: when the profile is already paired, what to print instead
 /// of pairing (the status, then `ALREADY_PAIRED`).
 pub fn already_paired(src: &Sources) -> Option<String> {
-    pairing(src)?;
+    let pairing = pairing(src)?;
+    if !bound(src, &pairing.astation_id) {
+        return None;
+    }
     Some(format!("{}{ALREADY_PAIRED}\n", text(src)))
 }
 
@@ -499,7 +524,9 @@ pub enum VerifyStart {
 /// `atem pair verify`'s offline checks: an existing pairing, not revoked,
 /// not already verified with the paired Astation.
 pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
-    let pairing = pairing(src).ok_or_else(|| anyhow!(NOT_PAIRED))?;
+    let pairing = pairing(src)
+        .filter(|pairing| bound(src, &pairing.astation_id))
+        .ok_or_else(|| anyhow!(NOT_PAIRED))?;
     let astation_id = pairing.astation_id;
     match verification(&src.paths.cred, &astation_id) {
         Verification::Verified { safety_code } => Ok(VerifyStart::AlreadyVerified(
@@ -741,10 +768,15 @@ pub(crate) mod tests {
                 session_expired: false,
             })
         );
+        // Not a pairing: `atem pair` proceeds and replaces it.
+        let report = report(dir.path());
         assert_eq!(
-            report(dir.path()).pairing.value,
-            "paired (astation-0, no pairing binding; run `atem unpair`, then `atem pair`)"
+            report.pairing.value,
+            "not paired (unfinished pairing with astation-0; run `atem pair`)"
         );
+        assert_eq!(report.verification.value, "—");
+        assert_eq!(already_paired(&src), None);
+        assert_eq!(verify_start(&src).unwrap_err().to_string(), NOT_PAIRED);
     }
 
     #[test]
@@ -789,8 +821,9 @@ pub(crate) mod tests {
         crate::pairing::tests::interrupted_unpair(dir.path());
         assert_eq!(
             report(dir.path()).pairing.value,
-            "paired (astation-1, no pairing binding; run `atem unpair`, then `atem pair`)"
+            "not paired (unfinished pairing with astation-1; run `atem pair`)"
         );
+        assert_eq!(already_paired(&src), None);
     }
 
     #[test]
